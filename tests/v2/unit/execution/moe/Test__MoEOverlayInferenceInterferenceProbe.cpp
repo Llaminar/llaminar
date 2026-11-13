@@ -16,6 +16,56 @@
 
 namespace llaminar2::test
 {
+    /** @test Original completion proof survives reset, while each replacement must complete anew. */
+    TEST(MoEOverlayInferenceInterferenceProbe, OriginalRankCompletionProofResetAndReuseReplay)
+    {
+        using Progress = MoEOverlayInferenceCompletionFenceProgress;
+        std::atomic<Progress> observation{Progress::Pending};
+        uint64_t recorded_session = 9, current_session = 9;
+        uint64_t recorded_workspace = 7, current_workspace = 7;
+        std::array<bool, 2> native_ready{true, false};
+        int native_queries = 0;
+        const auto query_original = [&] {
+            ++native_queries;
+            if (recorded_session != current_session || recorded_workspace != current_workspace)
+                return Progress::Failed;
+            return native_ready[0] && native_ready[1] ? Progress::Ready : Progress::Pending;
+        };
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Pending);
+        native_ready[1] = true;
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Ready);
+        const int completed_queries = native_queries;
+        ++current_session; // Actual request reset after native/ACK completion.
+        ++current_workspace;
+        for (int teardown_poll = 0; teardown_poll < 20; ++teardown_poll)
+            EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Ready);
+        EXPECT_EQ(native_queries, completed_queries) << "Completed evidence must not query a new producer generation";
+
+        // This is the production record() edge: a new native recording first
+        // withdraws the old proof, then binds its exact original identities.
+        observation = Progress::Pending;
+        recorded_session = current_session;
+        recorded_workspace = current_workspace;
+        native_ready = {false, false};
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Pending);
+        native_ready[0] = true;
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Pending);
+        native_ready[1] = true;
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Ready);
+
+        observation = Progress::Pending;
+        ++current_session; // Unobserved work is incompatible, never grandfathered.
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Failed);
+        const int failed_queries = native_queries;
+        recorded_session = current_session;
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, query_original), Progress::Failed);
+        EXPECT_EQ(native_queries, failed_queries) << "A failed original event proof stays failed";
+
+        observation = Progress::Pending;
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, [] { return Progress::Failed; }), Progress::Failed);
+        EXPECT_EQ(pollRetainedInferenceCompletion(observation, [] { return Progress::Ready; }), Progress::Failed);
+    }
+
     namespace
     {
         /** @brief Construct one valid request without stringly topology data. */

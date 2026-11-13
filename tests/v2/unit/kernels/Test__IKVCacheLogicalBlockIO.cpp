@@ -4,6 +4,8 @@
  * Tests explicit storage operands; public format selection is integration-tested.
  */
 #include <gtest/gtest.h>
+#include "kernels/KVCacheMetadataInitialization.h"
+#include "../../mocks/MockBackend.h"
 
 /**
  * @brief These packed-operand tests select their physical K/V types explicitly.
@@ -27,6 +29,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <functional>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -755,4 +758,84 @@ TEST(Test__IKVCacheLogicalBlockIO, SplitTQAsymmetricLogicalBlockRoundTripsRawByt
     ASSERT_TRUE(cache.exportLogicalBlock(desc, out_k.data(), out_v.data()));
     EXPECT_EQ(out_k, k_payload);
     EXPECT_EQ(out_v, v_payload);
+}
+
+namespace {
+/** @brief Deferred external backend operations; production event helper is unchanged. */
+class DeferredKVInitializationBackend final:public llaminar2::test::MockBackend {
+public:
+    enum class Failure {None,Create,Record,Wait,RecordThrows,WaitThrows};
+    Failure failure=Failure::None;
+    void* producer=reinterpret_cast<void*>(0x180);
+    std::vector<std::function<void()>> queued;
+    int creates=0,records=0,waits=0,destroys=0;
+    /** @copydoc IBackend::memset
+     * @brief Retain the actual initialization operation until its exact event is awaited. */
+    bool memset(void* ptr,int value,size_t bytes,int device,void* stream)override{
+        EXPECT_EQ(device,3);EXPECT_EQ(stream,producer);
+        queued.push_back([=]{std::memset(ptr,value,bytes);});return true;
+    }
+    /** @copydoc IBackend::createEvent
+     * @brief Keep failure injection at the original external creator boundary. */
+    void* createEvent(int device)override{EXPECT_EQ(device,3);++creates;return failure==Failure::Create?nullptr:this;}
+    /** @copydoc IBackend::recordEvent
+     * @brief Require original event/device/stream identity before publishing a completion. */
+    bool recordEvent(void* event,int device,void* stream)override{
+        EXPECT_EQ(event,this);EXPECT_EQ(device,3);EXPECT_EQ(stream,producer);++records;
+        if(failure==Failure::RecordThrows)throw std::runtime_error("original record failure");
+        return failure!=Failure::Record;
+    }
+    /** @copydoc IBackend::waitForEvent
+     * @brief Execute only the recorded producer prefix, never an arbitrary consumer stream. */
+    bool waitForEvent(void* event,int device)override{
+        EXPECT_EQ(event,this);EXPECT_EQ(device,3);EXPECT_EQ(records,1);++waits;
+        if(failure==Failure::WaitThrows)throw std::runtime_error("original wait failure");
+        if(failure==Failure::Wait)return false;
+        for(auto& work:queued)work();queued.clear();return true;
+    }
+    /** @copydoc IBackend::destroyEvent
+     * @brief Observe exact event retirement on success and every created-event failure. */
+    void destroyEvent(void* event,int device)override{EXPECT_EQ(event,this);EXPECT_EQ(device,3);++destroys;}
+};
+}
+/** @test Actual cold event helper orders delayed setup before an independent stream's append. */
+TEST(Test__IKVCacheLogicalBlockIO, ColdMetadataInitializationOrdersIndependentConsumer){
+    for(int replay=0;replay<20;++replay){
+        DeferredKVInitializationBackend backend;
+        int head=-1,count=-1;
+        ASSERT_TRUE(backend.memset(&head,0,sizeof(head),3,backend.producer));
+        ASSERT_TRUE(backend.memset(&count,0,sizeof(count),3,backend.producer));
+        detail::completeColdKVMetadataInitialization(backend,3,backend.producer);
+        EXPECT_EQ(head,0);EXPECT_EQ(count,0);
+        count=30; // Independent consumer may now publish its own original state.
+        for(auto& delayed:backend.queued)delayed();
+        EXPECT_EQ(count,30);EXPECT_EQ(backend.destroys,1);
+        EXPECT_EQ(backend.creates,1);EXPECT_EQ(backend.waits,1);
+        // Original no-handoff ordering is a deterministic red control, not a
+        // substitute production path: later producer zero overwrites append.
+        int original_count=-1;
+        ASSERT_TRUE(backend.memset(&original_count,0,sizeof(original_count),3,backend.producer));
+        original_count=30;
+        for(auto& delayed:backend.queued)delayed();
+        EXPECT_EQ(original_count,0);
+    }
+}
+/** @test Rejected cold publication cannot leak an event or manufacture readiness. */
+TEST(Test__IKVCacheLogicalBlockIO, ColdMetadataInitializationRejectsCaptureAndPreservesErrors){
+    DeferredKVInitializationBackend backend;
+    {GraphCaptureGuard capture;EXPECT_THROW(detail::completeColdKVMetadataInitialization(backend,3,backend.producer),std::logic_error);}
+    EXPECT_THROW(detail::completeColdKVMetadataInitialization(backend,3,nullptr),std::invalid_argument);
+    EXPECT_THROW(detail::completeColdKVMetadataInitialization(backend,-1,backend.producer),std::invalid_argument);
+    EXPECT_EQ(backend.creates,0);
+    for(const auto failure:{DeferredKVInitializationBackend::Failure::Create,DeferredKVInitializationBackend::Failure::Record,
+        DeferredKVInitializationBackend::Failure::Wait,DeferredKVInitializationBackend::Failure::RecordThrows,DeferredKVInitializationBackend::Failure::WaitThrows}){
+        DeferredKVInitializationBackend rejected;rejected.failure=failure;
+        try{detail::completeColdKVMetadataInitialization(rejected,3,rejected.producer);FAIL()<<"Rejected initialization completed";}
+        catch(const std::runtime_error& error){
+            if(failure==DeferredKVInitializationBackend::Failure::RecordThrows)EXPECT_STREQ(error.what(),"original record failure");
+            if(failure==DeferredKVInitializationBackend::Failure::WaitThrows)EXPECT_STREQ(error.what(),"original wait failure");
+        }
+        EXPECT_EQ(rejected.creates,1);
+        EXPECT_EQ(rejected.destroys,failure==DeferredKVInitializationBackend::Failure::Create?0:1);
+    }
 }

@@ -9,11 +9,21 @@
  * Portable diagnostic environment is explicitly exported by name: remote SSH
  * ranks do not inherit the launcher's ordinary environment. Rank/device-local
  * placement and cloud credentials must never cross that boundary implicitly.
+ * The shared CPU-only session helper retains launch ownership through exact
+ * process retirement. Remote daemons get host-local owners before MPI creates
+ * their runtime files. This child can exec exact mpirun while its retained
+ * ancestor still owns cleanup after every rank and daemon actually retires.
  *
  * @author David Sanftenberg
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #include "MPIBootstrap.h"
+#include "MPISessionOwner.h"
+#include "ScopedOpenMPPartitionAffinity.h"
 #include "Logger.h"
 #include "DebugEnv.h"
 #include <fstream>
@@ -25,6 +35,8 @@
 #include <set>
 #include <algorithm>
 #include <filesystem>
+#include <stdexcept>
+#include <limits>
 
 namespace llaminar2
 {
@@ -67,6 +79,14 @@ namespace llaminar2
                     command.emplace_back(name);
                 }
             }
+        }
+
+        /** @return One shell word for OpenMPI's explicitly shell-parsed remote launch agent. */
+        std::string remoteShellWord(const std::string &word)
+        {
+            std::string result = "'";
+            for (char character : word) result += character == '\'' ? "'\\''" : std::string(1, character);
+            return result + "'";
         }
 
         /** @brief Configure launcher-only hwloc discovery before execing MPI. */
@@ -474,6 +494,49 @@ namespace llaminar2
     // OpenMP Environment Configuration
     // ========================================================================
 
+    MPINUMAMapping MPINUMAMapping::fromObservedPlacement(std::span<const MPICorePlacement> placement,
+        std::span<const int> selected_nodes)
+    {
+        const auto observed = NUMATopology::logicalMPICoresForNUMANodes(placement, selected_nodes);
+        if (observed.empty() || observed.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("MPI NUMA mapping requires observed nonempty node membership");
+        MPINUMAMapping result;
+        std::set<int> unique;
+        for (const auto &[node, cpus] : observed)
+        {
+            if (node < 0 || cpus.empty())
+                throw std::invalid_argument("MPI NUMA mapping requires known nodes with logical cores");
+            // OpenMPI4.1's original rank-file parser owns a fixed64-byte
+            // slot_list and does not reject truncation. Reject unrepresentable
+            // native syntax here rather than launch with a partial core set.
+            constexpr size_t kOpenMPI41SlotListBytes = 64;
+            const auto logical_cores = formatCpuList(cpus);
+            if (logical_cores.size() >= kOpenMPI41SlotListBytes)
+                throw std::invalid_argument("Observed NUMA logical-core list exceeds OpenMPI4.1 native rankfile slot capacity");
+            // Native rankfile syntax consumes global hwloc logical core IDs.
+            // This mapping is local-only. OpenMPI4.1 inspects the rankfile
+            // before applying --host, so a relative +n0 cannot establish its
+            // allocation. Name localhost directly, never an OS NUMA label.
+            result.rank_file_contents_ += "rank " + std::to_string(result.nodes_.size()) +
+                "=localhost slot=" + logical_cores + "\n";
+            result.nodes_.push_back(node);
+            for (const int cpu : cpus)
+                if (cpu < 0 || !unique.insert(cpu).second)
+                    throw std::invalid_argument("MPI NUMA mapping requires distinct original logical core sets");
+        }
+        result.cpu_set_ = formatCpuList(std::vector<int>(unique.begin(), unique.end()));
+        return result;
+    }
+
+    void MPIBootstrap::configureOpenMPPlacement(const MPILaunchConfig &config)
+    {
+        if (config.omp_places.empty() || config.omp_proc_bind.empty())
+            throw std::invalid_argument("MPI OpenMP placement and binding policy must be explicit");
+        if (setenv("OMP_PLACES", config.omp_places.c_str(), 1) != 0 ||
+            setenv("OMP_PROC_BIND", config.omp_proc_bind.c_str(), 1) != 0)
+            throw std::runtime_error("Cannot publish MPI OpenMP placement before exec");
+    }
+
     void MPIBootstrap::configureOpenMPEnvironment(const CPUTopology &topology,
                                                   const MPILaunchConfig &config)
     {
@@ -487,8 +550,7 @@ namespace llaminar2
 
         // Set OpenMP environment variables
         setenv("OMP_NUM_THREADS", std::to_string(omp_threads).c_str(), 1);
-        setenv("OMP_PLACES", config.omp_places.c_str(), 1);
-        setenv("OMP_PROC_BIND", config.omp_proc_bind.c_str(), 1);
+        configureOpenMPPlacement(config);
         setenv("OMP_NESTED", "false", 1);
         setenv("OMP_DYNAMIC", "false", 1);
 
@@ -543,14 +605,29 @@ namespace llaminar2
     std::vector<std::string> MPIBootstrap::buildMPIRunCommand(
         int argc, char *argv[],
         const MPILaunchConfig &config,
-        const CPUTopology &topology)
+        const CPUTopology &topology,
+        MPIBootstrapArgumentPolicy arguments, const std::string &observed_numa_rankfile)
     {
+        if (arguments != MPIBootstrapArgumentPolicy::FilterLaunchArguments &&
+            arguments != MPIBootstrapArgumentPolicy::PreserveOriginalArguments)
+            throw std::invalid_argument("Unknown MPI bootstrap argument policy");
         std::vector<std::string> cmd;
 
         cmd.push_back("mpirun");
 
         // Number of processes
         int num_procs = config.num_procs;
+        if (config.numa_mapping)
+        {
+            if (!config.hostfile.empty() || !config.cpu_set.empty() || config.bind_to_socket || config.map_by_socket ||
+                (num_procs > 0 && static_cast<size_t>(num_procs) != config.numa_mapping->nodes().size()))
+                throw std::invalid_argument("Observed NUMA mapping requires one local rank per node and no competing placement");
+            num_procs = static_cast<int>(config.numa_mapping->nodes().size());
+            if (observed_numa_rankfile.empty() || observed_numa_rankfile.find_first_of("\n\r") != std::string::npos)
+                throw std::invalid_argument("Observed NUMA mapping requires its original guardian-owned rankfile");
+        }
+        else if (!observed_numa_rankfile.empty())
+            throw std::invalid_argument("A NUMA rankfile cannot replace an undeclared launcher placement");
         if (num_procs <= 0 && config.hostfile.empty())
         {
             num_procs = topology.num_sockets;
@@ -570,6 +647,12 @@ namespace llaminar2
         {
             cmd.push_back("--hostfile");
             cmd.push_back(config.hostfile);
+            // Daemons initialize PMIx before an app rank exists. Each remote
+            // host must create and retire its own roots, never inherit a path
+            // that exists only in the launcher's filesystem namespace.
+            cmd.push_back("--launch-agent");
+            cmd.push_back(remoteShellWord(MPISessionOwner::launcherExecutable().string()) +
+                          " --mpi-daemon --session-base /tmp -- orted");
         }
 
         const int pe_threads = config.omp_threads_per_rank > 0
@@ -587,6 +670,18 @@ namespace llaminar2
         // requests multiple processing elements per rank; bind-to socket with
         // PE=N is rejected and plain bind-to socket may bind only one core plus
         // its SMT sibling on some systems.
+        if (config.numa_mapping)
+        {
+            // OpenMPI4.1 aliases cpu-set to its rank-file mapper, which
+            // conflicts with explicit ppr mapping and replaces NUMA binding.
+            // Use its native per-rank map directly, with the cached complete
+            // logical core set for each observed NUMA partition.
+            // The rankfile names the local host directly; no scheduler/hostfile
+            // allocation or competing --host selector is needed.
+            cmd.insert(cmd.end(), {"--rankfile", observed_numa_rankfile,
+                "--mca", "rmaps_rank_file_physical", "0",
+                "--mca", "hwloc_base_use_hwthreads_as_cpus", "0"});
+        }
         if (config.bind_to_socket)
         {
             cmd.push_back("--bind-to");
@@ -637,33 +732,47 @@ namespace llaminar2
         cmd.push_back("mpi_leave_pinned");
         cmd.push_back("1");
 
-        cmd.push_back("--mca");
-        cmd.push_back("btl_vader_single_copy_mechanism");
-        cmd.push_back("none");
+        // Native MPI owns local-copy capability selection (CMA on supported
+        // Linux hosts). A CLI override would disable that path and also defeat
+        // an operator's inherited MCA setting. Preserve both sources of intent.
 
+        // Placement names are portable; remote ranks still observe their own
+        // allowed places and derive their numeric physical-worker budget.
+        // Name-only exports retain the selected value, including place syntax.
+        for (const char *name : {"OMP_PLACES", "OMP_PROC_BIND"})
+        {
+            cmd.emplace_back("-x");
+            cmd.emplace_back(name);
+        }
         appendDiagnosticEnvironment(cmd);
 
-        // Add original program and its arguments
-        // argv[0] is the program path
+        // MPI owns this explicit option/application delimiter. The shared
+        // session owner validates only that prefix, never opaque app flags.
+        cmd.push_back("--");
+        // argv[0] and every application argument retain their original meaning.
         cmd.push_back(argv[0]);
 
-        // Copy all original arguments, filtering out MPI bootstrap-specific ones
+        // Copy original arguments according to the application parser ownership.
         for (int i = 1; i < argc; ++i)
         {
             std::string arg = argv[i];
 
-            // Skip bootstrap-specific arguments (they're already processed)
-            if (arg == "--mpi-bootstrap" ||
-                arg.rfind("--mpi-procs=", 0) == 0 ||
-                arg == "--mpi-dry-run")
+            // An opaque diagnostic wrapper validates its complete original CLI
+            // again in the child. Preserve even flags after its -- separator;
+            // rank membership was already resolved in the MPI command prefix.
+            if (arguments == MPIBootstrapArgumentPolicy::PreserveOriginalArguments)
             {
+                cmd.push_back(argv[i]);
                 continue;
             }
 
-            // Handle arguments with separate values
-            if (arg == "--mpi-procs")
+            // Retain --mpi-procs: it is also original application configuration
+            // and must survive the child parser/runtime evidence boundary. An
+            // existing MPI environment prevents recursive self-launch.
+            // Consume only launcher actions already performed by this process.
+            if (arg == "--mpi-bootstrap" ||
+                arg == "--mpi-dry-run")
             {
-                ++i; // Skip the value too
                 continue;
             }
 
@@ -679,22 +788,50 @@ namespace llaminar2
 
     int MPIBootstrap::selfLaunchMPI(int argc, char *argv[],
                                     const MPILaunchConfig &config,
-                                    const CPUTopology &topology)
+                                    const CPUTopology &topology,
+                                    MPIBootstrapArgumentPolicy arguments)
     {
         // Configure OpenMP environment before exec (inherited by child processes)
         if (config.hostfile.empty())
             configureOpenMPEnvironment(topology, config);
+        else
+            configureOpenMPPlacement(config); // Never export the launcher's numeric geometry.
         configureLauncherEnvironment();
 
-        // Build command
-        auto cmd = buildMPIRunCommand(argc, argv, config, topology);
-
-        // Convert to C-style array for execvp
-        std::vector<char *> c_argv;
-        for (auto &s : cmd)
+        MPISessionOwner::requireProcessOwner();
+        std::optional<MPISessionOwner::SharedFile> numa_rankfile;
+        if (config.numa_mapping)
         {
-            c_argv.push_back(&s[0]);
+            const auto directory = MPISessionOwner::sharedDirectory();
+            if (!directory)
+                throw std::logic_error("Observed NUMA launch requires its original guardian-owned directory");
+            // Independent frontend children may share one process guardian.
+            // A successful exec retains its file until that ancestor retires;
+            // never collide with or replace a sibling launch's original file.
+            numa_rankfile.emplace(directory->createUnique("observed-numa.rankfile-"));
+            const auto &contents = config.numa_mapping->rankFileContents();
+            size_t written = 0;
+            while (written < contents.size())
+            {
+                const auto count = ::write(numa_rankfile->descriptor(), contents.data() + written,
+                    contents.size() - written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0)
+                    throw std::runtime_error("Cannot write original observed-NUMA rankfile");
+                written += static_cast<size_t>(count);
+            }
+            numa_rankfile->requireExtent(contents.size());
         }
+        // On exec failure SharedFile authenticates and removes its exact inode.
+        // Successful exec retains the name beneath the original ancestor until
+        // all native MPI descendants retire and that owner removes its roots.
+        auto cmd = buildMPIRunCommand(argc, argv, config, topology, arguments,
+            numa_rankfile ? numa_rankfile->path() : std::string{});
+
+        // The main-entry ancestor already owns this complete process subtree.
+        // Replacing this child with mpirun keeps one owner for all its ranks.
+        std::vector<char *> c_argv;
+        for (auto &s : cmd) c_argv.push_back(s.data());
         c_argv.push_back(nullptr);
 
         // Log what we're executing
@@ -715,11 +852,17 @@ namespace llaminar2
         }
         LOG_DEBUG("[MPIBootstrap] Launching: " << cmd_str.str());
 
-        // Replace current process with mpirun
+        // The helper stays alive until mpirun, local peers and daemon children
+        // have actually retired, then removes only its original private roots.
+        // A replacement process inherits this thread's native mask. Retain
+        // the current admitted OpenMP partition across exec, before retiring
+        // startup loans; on exec failure the caller's original place restores.
+        const ScopedOpenMPPartitionAffinity launcher_partition;
+        MPISessionOwner::retireStartupLoansForMPILaunch();
         execvp("mpirun", c_argv.data());
 
         // If we get here, exec failed
-        LOG_ERROR("[MPIBootstrap] Failed to exec mpirun: " << strerror(errno));
+        LOG_ERROR("[MPIBootstrap] Failed to exec owned mpirun: " << strerror(errno));
         return -1;
     }
 
@@ -743,7 +886,8 @@ namespace llaminar2
                   << " (" << topology.threads_per_core << " threads/core)" << std::endl;
 
         // MPI configuration
-        int num_procs = config.num_procs > 0 ? config.num_procs : topology.num_sockets;
+        int num_procs = config.numa_mapping ? static_cast<int>(config.numa_mapping->nodes().size()) :
+            (config.num_procs > 0 ? config.num_procs : topology.num_sockets);
         int omp_threads = config.omp_threads_per_rank > 0
                               ? config.omp_threads_per_rank
                               : topology.cores_per_socket;
@@ -770,6 +914,10 @@ namespace llaminar2
         {
             std::cout << "CPU Set: " << config.cpu_set << std::endl;
         }
+
+        if (config.numa_mapping)
+            std::cout << "Placement: native rankfile, one rank per observed NUMA partition, logical cores: "
+                      << config.numa_mapping->cpuSet() << std::endl;
 
         // MPI environment status
         if (env.is_mpi_process)

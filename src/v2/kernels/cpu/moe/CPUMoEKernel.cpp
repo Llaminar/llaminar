@@ -4,13 +4,18 @@
  *
  * Typed FP16 router gates round hidden operands to half in SIMD registers,
  * accumulate/output FP32, and leave the original hidden/Q8 expert publication
- * untouched. No second gate cache or activation mirror is introduced.
+ * untouched. Native BF16 gates widen their original words inside the existing
+ * fixed-tree SIMD matmul and consume unchanged FP32 activations. No second
+ * gate cache or activation mirror is introduced.
  * Owns CPU routing, placement-epoch operations and canonical Q8 input
  * publication. Ordinary and transported expert inputs share the same exact
  * block arithmetic; worksharing changes row ownership, never numerical order.
  * Publication provenance is revoked before mutation and becomes visible only
  * after the complete row workshare has joined. Optional worker diagnostics
- * observe completed work without controlling execution or allocating when off.
+ * observe completed quantization rows without controlling execution or allocating when off.
+ * Serial workspace publication borrows no competing cache: setup moves its
+ * declared physical backing into the kernel, which keeps that address across
+ * partial and repeated publication until the final owner retires.
  */
 
 #include "CPUMoEKernel.h"
@@ -20,7 +25,7 @@
 #include "../../cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
-#include "../gemm/CPUNativeVNNIGemv.h"
+#include "../gemm/CPUNativeQuantisedGemv.h"
 #include "../gemm/FloatingPointGemmKernel.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
@@ -39,6 +44,13 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return Whether the CPU router directly consumes this physical format. */
+        constexpr bool isCPURouterFormat(TensorType type) noexcept
+        {
+            return type == TensorType::FP32 || type == TensorType::FP16 ||
+                   type == TensorType::BF16;
+        }
+
         /** @brief Publish one complete CPU epoch-operation diagnostic. */
         void writeOverlayEpochStatus(
             DeviceMoEOverlayEpochStatus *status,
@@ -100,7 +112,8 @@ namespace llaminar2
         bool resolveSynchronizedAdmission(
             const std::uint64_t *external_admission_epoch,
             DeviceMoEOverlayEpochAdmissionBarrierBinding barrier,
-            std::uint64_t *required_epoch) noexcept
+            std::uint64_t *required_epoch,
+            std::uint64_t finite_epoch = 0u) noexcept
         {
             if (!external_admission_epoch || !barrier.record ||
                 !required_epoch)
@@ -170,7 +183,7 @@ namespace llaminar2
                     }
                     return false;
                 }
-                const std::uint64_t frozen =
+                const std::uint64_t frozen = finite_epoch ? finite_epoch :
                     std::atomic_ref<std::uint64_t>(
                         *const_cast<std::uint64_t *>(
                             external_admission_epoch))
@@ -198,6 +211,23 @@ namespace llaminar2
         }
     } // namespace
 
+    bool CPUMoEKernel::runMoEOverlayEpochParentAction(
+        const MoEKernelLaunchContext &launch,DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochStatus *status,DeviceMoEOverlayEpochParentAction action)
+    {
+        (void)launch;
+        if(!control || !status || !control->finite_parent)return false;
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const bool success=action==DeviceMoEOverlayEpochParentAction::Arm
+            ?protocol.armFiniteParent(*control->finite_parent)
+            :action==DeviceMoEOverlayEpochParentAction::Close && protocol.closeFiniteParent(*control->finite_parent);
+        writeOverlayEpochStatus(status,
+            action==DeviceMoEOverlayEpochParentAction::Arm?DeviceMoEOverlayEpochOperation::ArmFiniteParent:
+                DeviceMoEOverlayEpochOperation::CloseFiniteParent,
+            success?DeviceMoEOverlayEpochStatusCode::Success:DeviceMoEOverlayEpochStatusCode::InvalidControl);
+        return success;
+    }
+
     bool CPUMoEKernel::acquireMoEOverlayEpoch(
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,
@@ -207,92 +237,46 @@ namespace llaminar2
         DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
         MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
     {
+
         (void)launch;
-        if (!status)
-            return false;
-        if (peer_placement_epoch.valid())
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+        if(!status)return false;
+        if(!control || peer_placement_epoch.valid()) {
+            writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidControl);
             return true;
         }
-        if (!control)
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+        if(!ticket || ticket->epoch || ticket->selector || ticket->parent_generation) {
+            writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidTicket);
             return true;
         }
-        if (!ticket || ticket->epoch != 0u || ticket->selector != 0u)
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidTicket);
-            return true;
-        }
-
         MoEOverlayDeviceEpochProtocol protocol(*control);
-        std::uint64_t admitted_epoch = 0u;
-        bool admission_valid = true;
-        const bool synchronized = admission_barrier.record != nullptr;
-        if (synchronized)
-        {
-            /* Protect this participant's old bank before advertising arrival.
-             * tryAcquireAdmitted owns its usual narrower guard as well; the
-             * outer guard is dropped only after that reader is installed. */
-            std::atomic_ref<std::uint64_t>(
-                control->acquisitions_in_flight)
-                .fetch_add(1u, std::memory_order_seq_cst);
-            admission_valid = resolveSynchronizedAdmission(
-                external_admission_epoch,
-                admission_barrier,
-                &admitted_epoch);
-        }
-        else if (admission_barrier.participant_id != 0xffffffffu)
-        {
-            admission_valid = false;
-        }
-        else if (external_admission_epoch)
-        {
-            admitted_epoch = std::atomic_ref<std::uint64_t>(
-                                 *const_cast<std::uint64_t *>(
-                                     external_admission_epoch))
-                                 .load(std::memory_order_acquire);
-        }
-
-        const auto acquired = admission_valid
-                                  ? protocol.tryAcquireAdmitted(admitted_epoch)
-                                  : std::nullopt;
-        if (synchronized)
-        {
-            std::atomic_ref<std::uint64_t>(
-                control->acquisitions_in_flight)
-                .fetch_sub(1u, std::memory_order_seq_cst);
-        }
-        if (!acquired.has_value())
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidControl,
-                0u,
-                currentOverlaySelector(protocol));
+        auto *const parent=control->finite_parent;
+        const bool synchronized=admission_barrier.record!=nullptr;
+        const bool guarded=synchronized || parent!=nullptr;
+        auto guard=std::atomic_ref<std::uint64_t>(control->acquisitions_in_flight);
+        if(guarded)guard.fetch_add(1u);
+        using ParentState=DeviceMoEOverlayEpochParentState;
+        const auto parent_state=parent?std::atomic_ref<std::uint32_t>(parent->state).load():static_cast<std::uint32_t>(ParentState::Idle);
+        const bool finite=parent_state!=static_cast<std::uint32_t>(ParentState::Idle);
+        bool valid=!parent || (parent->control==control && parent->version==kDeviceMoEOverlayEpochParentVersion &&
+            (!finite || parent_state==static_cast<std::uint32_t>(ParentState::Armed) || parent_state==static_cast<std::uint32_t>(ParentState::Active)));
+        const auto finite_epoch=parent_state==static_cast<std::uint32_t>(ParentState::Active)?parent->ticket.epoch:0u;
+        if(parent_state==static_cast<std::uint32_t>(ParentState::Active) &&
+            (!parent->ticket.valid() || parent->ticket.parent_generation))valid=false;
+        std::uint64_t admitted_epoch=finite_epoch;
+        if(synchronized)valid=valid && resolveSynchronizedAdmission(external_admission_epoch,admission_barrier,&admitted_epoch,finite_epoch);
+        else if(admission_barrier.participant_id!=0xffffffffu)valid=false;
+        else if(!finite_epoch && external_admission_epoch)
+            admitted_epoch=std::atomic_ref<std::uint64_t>(*const_cast<std::uint64_t*>(external_admission_epoch)).load(std::memory_order_acquire);
+        const auto acquired=valid ? (finite?protocol.tryAcquireFiniteChild(*parent,admitted_epoch):protocol.tryAcquireAdmitted(admitted_epoch)):std::nullopt;
+        if(guarded)guard.fetch_sub(1u);
+        if(!acquired) {
+            writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                admitted_epoch,0u,kDeviceMoEOverlayInvalidBank,DeviceMoEOverlayEpochBankState::Empty);
             return true;
         }
-
-        *ticket = *acquired;
-        writeOverlayEpochStatus(
-            status,
-            DeviceMoEOverlayEpochOperation::Acquire,
-            DeviceMoEOverlayEpochStatusCode::Success,
-            ticket->epoch,
-            ticket->selector,
-            ticket->bank(),
-            protocol.bankState(ticket->bank()));
+        *ticket=*acquired;
+        writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::Success,
+            ticket->epoch,ticket->selector,ticket->bank(),protocol.bankState(ticket->bank()));
         return true;
     }
 
@@ -324,7 +308,9 @@ namespace llaminar2
 
         MoEOverlayDeviceEpochProtocol protocol(*control);
         const DeviceMoEOverlayEpochTicket released = *ticket;
-        const bool released_reader = protocol.release(released);
+        const bool released_reader = released.parent_generation
+            ? control->finite_parent && protocol.releaseFiniteChild(*control->finite_parent,*ticket)
+            : protocol.release(released);
         if (released_reader)
             *ticket = {};
         writeOverlayEpochStatus(
@@ -629,8 +615,9 @@ namespace llaminar2
 
         const int blocks_per_row = (d_model + Q8_1Block::BLOCK_SIZE - 1) /
                                    Q8_1Block::BLOCK_SIZE;
-        router_q8_hidden_.resize(
-            static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
+        const size_t required_blocks = static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row);
+        if (!router_q8_hidden_ || required_blocks > router_q8_hidden_->size())
+            throw std::logic_error("CPU router publication requires a sufficient declared physical root");
 
         if (!quantizeRouterQ8Rows(
                 source,
@@ -638,8 +625,8 @@ namespace llaminar2
                 d_model,
                 /*source_row_indices=*/nullptr,
                 rows,
-                router_q8_hidden_.data(),
-                router_q8_hidden_.size()))
+                router_q8_hidden_->data(),
+                router_q8_hidden_->size()))
         {
             return false;
         }
@@ -803,11 +790,11 @@ namespace llaminar2
             router_q8_hidden_rows_ < rows ||
             d_model <= 0 ||
             router_q8_hidden_d_model_ != d_model ||
-            router_q8_hidden_.empty())
+            (!router_q8_hidden_ || router_q8_hidden_->empty()))
         {
             return nullptr;
         }
-        return router_q8_hidden_.data();
+        return router_q8_hidden_->data();
     }
 
     bool CPUMoEKernel::publishTransportedRouterQ8Hidden(
@@ -818,40 +805,224 @@ namespace llaminar2
         return publishRouterQ8Hidden(source, rows, d_model);
     }
 
+    std::optional<CPUMoEKernel::RouterQ8ExpertMajorSchedule>
+    CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
+        std::span<const int> source_rows,
+        std::span<int> retired_expert_to_local,
+        std::span<const int> original_to_local,
+        std::span<const int> local_to_expert,
+        int top_k,
+        std::optional<std::span<const int>> compact_source_rows,
+        int source_capacity)
+    {
+        const size_t rows = source_rows.size();
+        if (top_k <= 0 || source_capacity < 0 ||
+            rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            rows != retired_expert_to_local.size() || rows != local_to_expert.size() ||
+            original_to_local.size() % static_cast<size_t>(top_k) != 0u)
+            return std::nullopt;
+        // Scratch is retired in-place. Reject every read/scratch overlap before
+        // even the first marker write; comparing integer address intervals also
+        // handles partial aliases between unrelated span views without C++
+        // relational comparisons between distinct allocations.
+        const auto scratch_overlaps = [&](std::span<const int> input)
+        {
+            if (retired_expert_to_local.empty() || input.empty())
+                return false;
+            constexpr auto limit = std::numeric_limits<std::uintptr_t>::max();
+            if (input.size() > limit / sizeof(int))
+                return true;
+            const auto scratch_begin = reinterpret_cast<std::uintptr_t>(retired_expert_to_local.data());
+            const auto input_begin = reinterpret_cast<std::uintptr_t>(input.data());
+            const auto scratch_bytes = retired_expert_to_local.size() * sizeof(int);
+            const auto input_bytes = input.size() * sizeof(int);
+            if (scratch_begin > limit - scratch_bytes || input_begin > limit - input_bytes)
+                return true;
+            return scratch_begin <= input_begin
+                ? input_begin - scratch_begin < scratch_bytes
+                : scratch_begin - input_begin < input_bytes;
+        };
+        if (scratch_overlaps(source_rows) || scratch_overlaps(original_to_local) ||
+            scratch_overlaps(local_to_expert) ||
+            (compact_source_rows && scratch_overlaps(*compact_source_rows)))
+            return std::nullopt;
+        const size_t compact_rows = original_to_local.size() / static_cast<size_t>(top_k);
+        if (compact_source_rows && compact_source_rows->size() != compact_rows)
+            return std::nullopt;
+        if (!compact_source_rows && compact_rows > static_cast<size_t>(source_capacity))
+            return std::nullopt;
+        const auto source_for_compact = [&](size_t row)
+        {
+            return compact_source_rows ? (*compact_source_rows)[row] : static_cast<int>(row);
+        };
+        for (size_t row = 0; row < compact_rows; ++row)
+        {
+            const int source = source_for_compact(row);
+            if (source < 0 || source >= source_capacity ||
+                (row > 0u && source_for_compact(row - 1u) >= source))
+                return std::nullopt;
+        }
+        // This inverse check proves the original scratch is a permutation,
+        // before it is retired. No new ownership/index buffer is introduced.
+        for (size_t destination = 0; destination < rows; ++destination)
+        {
+            const int local = retired_expert_to_local[destination];
+            if (local < 0 || static_cast<size_t>(local) >= rows ||
+                local_to_expert[static_cast<size_t>(local)] != static_cast<int>(destination))
+                return std::nullopt;
+        }
+        std::fill(retired_expert_to_local.begin(), retired_expert_to_local.end(), -1);
+        size_t assigned = 0u;
+        for (size_t row = 0; row < compact_rows; ++row)
+        {
+            const size_t begin = row * static_cast<size_t>(top_k);
+            int representative = -1;
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int local = original_to_local[begin + static_cast<size_t>(route)];
+                if (local == -1)
+                    continue;
+                if (local < 0 || static_cast<size_t>(local) >= rows)
+                    return std::nullopt;
+                const int destination = local_to_expert[static_cast<size_t>(local)];
+                if (destination < 0 || static_cast<size_t>(destination) >= rows ||
+                    retired_expert_to_local[static_cast<size_t>(destination)] != -1 ||
+                    source_rows[static_cast<size_t>(destination)] != source_for_compact(row))
+                    return std::nullopt;
+                if (representative < 0)
+                    representative = destination;
+                retired_expert_to_local[static_cast<size_t>(destination)] = representative;
+                ++assigned;
+            }
+        }
+        if (assigned != rows)
+            return std::nullopt;
+        return RouterQ8ExpertMajorSchedule(source_rows, retired_expert_to_local);
+    }
+
     bool CPUMoEKernel::publishTransportedRouterQ8HiddenExpertMajor(
         const float *source,
         int source_rows,
         int d_model,
-        std::span<const int> expert_major_source_rows,
+        RouterQ8ExpertMajorSchedule schedule,
         std::span<Q8_1Block> destination)
     {
-        invalidateRouterQ8HiddenPublication();
-        if (expert_major_source_rows.empty() ||
-            expert_major_source_rows.size() >
-                static_cast<size_t>(std::numeric_limits<int>::max()))
+        const auto revoke_publication = [&]() { invalidateRouterQ8HiddenPublication(); };
+        OMP_SINGLE(revoke_publication);
+        const size_t rows = schedule.source_rows_.size();
+        if (d_model <= 0 || source_rows < 0 ||
+            rows != schedule.representatives_.size() ||
+            rows > static_cast<size_t>(std::numeric_limits<int>::max()))
             return false;
-        const bool published = quantizeRouterQ8Rows(
-            source,
-            source_rows,
-            d_model,
-            expert_major_source_rows.data(),
-            static_cast<int>(expert_major_source_rows.size()),
-            destination.data(),
-            destination.size());
-        if (published && PerfStatsCollector::isDomainEnabled("kernel"))
+        if (rows == 0u)
+            return true;
+        const size_t blocks = (static_cast<size_t>(d_model) + 31u) / 32u;
+        if (!source || source_rows == 0 || !destination.data() ||
+            rows > destination.size() / blocks)
+            return false;
+
+        size_t unique_rows = 0u;
+        for (size_t row = 0; row < rows; ++row)
         {
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cpu_moe_transport_router_q8_expert_major_publication_calls",
-                1.0,
-                "moe",
-                "cpu",
-                {{"source_rows", std::to_string(source_rows)},
-                 {"route_rows",
-                  std::to_string(expert_major_source_rows.size())},
-                 {"d_model", std::to_string(d_model)}});
+            const int source_row = schedule.source_rows_[row];
+            const int representative = schedule.representatives_[row];
+            if (source_row < 0 || source_row >= source_rows ||
+                representative < 0 || static_cast<size_t>(representative) >= rows ||
+                schedule.representatives_[static_cast<size_t>(representative)] != representative ||
+                schedule.source_rows_[static_cast<size_t>(representative)] != source_row)
+                return false;
+            if (static_cast<size_t>(representative) == row)
+                ++unique_rows;
         }
-        return published;
+
+        const size_t copy_rows = rows - unique_rows;
+        // Quantization and copying have distinct live work. Repeated expert
+        // indices must not make a four-source verifier open a large team merely
+        // because it has many destinations. Copy threshold is active Q8 bytes.
+        constexpr size_t kMinimumQuantizedValuesForTeam = 16384u;
+        constexpr size_t kMinimumCopiedBytesForTeam = 256u * 1024u;
+        // A collective caller already inside a team must retain worksharing
+        // even for tiny unique work. This opens no nested team and prevents
+        // every existing worker from repeating the serial stores.
+        const bool use_parallel = omp_in_parallel() || (omp_get_max_threads() > 1 &&
+            (unique_rows * static_cast<size_t>(d_model) >= kMinimumQuantizedValuesForTeam ||
+             copy_rows * blocks * sizeof(Q8_1Block) >= kMinimumCopiedBytesForTeam));
+        const bool observe_workers = PerfStatsCollector::isDomainEnabled("kernel");
+        const auto publish_worker_rows = [&](int completed_rows)
+        {
+            if (observe_workers && completed_rows > 0)
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_moe_router_q8_worker_rows", completed_rows,
+                    "moe", "cpu", {{"rows", std::to_string(rows)},
+                    {"d_model", std::to_string(d_model)},
+                    {"worker", std::to_string(omp_get_thread_num())},
+                    {"workers", std::to_string(omp_get_num_threads())},
+                    {"layout", "indexed"}});
+        };
+        const auto quantize_row = [&](size_t row)
+        {
+            const float *input = source + static_cast<size_t>(schedule.source_rows_[row]) *
+                static_cast<size_t>(d_model);
+            Q8_1Block *output = destination.data() + row * blocks;
+            size_t block = 0;
+#if defined(__AVX512F__)
+            if (d_model % Q8_1Block::BLOCK_SIZE == 0)
+                for (; block + 1u < blocks; block += 2u)
+                    cpu::gpu_aligned_expert_q8::quantizeTwoBlocks(
+                        input + block * 32u, output[block], output[block + 1u]);
+#endif
+            for (; block < blocks; ++block)
+                cpu::gpu_aligned_expert_q8::quantizeBlock(
+                    input + block * 32u, output[block],
+                    std::min(32, d_model - static_cast<int>(block * 32u)));
+        };
+        const auto copy_row = [&](size_t row)
+        {
+            const size_t owner = static_cast<size_t>(schedule.representatives_[row]);
+            if (owner != row)
+                std::copy_n(destination.data() + owner * blocks, blocks,
+                            destination.data() + row * blocks);
+        };
+        if (use_parallel)
+        {
+            const auto work = [&]()
+            {
+                int completed_rows = 0;
+#pragma omp for schedule(static)
+                for (size_t row = 0; row < rows; ++row)
+                    if (schedule.representatives_[row] == static_cast<int>(row))
+                    {
+                        quantize_row(row);
+                        ++completed_rows;
+                    }
+                // The first workshare's implicit barrier publishes every root
+                // before any worker consumes one. Destinations remain disjoint.
+#pragma omp for schedule(static)
+                for (size_t row = 0; row < rows; ++row)
+                    copy_row(row);
+                publish_worker_rows(completed_rows);
+            };
+            OMP_WORKSHARE_REGION(work);
+        }
+        else
+        {
+            for (size_t row = 0; row < rows; ++row)
+                if (schedule.representatives_[row] == static_cast<int>(row))
+                    quantize_row(row);
+            for (size_t row = 0; row < rows; ++row)
+                copy_row(row);
+            publish_worker_rows(static_cast<int>(unique_rows));
+        }
+        const auto publish_call = [&]()
+        {
+            if (observe_workers)
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_moe_transport_router_q8_expert_major_publication_calls",
+                    1.0, "moe", "cpu", {{"source_rows", std::to_string(source_rows)},
+                    {"route_rows", std::to_string(rows)}, {"d_model", std::to_string(d_model)}});
+        };
+        OMP_SINGLE(publish_call);
+        return true;
     }
 
     bool CPUMoEKernel::reserveRouterQ8HiddenCapacity(
@@ -869,9 +1040,21 @@ namespace llaminar2
         {
             return false;
         }
-        router_q8_hidden_.resize(
-            static_cast<size_t>(rows) * blocks_per_row);
-        return true;
+        const size_t required_blocks = static_cast<size_t>(rows) * blocks_per_row;
+        return router_q8_hidden_ && required_blocks <= router_q8_hidden_->size();
+    }
+
+    void CPUMoEKernel::bindRouterQ8HiddenStorage(
+        std::shared_ptr<AlignedVector<Q8_1Block>> storage)
+    {
+        if (!storage || storage->empty())
+            throw std::invalid_argument("CPU router publication requires positive declared capacity");
+        // Rebinding the same graph-local producer/consumer pair preserves the
+        // publication; a different physical domain starts with no valid rows.
+        if (router_q8_hidden_ == storage)
+            return;
+        invalidateRouterQ8HiddenPublication();
+        router_q8_hidden_ = std::move(storage);
     }
 
     bool CPUMoEKernel::route(
@@ -894,7 +1077,7 @@ namespace llaminar2
         invalidateRouterQ8HiddenPublication();
         if (!hidden || !gate_weights || seq_len <= 0 || d_model <= 0 ||
             num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
-            (gate_type != TensorType::FP32 && gate_type != TensorType::FP16))
+            !isCPURouterFormat(gate_type))
         {
             LOG_ERROR("[CPUMoEKernel::route] invalid routing pointer or dimensions");
             return false;
@@ -950,6 +1133,22 @@ namespace llaminar2
                     {"hidden_operand","half_rne"},{"gate_weights","fp16"},{"accumulation","fp32"},
                     {"expert_q8_source","original_fp32_hidden"},{"reduction","fixed_256_lane_tree"}});
             }
+        }
+        else if (gate_type == TensorType::BF16)
+        {
+            // Native BF16 is a source representation, not the FP16 operand
+            // policy. Widen weights in registers and keep original FP32 A.
+            // The existing fixed tree is identical for serial and grouped M.
+            if (!gemm::run_gpu_aligned_expert_fp32_matmul<TensorType::BF16>(
+                    hidden, gate_weights, result.router_logits.data(),
+                    seq_len, num_experts, d_model))
+                return false;
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+                PerfStatsCollector::addCounter("kernel", "cpu_moe_bf16_router_calls", 1.0,
+                    "router", "cpu", {{"rows", std::to_string(seq_len)},
+                    {"num_experts", std::to_string(num_experts)},
+                    {"hidden_operand", "fp32"}, {"gate_weights", "bf16"},
+                    {"accumulation", "fp32"}, {"reduction", "fixed_256_lane_tree"}});
         }
         const int row_tiles = seq_len / 4 + (seq_len % 4 != 0);
         auto route_rows = [&]()
@@ -1067,18 +1266,31 @@ namespace llaminar2
 
         if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
             hidden->native_type() != TensorType::FP32 ||
-            (gate_weights->native_type() != TensorType::FP32 && gate_weights->native_type() != TensorType::FP16) ||
+            !isCPURouterFormat(gate_weights->native_type()) ||
             output_indices->native_type() != TensorType::FP32 || output_weights->native_type() != TensorType::FP32 ||
             hidden->numel() / static_cast<size_t>(d_model) < static_cast<size_t>(seq_len) ||
             gate_weights->numel() / static_cast<size_t>(d_model) < static_cast<size_t>(num_experts) ||
             output_indices->numel() / static_cast<size_t>(top_k) < static_cast<size_t>(seq_len) ||
             output_weights->numel() / static_cast<size_t>(top_k) < static_cast<size_t>(seq_len))
+        {
+            LOG_ERROR("[CPUMoEKernel::routeWithTensors] invalid router format or live geometry: "
+                      << "hidden=" << hidden->dtype_name() << ", gate=" << gate_weights->dtype_name()
+                      << ", indices=" << output_indices->dtype_name() << ", weights=" << output_weights->dtype_name()
+                      << ", rows=" << seq_len << ", width=" << d_model
+                      << ", experts=" << num_experts << ", top_k=" << top_k);
             return false;
+        }
         const auto *half_gate = dynamic_cast<const FP16Tensor *>(gate_weights);
-        if (gate_weights->native_type() == TensorType::FP16 &&
-            (!half_gate || hidden->cols() != static_cast<size_t>(d_model) ||
-             half_gate->cols() != static_cast<size_t>(d_model))) return false;
+        const auto *bfloat_gate = dynamic_cast<const BF16Tensor *>(gate_weights);
+        if (gate_weights->native_type() != TensorType::FP32 &&
+            ((!half_gate && !bfloat_gate) || hidden->cols() != static_cast<size_t>(d_model) ||
+             gate_weights->cols() != static_cast<size_t>(d_model)))
+        {
+            LOG_ERROR("[CPUMoEKernel::routeWithTensors] native 16-bit router requires typed contiguous matrix rows");
+            return false;
+        }
         const void *gate_data = half_gate ? static_cast<const void *>(half_gate->typed_data())
+                              : bfloat_gate ? static_cast<const void *>(bfloat_gate->typed_data())
                                          : static_cast<const void *>(gate_weights->data());
         if (!routePrepared(hidden->data(),
                    gate_data, gate_weights->native_type(),

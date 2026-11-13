@@ -7,6 +7,9 @@ serving core. Local Release qualification can select a binary explicitly. Each
 model runs on one CUDA and one ROCm device, with native router/wide arithmetic,
 model-scoped alpha/beta defaults, full captured graphs and no MTP or prefix reuse. Raw candidate
 logits are removed after scoring unless a local diagnostic explicitly retains them.
+An explicit schema2 catalog opts local Integration/Release diagnostics into the
+shared fixed-history companion. It reuses this process/driver lifecycle and
+never promotes missing baseline/calibration or prerequisites into qualification.
 """
 from pathlib import Path
 import argparse
@@ -26,13 +29,27 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/v2/e2e/server'))
 import gpu_driver_diagnostics as driver
 import resource_usage_observer as resources
+from resource_owned_process_tree import OwnedProcessTree
 import docker_paths
 from model_kld_canary import DEFAULT_GDN_POLICY, definition
 from model_kld_corpus import (CATALOG,identity,load_corpus,physical_workers,require,
                                score_observation,unchanged)
 from production_artifacts import image_identity,image_cpu_isa,write_json
 
-FILTER='kernel,forward_graph,gpu_graph_inventory,weight_loading,gemm,cuda_moe,rocm_moe,moe'
+FILTER='kernel,forward_graph,gpu_graph_inventory,weight_loading,gemm,cuda_moe,rocm_moe,moe,ngram_lookup,immutable_lookup'
+
+
+def observe_native_resources(manifest,local_owner):
+    """Include actual local descendants, keeping each process's memory separate.
+
+    Image runs retain exact cgroup ownership. A local launch uses its original
+    PID/start-time tree instead of mistaking the MPI wrapper's RSS for the
+    engine. The journal deliberately makes no sum of shared process mappings.
+    """
+    sample=resources.collect(manifest)
+    if local_owner is not None:
+        sample['local_process_tree']=local_owner.snapshot()
+    return sample
 
 
 def engine_arguments(model,backend,threads):
@@ -99,17 +116,111 @@ def retire(process,container):
     if container:subprocess.run(['docker','rm',container],check=True,stdout=subprocess.DEVNULL,timeout=30)
 
 
-def execute_cell(args,corpus,model,backend,model_path,output,image):
+def original_local_launch(args, adapter, image, output, native_command, environment, *, prepare_session=True):
+    """Select the existing direct launch or an explicitly authored MPI rankfile launch.
+
+    The typed corpus config owns MPI population. MPI and production inventory
+    own rankfile/NUMA meaning; this function never parses or replans affinity.
+    An authored one-rank mapping uses the same MPI guardian as larger worlds;
+    only an implicit one-rank launch may bypass that mapping.
+    Every launch input remains pinned through original process retirement.
+    A caller with the existing benchmark guardian leaves directory creation
+    to that guardian by passing prepare_session=False.
+    """
+    rankfile=getattr(args,'mpi_rankfile',None)
+    world=1;configured_world=0
+    if adapter is not None:
+        configuration=adapter.topology['expected_config']['configuration']
+        world=configuration.get('mpi_procs',0)
+        require(type(world) is int and world>=0,'Invalid original configured MPI population')
+        configured_world=world
+        world=max(1,world)
+    if rankfile is None:
+        require(world==1,'Distributed observer requires an explicit --mpi-rankfile')
+        return native_command,{},None
+    require(image is None and args.binary is not None and adapter is not None and configured_world>0,
+            'Explicit MPI rankfile requires a local declared positive-world corpus observer')
+    rankfile=Path(rankfile).resolve(strict=True)
+    require(rankfile.is_file(),'MPI rankfile is not a regular file')
+    launcher=(args.binary.parent/'llaminar_mpi_session').resolve(strict=True)
+    require(launcher.is_file() and os.access(launcher,os.X_OK),'Missing original executable MPI session launcher')
+    selected=shutil.which('mpirun',path=environment['PATH'])
+    require(selected is not None,'Missing original mpirun; no alternate launcher is permitted')
+    mpi=Path(selected).resolve(strict=True)
+    pins={str(path):identity(path) for path in (rankfile,launcher,mpi)}
+    binding='core'
+    session_base=output/'mpi-session'
+    require(not session_base.exists() and not session_base.is_symlink(),
+            'Original MPI session base must be fresh and non-symlink')
+    unchanged(pins)
+    if prepare_session:
+        session_base.mkdir()
+    command=[str(launcher),'--session-base',str(session_base),'--',str(mpi),'-np',str(world),
+             '--rankfile',str(rankfile),'--bind-to',binding,'--report-bindings']
+    command+=['--mca','mpi_leave_pinned','1',
+              '--mca','orte_allowed_exit_without_sync','1','--',*native_command]
+    proof=dict(schema='llaminar.original-mpi-rankfile-launch.v1',world_size=world,
+               rankfile=dict(path=str(rankfile),stat=pins[str(rankfile)]),
+               session_launcher=dict(path=str(launcher),stat=pins[str(launcher)]),
+               mpi_launcher=dict(path=str(mpi),stat=pins[str(mpi)]),
+               binding=binding,overlap_policy='strict',
+               performance_comparison_eligible=True)
+    unchanged(pins)
+    return command,pins,proof
+
+
+def preserve_original_rank_reports(adapter, payload, output):
+    """Retain only exact original rank metadata after native retirement, before raw-logit cleanup."""
+    if adapter is None:return
+    world=adapter.topology['expected_config']['configuration'].get('mpi_procs',0)
+    if type(world) is not int or world<=1:return
+    for rank in range(world):
+        path=payload/f'rank-{rank}.json'
+        if path.exists():
+            require(not path.is_symlink() and path.is_file() and path.resolve().parent==payload.resolve(),
+                    'Original rank metadata escapes native artifact owner')
+            shutil.copyfile(path,output/path.name)
+
+
+def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=None):
     """Bracket admission, inference, teardown and scoring with owned evidence."""
-    output.mkdir();payload=output/'logits';payload.mkdir()
-    entry=corpus['models'][model];model_pin=identity(model_path)
-    require(Path(model_path).name==entry['entry']['model_file'] and model_pin[3]==entry['entry']['model_bytes'],'GGUF differs from the frozen reference model')
+    output.mkdir();payload=output/'logits'
+    if adapter is None:
+        payload.mkdir()
+        entry=corpus['models'][model];model_pin=identity(model_path)
+        require(Path(model_path).name==entry['entry']['model_file'] and model_pin[3]==entry['entry']['model_bytes'],'GGUF differs from the frozen reference model')
+    else:
+        # The v2 native owner creates its original output root exactly once.
+        # Never precreate it or substitute a previously published result.
+        require(image is None,'Corpus-v2 currently requires an explicit local diagnostic binary')
     cell=dict(complete=False,passed=False,model=model,backend=backend,phase='admission',container_id=None,devices=[backend+':0'])
+    if adapter is not None:cell.update(topology_id=adapter.topology['id'],devices=adapter.devices)
     controller=output/'controller.json';write_json(controller,cell)
-    process=None;container=None;armed=False;retired=False;code=None
+    process=None;container=None;armed=False;retired=False;code=None;launch_pins={}
     try:
         env=dict(PATH=os.environ['PATH'],OMP_NUM_THREADS=str(physical_workers()),OMP_PLACES='cores',OMP_PROC_BIND='false',
                  OPENBLAS_NUM_THREADS='1',LLAMINAR_LOG_LEVEL='INFO',LLAMINAR_PERF_STATS_FILTER=FILTER)
+        if image is None:
+            # Local logical ordinals belong to the caller's explicit visibility
+            # selection. HOME also owns public runtime path defaults. Preserve
+            # empty selections too; never infer host devices
+            # or inherit loader/preload/ISA-spoofing settings from the parent.
+            for key in ('ROCR_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES','CUDA_VISIBLE_DEVICES',
+                        'GPU_DEVICE_ORDINAL','HWLOC_COMPONENTS','HOME'):
+                if key in os.environ:
+                    env[key]=os.environ[key]
+        if adapter is not None:
+            env.update(adapter.environment)
+            env['LD_LIBRARY_PATH']=str(args.binary.parent)
+            env['LLAMINAR_PERF_STATS_FILTER']=FILTER+',sampling.rank_resident_condition_host_logits_publications'
+            if adapter.topology['expected_config'].get('configuration', {}).get('mpi_procs', 1) > 1:
+                # Passive original fragment/transport evidence; no extra device clocks or probes.
+                env['LLAMINAR_PERF_STATS_FILTER'] += ',moe_overlay,moe_canonical_publication'
+            if adapter.paired is not None and 'observed_pipeline_binding' in adapter.paired.record:
+                env['LLAMINAR_PERF_STATS_FILTER'] += ',immutable_lookup'
+            workload_path,engine_argv=adapter.prepare(sys.modules[__name__],args,output,env)
+            cell.update(environment=env,workload=str(workload_path),engine_argv=engine_argv)
+        require(image is None or getattr(args,'mpi_rankfile',None) is None, 'MPI rankfiles are local diagnostics only')
         if image:
             candidate='llaminar-kld-'+uuid.uuid4().hex
             command=['docker','create','--name',candidate,'--init',*docker_paths.coding_owner_arguments(),
@@ -127,17 +238,21 @@ def execute_cell(args,corpus,model,backend,model_path,output,image):
         else:
             env['LD_LIBRARY_PATH']=str(args.binary.parent)
             env['LLAMINAR_PERF_STATS_JSON']=str(output/'perf-stats.json')
-            command=[str(args.binary),'--workload',str(entry['workload_path']),'--output',str(payload),'--',*engine_arguments(model_path,backend,physical_workers())]
+            command=[str(args.binary),'--workload',str(entry['workload_path']) if adapter is None else str(workload_path),
+                     '--output',str(payload),'--',*(engine_arguments(model_path,backend,physical_workers()) if adapter is None else engine_argv)]
+        if not image:
+            command,launch_pins,launch_proof=original_local_launch(args,adapter,image,output,command,env)
+            if launch_proof is not None:cell['native_launch']=launch_proof
         cell.update(phase='native',command=command);write_json(controller,cell)
         driver.begin(output/'driver-state.json');armed=True
-        manifest=dict(backends=[backend],cells={'canary':{'controller':str(controller)}},filesystems={'output':str(output)})
+        manifest=dict(backends=[backend] if adapter is None else adapter.backends,cells={'canary':{'controller':str(controller)}},filesystems={'output':str(output)})
         with (output/'native.log').open('x') as log,(output/'resources.jsonl').open('x') as observations:
+            unchanged(launch_pins)
             process=subprocess.Popen(command,env=env if not image else None,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+            local_owner=OwnedProcessTree(process.pid) if image is None else None
             started=time.monotonic()
             while True:
-                sample=resources.collect(manifest)
-                if not image and Path(f'/proc/{process.pid}/status').exists():
-                    sample['local_process']=resources.numeric_fields(Path(f'/proc/{process.pid}/status'),kilobytes=True)
+                sample=observe_native_resources(manifest,local_owner)
                 observations.write(json.dumps(sample)+'\n');observations.flush()
                 require(not sample['errors'] and not any(v['errors'] for v in sample['cells'].values()),'Resource observation failed')
                 require(sample['filesystems']['output']['available_bytes']>256*1024*1024,'Canary artifact filesystem exhausted')
@@ -148,14 +263,22 @@ def execute_cell(args,corpus,model,backend,model_path,output,image):
         driver_ok=driver.finish(output/'driver-state.json',output/'canary.driver-diagnostics.json');armed=False
         require(driver_ok,'GPU driver window failed')
         driver.validate_evidence(output)
+        unchanged(launch_pins)
         require(code==0,'Native canary observer failed')
-        unchanged(corpus['inputs']);require(identity(model_path)==model_pin,'GGUF changed during native run')
-        report=json.loads((payload/'logits.json').read_text())
-        proof=production_path(json.loads((output/'perf-stats.json').read_text()),report,backend,entry['entry'],model=model)
-        metrics=score_observation(corpus,payload/'logits.json',model=model,backend=backend)
-        write_json(output/'metrics.json',metrics)
-        cell.update(passed=metrics['passed'],verdict=metrics['verdict'],phases=metrics['phases'],mean_kl_nats=metrics['mean_kl_nats'],
-                    production_path=proof,reset_byte_equal=True,driver_window_clean=True,metrics=metrics)
+        unchanged(corpus['inputs'])
+        if adapter is None:
+            require(identity(model_path)==model_pin,'GGUF changed during native run')
+            report=json.loads((payload/'logits.json').read_text())
+            proof=production_path(json.loads((output/'perf-stats.json').read_text()),report,backend,entry['entry'],model=model)
+            metrics=score_observation(corpus,payload/'logits.json',model=model,backend=backend)
+            write_json(output/'metrics.json',metrics)
+            cell.update(passed=metrics['passed'],verdict=metrics['verdict'],phases=metrics['phases'],mean_kl_nats=metrics['mean_kl_nats'],
+                        production_path=proof,reset_byte_equal=True,driver_window_clean=True,metrics=metrics)
+        else:
+            # Retain the original native metadata even when local raw logits are
+            # removed after scoring. It remains distinct from numeric verdicts.
+            write_json(output/'native-observation.json',json.loads((payload/'logits.json').read_text()))
+            cell.update(adapter.score(sys.modules[__name__],payload,output))
     except BaseException as error:
         cell['error']=repr(error);raise
     finally:
@@ -165,10 +288,194 @@ def execute_cell(args,corpus,model,backend,model_path,output,image):
             if armed:
                 if not driver.finish(output/'driver-state.json',output/'canary.driver-diagnostics.json'):cell['passed']=False
             cell.update(complete=True,native_retired=retired,returncode=code,phase='retired' if retired else 'failed_retirement')
+            if adapter is not None and retired and (payload/'logits.json').is_file():
+                shutil.copyfile(payload/'logits.json',output/'native-observation.json')
+            if retired:preserve_original_rank_reports(adapter,payload,output)
             if not args.keep_logits and retired:
-                shutil.rmtree(payload);cell['raw_logits_removed']=True
+                if adapter is None:shutil.rmtree(payload)
+                elif payload.is_dir():shutil.rmtree(payload)
+                cell['raw_logits_removed']=True
             write_json(controller,cell)
     return cell
+
+
+
+
+def select_paired_corpus(args):
+    """Project one registered paired case into the existing local corpus adapter.
+
+    Discovery and original typed export own membership/argv. This route requires
+    genuine current prerequisites and complete document obligations; it never
+    attaches profiles, guesses a topology, or reclassifies short GTest failures.
+    """
+    from types import SimpleNamespace
+    import re
+    import model_parity_inventory as inventory
+    from model_kld_corpus_execution import PairedCorpusSelection,PairedMetadataPolicy
+    focused_report=getattr(args,'diagnostic_focused_prerequisites_report',None)
+    require(args.binary is not None and args.container_image is None and args.corpus_root is not None and
+            ((args.prerequisites_report is not None) != (focused_report is not None)),
+            'Paired canonical execution needs local source plus exactly one explicit complete or focused diagnostic prerequisite receipt')
+    require(not any((args.corpus_catalog,args.topology_id,args.baseline_report,args.baseline_approval,
+                     args.calibration,args.absolute_pilot)),
+            'Paired document policy cannot mix independent corpus/topology/numerical selectors')
+    require(type(args.paired_cell) is str and args.paired_cell and '\0' not in args.paired_cell,
+            'Paired acceptance requires a nonempty exact registered cell')
+    binary = args.binary.resolve(strict=True)
+    observed=getattr(args,'paired_observed_pipeline_artifacts',None)
+    if observed is not None:
+        require(focused_report is None and args.prerequisites_report is not None,
+            'Observed pipeline pairing requires complete current production prerequisites')
+    selected = inventory.discover(SimpleNamespace(build_dir=binary.parent,manifest=None,
+        source_revision=args.source_revision,backend='.*',campaign='.*',cell=re.escape(args.paired_cell)),
+        inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused_report is not None or observed is not None else inventory.InventoryScope.ALL)
+    require(len(selected)==1 and selected[0][1]==args.paired_cell,
+            'Paired acceptance requires exactly one original registered cell')
+    campaign, exact, record = selected[0]
+    if observed is not None:
+        record=inventory.bind_observed_pipeline_artifacts(exact,record,observed)
+    selection = PairedCorpusSelection.from_export(exact,record,args.corpus_root,ROOT,
+        metadata_policy=(PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused_report is not None else
+            PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE if observed is not None else
+            PairedMetadataPolicy.CANONICAL_ROOT))
+    matrix = inventory.matrix_binary(campaign).resolve(strict=True)
+    selection.pins[str(matrix)] = identity(matrix)
+    args._paired_selection = selection
+    args.corpus_catalog = selection.paths['catalog']
+    args.topology_id = [selection.topology['id']]
+    args.absolute_pilot = selection.paths.get('pilot')
+    args.baseline_report = selection.paths.get('baseline')
+    args.baseline_approval = selection.paths.get('approval')
+    args.calibration = selection.paths.get('calibration')
+
+
+def run_corpus_v2(args):
+    """Use the existing cell owner for selected local fixed-history observations.
+
+    Numerical GREEN is explicitly diagnostic-only, never image/backend/model
+    qualification. A missing optional prerequisite receipt remains unavailable;
+    an explicit stale/failed receipt rejects through the canonical validators.
+    An explicit pilot validates original selected row groups before native work;
+    its required-only result never qualifies the whole corpus or diagnostic groups.
+    """
+    from model_kld_corpus_execution import CorpusExecution,select_topologies,validate_absolute_pilot
+    import model_kld_corpus_v2 as v2
+    require(args.binary is not None and args.container_image is None,
+            'Corpus-v2 supports local diagnostic binaries only; v1 image CI is unchanged')
+    require(args.corpus_root is not None,'Corpus-v2 requires an explicit approved corpus root')
+    args.binary=args.binary.resolve(strict=True)
+    cache=(args.binary.parent/'CMakeCache.txt').read_text()
+    require(any('CMAKE_BUILD_TYPE:STRING='+kind in cache.splitlines() for kind in ('Integration','Release')),
+            'Local corpus diagnostic requires Integration or Release')
+    args.corpus_root=args.corpus_root.resolve(strict=True)
+    paired=getattr(args,'_paired_selection',None)
+    corpus=paired.corpus if paired is not None else v2.load_corpus(args.corpus_root,catalog=args.corpus_catalog,manifest_path=getattr(args,'corpus_manifest',None))
+    selected=select_topologies(corpus,args.topology_id)
+    pilot_path=getattr(args,'absolute_pilot',None)
+    pilot=None;pilot_scope=None;pilot_pin=None
+    if pilot_path is not None:
+        require(len(selected)==1 and not any((args.baseline_report,args.baseline_approval,args.calibration)),
+                'Absolute pilot needs exactly one topology and no baseline/approval/calibration')
+        pilot_path=pilot_path.resolve(strict=True);pilot_pin=identity(pilot_path)
+        pilot=json.loads(pilot_path.read_text())
+        pilot_scope=validate_absolute_pilot(pilot,corpus['manifest'],selected[0])
+        require(identity(pilot_path)==pilot_pin,'Absolute pilot changed during validation')
+    require(len(selected)==1 or not any((args.baseline_report,args.baseline_approval,args.calibration)),
+            'A selected-topology baseline/calibration requires exactly one topology')
+    args.report=args.report.resolve();require(not args.report.exists(),'Corpus report must be fresh')
+    args.report.parent.mkdir(parents=True,exist_ok=True)
+    # These are observed small source/build inputs, not a fabricated compiler or
+    # prerequisite receipt. Pin them across the run; raw metadata stays visible.
+    source_paths=[ROOT/name for name in ('scripts/ci/run_model_kld_canaries.py',
+        'scripts/ci/model_kld_corpus_execution.py','scripts/ci/model_kld_corpus_v2.py',
+        'scripts/ci/full_vocabulary_metrics.py','src/v2/tools/ModelKLDCanary.cpp',
+        'src/v2/tools/ModelKLDQFNContract.h')]
+    source_pins={str(p):identity(p) for p in source_paths}
+    source_pins[str(args.binary)]=identity(args.binary)
+    source_pins[str(args.binary.parent/'CMakeCache.txt')]=identity(args.binary.parent/'CMakeCache.txt')
+    from model_kld_corpus_execution import file_sha256
+    source_records={str(p):dict(stat=source_pins[str(p)],sha256=file_sha256(p)) for p in source_paths}
+    binary_record=dict(path=str(args.binary),stat=source_pins[str(args.binary)],sha256=file_sha256(args.binary))
+    if pilot_path is not None:source_pins[str(pilot_path)]=pilot_pin
+    if paired is not None:source_pins.update(paired.pins)
+    prerequisite_pins={}
+    focused_report=getattr(args,'diagnostic_focused_prerequisites_report',None)
+    focused_evidence=None
+    def check_prerequisites():
+        nonlocal focused_evidence
+        unchanged(source_pins)
+        if focused_report is not None:
+            from run_production_prerequisites import validate_focused_panel_prerequisites
+            focused_evidence=validate_focused_panel_prerequisites(args.binary.parent,focused_report)
+            unchanged(prerequisite_pins)
+            return
+        if args.prerequisites_report is None:return
+        from run_production_prerequisites import validate_source_freshness
+        from run_production_parity_campaigns import reuse_unchanged_production_test_preflight
+        validate_source_freshness(args.binary.parent,args.prerequisites_report)
+        reuse_unchanged_production_test_preflight(args.binary.parent,args.prerequisites_report)
+        unchanged(prerequisite_pins)
+    if args.prerequisites_report:
+        args.prerequisites_report=args.prerequisites_report.resolve(strict=True)
+        prerequisite_pins[str(args.prerequisites_report)]=identity(args.prerequisites_report)
+    if focused_report is not None:
+        require(paired is not None,'Focused prerequisite evidence requires an exact canonical paired cell')
+        focused_report=focused_report.resolve(strict=True)
+        prerequisite_pins[str(focused_report)]=identity(focused_report)
+    check_prerequisites()
+    state=dict(schema=2,mode='local_fixed_history_diagnostic',complete=False,passed=None,
+        source_revision=args.source_revision,diagnostic_only=True,certification_eligible=False,
+        corpus_manifest_digest=v2.metadata_digest(corpus['manifest']),
+        prerequisites=dict(available=bool(args.prerequisites_report),report=str(args.prerequisites_report) if args.prerequisites_report else None),
+        source_inputs=source_records,binary=binary_record,
+        qualification='local_diagnostic_only_prerequisites_unavailable' if not args.prerequisites_report else 'local_diagnostic_only_current_prerequisites_checked',
+        cells=[])
+    if pilot is not None:
+        state.update(scope='selected_topology_required_groups_only',acceptance_scope=pilot_scope,
+            absolute_pilot_digest=v2.metadata_digest(pilot),
+            absolute_pilot_input=dict(path=str(pilot_path),stat=pilot_pin),
+            calibrated=False,whole_corpus_accepted=False,
+            diagnostic_verdict='UNAVAILABLE')
+    if paired is not None:
+        state.update(mode='local_paired_canonical_accuracy',paired_workload=paired.observation(),
+            qualification='local_canonical_paired_numerical_scope_only_no_image_or_benchmark_qualification')
+    if focused_report is not None:
+        state.update(mode='local_paired_focused_diagnostic',full_preflight=False,
+            status='DIAGNOSTIC_PANEL_RUNNING',verdict='DIAGNOSTIC_RUNNING',
+            qualification='explicit_focused_diagnostic_only_no_complete_prerequisites_or_certification',
+            prerequisites=dict(available=True,mode='focused_DeviceFree_diagnostic',full_preflight=False,
+                report=str(focused_report),focused_tests=focused_evidence['focused_tests'],
+                original_completed_ns=focused_evidence['focused_completed_ns'],
+                native_backend_regressions='not_covered_by_DeviceFree_selection'))
+    write_json(args.report,state)
+    try:
+        for topology in selected:
+            check_prerequisites()
+            adapter=CorpusExecution(corpus,topology,baseline=args.baseline_report,
+                approval=args.baseline_approval,calibration=args.calibration,absolute_pilot=pilot_path,paired=paired)
+            result=execute_cell(args,corpus,'qwen4exp',topology['backend'],None,
+                args.report.parent/topology['id'],None,adapter=adapter)
+            state['cells'].append(result);write_json(args.report,state)
+            check_prerequisites()
+        state.update(complete=True,observations_complete=all(c.get('observations_complete') for c in state['cells']))
+        calibrated=all(c.get('passed') is not None for c in state['cells'])
+        state['passed']=all(c['passed'] for c in state['cells']) if calibrated else None
+        state['verdict']=('GREEN' if state['passed'] else 'RED') if calibrated else 'UNCALIBRATED'
+        if pilot is not None:
+            state['verdict']='REQUIRED_GROUPS_GREEN' if state['passed'] else 'REQUIRED_GROUPS_RED'
+        # Focused prerequisites never publish a legacy certifiable green/pass.
+        # Raw accuracy rows and required-group result stay intact for diagnosis.
+        if focused_report is not None:
+            state.update(diagnostic_passed=state['passed'],accuracy_verdict=state['verdict'],
+                verdict='DIAGNOSTIC_'+state['verdict'],status='DIAGNOSTIC_PANEL_COMPLETE',passed=None)
+        # Exit zero means complete collection; no absent calibration is promoted.
+        return 1 if any(c.get('passed') is False for c in state['cells']) else 0
+    except BaseException as error:
+        state['error']=repr(error)
+        if focused_report is not None:
+            state.update(status='DIAGNOSTIC_PANEL_FAILED',verdict='DIAGNOSTIC_ERROR',passed=None)
+        raise
+    finally:write_json(args.report,state)
 
 
 def main(argv=None):
@@ -179,8 +486,40 @@ def main(argv=None):
     parser.add_argument('--source-revision');parser.add_argument('--models',type=Path,default=Path('/opt/llaminar-models'))
     parser.add_argument('--corpus-root',type=Path);parser.add_argument('--report',type=Path,required=True)
     parser.add_argument('--keep-logits',action='store_true')
+    parser.add_argument('--paired-cell',help='One exact source-profiled canonical ProductionParity case; requires current prerequisites')
+    parser.add_argument('--paired-observed-pipeline-artifacts',type=Path,
+        help='Bind the exact paired cell to its completed original-rank numerical artifacts')
+    parser.add_argument('--corpus-catalog',type=Path,help='Explicit approved schema2 corpus; local diagnostics only')
+    parser.add_argument('--corpus-manifest',type=Path,help='Explicit catalog-bound v2 metadata; references remain inside --corpus-root')
+    parser.add_argument('--mpi-rankfile',type=Path,help='Authored MPI rankfile for a declared local observer, including one rank')
+    parser.add_argument('--topology-id',action='append',help='Repeat declared corpus topology IDs; omission selects its complete inventory')
+    parser.add_argument('--baseline-report',type=Path)
+    parser.add_argument('--baseline-approval',type=Path)
+    parser.add_argument('--calibration',type=Path)
+    parser.add_argument('--absolute-pilot',type=Path,help='Explicit selected-topology required-group pilot; no whole-corpus acceptance')
+    prerequisite=parser.add_mutually_exclusive_group()
+    prerequisite.add_argument('--prerequisites-report',type=Path,help='Genuine current complete canonical prerequisite receipt')
+    prerequisite.add_argument('--diagnostic-focused-prerequisites-report',type=Path,
+        help='Explicit paired-only DeviceFree diagnostic receipt; never full preflight/certification')
     args=parser.parse_args(argv)
     require(not args.container_image or not args.keep_logits,'CI always removes raw candidate logits')
+    require(args.diagnostic_focused_prerequisites_report is None or (args.paired_cell is not None and args.binary is not None and args.container_image is None),
+            'Focused prerequisites are an explicit local canonical paired diagnostic only')
+    require(args.corpus_manifest is None or (args.corpus_catalog is not None and args.paired_cell is None),
+            'Explicit corpus manifest requires v2 explicit catalog; paired document authority is unchanged')
+    require(args.paired_observed_pipeline_artifacts is None or args.paired_cell is not None,
+            'Observed pipeline artifacts require one exact local paired cell')
+    require(args.mpi_rankfile is None or (args.binary is not None and
+            (args.corpus_catalog is not None or args.paired_observed_pipeline_artifacts is not None)),
+            'MPI rankfile requires a local authored-rankfile corpus diagnostic')
+    require(args.paired_observed_pipeline_artifacts is None or args.mpi_rankfile is not None,
+            'Observed pipeline pairing requires the original discovery MPI rankfile')
+    if args.paired_cell is not None:
+        select_paired_corpus(args)
+    if args.corpus_catalog:
+        return run_corpus_v2(args)
+    require(not any((args.topology_id,args.baseline_report,args.baseline_approval,args.calibration,args.prerequisites_report,args.absolute_pilot)),
+            'Corpus-v2 options require --corpus-catalog')
     pin=json.loads(CATALOG.read_text());args.corpus_root=(args.corpus_root or ROOT/'corpora'/pin['path']).resolve(strict=True)
     corpus=load_corpus(args.corpus_root);args.models=args.models.resolve(strict=True)
     args.report=args.report.resolve();args.report.parent.mkdir(parents=True,exist_ok=True)

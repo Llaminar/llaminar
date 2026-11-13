@@ -10,6 +10,8 @@
  * protocol bound through the existing initialization-lifecycle preflight group.
  */
 #include "utils/MPIContext.h"
+#include "tools/ModelKLDQFNContract.h"
+#include <unistd.h>
 #include "planning/ExecutionRankMembership.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
@@ -174,4 +176,51 @@ TEST(ExecutionRankAdmissionMPI, ContextRetainsDiscoveryOwnerUntilItsDerivedTopol
     EXPECT_FALSE(weak.expired());
     active.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+/** @test Original artifact/terminal collectives survive inactive root and selected-root remapping. */
+TEST(ExecutionRankAdmissionMPI, QFNOriginalDiscoveryArtifactsAndFailureRetirement)
+{
+    auto discovery=MPIContextFactory::global();
+    ASSERT_EQ(discovery->world_size(),2);
+    const auto consensus=[&](auto identity,auto outcome){
+        return MPIRankInitializationConsensus::reach(discovery->communicator(),identity,outcome);
+    };
+    int owner_pid=discovery->is_root()?int(::getpid()):0;
+    ASSERT_EQ(MPI_Bcast(&owner_pid,1,MPI_INT,0,discovery->communicator()),MPI_SUCCESS);
+    for (const auto& selected : std::vector<std::vector<int>>{{1},{0},{1,0}})
+    {
+        const auto output=std::filesystem::path("/tmp")/("qfn-original-discovery-mpi-"+
+            std::to_string(owner_pid)+"-"+std::to_string(selected.size())+"-"+std::to_string(selected.front()));
+        const auto prepared=RankInitializationLifecycle::execute({0,"qfn_original_observer_artifacts"},[&]{
+            return accuracy::qfnCreateDiscoveryArtifactRoot(output,discovery->rank());
+        },consensus);
+        ASSERT_TRUE(prepared.succeeded());
+        EXPECT_TRUE(std::filesystem::is_directory(output));
+        auto admitted=MPIContextFactory::selectRanks(discovery,selected);
+        auto active=activeContext(admitted);
+        if(active)
+        {
+            EXPECT_EQ(selected.at(active->rank()),discovery->rank());
+            OrchestrationConfig config;
+            config.model_path="/__qfn_observer_contract_no_model_payload__/model.gguf";
+            config.device_for_this_rank=GlobalDeviceAddress::cpu(active->clusterInventory()->ranks.at(active->rank()).cpu.numa_node);
+            auto factory=createOrchestrationRunnerFactory(active);
+            auto runner=factory->createFromOrchestrationConfig(config);
+            ASSERT_TRUE(runner);
+            // No model is admitted by this model-free fixture. Retire the real
+            // selected runner before original discovery receives its outcome.
+            runner.reset();factory.reset();
+        }
+        else EXPECT_EQ(std::find(selected.begin(),selected.end(),discovery->rank()),selected.end());
+        const bool selected_root=active && active->rank()==0;
+        active.reset();admitted=InactiveMPIRank{discovery->rank()};
+        EXPECT_TRUE(accuracy::qfnCompleteDiscoveryObservation(true,consensus));
+        // A caught selected-root failure must reach every original participant,
+        // including discovery rank0 when it owns no selected model.
+        EXPECT_FALSE(accuracy::qfnCompleteDiscoveryObservation(!selected_root,consensus));
+        EXPECT_TRUE(accuracy::qfnCompleteDiscoveryObservation(true,consensus));
+        if(discovery->is_root())std::filesystem::remove_all(output);
+        discovery->barrier();
+    }
 }

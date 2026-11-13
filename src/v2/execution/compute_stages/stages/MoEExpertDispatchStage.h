@@ -18,6 +18,7 @@
 #include "../../moe/MoEOverlayResidencyAuthority.h"
 #include "../../moe/MoEOverlaySparseCollective.h"
 #include "../../moe/CPUCurrentBatchLLEP.h"
+#include "../../moe/ExpertHistogramSource.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -195,6 +196,9 @@ namespace llaminar2
         struct RoutingEvidencePublication
         {
             DecodeExpertHistogram *histogram = nullptr;
+            /** Original logical transaction owner; replicated peers still dispatch every expert row. */
+            MoERuntimeHistogramProducerRole producer_role =
+                MoERuntimeHistogramProducerRole::ProductionDecode;
             ExpertHistogramSource source =
                 ExpertHistogramSource::DecodeToken;
         };
@@ -307,6 +311,8 @@ namespace llaminar2
          */
         void updateMoEOverlayCollectiveRuntimeParams(
             const MoEOverlayCollectiveRuntimeParams &params) override;
+        /** @return Cold cache identity including original ticket and routing-history authority/phase. */
+        uint64_t graphCaptureVariantSignature() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

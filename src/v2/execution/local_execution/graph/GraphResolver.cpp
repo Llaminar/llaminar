@@ -1259,9 +1259,15 @@ namespace llaminar2
 
         for (const auto &buf : resolved)
         {
-            // Convert dtype string to BufferTensorType
-            BufferTensorType tensor_type = BufferTensorType::FP32;
-            if (buf.dtype == "bf16" || buf.dtype == "bfloat16")
+            // Preserve native integer state through descriptor construction.
+            // Unknown declarations cannot become floating-point allocations:
+            // equal byte widths do not make their ownership/type contracts equal.
+            BufferTensorType tensor_type;
+            if (buf.dtype == "fp32" || buf.dtype == "float32")
+                tensor_type = BufferTensorType::FP32;
+            else if (buf.dtype == "int32")
+                tensor_type = BufferTensorType::INT32;
+            else if (buf.dtype == "bf16" || buf.dtype == "bfloat16")
                 tensor_type = BufferTensorType::BF16;
             else if (buf.dtype == "fp16" || buf.dtype == "float16")
                 tensor_type = BufferTensorType::FP16;
@@ -1271,6 +1277,9 @@ namespace llaminar2
                 tensor_type = BufferTensorType::Q16_1;
             else if (buf.dtype == "q8_0")
                 tensor_type = BufferTensorType::Q8_0;
+            else
+                throw std::invalid_argument("Graph buffer '" + buf.name +
+                    "' has unsupported native dtype '" + buf.dtype + "'");
 
             // Convert semantic to role
             BufferRole role = BufferRole::SCRATCH;

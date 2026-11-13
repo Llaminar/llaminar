@@ -55,7 +55,7 @@ namespace llaminar2
         bool allow_single_scope = true;
         ///< Permit `scope=global` for the consuming configuration surface.
         bool allow_global_scope = true;
-        ///< Require a `routed_compute=` policy in this domain declaration.
+        ///< Require a `expert_compute=` policy in this domain declaration.
         bool require_routed_expert_compute = false;
         ///< Permit routed-expert policy fields on this configuration surface.
         bool allow_routed_expert_compute = true;
@@ -155,7 +155,7 @@ namespace llaminar2
         /** @brief Return true when LLEP may schedule among complete residents. */
         bool supportsLeastLoadedResidentAssignment() const;
 
-        /** @brief Return true when every expert may be tensor-sharded here. */
+        /** @brief Accept a real multi-participant tensor domain or exact full-matrix CPU TP1; no native readiness is implied. */
         bool supportsRoutedExpertTensorSharding() const;
 
         /**

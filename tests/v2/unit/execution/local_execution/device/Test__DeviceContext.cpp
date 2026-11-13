@@ -1,6 +1,10 @@
 /**
  * @file Test__DeviceContext.cpp
- * @brief Unit tests for DeviceContext
+ * @brief Device-free CPU context contracts and explicit native GPU creation checks.
+ *
+ * The Unit registration selects only CPU cases. Separate CUDA/ROCm preflight
+ * registrations create contexts for the real enumerated devices and fail on
+ * missing hardware or failed construction; native work never hides as a Unit skip.
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -19,9 +23,8 @@ using namespace llaminar2;
 // CPUDeviceContext Direct Construction Tests
 // =============================================================================
 
-// Note: We test CPUDeviceContext directly rather than through the factory,
-// because the factory requires DeviceManager to be initialized with devices,
-// which is not available in a simple unit test context.
+// Direct CPU context tests do not need native hardware discovery or a GPU
+// runtime. Native inventory is initialized only in the explicit integration cases.
 
 TEST(Test__DeviceContext, CreateCPUContextDirect)
 {
@@ -50,6 +53,7 @@ TEST(Test__DeviceContext, CreateWithThreadCount)
 class CPUDeviceContextTest : public ::testing::Test
 {
 protected:
+    /** @brief Create the CPU context owned by this isolated fixture. */
     void SetUp() override
     {
         ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
@@ -356,67 +360,49 @@ TEST(Test__DeviceContext, IWorkerGPUContextInterface)
     EXPECT_FALSE(cpu_ctx->isGPU());
 }
 
-#ifdef HAVE_CUDA
-TEST(Test__DeviceContext, CUDAContextRequiresGPU)
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+namespace
 {
-    // CUDADeviceContext requires actual CUDA GPU to construct
-    // This test documents the expected behavior
-    // In a proper GPU environment, this would succeed
-
-    // Get device manager
-    auto &dm = DeviceManager::instance();
-    const auto &devices = dm.devices();
-
-    // Look for CUDA device
-    bool found_cuda = false;
-    for (size_t i = 0; i < devices.size(); ++i)
+/**
+ * @brief Construct and retire the actual contexts advertised for one native backend.
+ * @param backend DeviceManager backend identity selected by the registration.
+ * @param type Typed allocator/device identity expected from the created context.
+ */
+void verifyNativeDeviceContexts(ComputeBackendType backend, DeviceType type)
+{
+    auto& manager = DeviceManager::instance();
+    manager.initialize(-1, false);
+    size_t checked = 0;
+    for (const auto& device : manager.devices())
     {
-        if (devices[i].type == ComputeBackendType::GPU_CUDA)
-        {
-            found_cuda = true;
-            auto ctx = IDeviceContext::create(DeviceId::cuda(devices[i].device_id));
-            if (ctx)
-            {
-                EXPECT_TRUE(ctx->isGPU());
-            }
-            break;
-        }
+        if (device.type != backend)
+            continue;
+        const DeviceId original(type, device.device_id);
+        auto context = IDeviceContext::create(original);
+        ASSERT_NE(context, nullptr) << original.to_string();
+        EXPECT_TRUE(context->isGPU());
+        EXPECT_EQ(context->deviceId(), original);
+        EXPECT_EQ(context->backendType(), backend);
+        EXPECT_EQ(context->deviceType(), type);
+        ++checked;
     }
+    ASSERT_GT(checked, 0u) << "Explicit native context registration has no eligible device";
+}
+} // namespace
+#endif
 
-    if (!found_cuda)
-    {
-        GTEST_SKIP() << "No CUDA GPU available";
-    }
+#ifdef HAVE_CUDA
+/** @test Every visible CUDA context retains its actual backend/device identity. */
+TEST(NativeDeviceContext, CUDA)
+{
+    verifyNativeDeviceContexts(ComputeBackendType::GPU_CUDA, DeviceType::CUDA);
 }
 #endif
 
 #ifdef HAVE_ROCM
-TEST(Test__DeviceContext, ROCmContextRequiresGPU)
+/** @test Every visible ROCm context retains its actual backend/device identity. */
+TEST(NativeDeviceContext, ROCm)
 {
-    // ROCmDeviceContext requires actual ROCm GPU to construct
-    // This test documents the expected behavior
-
-    auto &dm = DeviceManager::instance();
-    const auto &devices = dm.devices();
-
-    bool found_rocm = false;
-    for (size_t i = 0; i < devices.size(); ++i)
-    {
-        if (devices[i].type == ComputeBackendType::GPU_ROCM)
-        {
-            found_rocm = true;
-            auto ctx = IDeviceContext::create(DeviceId::rocm(devices[i].device_id));
-            if (ctx)
-            {
-                EXPECT_TRUE(ctx->isGPU());
-            }
-            break;
-        }
-    }
-
-    if (!found_rocm)
-    {
-        GTEST_SKIP() << "No ROCm GPU available";
-    }
+    verifyNativeDeviceContexts(ComputeBackendType::GPU_ROCM, DeviceType::ROCm);
 }
 #endif

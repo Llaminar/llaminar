@@ -6,12 +6,19 @@
  * GPU callers seal the same topology-bound values and trained initial depth
  * into the device ABI instead of consulting this host controller for live
  * device-owned decisions. Startup policy is resolved here once for both owners.
+ * A measured scope ranks every admitted depth using exact prefix-survival
+ * bounds, confirms targets on disjoint completed windows, then prices actual
+ * reversible trials in verified-state progress. Deferred windows consume their
+ * real observations without changing the selector, cooldown or failed reference.
+ * Physical emitted outputs retain their independent publication authority.
  */
 #include "MTPDepthController.h"
 #include "MTPDepthLearnedPolicy.h"
+#include "MTPSurvivalDepthSelector.h"
 
 #include <algorithm>
 #include <optional>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
@@ -24,6 +31,61 @@ namespace llaminar2
             int target_depth = 1;
             MTPDepthDecisionReason reason = MTPDepthDecisionReason::Hold;
         };
+
+        /**
+         * @brief Project the single actual cost-policy proposal into the trial gate.
+         * @param decision Result of the shared survival-score selector.
+         * @return Typed evidence for a real trial, or an explicit hold.
+         */
+        MTPDepthProposalOrigin proposalOrigin(const MTPDepthDecision &decision)
+        {
+            switch (decision.reason)
+            {
+            case MTPDepthDecisionReason::SurvivalSupportedProbe:
+                return MTPDepthProposalOrigin::SupportedScore;
+            case MTPDepthDecisionReason::SurvivalUnresolvedProbe:
+                return MTPDepthProposalOrigin::UnresolvedScore;
+            default:
+                return MTPDepthProposalOrigin::Hold;
+            }
+        }
+
+        /**
+         * @brief Rank every admitted depth using one actual eligible window.
+         * @param config Admitted bounds, without a second cadence authority.
+         * @param depth Sole current selector used by every observation in window.
+         * @param window Existing R/A/Z/F whose publication contract was checked.
+         * @param state Sole trial/rejection owner; pending trials bypass selection.
+         * @param costs Immutable costs for this complete measured execution scope.
+         * @return A proposal, never a prediction of end-to-end speed.
+         * @throws std::invalid_argument For malformed/overflowing observations.
+         */
+        MTPSurvivalDepthProposal survivalProposal(
+            const MTPDepthPolicyConfig &config, int depth, const MTPDepthWindow &window,
+            const MTPReversibleProposalState &state, const MTPDepthCostProfile &costs)
+        {
+            if (window.verifier_runs > UINT32_MAX || window.zero_accepts > UINT32_MAX ||
+                window.full_accepts > UINT32_MAX || window.accepted_draft_tokens > UINT32_MAX ||
+                window.verifier_runs > UINT32_MAX - window.accepted_draft_tokens)
+                throw std::invalid_argument("MTP verified-progress window exceeds its controller capacity");
+            MTPRejectedVerifiedComparison rejected;
+            if (state.phase == MTPReversibleProposalPhase::RejectedComparison)
+                rejected = {.kind = MTPRejectedVerifiedComparisonKind::RejectedTarget,
+                    .target_depth = state.reference_depth, .reference_runs = state.reference_runs,
+                    .reference_verified_progress = state.reference_verified_progress};
+            const auto proposal = selectMTPSurvivalDepthProposal(
+                {.scope = MTPPrefixEvidenceScope::NonStoppedUnclippedVerifiedState,
+                 .depth = static_cast<uint32_t>(depth),
+                 .runs = static_cast<uint32_t>(window.verifier_runs),
+                 .accepted = window.accepted_draft_tokens,
+                 .zero = static_cast<uint32_t>(window.zero_accepts),
+                 .full = static_cast<uint32_t>(window.full_accepts)},
+                static_cast<uint32_t>(config.min_depth), static_cast<uint32_t>(config.max_depth),
+                costs, rejected);
+            if (!proposal.valid())
+                throw std::invalid_argument("invalid measured MTP survival-score proposal");
+            return proposal;
+        }
 
         /**
          * @brief Return the first generated rule that matches this window.
@@ -41,7 +103,7 @@ namespace llaminar2
             const auto match = matchMTPLearnedDepthPolicy(
                 {.enabled = config.use_generated_policy && config.mode == MTPDepthPolicyMode::Dynamic,
                  .backend = config.backend, .model_class = config.model_class,
-                 .verify_mode = verify_mode},
+                 .verify_mode = verify_mode, .scope = config.scope},
                 current_depth,
                 {.attempted = window.attempted_draft_tokens,
                  .accepted = window.accepted_draft_tokens, .runs = window.verifier_runs,
@@ -76,22 +138,10 @@ namespace llaminar2
                 return -1;
             }
 
-            for (const auto &choice : kMTPGeneratedDepthPolicyStartups)
-            {
-                if (choice.verify_mode != verify_mode)
-                    continue;
-                if (choice.backend != MTPDepthPolicyBackend::Any &&
-                    choice.backend != config.backend)
-                    continue;
-                if (choice.model_class != MTPDepthPolicyModelClass::Any &&
-                    choice.model_class != config.model_class)
-                    continue;
-                if (choice.initial_depth < config.min_depth ||
-                    choice.initial_depth > config.max_depth)
-                    continue;
-                return choice.initial_depth;
-            }
-            return -1;
+            return resolveMTPLearnedStartup(
+                {.enabled = true, .backend = config.backend, .model_class = config.model_class,
+                 .verify_mode = verify_mode, .scope = config.scope},
+                config.min_depth, config.max_depth);
         }
 
         /** @brief Whether the live depth is the measured admission winner. */
@@ -141,6 +191,16 @@ namespace llaminar2
             return "window_not_ready";
         case MTPDepthDecisionReason::BudgetLimited:
             return "budget_limited";
+        case MTPDepthDecisionReason::ModelStopped:
+            return "model_stopped";
+        case MTPDepthDecisionReason::SurvivalSupportedProbe:
+            return "survival_supported_probe";
+        case MTPDepthDecisionReason::SurvivalUnresolvedProbe:
+            return "survival_unresolved_probe";
+        case MTPDepthDecisionReason::SurvivalAwaitingConfirmation:
+            return "survival_awaiting_confirmation";
+        case MTPDepthDecisionReason::SurvivalHold:
+            return "survival_hold";
         case MTPDepthDecisionReason::CooldownActive:
             return "cooldown_active";
         case MTPDepthDecisionReason::PromotionHysteresisActive:
@@ -165,6 +225,14 @@ namespace llaminar2
             return "depth_zero_bypass";
         case MTPDepthDecisionReason::Hold:
             return "hold";
+        case MTPDepthDecisionReason::UtilityProbeStarted:
+            return "utility_probe_started";
+        case MTPDepthDecisionReason::UtilityProbeKept:
+            return "utility_probe_kept";
+        case MTPDepthDecisionReason::UtilityProbeReturned:
+            return "utility_probe_returned";
+        case MTPDepthDecisionReason::UtilityRejectedComparisonHold:
+            return "utility_rejected_comparison_hold";
         default:
             return "unknown";
         }
@@ -183,6 +251,11 @@ namespace llaminar2
         int configured_draft_tokens,
         MTPVerifyMode verify_mode)
     {
+        const MTPLearnedDepthPolicyContext identity{
+            .backend = config.backend, .model_class = config.model_class,
+            .verify_mode = verify_mode, .scope = config.scope};
+        if (!identity.valid())
+            throw std::invalid_argument("MTP depth policy requires valid immutable learned scope and model keys");
         verify_mode_ = verify_mode;
         // Standalone CPU callers have no GPU domain. Orchestration supplies an
         // already-resolved profile value; explicit values are never replaced.
@@ -245,12 +318,22 @@ namespace llaminar2
             }
         }
 
+        const auto cost_profile = resolveMTPDepthCostProfile(
+            {.enabled = config.mode == MTPDepthPolicyMode::Dynamic && config.use_generated_policy,
+             .backend = config.backend, .model_class = config.model_class,
+             .verify_mode = verify_mode_, .scope = config.scope});
+        if (cost_profile.active() && (config.min_depth <= 0 || config.max_depth > 15))
+            throw std::invalid_argument("measured MTP utility profile requires positive depth bounds within1..15");
         config_ = config;
+        cost_profile_ = cost_profile;
         current_depth_ = config_.initial_depth;
         steps_since_change_ = config_.cooldown_steps;
-        promotion_streak_ = 0;
-        generated_best_bad_streak_ = 0;
+        if (cost_profile_.active())
+            proposal_history_ = MTPProposalConfirmation{static_cast<uint32_t>(current_depth_),0};
+        else
+            proposal_history_ = LegacyProposalHistory{};
         window_ = {};
+        utility_state_ = {};
         last_decision_ = {};
         last_decision_.old_depth = current_depth_;
         last_decision_.new_depth = current_depth_;
@@ -279,9 +362,12 @@ namespace llaminar2
     {
         current_depth_ = config_.initial_depth;
         steps_since_change_ = config_.cooldown_steps;
-        promotion_streak_ = 0;
-        generated_best_bad_streak_ = 0;
+        if (cost_profile_.active())
+            proposal_history_ = MTPProposalConfirmation{static_cast<uint32_t>(current_depth_),0};
+        else
+            proposal_history_ = LegacyProposalHistory{};
         window_ = {};
+        utility_state_ = {};
         last_decision_ = {};
         last_decision_.old_depth = current_depth_;
         last_decision_.new_depth = current_depth_;
@@ -316,10 +402,25 @@ namespace llaminar2
 
     bool MTPDepthController::windowReady() const
     {
+        // A pending experiment completes at its admitted minimum, before any
+        // ordinary parent matcher, full-window cadence or cooldown is consulted.
+        if (cost_profile_.active() && utility_state_.phase == MTPReversibleProposalPhase::ProbePending)
+            return window_.verifier_runs >= static_cast<uint64_t>(config_.min_samples);
         const uint64_t required = static_cast<uint64_t>(
             std::max(config_.window_size, config_.min_samples));
         if (window_.verifier_runs >= required)
             return true;
+
+        if (cost_profile_.active())
+        {
+            // Pending was handled above. A supported/unresolved proposal may
+            // use the existing minimum window, while holds retain the full
+            // configured window. No generated hold can hide a priced action.
+            return steps_since_change_ >= config_.cooldown_steps &&
+                window_.verifier_runs >= static_cast<uint64_t>(config_.min_samples) &&
+                survivalProposal(config_, current_depth_, window_, utility_state_, cost_profile_).kind !=
+                    MTPSurvivalProposalKind::Hold;
+        }
 
         if (config_.mode == MTPDepthPolicyMode::Fixed ||
             steps_since_change_ < config_.cooldown_steps ||
@@ -350,8 +451,7 @@ namespace llaminar2
              * suppress an eager handwritten demotion once a window is otherwise
              * ready, but they must not reset healthy evidence early.
              */
-            if (generated->target_depth != current_depth_)
-                return true;
+            return generated->target_depth != current_depth_;
         }
 
         const bool perfect_probe =
@@ -387,7 +487,7 @@ namespace llaminar2
         return true;
     }
 
-    MTPDepthDecision MTPDepthController::evaluateWindow() const
+    MTPDepthDecision MTPDepthController::windowDecision() const
     {
         MTPDepthDecision decision;
         decision.evaluated = true;
@@ -412,6 +512,12 @@ namespace llaminar2
                 static_cast<double>(window_.verifier_runs);
         }
 
+        return decision;
+    }
+
+    MTPDepthDecision MTPDepthController::evaluateWindow() const
+    {
+        auto decision = windowDecision();
         if (config_.mode == MTPDepthPolicyMode::Fixed)
         {
             decision.reason = MTPDepthDecisionReason::FixedMode;
@@ -420,6 +526,20 @@ namespace llaminar2
         if (steps_since_change_ < config_.cooldown_steps)
         {
             decision.reason = MTPDepthDecisionReason::CooldownActive;
+            return decision;
+        }
+
+        if (cost_profile_.active())
+        {
+            const auto proposal = survivalProposal(config_, current_depth_, window_, utility_state_, cost_profile_);
+            decision.recommended_depth = static_cast<int>(proposal.target_depth);
+            decision.new_depth = decision.recommended_depth;
+            decision.changed = decision.new_depth != current_depth_;
+            decision.reason = proposal.kind == MTPSurvivalProposalKind::SupportedProbe
+                ? MTPDepthDecisionReason::SurvivalSupportedProbe
+                : proposal.kind == MTPSurvivalProposalKind::UnresolvedProbe
+                    ? MTPDepthDecisionReason::SurvivalUnresolvedProbe
+                    : MTPDepthDecisionReason::SurvivalHold;
             return decision;
         }
 
@@ -472,7 +592,7 @@ namespace llaminar2
             isGeneratedBestDepth(config_, verify_mode_, current_depth_) &&
             (zero_accept_demote || low_accept_demote) &&
             decision.zero_accept_rate < catastrophic_zero_accept_rate &&
-            generated_best_bad_streak_ == 0;
+            std::get<LegacyProposalHistory>(proposal_history_).generated_best_bad_streak == 0;
 
         if (generated_best_depth_grace)
         {
@@ -559,7 +679,7 @@ namespace llaminar2
                 decision.reason = MTPDepthDecisionReason::Hold;
             }
             else if ((perfect_accept_window && !next_depth_was_rejected) ||
-                     promotion_streak_ + 1 >= config_.promote_consecutive_windows)
+                     std::get<LegacyProposalHistory>(proposal_history_).promotion_streak + 1 >= config_.promote_consecutive_windows)
             {
                 proposed_depth = current_depth_ + 1;
                 decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
@@ -583,7 +703,7 @@ namespace llaminar2
              * noisier stochastic/code prompts, while the default sticks near
              * fixed d1 unless depth 1 is essentially perfect.
              */
-            if (promotion_streak_ + 1 >= config_.promote_consecutive_windows)
+            if (std::get<LegacyProposalHistory>(proposal_history_).promotion_streak + 1 >= config_.promote_consecutive_windows)
             {
                 proposed_depth = current_depth_ + 1;
                 decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
@@ -617,11 +737,44 @@ namespace llaminar2
         MTPDepthDecision decision;
         decision.old_depth = current_depth_;
         decision.new_depth = current_depth_;
-        decision.recommended_depth = current_depth_;
+        decision.recommended_depth = cost_profile_.active() &&
+                std::holds_alternative<MTPProposalConfirmation>(proposal_history_)
+            ? static_cast<int>(std::get<MTPProposalConfirmation>(proposal_history_).target_depth)
+            : current_depth_;
+
+        if (cost_profile_.active())
+        {
+            const auto *confirmation = std::get_if<MTPProposalConfirmation>(&proposal_history_);
+            if (!confirmation || !validMTPProposalConfirmation(*confirmation,
+                    static_cast<uint32_t>(current_depth_),static_cast<uint32_t>(config_.min_depth),
+                    static_cast<uint32_t>(config_.max_depth),
+                    static_cast<uint32_t>(config_.promote_consecutive_windows),
+                    utility_state_.phase == MTPReversibleProposalPhase::ProbePending))
+                throw std::invalid_argument("invalid measured MTP proposal confirmation before observation");
+        }
+
+        if (cost_profile_.active() && (!observation.newly_emitted_tokens ||
+            *observation.newly_emitted_tokens == 0 ||
+            *observation.newly_emitted_tokens > static_cast<uint32_t>(current_depth_ + 1) ||
+            observation.accepted_speculative_prefix < 0 || observation.accepted_speculative_prefix > current_depth_))
+            throw std::invalid_argument("measured MTP utility requires actual positive emitted progress and valid prefix");
+
+        if (observation.publication && (!observation.publication->valid() ||
+            !observation.newly_emitted_tokens || observation.publication->newlyEmittedTokens() !=
+                *observation.newly_emitted_tokens))
+            throw std::invalid_argument("MTP observation disagrees with its actual committed publication");
+        if (cost_profile_.active() && !observation.publication)
+            throw std::invalid_argument("measured MTP requires an actual committed publication witness");
 
         if (config_.mode == MTPDepthPolicyMode::Fixed)
         {
             decision.reason = MTPDepthDecisionReason::FixedMode;
+            last_decision_ = decision;
+            return decision;
+        }
+        if (observation.publication && observation.publication->modelStopped())
+        {
+            decision.reason = MTPDepthDecisionReason::ModelStopped;
             last_decision_ = decision;
             return decision;
         }
@@ -641,6 +794,36 @@ namespace llaminar2
             observation.accepted_speculative_prefix,
             0,
             effective_depth);
+
+        // Only actual non-stopped, unclipped publication supports the prefix
+        // identity. Keep physical emitted Y separate from verified state V;
+        // carried outputs may change Y by one without changing accepted work.
+        if (observation.publication && observation.publication->publishedStateTokens() !=
+                static_cast<uint32_t>(accepted_prefix + 1))
+            throw std::invalid_argument("MTP verified progress violates its eligible prefix contract");
+
+        const bool utility_pending = cost_profile_.active() &&
+            utility_state_.phase == MTPReversibleProposalPhase::ProbePending;
+        if (cost_profile_.active())
+        {
+            if (!observation.newly_emitted_tokens ||
+                observation.effective_depth != current_depth_ || observation.requested_depth != current_depth_ ||
+                window_.verifier_runs >= UINT32_MAX ||
+                steps_since_change_ == std::numeric_limits<int>::max())
+                throw std::invalid_argument("measured MTP utility requires actual bounded emitted progress/current-depth observation");
+            auto next = utility_state_;
+            const auto appended = appendMTPReversibleProposalEmission(
+                {.mode = MTPReversibleProposalMode::Dynamic,
+                 .minimum_depth = static_cast<uint32_t>(config_.min_depth),
+                 .maximum_depth = static_cast<uint32_t>(config_.max_depth),
+                 .minimum_samples = static_cast<uint32_t>(config_.min_samples)}, next,
+                {.executed_depth = static_cast<uint32_t>(current_depth_),
+                 .window_runs = static_cast<uint32_t>(window_.verifier_runs + 1),
+                 .newly_emitted_tokens = *observation.newly_emitted_tokens, .eligible = true});
+            if (!appended.valid())
+                throw std::invalid_argument("invalid/overflowing measured MTP utility observation");
+            utility_state_ = next;
+        }
 
         ++window_.verifier_runs;
         window_.attempted_draft_tokens += static_cast<uint64_t>(effective_depth);
@@ -663,59 +846,123 @@ namespace llaminar2
             return decision;
         }
 
-        decision = evaluateWindow();
+        decision = utility_pending ? windowDecision() : evaluateWindow();
         ++stats_.windows;
-        if (decision.observe_recommendation)
+        // Parent heuristics keep their own history only when actually evaluated.
+        // A pending comparison must not manufacture a second parent observation.
+        if (!utility_pending && !cost_profile_.active())
         {
-            ++stats_.observe_recommendations;
-        }
-        if (decision.reason == MTPDepthDecisionReason::PromotionHysteresisActive)
-        {
-            ++promotion_streak_;
-        }
-        else if (decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate ||
-                 decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
-                 decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
-                 decision.reason == MTPDepthDecisionReason::GeneratedPolicyPromote ||
-                 decision.reason == MTPDepthDecisionReason::GeneratedPolicyDemote ||
-                 decision.reason == MTPDepthDecisionReason::GeneratedPolicyHold ||
-                 decision.reason == MTPDepthDecisionReason::GeneratedBestDepthGraceWindow ||
-                 decision.reason == MTPDepthDecisionReason::ProbeHigherBeforeDemote ||
-                 decision.reason == MTPDepthDecisionReason::Hold)
-        {
-            promotion_streak_ = 0;
-        }
-        if (decision.evaluated)
-        {
-            if (decision.reason == MTPDepthDecisionReason::GeneratedBestDepthGraceWindow)
-                ++generated_best_bad_streak_;
-            else
-                generated_best_bad_streak_ = 0;
-        }
-        if (config_.mode == MTPDepthPolicyMode::Dynamic)
-        {
-            if (decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
-                decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
-                decision.reason == MTPDepthDecisionReason::GeneratedPolicyDemote ||
-                decision.reason == MTPDepthDecisionReason::ProbeHigherBeforeDemote)
+            if (decision.observe_recommendation)
             {
-                setDepthRejected(decision.old_depth, true);
+                ++stats_.observe_recommendations;
             }
-            /*
-             * Generated promotions are explicit trained retests.  Ordinary
-             * fallback promotion no longer targets rejected depths, so this is
-             * normally a no-op for it.  ProbeHigherBeforeDemote is different:
-             * it is a diagnostic jump taken from a bad intermediate window.
-             * Do not clear a previously rejected destination depth merely
-             * because we are probing upward; otherwise the controller can
-             * churn back into an expensive bad depth.
-             */
-            if (decision.changed &&
-                decision.new_depth > decision.old_depth &&
-                (decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate ||
-                 decision.reason == MTPDepthDecisionReason::GeneratedPolicyPromote))
+            if (decision.reason == MTPDepthDecisionReason::PromotionHysteresisActive)
             {
-                setDepthRejected(decision.new_depth, false);
+                ++std::get<LegacyProposalHistory>(proposal_history_).promotion_streak;
+            }
+            else if (decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate ||
+                     decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
+                     decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
+                     decision.reason == MTPDepthDecisionReason::GeneratedPolicyPromote ||
+                     decision.reason == MTPDepthDecisionReason::GeneratedPolicyDemote ||
+                     decision.reason == MTPDepthDecisionReason::GeneratedPolicyHold ||
+                     decision.reason == MTPDepthDecisionReason::GeneratedBestDepthGraceWindow ||
+                     decision.reason == MTPDepthDecisionReason::ProbeHigherBeforeDemote ||
+                     decision.reason == MTPDepthDecisionReason::Hold)
+            {
+                std::get<LegacyProposalHistory>(proposal_history_).promotion_streak = 0;
+            }
+            if (decision.evaluated)
+            {
+                if (decision.reason == MTPDepthDecisionReason::GeneratedBestDepthGraceWindow)
+                    ++std::get<LegacyProposalHistory>(proposal_history_).generated_best_bad_streak;
+                else
+                    std::get<LegacyProposalHistory>(proposal_history_).generated_best_bad_streak = 0;
+            }
+            if (config_.mode == MTPDepthPolicyMode::Dynamic)
+            {
+                if (decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
+                    decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
+                    decision.reason == MTPDepthDecisionReason::GeneratedPolicyDemote ||
+                    decision.reason == MTPDepthDecisionReason::ProbeHigherBeforeDemote)
+                {
+                    setDepthRejected(decision.old_depth, true);
+                }
+                /*
+                 * Generated promotions are explicit trained retests.  Ordinary
+                 * fallback promotion no longer targets rejected depths, so this is
+                 * normally a no-op for it.  ProbeHigherBeforeDemote is different:
+                 * it is a diagnostic jump taken from a bad intermediate window.
+                 * Do not clear a previously rejected destination depth merely
+                 * because we are probing upward; otherwise the controller can
+                 * churn back into an expensive bad depth.
+                 */
+                if (decision.changed &&
+                    decision.new_depth > decision.old_depth &&
+                    (decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate ||
+                     decision.reason == MTPDepthDecisionReason::GeneratedPolicyPromote))
+                {
+                    setDepthRejected(decision.new_depth, false);
+                }
+            }
+        }
+        if (cost_profile_.active())
+        {
+            if (window_.accepted_draft_tokens > UINT32_MAX ||
+                window_.verifier_runs > UINT32_MAX - window_.accepted_draft_tokens)
+                throw std::invalid_argument("MTP verified progress exceeds comparison capacity");
+            auto &confirmation = std::get<MTPProposalConfirmation>(proposal_history_);
+            auto next_confirmation = MTPProposalConfirmation{static_cast<uint32_t>(current_depth_),0};
+            bool awaiting_confirmation = false;
+            if (!utility_pending)
+            {
+                const auto confirmed = confirmMTPSurvivalProposal(confirmation,
+                    static_cast<uint32_t>(current_depth_),static_cast<uint32_t>(config_.min_depth),
+                    static_cast<uint32_t>(config_.max_depth),
+                    static_cast<uint32_t>(config_.promote_consecutive_windows),
+                    static_cast<uint32_t>(decision.recommended_depth));
+                if (!confirmed.valid())
+                    throw std::invalid_argument("invalid completed MTP proposal confirmation");
+                next_confirmation = confirmed.next;
+                awaiting_confirmation = confirmed.action == MTPProposalConfirmationAction::AwaitingConfirmation;
+            }
+            const auto gate = decideMTPReversibleProposalGate(
+                {.mode = MTPReversibleProposalMode::Dynamic,
+                 .minimum_depth = static_cast<uint32_t>(config_.min_depth),
+                 .maximum_depth = static_cast<uint32_t>(config_.max_depth),
+                 .minimum_samples = static_cast<uint32_t>(config_.min_samples)}, utility_state_,
+                {.executed_depth = static_cast<uint32_t>(current_depth_),
+                 .window_runs = static_cast<uint32_t>(window_.verifier_runs), .eligible = true,
+                 .proposal_origin = utility_pending ? MTPDepthProposalOrigin::Unevaluated
+                                                    : awaiting_confirmation ? MTPDepthProposalOrigin::Hold : proposalOrigin(decision),
+                 .parent_target = static_cast<uint32_t>(awaiting_confirmation ? current_depth_ : decision.recommended_depth),
+                 .verified_progress = {.states = static_cast<uint32_t>(
+                     window_.verifier_runs + window_.accepted_draft_tokens)}}, cost_profile_);
+            if (!gate.valid() || !gate.consume_window)
+                throw std::invalid_argument("invalid measured MTP utility decision/window ownership");
+            decision.new_depth = static_cast<int>(gate.next_depth);
+            if (awaiting_confirmation)
+            {
+                confirmation = next_confirmation;
+                decision.reason = MTPDepthDecisionReason::SurvivalAwaitingConfirmation;
+            }
+            else
+            {
+                confirmation = MTPProposalConfirmation{gate.next_depth,0};
+                decision.recommended_depth = decision.new_depth;
+            }
+            decision.changed = decision.new_depth != decision.old_depth;
+            switch (gate.action)
+            {
+            case MTPReversibleProposalAction::ProbeStarted:
+                ++stats_.utility_probes; decision.reason = MTPDepthDecisionReason::UtilityProbeStarted; break;
+            case MTPReversibleProposalAction::ProbeKept:
+                ++stats_.utility_keeps; decision.reason = MTPDepthDecisionReason::UtilityProbeKept; break;
+            case MTPReversibleProposalAction::ProbeReturned:
+                ++stats_.utility_returns; decision.reason = MTPDepthDecisionReason::UtilityProbeReturned; break;
+            case MTPReversibleProposalAction::RejectedTargetBlocked:
+                decision.reason = MTPDepthDecisionReason::UtilityRejectedComparisonHold; break;
+            default: break;
             }
         }
         if (decision.changed)

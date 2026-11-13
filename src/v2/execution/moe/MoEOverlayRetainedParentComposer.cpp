@@ -33,15 +33,16 @@ namespace llaminar2
     {
         const GraphNativeCaptureEnvelope envelope =
             graph.nativeCaptureEnvelope();
-        if (envelope ==
-            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction)
+        const bool native_auxiliary = envelope ==
+            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction &&
+            graph.retainedParticipantAuxiliaryRange().has_value();
+        if (envelope == GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction)
         {
-            /*
-             * A device-owned timeline already captures every wait/publication in
-             * one indivisible executable. It has neither child boundaries nor a
-             * host ticket service for this lowerer to own.
-             */
-            return std::nullopt;
+            if (!native_auxiliary)
+                return std::nullopt;
+            // Cold child captures remain graph-only. The original parent owns
+            // every packet wait and the finite side body; no host replay lane is added.
+            graph.requireRetainedParticipantNativeAuxiliaryParent();
         }
         const bool heterogeneous_ticket_transaction =
             requiresHeterogeneousTicketSegmentation(envelope);
@@ -192,7 +193,7 @@ namespace llaminar2
         }
 
         std::optional<RetainedEndpointCompositionKind> composition_kind;
-        if (heterogeneous_ticket_transaction)
+        if (heterogeneous_ticket_transaction || native_auxiliary)
         {
             /*
              * Packet stages record their mapped wait/publication nodes while

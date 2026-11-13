@@ -159,7 +159,7 @@ namespace
                 auto ready = std::shared_ptr<void>(
                     backend->createEvent(device.ordinal),
                     [backend, device](void *event) { backend->destroyEvent(event, device.ordinal); });
-                ASSERT_TRUE(handle.payload_readiness->prepare(ready, device, stream));
+                ASSERT_TRUE(handle.payload_readiness->prepare(ready, device, stream, *backend));
                 ASSERT_TRUE(capture->launch());
                 bool copied = true;
                 for (const auto &[pointer, bytes] : complete)

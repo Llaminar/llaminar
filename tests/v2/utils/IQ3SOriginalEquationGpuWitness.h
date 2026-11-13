@@ -217,8 +217,8 @@ inline void runDense(DeviceId device,
             TransferEngine::prepareDeviceInput(o.input.get(),device,stream);
             ASSERT_TRUE(o.output->allocateOnDevice(device,stream));
             o.upload.resize(512*eq::k);
-            DeviceNativeVNNIMatrixDesc desc{};
-            ASSERT_TRUE(o.prepared.kernel->exportNativeVNNIMatrixDesc(desc));
+            DeviceNativeQuantisedMatrixDesc desc{};
+            ASSERT_TRUE(o.prepared.kernel->exportNativeQuantisedMatrixDesc(desc));
             ASSERT_EQ(desc.n,o.weights.n);ASSERT_EQ(desc.k,eq::k);
             ASSERT_EQ(desc.blocks_per_row,eq::k/32);
             ASSERT_EQ(desc.source_identity_present,1);

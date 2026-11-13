@@ -7,7 +7,11 @@
  * tool content are exported alongside a production streaming-parser replay. The
  * Python auditor independently authenticates XML argument values; replay alone
  * never certifies the parser which produced the HTTP response.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "loaders/ModelContext.h"
@@ -30,6 +34,8 @@
  */
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         const bool describe = argc == 3 && std::string_view(argv[1]) == "--describe-model";

@@ -11,10 +11,13 @@
  */
 
 #pragma once
+#include "../execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "../execution/config/RuntimeConfig.h" // ActivationPrecision
 #include "../tensors/ITensor.h"                // Lightweight interface (no MPI)
 #include "../tensors/TensorLayout.h"
+#include "qwen4exp/QwenSparseAttention.h"
+#include "kvcache/CacheAuxiliaryState.h"
 #include "../utils/Logger.h"
 #include <cstddef>
 #include <cstdint>
@@ -63,17 +66,18 @@ namespace llaminar2
         {
             StateRole role = StateRole::Standalone;
             int mtp_depth = -1;
+            MTPShiftedCacheOrigin shifted_origin = MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Frozen model-owned cache coordinates.
 
             bool valid() const
             {
                 return role == StateRole::MTPShiftedSidecar
-                           ? mtp_depth >= 0
-                           : mtp_depth == -1;
+                           ? mtpShiftedPrefixOffset(shifted_origin,mtp_depth)>=0
+                           : mtp_depth == -1 && shifted_origin==MTPShiftedCacheOrigin::SuccessorPairsOnly;
             }
 
             bool operator==(const StateOwnership &other) const
             {
-                return role == other.role && mtp_depth == other.mtp_depth;
+                return role == other.role && mtp_depth == other.mtp_depth && shifted_origin == other.shifted_origin;
             }
         };
 
@@ -465,6 +469,29 @@ namespace llaminar2
          */
         virtual int max_seq_len() const = 0;
 
+        /** @brief Exact admitted independent request slots for typed state attachments. */
+        virtual int request_capacity() const
+        {
+            throw std::logic_error("KV cache does not expose an admitted request capacity");
+        }
+
+        /** @brief Attach one borrowed model-state owner during setup, before request admission.
+         * @param state Exact cache-owned extension; its canonical cache identity must be this object.
+         * @param stream Exact initialization/publication stream; null for CPU.
+         */
+        void attachAuxiliaryState(std::unique_ptr<ICacheAuxiliaryState> state,void *stream)
+        {
+            if(!state || &state->cache()!=this || auxiliary_state_)
+                throw std::invalid_argument("KV auxiliary state must bind exactly once to its canonical cache owner");
+            state->initialize(stream);
+            auxiliary_state_=std::move(state);
+        }
+        /** @brief Inspect the immutable optional model extension without creating a second authority. */
+        ICacheAuxiliaryState *auxiliaryState() noexcept { return auxiliary_state_.get(); }
+        /** @brief Inspect the immutable optional model extension without observing live state. */
+        const ICacheAuxiliaryState *auxiliaryState() const noexcept { return auxiliary_state_.get(); }
+
+
         /**
          * @brief Get number of layers
          */
@@ -479,6 +506,14 @@ namespace llaminar2
          * @return First layer index (0 for non-PP caches)
          */
         virtual int first_layer_index() const { return 0; }
+
+        /** @brief Resolve a physical attention-storage row to its global model layer.
+         * Hybrid caches override this inverse mapping so lifecycle operations
+         * cannot confuse compressed FA slots with model-layer identity.
+         */
+        virtual int modelLayerForAttentionStorage(int storageLayer) const
+        { return first_layer_index()+storageLayer; }
+
 
         /**
          * @brief Remap a global layer index to a local cache index
@@ -610,6 +645,12 @@ namespace llaminar2
          * them. A zero result means device-resident checkpointing is not
          * implemented and is a hard capability failure for GPU MTP rollback.
          */
+        /** @brief Canonical head/count prefix bytes within an opaque sequence checkpoint.
+         * Model auxiliary rollback suffixes are excluded; consumers must never
+         * derive physical metadata rows from complete opaque storage capacity.
+         */
+        virtual size_t deviceSequenceStateMetadataBytes() const { return deviceSequenceStateCheckpointBytes(); }
+
         virtual size_t deviceSequenceStateCheckpointBytes() const
         {
             return 0;
@@ -1315,6 +1356,27 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Borrow native selected-read banks without gathering or converting KV.
+         * @param layer Model layer; hybrid caches resolve its local FA slot exactly once.
+         * @param sequence Admitted request slot.
+         * @param rows Exact execution-owner per-query params on GPU; null on CPU.
+         * @param policy Immutable publication encoding shared with the append stage.
+         * @param stream Exact GPU consumer stream; null on CPU.
+         * @return Stable native codecs/tables and canonical ring mapping; no payload is read.
+         * @throws std::invalid_argument For unsupported geometry or incomplete state authority.
+         * @details Cache construction publishes immutable native tables before capture.
+         * The caller orders append and selected reads through its executor DAG. This
+         * accessor allocates nothing, enqueues no conversion, and never reads GPU state.
+         */
+        virtual qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream)
+        {
+            (void)layer; (void)sequence; (void)rows; (void)policy; (void)stream;
+            throw std::invalid_argument("KV cache has no native selected-attention read contract");
+        }
+
         // =================================================================
         // Sharding Info (for tensor parallelism)
         // =================================================================
@@ -1496,6 +1558,7 @@ namespace llaminar2
         StateOwnership state_ownership_{};
         bool state_ownership_bound_ = false;
         std::shared_ptr<void> physical_memory_lease_;
+        std::unique_ptr<ICacheAuxiliaryState> auxiliary_state_;
     };
 
 } // namespace llaminar2

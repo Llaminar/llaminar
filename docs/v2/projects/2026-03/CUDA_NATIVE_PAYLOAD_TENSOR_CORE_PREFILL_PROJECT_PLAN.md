@@ -52,7 +52,7 @@ The correct salvage strategy is therefore:
 - replace the B-path with compact payload load + in-kernel decode
 - move weight scaling/correction into the K-block loop
 
-This is the same structural idea already used by ROCm native-VNNI GEMM:
+This is the same structural idea already used by ROCm native-quantised GEMM:
 
 - compact payload in HBM
 - decode into LDS/registers during load
@@ -93,7 +93,7 @@ extern "C" bool cudaFusedTCNativePayloadGemm_fp32(
 Contract notes:
 
 - `d_payload`, `d_block_scales`, `d_block_mins`, `d_block_emins` are the only persistent weight buffers required for the native-payload path.
-- `codebook_id` matches the existing native payload codebook IDs already used by CUDA decode and ROCm native-VNNI.
+- `codebook_id` matches the existing native payload codebook IDs already used by CUDA decode and ROCm native-quantised.
 - `blocks_per_row == K / 32` for the first supported formats.
 - `d_C_existing` and `d_bias` are optional and preserve the existing GEMM API behavior.
 
@@ -206,7 +206,7 @@ Why last:
 
 - dual-scale and/or embedded-min correction
 - more decode-heavy formats
-- may require cooperative `sum(A)` side paths like the ROCm native-VNNI kernels
+- may require cooperative `sum(A)` side paths like the ROCm native-quantised kernels
 
 ### Dispatch Contract
 

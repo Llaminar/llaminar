@@ -17,13 +17,18 @@
 
 #pragma once
 
+#include "LocalTPCaptureSourceDefinition.h"
+#include "NativeLocalTPContextBorrow.h"
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
+#include "collective/NativeCollectiveBytes.h"
 #include "ICollectiveBackend.h"
 #include "ITPContext.h"
 #include "NativeAllreduceRequestRows.h"
 #include <memory>
+#include <exception>
+#include <cstddef>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -106,6 +111,21 @@ namespace llaminar2
     {
     public:
         ~ILocalTPContext() override = default;
+        /** @return Revocable borrow issued by this exact original context for every public native factory. */
+        [[nodiscard]] NativeLocalTPContextBorrow borrowOriginalNativeContext()const{return native_lifetime_.borrow();}
+        /**
+         * @brief Abort from the failing participant before its future can be hidden behind another blocked participant.
+         * @param preparation Actual original participant cold preparation/capture body.
+         * @throws Original preparation exception after native abort publication. Failed abort is fatal before any storage retires.
+         */
+        template<class Preparation> void prepareOriginalNativeParticipant(Preparation&& preparation) {
+            try{std::forward<Preparation>(preparation)();}
+            catch(...){
+                try{if(!signalNativeCompletionAbort())std::terminate();}
+                catch(...){std::terminate();}
+                throw;
+            }
+        }
 
         /**
          * @brief LOCAL TP is always intra-rank
@@ -215,6 +235,27 @@ namespace llaminar2
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override = 0;
 
         /**
+         * @brief Gather exact CPU byte spans in immutable participant order.
+         * @param local_send This participant's live bytes, possibly empty.
+         * @param full_receive Exact degree()*local_send.size() output span.
+         * @param participant Index in devices(), never a coarse CPU DeviceId.
+         * @param stage_name Common retained operation identity across participants.
+         * @return True after every output is published; false after fatal rejection.
+         *
+         * CPU participants rendezvous through their host-owned context. The
+         * operation never infers order from arrival, invents a GPU stream, or
+         * sends admitted capacity. Spans remain borrowed until all readers have
+         * completed. Unsupported contexts fail closed without another path.
+         */
+        virtual bool allgatherHostIndexed(std::span<const std::byte> local_send,
+            std::span<std::byte> full_receive, int participant,
+            const std::string &stage_name)
+        {
+            (void)local_send; (void)full_receive; (void)participant; (void)stage_name;
+            return false;
+        }
+
+        /**
          * @brief All-gather raw device buffers across LOCAL devices.
          *
          * This is for graph-visible state handoffs that operate on backend-owned
@@ -276,6 +317,39 @@ namespace llaminar2
         {
             (void)rank_major_send; (void)local_receive; (void)receive_count;
             (void)dtype; (void)device_index; (void)producer_stream; (void)stage_name;
+            return false;
+        }
+
+        /** @brief Signal the original completed-family communicator abort words without reclaiming it.
+         * @return Whether every original participant received the absorbing signal.
+         * Native graph/event owners still require terminal proof before definition and communicator retirement.
+         */
+        virtual bool signalNativeCompletionAbort() { return false; }
+
+        /** @brief Borrow immutable original native completion provenance during cold preparation.
+         * @param participant Original local communicator coordinate.
+         * @return Unbound only for unsupported/uninitialized backend; callers must reject it.
+         * No device state is read and no native operation/allocation is issued.
+         */
+        virtual NativeCompletionAuthority nativeCompletionAuthority(int participant)
+        { (void)participant; return {}; }
+
+        /**
+         * @brief Record original fixed/prefix/slice bytes on a native rooted stream.
+         * @param send Original root source bank (unused contribution on receivers).
+         * @param receive Original participant-local destination bank.
+         * @param bytes Borrowed original communication metadata and admitted bounds.
+         * @param root Original communicator coordinate, never a device ordinal.
+         * @param participant Calling original communicator coordinate.
+         * @param stream Exact original producer/consumer stream.
+         * @param stage_name Stable original graph-operation name for error attribution.
+         * @return Successful native enqueue, with no host count read or fallback.
+         */
+        virtual bool nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
+            const std::string& stage_name)
+        {
+            (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream; (void)stage_name;
             return false;
         }
 
@@ -890,6 +964,45 @@ namespace llaminar2
         { throw std::logic_error("This LocalTP context cannot own a counted allgather"); }
         /** @return Frozen optional counted transport, not a capability probe or live state. */
         [[nodiscard]] virtual std::shared_ptr<DeviceCountedAllGather> deviceCountedAllGather() const { return {}; }
+        /**
+         * @brief Carry one immutable source definition through this SAME matched cold generation.
+         * @param name Original matched capture-end phase, including its existing geometry identity.
+         * @param participant Original authored LocalTP membership index.
+         * @param timeout_ms Original collective timeout; no separate payload deadline exists.
+         * @param definition Original domain and optional source publication; receives the exact token.
+         * @return True only after every original member matched and the source remained live.
+         * @throws std::logic_error If this implementation cannot own the typed exchange.
+         */
+        virtual bool graphCaptureBoundaryRendezvous(const std::string& name,int participant,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
+        {throw std::logic_error("LocalTP has no typed source-definition rendezvous");}
+        /**
+         * @brief Carry the definition through the original existing stream fence/rendezvous.
+         * @param name Original matched capture-end phase.
+         * @param participant Original authored LocalTP membership index.
+         * @param stream Exact non-default original participant capture stream.
+         * @param timeout_ms Original collective timeout.
+         * @param definition Original domain/publication and exact returned source token.
+         * @return True after the existing final fence boundary authenticates every member.
+         * @throws std::logic_error If this implementation cannot own the typed exchange.
+         */
+        virtual bool graphCaptureBoundaryOnStream(const std::string& name,int participant,void* stream,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
+        {throw std::logic_error("LocalTP has no typed source-definition stream boundary");}
+
+        /** @brief Record only the named original producer/consumer byte edge.
+         * @param payload Original local endpoint bank. @param bytes Borrowed count/slice authority.
+         * @param edge Exact original communicator edge. @param participant Actual caller coordinate.
+         * @param stream Exact non-null original endpoint stream. @param stage_name Stable diagnostic identity.
+         * @return Native enqueue success; unrelated members and unsupported backends fail before mutation. */
+        virtual bool nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream,const std::string& stage_name) {
+            (void)payload;(void)bytes;(void)edge;(void)participant;(void)stream;(void)stage_name;return false;
+        }
+
+    protected:
+        /** @brief Revoke every issued borrow before derived native teardown; waits only for host submission scopes. */
+        void retireOriginalNativeContextBorrows()noexcept{native_lifetime_.revoke();}
+    private:
+        NativeLocalTPContextLifetime native_lifetime_{*this}; ///< Unique authority, independent of installed fabric ownership.
     };
 
     /**

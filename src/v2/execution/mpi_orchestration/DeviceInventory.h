@@ -141,6 +141,8 @@ namespace llaminar2
         std::string pcie_bottleneck_bdf; ///< BDF of upstream bridge causing bottleneck (empty if none)
         /** Observed device-wide last-level cache; required to authenticate streaming memory samples. */
         size_t last_level_cache_bytes = 0;
+        std::string native_isa; ///< Original native ISA target; empty means unobserved.
+        std::vector<std::string> pcie_upstream_bdfs; ///< Original PCI ancestry, nearest bridge first; absent is unknown.
 
         /// Check if this is a GPU (any type)
         bool isGPU() const

@@ -22,7 +22,7 @@ Optimized the Q8_0 native GEMV hot path (96.7% of decode time) with two key impr
   with `gemv_dot_row_q8_0()` shared helper, `q8_0_native_gemv()` single-projection,
   and `q8_0_native_gemv_fused()` multi-projection path.
 
-- `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` — Updated dispatch: M=1 Q8_0
+- `src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h` — Updated dispatch: M=1 Q8_0
   uses `q8_0_native_gemv`, fused path uses `FusedProjectionDesc` stack array.
 
 ## Performance Results

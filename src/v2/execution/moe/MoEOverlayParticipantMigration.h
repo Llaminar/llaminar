@@ -15,6 +15,9 @@
 #pragma once
 
 #include "ExpertTierWeightStream.h"
+#include "ExpertTierWeightDeviceLayout.h"
+
+#include <functional>
 #include "MoEOverlayHostAuthorityDeviceBankPublisher.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayTierMigrationTransport.h"
@@ -22,11 +25,14 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace test { struct MoEOverlayParticipantMigrationTestAccess; }
+
     /** Number of independently transferred projections in one routed expert. */
     inline constexpr std::size_t kMoEOverlayExpertProjectionCount = 3;
 
@@ -49,8 +55,35 @@ namespace llaminar2
         explicit MoEOverlayPreparedExpertArrival(
             DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert);
 
-        /** @return The family authenticated by this transfer transaction. */
-        [[nodiscard]] DeviceMoEProjectionSet projections() const noexcept { return projections_; }
+        /** @return Whether this arrival has registry-authenticated CPU fragment provenance. */
+        bool isCPUJointFragment() const noexcept
+        {
+            return fragment_destination_.has_value();
+        }
+        /** @return Exact candidate epoch for a fragment arrival; zero for an ordinary arrival. */
+        uint64_t destinationEpoch() const noexcept
+        {
+            return fragment_destination_ ? fragment_destination_->epoch : 0;
+        }
+        /**
+         * @brief Seal a completed local fragment without representing it as a whole expert.
+         * @param payload Receives genuine completed engines and fixed original cohort provenance.
+         * @param error Precise wrong-arm, incomplete or failed-arrival diagnostic.
+         * @return True only for a complete registry-issued CPU fragment arrival.
+         */
+        bool completeCPUFragment(MoEOverlayPreparedCPUFragmentPayload &payload,
+                                 std::string *error = nullptr) const;
+
+        /**
+         * @return Required physical role set for this transfer transaction.
+         * @note CompleteExpert names gate/up/down roles only for a fragment arrival;
+         * it grants no whole-owner payload. isCPUJointFragment() distinguishes ownership,
+         * and completePayload() rejects that fragment arm.
+         */
+        [[nodiscard]] DeviceMoEProjectionSet projections() const noexcept
+        {
+            return projections_;
+        }
         /**
          * @brief Publish one prepared projection lifetime exactly once.
          * @param projection Gate, up, or down role represented by @p engine.
@@ -58,10 +91,8 @@ namespace llaminar2
          * @param error Optional exact rejection diagnostic.
          * @return True for the first publication or an identical idempotent one.
          */
-        bool publish(
-            ExpertTierWeightProjection projection,
-            std::shared_ptr<ITensorGemm> engine,
-            std::string *error = nullptr);
+        bool publish(ExpertTierWeightProjection projection, std::shared_ptr<ITensorGemm> engine,
+                     std::string *error = nullptr);
 
         /**
          * @brief Mark asynchronous preparation as irrecoverably failed.
@@ -76,11 +107,38 @@ namespace llaminar2
          * @param error Optional incomplete/failure diagnostic.
          * @return True only when all projections are present and no failure exists.
          */
-        [[nodiscard]] bool completePayload(
-            MoEOverlayPreparedExpertPayload &payload,
-            std::string *error = nullptr) const;
+        [[nodiscard]] bool completePayload(MoEOverlayPreparedExpertPayload &payload,
+                                           std::string *error = nullptr) const;
 
     private:
+        friend class MoEOverlayParticipantResidencyRegistry;
+        /** @brief Immutable candidate identity issued only by the original source-bound registry.
+         */
+        struct CPUFragmentDestination
+        {
+            ModelContextId model;
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
+            std::shared_ptr<const MoEExpertShardCohort> cohort;
+            std::size_t member;
+            uint64_t epoch;
+            int expert;
+        };
+        /**
+         * @brief Admit only the registry's checked original fixed-cohort candidate destination.
+         * @param model Original source-bound model identity.
+         * @param preparation SAME original preparation control block.
+         * @param cohort SAME original fixed source/cohort/cut authority.
+         * @param member Original cohort member coordinate.
+         * @param candidate_epoch Exact unpublished candidate bank epoch.
+         * @param expert Original candidate logical expert, not initial selected ordinal.
+         * @throws std::invalid_argument For absent or malformed destination identity.
+         */
+        MoEOverlayPreparedExpertArrival(
+            ModelContextId model,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
+            std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member,
+            uint64_t candidate_epoch, int expert);
+        const std::optional<CPUFragmentDestination> fragment_destination_;
         mutable std::mutex mutex_;
         const DeviceMoEProjectionSet projections_;
         std::array<std::shared_ptr<ITensorGemm>, 3> engines_{};
@@ -88,74 +146,142 @@ namespace llaminar2
     };
 
     /**
-     * @brief Publish one prepared engine only after its physical transfer is ready.
+     * @brief Checked destination coverage shared by its original physical operations.
      *
-     * The wrapper retains the destination engine, its arrival authority, and
-     * the exact underlying lane operation.  A successful lane poll publishes
-     * the engine lifetime before returning Ready to the composite barrier.  A
-     * lane or publication failure poisons the arrival and fails the wave.  No
-     * stream wait, host synchronization, or engine allocation occurs here.
+     * Construction proves a complete disjoint original-coordinate tiling before
+     * any operation can claim a piece. Readiness comes only from the associated
+     * physical operation, including any ACK it owns, never recipient storage finalization.
+     * This object owns no allocation or placement ledger.
      */
-    class MoEOverlayPreparedProjectionOperation final
-        : public IMoEOverlayTierTransferOperation
+    class MoEOverlayPreparedProjectionCompletion final
     {
     public:
         /**
-         * @brief Bind an already-enqueued operation to one destination engine.
-         * @param operation Exact physical lane operation.
-         * @param arrival Shared expert-level gate/up/down arrival authority.
-         * @param projection Projection role published on readiness.
-         * @param engine Fully constructed engine over reserved destination storage.
-         * @throws std::invalid_argument When any ownership is absent.
+         * @brief Bind a complete nonoverlapping destination and its final engine provider.
+         * @param intersections Exact original source/destination overlap for every physical piece.
+         * @param arrival Existing expert arrival receiving the completed projection.
+         * @param projection Semantic gate/up/down role.
+         * @param engine_provider Returns the actual reserved destination engine after all pieces
+         * finish.
+         * @throws std::invalid_argument For empty, overlapping, incomplete or foreign destination
+         * coverage.
+         * @note A multi-piece provider must construct and validate this complete coverage before
+         * enqueueing any physical operation in its wave. No invalid prefix may begin transfer.
          */
-        MoEOverlayPreparedProjectionOperation(
-            std::unique_ptr<IMoEOverlayTierTransferOperation> operation,
+        MoEOverlayPreparedProjectionCompletion(
+            std::vector<ExpertTierWeightProjectionIntersection> intersections,
             std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
             ExpertTierWeightProjection projection,
-            std::shared_ptr<ITensorGemm> engine);
-
-        /** @brief Poll the lane and publish the retained engine at exact readiness. */
-        MoEOverlayResidencyWaveProgress poll(
-            std::string *error) noexcept override;
-
-        /** @brief Abort the physical operation and poison this unpublished arrival. */
-        void abort() noexcept override;
-
-        /** @brief Delegate asynchronous reclamation to the exact physical operation. */
-        MoEOverlayResidencyWaveProgress pollAbort(
-            std::string *error) noexcept override;
-
-        /** @brief Delegate completed timing evidence to the physical operation. */
-        [[nodiscard]] std::optional<
-            ExpertTierProjectionTransferMeasurement>
-        completedMeasurement() const noexcept override;
+            std::function<std::shared_ptr<ITensorGemm>()> engine_provider);
 
     private:
-        std::unique_ptr<IMoEOverlayTierTransferOperation> operation_;
+        friend class MoEOverlayPreparedProjectionOperation;
+        /**
+         * @brief Assign a coverage piece to its unique physical operation.
+         * @param piece Original piece index.
+         * @throws std::invalid_argument For duplicate or out-of-range ownership.
+         */
+        void claim(std::size_t piece);
+        /**
+         * @brief Accept actual physical completion and publish only the complete tiling.
+         * @param piece Claimed physical piece.
+         * @param error Failure diagnostic.
+         * @return Whether this piece's readiness was accepted.
+         */
+        bool ready(std::size_t piece, std::string *error) noexcept;
+        /**
+         * @brief Preserve the first physical failure across every destination piece.
+         * @param error Physical operation failure; poisons unpublished arrival.
+         */
+        void fail(std::string error) noexcept;
+        /**
+         * @brief Read the shared destination failure without changing physical operations.
+         * @param error Receives the original failure.
+         * @return Whether any piece failed or aborted.
+         */
+        bool failed(std::string *error) const noexcept;
+
+        const std::vector<ExpertTierWeightProjectionIntersection> intersections_;
         std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival_;
-        ExpertTierWeightProjection projection_ =
-            ExpertTierWeightProjection::Gate;
-        std::shared_ptr<ITensorGemm> engine_;
+        ExpertTierWeightProjection projection_;
+        std::function<std::shared_ptr<ITensorGemm>()> engine_provider_;
+        mutable std::mutex mutex_;
+        std::vector<bool> claimed_, ready_;
+        std::string failure_;
         bool published_ = false;
-        bool aborted_ = false;
     };
 
     /**
-     * @brief Physical work and optional local arrival for one migration record.
+     * @brief Retain one original physical operation and its exact destination piece.
+     * Each operation keeps its own timing, ACK, source/destination owners and
+     * asynchronous drain. Only the checked shared completion can publish the
+     * destination engine, after every claimed intersection reports Ready.
+     */
+    class MoEOverlayPreparedProjectionOperation final : public IMoEOverlayTierTransferOperation
+    {
+    public:
+        /**
+         * @brief Bind one original physical operation to exactly one checked piece.
+         * @param operation Already-enqueued original lane/ACK operation.
+         * @param completion Complete immutable destination coverage.
+         * @param piece Exact original index in that coverage; may be claimed only once.
+         * @throws std::invalid_argument For absent ownership or an invalid/duplicate piece.
+         */
+        MoEOverlayPreparedProjectionOperation(
+            std::unique_ptr<IMoEOverlayTierTransferOperation> operation,
+            std::shared_ptr<MoEOverlayPreparedProjectionCompletion> completion, std::size_t piece);
+        /** @brief Poll the original operation and report its piece only after actual Ready. */
+        MoEOverlayResidencyWaveProgress poll(std::string *error) noexcept override;
+        /** @brief Poison unpublished completion and asynchronously abort the original operation. */
+        void abort() noexcept override;
+        /** @brief Drain the original operation without releasing its retained owners early. */
+        MoEOverlayResidencyWaveProgress pollAbort(std::string *error) noexcept override;
+        /** @return Unmodified timing of this physical piece after successful completion. */
+        std::optional<ExpertTierProjectionTransferMeasurement>
+        completedMeasurement() const noexcept override;
+        /** @return The underlying actual operation quote, with unchanged source lifetime. */
+        std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override;
+
+    private:
+        std::unique_ptr<IMoEOverlayTierTransferOperation> operation_;
+        std::shared_ptr<MoEOverlayPreparedProjectionCompletion> completion_;
+        std::size_t piece_;
+        bool ready_ = false;
+        bool aborted_ = false;
+    };
+
+    /** @brief One real physical piece, in role/destination-member/source-member order. */
+    struct MoEOverlayParticipantProjectionTransfer
+    {
+        ExpertTierWeightProjection projection=ExpertTierWeightProjection::Gate;
+        int destination_participant=-1; ///< Canonical original target member, never allocation ordinal.
+        int source_participant=-1; ///< Canonical original source member.
+        std::unique_ptr<IMoEOverlayTierTransferOperation> operation;
+        bool requires_local_measurement = false;
+        int observer_world_rank = -1; ///< Actual original fabric PMA owner; absent for protocol-only work.
+    };
+
+    /** @brief One actual local destination's complete role arrival authority. */
+    struct MoEOverlayParticipantDestinationArrival
+    {
+        int participant_id=-1;
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival;
+    };
+
+    /**
+     * @brief All physical work and participant-keyed arrivals for one logical migration.
      *
-     * Records are ordered exactly like `MoEOverlayResidencyTransaction::migrations`.
-     * Every record owns three operations.  `destination_arrival` is present only
-     * on the process that owns the destination participant; other ranks still
-     * carry their topology protocol operations but do not create a host shadow
-     * of a remote prepared engine.
+     * Records retain logical migration order. Operations contain only actual
+     * physical/protocol work, in role, original destination-member, original
+     * source-member order. Local arrivals match the exact local destination
+     * target members; source-only and empty-local ranks fabricate no arrival.
+     * Storage capacity never determines these live vector extents.
      */
     struct MoEOverlayParticipantExpertTransfer
     {
-        std::array<
-            std::unique_ptr<IMoEOverlayTierTransferOperation>,
-            kMoEOverlayExpertProjectionCount>
-            projections;
-        std::shared_ptr<MoEOverlayPreparedExpertArrival> destination_arrival;
+        std::vector<MoEOverlayParticipantProjectionTransfer> operations;
+        std::vector<MoEOverlayParticipantDestinationArrival> destination_arrivals;
+        std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> measurement_geometry;
     };
 
     /** @brief Atomic result of reserving and enqueueing one physical wave. */
@@ -171,7 +297,8 @@ namespace llaminar2
      * @brief Topology-specific authority for projection slots, lanes, and engines.
      *
      * Implementations must reserve the complete closed-cycle transaction before
-     * enqueueing its first byte.  A `Deferred` result owns no operation.  A
+     * enqueueing its first byte. Complete multi-piece destination coverage must
+     * also be checked before that enqueue edge. A `Deferred` result owns no operation.  A
      * `Failed` result may return a fenced prefix so the generic wave can retain
      * and asynchronously abort it.  CUDA/CPU, CUDA/ROCm, same-backend peer, and
      * cross-rank providers all implement this one contract.
@@ -252,6 +379,16 @@ namespace llaminar2
             const MoEOverlayResidencyTransaction &transaction) override;
 
     private:
+        friend struct test::MoEOverlayParticipantMigrationTestAccess;
+        /** Explicit recorded component boundary, inaccessible to production callers. */
+        struct RecordedComponentSource {};
+        /**
+         * @brief Preserve component protocol tests without pretending to own a model source.
+         * @param config Existing test registry and recorded transfer provider.
+         * @param source Private test-access tag, never a public runtime policy.
+         */
+        MoEOverlayParticipantPreparedWaveFactory(Config config,RecordedComponentSource source);
         Config config_;
+        bool requires_original_source_=true; ///< Constructor-only; public runtime construction always authenticates.
     };
 } // namespace llaminar2

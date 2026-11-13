@@ -14,10 +14,13 @@
 
 #include "MoEOverlayInferenceInterferenceProbe.h"
 #include "MoEOverlayMigrationMeasurementExchange.h"
+#include "MoEOverlayMigrationTargetCoordinate.h"
+#include "MoEOverlayPreparedTargetService.h"
 
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "MoEOverlayMigrationEvidenceContext.h"
 
 namespace llaminar2
 {
@@ -32,9 +35,12 @@ namespace llaminar2
     struct MoEOverlayMigrationProfileEvidence
     {
         std::uint64_t profile_sequence = 0;
-        MoEOverlayMigrationMeasurementCoordinate coordinate;
+        MoEOverlayMigrationTargetCoordinate coordinate;
         std::vector<MoEOverlayCompletedMigrationMeasurement>
             local_measurements;
+
+        /** Original local prepared-wave metadata; not reconstructed from incoming rows. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> context;
 
         /** @return Whether identity and the reciprocal pair rows are complete. */
         [[nodiscard]] bool valid() const noexcept;
@@ -82,7 +88,7 @@ namespace llaminar2
     struct MoEOverlayCalibrationAttemptEvidence
     {
         std::uint64_t calibration_sequence = 0;
-        MoEOverlayMigrationMeasurementCoordinate coordinate;
+        MoEOverlayMigrationTargetCoordinate coordinate;
         ExpertHistogramSource source = ExpertHistogramSource::SyntheticTest;
         MoEOverlayInferenceWorkloadIdentity workload;
         std::uint64_t baseline_nanoseconds = 0;
@@ -90,6 +96,9 @@ namespace llaminar2
         bool exact_overlap = false;
         std::vector<MoEOverlayCompletedMigrationMeasurement>
             local_measurements;
+
+        /** Original local prepared-wave metadata shared through cleanup. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> context;
 
         /** @return Whether identity, timings, and two-row swap evidence cohere. */
         [[nodiscard]] bool valid() const noexcept;
@@ -261,6 +270,21 @@ namespace llaminar2
         virtual MoEOverlayResidencyWaveProgress pollService(
             std::vector<MoEOverlayParticipantLayerServiceTotals> *result,
             std::string *error = nullptr) = 0;
+
+        /** @brief Begin prepared-only root evidence on the existing lane; never use live packet totals.
+         * @param plan Original checked declarations. @param local Actual local root samples. @param error Failure diagnostic.
+         * @return Whether this implementation posted the actual prepared exchange. */
+        virtual bool beginPreparedService(std::shared_ptr<const MoEOverlayPreparedTargetServicePlan>,
+            const std::vector<MoEOverlayPreparedTargetServiceTotals>&,std::string* error=nullptr) {
+            if(error)*error="Evidence owner does not implement prepared-target service exchange";return false;
+        }
+        /** @brief Poll actual prepared target evidence; unsupported owners fail rather than use legacy service.
+         * @param result Output corpus. @param error Failure diagnostic. @return Existing lifecycle progress. */
+        virtual MoEOverlayResidencyWaveProgress pollPreparedService(
+            std::vector<MoEOverlayPreparedTargetServiceTotals>*,std::string* error=nullptr) {
+            if(error)*error="Evidence owner does not implement prepared-target service exchange";
+            return MoEOverlayResidencyWaveProgress::Failed;
+        }
 
         /** @return Whether no attempt or service exchange owns resources. */
         [[nodiscard]] virtual bool idle() const noexcept = 0;

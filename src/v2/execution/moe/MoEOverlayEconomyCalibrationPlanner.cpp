@@ -17,6 +17,7 @@
 #include <array>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -254,10 +255,10 @@ namespace llaminar2
                     static_cast<std::uint8_t>(projection.format.kind));
                 hashUnsigned(
                     hash,
-                    projection.format.native_vnni.codebook_id);
+                    projection.format.native_quantised.codebook_id);
                 hashUnsigned(
                     hash,
-                    projection.format.native_vnni.is_superblock ? 1u : 0u);
+                    projection.format.native_quantised.is_superblock ? 1u : 0u);
             }
         }
         std::sort(
@@ -427,117 +428,158 @@ namespace llaminar2
 
     MoEOverlaySealedMigrationMeasurements
     MoEOverlayEconomyCalibrationLayerCatalog::expand(
-        const MoEOverlaySealedMigrationMeasurements &
-            representative_measurements) const
+        const MoEOverlaySealedMigrationMeasurements &measurements) const
     {
-        if (!representative_measurements.valid() || groups_.empty() ||
-            identity_.empty())
+        return expandOriginalMeasurements(measurements, {});
+    }
+
+    MoEOverlaySealedMigrationMeasurements
+    MoEOverlayEconomyCalibrationLayerCatalog::expand(
+        const MoEOverlaySealedMigrationMeasurements &measurements,
+        std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot) const
+    {
+        if (!snapshot || !snapshot->valid() ||
+            snapshot->firstModelLayer() != firstModelLayer() ||
+            snapshot->layerCount() != static_cast<int>(layerCount()))
+            throw std::invalid_argument("Target expansion requires the original sealed cohort source and exact layer interval");
+        if (snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+            return expandOriginalMeasurements(measurements, {});
+        if (!snapshot->originalProjectionPreparation())
+            throw std::invalid_argument("Target expansion lost its original cohort source preparation");
+        return expandOriginalMeasurements(measurements, std::move(snapshot));
+    }
+
+    MoEOverlaySealedMigrationMeasurements
+    MoEOverlayEconomyCalibrationLayerCatalog::expandOriginalMeasurements(
+        const MoEOverlaySealedMigrationMeasurements &measurements,
+        std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot) const
+    {
+        if (!measurements.valid() || groups_.empty() || identity_.empty())
+            throw std::invalid_argument("Calibration expansion requires valid original measurements and catalog");
+
+        using Coordinate = MoEOverlayMigrationTargetCoordinate;
+        std::map<Coordinate, std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>> original_geometry;
+        std::vector<Coordinate> required;
+        if (snapshot)
         {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration expansion requires valid representative evidence and catalog");
+            // The existing planner and fabric geometry builder remain the ONLY
+            // target/intersection authorities. buildShardPlacement uses one
+            // fixed plan-level member order per tier and balancedIntervals for
+            // each source. That rule depends only on F, source block and width;
+            // exact catalog projection classes therefore have identical cuts.
+            // Validate geometry anyway: arbitrary passive cuts are NOT another
+            // admitted scheduler or a reason to invent additional samples.
+            // Every layer's original cohort
+            // retains its complete source manifest, including whole endpoint roles.
+            std::vector<MoEOverlayLayerWeightManifest> manifests;
+            for (int layer = firstModelLayer(); layer < firstModelLayer() + static_cast<int>(layerCount()); ++layer)
+            {
+                const auto &owners = snapshot->placementOwnerMap().owners();
+                const auto source = std::find_if(owners.begin(), owners.end(), [&](const auto &owner) {
+                    return owner.layer_idx == layer && owner.shard_cohort;
+                });
+                if (source == owners.end())
+                    throw std::invalid_argument("Target expansion has no original cohort source manifest for a layer");
+                manifests.push_back(source->shard_cohort->source());
+            }
+            const MoEOverlayEconomyCalibrationLayerCatalog original_catalog(manifests);
+            if (original_catalog.identity() != identity_)
+                throw std::invalid_argument("Target expansion catalog differs from original source formats or geometry");
+            MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,
+                .complete_expert_bytes_per_layer = complete_expert_bytes_per_layer_});
+            required = planner.requiredTargetCoordinates();
+            for (const auto &declaration : planner.requiredTargetMeasurements(manifests))
+                original_geometry.emplace(declaration.coordinate, declaration.geometry);
         }
 
-        using DirectedPair = std::pair<int, int>;
-        std::set<DirectedPair> directed_pairs;
-        std::set<std::tuple<int, int, int>> observed;
-        for (const auto &row : representative_measurements.rows)
+        std::map<Coordinate, const MoEOverlayTargetLayerMigrationMeasurement *> observed;
+        std::set<std::pair<int, int>> directed_pairs;
+        for (const auto &row : measurements.rows)
         {
-            const auto representative = std::lower_bound(
-                representative_layers_.begin(),
-                representative_layers_.end(),
-                row.layer);
-            if (representative == representative_layers_.end() ||
-                *representative != row.layer ||
-                !observed.emplace(
-                     row.source_participant,
-                     row.destination_participant,
-                     row.layer)
-                     .second)
+            if (row.measured_coordinate ||
+                !observed.emplace(row.coordinate, &row).second)
+                throw std::invalid_argument("Calibration expansion rejects projected or duplicate input measurements");
+            (void)storageIndexForModelLayer(row.coordinate.layer);
+            if (!std::binary_search(representative_layers_.begin(), representative_layers_.end(), row.coordinate.layer))
+                throw std::invalid_argument("Calibration expansion requires physically measured catalog representatives");
+            if (snapshot)
             {
-                throw std::invalid_argument(
-                    "ExpertOverlay calibration expansion received a non-representative or duplicate row");
+                const auto expected = original_geometry.find(row.coordinate);
+                if (expected == original_geometry.end() || !row.geometry ||
+                    !expected->second->sameIdentity(*row.geometry))
+                    throw std::invalid_argument("Measured target geometry differs from original members, cuts or source formats");
             }
-            directed_pairs.emplace(
-                row.source_participant, row.destination_participant);
-        }
-        const std::size_t expected_representative_rows = checkedProduct(
-            directed_pairs.size(), groups_.size(), "representative matrix");
-        if (representative_measurements.rows.size() !=
-            expected_representative_rows)
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration expansion is missing a directed-pair/layer-class row");
-        }
-        for (const auto &[source, destination] : directed_pairs)
-        {
-            for (const int representative : representative_layers_)
+            else if (!row.coordinate.source_target.isWhole() || !row.coordinate.destination_target.isWhole())
             {
-                if (!observed.contains(
-                        {source, destination, representative}))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay calibration expansion has an incomplete representative matrix");
-                }
+                throw std::invalid_argument("Whole expansion adapter requires unprojected whole representative rows");
             }
+            directed_pairs.emplace(row.coordinate.source_target.word(), row.coordinate.destination_target.word());
         }
+        if (!snapshot)
+            for (const auto &[source, destination] : directed_pairs)
+                for (int layer = firstModelLayer(); layer < firstModelLayer() + static_cast<int>(layerCount()); ++layer)
+                    required.push_back({MoEOverlayRouteTarget::fromWord(source),
+                        MoEOverlayRouteTarget::fromWord(destination), layer});
+        std::sort(required.begin(), required.end());
 
         MoEOverlaySealedMigrationMeasurements expanded;
-        expanded.rows.reserve(checkedProduct(
-            directed_pairs.size(),
-            complete_expert_bytes_per_layer_.size(),
-            "expanded matrix"));
-        for (const auto &row : representative_measurements.rows)
+        expanded.rows.reserve(required.size());
+        for (const auto &coordinate : required)
         {
-            const auto group = std::lower_bound(
-                groups_.begin(),
-                groups_.end(),
-                row.layer,
-                [](const auto &candidate, int representative)
-                {
-                    return candidate.representative_layer < representative;
-                });
-            if (group == groups_.end() ||
-                group->representative_layer != row.layer)
-            {
-                throw std::logic_error(
-                    "ExpertOverlay calibration representative disappeared during expansion");
-            }
-            for (const int member : group->member_layers)
-            {
-                auto copy = row;
-                copy.layer = member;
-                expanded.rows.push_back(std::move(copy));
-            }
-        }
-        std::sort(
-            expanded.rows.begin(),
-            expanded.rows.end(),
-            [](const auto &left, const auto &right)
-            {
-                return std::tie(
-                           left.source_participant,
-                           left.destination_participant,
-                           left.layer) <
-                       std::tie(
-                           right.source_participant,
-                           right.destination_participant,
-                           right.layer);
+            const auto group = std::find_if(groups_.begin(), groups_.end(), [&](const auto &candidate) {
+                return std::binary_search(candidate.member_layers.begin(), candidate.member_layers.end(), coordinate.layer);
             });
+            if (group == groups_.end())
+                throw std::logic_error("Original catalog lost an owned layer during expansion");
+            const auto sample = observed.find({coordinate.source_target,
+                coordinate.destination_target, group->representative_layer});
+            if (sample == observed.end())
+                throw std::invalid_argument("Calibration expansion is missing an original directed-pair/layer-class measurement");
+            if (snapshot && !sample->second->geometry->sameIdentity(*original_geometry.at(coordinate)))
+                throw std::invalid_argument("Changed original target cuts are not admitted by representative calibration");
 
-        std::uint64_t hash = kFNV1a64OffsetBasis;
-        hashString(hash, representative_measurements.identity);
-        hashString(hash, identity_);
-        expanded.identity =
-            "expert-overlay-expanded-migration-v1/" +
-            catalogIdentity(hash).substr(
-                std::string("expert-overlay-calibration-layer-catalog-v1/")
-                    .size());
-        if (!expanded.valid())
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration expansion produced an invalid full-layer corpus");
+            auto copy = *sample->second;
+            if (copy.coordinate.layer != coordinate.layer)
+            {
+                // Preserve the genuine observation owner and its measured layer.
+                // Equivalent-layer pricing does not create another physical sample.
+                copy.measured_coordinate = copy.coordinate;
+                copy.coordinate = coordinate;
+            }
+            expanded.rows.push_back(std::move(copy));
         }
+        std::uint64_t hash = kFNV1a64OffsetBasis;
+        hashString(hash, measurements.identity);
+        hashString(hash, identity_);
+        if (snapshot)
+        {
+            for (const auto &row : expanded.rows)
+            {
+                hashUnsigned(hash, static_cast<uint64_t>(row.coordinate.source_target.word()));
+                hashUnsigned(hash, static_cast<uint64_t>(row.coordinate.destination_target.word()));
+                hashUnsigned(hash, static_cast<uint64_t>(row.coordinate.layer));
+                hashUnsigned(hash, static_cast<uint64_t>(row.measured_coordinate
+                    ? row.measured_coordinate->layer : row.coordinate.layer));
+            }
+        }
+        expanded.identity = std::string(snapshot ? "expert-overlay-expanded-migration-v2/"
+                                                 : "expert-overlay-expanded-migration-v1/") +
+            catalogIdentity(hash).substr(std::string("expert-overlay-calibration-layer-catalog-v1/").size());
+        if (!expanded.valid())
+            throw std::logic_error("Calibration expansion produced an invalid full-layer corpus");
         return expanded;
+    }
+
+    namespace
+    {
+        /** @return Existing typed route alternative after validating the full original target. */
+        MoEOverlayRouteTarget calibrationRouteTarget(const MoEExpertOwner &owner)
+        {
+            const auto target = MoEExpertPlacementTarget::fromPlacement(owner);
+            if (!target) throw std::invalid_argument("Calibration source has an incomplete original target");
+            return target->isCohort() ? MoEOverlayRouteTarget::cpuCohort(target->tierIndex())
+                                      : MoEOverlayRouteTarget::whole(target->participantId(0));
+        }
     }
 
     MoEOverlayEconomyCalibrationPlanner::
@@ -545,108 +587,125 @@ namespace llaminar2
         : config_(std::move(config))
     {
         if (!config_.live_snapshot || !config_.live_snapshot->valid())
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration planner requires a valid live snapshot");
-        }
-        const int layers =
-            config_.live_snapshot->layered_ownership.layerCount();
-        if (layers <= 0 ||
-            config_.complete_expert_bytes_per_layer.size() !=
-                static_cast<std::size_t>(layers) ||
-            std::any_of(
-                config_.complete_expert_bytes_per_layer.begin(),
-                config_.complete_expert_bytes_per_layer.end(),
-                [](std::size_t bytes) { return bytes == 0; }))
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration planner requires one positive complete-expert footprint per layer");
-        }
-
+            throw std::invalid_argument("Calibration requires a valid original live snapshot");
+        const auto &snapshot = *config_.live_snapshot;
+        const int layers = snapshot.layerCount();
+        if (layers <= 0 || config_.complete_expert_bytes_per_layer.size() != size_t(layers) ||
+            std::any_of(config_.complete_expert_bytes_per_layer.begin(),
+                config_.complete_expert_bytes_per_layer.end(), [](size_t bytes) { return bytes == 0; }))
+            throw std::invalid_argument("Calibration requires one positive complete-expert footprint per layer");
         calibration_layers_ = config_.calibration_layers;
         if (calibration_layers_.empty())
+            for (int row = 0; row < layers; ++row)
+                calibration_layers_.push_back(snapshot.firstModelLayer() + row);
+        if (!std::is_sorted(calibration_layers_.begin(), calibration_layers_.end()) ||
+            std::adjacent_find(calibration_layers_.begin(), calibration_layers_.end()) != calibration_layers_.end() ||
+            std::any_of(calibration_layers_.begin(), calibration_layers_.end(), [&](int layer) {
+                return layer < snapshot.firstModelLayer() ||
+                       int64_t(layer) >= int64_t(snapshot.firstModelLayer()) + layers; }))
+            throw std::invalid_argument("Calibration layers must be unique original model coordinates");
+        const auto &map = snapshot.placementOwnerMap();
+        for (const int layer : calibration_layers_)
         {
-            calibration_layers_.resize(static_cast<std::size_t>(layers));
-            for (int layer = 0; layer < layers; ++layer)
-                calibration_layers_[static_cast<std::size_t>(layer)] =
-                    config_.live_snapshot->layered_ownership.modelLayerForStorageIndex(layer);
-        }
-        if (!std::is_sorted(
-                calibration_layers_.begin(), calibration_layers_.end()) ||
-            std::adjacent_find(
-                calibration_layers_.begin(), calibration_layers_.end()) !=
-                calibration_layers_.end() ||
-            std::any_of(
-                calibration_layers_.begin(),
-                calibration_layers_.end(),
-                [this](int layer)
-                { return !config_.live_snapshot->layered_ownership.containsModelLayer(layer); }))
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration layers must be sorted, unique, and inside model geometry");
-        }
-
-        const auto &participants =
-            config_.live_snapshot->owner_map.participants();
-        if (participants.size() < 2)
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay migration calibration requires at least two participants");
-        }
-        for (const auto &source : participants)
-        {
-            for (const auto &destination : participants)
+            std::map<int32_t, MoEExpertPlacementTarget> targets;
+            std::set<int> covered_participants;
+            for (const auto &owner : map.owners())
             {
-                if (source.participant_id == destination.participant_id)
-                    continue;
-                for (const int layer : calibration_layers_)
-                {
-                    if (config_.live_snapshot->owner_map
-                            .expertsForParticipant(
-                                layer, source.participant_id)
-                            .empty())
-                    {
-                        throw std::invalid_argument(
-                            "ExpertOverlay calibration cannot measure an endpoint/layer with no resident source expert");
-                    }
-                    required_coordinates_.push_back({
-                        .source_participant = source.participant_id,
-                        .destination_participant = destination.participant_id,
-                        .layer = layer,
-                    });
-                }
+                if (owner.layer_idx != layer) continue;
+                const auto tag = calibrationRouteTarget(owner);
+                const auto target = *MoEExpertPlacementTarget::fromPlacement(owner);
+                const auto [position, inserted] = targets.emplace(tag.word(), target);
+                if (!inserted && !(position->second == target))
+                    throw std::invalid_argument("Calibration target tag has conflicting original source geometry");
+                for (size_t member = 0; member < target.participantCount(); ++member)
+                    covered_participants.insert(target.participantId(member));
             }
+            // A zero-quota/empty endpoint cannot be invented as a calibration
+            // source. Cohort members are covered by their one complete target.
+            for (const auto &participant : map.participants())
+                if (!covered_participants.contains(participant.participant_id))
+                    throw std::invalid_argument("Calibration requires a resident source at every admitted target/layer");
+            if (targets.size() < 2)
+                throw std::invalid_argument("Calibration requires at least two complete resident targets");
+            for (const auto &[source, source_definition] : targets)
+                for (const auto &[destination, destination_definition] : targets)
+                {
+                    (void)source_definition; (void)destination_definition;
+                    if (source != destination)
+                        required_target_coordinates_.push_back({MoEOverlayRouteTarget::fromWord(source),
+                            MoEOverlayRouteTarget::fromWord(destination), layer});
+                }
         }
-        std::sort(
-            required_coordinates_.begin(), required_coordinates_.end());
+        std::sort(required_target_coordinates_.begin(), required_target_coordinates_.end());
     }
 
-    MoEExpertOwner MoEOverlayEconomyCalibrationPlanner::destinationOwner(
-        const MoEExpertOwner &source,
-        int destination_participant) const
+    std::vector<MoEOverlayRequiredTargetMigrationMeasurement>
+    MoEOverlayEconomyCalibrationPlanner::requiredTargetMeasurements(
+        std::span<const MoEOverlayLayerWeightManifest> manifests) const
     {
-        const auto *participant =
-            config_.live_snapshot->owner_map.participantForId(
-                destination_participant);
-        if (!participant)
+        std::map<int, const MoEOverlayLayerWeightManifest *> source;
+        for (const auto &manifest : manifests)
         {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration references an unknown destination participant");
+            if (!manifest.valid() || !source.emplace(manifest.layer_idx, &manifest).second)
+                throw std::invalid_argument("Calibration declarations require unique complete original source manifests");
         }
-        MoEExpertOwner destination = source;
-        destination.tier_idx = participant->tier_idx;
-        destination.owner_participant = participant->participant_id;
-        destination.device = participant->device;
-        destination.resident = true;
-        destination.tier_name = participant->tier_name;
-        destination.domain_name = participant->domain_name;
-        destination.domain_participant_index =
-            participant->domain_participant_index;
-        destination.owner_world_rank = participant->world_rank;
-        destination.owner_world_rank_known =
-            participant->world_rank_known;
-        destination.address = participant->address;
-        return destination;
+        if (source.size() != static_cast<std::size_t>(config_.live_snapshot->layerCount()))
+            throw std::invalid_argument("Calibration declarations omitted original source layers");
+        for (int layer = config_.live_snapshot->firstModelLayer();
+             layer < config_.live_snapshot->firstModelLayer() + config_.live_snapshot->layerCount(); ++layer)
+        {
+            const auto manifest = source.find(layer);
+            if (manifest == source.end())
+                throw std::invalid_argument("Calibration declarations contain a foreign or omitted original source layer");
+            if (config_.live_snapshot->jointOwnerMap())
+            {
+                const auto &owners = config_.live_snapshot->placementOwnerMap().owners();
+                const auto original = std::find_if(owners.begin(), owners.end(), [layer](const auto &owner) {
+                    return owner.layer_idx == layer && owner.shard_cohort;
+                });
+                if (original == owners.end() || original->shard_cohort->source() != *manifest->second)
+                    throw std::invalid_argument("Calibration declaration changed its original cohort source geometry or format");
+            }
+        }
+        std::vector<MoEOverlayRequiredTargetMigrationMeasurement> result;
+        result.reserve(required_target_coordinates_.size());
+        for (const auto &coordinate : required_target_coordinates_)
+        {
+            const auto manifest = source.find(coordinate.layer);
+            if (manifest == source.end())
+                throw std::invalid_argument("Calibration declaration has no original source layer");
+            const auto wave = buildPairSwap(coordinate.source_target,
+                coordinate.destination_target, coordinate.layer, 1);
+            result.push_back({.coordinate = coordinate,
+                .geometry = makePhysicalMoEOverlayMeasurementGeometry(wave.migrations.front(),
+                    *manifest->second, config_.live_snapshot->expertCount(),
+                    config_.live_snapshot->placementOwnerMap())});
+        }
+        return result;
+    }
+
+    std::vector<MoEOverlayMigrationMeasurementCoordinate>
+    MoEOverlayEconomyCalibrationPlanner::requiredCoordinates() const
+    {
+        std::vector<MoEOverlayMigrationMeasurementCoordinate> result;
+        result.reserve(required_target_coordinates_.size());
+        for (const auto &coordinate : required_target_coordinates_)
+        {
+            if (!coordinate.source_target.isWhole() || !coordinate.destination_target.isWhole())
+                throw std::logic_error("Scalar calibration consumers cannot certify complete CPU cohort targets");
+            result.push_back({coordinate.source_target.word(), coordinate.destination_target.word(), coordinate.layer});
+        }
+        return result;
+    }
+
+    const MoEExpertOwner &MoEOverlayEconomyCalibrationPlanner::sourceOwner(
+        MoEOverlayRouteTarget target, int layer) const
+    {
+        if (target.isAbsent()) throw std::invalid_argument("Calibration target is absent");
+        for (const auto &owner : config_.live_snapshot->placementOwnerMap().owners())
+            if (owner.layer_idx == layer && calibrationRouteTarget(owner).word() == target.word())
+                return owner;
+        throw std::invalid_argument("Calibration target has no complete resident original source at this layer");
     }
 
     MoEOverlayTierMigrationDirection
@@ -674,112 +733,50 @@ namespace llaminar2
         return MoEOverlayTierMigrationDirection::SamePriority;
     }
 
-    MoEOverlayResidencyTransaction
-    MoEOverlayEconomyCalibrationPlanner::buildPairSwap(
-        int source_participant,
-        int destination_participant,
-        int layer,
-        std::uint64_t calibration_sequence) const
+    MoEOverlayResidencyTransaction MoEOverlayEconomyCalibrationPlanner::buildPairSwap(
+        int source_participant, int destination_participant, int layer, uint64_t sequence) const
     {
-        if (source_participant == destination_participant ||
-            calibration_sequence == 0 ||
-            !config_.live_snapshot->layered_ownership.containsModelLayer(layer) ||
-            !std::binary_search(
-                calibration_layers_.begin(),
-                calibration_layers_.end(),
-                layer))
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration swap requires distinct endpoints, a valid layer, and positive sequence");
-        }
-        const auto source_experts =
-            config_.live_snapshot->owner_map.expertsForParticipant(
-                layer, source_participant);
-        const auto destination_experts =
-            config_.live_snapshot->owner_map.expertsForParticipant(
-                layer, destination_participant);
-        if (source_experts.empty() || destination_experts.empty())
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration swap endpoint has no resident source expert");
-        }
+        return buildPairSwap(MoEOverlayRouteTarget::whole(source_participant),
+                             MoEOverlayRouteTarget::whole(destination_participant), layer, sequence);
+    }
 
-        const auto *forward_source =
-            config_.live_snapshot->owner_map.ownerFor(
-                layer, source_experts.front());
-        const auto *reverse_source =
-            config_.live_snapshot->owner_map.ownerFor(
-                layer, destination_experts.front());
-        if (!forward_source || !reverse_source)
+    MoEOverlayResidencyTransaction MoEOverlayEconomyCalibrationPlanner::buildPairSwap(
+        MoEOverlayRouteTarget source_target, MoEOverlayRouteTarget destination_target,
+        int layer, uint64_t sequence) const
+    {
+        const MoEOverlayMigrationTargetCoordinate coordinate{source_target, destination_target, layer};
+        if (!coordinate.valid() || sequence == 0 ||
+            !std::binary_search(required_target_coordinates_.begin(), required_target_coordinates_.end(), coordinate))
+            throw std::invalid_argument("Calibration requires one declared complete target pair/layer and positive sequence");
+        const auto &forward = sourceOwner(source_target, layer);
+        const auto &reverse = sourceOwner(destination_target, layer);
+        auto forward_destination = reverse;
+        forward_destination.expert_id = forward.expert_id;
+        auto reverse_destination = forward;
+        reverse_destination.expert_id = reverse.expert_id;
+        MoEOverlayResidencyTransaction result;
+        result.purpose = MoEOverlayResidencyTransactionPurpose::EconomyCalibration;
+        result.calibration_sequence = sequence;
+        result.expected_epoch = config_.live_snapshot->epoch;
+        result.previous = config_.live_snapshot;
+        result.candidate = MoEOverlayResidencyAuthority::buildCalibrationShadowSnapshot(config_.live_snapshot);
+        const auto bytes = config_.complete_expert_bytes_per_layer.at(size_t(layer - result.previous->firstModelLayer()));
+        result.migrations = {
+            {.layer_idx=layer, .expert_id=forward.expert_id, .activation_count=0, .estimated_weight_bytes=bytes,
+             .direction=direction(forward.tier_idx, reverse.tier_idx), .source=forward, .destination=std::move(forward_destination)},
+            {.layer_idx=layer, .expert_id=reverse.expert_id, .activation_count=0, .estimated_weight_bytes=bytes,
+             .direction=direction(reverse.tier_idx, forward.tier_idx), .source=reverse, .destination=std::move(reverse_destination)}};
+        result.migration_cycles = {{.layer_idx=layer, .migration_indices={0,1}}};
+        // Preserve the historical forward/reverse requirement order for whole
+        // targets, expanding each actual original destination member in place.
+        for (const auto &edge : result.migrations)
         {
-            throw std::logic_error(
-                "ExpertOverlay calibration lost an owner selected from its live map");
+            const auto destination = *MoEExpertPlacementTarget::fromPlacement(edge.destination);
+            for (size_t member = 0; member < destination.participantCount(); ++member)
+                result.shadow_requirements.push_back({.layer_idx=layer, .tier_idx=destination.tierIndex(),
+                    .destination_participant=destination.participantId(member), .slot_count=1});
         }
-
-        auto candidate =
-            std::make_shared<MoEOverlayResidencySnapshot>(
-                *config_.live_snapshot);
-        candidate->epoch = config_.live_snapshot->epoch + 1;
-        const std::size_t bytes =
-            config_.complete_expert_bytes_per_layer[
-                config_.live_snapshot->layered_ownership.storageIndexForModelLayer(layer)];
-
-        MoEOverlayResidencyTransaction transaction;
-        transaction.purpose =
-            MoEOverlayResidencyTransactionPurpose::EconomyCalibration;
-        transaction.calibration_sequence = calibration_sequence;
-        transaction.expected_epoch = config_.live_snapshot->epoch;
-        transaction.previous = config_.live_snapshot;
-        transaction.candidate = std::move(candidate);
-        transaction.migrations = {
-            {
-                .layer_idx = layer,
-                .expert_id = forward_source->expert_id,
-                .activation_count = 0,
-                .estimated_weight_bytes = bytes,
-                .direction = direction(
-                    forward_source->tier_idx,
-                    reverse_source->tier_idx),
-                .source = *forward_source,
-                .destination = destinationOwner(
-                    *forward_source, destination_participant),
-            },
-            {
-                .layer_idx = layer,
-                .expert_id = reverse_source->expert_id,
-                .activation_count = 0,
-                .estimated_weight_bytes = bytes,
-                .direction = direction(
-                    reverse_source->tier_idx,
-                    forward_source->tier_idx),
-                .source = *reverse_source,
-                .destination = destinationOwner(
-                    *reverse_source, source_participant),
-            },
-        };
-        transaction.migration_cycles = {{
-            .layer_idx = layer,
-            .migration_indices = {0, 1},
-        }};
-        transaction.shadow_requirements = {
-            {
-                .layer_idx = layer,
-                .tier_idx = transaction.migrations[0].destination.tier_idx,
-                .destination_participant = destination_participant,
-                .slot_count = 1,
-            },
-            {
-                .layer_idx = layer,
-                .tier_idx = transaction.migrations[1].destination.tier_idx,
-                .destination_participant = source_participant,
-                .slot_count = 1,
-            },
-        };
-        if (!transaction.valid())
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration planner produced an invalid closed swap");
-        }
-        return transaction;
+        if (!result.valid()) throw std::logic_error("Calibration producer did not seal a complete original-target shadow wave");
+        return result;
     }
 } // namespace llaminar2

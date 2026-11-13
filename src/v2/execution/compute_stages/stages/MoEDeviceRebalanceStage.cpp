@@ -296,7 +296,14 @@ namespace llaminar2
             static_cast<DeviceMoERebalanceMovementEdge *>(bound_workspace_->getBuffer(
                 workspaceBufferName(WS_MOVEMENT_EDGES, workspaceSuffix()))),
             static_cast<uint32_t>(capacity.movementJournalWaveCapacity()),
-            static_cast<uint32_t>(capacity.movementJournalEdgeCapacity())};
+            static_cast<uint32_t>(capacity.movementJournalEdgeCapacity()),
+            hasDeviceMoERebalanceFlag(params_.config.flags, DeviceMoERebalanceFlags::CompletedDynamicDecisions) &&
+                    params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply &&
+                    params_.overlay_epoch_arena && params_.config.participant_count > 1 &&
+                    params_.config.participant_id == params_.config.root_participant
+                ? static_cast<const DeviceMoERebalanceStatus *>(bound_workspace_->getBuffer(
+                      workspaceBufferName(WS_STATUS, workspaceSuffix())))
+                : nullptr};
     }
 
     std::string MoEDeviceRebalanceStage::llepLayerPlansBufferName() const

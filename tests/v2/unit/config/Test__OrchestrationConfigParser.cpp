@@ -21,11 +21,60 @@
 
 #include <gtest/gtest.h>
 #include "config/OrchestrationConfigParser.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "utils/DebugEnv.h"
 #include "planning/ActivationBufferSizing.h"
 
 using namespace llaminar2;
+
+/** @test Public domain keys name experts and retain each distinct physical compute mode. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysPreserveDistinctCPUComputeModes)
+{
+    for (const auto mode : {RoutedExpertComputePolicy::Apportioned,
+                           RoutedExpertComputePolicy::Replicated,
+                           RoutedExpertComputePolicy::TensorSharded})
+    {
+        const std::string specification =
+            std::string("cpu_capacity=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=upi;") +
+            "expert_compute=" + routedExpertComputePolicyToString(mode) +
+            ";expert_phase=uniform;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner";
+        const auto domain = ExecutionDomainDefinition::parse(specification);
+        EXPECT_EQ(domain.routed_compute_policy, mode);
+        EXPECT_EQ(domain.routed_phase_policy, RoutedExpertPhasePolicy::Uniform);
+        EXPECT_EQ(domain.routed_decode_assignment_policy, RoutedExpertAssignmentPolicy::StaticOwner);
+        EXPECT_EQ(domain.routed_prefill_assignment_policy, RoutedExpertAssignmentPolicy::StaticOwner);
+        EXPECT_EQ(domain.scope, ExecutionDomainScope::NODE_LOCAL);
+        EXPECT_EQ(domain.backend, CollectiveBackendType::UPI);
+        EXPECT_EQ(domain.participants.size(), 2u);
+        EXPECT_TRUE(domain.validate().empty());
+        const auto description=domain.toString();
+        EXPECT_NE(description.find("expert_compute="),std::string::npos);
+        EXPECT_EQ(description.find("routed_compute="),std::string::npos);
+    }
+}
+
+/** @test Obsolete ambiguous domain keys are rejected instead of becoming hidden aliases. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysRejectObsoleteSpellings)
+{
+    for (const auto* obsolete : {"routed_compute=apportioned", "routed_phase=uniform",
+                                "routed_decode_assignment=static-owner", "routed_prefill_assignment=static-owner"})
+    {
+        EXPECT_THROW(ExecutionDomainDefinition::parse(
+            std::string("cpu_capacity=cpu:0;scope=single;") + obsolete), std::invalid_argument);
+    }
+}
+
+/** @test Domain help explains both expert layouts and exposes every expert-specific key. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysHelpExplainsPhysicalLayouts)
+{
+    const auto help=OrchestrationConfigParser::getHelpText();
+    for(const auto* key:{"expert_compute=", "expert_phase=", "expert_decode_assignment=", "expert_prefill_assignment="})
+        EXPECT_NE(help.find(key),std::string::npos);
+    EXPECT_NE(help.find("apportioned distributes whole experts"),std::string::npos);
+    EXPECT_NE(help.find("tensor-sharded splits each expert's matrices"),std::string::npos);
+    EXPECT_EQ(help.find("routed_compute="),std::string::npos);
+}
 
 // ============================================================================
 // Helper to convert string array to argc/argv
@@ -53,6 +102,32 @@ private:
     std::vector<std::string> strings_;
     std::vector<char *> argv_;
 };
+
+/** @test Compact tier CLI and saved config preserve expert policies without selecting a topology implementation. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysRoundTripPublicTierDeclaration)
+{
+    for(const auto* mode:{"apportioned","tensor-sharded"})
+    {
+        const std::string specification=std::string(
+            "cpu_capacity=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=upi;priority=10;")+
+            "expert_compute="+mode+";expert_phase=uniform;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner";
+        ArgvHelper args{"llaminar2","--expert-tier",specification.c_str()};
+        const auto config=OrchestrationConfigParser{}.parseArgs(args.argc(),args.argv());
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        ASSERT_EQ(config.moe_routed_expert_plan->domains.size(),1u);
+        const auto& original=config.moe_routed_expert_plan->domains.front();
+        EXPECT_EQ(routedExpertComputePolicyToString(original.routed_compute_policy),std::string(mode));
+        const auto restored=deserializeOrchestrationConfig(serializeOrchestrationConfig(config));
+        ASSERT_TRUE(restored.moe_routed_expert_plan);
+        ASSERT_EQ(restored.moe_routed_expert_plan->domains.size(),1u);
+        const auto& roundTrip=restored.moe_routed_expert_plan->domains.front();
+        EXPECT_EQ(roundTrip.routed_compute_policy,original.routed_compute_policy);
+        EXPECT_EQ(roundTrip.routed_phase_policy,original.routed_phase_policy);
+        EXPECT_EQ(roundTrip.routed_decode_assignment_policy,original.routed_decode_assignment_policy);
+        EXPECT_EQ(roundTrip.routed_prefill_assignment_policy,original.routed_prefill_assignment_policy);
+        EXPECT_EQ(roundTrip.participants,original.participants);
+    }
+}
 
 // ============================================================================
 // Factory Function Tests
@@ -647,7 +722,7 @@ TEST(Test__OrchestrationConfigParser,
         "--moe-routed-expert-continuation-domain", "portable_gpu_pool",
         "--moe-routed-expert-shared-domain", "portable_gpu_pool",
         "--moe-routed-expert-domain",
-        "portable_gpu_pool=cuda:0,cuda:1;scope=auto;backend=nccl;routed_compute=apportioned",
+        "portable_gpu_pool=cuda:0,cuda:1;scope=auto;backend=nccl;expert_compute=apportioned",
         "--moe-routed-expert-tier",
         "priority_0@portable_gpu_pool;priority=0",
     };
@@ -672,8 +747,8 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
                             "--moe-routed-expert-placement", "tiered-overlay",
                             "--moe-routed-expert-continuation-domain", "rocm_hot",
                             "--moe-routed-expert-shared-domain", "rocm_hot",
-                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;routed_compute=apportioned;owner=0",
-                            "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1",
+                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;expert_compute=apportioned;owner=0",
+                            "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;expert_compute=apportioned;ranks=0,1",
                             "--moe-routed-expert-tier", "hot@rocm_hot;priority=0",
                             "--moe-routed-expert-tier", "cold@cpu_cold;priority=1"};
 
@@ -715,7 +790,7 @@ TEST(Test__OrchestrationConfigParser, Phase9B_OverlayDenseTPOptIn)
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-tp", "true",
                     "--moe-continuation-dense-decode-replicated", "true",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -743,7 +818,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesPhaseSplitHybrid
                     "--moe-routed-expert-base-model-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-policy", "prefill-tensor-parallel-decode-replicated",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -769,7 +844,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesDecodeMirroredEm
                     "--moe-routed-expert-base-model-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-policy", "tensor-parallel-decode-mirrored-embedding",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -815,9 +890,9 @@ TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyDescriptionNamesEveryAxi
     EXPECT_EQ(
         describeMoEExecutionPolicy(policy),
         "dense=tensor-parallel-decode-mirrored-embedding,"
-        "routed_compute=tensor-sharded,routed_phase=uniform,"
-        "routed_decode_assignment=static-owner,"
-        "routed_prefill_assignment=static-owner");
+        "expert_compute=tensor-sharded,expert_phase=uniform,"
+        "expert_decode_assignment=static-owner,"
+        "expert_prefill_assignment=static-owner");
 }
 
 TEST(Test__OrchestrationConfigParser, AmbiguousCompositePolicyAliasesAreRejected)
@@ -842,10 +917,10 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesPhaseSplitIndependen
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
         "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
-        "routed_compute=replicated;"
-        "routed_phase=prefill-apportioned-decode-replicated;"
-        "routed_decode_assignment=static-owner;"
-        "routed_prefill_assignment=static-owner;owner=0",
+        "expert_compute=replicated;"
+        "expert_phase=prefill-apportioned-decode-replicated;"
+        "expert_decode_assignment=static-owner;"
+        "expert_prefill_assignment=static-owner;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
@@ -884,8 +959,8 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsPhaseSplitWithoutRe
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
         "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
-        "routed_compute=apportioned;"
-        "routed_phase=prefill-apportioned-decode-replicated;owner=0",
+        "expert_compute=apportioned;"
+        "expert_phase=prefill-apportioned-decode-replicated;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
@@ -899,7 +974,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesDecodeAndPrefillAssi
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;expert_decode_assignment=static-owner;expert_prefill_assignment=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -932,7 +1007,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsAmbiguousAllWorkAss
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
         "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
-        "routed_compute=apportioned;"
+        "expert_compute=apportioned;"
         "routed_assignment=least-loaded-resident;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
@@ -949,7 +1024,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLeastLoadedAsComput
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -962,7 +1037,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=expert_parallel;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=expert_parallel;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -971,9 +1046,9 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
 TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForSharedParticipants)
 {
     const auto first = ExecutionDomainDefinition::parse(
-        "continuation=0:cuda:0;scope=single;backend=auto;routed_compute=apportioned");
+        "continuation=0:cuda:0;scope=single;backend=auto;expert_compute=apportioned");
     const auto second = ExecutionDomainDefinition::parse(
-        "shared_experts=0:cuda:0;scope=single;backend=auto;routed_compute=apportioned");
+        "shared_experts=0:cuda:0;scope=single;backend=auto;expert_compute=apportioned");
 
     EXPECT_TRUE(first.samePhysicalParticipants(second));
     EXPECT_NE(first.logicalIdentity(), second.logicalIdentity());
@@ -1531,7 +1606,7 @@ moe_routed_expert_placement:
     base_model_domain: gpu_hot
     shared_expert_domain: gpu_hot
     domains:
-        - "gpu_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0"
+        - "gpu_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner;owner=0"
     routed_tiers:
         - "hot@gpu_hot;priority=0"
     )";
@@ -3084,4 +3159,254 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_RepeatedFlag_LastWriteWins)
     auto parser = createOrchestrationConfigParser();
     auto config = parser->parseArgs(args.argc(), args.argv());
     EXPECT_FLOAT_EQ(config.temperature, 0.9f);
+}
+
+/** @test Explicit row-store mode and exact bounded mapping geometry survive public parsing. */
+TEST(Test__OrchestrationConfigParser, NgramStorageCliAndYamlRetainTypedPolicy)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{"llaminar2", "--ngram-storage=mmap", "--ngram-mmap-window-bytes", "131072",
+                    "--ngram-mmap-window-count", "17"};
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.ngram_table_policy.storage, ImmutableRowStoragePreference::MemoryMapped);
+    EXPECT_EQ(config.ngram_table_policy.window_bytes, 131072u);
+    EXPECT_EQ(config.ngram_table_policy.window_count, 17u);
+    const auto yaml = parser.parseYamlString(
+        "ngram:\n  storage: mmap\n  mmap_window_bytes: 131072\n  mmap_window_count: 17\n");
+    EXPECT_EQ(yaml.ngram_table_policy, config.ngram_table_policy);
+    const auto flat = parser.parseYamlString(
+        "ngram_storage: mmap\nngram_mmap_window_bytes: 131072\nngram_mmap_window_count: 17\n");
+    EXPECT_EQ(flat.ngram_table_policy, config.ngram_table_policy);
+    ArgvHelper ram{"llaminar2", "--ngram-storage", "ram"};
+    EXPECT_EQ(parser.parseArgs(ram.argc(), ram.argv()).ngram_table_policy.storage, ImmutableRowStoragePreference::RAM);
+}
+
+/** @test Invalid modes, incomplete numbers and unbounded windows fail without substitution. */
+TEST(Test__OrchestrationConfigParser, NgramStorageRejectsUnknownAndUnboundedPolicy)
+{
+    OrchestrationConfigParser parser;
+    for (const auto *value : {"automatic", "ssd", "RAM", ""})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-storage", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    for (const auto *value : {"0", "-1", "4x", "18446744073709551616"})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-mmap-window-count", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    for (const auto *value : {"0", "1", "4097"})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-storage", "mmap", "--ngram-mmap-window-bytes", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    EXPECT_EQ(parser.parseYamlString("ngram:\n  storage: auto\n").ngram_table_policy.storage,
+              ImmutableRowStoragePreference::Automatic);
+    EXPECT_THROW(parser.parseYamlString("ngram:\n  mmap_window_count: 0\n"), std::invalid_argument);
+    EXPECT_THROW(parser.parseYamlString("ngram:\n  invented: 1\n"), std::invalid_argument);
+}
+
+/** @test All public preferences remain lossless; no capacity or runtime decision is made while parsing. */
+TEST(Test__OrchestrationConfigParser, NgramStoragePreferenceIsRequestedAndDefaultsAutomatic)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper defaults{"llaminar2"};
+    EXPECT_EQ(parser.parseArgs(defaults.argc(), defaults.argv()).ngram_table_policy.storage,
+              ImmutableRowStoragePreference::Automatic);
+    for (const auto &[text, preference] : std::vector<std::pair<std::string, ImmutableRowStoragePreference>>{
+        {"auto", ImmutableRowStoragePreference::Automatic}, {"vram", ImmutableRowStoragePreference::VRAM},
+        {"ram", ImmutableRowStoragePreference::RAM}, {"mmap", ImmutableRowStoragePreference::MemoryMapped}})
+    {
+        SCOPED_TRACE(text);
+        ArgvHelper args{"llaminar2", "--ngram-storage", text.c_str()};
+        EXPECT_EQ(parser.parseArgs(args.argc(), args.argv()).ngram_table_policy.storage, preference);
+        EXPECT_EQ(parser.parseYamlString("ngram:\n  storage: " + text + "\n").ngram_table_policy.storage, preference);
+    }
+}
+
+/** @test Adaptive RAM/SSD is explicit, bounded and lossless; original Auto remains unchanged. */
+TEST(Test__OrchestrationConfigParser, NgramHostAdaptiveRamSsdCliAndYamlRemainFirstClass)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *rows:{"0","37"})
+    {
+        ArgvHelper args{"llaminar2","--ngram-storage","host-adaptive-ram-ssd","--ngram-cache-max-rows",rows,
+            "--ngram-cache-bytes","8192","--ngram-cache-aging-accesses","97",
+            "--ngram-cache-protected-numerator","2","--ngram-cache-protected-denominator","5",
+            "--ngram-mmap-window-bytes","131072","--ngram-mmap-window-count","7"};
+        const auto c=parser.parseArgs(args.argc(),args.argv());
+        EXPECT_TRUE(c.ngram_table_policy.isHostAdaptive());
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.maximum_cache_rows,std::stoull(rows));
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.cache_physical_byte_limit,8192u);
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.policy.aging_accesses,97u);
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.policy.protected_numerator,2u);
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.policy.protected_denominator,5u);
+        const auto yaml=parser.parseYamlString(std::string("ngram:\n  storage: host-adaptive-ram-ssd\n  ram_cache_max_rows: ")+rows+
+            "\n  ram_cache_bytes: 8192\n  aging_accesses: 97\n  protected_numerator: 2\n  protected_denominator: 5"
+            "\n  mmap_window_bytes: 131072\n  mmap_window_count: 7\n");
+        EXPECT_EQ(c.ngram_table_policy,yaml.ngram_table_policy);
+    }
+    ArgvHelper automatic{"llaminar2"};
+    EXPECT_EQ(parser.parseArgs(automatic.argc(),automatic.argv()).ngram_table_policy,ImmutableRowTablePolicy{});
+    ArgvHelper zero{"llaminar2","--ngram-storage","host-adaptive-ram-ssd"};
+    const auto zero_policy=parser.parseArgs(zero.argc(),zero.argv()).ngram_table_policy;
+    EXPECT_TRUE(zero_policy.isHostAdaptive());EXPECT_EQ(zero_policy.host_adaptive.maximum_cache_rows,0u);
+    EXPECT_EQ(zero_policy.host_adaptive.cache_physical_byte_limit,0u);
+}
+/** @test Mixed arms and malformed ceilings reject without selecting another storage tier. */
+TEST(Test__OrchestrationConfigParser, NgramHostAdaptiveRamSsdRejectsMixedAndInvalidRequests)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *mode:{"auto","ram","mmap","vram"})
+    {
+        ArgvHelper mixed{"llaminar2","--ngram-storage",mode,"--ngram-cache-max-rows","1"};
+        EXPECT_THROW((void)parser.parseArgs(mixed.argc(),mixed.argv()),std::invalid_argument);
+    }
+    for(const auto *value:{"-1","4x","4294967295","18446744073709551616"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","host-adaptive-ram-ssd","--ngram-cache-max-rows",value};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    for(const auto *flag:{"--ngram-cache-aging-accesses","--ngram-cache-protected-denominator"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","host-adaptive-ram-ssd",flag,"0"};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: host-adaptive-ram-ssd\n  protected_numerator: 4\n  protected_denominator: 3\n"),std::invalid_argument);
+}
+
+/** @test CLI carries an explicit distribution independently of tier; Auto cannot enter it. */
+TEST(Test__OrchestrationConfigParser, FixedHeadDistributionRequiresExplicitVRAM)
+{
+    ArgvHelper args{"llaminar2","--ngram-storage","vram","--ngram-distribution","fixed-head-sharded"};
+    const auto c=OrchestrationConfigParser{}.parseArgs(args.argc(),args.argv());
+    EXPECT_EQ(c.ngram_table_policy.distribution,ImmutableRowTableDistribution::FixedHeadSharded);
+    EXPECT_EQ(c.ngram_table_policy.storage,ImmutableRowStoragePreference::VRAM);
+    ArgvHelper defaults{"llaminar2","--ngram-storage","vram"};
+    EXPECT_EQ(OrchestrationConfigParser{}.parseArgs(defaults.argc(),defaults.argv()).ngram_table_policy.distribution,
+        ImmutableRowTableDistribution::Replicated);
+    ArgvHelper automatic{"llaminar2","--ngram-distribution","fixed-head-sharded"};
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseArgs(automatic.argc(),automatic.argv()),std::invalid_argument);
+    ArgvHelper unknown{"llaminar2","--ngram-distribution","sharded"};
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseArgs(unknown.argc(),unknown.argv()),std::invalid_argument);
+}
+
+/** @test Disjoint GPU/subordinate fields round-trip through CLI/YAML/document without flag-order interpretation. */
+TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdPreservesDisjointCeilingsAndPolicies)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *rows:{"0","64"})
+    {
+        ArgvHelper args{"llaminar2","--ngram-gpu-cache-max-rows",rows,"--ngram-gpu-cache-bytes","1048576",
+            "--ngram-gpu-cache-aging-accesses","97","--ngram-gpu-cache-protected-numerator","2",
+            "--ngram-gpu-cache-protected-denominator","5","--ngram-source-cache-max-rows","32",
+            "--ngram-source-cache-bytes","65536","--ngram-source-cache-aging-accesses","113",
+            "--ngram-source-cache-protected-numerator","1","--ngram-source-cache-protected-denominator","3",
+            "--ngram-mmap-window-bytes","131072","--ngram-mmap-window-count","7",
+            "--ngram-storage","gpu-adaptive-vram-ram-ssd"};
+        const auto c=parser.parseArgs(args.argc(),args.argv());const auto &p=c.ngram_table_policy;
+        ASSERT_TRUE(p.isGPUAdaptive());EXPECT_EQ(p.host_adaptive,HostAdaptiveRAMSSDRequest{});
+        EXPECT_EQ(p.gpu_adaptive.maximum_gpu_cache_rows,std::stoull(rows));EXPECT_EQ(p.gpu_adaptive.gpu_cache_physical_byte_limit,1048576u);
+        EXPECT_EQ(p.gpu_adaptive.gpu_policy,(CpuImmutableRowCachePolicy{97,2,5}));
+        EXPECT_EQ(p.gpu_adaptive.host.maximum_cache_rows,32u);EXPECT_EQ(p.gpu_adaptive.host.cache_physical_byte_limit,65536u);
+        EXPECT_EQ(p.gpu_adaptive.host.policy,(CpuImmutableRowCachePolicy{113,1,3}));
+        const auto yaml=parser.parseYamlString(std::string("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  gpu_cache_max_rows: ")+rows+
+            "\n  gpu_cache_bytes: 1048576\n  gpu_aging_accesses: 97\n  gpu_protected_numerator: 2\n  gpu_protected_denominator: 5\n"
+            "  source_cache_max_rows: 32\n  source_cache_bytes: 65536\n  source_aging_accesses: 113\n"
+            "  source_protected_numerator: 1\n  source_protected_denominator: 3\n  mmap_window_bytes: 131072\n  mmap_window_count: 7\n");
+        EXPECT_EQ(yaml.ngram_table_policy,p);
+        EXPECT_EQ(parser.parseYamlString(serializeOrchestrationConfig(c)).ngram_table_policy,p);
+    }
+    ArgvHelper zero{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd"};
+    const auto p=parser.parseArgs(zero.argc(),zero.argv()).ngram_table_policy;
+    EXPECT_TRUE(p.isGPUAdaptive());EXPECT_EQ(p.gpu_adaptive,AdaptiveVRAMRAMSSDRequest{});
+    ArgvHelper automatic{"llaminar2"};
+    EXPECT_EQ(parser.parseArgs(automatic.argc(),automatic.argv()).ngram_table_policy,ImmutableRowTablePolicy{});
+}
+/** @test Wrong/mixed arms, malformed limits and unknown policy cannot be repaired into another mode. */
+TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdRejectsMixedInvalidAndWrongModeFields)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *mode:{"auto","vram","ram","mmap","host-adaptive-ram-ssd"})
+    {
+        ArgvHelper mixed{"llaminar2","--ngram-storage",mode,"--ngram-gpu-cache-max-rows","1"};
+        EXPECT_THROW((void)parser.parseArgs(mixed.argc(),mixed.argv()),std::invalid_argument);
+        ArgvHelper source{"llaminar2","--ngram-source-cache-max-rows","1","--ngram-storage",mode};
+        EXPECT_THROW((void)parser.parseArgs(source.argc(),source.argv()),std::invalid_argument);
+    }
+    for(const auto *value:{"-1","4x","2147483648","18446744073709551616"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-gpu-cache-max-rows",value};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    for(const auto *flag:{"--ngram-gpu-cache-bytes","--ngram-source-cache-bytes","--ngram-source-cache-max-rows"})
+    {
+        for(const auto *value:{"-1","12x","18446744073709551616"})
+        {
+            ArgvHelper bad{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd",flag,value};
+            EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+        }
+    }
+    ArgvHelper sourceLimit{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-source-cache-max-rows","4294967295"};
+    EXPECT_THROW((void)parser.parseArgs(sourceLimit.argc(),sourceLimit.argv()),std::invalid_argument);
+    for(const auto *flag:{"--ngram-gpu-cache-aging-accesses","--ngram-gpu-cache-protected-denominator",
+        "--ngram-source-cache-aging-accesses","--ngram-source-cache-protected-denominator"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd",flag,"0"};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    ArgvHelper hostFirst{"llaminar2","--ngram-cache-max-rows","1","--ngram-storage","gpu-adaptive-vram-ram-ssd"};
+    EXPECT_THROW((void)parser.parseArgs(hostFirst.argc(),hostFirst.argv()),std::invalid_argument);
+    ArgvHelper hostLast{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-cache-max-rows","1"};
+    EXPECT_THROW((void)parser.parseArgs(hostLast.argc(),hostLast.argv()),std::invalid_argument);
+    ArgvHelper shards{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-distribution","fixed-head-sharded"};
+    EXPECT_THROW((void)parser.parseArgs(shards.argc(),shards.argv()),std::invalid_argument);
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  gpu_protected_numerator: 5\n  gpu_protected_denominator: 4\n"),std::invalid_argument);
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  source_protected_numerator: 5\n  source_protected_denominator: 4\n"),std::invalid_argument);
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  gpu_cache_invented: 1\n"),std::invalid_argument);
+}
+/** @test Public help is generated from the same typed mode and disjoint option owners. */
+TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdHelpNamesActualSettings)
+{
+    const auto help=OrchestrationConfigParser::getHelpText();
+    for(const auto *name:{"gpu-adaptive-vram-ram-ssd","--ngram-gpu-cache-max-rows","--ngram-gpu-cache-bytes",
+        "--ngram-gpu-cache-aging-accesses","--ngram-gpu-cache-protected-numerator","--ngram-gpu-cache-protected-denominator",
+        "--ngram-source-cache-max-rows","--ngram-source-cache-bytes","--ngram-source-cache-aging-accesses",
+        "--ngram-source-cache-protected-numerator","--ngram-source-cache-protected-denominator"})
+        EXPECT_NE(help.find(name),std::string::npos) << name;
+}
+
+/** @test Local L1 flags retain independent shared/source ceilings and explicit combined C0. */
+TEST(Test__OrchestrationConfigParser, NgramLocalHotCacheHasIndependentExplicitArm)
+{
+    // Help is generated from the SAME CliSpec entries used for parsing, so a
+    // second hand-maintained option list cannot hide or rename this arm.
+    const auto help = OrchestrationConfigParser::getHelpText();
+    for (const auto* flag : {"--ngram-local-cache-max-rows", "--ngram-local-cache-bytes",
+        "--ngram-local-cache-aging-accesses", "--ngram-local-cache-protected-numerator",
+        "--ngram-local-cache-protected-denominator"})
+        EXPECT_NE(help.find(flag), std::string::npos) << flag;
+    OrchestrationConfigParser parser;
+    for (const auto* rows : {"0", "64"})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd",
+            "--ngram-gpu-cache-placement", "0:rocm:0/128/1048576@0:cuda:0",
+            "--ngram-local-cache-max-rows", rows, "--ngram-local-cache-bytes", "65536",
+            "--ngram-local-cache-aging-accesses", "97", "--ngram-local-cache-protected-numerator", "2",
+            "--ngram-local-cache-protected-denominator", "5"};
+        const auto c = parser.parseArgs(args.argc(), args.argv());
+        const auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+        ASSERT_TRUE(local);
+        EXPECT_EQ(local->maximum_cache_rows, std::stoull(rows));
+        EXPECT_EQ(local->cache_physical_byte_limit, 65536u);
+        EXPECT_EQ(local->policy, (CpuImmutableRowCachePolicy{97,2,5}));
+        EXPECT_EQ(c.ngram_table_policy.gpu_adaptive.placement.owners.front().maximum_cache_rows, 128u);
+        EXPECT_EQ(c.ngram_table_policy.gpu_adaptive.host, HostAdaptiveRAMSSDRequest{});
+        EXPECT_EQ(parser.parseYamlString(serializeOrchestrationConfig(c)).ngram_table_policy, c.ngram_table_policy);
+    }
+    ArgvHelper independent{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd",
+        "--ngram-local-cache-max-rows", "0"};
+    EXPECT_THROW((void)parser.parseArgs(independent.argc(), independent.argv()), std::invalid_argument);
+    ArgvHelper absent{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd"};
+    EXPECT_FALSE(parser.parseArgs(absent.argc(), absent.argv()).ngram_table_policy.gpu_adaptive.local_hot_cache);
 }

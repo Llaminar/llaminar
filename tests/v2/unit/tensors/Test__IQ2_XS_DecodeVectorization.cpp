@@ -12,8 +12,12 @@
  * - Fuzz testing across random inputs
  * - Error handling (bounds checking)
  * - Performance comparison (scalar vs SIMD)
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "tensors/SIMDHelpers.h"
@@ -474,6 +478,8 @@ TEST(Test__IQ2_XS_DecodeVectorization, Performance)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -20,6 +20,7 @@ namespace llaminar2
 {
 class IBackend;
 class IWorkerGPUContext;
+class IRetainedGraphStorageBoundary;
 
 /** @brief Borrowed complete controller geometry and immutable admitted algorithm. */
 struct DeviceGenerationGraphControl
@@ -74,12 +75,17 @@ public:
      * @param maintenance_due Optional completed-transaction maintenance predicate.
      * @param tickets Persistent fixed-size ticket rows; no response/cache pointers.
      * @param error Precise first construction error, cleared on success.
+     * @param storage_boundary Original retained source close, if this program owns immutable I/O.
      * @return True only after the isolated publisher is instantiated.
      *
      * The existing scheduler retains and authenticates complete transaction
      * branches. This publisher does not perform or decide model work. RAII
      * closes native capture on enqueue failure or exception, so a local error
      * cannot strand the stream in capture mode and poison unrelated requests.
+     * An explicit retained-participant source authenticates its original worker
+     * and executes this whole cold recording/instantiation on that worker;
+     * caller-side nesting is rejected before dispatch. No model replay or GPU
+     * completion wait moves into this construction boundary.
      */
     [[nodiscard]] static bool ticketPublisher(
         IGPUGraphCapture &destination,
@@ -89,6 +95,7 @@ public:
         const DeviceGenerationGraphControl &control,
         const uint32_t *maintenance_due,
         sampling_math::DeviceGenerationDispatchTicket *tickets,
-        std::string &error);
+        std::string &error,
+        IRetainedGraphStorageBoundary *storage_boundary=nullptr);
 };
 } // namespace llaminar2

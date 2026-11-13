@@ -6,11 +6,20 @@
  * pair. Fixed down-output slices have model lifetime and never travel through
  * this value. Empty values represent non-resident slots; partially assembled
  * arrivals belong to the transfer builder, not to a publishable residency bank.
- * This class owns engine lifetimes only, never an owner map or memory ledger.
+ * Whole payloads own engine lifetimes only. A distinct closed CPU-fragment
+ * payload additionally retains its SAME original fixed cohort geometry and
+ * preparation, never a second placement map or physical memory ledger.
  */
 #pragma once
 
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "loaders/WeightIdentity.h"
+#include "utils/PerfStatsCollector.h"
+#include <optional>
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
 #include <array>
 #include <memory>
@@ -20,6 +29,126 @@
 namespace llaminar2
 {
     class ITensorGemm;
+    class MoEExpertShardCohort;
+    class MoEExpertOverlayPreparationPlan;
+    class MoEOverlayPreparedExpertArrival;
+    class MoEOverlayParticipantResidencyRegistry;
+    enum class ExpertTierWeightProjection : std::uint8_t;
+
+    /**
+     * @brief Closed CPU fragment retaining original fixed source geometry and actual engines.
+     *
+     * A complete local triplet is not a whole expert. This type cannot convert
+     * to the whole-owner payload or manufacture an initial static source layer.
+     * Epoch belongs to its containing RCU bank; unchanged engines can survive
+     * bank replacement without rewriting source provenance or original IDs.
+     */
+    class MoEOverlayPreparedCPUFragmentPayload final
+    {
+    public:
+        /** @brief Construct an empty nonresident fragment slot. */
+        MoEOverlayPreparedCPUFragmentPayload() noexcept = default;
+        /** @return Whether this is an empty nonresident slot. */
+        bool empty() const noexcept
+        {
+            return !cohort_;
+        }
+        /** @return Whether closed construction retained the complete original family. */
+        bool valid() const noexcept;
+        /** @return Original model identity, never inferred from engine shape. */
+        ModelContextId model() const noexcept
+        {
+            return model_;
+        }
+        /** @return SAME immutable source/cohort/cut authority; never initial selected IDs. */
+        const std::shared_ptr<const MoEExpertShardCohort> &cohort() const noexcept
+        {
+            return cohort_;
+        }
+        /** @return Original member coordinate in the retained fixed cohort. */
+        std::size_t participantIndex() const noexcept
+        {
+            return member_;
+        }
+        /** @return Original logical expert ID represented by these local engines. */
+        int expertId() const noexcept
+        {
+            return expert_;
+        }
+        /** @return Actual completed arrival epoch; zero denotes the original static source. */
+        std::uint64_t arrivalEpoch()const noexcept{return arrival_epoch_;}
+        /** @brief Record only completed use of these genuine incoming engines.
+         * @param invocation_epoch Exact containing bank selected by the retained invocation lease.
+         * @param routes Positive number of completed logical expert routes.
+         * @throws std::logic_error For an invocation older than its actual arrival.
+         * Static source payloads and disabled evidence publish nothing. Metadata keys are cold-bound.
+         */
+        void recordCompletedExecution(std::uint64_t invocation_epoch,std::uint64_t routes)const;
+        /** @return SAME original preparation shared control block. */
+        const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation() const noexcept
+        {
+            return preparation_;
+        }
+        /** @return Genuine local gate engine and its destination storage lease. */
+        const std::shared_ptr<ITensorGemm> &gate() const noexcept
+        {
+            return engines_[0];
+        }
+        /** @return Genuine local up engine and its destination storage lease. */
+        const std::shared_ptr<ITensorGemm> &up() const noexcept
+        {
+            return engines_[1];
+        }
+        /** @return Genuine local down engine and its destination storage lease. */
+        const std::shared_ptr<ITensorGemm> &down() const noexcept
+        {
+            return engines_[2];
+        }
+        /** @param other Another fragment slot. @return Exact provenance and shared-engine ownership
+         * equality. */
+        bool sameIdentity(const MoEOverlayPreparedCPUFragmentPayload &other) const noexcept;
+        /**
+         * @brief Validate physical geometry/format without minting model or source authority.
+         * @param cohort Original fixed source geometry.
+         * @param member Exact original member coordinate.
+         * @param role Semantic projection being completed.
+         * @param engine Actual final local CPU engine.
+         * @param error Precise physical mismatch diagnostic.
+         * @return True only for exact local N/K and original source format.
+         */
+        static bool validateRole(const MoEExpertShardCohort &cohort, std::size_t member,
+                                 ExpertTierWeightProjection role,
+                                 const std::shared_ptr<ITensorGemm> &engine,
+                                 std::string *error = nullptr);
+
+    private:
+        friend class MoEOverlayPreparedExpertArrival;
+        friend class MoEOverlayParticipantResidencyRegistry;
+        /**
+         * @brief Seal only a registry-authenticated destination or authenticated initial source.
+         * @param model Original live producer's model identity.
+         * @param preparation SAME preparation authenticated by that producer.
+         * @param cohort SAME fixed original source/cohort/cut authority.
+         * @param member Original fixed member coordinate.
+         * @param expert Exact candidate logical expert; need not belong to the initial selection.
+         * @param engines Three actual completed local engines retaining destination storage.
+         * @param arrival_epoch Existing authenticated destination epoch; zero only for initial source construction.
+         * @throws std::invalid_argument For absent provenance or incompatible physical engines.
+         */
+        MoEOverlayPreparedCPUFragmentPayload(
+            ModelContextId model,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
+            std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member, int expert,
+            std::array<std::shared_ptr<ITensorGemm>, 3> engines,std::uint64_t arrival_epoch);
+        ModelContextId model_{};
+        std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation_;
+        std::shared_ptr<const MoEExpertShardCohort> cohort_;
+        std::size_t member_ = 0;
+        int expert_ = -1;
+        std::uint64_t arrival_epoch_=0; ///< Immutable original arrival, retained unchanged across successor banks.
+        std::optional<PerfStatsCollector::CounterIdentity> execution_evidence_; ///< Cold metadata only; collector alone owns observations/reset.
+        std::array<std::shared_ptr<ITensorGemm>, 3> engines_{};
+    };
 
     /**
      * @brief Immutable projection family retained by the existing RCU lifecycle.

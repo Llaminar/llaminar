@@ -553,7 +553,7 @@ not installed policies or model-correctness certificates. See
 
 The pre-change captured DAG revealed an additional grouping defect: GDN QKV and Z
 executed serially, with two activation quantizers. `GDNProjectionStage` rejected
-different NativeVNNI codebooks even though CUDA and ROCm fused implementations
+different NativeQuantised codebooks even though CUDA and ROCm fused implementations
 select each projection's own decoder and already own disjoint persistent
 scratch. FFN gate/up already overlaps. Any earlier suggestion that the GDN pair
 already overlaps was incorrect. The temporary source-bound DSO and shared native capture regression now pass
@@ -1275,7 +1275,7 @@ The follow-up implementation removes the CUDA canonical partial clear under a
 strict complete-live-extent overwrite contract. Focused capture/poison tests,
 including explicit empty K partitions, pass. Current complete qualification
 and both canonical Release HTTP cells pass as described above.
-ROCm's corresponding NativeVNNI partial fold is register-resident and already
+ROCm's corresponding NativeQuantised partial fold is register-resident and already
 has no clear. Cache startup initialization remains under audit.
 
 The unobserved eight-row bucket-cap cohort passes all **24 measured greedy

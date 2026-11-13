@@ -22,7 +22,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "utils/Logger.h"
@@ -297,8 +297,8 @@ TEST_F(SwiGLUParityTest, LargeBatch)
  */
 TEST_F(SwiGLUParityTest, FusedQ8PublicationMatchesTwoStageBytesForRuntimeM)
 {
-    using llaminar2::cpu::native_vnni::quantize_activations_to_q8_1;
-    using llaminar2::cpu::native_vnni::swiglu_quantize_activations_to_q8_1;
+    using llaminar2::cpu::native_quantised::quantize_activations_to_q8_1;
+    using llaminar2::cpu::native_quantised::swiglu_quantize_activations_to_q8_1;
 
     constexpr std::array<int, 4> widths = {32, 64, 96, 512};
     std::vector<int> row_counts = {1};

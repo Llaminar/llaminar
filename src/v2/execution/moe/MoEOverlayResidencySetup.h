@@ -11,6 +11,7 @@
 
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoERoutedExpertPlacementPlanner.h"
+#include "loaders/WeightIdentity.h"
 #include <memory>
 
 namespace llaminar2
@@ -32,6 +33,7 @@ namespace llaminar2
         std::shared_ptr<PhysicalMemoryAuthority> memory;
         int world_rank = 0;
         int world_size = 1;
+        ModelContextId original_model; ///< Original context strategy/store identity, required only for CPU joint sources.
     };
 
     /**

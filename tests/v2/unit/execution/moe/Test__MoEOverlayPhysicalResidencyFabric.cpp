@@ -2,21 +2,30 @@
  * @file Test__MoEOverlayPhysicalResidencyFabric.cpp
  * @brief Device-free production-fabric tests for ExpertOverlay residency moves.
  *
- * These tests use the real CPU NativeVNNI prepared engines, physical inactive
+ * These tests use the real CPU NativeQuantised prepared engines, physical inactive
  * slot pools, participant RCU banks, composite transport, and publication
  * authority.  Only the GPU DMA lanes are absent; no scripted transfer provider
  * or identity-only GEMM stands in for the production CPU path.
  */
 
 #include "execution/moe/CpuExpertSlotPool.h"
+#include "backends/BackendManager.h"
+#include "execution/moe/MoEOverlayCPUHostMaintenance.h"
+#include "loaders/ModelContext.h"
+#include "loaders/WeightManager.h"
+#include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "execution/moe/MoEOverlayHostDemandMemoryPlan.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayDevicePhysicalSlotLedger.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "../../../fixtures/moe/MoEOverlayParticipantMigrationTestAccess.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "loaders/ModelLoader.h"
+#include "../../../utils/ExpertTierEncodedColumnOracle.h"
 
 #include <gtest/gtest.h>
 
@@ -137,13 +146,13 @@ namespace
 
     /**
      * @brief Gate/up/down shapes for one exact prepared-weight format.
-     * @param format NativeVNNI codebook or contiguous floating precision.
+     * @param format NativeQuantised codebook or contiguous floating precision.
      * @return Complete projection geometry matching a 64x32 routed MLP.
      */
     std::vector<CpuExpertSlotPool::ProjectionSpec> sourceProjectionSpecs(
-        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         }))
     {
@@ -250,9 +259,9 @@ namespace
         int layer_idx,
         int expert_id,
         std::uint8_t seed,
-        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         }))
     {
@@ -303,9 +312,9 @@ namespace
         int participant_id,
         int expert_id,
         std::uint8_t seed,
-        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         }))
     {
@@ -317,7 +326,9 @@ namespace
     template <std::size_t ExpertCount>
     std::shared_ptr<MoEOverlayParticipantResidencyRegistry> makeRegistry(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &snapshot,
-        const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts)
+        const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts,
+        bool service_measurements = false,
+        ModelContextId original_model = {})
     {
         static_assert(ExpertCount > 0);
         const int first = snapshot->layered_ownership.firstModelLayer();
@@ -330,7 +341,9 @@ namespace
                     .num_experts = static_cast<int>(ExpertCount),
                     .initial_epoch = snapshot->epoch,
                     .retained_epoch_capacity = 2,
+                    .collect_economy_service_measurements = service_measurements,
                     .first_model_layer = first,
+                    .original_model = original_model,
                 });
 
         std::string error;
@@ -449,11 +462,13 @@ namespace
     /**
      * @brief Snapshot the exact live CPU bytes for a prepared payload.
      *
-     * Quantized experts expose their final NativeVNNI buffer; floating experts
-     * expose their exact row-major FP16, BF16, or FP32 buffer. Reading through
-     * the engine interface keeps the assertion independent of slot ownership.
+     * Quantized experts expose every live NativeQuantised column's data, comp,
+     * scale, min and grid fields. Inactive SIMD output columns are not weights
+     * or transfer extents. Floating experts expose all exact row-major bytes.
+     * The independent encoded-column inspector never calls the production
+     * gather/scatter/copy path, and slot ownership cannot change this oracle.
      */
-    std::array<std::vector<std::uint8_t>, 3> preparedBytes(
+    std::array<std::vector<std::uint8_t>, 3> livePreparedBytes(
         const MoEOverlayPreparedExpertPayload &payload)
     {
         std::array<std::vector<std::uint8_t>, 3> result;
@@ -467,11 +482,23 @@ namespace
              ++projection)
         {
             if (const auto *packed =
-                    engines[projection]->exportCPUNativeVNNIPackedWeights())
+                    engines[projection]->exportCPUNativeQuantisedPackedWeights())
             {
-                result[projection].assign(
-                    packed->native_interleaved.begin(),
-                    packed->native_interleaved.end());
+                // Native roots are N-padded for SIMD; only [0,N) columns
+                // execute or move. Inspect every live plane independently of
+                // the production copier, including comp/min/grid fields.
+                if(packed->N<=0 || packed->K<=0 || packed->K%32 || packed->interleaved_block_stride%64)
+                    throw std::runtime_error("Native oracle received invalid physical geometry");
+                ExpertTierWeightCPUStorageLayout layout;
+                layout.cpu_K=packed->K;layout.cpu_data_stride=packed->data_stride;
+                layout.cpu_block_stride=packed->interleaved_block_stride;layout.cpu_encoding=packed->encoding;
+                const std::span<const uint8_t> root(packed->native_interleaved.data(),packed->native_interleaved.size());
+                for(int n=0;n<packed->N;++n)for(int kb=0;kb<packed->K/32;++kb) {
+                    const auto column=test::encodedTierColumn(root,layout,size_t(n),size_t(kb));
+                    if(column.size()!=size_t(packed->interleaved_block_stride)/64)
+                        throw std::runtime_error("Independent native oracle omitted a live encoded field");
+                    result[projection].insert(result[projection].end(),column.begin(),column.end());
+                }
                 continue;
             }
 
@@ -579,6 +606,97 @@ namespace
             throw std::logic_error("device ledger test built an invalid swap");
         return result;
     }
+
+    /** @brief Exact production CPU host lifecycle with an offset and two logical local owners. */
+    struct CPUHostMaintenanceFixture
+    {
+        // This explicit component context owns the SAME prepared engine cache;
+        // it does not claim GGUF/native model readiness. Genuine tiny-source
+        // binding coverage lives in PreparedSourceNonemptyBankContract.inc.
+        std::shared_ptr<ModelContext> original_context;
+        MoERoutedExpertModelMetadata metadata{.num_layers = 1, .num_experts = 2,
+            .d_model = 64, .routed_intermediate_size = 32, .main_inference_layer_count = 33, .first_model_layer = 32};
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        std::shared_ptr<DecodeExpertHistogram> histogram;
+        std::shared_ptr<MoEOverlayResidencyAuthority> authority;
+        std::shared_ptr<MoEOverlayParticipantResidencyRegistry> residency;
+        MoEOverlayCPUHostMaintenance::Config config;
+
+        /** @brief Author exact scratch/demand/shadow BOM before constructing any runtime owner. */
+        explicit CPUHostMaintenanceFixture(bool admit_shadow = true)
+        {
+            if (!hasCPUBackend()) initCPUBackend(-1);
+            auto plan = twoCpuTierPlan({0, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+            plan.first_model_layer = metadata.first_model_layer;
+            plan.placements.front().layer = metadata.first_model_layer;
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+            const auto owner_map = MoEExpertOwnerMap::build(plan);
+            const auto format = sourceProjectionSpecs().front().format;
+            const std::array experts{makeSourceExpertAtLayer(0, 32, 0, 11, format),
+                makeSourceExpertAtLayer(1, 32, 1, 93, format)};
+            MoEExpertComputeStage::Params sample;
+            sample.device_id = DeviceId::cpu(); sample.seq_len = MoEOverlayCPUServiceMeasurement::kMaximumRows;
+            sample.d_model = 64; sample.expert_intermediate = 32; sample.num_experts = 1; sample.top_k = 1;
+            sample.expert_mask = {true}; sample.prepared_gate_gemm = {experts[0].gate().get()};
+            sample.prepared_up_gemm = {experts[0].up().get()}; sample.prepared_down_gemm = {experts[0].down().get()};
+            const auto invocation = MoEExpertComputeStage(std::move(sample)).getWorkspaceRequirements(
+                MoEOverlayCPUServiceMeasurement::kMaximumRows).named_bytes_with_alignment();
+            const MoEOverlayHostDemandMemoryPlan demand({.num_layers = 1, .num_experts = 2, .top_k = 1,
+                .initial_window_rows = 4, .maximum_window_rows = 4, .maximum_invocation_rows = 8});
+            const auto shadows = admitCpuShadowPools(format, 2, 1);
+            const auto &resource = shadows.authority->admission()->plan().resources().front().resource();
+            PhysicalMemoryPlanBuilder builder;
+            builder.add(resource, PhysicalMemoryOwner::ExpertShadowSlots, admit_shadow ? shadows.bytes : 0);
+            builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, demand.allocationBytes() +
+                MoEOverlayCPUServiceMeasurement::allocationBytes({.d_model = 64, .intermediate = 32}, invocation));
+            auto admission = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+            memory = std::make_shared<PhysicalMemoryAuthority>(admission, 0);
+            DecodeExpertHistogramConfig h;
+            h.num_layers = 1; h.num_experts = 2; h.top_k = 1; h.window_size = 4;
+            h.token_boundary_layer_idx = 32; h.sockets = {DeviceId::cpu(), DeviceId::cpu()};
+            h.ownership = owner_map.layeredOwnership(1, 2, 32); h.transaction_demand = demand.bind(h, memory);
+            histogram = std::make_shared<DecodeExpertHistogram>(h);
+            const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(oneLayerExpertModel(GGUFTensorType::Q4_0, 2, 32), 1, 2, 32);
+            auto catalog = std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(manifest);
+            authority = std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+                .initial_plan = plan, .model_metadata = metadata, .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(), .histogram_max_window_tokens = 4, .economy_layer_catalog = catalog,
+                .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 1});
+            original_context = ModelContext::createForTesting(
+                "cpu-host-stage32-component", MPIContextFactory::self(), 33, true);
+            auto &source_registry = original_context->concreteWeightManager()->expertGemmRegistry();
+            for (const auto &owner : authority->snapshot()->owner_map.owners())
+            {
+                const auto *participant = authority->snapshot()->owner_map.participantForId(owner.owner_participant);
+                const auto &payload = experts.at(static_cast<size_t>(owner.expert_id));
+                const std::array engines{payload.gate(), payload.up(), payload.down()};
+                for (int role = 0; role < 3; ++role)
+                    source_registry.registerEngineForParticipant(participant->domain_name, participant->device,
+                        participant->world_rank, participant->domain_participant_index, owner.layer_idx,
+                        owner.expert_id, static_cast<ExpertGemmRegistry::WeightRole>(role),
+                        engines[role].get(), engines[role]);
+            }
+            residency = makeRegistry(authority->snapshot(), experts, true,
+                ModelContextId{reinterpret_cast<uint64_t>(original_context.get())});
+            std::string source_error;
+            if (!residency->bindOriginalPreparedContext(original_context, {}, &source_error))
+                throw std::runtime_error(source_error);
+            config.metadata = metadata; config.storage.migration_storage = MoEOverlayMigrationStorageKind::PhysicalResidencyFabric;
+            config.storage.overlay_world_size = 1; config.storage.shadow_slots_per_endpoint_layer = 1;
+            config.storage.staging_capacity_bytes = 64; config.storage.maximum_concurrent_cycles = 1;
+            config.storage.maximum_execution_streams = 1; config.rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+            config.rebalance.window_size = 4; config.rebalance.max_window_size = 4;
+            config.rebalance.migration_transfer_slots = 1;
+            config.topology = ExpertHistogramProductionTopology::forRetainedExecution(1, 33,
+                ExpertHistogramServingRegime::Serial, 32);
+            config.memory = memory; config.admission = admission; config.authority = authority;
+            config.residency = residency; config.histogram = histogram; config.perf_device = "cpu-host-stage32";
+        }
+        /** @return Actual retained shadow allocation, never an estimated live count. */
+        size_t liveShadows() const
+        { return memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExpertShadowSlots,
+            PhysicalMemoryMaterializationKind::NewAllocation); }
+    };
 } // namespace
 
 TEST(Test__MoEOverlayPhysicalResidencyFabric,
@@ -701,29 +819,29 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     struct FormatCase
     {
         GGUFTensorType gguf_type;
-        const NativeVnniFormatInfo *native_format;
+        const NativeQuantisedFormatInfo *native_format;
     };
     const std::array formats{
-        FormatCase{GGUFTensorType::Q4_0, &native_vnni_formats::Q4_0},
-        FormatCase{GGUFTensorType::Q4_1, &native_vnni_formats::Q4_1},
-        FormatCase{GGUFTensorType::Q5_0, &native_vnni_formats::Q5_0},
-        FormatCase{GGUFTensorType::Q5_1, &native_vnni_formats::Q5_1},
-        FormatCase{GGUFTensorType::Q8_0, &native_vnni_formats::Q8_0},
-        FormatCase{GGUFTensorType::Q2_K, &native_vnni_formats::Q2_K},
-        FormatCase{GGUFTensorType::Q3_K, &native_vnni_formats::Q3_K},
-        FormatCase{GGUFTensorType::Q4_K, &native_vnni_formats::Q4_K},
-        FormatCase{GGUFTensorType::Q5_K, &native_vnni_formats::Q5_K},
-        FormatCase{GGUFTensorType::Q6_K, &native_vnni_formats::Q6_K},
-        FormatCase{GGUFTensorType::Q8_K, &native_vnni_formats::Q8_K},
-        FormatCase{GGUFTensorType::IQ2_XXS, &native_vnni_formats::IQ2_XXS},
-        FormatCase{GGUFTensorType::IQ2_XS, &native_vnni_formats::IQ2_XS},
-        FormatCase{GGUFTensorType::IQ3_XXS, &native_vnni_formats::IQ3_XXS},
-        FormatCase{GGUFTensorType::IQ1_S, &native_vnni_formats::IQ1_S},
-        FormatCase{GGUFTensorType::IQ4_NL, &native_vnni_formats::IQ4_NL},
-        FormatCase{GGUFTensorType::IQ3_S, &native_vnni_formats::IQ3_S},
-        FormatCase{GGUFTensorType::IQ2_S, &native_vnni_formats::IQ2_S},
-        FormatCase{GGUFTensorType::IQ4_XS, &native_vnni_formats::IQ4_XS},
-        FormatCase{GGUFTensorType::IQ1_M, &native_vnni_formats::IQ1_M},
+        FormatCase{GGUFTensorType::Q4_0, &native_quantised_formats::Q4_0},
+        FormatCase{GGUFTensorType::Q4_1, &native_quantised_formats::Q4_1},
+        FormatCase{GGUFTensorType::Q5_0, &native_quantised_formats::Q5_0},
+        FormatCase{GGUFTensorType::Q5_1, &native_quantised_formats::Q5_1},
+        FormatCase{GGUFTensorType::Q8_0, &native_quantised_formats::Q8_0},
+        FormatCase{GGUFTensorType::Q2_K, &native_quantised_formats::Q2_K},
+        FormatCase{GGUFTensorType::Q3_K, &native_quantised_formats::Q3_K},
+        FormatCase{GGUFTensorType::Q4_K, &native_quantised_formats::Q4_K},
+        FormatCase{GGUFTensorType::Q5_K, &native_quantised_formats::Q5_K},
+        FormatCase{GGUFTensorType::Q6_K, &native_quantised_formats::Q6_K},
+        FormatCase{GGUFTensorType::Q8_K, &native_quantised_formats::Q8_K},
+        FormatCase{GGUFTensorType::IQ2_XXS, &native_quantised_formats::IQ2_XXS},
+        FormatCase{GGUFTensorType::IQ2_XS, &native_quantised_formats::IQ2_XS},
+        FormatCase{GGUFTensorType::IQ3_XXS, &native_quantised_formats::IQ3_XXS},
+        FormatCase{GGUFTensorType::IQ1_S, &native_quantised_formats::IQ1_S},
+        FormatCase{GGUFTensorType::IQ4_NL, &native_quantised_formats::IQ4_NL},
+        FormatCase{GGUFTensorType::IQ3_S, &native_quantised_formats::IQ3_S},
+        FormatCase{GGUFTensorType::IQ2_S, &native_quantised_formats::IQ2_S},
+        FormatCase{GGUFTensorType::IQ4_XS, &native_quantised_formats::IQ4_XS},
+        FormatCase{GGUFTensorType::IQ1_M, &native_quantised_formats::IQ1_M},
     };
 
     for (const auto &format : formats)
@@ -732,6 +850,10 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         SCOPED_TRACE(static_cast<std::uint32_t>(format.gguf_type));
         const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
             oneLayerExpertModel(format.gguf_type, 2, first), 1, 2, first);
+        ModelLoader source;
+        source.initializeTestModel();
+        const_cast<GGUFModel &>(source.getModel())=oneLayerExpertModel(format.gguf_type,2,first);
+        EXPECT_EQ(buildMoEOverlayLayerWeightManifestFromLoader(source,1,2,first),manifest);
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front().valid());
         EXPECT_EQ(manifest.front().layer_idx, first);
@@ -755,13 +877,13 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                     ? 32
                     : 64);
             EXPECT_EQ(
-                projection.format.native_vnni.codebook_id,
+                projection.format.native_quantised.codebook_id,
                 format.native_format->codebook_id);
             EXPECT_EQ(
-                projection.format.native_vnni.is_superblock,
+                projection.format.native_quantised.is_superblock,
                 format.native_format->is_superblock);
-            EXPECT_TRUE(projection.format.native_vnni.present);
-            EXPECT_TRUE(projection.format.isNativeVnni());
+            EXPECT_TRUE(projection.format.native_quantised.present);
+            EXPECT_TRUE(projection.format.isNativeQuantised());
         }
     }
 }
@@ -786,6 +908,10 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         SCOPED_TRACE(static_cast<std::uint32_t>(format.gguf_type));
         const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
             oneLayerExpertModel(format.gguf_type, 2, first), 1, 2, first);
+        ModelLoader source;
+        source.initializeTestModel();
+        const_cast<GGUFModel &>(source.getModel())=oneLayerExpertModel(format.gguf_type,2,first);
+        EXPECT_EQ(buildMoEOverlayLayerWeightManifestFromLoader(source,1,2,first),manifest);
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front().valid());
         EXPECT_EQ(manifest.front().layer_idx, first);
@@ -795,7 +921,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             EXPECT_EQ(
                 projection.format.floatingTensorType(),
                 std::optional<TensorType>(format.tensor_type));
-            EXPECT_FALSE(projection.format.native_vnni.present);
+            EXPECT_FALSE(projection.format.native_quantised.present);
         }
     }
 }
@@ -811,7 +937,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageManifestExcludesForei
     ASSERT_EQ(owned.size(), 2u);
     EXPECT_EQ(owned.front().layer_idx, 32);
     EXPECT_EQ(owned.back().layer_idx, 33);
-    EXPECT_TRUE(owned.front().projections.front().format.isNativeVnni());
+    EXPECT_TRUE(owned.front().projections.front().format.isNativeQuantised());
     EXPECT_TRUE(owned.back().projections.front().format.isFloating());
     EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 3, 2, 32), std::invalid_argument);
     EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 2, 2, -1), std::invalid_argument);
@@ -922,9 +1048,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
 {
     constexpr std::size_t kLayerCount = 2u;
     constexpr std::size_t kExpertCount = 3u;
-    const ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-        .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-        .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+    const ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+        .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+        .is_superblock = native_quantised_formats::Q4_0.is_superblock,
         .present = true,
     });
     const auto plan = twoCpuTierPlan(
@@ -990,7 +1116,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         .perf_device = "cpu-shared-geometry-arena",
     });
 
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = registry,
         .transfer_provider = fabric,
         .perf_device = "cpu-shared-geometry-arena",
@@ -1047,8 +1173,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                     .experts[static_cast<std::size_t>(migration.expert_id)];
             ASSERT_TRUE(arrived.complete());
             EXPECT_EQ(
-                preparedBytes(arrived),
-                preparedBytes(
+                livePreparedBytes(arrived),
+                livePreparedBytes(
                     experts[static_cast<std::size_t>(layer_idx)]
                            [static_cast<std::size_t>(migration.expert_id)]));
         }
@@ -1087,169 +1213,169 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     const std::array format_cases{
         FormatCase{
             "Q4_0",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_0.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q4_1",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_1.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q5_0",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q5_0.codebook_id,
-                .is_superblock = native_vnni_formats::Q5_0.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q5_0.codebook_id,
+                .is_superblock = native_quantised_formats::Q5_0.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q5_1",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q5_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q5_1.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q5_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q5_1.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q8_0",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q8_0.codebook_id,
-                .is_superblock = native_vnni_formats::Q8_0.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q8_0.codebook_id,
+                .is_superblock = native_quantised_formats::Q8_0.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q8_1",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q8_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q8_1.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q8_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q8_1.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q2_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q2_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q2_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q2_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q2_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q3_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q3_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q3_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q3_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q3_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q4_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q5_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q5_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q5_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q5_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q5_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q6_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q6_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q6_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q6_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q6_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q8_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q8_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q8_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q8_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q8_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ2_XXS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ2_XXS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ2_XXS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ2_XXS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ2_XXS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ2_XS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ2_XS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ2_XS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ2_XS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ2_XS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ3_XXS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ3_XXS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ3_XXS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ3_XXS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ3_XXS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ1_S",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ1_S.codebook_id,
-                .is_superblock = native_vnni_formats::IQ1_S.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ1_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ1_S.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ4_NL",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ4_NL.codebook_id,
-                .is_superblock = native_vnni_formats::IQ4_NL.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ4_NL.codebook_id,
+                .is_superblock = native_quantised_formats::IQ4_NL.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ3_S",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ3_S.codebook_id,
-                .is_superblock = native_vnni_formats::IQ3_S.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ3_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ3_S.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ2_S",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ2_S.codebook_id,
-                .is_superblock = native_vnni_formats::IQ2_S.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ2_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ2_S.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ4_XS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ4_XS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ4_XS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ4_XS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ4_XS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ1_M",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ1_M.codebook_id,
-                .is_superblock = native_vnni_formats::IQ1_M.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ1_M.codebook_id,
+                .is_superblock = native_quantised_formats::IQ1_M.is_superblock,
                 .present = true,
             }),
         },
@@ -1262,7 +1388,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     };
     static_assert(
         format_cases.size() ==
-        native_vnni_formats::kAllSourceFormats.size() + 3u);
+        native_quantised_formats::kAllSourceFormats.size() + 3u);
 
     for (const auto &format_case : format_cases)
     {
@@ -1303,9 +1429,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             makeSourceExpert(1, 2, 177, format_case.format),
         };
         const std::array expected{
-            preparedBytes(experts[0]),
-            preparedBytes(experts[1]),
-            preparedBytes(experts[2]),
+            livePreparedBytes(experts[0]),
+            livePreparedBytes(experts[1]),
+            livePreparedBytes(experts[2]),
         };
         auto registry = makeRegistry(initial_snapshot, experts);
         const auto memory = admitCpuShadowPools(
@@ -1321,7 +1447,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             .perf_device = "cpu-hot/cpu-cold",
         });
 
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = registry,
             .transfer_provider = fabric,
             .perf_device = "cpu-hot/cpu-cold",
@@ -1387,7 +1513,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                             migration.expert_id)];
                 ASSERT_TRUE(arrived.complete());
                 EXPECT_EQ(
-                    preparedBytes(arrived),
+                    livePreparedBytes(arrived),
                     expected[static_cast<std::size_t>(migration.expert_id)])
                     << "Published destination bytes differ from expert "
                     << migration.expert_id << " at epoch " << expected_epoch;
@@ -1482,7 +1608,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                     static_cast<std::size_t>(expert_id));
                 ASSERT_TRUE(payload.complete());
                 EXPECT_EQ(
-                    preparedBytes(payload),
+                    livePreparedBytes(payload),
                     expected[static_cast<std::size_t>(expert_id)]);
                 observed[static_cast<std::size_t>(expert_id)] = true;
             }
@@ -1511,8 +1637,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
 TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEveryPreparedFormat)
 {
     std::vector<ExpertWeightFormat> formats;
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
-        formats.push_back(ExpertWeightFormat::nativeVnni({
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+        formats.push_back(ExpertWeightFormat::nativeQuantised({
             .codebook_id = source.metadata->codebook_id,
             .is_superblock = source.metadata->is_superblock, .present = true,
         }));
@@ -1555,7 +1681,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEver
         EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
             PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), memory.bytes);
         {
-            MoEOverlayParticipantPreparedWaveFactory factory({.registry = registry, .transfer_provider = fabric});
+            auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({.registry = registry, .transfer_provider = fabric});
             MoEOverlayTierMigrationTransport transport({.factory = &factory, .projections_per_expert = 3});
             std::shared_ptr<const MoEOverlayResidencySnapshot> previous = initial;
             for (const std::uint64_t epoch : {2u, 3u})
@@ -1637,7 +1763,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEver
                         EXPECT_EQ(layer.resident_mask, candidate->owner_map.expertMaskForParticipant(first + row, participant, 2));
                         for (const int expert : {0, 1})
                             if (layer.resident_mask[expert])
-                                EXPECT_EQ(preparedBytes(layer.experts[expert]), preparedBytes(experts[row][expert]));
+                                EXPECT_EQ(livePreparedBytes(layer.experts[expert]), livePreparedBytes(experts[row][expert]));
                     }
                 }
                 previous = candidate;
@@ -1698,4 +1824,179 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageRejectsForeignFabricA
     EXPECT_THROW((void)MoEOverlayPhysicalResidencyFabric::create(config), std::runtime_error);
     EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
         PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+
+/** @test Real CPU maintenance preserves offset, replay lifecycle and backing lifetime across aliases. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceStageOffsetLifetimeAndReplay)
+{
+    for (int replay = 0; replay < 2; ++replay)
+    {
+        CPUHostMaintenanceFixture fixture;
+        const auto demand_live = fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation);
+        auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(fixture.config);
+        EXPECT_FALSE(owner->ready());
+        EXPECT_THROW(owner->start(), std::logic_error);
+        owner->prepare();
+        ASSERT_TRUE(owner->ready());
+        EXPECT_EQ(fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation), demand_live)
+            << "Prepared service scratch retires before the background owner publishes";
+        EXPECT_GT(fixture.liveShadows(), 0u);
+        EXPECT_NO_THROW(owner->requireScope(fixture.authority.get(), fixture.residency.get(), fixture.metadata));
+        auto alias = owner;
+        owner->start();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!fixture.authority->hasEconomyCertification() && owner->service()->healthy() &&
+            std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        ASSERT_TRUE(owner->service()->healthy()) << owner->service()->failureMessage();
+        ASSERT_TRUE(owner->service()->measurementReadiness().ready());
+        ASSERT_TRUE(fixture.authority->hasEconomyCertification());
+        (void)fixture.authority->activateOptimizationDemandAtRequestBoundary();
+        owner->notify({.phase = MoEOverlayInferenceProgressPhase::Decode, .completed_logical_tokens = 3});
+        owner->stopAndDrain();
+        EXPECT_FALSE(owner->ready());
+        const auto seal = owner->restorePreparedPlacement();
+        EXPECT_TRUE(seal.valid());
+        EXPECT_EQ(seal.canonical_owner_map.layeredOwnership(1, 2, 32).firstModelLayer(), 32);
+        EXPECT_THROW(owner->start(), std::logic_error);
+        EXPECT_NO_THROW(owner->stopAndDrain());
+        owner.reset();
+        EXPECT_GT(fixture.liveShadows(), 0u);
+        alias.reset();
+        EXPECT_EQ(fixture.liveShadows(), 0u);
+    }
+}
+
+/** @test A frozen permit without shadow capacity fails and retires every partial physical root. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceFailureRetiresExactRoots)
+{
+    CPUHostMaintenanceFixture fixture(false);
+    const auto before = fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation);
+    auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(fixture.config);
+    try
+    {
+        owner->prepare();
+        FAIL() << "Missing frozen shadow admission unexpectedly materialized maintenance";
+    }
+    catch (const std::exception &error)
+    {
+        EXPECT_NE(std::string(error.what()).find("Physical memory live claim exceeds admitted expert_shadow_slots"), std::string::npos)
+            << error.what();
+    }
+    EXPECT_FALSE(owner->ready());
+    EXPECT_EQ(fixture.liveShadows(), 0u);
+    EXPECT_EQ(fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation), before);
+    EXPECT_NO_THROW(owner->stopAndDrain());
+}
+
+/** @test Stage global origin, histogram ownership and original PMA permit cannot be substituted. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceRejectsForeignScopeAndAdmission)
+{
+    CPUHostMaintenanceFixture fixture;
+    auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(fixture.config);
+    auto changed = fixture.metadata; changed.first_model_layer = 0;
+    EXPECT_THROW(owner->requireScope(fixture.authority.get(), fixture.residency.get(), changed), std::invalid_argument);
+    EXPECT_THROW(owner->requireScope(nullptr, fixture.residency.get(), fixture.metadata), std::invalid_argument);
+    auto config = fixture.config; config.admission.reset();
+    EXPECT_THROW(MoEOverlayCPUHostMaintenance{config}, std::invalid_argument);
+    config = fixture.config; config.topology = ExpertHistogramProductionTopology::forRetainedExecution(1, 1,
+        ExpertHistogramServingRegime::Serial);
+    EXPECT_THROW(MoEOverlayCPUHostMaintenance{config}, std::invalid_argument);
+    EXPECT_EQ(fixture.liveShadows(), 0u);
+}
+
+/** @brief Unpriced GPU endpoints stay empty; priced missing sources fail before native admission. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentClassIsNotFabricated)
+{
+    for (bool rocm : {false, true})
+    {
+        auto plan = twoCpuTierPlan({1, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        plan.domains.front().participants = {rocm ? GlobalDeviceAddress::rocm(0) : GlobalDeviceAddress::cuda(0)};
+        plan.domains.front().backend = rocm ? CollectiveBackendType::RCCL : CollectiveBackendType::NCCL;
+        MoEOverlayParticipantResidencyRegistry registry({
+            .owner_map = MoEExpertOwnerMap::build(plan), .local_participant_ids = {0},
+            .num_layers = 1, .num_experts = 2, .initial_epoch = 1,
+            .collect_economy_service_measurements = true});
+        const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
+            oneLayerExpertModel(GGUFTensorType::Q4_0, 2), 1, 2);
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
+        const auto resource = admitCpuShadowPools(sourceProjectionSpecs().front().format, 2, 1)
+            .authority->admission()->plan().resources().front().resource();
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, 1);
+        auto memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+        const ExpertHistogramProductionTopology priced({{true, true, true}}, {{false, true, false}});
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> zero{{.participant_id = 0, .layer = 0}};
+        const auto gaps = catalog.serviceEvidenceGaps(zero, {0}, priced);
+        ASSERT_EQ(gaps.size(), 1u); // Reachable unpriced phases author no obligation.
+        EXPECT_EQ(gaps.front().source, ExpertHistogramSource::PrefillChunk);
+        MoEOverlayParticipantResidencyRegistry idle({
+            .owner_map = MoEExpertOwnerMap::build(plan), .local_participant_ids = {},
+            .num_layers = 1, .num_experts = 2, .initial_epoch = 1,
+            .collect_economy_service_measurements = true});
+        EXPECT_TRUE(MoEOverlayCPUServiceMeasurement::measure(idle, 1, catalog,
+            priced, {.d_model = 64, .intermediate = 32}, memory).empty());
+        try
+        {
+            (void)MoEOverlayCPUServiceMeasurement::measure(registry, 1, catalog,
+                priced, {.d_model = 64, .intermediate = 32}, memory);
+            FAIL() << "Priced absent resident source was accepted";
+        }
+        catch (const std::logic_error &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("priced class has no matching movable resident source"), std::string::npos);
+            EXPECT_NE(std::string(error.what()).find("participant=0"), std::string::npos);
+        }
+    }
+}
+
+/** @test The independent equality oracle ignores only inactive padding and detects every live field class. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirtyPaddingAndEveryEncodedField)
+{
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
+        SCOPED_TRACE(format.quant_type);
+        const auto source_format=ExpertWeightFormat::nativeQuantised({.codebook_id=format.metadata->codebook_id,
+            .is_superblock=format.metadata->is_superblock,.present=true});
+        auto original=makeSourceExpert(0,0,19,source_format);
+        auto changed=makeSourceExpert(1,0,19,source_format);
+        const auto expected=livePreparedBytes(original);
+        ASSERT_EQ(livePreparedBytes(changed),expected);
+        auto engine=changed.gate();
+        const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(packed);
+        ASSERT_EQ(packed->N,32);ASSERT_GE(packed->N_padded,64);
+        // This source fixture has never been published. Its actual slot owner
+        // grants the retired-storage mutation API, not a const-cast/live write.
+        auto bytes=engine->exportRetiredCPUNativeQuantisedStorage();ASSERT_FALSE(bytes.empty());
+        const size_t inactive_data_byte=size_t(packed->N)*4;
+        const auto before=bytes[inactive_data_byte];bytes[inactive_data_byte]^=0x80;
+        EXPECT_NE(bytes[inactive_data_byte],before);
+        EXPECT_EQ(livePreparedBytes(changed),expected);
+        std::vector<size_t> fields;
+        const bool q6=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+        for(size_t byte=0;byte<(q6?16:size_t(packed->data_stride)/64);++byte)
+            fields.push_back((byte/4)*256+byte%4);
+        if(q6)for(size_t group=0;group<8;++group) {
+            fields.push_back(1024+group*64);fields.push_back(1024+group*64+8);
+        }
+        const bool compact=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
+        for(size_t plane=0;plane<(compact?2:(size_t(packed->interleaved_block_stride)-packed->data_stride)/128);++plane)
+            for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
+        if(compact)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
+        for(const size_t byte:fields) {
+            SCOPED_TRACE(byte);const auto saved=bytes[byte];bytes[byte]^=1;
+            EXPECT_NE(livePreparedBytes(changed),expected); // All data/comp/scale/min/grid classes must contribute.
+            bytes[byte]=saved;
+        }
+        EXPECT_EQ(livePreparedBytes(changed),expected);
+        for(size_t role=0;role<3;++role) {
+            const auto& engine=role==0?original.gate():role==1?original.up():original.down();
+            const auto* layout=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(layout);
+            EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
+        }
+    }
 }

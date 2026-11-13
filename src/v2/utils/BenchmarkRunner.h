@@ -20,6 +20,7 @@
 
 #include "Tokenizer.h"
 #include "Sampler.h"
+#include "PerfStatsCollector.h"
 #include "../execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "../config/OrchestrationConfig.h"
 #include <cstddef>
@@ -29,6 +30,8 @@
 #include <vector>
 #include <chrono>
 #include <functional>
+#include <optional>
+#include <utility>
 
 namespace llaminar2
 {
@@ -85,6 +88,28 @@ namespace llaminar2
     ResolvedBenchmarkPrompt resolveBenchmarkPrompt(const OrchestrationConfig &config);
 
     /**
+     * @brief Immutable prompt bytes and their one canonical tokenizer result.
+     * Benchmark campaigns prepare each natural prompt once before their first
+     * request. Only BenchmarkRunner may construct this value; replay never
+     * rereads an input file or substitutes another tokenization.
+     */
+    class PreparedBenchmarkInput final
+    {
+    public:
+        /** @return Exact immutable prompt origin, bytes and SHA-256. */
+        const ResolvedBenchmarkPrompt &prompt() const noexcept { return prompt_; }
+        /** @return Exact natural token IDs, including their original order. */
+        const std::vector<int> &tokenIds() const noexcept { return tokens_; }
+    private:
+        friend class BenchmarkRunner;
+        /** @brief Seal an already validated tokenizer result with its source. */
+        PreparedBenchmarkInput(ResolvedBenchmarkPrompt prompt, std::vector<int> tokens)
+            : prompt_(std::move(prompt)), tokens_(std::move(tokens)) {}
+        ResolvedBenchmarkPrompt prompt_;
+        std::vector<int> tokens_;
+    };
+
+    /**
      * @brief Inter-step overhead profiling data from the decode loop.
      *
      * Tracks time spent BETWEEN forward() calls: sampling, token broadcast,
@@ -114,6 +139,19 @@ namespace llaminar2
         int token_count = 0; ///< Samples in this interval.
         double time_ms = 0.0; ///< Sum of emitted-token wall latencies.
         double tokens_per_sec = 0.0; ///< Interval-local generation rate.
+    };
+
+    /**
+     * @brief Completed terminal records observed at one measured request's host boundaries.
+     * These are immutable collector snapshots, not device reads or a new ledger.
+     * Native storage/controller/service windows and reset semantics remain in
+     * their original tags/sequence fields; no cross-window delta is inferred.
+     */
+    struct BenchmarkLookupTerminalBracket
+    {
+        bool collection_enabled = false;
+        std::vector<PerfStatRecord> before_request;
+        std::vector<PerfStatRecord> after_request;
     };
 
     /**
@@ -186,6 +224,24 @@ namespace llaminar2
 
         /** Decode trajectory partitioned by the configured maintenance window. */
         std::vector<BenchmarkDecodeWindowResult> decode_windows;
+        BenchmarkLookupTerminalBracket lookup_terminal; ///< Raw completed observations; never synthesized per-tier totals.
+    };
+
+    /**
+     * @brief Result-owned passive arithmetic observations at the pre-measurement boundary.
+     *
+     * Retained graph recording can emit host metadata only during setup/warmup.
+     * Copying those exact records before the measured reset preserves the
+     * observed route and prepared operands without retaining warmup work in the
+     * measured counters. Counts describe host recording/submission observations;
+     * they are neither native graph replay counts nor token counts. Missing
+     * records do not prove that an arithmetic path was absent.
+     */
+    struct BenchmarkSetupArithmeticObservation
+    {
+        bool observed_before_measurement = false; ///< False when the run never reached the measurement boundary.
+        bool collection_enabled = false; ///< Collector policy at that boundary; this snapshot never enables it.
+        std::vector<PerfStatRecord> records; ///< Independent copies of exact tagged arithmetic families, not collector aliases.
     };
 
     /**
@@ -195,12 +251,14 @@ namespace llaminar2
     {
         int measurement_iterations = 3; ///< Number of measured benchmark iterations averaged.
         int warmup_iterations = 1;      ///< Number of pre-measurement warmup iterations.
+        BenchmarkSetupArithmeticObservation setup_warmup_arithmetic; ///< Independent setup/warmup evidence, unaffected by collector resets.
 
         // Exact benchmark input identity (the prompt text itself is deliberately omitted).
         BenchmarkPromptSource prompt_source = BenchmarkPromptSource::BuiltIn;
         std::string prompt_file_path; ///< Source path when `prompt_source == File`.
         size_t prompt_bytes = 0;      ///< Exact byte count before tokenization.
         std::string prompt_sha256;    ///< SHA-256 of the exact pre-tokenization bytes.
+        std::vector<int> prompt_token_ids; ///< Exact once-tokenized natural input; never inferred from output tokens.
 
         // Prefill phase
         int prefill_tokens = 0;              ///< Number of tokens in prefill
@@ -303,6 +361,22 @@ namespace llaminar2
         BenchmarkResult run(const OrchestrationConfig &config);
 
         /**
+         * @brief Resolve/tokenize an immutable input without executing inference.
+         * @param config Exact prompt source; all bytes remain significant.
+         * @return Sealed prompt and nonempty natural token sequence.
+         * @throws std::runtime_error For unreadable/empty/failed tokenizer input.
+         */
+        PreparedBenchmarkInput prepareInput(const OrchestrationConfig &config) const;
+
+        /**
+         * @brief Run the same production timing path with a previously sealed input.
+         * @param config Exact request sampling/MTP/decode policy.
+         * @param input Once-tokenized immutable natural prompt.
+         * @return Ordinary BenchmarkResult with the exact input token IDs.
+         */
+        BenchmarkResult run(const OrchestrationConfig &config, const PreparedBenchmarkInput &input);
+
+        /**
          * @brief Print benchmark results in a formatted table
          * @param result Benchmark results to print
          */
@@ -321,6 +395,9 @@ namespace llaminar2
         void setDecodeStepCallback(std::function<void()> cb) { decode_step_cb_ = std::move(cb); }
 
     private:
+        /** @brief Shared timing implementation; preparation never changes the inference path. */
+        BenchmarkResult runImpl(const OrchestrationConfig &config,
+            std::optional<std::reference_wrapper<const PreparedBenchmarkInput>> input);
         std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
         std::function<void()> post_warmup_cb_;

@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 #include <algorithm>
 #include <cstddef>
 
@@ -37,6 +38,9 @@ namespace llaminar2
         float *request_state_bank = nullptr;  ///< Packed request-local live states and canonical request zero.
         size_t request_state_bank_floats = 0; ///< Complete request-bank capacity.
         int request_capacity = 0;             ///< Maximum independent requests.
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Recurrence-only format; conv
+                                                               ///< bindings retain the default.
 
         /**
          * @brief Return the largest scalar state geometry represented here.
@@ -56,8 +60,8 @@ namespace llaminar2
          */
         bool valid() const noexcept
         {
-            if (!primary_state || primary_state_floats <= 0 ||
-                !request_state_bank || request_capacity <= 0)
+            if (!validGDNRecurrenceStateLayout(recurrence_layout) || !primary_state ||
+                primary_state_floats <= 0 || !request_state_bank || request_capacity <= 0)
             {
                 return false;
             }

@@ -147,7 +147,8 @@ namespace llaminar2
      * @brief Policy objective carried by one immutable device command.
      *
      * This is a wire-level spelling of the authority-owned movement axis. It
-     * occupies the command's `flags` word so adding the semantic identity does
+     * occupies the low two bits of the command's `flags` word; the remaining
+     * bits preserve the original durable cycle identity. This encoding does
      * not change fixed arena geometry. The host follower authenticates and
      * translates it but never reconstructs it from endpoint priorities.
      */
@@ -164,7 +165,7 @@ namespace llaminar2
 
     /** Version of @ref MoEOverlayDeviceMovementCommand. */
     inline constexpr std::uint32_t kMoEOverlayDeviceMovementCommandVersion =
-        3u;
+        4u;
 
     /** Sentinel used when an action has no physical source or destination slot. */
     inline constexpr std::uint32_t kMoEOverlayDeviceInvalidSlot =
@@ -196,7 +197,7 @@ namespace llaminar2
         std::uint32_t source_participant = 0u;
         std::uint32_t destination_participant = 0u;
         std::uint32_t payload_slot = kMoEOverlayDeviceInvalidSlot;
-        /** Encoded @ref MoEOverlayDeviceMovementAxis authored by policy. */
+        /** Low two bits encode axis; upper bits hold the 1-based durable cycle. */
         std::uint32_t flags = 0u;
         std::uint64_t payload_bytes = 0u;
         /** Durable source epoch, or pinned durable epoch for transient LLEP. */

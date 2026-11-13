@@ -7,10 +7,18 @@
  * the same single-tier authority as explicit overlays. No frontend-specific
  * placement, fake model geometry, physical-byte arithmetic or MPI protocol lives
  * here. Runtime and automatic candidates therefore use identical role lowering.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "planning/ResolvedRankOrchestration.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/RankMemoryPlanInputs.h"
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
+#include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
+#include "execution/global/NamedDomainGraphBuilder.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include <algorithm>
@@ -48,7 +56,8 @@ namespace llaminar2
         {
             if (!config.moe_routed_expert_plan || !config.moe_routed_expert_plan->usesExpertOverlayAuthority())
                 return;
-            auto bound = bindMoEExpertOverlayPlanToClusterInventory(*config.moe_routed_expert_plan, inventory);
+            auto bound = bindMoEExpertOverlayPlanToClusterInventory(*config.moe_routed_expert_plan, inventory,
+                resolvedMoEOverlayDiagnosticPrefillTransport());
             requireValid(installResolvedMoEExpertOverlayPlan(config, std::move(bound), origin),
                          "Cannot install hardware-resolved ExpertOverlay topology");
         }
@@ -174,6 +183,56 @@ namespace llaminar2
         }
 
         /**
+         * @brief Project authored routed policies through the exact compiled domain identity.
+         * @param parent Original request, before its domain table is retired in the child.
+         * @param rank Actual original execution rank owning this stage.
+         * @param participants Exact compiler-resolved local participants.
+         * @param weights Compiler-resolved workshare, without another physical owner table.
+         * @param backend Native collective authority selected by the compiler.
+         * @param domain_name Authored name retained by the compiled stage, empty for flat PP.
+         * @return Normalizer input; omitted fields retain the existing parent/default policy.
+         * @throws std::invalid_argument If a named compiled stage lost its original declaration.
+         *
+         * Compute resolution remains in ExecutionDomainDefinition, as used by
+         * the authority normalizer. This projection only preserves authored
+         * typed values before child construction erases parent topology fields.
+         */
+        MoEExpertOverlayAuthorityPlanRequest pipelineStageAuthorityRequest(
+            const OrchestrationConfig &parent, int rank,
+            const std::vector<GlobalDeviceAddress> &participants,
+            const std::vector<float> &weights, CollectiveBackendType backend,
+            const std::string &domain_name)
+        {
+            MoEExpertOverlayAuthorityPlanRequest request{
+                .model_has_routed_experts = true, .world_rank = rank,
+                .local_tp_participants = participants, .local_tp_weights = weights,
+                .local_tp_backend = backend,
+                .routed_compute_policy = parent.routed_expert_compute_policy,
+                .owner_order = parent.routed_expert_owner_order,
+                .residency_maintenance = parent.moe_rebalance.mode};
+            if (domain_name.empty()) return request;
+            const DomainDefinition *authored = nullptr;
+            for (const auto &domain : parent.domain_definitions)
+                if (domain.name == domain_name)
+                {
+                    if (authored)
+                        throw std::invalid_argument("Pipeline stage has duplicate authored execution-domain identity");
+                    authored = &domain;
+                }
+            if (!authored)
+                throw std::invalid_argument("Pipeline stage lost its authored execution-domain policy");
+            if (authored->routed_compute_policy != RoutedExpertComputePolicy::Unspecified)
+                request.routed_compute_policy = authored->routed_compute_policy;
+            if (authored->routed_phase_policy != RoutedExpertPhasePolicy::Unspecified)
+                request.routed_phase_policy = authored->routed_phase_policy;
+            if (authored->routed_decode_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
+                request.routed_assignment_policy.decode = authored->routed_decode_assignment_policy;
+            if (authored->routed_prefill_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
+                request.routed_assignment_policy.prefill = authored->routed_prefill_assignment_policy;
+            return request;
+        }
+
+        /**
          * @brief Retire parent placement selectors before binding a child authority.
          * @param parent Immutable serving policy and authored pipeline intent.
          * @param participants Actual child participants, never a topology selector.
@@ -220,7 +279,8 @@ namespace llaminar2
 
     ResolvedRankOrchestration ResolvedRankOrchestration::resolve(
         const OrchestrationConfig &requested, const PlanningModelMetadata &model,
-        const ClusterInventory &inventory, IExecutionPlanBuilder &builder, int rank)
+        const ClusterInventory &inventory, IExecutionPlanBuilder &builder, int rank,
+        OrdinaryTerminalProjectionCapacity terminal_projection)
     {
         if (inventory.world_size <= 0 || inventory.ranks.size() != static_cast<size_t>(inventory.world_size) ||
             rank < 0 || rank >= inventory.world_size)
@@ -237,6 +297,114 @@ namespace llaminar2
         bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains);
         requireValid(builder.validateConfig(config, geometry, inventory), "Configuration validation failed");
         auto rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
+        // Install authored output demand before immutable child rank projections.
+        rank_plan.runtime.ordinary_terminal_projection = terminal_projection;
+        if (model.memoryProfile().expert_count > 0 && requiresNamedDomainGlobalGraph(config))
+        {
+            if (config.moe_routed_expert_plan)
+                throw std::invalid_argument("MoE pipeline stages cannot inherit a model-wide expert authority");
+            auto *compiler = dynamic_cast<ExecutionPlanBuilder *>(&builder);
+            if (!compiler)
+                throw std::invalid_argument("Cross-rank MoE pipeline requires its original topology compiler");
+            auto global = compiler->buildGlobalPPTopology(config, geometry, inventory);
+            requireValid(global.validate(), "Global MoE pipeline topology validation failed");
+            if (std::any_of(global.stages.begin(), global.stages.end(), [](const auto &stage) {
+                    return stage.inner_mode == InnerParallelism::LOCAL_PP ||
+                        (stage.is_global_tp && (stage.per_rank_devices.empty() ||
+                            std::any_of(stage.per_rank_devices.begin(),stage.per_rank_devices.end(),
+                                [](const auto& device){return !device.isCPU();})));
+                }))
+                throw std::invalid_argument("MoE prepared global stages require original rank-local devices or a real cross-rank CPU domain");
+            config.mtp.depth_defaults_profile = rank_plan.runtime.mtp.depth_defaults_profile;
+            config.mtp.terminal_head_policy = rank_plan.runtime.mtp.terminal_head_policy;
+            if (rank_plan.runtime.routed_expert_compute_policy == RoutedExpertComputePolicy::Automatic)
+                rank_plan.runtime.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+            const auto actions = GlobalPPRankPlanBuilder::build(global, rank);
+            ResolvedRankOrchestration result(config, rank_plan, std::nullopt,
+                MoEExpertOverlayAuthorityPlanDisposition::SynthesizedPipeline);
+            result.global_pipeline_ = global;
+            for (const auto *action : actions.executeStages())
+            {
+                const auto original_stage=std::find_if(global.stages.begin(),global.stages.end(),
+                    [&](const auto& stage){return stage.stage_id==action->stage_id;});
+                if(original_stage==global.stages.end() || action->inner_mode==InnerParallelism::LOCAL_PP)
+                    throw std::invalid_argument("MoE pipeline lost its original compiled stage");
+                const auto& participants=action->is_global_tp?original_stage->per_rank_devices:action->devices;
+                const auto& weights=action->is_global_tp?original_stage->tp_weights:action->tp_weights;
+                if(participants.empty()) throw std::invalid_argument("MoE pipeline has no original stage participants");
+                const FactoryPPStageConfig scope{
+                    .first_layer = action->first_layer, .last_layer = action->last_layer + 1,
+                    .has_embedding = action->has_embedding, .has_lm_head = action->has_lm_head,
+                    .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary};
+                auto stage_config = projectPipelineConfig(config, participants, weights, action->backend);
+                auto stage_rank = projectPipelineRank(rank_plan, scope, participants, weights, action->backend);
+                auto authority_request=pipelineStageAuthorityRequest(config, rank, participants, weights,
+                    action->backend,action->domain_name);
+                std::optional<ExecutionDomainDefinition> cpu_domain;
+                if(action->is_global_tp) {
+                    if(original_stage->participating_ranks.size()!=participants.size() ||
+                        action->tp_domain_size!=static_cast<int>(participants.size()) ||
+                        action->tp_rank_in_domain<0 || action->tp_rank_in_domain>=action->tp_domain_size ||
+                        original_stage->participating_ranks[action->tp_rank_in_domain]!=rank)
+                        throw std::invalid_argument("CPU pipeline changed its original MPI domain membership");
+                    int node=-1;
+                    for(std::size_t i=0;i<participants.size();++i) {
+                        const int owner=original_stage->participating_ranks[i];
+                        if(owner<0 || owner>=inventory.world_size || !participants[i].isCPU())
+                            throw std::invalid_argument("CPU pipeline has a foreign original domain rank");
+                        const auto& observed=inventory.ranks.at(owner);
+                        if(observed.rank!=owner || participants[i].hostname!=observed.hostname ||
+                            participants[i].numa_node!=observed.cpu.numa_node || observed.cpu.numa_node<0 ||
+                            (node>=0 && observed.node_id!=node))
+                            throw std::invalid_argument("CPU pipeline requires its actual original node-local CPU NUMA owners");
+                        node=observed.node_id;
+                    }
+                    cpu_domain.emplace();
+                    cpu_domain->name=action->domain_name;
+                    cpu_domain->scope=ExecutionDomainScope::NODE_LOCAL;
+                    cpu_domain->participants=participants;
+                    cpu_domain->weights=weights;
+                    cpu_domain->backend=action->backend;
+                    cpu_domain->ranks=original_stage->participating_ranks;
+                    const auto original=std::find_if(rank_plan.my_domains.begin(),rank_plan.my_domains.end(),
+                        [&](const auto& domain){return domain.domain_name==action->domain_name;});
+                    if(original==rank_plan.my_domains.end() || original->my_index_in_domain!=action->tp_rank_in_domain)
+                        throw std::invalid_argument("CPU pipeline lost its original compiled TP participation");
+                    stage_rank.primary_device=action->device;
+                    stage_rank.local_tp_devices.clear();stage_rank.local_tp_weights.clear();
+                    stage_rank.global_tp_domain_id=original->domain_id;
+                    stage_rank.global_tp_rank_in_domain=action->tp_rank_in_domain;
+                    stage_rank.global_tp_domain_size=action->tp_domain_size;
+                    stage_rank.weight_shard=action->weight_shard;
+                    stage_rank.my_domains={*original};stage_rank.tp_scope=TPScope::NODE_LOCAL;
+                    stage_config.tp_devices.clear();stage_config.tp_weights.clear();
+                    stage_config.tp_scope=TPScope::NODE_LOCAL;
+                    stage_config.tp_global_degree=action->tp_domain_size;
+                    authority_request.has_cross_rank_tensor_parallel=true;
+                }
+                // These are stage-local memory claims. Only the retained
+                // GlobalPPRankPlan owns inter-rank MPI edges and executes them.
+                stage_rank.prev_rank.reset();
+                stage_rank.next_rank.reset();
+                stage_config.moe_routed_expert_plan = cpu_domain
+                    ? normalizeMoEExpertOverlayPipelineStagePlan(authority_request,scope,*cpu_domain)
+                    : normalizeMoEExpertOverlayPipelineStagePlan(authority_request,scope);
+                // Child runtime consumes the normalized stage policy, including
+                // an explicit domain override of the parent scalar setting.
+                stage_config.routed_expert_compute_policy =
+                    stage_config.moe_routed_expert_plan->domains.front().routed_compute_policy;
+                bindOverlay(stage_config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
+                auto execution = resolveMoEExpertOverlayExecutionPlan(stage_config.moe_routed_expert_plan,
+                    {.current_world_rank = rank, .world_size = inventory.world_size});
+                applyOverlayRole(stage_rank, *stage_config.moe_routed_expert_plan, execution);
+                stage_rank.runtime.routed_expert_compute_policy = stage_config.routed_expert_compute_policy;
+                result.pipeline_stages_.push_back(ResolvedMoEPipelineStage(scope, std::move(stage_config),
+                    std::move(stage_rank), std::move(execution), action->stage_id));
+            }
+            if (result.pipeline_stages_.empty())
+                throw std::invalid_argument("MoE global pipeline rank owns no declared executable stage");
+            return result;
+        }
         if (model.memoryProfile().expert_count > 0 && rank_plan.usesLocalPP())
         {
             if (rank_plan.usesGlobalTP() || rank_plan.usesPipelineParallel() || config.moe_routed_expert_plan)
@@ -258,7 +426,8 @@ namespace llaminar2
                     .first_layer = rank_plan.local_pp_layer_boundaries[index],
                     .last_layer = rank_plan.local_pp_layer_boundaries[index + 1],
                     .has_embedding = rank_plan.has_embedding && index == 0,
-                    .has_lm_head = rank_plan.has_lm_head && index + 1 == rank_plan.local_pp_devices.size()};
+                    .has_lm_head = rank_plan.has_lm_head && index + 1 == rank_plan.local_pp_devices.size(),
+                    .generation_domain = declaredRankDeviceGenerationDomain(rank_plan)};
                 const auto child = rank_plan.local_pp_stage_tp_info.empty()
                     ? RankExecutionPlan::LocalPPStageTPInfo{} : rank_plan.local_pp_stage_tp_info[index];
                 const auto participants = child.devices.empty()
@@ -267,15 +436,14 @@ namespace llaminar2
                     throw std::invalid_argument("ExpertOverlay pipeline primary device differs from its child TP participants");
                 auto stage_config = projectPipelineConfig(config, participants, child.tp_weights, child.tp_backend);
                 auto stage_rank = projectPipelineRank(rank_plan, scope, participants, child.tp_weights, child.tp_backend);
-                stage_config.moe_routed_expert_plan = normalizeMoEExpertOverlayPipelineStagePlan({
-                    .model_has_routed_experts = true,
-                    .world_rank = rank,
-                    .local_tp_participants = participants,
-                    .local_tp_weights = child.tp_weights,
-                    .local_tp_backend = child.tp_backend,
-                    .routed_compute_policy = config.routed_expert_compute_policy,
-                    .owner_order = config.routed_expert_owner_order,
-                    .residency_maintenance = config.moe_rebalance.mode}, scope);
+                stage_config.moe_routed_expert_plan = normalizeMoEExpertOverlayPipelineStagePlan(
+                    pipelineStageAuthorityRequest(config, rank, participants,
+                        child.tp_weights, child.tp_backend, child.domain_name), scope);
+                // The normalized stage domain is the one concrete policy
+                // authority. Parent scalar intent may explicitly differ and
+                // must not leak into child runtime/graph preparation.
+                stage_config.routed_expert_compute_policy =
+                    stage_config.moe_routed_expert_plan->domains.front().routed_compute_policy;
                 bindOverlay(stage_config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
                 auto execution = resolveMoEExpertOverlayExecutionPlan(stage_config.moe_routed_expert_plan,
                     {.current_world_rank = rank, .world_size = inventory.world_size});
@@ -285,7 +453,7 @@ namespace llaminar2
                 // no previous peer implies embedding ownership. A local stage
                 // instead has the checked parent boundary, never a fake peer.
                 result.pipeline_stages_.push_back(ResolvedMoEPipelineStage(scope, std::move(stage_config),
-                    std::move(stage_rank), std::move(execution)));
+                    std::move(stage_rank), std::move(execution), static_cast<int>(index)));
             }
             return result;
         }
@@ -310,6 +478,7 @@ namespace llaminar2
             bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
             requireValid(builder.validateConfig(config, geometry, inventory), "Implicit ExpertOverlay validation failed");
             rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
+            rank_plan.runtime.ordinary_terminal_projection = terminal_projection;
         }
         else if (config.routed_expert_compute_policy == RoutedExpertComputePolicy::Automatic)
         {

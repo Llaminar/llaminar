@@ -39,7 +39,7 @@ namespace llaminar2
         const void *iq1s_grid) noexcept;
 
     /**
-     * @brief Convert common GPU packed bytes into final CPU NativeVNNI units.
+     * @brief Convert common GPU packed bytes into final CPU NativeQuantised units.
      * @param source Read-only separated ROCm projection.
      * @param layout Immutable cross-tier format and geometry.
      * @param first_unit First global CPU unit represented by this chunk.
@@ -59,7 +59,7 @@ namespace llaminar2
         void *stream) noexcept;
 
     /**
-     * @brief Convert streamed CPU NativeVNNI units into common GPU packed data.
+     * @brief Convert streamed CPU NativeQuantised units into common GPU packed data.
      * @param device_cpu_chunk Preallocated HIP staging source.
      * @param device_cpu_chunk_bytes Valid bytes in the source chunk.
      * @param layout Immutable cross-tier format and geometry.

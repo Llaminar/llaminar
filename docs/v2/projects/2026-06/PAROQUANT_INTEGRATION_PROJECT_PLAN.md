@@ -148,7 +148,7 @@ Current quantized GEMM flows through prepared handles:
 | Prepared store | `src/v2/loaders/PreparedWeightStore.cpp` | Owns model prepared handles and caches |
 | CUDA packer | `src/v2/kernels/cuda/gemm/CUDAWeightPacker.cpp` | Packs native quantized formats for CUDA kernels |
 | CUDA quant GEMM | `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp` | Decode/prefill GEMM implementation |
-| CPU VNNI packer | `src/v2/kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h` | CPU reference/performance path |
+| CPU VNNI packer | `src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h` | CPU reference/performance path |
 | Stage execution | `src/v2/execution/compute_stages/stages/GEMMStage.cpp` | Calls prepared GEMM kernels |
 
 Important repository convention: model-owned prepared GEMM state should remain in `PreparedWeightStore`, not in global `KernelFactory` registries.
@@ -354,9 +354,9 @@ Because Paro uses group size 128 and Llaminar native 4-bit blocks are commonly 3
   - `src/v2/tensors/BlockStructures.h`
   - `src/v2/tensors/TensorClasses.h`
   - `src/v2/tensors/TensorKernels.h`
-  - `src/v2/tensors/NativeVnniFormatInfo.h`
+  - `src/v2/tensors/NativeQuantisedFormatInfo.h`
 - [ ] Add C++ unpack/repack tests against the Phase 0 fixtures.
-- [ ] Confirm CUDA and CPU native-VNNI packers accept the chosen storage type.
+- [ ] Confirm CUDA and CPU native-quantised packers accept the chosen storage type.
 
 #### Deliverables
 
@@ -689,7 +689,7 @@ bool paroRotateCUDA(
 - [ ] Port CUDA rotation kernel to HIP under `src/v2/kernels/rocm/paroquant/`.
 - [ ] Use existing ROCm backend memory allocation and stream conventions.
 - [ ] Add MI50/gfx906-compatible kernel configuration.
-- [ ] Integrate with ROCm native-VNNI quantized GEMM path.
+- [ ] Integrate with ROCm native-quantised quantized GEMM path.
 - [ ] Add ROCm unit tests and parity tests guarded by `HAVE_ROCM=ON`.
 
 #### Acceptance Criteria

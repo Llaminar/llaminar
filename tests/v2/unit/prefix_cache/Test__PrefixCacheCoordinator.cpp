@@ -309,6 +309,8 @@ TEST(Test__PrefixCacheCoordinator, RecurrentCheckpointCountsLogicalCoverage)
     terminal.layout.block_size = 4;
     terminal.layout.total_layers = terminal.layout.gdn_layers = 1;
     terminal.layout.hybrid_host_state_bytes = terminal.layout.hybrid_state_bytes = 8;
+    terminal.layout.hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+    terminal.layout.hybrid_host_state_capacity_bytes = terminal.layout.hybrid_host_state_bytes;
     terminal.layout.includes_hybrid_state = terminal.has_hybrid_state = true;
     terminal.total_bytes = terminal.layout.totalBytes();
     hit.blocks.push_back(terminal);

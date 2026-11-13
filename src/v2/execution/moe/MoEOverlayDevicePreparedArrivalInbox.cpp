@@ -201,8 +201,12 @@ namespace llaminar2
              ++ordinal)
         {
             const auto &migration = batch.migrations[ordinal];
-            const auto &arrival =
-                prepared.migrations[ordinal].destination_arrival;
+            const auto &keyed = prepared.migrations[ordinal].destination_arrivals;
+            if (keyed.size() > 1u || (!keyed.empty() &&
+                (keyed.front().participant_id != migration.destination.owner_participant ||
+                 !keyed.front().arrival || keyed.front().arrival->isCPUJointFragment())))
+                return reject(error, "device inbox requires the exact whole-owner singleton arrival");
+            const auto arrival = keyed.empty() ? nullptr : keyed.front().arrival;
             const bool local_destination =
                 migration.destination.owner_participant ==
                 config_.runtime_binding.overlay_participant_id;

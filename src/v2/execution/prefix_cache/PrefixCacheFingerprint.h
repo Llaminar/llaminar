@@ -7,11 +7,15 @@
  * of expert placement; callers retain both through lookup and harvest.
  */
 #pragma once
+#include "kernels/CPUGDNStateLayout.h"
 
 #include "execution/config/RuntimeConfig.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -51,6 +55,28 @@ namespace llaminar2
     };
 
     /**
+     * @brief Seal host/device recurrence formats before persisted prefix lookup.
+     * @param fields Canonical hybrid compatibility category.
+     * @param host_layout Authenticated host representation, absent without a host payload section.
+     * @param device_layout Authenticated device representation, absent without a device payload
+     * section.
+     * @throws std::invalid_argument For unknown layout or duplicate authority.
+     */
+    void
+    appendGDNStateLayoutFingerprintFields(std::vector<PrefixFingerprintField> &fields,
+                                          std::optional<GDNRecurrenceStateLayout> host_layout,
+                                          std::optional<GDNRecurrenceStateLayout> device_layout);
+
+    /**
+     * @brief Bind only real CPU host-GDN prefixes to their durable wire representation.
+     * @param fields Existing hybrid compatibility category; phase never enters its identity.
+     * @param encoding Actual cache-owned durable encoding, never a local rollback image.
+     * @throws std::invalid_argument For legacy/local/unknown formats or duplicate authority.
+     */
+    void appendCPUHostPrefixEncodingFingerprintFields(std::vector<PrefixFingerprintField> &fields,
+                                                       HybridPrefixHostEncoding encoding);
+
+    /**
      * @brief Bind persisted state to the immutable projection arithmetic choices.
      * @param fields Runtime compatibility fields receiving the owned policy keys.
      * @param gdn Selected GDN projection arithmetic.
@@ -67,6 +93,39 @@ namespace llaminar2
         GDNProjectionArithmetic gdn,
         MoERouterArithmetic router,
         CUDARouterPrefillArithmetic cuda_prefill = CUDARouterPrefillArithmetic::FP32);
+
+    /**
+     * @brief Distinguish Flash Next activation policies before prefix payload I/O.
+     * @param fields Runtime compatibility fields owned by the prefix builder.
+     * @param hc_up Frozen graph HC-up activation arithmetic.
+     * @param gdn_output Independent frozen GDN-output policy; default preserves historical fields.
+     * @param fa_output Independent main-only FA correction; default preserves prior identities.
+     * @param gdn_qkv Independent original-main GDN-QKV policy; default preserves existing fingerprints.
+     * @param attention_phase_schedule Exact admitted schedule; Uniform preserves historical field bytes.
+     * @throws std::invalid_argument For duplicate authority or an invalid enum.
+     *
+     * The revision authenticates the residual subtraction, each backend's
+     * native primary quantizer, and the independent fixed-order dot folds.
+     * Ordinary models do not append this model-specific compatibility field.
+     */
+    void appendQwen4ExpArithmeticFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        QuantizedActivationOperandPrecision hc_up,
+        QuantizedActivationOperandPrecision gdn_output = QuantizedActivationOperandPrecision::SingleQ8,
+        QuantizedActivationOperandPrecision fa_output = QuantizedActivationOperandPrecision::SingleQ8,
+        QuantizedActivationOperandPrecision gdn_qkv = QuantizedActivationOperandPrecision::SingleQ8,
+        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform);
+
+    /**
+     * @brief Authenticate the graph-owned frozen QFN base attention program.
+     * @param fields Runtime compatibility fields owned by the prefix builder.
+     * @param arithmetic Construction-time base snapshot; never a live setup read or resolved phase.
+     * @throws std::invalid_argument For unknown/resolved-only programs or duplicate authority.
+     * @details FixedFP32 preserves historical fields; explicit FP16 must never restore FP32 state.
+     */
+    void appendQwen4ExpAttentionBaseFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        qwen4exp::QwenSparseAttentionArithmetic arithmetic);
 
     /** @brief One fingerprint and the exact placement observation it describes. */
     struct PrefixCacheFingerprintResult

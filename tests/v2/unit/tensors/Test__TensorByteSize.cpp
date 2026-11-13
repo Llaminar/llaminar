@@ -153,7 +153,7 @@ void proveNativeRowViewExtent(const char *label)
 /** @test Every source format retains each row's padded block through nested views. */
 TEST(NativeTensorExtent, RowPaddedAllFormatsNestedViewsKeepIndependentSourceStrides)
 {
-    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+    ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 21u);
     proveNativeRowViewExtent<Q4_0Tensor, Q4_0Block>("Q4_0");
     proveNativeRowViewExtent<IQ4_NLTensor, IQ4_NLBlock>("IQ4_NL");
     proveNativeRowViewExtent<IQ4_XSTensor, IQ4_XSBlock>("IQ4_XS");

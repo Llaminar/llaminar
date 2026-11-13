@@ -102,6 +102,12 @@ namespace llaminar2
             std::vector<MoEOverlayDistributedResidencyVote> *votes,
             std::string *error = nullptr) override;
 
+        /**
+         * @brief Abort the original private communicator on irrecoverable staging failure.
+         * @param diagnostic Exact originating physical failure; emitted before MPI abort.
+         */
+        [[noreturn]] void failPhysicalStage(const std::string &diagnostic) noexcept override;
+
         /** @return Whether no MPI request is currently in flight. */
         [[nodiscard]] bool idle() const noexcept override
         {

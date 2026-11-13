@@ -6,6 +6,8 @@
  * recurrent-only pipeline shards. Keep this fixture separate from the larger
  * generation/composition suite so prefix lifecycle iteration stays inexpensive.
  * Lookup retains metadata; each restore selects one immutable payload frontier.
+ * Mixed-format PP additionally retains real CUDA/ROCm owners across a shared
+ * archive restart, proving that each stage restores its own physical format.
  */
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -15,17 +17,59 @@
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
+#include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "models/qwen35/Qwen35Graph.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "../../../utils/CPUOrchestratorTestAdmission.h"
 #include "tensors/TensorKernels.h"
 #include "../../../mocks/MockModelContext.h"
+#include "../../../fixtures/CPUGDNStateTestUtils.h"
 #include "../../backends/MTPMainForwardReadRetirementProof.h"
 #include "config/TensorParallelConfig.h"
+#include "execution/global/GlobalOrchestrator.h"
+#include "execution/prefix_cache/PrefixCacheShutdown.h"
+#include "utils/DebugEnv.h"
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
 
 namespace llaminar2::test
 {
+/**
+ * @brief Combine the authored cache/archive BOM with the actual CPU graph arena.
+ * @param profile Fixture's exact native cache and recurrent layer inventory.
+ * @param input Original participant-local cache/archive planning declaration.
+ * @param graph Actual arena schema; PP cache scope does not rewrite this graph.
+ * @return One complete immutable plan with no anonymous capacity contribution.
+ *
+ * These state fixtures intentionally construct the full model graph and then
+ * select a cache PP slice on DGO. Their cache/archive estimators remain exact,
+ * while arena ownership must follow the actual constructed graph schema.
+ */
+static PhysicalMemoryPlan prefixFixturePlan(const ModelMemoryProfile &profile,
+    const DevicePlanConfig &input, const Qwen35Graph &graph)
+{
+    const auto modeled = MemoryPlanner::plan(profile, {input});
+    if (!input.device.is_cpu())
+        return modeled.physicalPlan();
+    const size_t arena_bytes = cpuFixtureGraphRoots(graph, input.batch_size,
+        input.activation_seq_len).cpuPhysicalBytes();
+    PhysicalMemoryPlanBuilder admission;
+    for (const auto &resource : modeled.physicalPlan().resources())
+        for (size_t ordinal = 0; ordinal < static_cast<size_t>(PhysicalMemoryOwner::Count); ++ordinal)
+        {
+            const auto owner = static_cast<PhysicalMemoryOwner>(ordinal);
+            const bool arena = resource.resource().device == input.device &&
+                resource.resource().world_rank == input.world_rank && owner == PhysicalMemoryOwner::ActivationArena;
+            admission.add(resource.resource(), owner, arena ? arena_bytes : resource.bytes(owner));
+        }
+    return admission.build();
+}
+
 /** @brief Explicit backend selection keeps CPU-only preflight device-free. */
 class PipelinePrefixState : public ::testing::TestWithParam<std::string>
 {
@@ -146,10 +190,10 @@ TEST_P(PipelinePrefixState, FullVocabularyPublicationArchivesEveryTPShard)
             input.kv_precision = "fp16";
             input.prefix_cache = config.prefix_cache;
             input.mtp_terminal_logits_layout = config.mtpTerminalLogitsLayout();
+            auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
             auto memory = std::make_shared<PhysicalMemoryAuthority>(
                 std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
-                    MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
-            auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                    prefixFixturePlan(profile, input, *graph)), 0);
             auto owner = DeviceGraphOrchestrator::createForTest({
                 .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                 .physical_memory_authority = memory});
@@ -274,10 +318,10 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     input.mtp_enabled = true; // Price retained capacity, not request enablement.
                     input.mtp_target_query_rows = 16;
                     input.prefix_cache = config.prefix_cache;
+                    auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
                     auto memory = std::make_shared<PhysicalMemoryAuthority>(
                         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
-                            MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
-                    auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                            prefixFixturePlan(profile, input, *graph)), 0);
                     auto owner = DeviceGraphOrchestrator::createForTest({
                         .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                         .physical_memory_authority = memory});
@@ -309,7 +353,18 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                             ASSERT_TRUE(hybrid->getRecurrenceKernel(0)->importState(
                                 state_values.data(), nullptr, stream));
                         else
-                            std::copy(state_values.begin(), state_values.end(), hybrid->getRecurrenceState(0));
+                        {
+                            // CPU owns phase/checkpoint/history, not a dense matrix
+                            // beginning at element zero. Preserve the original dense
+                            // checkpoint pattern at a canonical phase-zero boundary.
+                            auto *state = hybrid->getGDNState(0);
+                            ASSERT_NE(state, nullptr);
+                            const auto encoded = encodeCPUGDNTestState(state_values,
+                                state->n_v_heads, state->d_k, state->d_v);
+                            ASSERT_EQ(encoded.size(), state->recurrence_state.size());
+                            ASSERT_EQ(hybrid->getRecurrenceState(0), state->recurrence_state.data());
+                            std::copy(encoded.begin(), encoded.end(), state->recurrence_state.begin());
+                        }
                     };
                     const auto expect_state = [&](float expected)
                     {
@@ -320,7 +375,20 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                             ASSERT_TRUE(getBackendFor(device)->synchronizeStream(stream, 0));
                         }
                         else
-                            std::copy_n(hybrid->getRecurrenceState(0), state_values.size(), state_values.begin());
+                        {
+                            const auto *state = hybrid->getGDNState(0);
+                            ASSERT_NE(state, nullptr);
+                            const std::vector<float> dense_expected(state_values.size(), expected);
+                            const auto encoded_expected = encodeCPUGDNTestState(dense_expected,
+                                state->n_v_heads, state->d_k, state->d_v);
+                            ASSERT_EQ(encoded_expected.size(), state->recurrence_state.size());
+                            // Verify the physical phase and inactive zeros as well as
+                            // the independently interpreted original matrix payload.
+                            EXPECT_EQ(std::memcmp(state->recurrence_state.data(), encoded_expected.data(),
+                                                  encoded_expected.size() * sizeof(float)), 0);
+                            state_values = materializeCPUGDNTestState(state->recurrence_state,
+                                state->n_v_heads, state->d_k, state->d_v);
+                        }
                         EXPECT_TRUE(std::all_of(state_values.begin(), state_values.end(),
                             [expected](float value) { return value == expected; }));
                     };
@@ -481,10 +549,10 @@ TEST_P(PipelinePrefixState, OffsetHybridSlicesUseGlobalLayerIdentity)
                 input.max_seq_len = input.activation_seq_len = 64;
                 input.kv_precision = kvCachePrecisionToString(precision);
                 input.prefix_cache = config.prefix_cache;
+                auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
                 auto memory = std::make_shared<PhysicalMemoryAuthority>(
                     std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
-                        MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
-                auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                        prefixFixturePlan(profile, input, *graph)), 0);
                 auto owner = DeviceGraphOrchestrator::createForTest({
                     .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                     .physical_memory_authority = memory});
@@ -537,4 +605,384 @@ INSTANTIATE_TEST_SUITE_P(Backends, PipelinePrefixState,
         , "ROCm"
 #endif
     ), [](const auto &info) { return info.param; });
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+namespace
+{
+/** @brief Explicit cold policies remain fixed until both real cache owners retire. */
+struct MixedPrefixLayoutScope final
+{
+    GDNRecurrenceStateLayout cuda = debugEnv().execution.cuda_gdn_state_layout;
+    GDNRecurrenceStateLayout rocm = debugEnv().execution.rocm_gdn_state_layout;
+    /** @brief Select formats independently of defaults or inherited diagnostic settings. */
+    MixedPrefixLayoutScope()
+    {
+        mutableDebugEnv().execution.cuda_gdn_state_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+        mutableDebugEnv().execution.rocm_gdn_state_layout =
+            GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    }
+    /** @brief Restore only after all test-owned participants and archives are destroyed. */
+    ~MixedPrefixLayoutScope()
+    {
+        mutableDebugEnv().execution.cuda_gdn_state_layout = cuda;
+        mutableDebugEnv().execution.rocm_gdn_state_layout = rocm;
+    }
+};
+
+/** @brief One tiny source artifact and shared archive namespace, removed last. */
+struct MixedPrefixDirectory final
+{
+    std::filesystem::path directory;
+    std::filesystem::path artifact;
+    /** @brief Disk identity authenticates this admitted model-free source marker. */
+    MixedPrefixDirectory()
+    {
+        std::string pattern = (std::filesystem::temp_directory_path() /
+            "llaminar-mixed-gdn-prefix-XXXXXX").string();
+        char *created = ::mkdtemp(pattern.data());
+        if (!created) throw std::runtime_error("Cannot create mixed prefix fixture directory");
+        directory = created;
+        artifact = directory / "model-free-source.bin";
+        std::ofstream file(artifact, std::ios::binary);
+        file << "Llaminar model-free mixed-format GDN prefix source identity\n";
+        if (!file) throw std::runtime_error("Cannot publish mixed prefix source marker");
+    }
+    /** @brief Remove only this fixture after all archive descriptors have retired. */
+    ~MixedPrefixDirectory()
+    {
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+    }
+};
+
+/** @brief Actual DGO owners in the real global PP prefix coordinator. */
+struct MixedPrefixPair final
+{
+    static constexpr int Width = 64;
+    std::array<DeviceGraphOrchestrator *, 2> leaves{};
+    std::array<DeviceId, 2> devices{DeviceId::cuda(0), DeviceId::rocm(0)};
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    StageRunnerRegistry registry;
+
+    /**
+     * @brief Construct two one-layer recurrent PP slices in one archive namespace.
+     * @param directory Real source marker and disk path retained through both lifetimes.
+     * @details Construction uses each device's existing worker/context. Later public
+     * prefix calls enter through the same StageRunnerRegistry as production PP.
+     */
+    explicit MixedPrefixPair(const MixedPrefixDirectory &directory)
+    {
+        PrefixCacheRuntimeConfig prefix;
+        prefix.enabled = true;
+        prefix.storage_mode = PrefixCacheStorageMode::Tiered;
+        prefix.ram_budget_bytes = 1u << 20;
+        prefix.disk_budget_bytes = 4u << 20;
+        prefix.device_budget_bytes = 0;
+        prefix.disk_dir = directory.directory.string();
+        prefix.block_size = 4;
+        ModelMemoryProfile profile;
+        profile.architecture = "qwen35";
+        profile.n_layers = 2;
+        profile.d_model = profile.head_dim = profile.d_ff = Width;
+        profile.vocab_size = 32;
+        profile.n_heads = profile.n_kv_heads = 1;
+        profile.max_seq_len = 16;
+        profile.full_attention_interval = 3;
+        profile.gdn_conv_kernel_size = 4;
+        profile.gdn_state_size = profile.gdn_inner_size = Width;
+        profile.gdn_group_count = profile.gdn_time_step_rank = 1;
+        std::vector<DevicePlanConfig> inputs;
+        for (int stage = 0; stage != 2; ++stage)
+        {
+            const auto device = devices[stage];
+            DevicePlanConfig input;
+            input.world_rank = 0;
+            input.device = device;
+            input.device_total_bytes = getBackendFor(device)->deviceMemoryTotal(0);
+            input.device_free_bytes = getBackendFor(device)->deviceMemoryFree(0);
+            input.device_compute_units = 128;
+            input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+                .device = DeviceId::cpu(), .total_bytes = 1ull << 30,
+                .admission_available_bytes = 1ull << 30};
+            input.first_layer = input.last_layer = stage;
+            input.owns_embedding = stage == 0;
+            input.max_seq_len = input.activation_seq_len = 16;
+            input.kv_precision = "fp16";
+            input.prefix_cache = prefix;
+            inputs.push_back(input);
+        }
+        memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
+                MemoryPlanner::plan(profile, inputs).physicalPlan()), 0);
+        for (int stage = 0; stage != 2; ++stage)
+        {
+            const auto device = devices[stage];
+            std::unique_ptr<DeviceGraphOrchestrator> owner;
+            GPUDeviceContextPool::instance().getContext(device).submitAndWait([&]
+            {
+                GraphConfig config;
+                config.d_model = config.head_dim = config.gdn.state_size =
+                    config.gdn.inner_size = Width;
+                config.d_ff = config.d_ff_local = Width;
+                config.n_heads = config.local_n_heads = config.n_kv_heads =
+                    config.local_n_kv_heads = config.gdn.group_count =
+                    config.gdn.time_step_rank = 1;
+                config.gdn.conv_kernel_size = 4;
+                config.n_layers = config.total_n_layers = 2;
+                config.layer_types = {"gdn", "gdn"};
+                config.vocab_size = config.vocab_local = 32;
+                config.max_seq_len = 16;
+                config.default_device = device;
+                config.kv_cache_precision = KVCachePrecision::FP16;
+                config.mtp_request_terminal_hidden_publication =
+                    MTPRequestTerminalHiddenPublicationPolicy::GraphCapturedDeviceGeometry;
+                config.mtp_shifted_prefill_hidden_publication =
+                    MTPShiftedPrefillHiddenPublicationPolicy::GraphIntegratedKVTransaction;
+                config.prefix_cache = prefix;
+                auto model = MockModelContext::createMinimal();
+                model->setPath(directory.artifact.string());
+                auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                owner = DeviceGraphOrchestrator::createForTest({.model_ctx = model,
+                    .graph_builder = graph, .physical_memory_authority = memory});
+                owner->setPPStageConfig({.first_layer = stage, .last_layer = stage + 1,
+                    .has_embedding = stage == 0, .has_lm_head = stage == 1});
+                if (!owner->initializeInferenceStateFromArena(1, 16, device))
+                    throw std::runtime_error("Mixed prefix native state admission failed");
+            });
+            leaves[stage] = owner.get();
+            auto *hybrid = dynamic_cast<IHybridKVCache *>(owner->inferenceState().kv_cache.get());
+            auto *recurrence = hybrid ? hybrid->getRecurrenceKernel(stage) : nullptr;
+            if (!recurrence || recurrence->recurrenceStateLayout() != layout(stage))
+                throw std::runtime_error("Mixed prefix actual owner format differs from explicit policy");
+            StageRunnerEntry entry;
+            entry.stage_id = entry.action.stage_id = stage;
+            entry.domain_name = entry.action.domain_name = stage ? "rocm-value" : "cuda-key";
+            entry.action.has_embedding = stage == 0;
+            entry.action.has_lm_head = stage == 1;
+            entry.pp_stage_config = FactoryPPStageConfig{.first_layer = stage,
+                .last_layer = stage + 1, .has_embedding = stage == 0, .has_lm_head = stage == 1};
+            entry.runner = std::move(owner);
+            registry.add(std::move(entry));
+        }
+    }
+
+    /**
+     * @brief Resolve this test's declared format, independently of production defaults.
+     * @param stage CUDA stage zero or ROCm stage one.
+     * @return Exactly the intentionally different native physical format.
+     */
+    static GDNRecurrenceStateLayout layout(int stage)
+    {
+        return stage ? GDNRecurrenceStateLayout::ValueMajorKeyContiguous
+                     : GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+    }
+
+    /**
+     * @brief Author an independent logical matrix without a recurrence implementation.
+     * @param stage Participant-specific marker and signed-zero policy.
+     * @param seed Distinct cold state image used before archive or rejection.
+     * @return Axis-dependent logical bytes, including signed-zero witnesses.
+     */
+    static std::vector<float> logical(int stage, int seed)
+    {
+        std::vector<float> result(Width * Width);
+        for (int key = 0; key != Width; ++key)
+            for (int value = 0; value != Width; ++value)
+                result[key * Width + value] = (key + value) % 17 == 0
+                    ? (stage ? -0.0f : 0.0f)
+                    : static_cast<float>(seed * 10000 + stage * 1000 + key * 67 + value) * 0.0001f;
+        return result;
+    }
+
+    /**
+     * @brief Author the independent original short-convolution byte oracle.
+     * @param stage Participant marker, independent of matrix format.
+     * @param seed Exact state image used for this publication.
+     * @return Original short-convolution bytes, unrelated to matrix transpose.
+     */
+    static std::vector<float> convolution(int stage, int seed)
+    {
+        std::vector<float> result(3 * 3 * Width);
+        for (size_t index = 0; index != result.size(); ++index)
+            result[index] = static_cast<float>(seed * 1000 + stage * 100 + index) * 0.0003f;
+        return result;
+    }
+
+    /**
+     * @brief Publish through the original cache-owned kernel state interfaces.
+     * @param value Cold diagnostic state image retained until its explicit-stream join.
+     */
+    void seed(int value)
+    {
+        for (int stage = 0; stage != 2; ++stage)
+            GPUDeviceContextPool::instance().getContext(devices[stage]).submitAndWait([&]
+            {
+                auto *hybrid = dynamic_cast<IHybridKVCache *>(leaves[stage]->inferenceState().kv_cache.get());
+                auto physical = logical(stage, value);
+                if (stage)
+                {
+                    const auto canonical = physical;
+                    for (int key = 0; key != Width; ++key)
+                        for (int column = 0; column != Width; ++column)
+                            physical[column * Width + key] = canonical[key * Width + column];
+                }
+                const auto conv = convolution(stage, value);
+                void *stream = GPUDeviceContextPool::instance().getContext(devices[stage]).defaultStream();
+                ASSERT_TRUE(hybrid->getRecurrenceKernel(stage)->importState(physical.data(), nullptr, stream));
+                ASSERT_TRUE(hybrid->getConvKernel(stage)->importState(conv.data(), nullptr, stream));
+                // Cold diagnostic publication must retire before its local host
+                // vectors disappear; this is outside any captured execution.
+                ASSERT_TRUE(getBackendFor(devices[stage])->synchronizeStream(stream, 0));
+            });
+    }
+
+    /**
+     * @brief Compare complete native banks after the canonical logical observation.
+     * @param value Expected authored state image, including every signed-zero byte.
+     */
+    void expect(int value)
+    {
+        const PrefixProbeCapturePolicy policy{.capture_gdn_values = true};
+        const auto aggregate = registry.prefixStateProbeAll(policy);
+        ASSERT_EQ(aggregate.gdn_layers.size(), 2u);
+        for (int stage = 0; stage != 2; ++stage)
+        {
+            const auto &probe = aggregate.gdn_layers[stage];
+            EXPECT_EQ(probe.global_layer, stage);
+            EXPECT_EQ(probe.recurrence_layout, layout(stage));
+            const auto expected = logical(stage, value);
+            const auto conv = convolution(stage, value);
+            ASSERT_EQ(probe.recurrence_sample_values.size(), expected.size());
+            ASSERT_EQ(probe.conv_sample_values.size(), conv.size());
+            EXPECT_EQ(std::memcmp(probe.recurrence_sample_values.data(), expected.data(),
+                expected.size() * sizeof(float)), 0);
+            EXPECT_EQ(std::memcmp(probe.conv_sample_values.data(), conv.data(), conv.size() * sizeof(float)), 0);
+        }
+    }
+
+    /**
+     * @brief Reject a same-size foreign descriptor using a real ready archive source.
+     * @param prompt Existing complete archive key, independently looked up per child.
+     * @details Cache import validates physical format before copying any state.
+     * No fabricated DGO admission or invalid source pointer is needed.
+     */
+    void rejectForeign(const std::vector<int32_t> &prompt)
+    {
+        for (int stage = 0; stage != 2; ++stage)
+        {
+            const auto hit = leaves[stage]->lookupPrefix(prompt);
+            auto blocks = hit.materializeRestoreBlocks();
+            ASSERT_FALSE(blocks.empty());
+            const auto &source = blocks.back();
+            ASSERT_TRUE(source.waitForPayloadOnHost());
+            ASSERT_NE(source.hybrid_payload, nullptr);
+            EXPECT_EQ(source.layout.hybrid_device_recurrence_layout, layout(stage));
+            GPUDeviceContextPool::instance().getContext(devices[stage]).submitAndWait([&]
+            {
+                auto *hybrid = dynamic_cast<IHybridKVCache *>(leaves[stage]->inferenceState().kv_cache.get());
+                HybridPrefixStateDescriptor descriptor;
+                descriptor.stream = GPUDeviceContextPool::instance().getContext(devices[stage]).defaultStream();
+                descriptor.logical_token_count = static_cast<int>(prompt.size());
+                descriptor.include_host_state = false;
+                descriptor.include_device_state = true;
+                const auto metadata = hybrid->hybridPrefixStateMetadata();
+                descriptor.host_recurrence_layout = metadata.host_recurrence_layout;
+                descriptor.device_recurrence_layout = metadata.device_recurrence_layout;
+                std::vector<uint8_t> before(metadata.device_bytes), after(metadata.device_bytes);
+                ASSERT_TRUE(hybrid->exportHybridPrefixState(descriptor, before.data(), nullptr));
+                descriptor.device_recurrence_layout = layout(1 - stage);
+                ASSERT_FALSE(hybridPrefixStateLayoutsMatch(metadata, descriptor));
+                EXPECT_FALSE(hybrid->importHybridPrefixState(descriptor, source.hybrid_payload, nullptr));
+                descriptor.device_recurrence_layout = metadata.device_recurrence_layout;
+                ASSERT_TRUE(hybrid->exportHybridPrefixState(descriptor, after.data(), nullptr));
+                EXPECT_EQ(before, after) << "Foreign format changed an existing serialized native bank";
+            });
+        }
+    }
+};
+} // namespace
+
+/** @test Real mixed-format PP preserves each child's RAM and restarted disk payload. */
+TEST(PipelinePrefixMixedLayouts, OwnChildRamAndDiskRestartRestoreBytes)
+{
+    initCPUBackend(-1);
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    MixedPrefixLayoutScope formats;
+    MixedPrefixDirectory directory;
+    const std::vector<int32_t> prompt{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<float> terminal_logits(32, 0.25f);
+    std::array<uint64_t, 2> fingerprints{};
+    {
+        MixedPrefixPair pair(directory);
+        const auto admission = pair.registry.lookupPrefixAll(prompt);
+        ASSERT_TRUE(admission.supported) << admission.bypass_reason;
+        pair.seed(1);
+        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publishTerminalRow(
+            *pair.leaves[1], terminal_logits, ForwardLogitsStorageSurface::CanonicalFull));
+        ASSERT_TRUE(pair.registry.harvestPrefixAll(admission, prompt, 8));
+        for (int stage = 0; stage != 2; ++stage)
+        {
+            const auto own = pair.leaves[stage]->lookupPrefix(prompt);
+            ASSERT_EQ(own.cached_tokens, 8);
+            ASSERT_FALSE(own.blocks.empty());
+            fingerprints[stage] = own.fingerprint_key;
+            EXPECT_EQ(own.blocks.back().tier, PrefixStorageTier::Ram);
+            EXPECT_EQ(own.blocks.back().layout.hybrid_device_recurrence_layout, pair.layout(stage));
+        }
+        EXPECT_NE(fingerprints[0], fingerprints[1]);
+        pair.seed(9);
+        pair.rejectForeign(prompt);
+        ASSERT_FALSE(HasFatalFailure());
+        pair.expect(9); // Both real source pointers were ready; rejection changed no bank.
+        ASSERT_FALSE(HasFatalFailure());
+        const auto hit = pair.registry.lookupPrefixAll(prompt);
+        ASSERT_EQ(hit.cached_tokens, 8);
+        ASSERT_TRUE(pair.registry.populatePrefixAll(hit, 0));
+        ASSERT_TRUE(pair.registry.restorePrefixTerminalStateAll(hit));
+        pair.expect(1); // Distinct per-stage bytes detect use of aggregate representative blocks.
+        ASSERT_FALSE(HasFatalFailure());
+        PrefixCacheShutdown shutdown;
+        pair.registry.collectPrefixCacheShutdownAll(shutdown);
+        const auto written = shutdown.flush();
+        EXPECT_GE(written.selected, 2u);
+        EXPECT_EQ(written.written + written.reused, written.selected);
+    } // All RAM lookup leases, native owners and shared disk descriptors retire.
+    {
+        MixedPrefixPair pair(directory); // Reopen the same durable per-record archive.
+        for (int stage = 0; stage != 2; ++stage)
+        {
+            const auto own = pair.leaves[stage]->lookupPrefix(prompt);
+            ASSERT_EQ(own.cached_tokens, 8);
+            ASSERT_FALSE(own.blocks.empty());
+            EXPECT_EQ(own.fingerprint_key, fingerprints[stage]);
+            EXPECT_EQ(own.blocks.back().tier, PrefixStorageTier::Disk);
+            EXPECT_EQ(own.blocks.back().layout.hybrid_device_recurrence_layout, pair.layout(stage));
+        }
+        pair.seed(13);
+        ASSERT_FALSE(HasFatalFailure());
+        const auto hit = pair.registry.lookupPrefixAll(prompt);
+        ASSERT_EQ(hit.cached_tokens, 8);
+        ASSERT_TRUE(pair.registry.populatePrefixAll(hit, 0));
+        ASSERT_TRUE(pair.registry.restorePrefixTerminalStateAll(hit));
+        pair.expect(1); // First restore consumes the actual restarted disk admissions.
+        ASSERT_FALSE(HasFatalFailure());
+        for (auto *leaf : pair.leaves)
+            EXPECT_GT(leaf->prefixStateProbe().prefix_cache_disk_hydrations, 0u);
+        pair.seed(17);
+        pair.rejectForeign(prompt);
+        ASSERT_FALSE(HasFatalFailure());
+        pair.expect(17); // Reopened payload formats still reject before any import.
+        ASSERT_FALSE(HasFatalFailure());
+        const auto again = pair.registry.lookupPrefixAll(prompt);
+        ASSERT_EQ(again.cached_tokens, 8);
+        ASSERT_TRUE(pair.registry.populatePrefixAll(again, 0));
+        ASSERT_TRUE(pair.registry.restorePrefixTerminalStateAll(again));
+        pair.expect(1);
+    }
+}
+#endif
+
 }

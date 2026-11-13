@@ -190,14 +190,25 @@ namespace llaminar2
         /** @brief Resolve and validate the tier descriptor owned by the root dispatch stage. */
         const MoEExpertTierDispatch *resolveTierDispatch() const;
 
-        /** @brief Pack one target's descriptor entries into its fixed outbound view. */
+        /**
+         * @brief Pack one target's descriptor entries into its fixed outbound view.
+         * @param runtime_key Authenticated original rank-batch transaction key.
+         * @param tier Current tier's ordered live descriptor.
+         * @param hidden Original normalized row source.
+         * @param logical_seq_len Live row count.
+         * @param participant_index Target's position in the graph-bound batch.
+         * @param residency_epoch Exact epoch carried by the dispatch descriptor.
+         * @param original_joint_cohort Whether the source lease authorized joint CPU fanout.
+         * @return Whether all useful rows were packed within the admitted workspace.
+         */
         bool packParticipant(
             const MoEOverlayRankBatchKey &runtime_key,
             const MoEExpertTierDispatch &tier,
             const float *hidden,
             int logical_seq_len,
             size_t participant_index,
-            uint64_t residency_epoch);
+            uint64_t residency_epoch,
+            bool original_joint_cohort);
 
         Params params_;
         std::vector<MoEOverlaySparseRows> outbound_rows_;

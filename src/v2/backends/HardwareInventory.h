@@ -12,12 +12,17 @@
  *
  * @author David Sanftenberg
  * @date 2026-04-11
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #pragma once
 
 #include "CPUSocketInfo.h"
 #include "CPUExecutionGeometry.h"
+#include "utils/NUMATopology.h"
 #include "ComputeBackend.h"
 #include <string>
 #include <vector>
@@ -56,6 +61,12 @@ namespace llaminar2
 
         std::vector<CPUSocketInfo> cpu_sockets; ///< Per-socket CPU info (sorted by socket_id)
         CPUExecutionGeometry cpu_execution; ///< Policy observed by this CPU execution process.
+        /// Canonical cold CPU placement: OS NUMA/PU identities stay distinct
+        /// from OpenMPI hwloc logical core indices. This is metadata, not affinity.
+        std::vector<MPICorePlacement> mpi_core_placement;
+        /// Exact NUMA CPU observations supplement package metadata when one
+        /// package contains several nodes. Same canonical discovery authority.
+        std::map<int, ComputeDevice> cpu_numa_devices;
         std::map<int, size_t> cpu_last_level_cache_bytes; ///< Socket ID -> observed distinct LLC domain sum; absent/zero is unknown.
 
         /// Total physical cores across all sockets
@@ -80,17 +91,15 @@ namespace llaminar2
          * @brief Project one CPU endpoint from this observation without rediscovery.
          * @param numa_node Exact NUMA locality, or -1 for whole-host ownership.
          * @return CPU device with observed capacity, thread count and model name.
-         * @throws std::invalid_argument for absent locality or malformed capacity.
+         * @throws std::invalid_argument for missing exact per-NUMA observations,
+         * absent locality or malformed capacity. Package labels cannot repair missing facts.
          */
         ComputeDevice cpuDevice(int numa_node = -1) const;
 
         /// Total CPU memory across all NUMA nodes (bytes)
         size_t total_cpu_memory() const
         {
-            size_t n = 0;
-            for (const auto &s : cpu_sockets)
-                n += s.memory_bytes;
-            return n;
+            return cpuDevice(-1).total_memory_bytes;
         }
 
         /// Number of CPU sockets

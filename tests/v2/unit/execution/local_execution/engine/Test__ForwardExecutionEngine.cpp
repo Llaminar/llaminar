@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <type_traits>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -365,6 +366,7 @@ namespace
         std::vector<std::function<std::unique_ptr<IComputeStage>(const std::string &, DeviceId)>> graph_stage_factories;
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        GraphNativeCaptureEnvelope mock_native_capture_envelope = GraphNativeCaptureEnvelope::Ordinary;
         GraphCaptureAuxiliaryBranchFactory mock_auxiliary_factory;
         bool mock_compute_all_position_logits = false;
         bool mock_live_mtp_request_batch_condition = false;
@@ -388,6 +390,9 @@ namespace
         int prefill_participant_id = 0;
         uint64_t prefill_topology_signature = 0;
         int mock_resident_graph_rows = 0;
+        std::function<void(const ComputeGraph&)> workspace_graph_observer; ///< Original callback address, before native sealing.
+        bool publication_should_fail=false; ///< Exact post-capture publication failure, preserving original cleanup.
+        bool workspace_should_fail=false; ///< Exact cold workspace failure, never a fallback execution path.
 
         // ----- IForwardExecutionHost Interface -----
 
@@ -419,6 +424,7 @@ namespace
                 return GraphBuildResult(build_error_message);
 
             ComputeGraph graph;
+            graph.setNativeCaptureEnvelope(mock_native_capture_envelope);
             const int stage_count = !graph_stage_factories.empty()
                                         ? static_cast<int>(graph_stage_factories.size())
                                         : (graph_stage_types.empty()
@@ -469,15 +475,16 @@ namespace
 
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph, int workspace_seq_len) override
         {
             ensure_workspace_calls++;
             last_workspace_seq_len = workspace_seq_len;
-            return true;
+            if(workspace_graph_observer)workspace_graph_observer(graph);
+            return !workspace_should_fail;
         }
 
         bool ensureDeviceWorkspaceAllocated(
-            const ComputeGraph &,
+            const ComputeGraph &graph,
             int workspace_seq_len,
             WorkspaceGraphFamilyPolicy graph_family_policy,
             WorkspaceGraphParticipantRole participant_role) override
@@ -487,7 +494,8 @@ namespace
             typed_workspace_role_seen = true;
             last_workspace_family_policy = graph_family_policy;
             last_workspace_participant_role = participant_role;
-            return true;
+            if(workspace_graph_observer)workspace_graph_observer(graph);
+            return !workspace_should_fail;
         }
 
         int residentGraphRows() const override
@@ -502,7 +510,7 @@ namespace
             last_published_logits = output.logits;
             (void)ctx;
             sync_logits_calls++;
-            return true;
+            return !publication_should_fail;
         }
 
         void commitSuccessfulForwardOutput(
@@ -2801,12 +2809,20 @@ TEST_F(
  */
 TEST_F(Test__ForwardExecutionEngine, SetupOnlyDecodeExportsWithoutAnyInferenceLaunch)
 {
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}});
     for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
     for (const auto role : {ForwardExecutionRole::MainInference,
                            ForwardExecutionRole::GroupedMTPVerifier,
                            ForwardExecutionRole::MTPCondition})
     {
         SCOPED_TRACE(device.toString() + " role=" + std::to_string(static_cast<int>(role)));
+        PerfStatsCollector::reset();
+        const auto executed_forwards = [] {
+            double count = 0;
+            for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+                if (record.name == "decode_graph_phase") count += record.value;
+            return count;
+        };
         auto engine = makeEngine(/*cache_enabled=*/true);
         llaminar2::testing::MockDeviceContext gpu_ctx(device,
             device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
@@ -2844,8 +2860,78 @@ TEST_F(Test__ForwardExecutionEngine, SetupOnlyDecodeExportsWithoutAnyInferenceLa
             identity = child->capture;
             EXPECT_EQ(host.committed_forward_output_calls, 0);
             EXPECT_EQ(host.sync_logits_calls, 0);
+            EXPECT_EQ(executed_forwards(), 0) << "Recording a child is not execution of its model rows";
             engine.resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
         }
+        // First real submission reuses the same prepared executable and must
+        // contribute exactly one traversal, with no setup capture counted.
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_EQ(executed_forwards(), 1);
+        PerfStatsCollector::reset();
+    }
+}
+
+/**
+ * @brief Prefill through the shared captured executor never counts as decode.
+ *
+ * Native timeline envelopes use the same cache submission path as decode.
+ * Replay and reset must preserve the signature's phase even for one live row;
+ * row geometry and the generic executor's historical name are not phase proof.
+ */
+TEST_F(Test__ForwardExecutionEngine, NativeTimelinePrefillDoesNotCountAsDecode)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}, {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"}, {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int live_rows : {1, 17, 64})
+    {
+        SCOPED_TRACE(device.toString() + " rows=" + std::to_string(live_rows));
+        PerfStatsCollector::reset();
+        auto engine = makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.graph_stage_count = 1;
+        host.mock_native_capture_envelope = GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
+        host.mock_capture_policy.allow_fast_decode = true;
+        std::array<int, 64> tokens{}, positions{};
+        auto input = makeTestInput(64, 1, device, nullptr, nullptr);
+        input.real_seq_len = live_rows;
+        input.bucket_seq_len = 64;
+        input.token_ids_device = tokens.data();
+        input.position_ids_device = positions.data();
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_EQ(host.committed_forward_output_calls, 0);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        constexpr int replays = 20;
+        for (int iteration = 0; iteration < replays; ++iteration)
+        {
+            SCOPED_TRACE(iteration);
+            ASSERT_TRUE(engine.execute(input, output, host));
+            const auto observation = engine.lastExecutedForwardGraph();
+            ASSERT_TRUE(observation.has_value());
+            EXPECT_FALSE(observation->signature.decode);
+            engine.resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+        EXPECT_EQ(host.committed_forward_output_calls, replays);
+        double decode = 0, prefill = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+        {
+            if (record.name == "decode_graph_phase") decode += record.value;
+            if (record.name == "prefill_graph_phase" &&
+                record.tags.at("capture_phase") != "materialized_without_launch")
+                prefill += record.value;
+        }
+        EXPECT_EQ(decode, 0) << "Shared cache submission must retain the explicit prefill phase";
+        EXPECT_EQ(prefill, replays) << "The original prefill publisher counts each actual traversal once";
+        PerfStatsCollector::reset();
     }
 }
 
@@ -4145,4 +4231,491 @@ TEST_F(Test__ForwardExecutionEngine, DiscardAllCachedGraphs_AfterExecute)
     // discard should always succeed.
     engine.discardAllCachedGraphs();
     EXPECT_TRUE(engine.cacheEmpty());
+}
+
+
+/** @test Two actual engine cache programs survive request reset and alternating request selection. */
+TEST_F(Test__ForwardExecutionEngine, SparseQueryProgramCachesSurviveRequestReset)
+{
+    auto engine=makeEngine(true);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    int token=42,position=7;
+    auto complete=makeTestInput(1,1,DeviceId::cpu(),&token,&position);
+    auto no_ranking=complete;
+    no_ranking.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(complete,output,host));
+    ASSERT_TRUE(engine.execute(no_ranking,output,host));
+    ASSERT_EQ(host.build_forward_graph_calls,2);
+    engine.resetSessionReplayState(true);
+    for(int request=0;request<6;++request){
+        ++token;++position;
+        ASSERT_TRUE(engine.execute(request%2?complete:no_ranking,output,host));
+        EXPECT_EQ(host.build_forward_graph_calls,2);
+    }
+    const auto entries=engine.replayCacheObservations(1);
+    ASSERT_EQ(entries.size(),2u);
+    for(const auto &entry:entries)EXPECT_TRUE(entry.valid);
+}
+
+/** @test Parent owners retire once while all replaced shared child entries are still valid. */
+TEST_F(Test__ForwardExecutionEngine, SparseQueryChildEvictionRetiresParentsBeforeAnyChild)
+{
+    int retired=0;
+    {
+    auto engine=makeEngine(true);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    int tokens[]{31,32,33},positions[]{7,8,9};
+    auto complete=makeTestInput(3,1,DeviceId::cpu(),tokens,positions);
+    auto no_ranking=complete;
+    no_ranking.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(complete,output,host));
+    ASSERT_TRUE(engine.execute(no_ranking,output,host));
+    std::weak_ptr<int> callback_lifetime;
+    {
+        auto lease=std::make_shared<int>(1);
+        callback_lifetime=lease;
+        EXPECT_EQ(engine.invalidateMoEPlacementSensitiveGraphsForStablePlacement([&,lease]{
+            ++retired;
+            const auto entries=engine.replayCacheObservations(1);
+            ASSERT_EQ(entries.size(),2u);
+            for(const auto &entry:entries)EXPECT_TRUE(entry.valid);
+        }),2u);
+    }
+    EXPECT_TRUE(callback_lifetime.expired()) << "The engine may not retain a DGO callback borrow";
+    EXPECT_EQ(retired,1);
+    for(const auto &entry:engine.replayCacheObservations(1))EXPECT_FALSE(entry.valid);
+    EXPECT_EQ(engine.invalidateMoEPlacementSensitiveGraphsForStablePlacement(),0u);
+    engine.discardAllCachedGraphs();
+    EXPECT_EQ(retired,1) << "Explicit cleanup has no deferred callback";
+    }
+    EXPECT_EQ(retired,1) << "Engine destruction has no retained DGO callback borrow";
+}
+
+/** @test Malformed programs fail before a context, graph build or cache lookup can hide them. */
+TEST_F(Test__ForwardExecutionEngine, SparseQueryMalformedProgramRejectedCold)
+{
+    auto engine=makeEngine(true);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    int token=1,position=0;
+    auto input=makeTestInput(1,1,DeviceId::cpu(),&token,&position);
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    input.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input,output,host));
+    EXPECT_EQ(host.build_forward_graph_calls,0);
+    input.sparse_query_execution_program=static_cast<SparseQueryExecutionProgram>(99);
+    EXPECT_THROW((void)engine.execute(input,output,host),std::invalid_argument);
+    EXPECT_EQ(host.build_forward_graph_calls,0);
+}
+
+namespace
+{
+/** @brief Observe the real engine's capture lifecycle with no backend or model work. */
+class PrefillAttentionCaptureProbe final : public llaminar2::testing::MockComputeStage
+{
+public:
+    /** @brief Borrow an observation vector that outlives graph/cache retirement. */
+    PrefillAttentionCaptureProbe(std::string name, DeviceId device,
+        std::vector<GraphCaptureActivityTransition> &transitions, bool fail_body)
+        : MockComputeStage(ComputeStageType::ATTENTION, std::move(name), device),
+          transitions_(transitions), fail_body_(fail_body) {}
+    /** @brief Model a native submission failure only while the mock worker is recording. */
+    bool execute(IDeviceContext *context) override
+    {
+        if (fail_body_ && llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive())
+            return false;
+        return MockComputeStage::execute(context);
+    }
+    /** @brief Authenticate owner/stream and observe that native recording closed before its terminal edge. */
+    bool transitionGraphCaptureActivity(IDeviceContext *context, void *stream,
+        GraphCaptureActivityTransition transition) override
+    {
+        EXPECT_NE(context, nullptr);
+        EXPECT_EQ(context->deviceId(), device());
+        EXPECT_NE(stream, nullptr);
+        EXPECT_FALSE(llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive());
+        transitions_.push_back(transition);
+        return true;
+    }
+private:
+    std::vector<GraphCaptureActivityTransition> &transitions_;
+    bool fail_body_;
+};
+}
+
+/** @test Monolithic materialization emits one complete stage interval; cache-hit replay never republishes capture. */
+TEST_F(Test__ForwardExecutionEngine, AttentionEvidencePrefillCaptureAndReplayHaveOneLifecycle)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        std::vector<GraphCaptureActivityTransition> transitions;
+        auto engine = makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.graph_stage_factories.push_back([&](const std::string &name, DeviceId owner) {
+            return std::make_unique<PrefillAttentionCaptureProbe>(name, owner, transitions, false);
+        });
+        std::array<int, 64> tokens{}, positions{};
+        // Mock device storage has one authoritative input owner, as production
+        // bucket admission requires; host shadows must remain absent.
+        auto input = makeTestInput(64, 1, device, nullptr, nullptr);
+        input.token_ids_device = tokens.data(); input.position_ids_device = positions.data();
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        const std::vector<GraphCaptureActivityTransition> expected{
+            GraphCaptureActivityTransition::Entering, GraphCaptureActivityTransition::Completed};
+        ASSERT_EQ(transitions, expected);
+        ASSERT_TRUE(engine.execute(input, output, host));
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        ASSERT_TRUE(engine.execute(input, output, host));
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_EQ(transitions, expected);
+    }
+}
+
+/** @test A failed native body closes capture and aborts its entered stage without publishing Completed. */
+TEST_F(Test__ForwardExecutionEngine, AttentionEvidenceFailedPrefillCaptureAbortsAfterNativeClose)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        std::vector<GraphCaptureActivityTransition> transitions;
+        auto engine = makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.graph_stage_factories.push_back([&](const std::string &name, DeviceId owner) {
+            return std::make_unique<PrefillAttentionCaptureProbe>(name, owner, transitions, true);
+        });
+        std::array<int, 64> tokens{}, positions{};
+        auto input = makeTestInput(64, 1, device, nullptr, nullptr);
+        input.token_ids_device = tokens.data(); input.position_ids_device = positions.data();
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        EXPECT_FALSE(engine.execute(input, output, host));
+        EXPECT_EQ(transitions, (std::vector<GraphCaptureActivityTransition>{
+            GraphCaptureActivityTransition::Entering, GraphCaptureActivityTransition::Aborted}));
+        EXPECT_FALSE(llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive());
+    }
+}
+
+
+namespace {
+/** @brief Observe actual stage ownership through engine cache commit and failed cold cleanup. */
+class StableForwardGraphLifetimeStage final:public llaminar2::testing::MockComputeStage {
+public:
+    /** @param name Original graph node name.
+     * @param device Original participant identity.
+     * @param retired Counter retained beyond the actual cache/stage lifetime.
+     * @param onRetire Optional observation after native cache borrowers must have retired.
+     */
+    StableForwardGraphLifetimeStage(std::string name,DeviceId device,int& retired,std::function<void()> onRetire={})
+        :MockComputeStage(ComputeStageType::GEMM,std::move(name),device),retired_(retired),onRetire_(std::move(onRetire)){}
+    /** @brief Count only actual sole-stage destruction, never a copied graph observation. */
+    ~StableForwardGraphLifetimeStage()override{++retired_;if(onRetire_)onRetire_();}
+private:
+    int& retired_;
+    std::function<void()> onRetire_;
+};
+}
+
+/** @test Cold workspace/capture identity survives either real engine cache commit and repeated reuse. */
+TEST_F(Test__ForwardExecutionEngine, CacheableGraphAddressRemainsStableAcrossCommitAndReuse)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS","1"},{"LLAMINAR_PREFILL_GRAPH_BUCKETS","0"},
+        {"LLAMINAR_VALIDATE_BUFFERS","0"},{"LLAMINAR_VALIDATE_INPUTS","0"},{"LLAMINAR_FAIL_ON_ZERO","0"}});
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})for(const bool decode:{false,true}){
+        SCOPED_TRACE(device.toString());
+        SCOPED_TRACE(decode);
+        int retired=0;
+        std::vector<const ComputeGraph*> prepared;
+        auto engine=makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,device.is_cpu()?ComputeBackendType::CPU:
+            device.is_cuda()?ComputeBackendType::GPU_CUDA:ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.workspace_graph_observer=[&](const ComputeGraph& graph){prepared.push_back(&graph);};
+        host.graph_stage_factories.push_back([&](const std::string& name,DeviceId owner){
+            return std::make_unique<StableForwardGraphLifetimeStage>(name,owner,retired);
+        });
+        std::array<int,4> tokens{1,2,3,4},positions{0,1,2,3};
+        auto input=makeTestInput(decode?1:4,1,device,tokens.data(),positions.data());
+        input.execution_phase=decode?ForwardExecutionPhase::Decode:ForwardExecutionPhase::Prefill;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input,output,host));
+        const auto original=engine.lastExecutedForwardGraph();ASSERT_TRUE(original);
+        ASSERT_FALSE(prepared.empty());
+        EXPECT_EQ(original->graph,prepared.front())<<"Cache publication moved the graph after its original identity escaped";
+        for(const auto* graph:prepared)EXPECT_EQ(graph,original->graph);
+        const auto topology=original->graph->topologyGeneration();
+        engine.resetSessionReplayState(true);
+        for(unsigned replay=0;replay<3;++replay){
+            ASSERT_TRUE(engine.execute(input,output,host));
+            const auto current=engine.lastExecutedForwardGraph();ASSERT_TRUE(current);
+            EXPECT_EQ(current->graph,original->graph);EXPECT_EQ(current->graph->topologyGeneration(),topology);
+            EXPECT_EQ(host.build_forward_graph_calls,1);EXPECT_EQ(retired,0);
+        }
+        engine.invalidateAll();EXPECT_EQ(retired,1);EXPECT_FALSE(engine.lastExecutedForwardGraph());
+    }
+}
+
+/** @test Failed pending construction releases the sole graph and never exports a stale cache identity. */
+TEST_F(Test__ForwardExecutionEngine, FailedColdGraphOwnerRetiresBeforeRetryAndUncachedExit)
+{
+    int retired=0;
+    std::vector<const ComputeGraph*> prepared;
+    auto engine=makeEngine();MockForwardExecutionHost host(&mock_ctx_);
+    host.workspace_should_fail=true;
+    host.workspace_graph_observer=[&](const ComputeGraph& graph){prepared.push_back(&graph);};
+    host.graph_stage_factories.push_back([&](const std::string& name,DeviceId owner){
+        return std::make_unique<StableForwardGraphLifetimeStage>(name,owner,retired);
+    });
+    std::array<int,4> tokens{1,2,3,4},positions{0,1,2,3};
+    auto input=makeTestInput(4,1,DeviceId::cpu(),tokens.data(),positions.data());
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input,output,host));EXPECT_EQ(retired,1);EXPECT_FALSE(engine.lastExecutedForwardGraph());
+    host.workspace_should_fail=false;prepared.clear();
+    ASSERT_TRUE(engine.execute(input,output,host));const auto current=engine.lastExecutedForwardGraph();ASSERT_TRUE(current);
+    ASSERT_FALSE(prepared.empty());EXPECT_EQ(current->graph,prepared.front());EXPECT_EQ(retired,1);
+    engine.invalidateAll();EXPECT_EQ(retired,2);
+    auto uncached=makeEngine(false);prepared.clear();
+    EXPECT_TRUE(uncached.execute(input,output,host));EXPECT_EQ(retired,3);EXPECT_FALSE(uncached.lastExecutedForwardGraph());
+}
+
+
+/** @test A real failed first-use recording retires native borrowers before its sole graph/stage owner. */
+TEST_F(Test__ForwardExecutionEngine, FailedCapturePublicationRetiresNativeBorrowersBeforeGraph)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS","1"},{"LLAMINAR_VALIDATE_BUFFERS","0"},
+        {"LLAMINAR_VALIDATE_INPUTS","0"},{"LLAMINAR_FAIL_ON_ZERO","0"}});
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+        SCOPED_TRACE(device.toString());
+        auto& worker=llaminar2::testing::sharedMockWorkerGPUContext();
+        int nativeLive=0,created=0,retired=0;
+        struct RestoreHooks {
+            llaminar2::testing::MockWorkerGPUContext& worker;
+            std::function<void()> created,destroyed;
+            /** @brief Restore the original worker observations after every engine/cache has retired. */
+            ~RestoreHooks(){worker.capture_created=std::move(created);worker.capture_destroyed=std::move(destroyed);}
+        } restore{worker,worker.capture_created,worker.capture_destroyed};
+        worker.capture_created=[&]{++nativeLive;++created;};
+        worker.capture_destroyed=[&]{--nativeLive;};
+        auto engine=makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,device.is_cuda()?ComputeBackendType::GPU_CUDA:ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.mock_capture_policy.allow_fast_decode=true;
+        host.mock_capture_policy.allow_cached_graph_replay=true;
+        host.publication_should_fail=true;
+        host.graph_stage_factories.push_back([&](const std::string& name,DeviceId owner){
+            return std::make_unique<StableForwardGraphLifetimeStage>(name,owner,retired,[&]{EXPECT_EQ(nativeLive,0);});
+        });
+        int token=1,position=0;auto input=makeTestInput(1,1,device,&token,&position);ForwardOutput output{};
+        EXPECT_FALSE(engine.execute(input,output,host));
+        EXPECT_GT(created,0);EXPECT_EQ(nativeLive,0);EXPECT_EQ(retired,1);EXPECT_FALSE(engine.lastExecutedForwardGraph());
+        host.publication_should_fail=false;
+        ASSERT_TRUE(engine.execute(input,output,host));
+        EXPECT_EQ(retired,1);EXPECT_GT(nativeLive,0);
+        engine.invalidateAll();EXPECT_EQ(nativeLive,0);EXPECT_EQ(retired,2);
+    }
+}
+
+/**
+ * @test Both admitted prefill programs survive alternating request reset at one bucket.
+ * @details Original code genuinely rejects proved Prefill omission. The closed
+ * roster expands the existing bucket retention quantity without growing another
+ * cache or recapturing either owner during reuse.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillRetainsBothProgramOwners)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "1"}});
+    ForwardExecutionEngine::Config config;
+    config.cache_config.enabled=true;
+    const auto bindRoster=[]<class Config>(Config &value) {
+        if constexpr(requires { value.sparse_query_program_count; }) value.sparse_query_program_count=2u;
+    };
+    bindRoster(config);
+    ForwardExecutionEngine engine(std::move(config),executor_);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    std::array<int,3> tokens{31,32,33},positions{0,1,2};
+    auto full=makeTestInput(3,1,DeviceId::cpu(),tokens.data(),positions.data());
+    full.execution_phase=ForwardExecutionPhase::Prefill;
+    auto omitted=full;omitted.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    const auto admit=[]<class Input>(Input &input) {
+        if constexpr(requires { input.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(input.sparse_query_prefill_proof)>::value_type;
+            input.sparse_query_prefill_proof=Proof::admittedRange(0,3);
+        }
+    };
+    admit(omitted);
+    ForwardOutput output{};
+    for(int request=0;request<6;++request) {
+        ASSERT_TRUE(engine.execute(request%2?omitted:full,output,host));
+        engine.resetCapturedReplayState();
+    }
+    EXPECT_EQ(host.build_forward_graph_calls,2);
+    const auto snapshots=engine.prefillGraphCacheSnapshots();
+    ASSERT_EQ(snapshots.size(),2u);
+    for(const auto &snapshot:snapshots) EXPECT_EQ(snapshot.eviction_count,0u);
+}
+
+/** @test Arbitrary enum, foreign range and cold-only proofs reject before graph construction. */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillRejectsMissingForeignAndColdProof)
+{
+    ForwardExecutionEngine::Config config;config.cache_config.enabled=true;
+    const auto bind=[]<class Config>(Config &value) {
+        if constexpr(requires { value.sparse_query_program_count; })value.sparse_query_program_count=2u;
+    };bind(config);
+    ForwardExecutionEngine engine(std::move(config),executor_);MockForwardExecutionHost host(&mock_ctx_);
+    std::array<int,3> tokens{31,32,33},positions{0,1,2};
+    auto input=makeTestInput(3,1,DeviceId::cpu(),tokens.data(),positions.data());
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    input.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input,output,host));
+    const auto verify=[&]<class Input>(Input candidate) {
+        if constexpr(requires { candidate.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(candidate.sparse_query_prefill_proof)>::value_type;
+            candidate.sparse_query_prefill_proof=Proof::admittedRange(1,3);
+            EXPECT_FALSE(engine.execute(candidate,output,host));
+            candidate.sparse_query_prefill_proof=Proof::materialization(SparseQueryExecutionProgram::ProvenNoRanking);
+            EXPECT_FALSE(engine.execute(candidate,output,host));
+        }
+    };
+    verify(input);EXPECT_EQ(host.build_forward_graph_calls,0);
+}
+
+/**
+ * @test Initial restored-prefix materialization retains both distinct programs thereafter.
+ * @details Two original identity classes (ordinary and rehydration), each with
+ * two admitted programs, retain four owners. This proves reuse after first
+ * materialization; it does not claim restored variants are cold-materialized.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillRestoredProgramsReuseAfterInitialMaterialization)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "2"}});
+    ForwardExecutionEngine::Config config;config.cache_config.enabled=true;
+    const auto bind=[]<class Config>(Config &value) {
+        if constexpr(requires { value.sparse_query_program_count; })value.sparse_query_program_count=2u;
+    };bind(config);
+    ForwardExecutionEngine engine(std::move(config),executor_);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    std::array<int,3> tokens{31,32,33},positions{0,1,2};
+    auto full=makeTestInput(3,1,DeviceId::cpu(),tokens.data(),positions.data());
+    full.execution_phase=ForwardExecutionPhase::Prefill;
+    auto omitted=full;omitted.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    const auto admit=[]<class Input>(Input &input) {
+        if constexpr(requires { input.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(input.sparse_query_prefill_proof)>::value_type;
+            input.sparse_query_prefill_proof=Proof::admittedRange(0,3);
+        }
+    };admit(omitted);
+    auto restoredFull=full;restoredFull.rehydrate_prefix_runtime_on_device=true;
+    auto restoredOmitted=omitted;restoredOmitted.rehydrate_prefix_runtime_on_device=true;
+    const std::array inputs{full,omitted,restoredFull,restoredOmitted};
+    ForwardOutput output{};
+    for(const auto &input:inputs)ASSERT_TRUE(engine.execute(input,output,host));
+    ASSERT_EQ(host.build_forward_graph_calls,4);
+    for(int request=0;request<3;++request) {
+        engine.resetCapturedReplayState();
+        for(const auto &input:inputs)ASSERT_TRUE(engine.execute(input,output,host));
+    }
+    EXPECT_EQ(host.build_forward_graph_calls,4);
+    const auto snapshots=engine.prefillGraphCacheSnapshots();ASSERT_EQ(snapshots.size(),4u);
+    for(const auto &snapshot:snapshots)EXPECT_EQ(snapshot.eviction_count,0u);
+}
+
+/** @test A later chunk outside original admitted I/O rejects before any stage mutates state. */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillFamilyRejectsLaterForeignChunkBeforeSubmission)
+{
+    auto engine=makeEngine(false);MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    const std::array<int,8> tokens{10,11,12,13,14,15,16,17};
+    auto input=makeTestInput(8,1,DeviceId::cpu(),tokens.data(),nullptr);
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    input.position_offset=input.token_offset=2048;
+    const auto admit=[]<class Input>(Input &value) {
+        if constexpr(requires { value.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(value.sparse_query_prefill_proof)>::value_type;
+            value.sparse_query_prefill_proof=Proof::admittedRange(2048,8);
+        }
+    };admit(input);
+    PrefillChunkSchedulerPolicy policy;policy.bucket_sizes={4};policy.fixed_chunk_real_tokens=4;
+    policy.real_token_start=2048;policy.real_token_count=8;
+    auto schedule=ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(input,policy,0,false);
+    ASSERT_TRUE(schedule)<<schedule.error;ASSERT_EQ(schedule.chunks.size(),2u);
+    schedule.chunks[1].chunk.token_offset=9000;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunkSchedule(input,schedule,output,host));
+    EXPECT_EQ(host.build_forward_graph_calls,0);
+    EXPECT_EQ(host.prefill_chunk_submission_begin_calls,0);
+}
+
+/**
+ * @test Completed-parent diagnostics retain exact source identity and stream across reset/repeated observations.
+ * @details Native snapshot bytes are qualified by pipeline parity; this device-free
+ * replay authenticates the real publication API and rejects foreign/stale sources
+ * without launching or constructing another capture.
+ */
+TEST_F(Test__ForwardExecutionEngine, ComposedForwardSnapshotsRetainOriginalCaptureAndProducer)
+{
+    auto engine=makeEngine(true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0),ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count=1;host.mock_compute_all_position_logits=true;
+    host.mock_capture_policy.allow_fast_decode=true;host.mock_capture_policy.allow_cached_graph_replay=true;
+    std::array<int,4> tokens{1,2,3,4},positions{9,10,11,12};
+    std::vector<ForwardGraphSignature> signatures;
+    std::vector<const IGPUGraphCapture*> captures;
+    for(const int rows:{2,4}) {
+        auto input=makeTestInput(rows,1,DeviceId::cuda(0),tokens.data(),positions.data());
+        input.token_ids_device=tokens.data();input.position_ids_device=positions.data();
+        input.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        input.execution_phase=ForwardExecutionPhase::Decode;
+        ForwardOutput output{};ASSERT_TRUE(engine.execute(input,output,host));
+        const auto last=engine.lastAllPositionVerifierForwardGraph();ASSERT_TRUE(last);
+        std::string error;const auto original=engine.deviceLoopGraphTemplate(last->signature,&error);
+        ASSERT_TRUE(original)<<error;signatures.push_back(original->signature);captures.push_back(original->capture);
+    }
+    const auto materializations=llaminar2::testing::sharedMockWorkerGPUContext().graphCaptureCreateCount();
+    int parent_stream=0;
+    std::string error;
+    // Publication can return to an older exact retained child even though the
+    // mutable last-executed selector currently names the other geometry.
+    for(int replay=0;replay<6;++replay) {
+        const auto index=static_cast<std::size_t>(replay%2);
+        ASSERT_TRUE(engine.publishComposedForwardSnapshots(signatures[index],captures[index],&parent_stream,&error))<<error;
+        const auto last=engine.lastExecutedForwardGraph();ASSERT_TRUE(last);
+        EXPECT_EQ(last->signature,signatures[index]);
+        EXPECT_EQ(last->stream,&parent_stream);
+    }
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[1],&parent_stream,&error));
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],nullptr,&parent_stream,&error));
+    for(const std::uintptr_t stream:{0u,1u,2u})
+        EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],reinterpret_cast<void*>(stream),&error));
+    auto absent=signatures[0];absent.seq_len=3;
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(absent,captures[0],&parent_stream,&error));
+    auto foreign_generation=signatures[0];++foreign_generation.moe_placement_epoch;
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(foreign_generation,captures[0],&parent_stream,&error));
+    const auto successful=engine.lastExecutedForwardGraph();ASSERT_TRUE(successful);
+    EXPECT_EQ(successful->signature,signatures[1]); // Partial/foreign publication never relabels the prior success.
+
+    // Selecting a different snapshot topology is not permission to publish
+    // the old captured manifest under the new epoch or silently recapture it.
+    executor_.setSnapshotStageFilter([](const std::string&,const StageDumpInfo&){return true;});
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],&parent_stream,&error));
+    EXPECT_NE(error.find("stale original snapshot configuration"),std::string::npos);
+    EXPECT_EQ(llaminar2::testing::sharedMockWorkerGPUContext().graphCaptureCreateCount(),materializations);
+    engine.invalidateAll();
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],&parent_stream,&error));
+    EXPECT_FALSE(engine.lastExecutedForwardGraph());
 }

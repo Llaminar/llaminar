@@ -401,3 +401,73 @@ TEST(Test__TensorHostRelease, CombinedGuardPattern_FourCases)
     // Case 4: Not released, device valid → release (requires GPU; tested in
     //         integration test MultipleRelease_NoCumulativeCorruption)
 }
+
+#include "kernels/common/NativeEmbeddingLayout.h"
+#include "../../mocks/MockMPIContext.h"
+
+/** @test Releasing one borrowed raw view must preserve its root and sibling,
+ * while root retirement revokes every remaining nonzero-offset borrower.
+ * These are real owned native tensors, not device/prepared execution handles.
+ */
+TEST(Test__TensorHostRelease, AllNativeRawViewsRetireIndependentlyAndFollowRoot)
+{
+    test::MockMPIContext context;
+    TensorFactory factory(context);
+    std::vector<TensorType> types{TensorType::FP32,TensorType::FP16,TensorType::BF16,TensorType::Q16_1};
+    for(int id=0;id<=64;++id)
+        if(NativeEmbeddingLayout::supports(static_cast<TensorType>(id)))types.push_back(static_cast<TensorType>(id));
+    ASSERT_EQ(types.size(),25u);
+    for(const auto type:types)
+    {
+        SCOPED_TRACE(static_cast<int>(type));
+        for(int iteration=0;iteration<3;++iteration)
+        {
+            std::shared_ptr<TensorBase> root;
+            if(type==TensorType::FP32)root=factory.createFP32({8,256});
+            else if(type==TensorType::FP16)root=factory.createFP16({8,256});
+            else if(type==TensorType::BF16)root=factory.createBF16({8,256});
+            else if(type==TensorType::Q16_1)root=factory.createQ16_1({8,256});
+            else if(type==TensorType::Q8_1)root=std::make_shared<Q8_1Tensor>(std::vector<size_t>{8,256},std::vector<uint8_t>(NativeEmbeddingLayout::forSource(type,8,256).byte_size,0));
+            else root=factory.createQuantized(type,{8,256},std::vector<uint8_t>(
+                NativeEmbeddingLayout::forSource(type,8,256).byte_size,0));
+            ASSERT_NE(root->raw_data(),nullptr);
+            auto first=root->create_view({2,256},256);
+            auto sibling=root->create_view({2,256},4*256);
+            auto nested=sibling->create_view({1,256},256);
+            ASSERT_NE(nested->raw_data(),nullptr);
+            ASSERT_NE(first->raw_data(),nullptr);ASSERT_NE(sibling->raw_data(),nullptr);
+            const auto* rootBytes=static_cast<const uint8_t*>(root->raw_data());
+            const auto* siblingBytes=static_cast<const uint8_t*>(sibling->raw_data());
+            // A decoded cache is a separate owned representation. A rejected
+            // mutable borrow must not invalidate that representation on its parent.
+            const float* parentCache=type==TensorType::FP16
+                ? static_cast<FP16Tensor*>(root.get())->data():nullptr;
+            ASSERT_GT(siblingBytes,rootBytes);
+            first->release_raw_data();
+            EXPECT_TRUE(first->is_raw_data_released());EXPECT_EQ(first->raw_data(),nullptr);
+            EXPECT_EQ(first->raw_mutable_data(),nullptr);
+            if(type==TensorType::IQ4_NL)
+                EXPECT_EQ(static_cast<IQ4_NLTensor*>(first.get())->raw_blocks(),nullptr);
+            const auto* retiredBlocks=dynamic_cast<const ITensorGemmTileDataProvider*>(first.get());
+            ASSERT_NE(retiredBlocks,nullptr);
+            EXPECT_THROW((void)retiredBlocks->get_raw_block_at(0,0),std::runtime_error);
+            EXPECT_FALSE(root->is_raw_data_released());EXPECT_EQ(root->raw_data(),rootBytes);
+            EXPECT_FALSE(sibling->is_raw_data_released());EXPECT_EQ(sibling->raw_data(),siblingBytes);
+            EXPECT_FALSE(nested->is_raw_data_released());EXPECT_NE(nested->raw_data(),nullptr);
+            first->release_raw_data(); // Idempotent self-retirement cannot affect peers.
+            root->release_raw_data();
+            EXPECT_TRUE(root->is_raw_data_released());EXPECT_EQ(root->raw_data(),nullptr);
+            EXPECT_TRUE(sibling->is_raw_data_released());EXPECT_EQ(sibling->raw_data(),nullptr);
+            EXPECT_EQ(sibling->raw_mutable_data(),nullptr);
+            EXPECT_TRUE(nested->is_raw_data_released());EXPECT_EQ(nested->raw_data(),nullptr);
+            if(type==TensorType::FP16) {
+                EXPECT_EQ(static_cast<FP16Tensor*>(first.get())->mutable_fp16_data(),nullptr);
+                EXPECT_EQ(static_cast<FP16Tensor*>(root.get())->data(),parentCache);
+            }
+            if(type==TensorType::IQ4_NL)
+                EXPECT_EQ(static_cast<IQ4_NLTensor*>(sibling.get())->raw_blocks(),nullptr);
+            sibling->release_raw_data();root->release_raw_data();
+            EXPECT_EQ(sibling->raw_data(),nullptr);
+        }
+    }
+}

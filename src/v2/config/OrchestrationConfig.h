@@ -32,6 +32,7 @@
 #include "CollectiveBackendType.h"
 #include "ExecutionDomainDefinition.h"
 #include "OrchestrationPlanningPolicy.h"
+#include "loaders/SharedPredictorGGUFSource.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
@@ -369,6 +370,8 @@ namespace llaminar2
         // =========================================================================
 
         std::string model_path; ///< Path to GGUF model file
+        /** Explicit optional shared predictor artifact; main metadata and globals remain authoritative. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
         int max_seq_len = 4096; ///< Maximum sequence length
         /**
          * Explicit captured-prefill cap, distinct from KV context capacity.
@@ -412,6 +415,8 @@ namespace llaminar2
         // =========================================================================
 
         bool benchmark_mode = false;            ///< Run benchmark.
+        std::string benchmark_campaign_path; ///< Strict ordered request campaign over one admitted runtime.
+        bool benchmark_campaign_was_provided = false; ///< Rejects an explicitly empty campaign path.
         std::string benchmark_json_output_path; ///< Optional machine-readable benchmark JSON output path.
         std::string benchmark_prompt_file_path; ///< Exact benchmark prompt bytes loaded from this text file.
         bool benchmark_prompt_file_was_provided = false; ///< Distinguishes omission from `--prompt-file ""`.
@@ -506,6 +511,7 @@ namespace llaminar2
         // =========================================================================
 
         PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
+        ImmutableRowTablePolicy ngram_table_policy; ///< Requested native PLE storage preference and bounded mmap windows; resolved only by final PMA admission.
         /**
          * @brief GGUF-selected dynamic MTP with an explicit serial opt-out.
          *

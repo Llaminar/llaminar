@@ -1,0 +1,21 @@
+diff --git a/src/plugin/net.cc b/src/plugin/net.cc
+--- a/src/plugin/net.cc
++++ b/src/plugin/net.cc
+@@ -203,4 +203,9 @@
+   if (pluginLib->ncclGinPluginState == ncclNetPluginStateInitReady && pluginLib->ncclGin) {
+     if ((ncclParamGinType() == -1) && (pluginLib->ncclGin == (ncclGin_t *)-1)) {
++      // Auto selection starts with the existing IB proxy implementation. A
++      // successful GDAKI probe may still expose no compatible devices; only a
++      // positive device inventory can replace this valid candidate. Never let
++      // the unresolved auto sentinel reach a plugin function call.
++      pluginLib->ncclGin = &ncclGinIbProxy;
+       void* throwAwayContext = nullptr;
+       if (ncclGinIbGdaki.init(&throwAwayContext, comm->commHash, ncclDebugLog) == ncclSuccess) {
+@@ -209,7 +214,4 @@
+         }
+         ncclGinIbGdaki.finalize(throwAwayContext);
+-      }
+-      else {
+-        pluginLib->ncclGin = &ncclGinIbProxy;
+       }
+     }

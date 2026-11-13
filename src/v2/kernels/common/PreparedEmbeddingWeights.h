@@ -6,6 +6,9 @@
  * The prepared store owns the stable handle and its physical-memory lease before
  * graph capture. Lookup consumes this allocation directly on its exact device;
  * no runtime weight preparation or workspace-owned replacement exists.
+ * CPU preparation may instead retain the original final native tensor. Its
+ * allocation lease stays on that tensor; this handle neither copies nor frees
+ * its pointer as an independently allocated backend buffer.
  */
 
 #pragma once
@@ -20,12 +23,13 @@
 namespace llaminar2
 {
     class PhysicalMemoryAllocationLease;
+    class TensorBase;
 
     /**
-     * @brief GPU-resident prepared embedding weights
+     * @brief Prepared source-native embedding storage on one exact endpoint.
      *
      * Contains unchanged native source blocks uploaded to one exact device.
-     * Owns the device allocation and frees it on destruction.
+     * Owns a copied backend allocation or retains an already-final CPU tensor.
      */
     struct PreparedEmbeddingWeights
     {
@@ -37,6 +41,22 @@ namespace llaminar2
          */
         void bindPhysicalMemoryLease(
             PhysicalMemoryAllocationLease lease);
+
+        /**
+         * @brief Retain final native CPU tensor storage without another allocation.
+         * @param tensor Owning CPU matrix matching the declared layout and endpoint.
+         * @throws std::invalid_argument For missing, borrowed, mapped or mismatched storage.
+         * @throws std::logic_error If this handle already owns backing or a separate lease.
+         * @details The original tensor remains live execution data. Cleanup may
+         * release source windows, but must not release this tensor's raw bytes.
+         */
+        void bindFinalCPUStorage(std::shared_ptr<const TensorBase> tensor);
+
+        /** @return Retained final CPU owner, or empty for an independently copied backend allocation. */
+        const std::shared_ptr<const TensorBase> &retainedFinalCPUTensor() const noexcept
+        {
+            return final_cpu_tensor_;
+        }
 
         void *device_data = nullptr; ///< Backend pointer to unchanged source-native blocks.
         NativeEmbeddingLayout layout{}; ///< Sole physical format/stride/extent authority.
@@ -71,6 +91,7 @@ namespace llaminar2
         /** Ledger claim released only after the matching backing allocation. */
         std::unique_ptr<PhysicalMemoryAllocationLease>
             physical_memory_lease_;
+        std::shared_ptr<const TensorBase> final_cpu_tensor_; ///< Sole CPU backing owner; its existing lease is never duplicated here.
 
         /** @brief Free owned storage while preserving noexcept teardown. */
         void releaseDeviceData() noexcept;

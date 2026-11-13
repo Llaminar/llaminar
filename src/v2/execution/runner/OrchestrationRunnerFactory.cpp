@@ -15,7 +15,6 @@
 
 #include "IOrchestrationRunnerFactory.h"
 #include "OrchestrationRunner.h"
-#include "../global/NamedDomainGraphBuilder.h"
 #include "../../config/OrchestrationConfigParser.h"
 #include "../../config/ParallelismTreeParser.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
@@ -31,7 +30,10 @@ namespace llaminar2
     RunnerModelAuthorityScope resolveRunnerModelAuthorityScope(
         const OrchestrationConfig &config)
     {
-        if (config.topology_tree || requiresNamedDomainGlobalGraph(config))
+        // Named-domain GlobalOrchestrator graphs borrow the enclosing rank's
+        // admitted context; remote graph edges do not create model owners.
+        // Tree lowering has no admitted rank-local construction contract.
+        if (config.topology_tree)
             return RunnerModelAuthorityScope::MultiRankSet;
         return RunnerModelAuthorityScope::RankLocal;
     }
@@ -207,10 +209,10 @@ namespace llaminar2
          * @brief Normalize configuration and construct the selected runner.
          *
          * A retained ModelContext is a rank-local OrchestrationRunner contract.
-         * Legacy cross-rank TP/PP still constructs one such runner per MPI rank;
-         * named-domain and topology-tree runners compose multiple rank-specific
-         * authorities and reject this overload until their builders accept a
-         * typed context set.
+         * Cross-rank TP/PP and named-domain graphs construct one such runner
+         * per MPI rank. Their local stages borrow that rank's original context
+         * and physical-memory authority. A topology tree remains a distinct,
+         * unsupported construction form and cannot consume this contract.
          *
          * @param config Declarative production topology and runtime policy.
          * @param model_context Optional metadata-only preloaded context.

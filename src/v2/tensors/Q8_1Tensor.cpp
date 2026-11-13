@@ -2,6 +2,9 @@
  * @file Q8_1Tensor.cpp
  * @brief Q8_1 quantized tensor implementation (8-bit with pre-computed sum, intermediate activation format)
  * @author David Sanftenberg
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 #include "TensorClasses.h"
@@ -28,6 +31,40 @@
 
 namespace llaminar2
 {
+
+    std::unique_ptr<Q8_1Tensor> Q8_1Tensor::adoptImmutableCPUStorage(
+        const std::vector<size_t> &shape, AlignedVector<uint8_t> storage, DeviceId device)
+    {
+        auto tensor = std::make_unique<Q8_1Tensor>(shape, std::move(storage), device);
+        // Seal before publication. Activation construction retains its mutable
+        // contract; the final weight factory never exposes that intermediate state.
+        tensor->is_mutable_ = false;
+        return tensor;
+    }
+
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const uint8_t *source,
+        size_t byte_size, std::shared_ptr<void> owner)
+        : shape_(shape), is_view_(true), raw_data_ptr_(source), view_byte_offset_(0),
+          parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr),
+          is_mutable_(false), cache_dirty_(false), source_owner_(std::move(owner))
+    {
+        if (!source || shape.size() != 2 || !shape[0] || !shape[1] ||
+            byte_size != nativeMatrixExtent<Q8_1Block>(shape[0], shape[1]))
+            throw std::invalid_argument("Q8_1 borrowed source requires its exact nonempty native matrix extent");
+    }
+
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> storage,
+        DeviceId device)
+        : shape_(shape), is_view_(false), raw_data_(std::move(storage)), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(device), device_blocks_(nullptr),
+          is_mutable_(true), cache_dirty_(false)
+    {
+        if (!device.is_valid() || !device.is_cpu() || shape.size() != 2)
+            throw std::invalid_argument("Q8_1Tensor owned CPU storage requires a matrix and exact CPU home device");
+        const size_t expected = nativeMatrixExtent<Q8_1Block>(shape[0], shape[1]);
+        if (raw_data_.size() != expected)
+            throw std::invalid_argument("Q8_1Tensor owned storage does not match native matrix extent");
+    }
 
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
         : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
@@ -115,8 +152,10 @@ namespace llaminar2
             const size_t n_blocks = rows * blocks_per_row;
             const size_t required_bytes = n_blocks * sizeof(Q8_1Block);
 
-            raw_data_.resize(required_bytes);
-            std::memcpy(raw_data_.data(), other.raw_data_ptr_ + other.view_byte_offset_, required_bytes);
+            const auto root = std::dynamic_pointer_cast<Q8_1Tensor>(other.parent_);
+            if (!root || root->is_view_)
+                throw std::logic_error("Q8_1 view copy requires its original physical backing owner");
+            raw_data_ = root->raw_data_.copySubrange(other.view_byte_offset_, required_bytes);
         }
 
         // Copy dequant cache if present
@@ -173,7 +212,7 @@ namespace llaminar2
                            size_t byte_offset,
                            std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
-          view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr),
+          view_byte_offset_(byte_offset), parent_(parent), device_(parent ? parent->home_device() : DeviceId::cpu()), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
         // Check if parent is a mutable Q8_1Tensor - if so, inherit mutability
@@ -273,7 +312,9 @@ namespace llaminar2
         {
             root_data_ptr = raw_data_ptr_;
             root_byte_offset = view_byte_offset_ + byte_offset;
-            root_parent = parent_;
+            // A direct borrowed root has no TensorBase parent. Retain that
+            // root itself so a supplied external source owner outlives children.
+            root_parent = parent_ ? parent_ : std::static_pointer_cast<TensorBase>(shared_from_this());
         }
         else
         {

@@ -1,0 +1,72 @@
+From: Llaminar ROCm dependency ownership
+Subject: [PATCH] Require legacy SMI from the explicitly selected SDK
+
+Pinned RCCL7.2.4 keeps its existing SMI/ARSMI APIs. Core10.1 omits the legacy
+SMI package, so build it from the paired systems source. Reject system search,
+foreign warmed cache entries and imported targets whose libraries escape SDK.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -264,13 +264,5 @@
+-## Check for ROCM-smi
+-find_package(rocm_smi PATHS ${ROCM_PATH}/lib/cmake/rocm_smi)
+-if (rocm_smi_FOUND)
+-  message(STATUS "Found rocm_smi at ${ROCM_SMI_INCLUDE_DIR}")
+-else()
+-  message(STATUS "Checking old include directory structure for rocm_smi")
+-  set(ROCM_SMI_INCLUDE_DIR "${ROCM_PATH}/rocm_smi/include")
+-  set(ROCM_SMI_LIB_DIR     "${ROCM_PATH}/rocm_smi/lib")
+-  set(ROCM_SMI_LIBRARIES   rocm_smi64)
+-endif()
++## Require the matching source-built legacy SMI component from this SDK.
++include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rccl_legacy_smi_sdk.cmake")
+ check_include_file_cxx("${ROCM_SMI_INCLUDE_DIR}/rocm_smi/rocm_smi64Config.h" HAVE_ROCM_SMI64CONFIG)
+ ### Check for RSMI_INIT_FLAG_THRAD_ONLY_MUTEX support
+ file(READ "${ROCM_SMI_INCLUDE_DIR}/rocm_smi/rocm_smi.h" rocm_smi_incl)
+diff --git a/cmake/rccl_legacy_smi_sdk.cmake b/cmake/rccl_legacy_smi_sdk.cmake
+new file mode 100644
+--- /dev/null
++++ b/cmake/rccl_legacy_smi_sdk.cmake
+@@ -0,0 +1,41 @@
++# RCCL's legacy SMI dependency belongs to the explicitly selected SDK only.
++# PATHS is normally additive in find_package; a system package or a warmed
++# rocm_smi_DIR must never select another release's same-SONAME library.
++get_filename_component(_rccl_smi_sdk "${ROCM_PATH}" REALPATH)
++get_filename_component(_rccl_smi_required "${ROCM_PATH}/lib/cmake/rocm_smi" REALPATH)
++if(DEFINED rocm_smi_DIR AND rocm_smi_DIR AND NOT rocm_smi_DIR MATCHES "-NOTFOUND$")
++  get_filename_component(_rccl_smi_cached "${rocm_smi_DIR}" REALPATH)
++  if(NOT _rccl_smi_cached STREQUAL _rccl_smi_required)
++    message(FATAL_ERROR "RCCL rocm_smi_DIR belongs to another SDK: ${rocm_smi_DIR}")
++  endif()
++endif()
++find_package(rocm_smi CONFIG REQUIRED PATHS "${_rccl_smi_required}" NO_DEFAULT_PATH)
++if(NOT TARGET rocm_smi64)
++  message(FATAL_ERROR "Selected SDK legacy SMI did not publish rocm_smi64")
++endif()
++get_target_property(_rccl_smi_configs rocm_smi64 IMPORTED_CONFIGURATIONS)
++set(_rccl_smi_properties IMPORTED_LOCATION)
++foreach(_rccl_smi_config IN LISTS _rccl_smi_configs)
++  string(TOUPPER "${_rccl_smi_config}" _rccl_smi_config)
++  list(APPEND _rccl_smi_properties "IMPORTED_LOCATION_${_rccl_smi_config}")
++endforeach()
++set(_rccl_smi_has_location FALSE)
++get_filename_component(_rccl_smi_libdir "${_rccl_smi_sdk}/lib" REALPATH)
++foreach(_rccl_smi_property IN LISTS _rccl_smi_properties)
++  get_target_property(_rccl_smi_location rocm_smi64 "${_rccl_smi_property}")
++  if(_rccl_smi_location AND NOT _rccl_smi_location MATCHES "-NOTFOUND$")
++    if(NOT EXISTS "${_rccl_smi_location}")
++      message(FATAL_ERROR "Selected SDK legacy SMI imported a missing library")
++    endif()
++    get_filename_component(_rccl_smi_physical "${_rccl_smi_location}" REALPATH)
++    get_filename_component(_rccl_smi_parent "${_rccl_smi_physical}" DIRECTORY)
++    if(NOT _rccl_smi_parent STREQUAL _rccl_smi_libdir)
++      message(FATAL_ERROR "RCCL legacy SMI library belongs to another SDK: ${_rccl_smi_location}")
++    endif()
++    set(_rccl_smi_has_location TRUE)
++  endif()
++endforeach()
++if(NOT _rccl_smi_has_location)
++  message(FATAL_ERROR "Selected SDK legacy SMI has no imported library location")
++endif()
++message(STATUS "RCCL legacy SMI from selected SDK: ${ROCM_SMI_INCLUDE_DIR}")

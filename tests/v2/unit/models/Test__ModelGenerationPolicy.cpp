@@ -86,6 +86,8 @@ namespace
          "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/995ad96eacd98c81ed38be0c5b274b04031597b0/README.md"},
         {"Qwen3.8-27B", "qwen35", true, {1.0f, 0.95f, 0.0f}, {0.7f, 0.8f, 1.5f}, 1.0f,
          "https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/README.md"},
+        {"Qwen3.8-Flash-Next", "qwen4exp", true, {1.0f, 0.95f, 0.0f}, {0.7f, 0.8f, 1.5f}, 1.0f,
+         "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/README.md"},
     });
 
     /**
@@ -110,7 +112,7 @@ namespace
 /** @test Every card selects both modes and its documented default from GGUF metadata. */
 TEST(Test__ModelGenerationPolicy, OfficialCardsCoverAllSizesModesAndMetadataForms)
 {
-    ASSERT_EQ(cards.size(), 25u);
+    ASSERT_EQ(cards.size(), 26u);
     for (const auto &card : cards)
     {
         SCOPED_TRACE(card.source);

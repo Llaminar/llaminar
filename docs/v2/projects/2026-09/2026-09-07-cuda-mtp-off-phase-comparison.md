@@ -1026,9 +1026,9 @@ certification has already produced a shippable, certified container.
 ## Packed prefill staging: shared launch identity and completed GPU byte proof
 
 The BK64 arithmetic body now lives in
-`src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDevice.cuh`, compiled by the
+`src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillDevice.cuh`, compiled by the
 production core. The focused fixture captures that core's exact opaque kernel
-symbol; it does not recompile the body. `CUDANativeVNNIPrefillSchedule.h`
+symbol; it does not recompile the body. `CUDANativeQuantisedPrefillSchedule.h`
 owns a CUDA-runtime-free typed identity and structural admission predicate.
 RegisterDecode, AsyncPayload, AsyncWeightOperands and AsyncAllOperands are
 distinct physical specializations; staging is not encoded as another tile or
@@ -1444,7 +1444,7 @@ request resolution still names the measured exact launch, not a formula token.
 
 The compact fold prototype was expanded from three formats to all 17 physical
 execution codebooks, including the CPU-migration representations. The oracle
-is now the actual Release `cudaNativeVNNIGemvTuned_fp32` KPAR bridge rather
+is now the actual Release `cudaNativeQuantisedGemvTuned_fp32` KPAR bridge rather
 than a copied producer. **765 cases passed**, with 20 captured replays per
 mode and full-output byte/guard checks. Coverage combines M=1/2/3/16/31,
 ragged columns, trailing empty partitions, signed-zero alpha, non-unit alpha,
@@ -1642,7 +1642,7 @@ Receipts: `/tmp/qwen38-fused-dispatch-all-formats.{csv,timing.csv,log}`.
 
 ### Full dispatch certification in flight
 
-The canonical `scripts/train_native_vnni_dispatch.sh --backend cuda`
+The canonical `scripts/train_native_quantised_dispatch.sh --backend cuda`
 transaction began September 7 at approximately 12:37 UTC, without `--install`.
 It uses the standard p95 <5% / at-least-95%-of-domains criteria, fresh Release
 measurements, 117 common-development shapes, all 21 source formats, and two
@@ -1662,7 +1662,7 @@ sealed certification, grouped verification nor a new model benchmark has
 completed for this generation.
 
 The work directory is
-`benchmark_results/native_vnni_dispatch/work/collect-cuda-nvidia-geforce-rtx-3090-8.6-aa32f0858c642c2c-4f53cda18c2b`;
+`benchmark_results/native_quantised_dispatch/work/collect-cuda-nvidia-geforce-rtx-3090-8.6-aa32f0858c642c2c-4f53cda18c2b`;
 the driver log is `/tmp/qwen38-fused-certification.log`. Detailed progress is
 in its `cuda_decode_m1-development-common.lane{0,1}.log` files. Do not restart
 because the parent log is quiet or rebuild the measured core during collection.
@@ -2070,7 +2070,7 @@ Receipts: `/tmp/qwen38-attention-aba-{vector-before,scalar-control,vector-after}
 ### Read-only packed-byte inventory: next diagnostic, not a new allocation plan
 
 A header-only GGUF inventory was paired with a temporary C++ probe calling
-the production `nativeVnniPackedRegionSizes()` function. No tensors were
+the production `nativeQuantisedPackedRegionSizes()` function. No tensors were
 dequantized or uploaded, no full-GGUF hashing was performed, and no alternative
 live accounting ledger was created. Main-layer and vocabulary matrices show:
 
@@ -2143,11 +2143,11 @@ The exact profile inventory is:
 
 | Engine / family | Specialization | Grid | Block | Registers/thread | Profiled duration |
 |---|---|---|---|---:|---:|
-| Llaminar IQ4 | `nativeVnniGemv_kpar<128,1,4>` | 136 × 6 | 128 | 38 | 62.848 µs |
+| Llaminar IQ4 | `nativeQuantisedGemv_kpar<128,1,4>` | 136 × 6 | 128 | 38 | 62.848 µs |
 | llama.cpp IQ4 pair | `mul_mat_vec_q<23,1,1,0,0>` | 17408 | 32 × 4 | 48 | 113.280 µs |
-| Llaminar Q5 | `nativeVnniGemv_kpar<128,2,7>` | 80 × 9 | 64 | 40 | 51.072 µs |
+| Llaminar Q5 | `nativeQuantisedGemv_kpar<128,2,7>` | 80 × 9 | 64 | 40 | 51.072 µs |
 | llama.cpp Q5 | `mul_mat_vec_q<13,1,0,0,0>` | 10240 | 32 × 4 | 40 | 46.656 µs |
-| Llaminar Q6 | `nativeVnniGemv_wide<64,1,8>` | 3880 | 64 | 37 | 1320.640 µs |
+| Llaminar Q6 | `nativeQuantisedGemv_wide<64,1,8>` | 3880 | 64 | 37 | 1320.640 µs |
 | llama.cpp Q6 | `mul_mat_vec_q<14,1,0,0,0>` | 248320 | 32 × 4 | 40 | 1182.176 µs |
 
 Each invocation uses `--graph-profiling node --kernel-name-base demangled`,

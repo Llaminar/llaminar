@@ -14,6 +14,7 @@
 #include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/rocm/gemm/ROCmQuantisedActivationProducers.h"
 
 #include <algorithm>
 #include <bit>
@@ -26,14 +27,18 @@
 #include <string>
 #include <vector>
 
-extern "C" {
-    bool rocmQuantGemm_quantizeActivationsBlockwise(
-        const float *, int8_t *, float *, int, int, int, void *, int);
-    bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
-        const float *, int8_t *, float *, int32_t *, int, int, int, void *, int);
-}
 
 namespace {
+/** @brief Explicit diagnostic producer authority; ordinary remains the default. */
+enum class RowPolicy { Ordinary, DeviceCounted };
+/** @brief Parse the isolated diagnostic selector without changing production policy. */
+RowPolicy rowPolicy() {
+    const char *value=std::getenv("LLAMINAR_QUANT_PROFILE_COUNTED");
+    if (!value || std::string(value)=="0") return RowPolicy::Ordinary;
+    if (std::string(value)=="1") return RowPolicy::DeviceCounted;
+    throw std::invalid_argument("LLAMINAR_QUANT_PROFILE_COUNTED requires 0 or 1");
+}
+
 /** @brief Surface a native failure immediately, never as a very fast sample. */
 void checked(hipError_t status) {
     if (status != hipSuccess) throw std::runtime_error(hipGetErrorString(status));
@@ -89,8 +94,9 @@ public:
  * @param width Source row stride; partial blocks select the real scalar-tail route.
  * @param with_sums Include asymmetric-codebook INT32 sum publication.
  * @param samples Number of native-event observations, distinct from warmup.
+ * @param policy Ordinary ABI or explicit full-live device-counted producer.
  */
-void measure(int rows,int width,bool with_sums,int samples=25) {
+void measure(int rows,int width,bool with_sums,int samples=25,RowPolicy policy=RowPolicy::Ordinary) {
     SCOPED_TRACE(::testing::Message() << "M=" << rows << " K=" << width
         << " sums=" << with_sums);
     constexpr int repetitions = 16;
@@ -106,17 +112,28 @@ void measure(int rows,int width,bool with_sums,int samples=25) {
     }
     Storage<float> device_input(count), device_scales(blocks);
     Storage<int8_t> device_output(count);
-    Storage<int32_t> device_sums(blocks);
+    Storage<int32_t> device_sums(blocks), device_count(1);
+    // Both host upload source and device scalar outlive terminal retirement.
+    const int32_t live=rows;
+    const auto row_range=llaminar2::DeviceRowRange::deviceCounted(rows,device_count.data);
     Execution execution;
     const auto stream = execution.stream;
     checked(hipMemcpyAsync(device_input.data,input.data(),count*sizeof(float),hipMemcpyHostToDevice,stream));
+    if (policy==RowPolicy::DeviceCounted)
+        checked(hipMemcpyAsync(device_count.data,&live,sizeof(live),hipMemcpyHostToDevice,stream));
     checked(hipStreamSynchronize(stream));
     execution.graph = std::make_unique<llaminar2::HIPGraphCapture>(stream,0);
     {
         llaminar2::ScopedBackendGraphCapture recording(*execution.graph,"activation quantizer economy");
         ASSERT_TRUE(recording.begin());
         for (int repetition=0; repetition<repetitions; ++repetition) {
-            const bool submitted = with_sums
+            const bool submitted = policy==RowPolicy::DeviceCounted
+                ? (with_sums
+                    ? rocmQuantGemm_quantizeActivationsBlockwiseWithSums_rows(device_input.data,device_output.data,
+                        device_scales.data,device_sums.data,rows,width,0,stream,32,&row_range)
+                    : rocmQuantGemm_quantizeActivationsBlockwise_rows(device_input.data,device_output.data,
+                        device_scales.data,rows,width,0,stream,32,&row_range))
+                : with_sums
                 ? rocmQuantGemm_quantizeActivationsBlockwiseWithSums(device_input.data,device_output.data,
                     device_scales.data,device_sums.data,rows,width,0,stream,32)
                 : rocmQuantGemm_quantizeActivationsBlockwise(device_input.data,device_output.data,
@@ -126,6 +143,25 @@ void measure(int rows,int width,bool with_sums,int samples=25) {
         recording.finish();
         ASSERT_TRUE(execution.graph->instantiate());
     }
+    std::vector<llaminar2::GPUGraphKernelNodeInfo> kernels;
+    std::string inspection_error;
+    ASSERT_TRUE(execution.graph->inspectKernelNodes(kernels,&inspection_error)) << inspection_error;
+    ASSERT_EQ(execution.graph->nodeCount(),size_t(repetitions));
+    ASSERT_EQ(kernels.size(),size_t(repetitions));
+    const auto &native=kernels.front();
+    ASSERT_TRUE(native.name_resolved);ASSERT_TRUE(native.valid());
+    EXPECT_EQ(native.local_memory_bytes_per_thread,0u);
+    for (const auto &node:kernels) {
+        ASSERT_EQ(node.function_identity,native.function_identity);
+        ASSERT_EQ(node.name,native.name);
+        ASSERT_EQ(node.grid_x,native.grid_x);ASSERT_EQ(node.grid_y,native.grid_y);ASSERT_EQ(node.grid_z,native.grid_z);
+        ASSERT_EQ(node.block_x,native.block_x);ASSERT_EQ(node.block_y,native.block_y);ASSERT_EQ(node.block_z,native.block_z);
+        ASSERT_EQ(node.registers_per_thread,native.registers_per_thread);
+        ASSERT_EQ(node.local_memory_bytes_per_thread,0u);
+        ASSERT_EQ(node.static_shared_memory_bytes,native.static_shared_memory_bytes);
+        ASSERT_EQ(node.dynamic_shared_memory_bytes,native.dynamic_shared_memory_bytes);
+    }
+    ASSERT_FALSE(::testing::Test::HasFailure());
     std::vector<double> times;
     for (int sample=-5; sample<samples; ++sample) {
         checked(hipEventRecord(execution.start,stream));
@@ -161,11 +197,19 @@ void measure(int rows,int width,bool with_sums,int samples=25) {
             }
             if (with_sums) ASSERT_EQ(sums[index],expected_sum);
         }
+    // Native API resources expose registers and private/local bytes, not a
+    // separate spill counter. Compiler spill-policy/ISA evidence remains the
+    // authority for spills; this inventory must not invent that measurement.
+    for (size_t sample=0;sample<times.size();++sample)
+        std::printf("QUANTIZE_RAW,policy=%s,live=%d,M=%d,K=%d,sums=%d,sample=%zu,us=%.6f,symbol=%s,grid=%u/%u/%u,block=%u/%u/%u,registers=%u,local_bytes=%zu,static_lds=%zu,dynamic_lds=%zu,spill_counter=not_exposed\n",
+            policy==RowPolicy::DeviceCounted?"counted":"ordinary",live,rows,width,int(with_sums),sample,times[sample],
+            native.name.c_str(),native.grid_x,native.grid_y,native.grid_z,native.block_x,native.block_y,native.block_z,
+            native.registers_per_thread,native.local_memory_bytes_per_thread,native.static_shared_memory_bytes,native.dynamic_shared_memory_bytes);
     std::sort(times.begin(),times.end());
     const double median=times[times.size()/2];
     const size_t logical_bytes=count*5+blocks*(with_sums?8:4);
-    std::printf("QUANTIZE_CAPTURED,backend=ROCm,M=%d,K=%d,sums=%d,median_us=%.4f,logical_GBps=%.3f,byte_exact=1\n",
-        rows,width,int(with_sums),median,double(logical_bytes)/(median*1000));
+    std::printf("QUANTIZE_CAPTURED,backend=ROCm,policy=%s,live=%d,M=%d,K=%d,sums=%d,median_us=%.4f,logical_GBps=%.3f,byte_exact=1\n",
+        policy==RowPolicy::DeviceCounted?"counted":"ordinary",live,rows,width,int(with_sums),median,double(logical_bytes)/(median*1000));
 }
 
 /** @brief Public auto dispatch over decoder, verifier, main bucket and tail. */
@@ -183,6 +227,6 @@ TEST(BlockwiseQuantPerfTest,ExactProductionShapeProfilerLaunch) {
     if (sum_mode && std::string(sum_mode)!="0" && std::string(sum_mode)!="1")
         throw std::invalid_argument("LLAMINAR_QUANT_PROFILE_SUMS requires 0 or 1");
     measure(dimension("LLAMINAR_QUANT_PROFILE_M",512),
-            dimension("LLAMINAR_QUANT_PROFILE_K",2048),sum_mode && *sum_mode=='1',1);
+            dimension("LLAMINAR_QUANT_PROFILE_K",2048),sum_mode && *sum_mode=='1',1,rowPolicy());
 }
 } // namespace

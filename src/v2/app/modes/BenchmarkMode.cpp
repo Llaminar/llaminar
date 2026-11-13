@@ -12,6 +12,7 @@
  */
 
 #include "app/modes/BenchmarkMode.h"
+#include "execution/runner/ObservedFixedPipelineEvidence.h"
 #include "app/AppContext.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
@@ -21,6 +22,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
+#include "utils/BenchmarkCampaign.h"
 
 #include <fstream>
 #include <memory>
@@ -175,6 +177,20 @@ namespace llaminar2
 
         BenchmarkRunner benchmark(adapter, tokenizer);
 
+        if (ctx.config.benchmark_campaign_was_provided || !ctx.config.benchmark_campaign_path.empty())
+        {
+            // Physical admission/readiness above occurs once. The immutable
+            // campaign validates every natural input and depth before any cell
+            // may reset/publish a request; all inference uses this same adapter.
+            auto resolved = runner->config();
+            resolved.benchmark_campaign_path = ctx.config.benchmark_campaign_path;
+            resolved.benchmark_mode = true;
+            const auto campaign = prepareBenchmarkCampaign(resolved, benchmark);
+            const auto outcome = runBenchmarkCampaign(campaign, *runner, benchmark);
+            if (!outcome.success) LOG_ERROR("Benchmark campaign failed: " << outcome.failure_reason);
+            return shutdownAndReturn(outcome.success, outcome.failure_reason);
+        }
+
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);
         if (!ctx.config.benchmark_json_output_path.empty())
@@ -189,7 +205,16 @@ namespace llaminar2
             }
             // The runner exposes the topology-resolved startup configuration;
             // raw CLI intent cannot attest which hardware defaults ran.
-            json_out << benchmarkResultToJsonString(result, &runner->config()) << '\n';
+            if (isObservedFixedNativePipeline(runner->config()))
+            {
+                auto document=nlohmann::json::parse(benchmarkResultToJsonString(result,&runner->config()));
+                document["observed_pipeline_binding"]=observeFixedNativePipelineBinding(*runner,*ctx.mpi_ctx);
+                if (PerfStatsCollector::isDomainEnabled("immutable_lookup"))
+                    document["fixed_native_pipeline_terminal"]=observeFixedNativePipelineTerminal(*runner);
+                json_out << document.dump() << '\n';
+            }
+            else
+                json_out << benchmarkResultToJsonString(result, &runner->config()) << '\n';
             if (!json_out)
             {
                 LOG_ERROR("Failed to write benchmark JSON output path: "

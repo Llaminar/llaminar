@@ -14,6 +14,8 @@
 #pragma once
 
 #include "ExpertTierTransferMeasurement.h"
+#include "MoEOverlayPhysicalProjectionGeometry.h"
+#include "ExpertWeightFormat.h"
 #include "MoEOverlayResidencyAuthority.h"
 
 #include <array>
@@ -50,6 +52,96 @@ namespace llaminar2
             std::string *error = nullptr) noexcept = 0;
     };
 
+    /** @brief Passive original-coordinate identity and optional real event observation of one piece. */
+    struct MoEOverlayMigrationPieceMeasurement
+    {
+        ExpertTierWeightProjection projection = static_cast<ExpertTierWeightProjection>(0);
+        int source_participant = -1;
+        int destination_participant = -1;
+        std::optional<ExpertTierWeightProjectionIntersection> intersection;
+        ExpertWeightFormat format;
+
+        /** @return Whether original geometry and source format describe a live physical piece. */
+        bool valid() const noexcept;
+        /** @param other Original piece to compare. @return Exact identity, excluding runtime observations. */
+        bool sameIdentity(const MoEOverlayMigrationPieceMeasurement &other) const noexcept;
+    };
+
+    /**
+     * @brief Immutable, checked original geometry shared by one wave and its evidence.
+     *
+     * Construction is a passive geometry check, never source readiness. The
+     * source-bound factory authenticates these values against its original
+     * preparation. Polling and journaling only borrow this retained owner.
+     */
+    class MoEOverlayMigrationMeasurementGeometry final
+    {
+    public:
+        /** @brief Geometry storage is shared by ownership, never copied at completion. */
+        MoEOverlayMigrationMeasurementGeometry(const MoEOverlayMigrationMeasurementGeometry &) = delete;
+        MoEOverlayMigrationMeasurementGeometry &operator=(const MoEOverlayMigrationMeasurementGeometry &) = delete;
+        /**
+         * @brief Check complete original targets and enumerate exact pieces once, before polling.
+         * @param targets Original ordered source and destination member rectangles.
+         * @param formats Source formats indexed by projection enum, never manifest position.
+         * @return One immutable passive geometry owner.
+         * @throws std::invalid_argument For incomplete, overlapping or invalid original geometry.
+         */
+        static std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> checked(
+            std::pair<MoEOverlayPhysicalProjectionTarget, MoEOverlayPhysicalProjectionTarget> targets,
+            std::array<ExpertWeightFormat, 3> formats);
+        /** @return Original complete targets. */
+        const auto &targets() const noexcept { return targets_; }
+        /** @return Source formats in projection-enum order. */
+        const auto &formats() const noexcept { return formats_; }
+        /** @return Canonical expected global pieces, with no observations or timing authority. */
+        const auto &pieces() const noexcept { return pieces_; }
+        /** @param other Checked original geometry. @return Complete value identity, without allocation. */
+        bool sameIdentity(const MoEOverlayMigrationMeasurementGeometry &other) const noexcept;
+    private:
+        /** @brief Retain already checked geometry; public callers cannot bypass enumeration.
+         * @param targets Validated target rectangles. @param formats Validated role formats.
+         * @param pieces Canonically enumerated expected intersections. */
+        MoEOverlayMigrationMeasurementGeometry(
+            std::pair<MoEOverlayPhysicalProjectionTarget, MoEOverlayPhysicalProjectionTarget> targets,
+            std::array<ExpertWeightFormat, 3> formats,
+            std::vector<MoEOverlayMigrationPieceMeasurement> pieces)
+            : targets_(std::move(targets)), formats_(formats), pieces_(std::move(pieces)) {}
+        std::pair<MoEOverlayPhysicalProjectionTarget, MoEOverlayPhysicalProjectionTarget> targets_;
+        std::array<ExpertWeightFormat, 3> formats_;
+        std::vector<MoEOverlayMigrationPieceMeasurement> pieces_;
+    };
+
+    /**
+     * @brief Build the actual fabric's measurement identity from its authenticated original source.
+     * @param migration Original logical source/destination target edge.
+     * @param manifest Full source role geometry/formats, in any valid role permutation.
+     * @param experts Original source expert population.
+     * @param topology Original canonical participant inventory.
+     * @return Checked passive geometry; no event, source permit or readiness is created.
+     */
+    std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> makePhysicalMoEOverlayMeasurementGeometry(
+        const MoEOverlayTierMigration &migration, const MoEOverlayLayerWeightManifest &manifest,
+        int experts, const MoEExpertOwnerMap &topology);
+
+    /** @brief One preallocated observation slot; quote comes from the bound operation, not the sample. */
+    struct MoEOverlayMigrationPieceObservation
+    {
+        std::optional<std::uint64_t> quoted_payload_bytes;
+        std::optional<ExpertTierProjectionTransferMeasurement> observation;
+        /** @return Whether a present sample matches its independently retained actual operation quote. */
+        bool valid() const noexcept;
+    };
+
+    /** @brief Map one existing owned operation to its original logical/piece coordinate. */
+    struct MoEOverlayMigrationOperationMeasurement
+    {
+        std::size_t migration = 0;
+        std::size_t piece = 0;
+        bool requires_local_observation = false;
+        int observer_world_rank = -1; ///< Original fabric rank retained independently of optional event timing.
+    };
+
     /**
      * @brief Completed physical evidence for one expert in a migration wave.
      *
@@ -73,6 +165,10 @@ namespace llaminar2
             3>
             projections;
         std::uint64_t wave_wall_nanoseconds = 0;
+        /** Checked passive geometry is shared, never copied or re-enumerated at completion. */
+        std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> geometry;
+        /** Allocated to exact geometry cardinality before polling, then filled only by actual operations. */
+        std::vector<MoEOverlayMigrationPieceObservation> piece_observations;
 
         /** @return Whether identity, wall time, and optional values are coherent. */
         [[nodiscard]] bool valid() const noexcept;
@@ -98,8 +194,7 @@ namespace llaminar2
          * @return Whether the complete local observation was accepted.
          */
         virtual bool recordCompletedWave(
-            const std::vector<MoEOverlayCompletedMigrationMeasurement> &
-                measurements,
+            std::vector<MoEOverlayCompletedMigrationMeasurement> &&measurements,
             std::string *error) noexcept = 0;
     };
 
@@ -152,6 +247,10 @@ namespace llaminar2
         {
             return std::nullopt;
         }
+        /** @return Exact payload quote retained by this bound production operation, never inferred from timing. */
+        [[nodiscard]] virtual std::optional<std::uint64_t> quotedPayloadBytes() const noexcept
+        { return std::nullopt; }
+
     };
 
     /**
@@ -243,6 +342,9 @@ namespace llaminar2
         std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation>> transfers;
         std::unique_ptr<IMoEOverlayInactiveBankTransaction> inactive_bank;
         std::string error;
+        /** Passive immutable expected geometry and actual flat-operation coordinates. */
+        std::vector<std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>> measurement_geometries;
+        std::vector<MoEOverlayMigrationOperationMeasurement> measurement_operations;
 
         /**
          * @brief Validate ownership shape for a requested operation count.

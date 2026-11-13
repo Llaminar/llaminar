@@ -18,6 +18,7 @@
 #include "utils/FNV1a.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -559,6 +560,8 @@ namespace llaminar2
             {
                 device_state_bytes.resize(metadata.device_bytes);
                 HybridPrefixStateDescriptor desc;
+                desc.host_recurrence_layout = metadata.host_recurrence_layout;
+                desc.device_recurrence_layout = metadata.device_recurrence_layout;
                 desc.stream = stream;
                 desc.synchronize = true;
                 desc.include_host_state = false;
@@ -568,7 +571,8 @@ namespace llaminar2
                         device_state_bytes.data(),
                         nullptr))
                 {
-                    device_state_bytes.clear();
+                    throw std::runtime_error(
+                        "GDN diagnostic export failed for authenticated recurrence layout");
                 }
             }
         }
@@ -594,6 +598,25 @@ namespace llaminar2
 
             PrefixGDNLayerProbe probe;
             probe.global_layer = global_layer;
+            probe.recurrence_layout = has_authoritative_device_state
+                                          ? metadata.device_recurrence_layout
+                                          : metadata.host_recurrence_layout;
+            // CPU cache metadata certifies host-owned epoch storage. Preserve
+            // its full checkpoint/history extent: interpreting it as a dense
+            // matrix would lose the arithmetic state of an unfinished epoch.
+            if (!has_authoritative_device_state && metadata.host_bytes > 0)
+            {
+                const CPUGDNStateLayout layout(state->n_v_heads, state->d_k, state->d_v);
+                if (probe.recurrence_layout != GDNRecurrenceStateLayout::KeyMajorValueContiguous ||
+                    state->recurrence_state.size() != static_cast<size_t>(layout.floats()) ||
+                    !layout.valid(state->recurrence_state.data()))
+                    throw std::invalid_argument("Invalid CPU GDN diagnostic epoch extent/layout/phase");
+                probe.recurrence_storage = GDNStateStorage::CPUFixedEpoch;
+                probe.recurrence_epoch_phase_words.reserve(static_cast<size_t>(state->n_v_heads));
+                for (int head = 0; head < state->n_v_heads; ++head)
+                    probe.recurrence_epoch_phase_words.push_back(std::bit_cast<uint32_t>(
+                        state->recurrence_state[static_cast<size_t>(head) * layout.headFloats()]));
+            }
             probe.recurrence_values = state->recurrence_state.size();
             probe.conv_values = state->conv_state.size();
             probe.recurrence_hash = hashFloatVector(state->recurrence_state);
@@ -745,10 +768,41 @@ namespace llaminar2
                 probe.recurrence_sample_values = state->recurrence_state;
                 probe.conv_sample_values = state->conv_state;
             }
+            if (capture_policy.capture_gdn_values &&
+                probe.recurrence_storage == GDNStateStorage::DeviceDense)
+                canonicalizeRecurrenceValuesForPrefixProbe(probe.recurrence_sample_values,
+                                                           state->d_k,
+                                                           state->d_v,
+                                                           probe.recurrence_layout);
             probes.push_back(probe);
         }
 
         return probes;
+    }
+
+    void canonicalizeRecurrenceValuesForPrefixProbe(std::vector<float> &values,
+                                                    int key_width,
+                                                    int value_width,
+                                                    GDNRecurrenceStateLayout layout)
+    {
+        if (!validGDNRecurrenceStateLayout(layout) || key_width <= 0 || value_width <= 0 ||
+            static_cast<size_t>(key_width) >
+                std::numeric_limits<size_t>::max() / static_cast<size_t>(value_width))
+            throw std::invalid_argument("Invalid GDN diagnostic matrix geometry/layout");
+        const size_t dk = static_cast<size_t>(key_width);
+        const size_t dv = static_cast<size_t>(value_width);
+        if (values.size() % (dk * dv) != 0)
+            throw std::invalid_argument("Incomplete GDN diagnostic matrix observation");
+        if (layout == GDNRecurrenceStateLayout::KeyMajorValueContiguous || values.empty())
+            return;
+        // Only the caller's explicit diagnostic observation is copied. Native live,
+        // speculative and prefix payload banks retain their immutable physical bytes.
+        const auto physical = values;
+        for (size_t head = 0; head < physical.size() / (dk * dv); ++head)
+            for (size_t key = 0; key < dk; ++key)
+                for (size_t value = 0; value < dv; ++value)
+                    values[(head * dk + key) * dv + value] =
+                        physical[(head * dv + value) * dk + key];
     }
 
     uint64_t hashFloatBufferForPrefixProbe(const float *values, size_t count)

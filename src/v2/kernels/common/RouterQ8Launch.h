@@ -13,6 +13,24 @@
 
 extern "C"
 {
+    /**
+     * @brief Publish canonical original-FP32 Q8 rows for an explicit expert consumer.
+     * @param hidden Original FP32 rows, never FP16 router operands.
+     * @param codes Persistent graph-owned Q8 destination [rows,width].
+     * @param scales Persistent block32 scales [rows,width/32].
+     * @param rows Immutable physical row capacity. @param width Positive multiple of 32.
+     * @param device Exact owning ordinal. @param stream Explicit producer stream.
+     * @param live_rows Optional device-owned live prefix; inactive rows stay untouched.
+     * @return Whether the existing production quantizer launch was accepted.
+     */
+    bool cudaMoE_publish_original_hidden_q8_rows(const float *hidden, std::int8_t *codes,
+        float *scales, int rows, int width, int device, void *stream,
+        const int *live_rows);
+    /** @copydoc cudaMoE_publish_original_hidden_q8_rows */
+    bool hipMoE_publish_original_hidden_q8_rows(const float *hidden, std::int8_t *codes,
+        float *scales, int rows, int width, int device, void *stream,
+        const int *live_rows);
+
     /** @brief Quantize original floating gate rows once in the selected basis.
      * @param weights Immutable FP32 source [experts,width].
      * @param codes Retained Q8 destination. @param scales Retained block32 scales.

@@ -29,6 +29,8 @@
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -71,6 +73,20 @@ namespace llaminar2
             BindDeclaredAddressesOnly, ///< Setup records declared frontier pointers only.
         };
 
+        /** @brief Exact native event operations supplied by the retained resource owner.
+         * Implementations enqueue only device events on already admitted handles.
+         * They must reject failed recording/waits; they never synchronize the host.
+         */
+        class EventRecorder
+        {
+        public:
+            virtual ~EventRecorder() = default;
+            /** @brief Record completion on the exact producer stream. */
+            virtual void record(void *event, void *producer_stream) = 0;
+            /** @brief Queue a dependency on the exact consumer stream. */
+            virtual void wait(void *event, void *consumer_stream) = 0;
+        };
+
         /** @brief One tensor consumed from an earlier stage in this transaction. */
         struct InternalInput
         {
@@ -92,6 +108,10 @@ namespace llaminar2
              */
             std::vector<const TensorBase *> retained_parent_inputs;
             std::vector<const TensorBase *> outputs;          ///< Declared arena write owners.
+            void *recording_stream = nullptr; ///< Null inherits the exact parent stream; otherwise a retained lane.
+            void *completion_event = nullptr; ///< Persistent exact-event publication after this stage.
+            std::optional<size_t> wait_for_stage; ///< Earlier event producer joined before this stage.
+
         };
 
         /** @brief How TransferEngine must validate one current-stage input. */
@@ -119,8 +139,12 @@ namespace llaminar2
             std::vector<StagePlan> stages,
             std::string context,
             ExternalInputAuthority external_input_authority =
-                ExternalInputAuthority::RequireReadyBytes)
-            : device_(device),
+                ExternalInputAuthority::RequireReadyBytes,
+            EventRecorder *event_recorder = nullptr,
+            IWorkerGPUContext *event_worker = nullptr)
+            : event_worker_(event_worker),
+              event_recorder_(event_recorder),
+              device_(device),
               stream_(stream),
               stages_(std::move(stages)),
               context_(std::move(context)),
@@ -140,6 +164,7 @@ namespace llaminar2
                 max_stage_outputs_ =
                     std::max(max_stage_outputs_, stage.outputs.size());
             }
+            validateStreamDAG();
             current_stage_publications_.resize(max_stage_outputs_, 0);
         }
 
@@ -167,7 +192,7 @@ namespace llaminar2
          * @brief Enter the next exact stage in the precomputed topological plan.
          * @param stage_identity Exact IComputeStage object about to record work.
          */
-        void beginStage(const void *stage_identity)
+        void beginStage(const void *stage_identity,void *actual_stream=nullptr)
         {
             if (!active_ || current_stage_active_ || stage_cursor_ >= stages_.size())
                 throw std::logic_error(
@@ -179,18 +204,49 @@ namespace llaminar2
                     "Graph capture stage order mismatch: expected '" +
                     expected.stage_name + "' in " + context_);
             }
+            if((actual_stream && actual_stream!=expected.recording_stream) ||
+               (!actual_stream && expected.recording_stream!=stream_))
+            {
+                failed_=true;
+                throw std::logic_error("Read-ahead stage binding changed before native recording: "+expected.stage_name);
+            }
             std::fill(
                 current_stage_publications_.begin(),
                 current_stage_publications_.begin() +
                     static_cast<std::ptrdiff_t>(expected.outputs.size()),
                 uint8_t{0});
             current_stage_active_ = true;
+            try
+            {
+                if (expected.wait_for_stage)
+                    waitNativeEvent(
+                        stages_[*expected.wait_for_stage].completion_event,
+                        expected.recording_stream);
+            }
+            catch (...)
+            {
+                failed_ = true;
+                current_stage_active_ = false;
+                throw;
+            }
         }
 
         /** @brief Commit the current stage after every required launch was recorded. */
         void completeStage(const void *stage_identity)
         {
             requireCurrentStage(stage_identity);
+            try
+            {
+                const auto &stage = stages_[stage_cursor_];
+                if (stage.completion_event)
+                    recordNativeEvent(stage.completion_event, stage.recording_stream);
+            }
+            catch (...)
+            {
+                failed_ = true;
+                current_stage_active_ = false;
+                throw;
+            }
             current_stage_active_ = false;
             ++stage_cursor_;
         }
@@ -349,19 +405,103 @@ namespace llaminar2
         bool failed() const noexcept { return failed_; }
 
     private:
+        /** @brief Enqueue a required wait; native failure poisons this capture. */
+        void waitNativeEvent(void *event, void *stream)
+        {
+            if(event_recorder_) event_recorder_->wait(event,stream);
+            else if(!event_worker_->waitEventChecked(event,stream))
+                throw std::runtime_error("Read-ahead native wait failed: "+context_);
+        }
+        /** @brief Publish on the producer's exact stream; failure is fatal. */
+        void recordNativeEvent(void *event, void *stream)
+        {
+            if(event_recorder_) event_recorder_->record(event,stream);
+            else if(!event_worker_->recordEventChecked(event,stream))
+                throw std::runtime_error("Read-ahead native event record failed: "+context_);
+        }
+
+        /**
+         * @brief Prove the bounded two-lane native event DAG before capture.
+         *
+         * Each stream retains the latest visible producer in each lane. Waiting
+         * on an earlier stage imports its complete visibility frontier. Merely
+         * recording an earlier stage on the host never orders a cross-stream
+         * read. The final primary stage must join every side-stream operation,
+         * so capture cannot end with an unjoined branch. All work here is setup.
+         */
+        void validateStreamDAG()
+        {
+            constexpr size_t none = std::numeric_limits<size_t>::max();
+            std::array<void *, 2> streams{stream_, nullptr};
+            std::array<std::array<size_t, 2>, 2> frontier{{{none, none}, {none, none}}};
+            std::vector<std::array<size_t, 2>> visible;
+            visible.reserve(stages_.size());
+            std::vector<size_t> lanes;
+            lanes.reserve(stages_.size());
+            bool side_used = false;
+            for (size_t index = 0; index < stages_.size(); ++index)
+            {
+                auto &stage = stages_[index];
+                if (!stage.recording_stream) stage.recording_stream = stream_;
+                size_t lane = 0;
+                if (stage.recording_stream != stream_)
+                {
+                    if (!streams[1]) streams[1] = stage.recording_stream;
+                    if (stage.recording_stream != streams[1])
+                        throw std::invalid_argument("Capture supports one retained read-ahead lane: " + context_);
+                    lane = 1;
+                    side_used = true;
+                }
+                if ((stage.completion_event || stage.wait_for_stage) && !event_recorder_ && !event_worker_)
+                    throw std::invalid_argument("Capture event DAG has no retained event recorder: " + context_);
+                if (stage.completion_event)
+                    for (size_t previous = 0; previous < index; ++previous)
+                        if (stages_[previous].completion_event == stage.completion_event)
+                            throw std::invalid_argument("Capture event has multiple producers: " + context_);
+                if (stage.wait_for_stage)
+                {
+                    const auto producer = *stage.wait_for_stage;
+                    if (producer >= index || !stages_[producer].completion_event)
+                        throw std::invalid_argument("Capture wait requires an earlier exact-event producer: " + context_);
+                    for (size_t stream_lane = 0; stream_lane < 2; ++stream_lane)
+                        if (visible[producer][stream_lane] != none &&
+                            (frontier[lane][stream_lane] == none ||
+                             frontier[lane][stream_lane] < visible[producer][stream_lane]))
+                            frontier[lane][stream_lane] = visible[producer][stream_lane];
+                }
+                if(lane==1 && frontier[1][0]==none)
+                    throw std::invalid_argument("Read-ahead lane has no captured primary fork: "+context_);
+                for (const auto &input : stage.internal_inputs)
+                {
+                    const auto producer = input.producer_stage_index;
+                    if (producer >= index || frontier[lane][lanes[producer]] == none ||
+                        frontier[lane][lanes[producer]] < producer)
+                        throw std::invalid_argument("Capture internal read lacks a native stream/event edge: " + stage.stage_name);
+                }
+                frontier[lane][lane] = index;
+                visible.push_back(frontier[lane]);
+                lanes.push_back(lane);
+            }
+            if (side_used && (stages_.empty() || lanes.back() != 0 ||
+                frontier[0][1] == none || frontier[0][1] != frontier[1][1]))
+                throw std::invalid_argument("Capture read-ahead lane is not joined before parent closure: " + context_);
+        }
+
         void requireCurrentTransaction(DeviceId device, void *stream) const
         {
             if (!active_)
                 throw std::logic_error(
                     "Graph capture dependency ledger is not active: " + context_);
-            if (device != device_ || stream != stream_)
+            const void *expected_stream = current_stage_active_ && stage_cursor_ < stages_.size()
+                ? stages_[stage_cursor_].recording_stream : stream_;
+            if (device != device_ || stream != expected_stream)
             {
                 throw std::logic_error(
                     "Graph capture dependency used a different device or stream: " +
                     context_ + " expected_device=" + device_.toString() +
                     " observed_device=" + device.toString() +
                     " expected_stream=" +
-                    std::to_string(reinterpret_cast<std::uintptr_t>(stream_)) +
+                    std::to_string(reinterpret_cast<std::uintptr_t>(expected_stream)) +
                     " observed_stream=" +
                     std::to_string(reinterpret_cast<std::uintptr_t>(stream)));
             }
@@ -378,6 +518,8 @@ namespace llaminar2
             }
         }
 
+        IWorkerGPUContext *event_worker_ = nullptr; ///< Original family-retained context, used only while recording.
+        EventRecorder *event_recorder_ = nullptr; ///< Borrowed from the parent-retained resource owner.
         DeviceId device_;
         void *stream_ = nullptr;
         std::vector<StagePlan> stages_;
@@ -490,12 +632,12 @@ namespace llaminar2
     class ScopedGraphCaptureStage final
     {
     public:
-        explicit ScopedGraphCaptureStage(const void *stage_identity)
+        explicit ScopedGraphCaptureStage(const void *stage_identity,void *actual_stream=nullptr)
             : ledger_(currentGraphCaptureDependencyLedger()),
               stage_identity_(stage_identity)
         {
             if (ledger_)
-                ledger_->beginStage(stage_identity_);
+                ledger_->beginStage(stage_identity_,actual_stream);
         }
 
         ~ScopedGraphCaptureStage()

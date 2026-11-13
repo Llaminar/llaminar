@@ -3,7 +3,10 @@
  * @brief CUDA ownership, composition, replay, and metadata inspection for native graphs.
  *
  * The capture owns CUDA graph and executable handles but borrows one exact,
- * non-default execution stream. It also exposes read-only recursive kernel
+ * non-default execution stream. Context-factory captures retain their exact
+ * context through graph lifetime and lease its projection streams across the
+ * complete native recording interval. Standalone captures cannot borrow that
+ * shared resource set. It also exposes read-only recursive kernel
  * inventory so orchestration diagnostics can attribute captured production work
  * without replaying a second path or involving device memory.
  */
@@ -13,6 +16,9 @@
 #ifdef HAVE_CUDA
 
 #include "../IGPUGraphCapture.h"
+#include "../NativeParallelGraphBranch.h"
+#include "../IWorkerGPUContext.h"
+#include <optional>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -23,6 +29,7 @@
 
 namespace llaminar2
 {
+    class NvidiaDeviceContext;
 
     /**
      * @brief Splice one mapped 64-bit wait into an active CUDA stream capture.
@@ -297,11 +304,15 @@ namespace llaminar2
     class CUDAGraphCapture : public IGPUGraphCapture
     {
     public:
+        /// @brief Standalone native capture; shared projection borrowing is rejected.
         /// @param stream The explicit CUDA stream to capture on. Must remain
         ///               valid for the lifetime of this object.
         /// @param device_ordinal CUDA device that owns @p stream and every graph
         ///                       resource composed into this capture.
         CUDAGraphCapture(cudaStream_t stream, int device_ordinal);
+        /** @brief Bind shared projection submission to this exact worker context. */
+        CUDAGraphCapture(cudaStream_t stream, int device_ordinal, NvidiaDeviceContext &owner);
+
         ~CUDAGraphCapture() override;
 
         // Move-only (graph handles are not copyable)
@@ -352,6 +363,14 @@ namespace llaminar2
                 GPUOrderedTimelineInstrumentation::Disabled) override;
         [[nodiscard]] GPUOrderedTimelineTimingSnapshot
         consumeOrderedTimelineTiming() override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodySiblings */
+        bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodyAfterCapturedFragment */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            const IGPUGraphCapture& producer, const IGPUGraphCapture& body) override;
+        /** @brief Join exact original main and already appended finite-body frontiers; see base contract. */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body) override;
         /** @copydoc IGPUGraphCapture::appendParallelBranch */
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;
@@ -379,6 +398,9 @@ namespace llaminar2
             return resident_memory_bytes_;
         }
         size_t nodeCount() const override;
+        /** @copydoc IGPUGraphCapture::inspectFlatGraphStructure */
+        bool inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,std::span<std::byte> scratch,
+            GPUFlatGraphStructure& observed,std::string* error=nullptr)const override;
         bool inspectKernelNodes(
             std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
             std::string *error = nullptr) const override;
@@ -395,6 +417,26 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        /** @copydoc IGPUGraphCapture::appendActiveCaptureChild */
+        [[nodiscard]] bool appendActiveCaptureChild(const IGPUGraphCapture &child) override;
+
+        /** Unique cold recording lifetime, invalidated by reset/re-recording. */
+        mutable std::shared_ptr<const void> definition_scope_;
+        /** @return This exact cold native definition lifetime, created before its first import. */
+        const std::shared_ptr<const void>& definitionScope() const
+        {
+            if(!definition_scope_)definition_scope_=std::make_shared<const std::byte>();
+            return definition_scope_;
+        }
+        /** Exact original fragment exits in THIS composed parent, not live inference state. */
+        detail::NativeCapturedFragmentFrontiers<cudaGraph_t,cudaGraphNode_t> fragment_frontiers_;
+        /** Native capture, not software stage guards, owns shared side streams. */
+        NvidiaDeviceContext *projection_owner_ = nullptr;
+        std::shared_ptr<IWorkerGPUContext> projection_context_lifetime_;
+        std::optional<GPUProjectionSubmission> projection_submission_;
+        bool native_capture_active_ = false;
+        /** @brief Prove native capture closed before releasing shared resources. */
+        void releaseNativeCaptureSubmission();
         /** @brief Shared native definition; fragments cannot outlive its storage. */
         struct OrderedTimelineRecording;
         /** @brief Distinguish executable owners from non-executable recording views. */

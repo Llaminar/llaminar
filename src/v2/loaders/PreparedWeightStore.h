@@ -1,4 +1,5 @@
 #pragma once
+#include "kernels/cpu/gemm/CPUPreparedWeightWriter.h"
 
 /**
  * @file PreparedWeightStore.h
@@ -19,6 +20,7 @@
 
 #include "ExpertSlabTypes.h"
 #include "WeightPlan.h"
+#include "kernels/common/OriginalOutputSlice.h"
 #include "../kernels/KernelFactory.h"
 #include "../kernels/common/PreparedEmbeddingWeights.h"
 
@@ -80,6 +82,46 @@ namespace llaminar2
         [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
         physicalMemoryAuthority() const;
 
+        /** @brief One Store-issued source transaction; partial final roots cannot become bindings. */
+        class CPUPreparation final {
+        public:
+            ~CPUPreparation();
+            CPUPreparation(const CPUPreparation&)=delete;
+            CPUPreparation& operator=(const CPUPreparation&)=delete;
+            /** @return The SAME consumer geometry used by planner and source transaction. */
+            std::optional<NativeWeightLoadStagingRequest> stagingRequest() const;
+            /** @return Original immutable matrix/range and precision, never inferred from converted storage. */
+            const CPUPreparedWeightSource& source() const & noexcept;
+            /** @brief Synchronously append the next actual original native window using admitted scratch. */
+            void append(const NativeWeightSourceWindow&,std::span<const std::byte>,std::span<std::byte>);
+            /** @brief Let the original reader fill a genuine final destination without an input shadow. */
+            void readDirect(const NativeWeightSourceWindow&,const std::function<void(std::span<std::byte>)>&);
+        private:
+            friend class PreparedWeightStore;
+            struct Impl;
+            explicit CPUPreparation(std::unique_ptr<Impl>);
+            std::unique_ptr<Impl> impl_;
+        };
+
+        /**
+         * @brief Begin one final CPU weight owner from original unmaterialized binding metadata.
+         * @param original Binding identity/selection from the actual frozen plan; tensor/prepared fields are absent.
+         * @param source Actual original source/range plus code-owned resolved precision/consumer.
+         * @param memory_owner Existing original persistent final-weight BOM family.
+         * @param placement Original resolved final CPU placement, independent of read-buffer placement.
+         * @return Store-issued incomplete preparation, retaining original model/PMA identity until commit.
+         * @throws std::invalid_argument For foreign identity, invalid geometry, placement or owner.
+         */
+        std::unique_ptr<CPUPreparation> beginCPUPreparation(WeightBinding original,CPUPreparedWeightSource source,
+            PhysicalMemoryOwner memory_owner,CPUStoragePlacement placement);
+        /**
+         * @brief Commit complete actual engine/root to the existing prepared registry and final binding.
+         * @param preparation Actual transaction issued by this original model/PMA, consumed once.
+         * @return Materialized binding with its real final tensor/prepared ref; no source-only placeholder.
+         * @throws std::logic_error For incomplete, failed, foreign or duplicate preparation.
+         */
+        WeightBinding finishCPUPreparation(std::unique_ptr<CPUPreparation> preparation);
+
         // =========================================================================
         // GEMM Preparation & Resolution
         // =========================================================================
@@ -99,11 +141,21 @@ namespace llaminar2
             const WeightBinding &binding,
             PreparedWeightKind kind,
             DeviceId device);
+        /**
+         * @brief Register an existing physical handle without allocating another copy.
+         * @param binding Immutable source identity retained by the handle.
+         * @param kind Backend storage representation.
+         * @param device Exact admitted physical allocator identity.
+         * @param handle Existing independently owned prepared handle.
+         * @param memory_owner Explicit persistent owner for any later derived CPU slices.
+         * @return Stable store reference sharing the original physical storage.
+         */
         PreparedWeightRef registerPreparedGemmHandle(
             const WeightBinding &binding,
             PreparedWeightKind kind,
             DeviceId device,
-            std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle);
+            std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle,
+            std::optional<PhysicalMemoryOwner> memory_owner = std::nullopt);
         /**
          * @brief Attach an existing prepared GEMM to a materialized binding.
          *
@@ -160,6 +212,16 @@ namespace llaminar2
         /// Resolve GEMM kernel from a prepared ref. O(1) lookup by binding_id.
         /// Returns nullptr if ref not found or handle missing.
         ITensorGemm *gemmKernel(const PreparedWeightRef &ref) const;
+
+        /**
+         * @brief Retain the exact prepared handle allocation while borrowing its GEMM.
+         * @param ref Original store reference, including kind/model/device/binding.
+         * @return Shared alias of the owned handle, or null for an absent/incomplete entry.
+         *
+         * Registry/graph borrowers must not alias the store itself: clearing its
+         * entries would then destroy engines while the store remained alive.
+         */
+        std::shared_ptr<ITensorGemm> gemmKernelLifetime(const PreparedWeightRef& ref) const;
 
         /// Resolve a prepared ref by frozen binding identity. O(1) lookup by binding id.
         /// Returns std::nullopt if the binding has not been prepared for this device.
@@ -262,6 +324,24 @@ namespace llaminar2
 
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
+
+        /**
+         * @brief Authenticate one original output interval from the actual frozen binding.
+         * @param ref Exact published prepared engine/device/model identity.
+         * @param source Actual graph source tensor, including an already materialized TP view.
+         * @return Immutable interval retaining the exact published source and engine owners.
+         * @throws std::invalid_argument For foreign, unowned, mutable, missing, K-sliced or expert bindings.
+         *
+         * Source coordinates come only from WeightBinding::slice. A presliced
+         * inner tensor remains valid: its original coordinates stay in that
+         * existing binding rather than being reconstructed from local shape.
+         * Canonical Factory-to-store publication remains the payload-affinity
+         * trust boundary; matching format metadata is not a payload comparison.
+         * A fact keeps its exact owned kernel and tensor owner alive across index
+         * replacement/clear. A fresh stage still authenticates the current entry.
+         */
+        [[nodiscard]] OriginalOutputSlice originalOutputSlice(
+            const PreparedWeightRef &ref, const TensorBase &source) const;
         size_t size() const;
 
         /**
@@ -409,6 +489,7 @@ namespace llaminar2
             PreparedWeightRef ref;
             // Phase 8: Store owns the prepared handle directly (not borrowed from KernelFactory).
             std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> owned_handle;
+            std::optional<PhysicalMemoryOwner> memory_owner; ///< Explicit allocator owner retained for derived physical slices.
 
             /// Resolve the active handle (owned or legacy).
             const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *activeHandle() const
@@ -416,6 +497,46 @@ namespace llaminar2
                 return owned_handle.get();
             }
         };
+
+        /** @brief Non-owning original source-name lookup, scoped to the physical device. */
+        struct AdoptionNameKey {
+            std::string name;
+            DeviceId device;
+            bool operator==(const AdoptionNameKey&) const = default;
+        };
+        /** @brief Hash existing source names only; equality authenticates the full original name. */
+        struct AdoptionNameHash {
+            size_t operator()(const AdoptionNameKey& key) const noexcept {
+                return std::hash<std::string>{}(key.name) ^ (std::hash<DeviceId>{}(key.device) << 1u);
+            }
+        };
+        /** @brief Non-owning tensor identity lookup; no tensor or prepared handle is retained here. */
+        struct AdoptionTensorKey {
+            const TensorBase* tensor;
+            DeviceId device;
+            bool operator==(const AdoptionTensorKey&) const = default;
+        };
+        /** @brief Hash actual tensor address and exact physical device. */
+        struct AdoptionTensorHash {
+            size_t operator()(const AdoptionTensorKey& key) const noexcept {
+                return std::hash<const TensorBase*>{}(key.tensor) ^ (std::hash<DeviceId>{}(key.device) << 1u);
+            }
+        };
+        using AdoptionKeys = std::vector<PreparedBindingKey>;
+        /** @brief Publish/replace the sole GEMM owner and both non-owning lookup memberships atomically.
+         * @param key Exact original stable binding/device key.
+         * @param entry Complete new owner; existing mutex must already be held.
+         * @throws Allocation failure before replacing the previous owner or its memberships.
+         */
+        void publishGemmEntry(PreparedBindingKey key, Entry entry);
+        /** @brief Remove one original membership without allocating, including an empty lookup bucket.
+         * @param name Existing original name/device key, empty names have no name membership.
+         * @param tensor Existing original tensor/device key, null tensors have no tensor membership.
+         * @param key Original stable binding key to remove once.
+         * @note Existing mutex must already be held; replacement may temporarily contain two identical keys.
+         */
+        void removeGemmMembership(const AdoptionNameKey& name, AdoptionTensorKey tensor,
+            PreparedBindingKey key) noexcept;
 
         /// Fused gate/up kernel cache (Phase 8: owned by this store, not KernelFactory)
         struct FusedCacheKey
@@ -456,6 +577,10 @@ namespace llaminar2
         /** Sole admitted authority carried to graph-owned allocation sites. */
         std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
         std::unordered_map<PreparedBindingKey, Entry, PreparedBindingKeyHash> entries_;
+        // Candidate indices contain keys only. Every compatibility/lifetime check
+        // still reads the sole original Entry under mutex_; success is never cached.
+        std::unordered_map<AdoptionNameKey, AdoptionKeys, AdoptionNameHash> adoption_names_;
+        std::unordered_map<AdoptionTensorKey, AdoptionKeys, AdoptionTensorHash> adoption_tensors_;
         mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
 
         // =========================================================================

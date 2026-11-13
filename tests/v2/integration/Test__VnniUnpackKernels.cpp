@@ -35,7 +35,7 @@
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "loaders/gpu_pipeline/WeightTranslator.h"
 #include "tensors/BlockStructures.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "../utils/TestTensorFactory.h"
 
 #ifdef HAVE_CUDA
@@ -684,12 +684,12 @@ TEST_P(VnniUnpackTest, GroupedExpertReusableCapacityMatchesStandaloneForEveryFor
 
         const size_t source_row_bytes =
             tensor->size_bytes() / static_cast<size_t>(kTotalRows);
-        const auto expert_regions = nativeVnniPackedRegionSizes(
+        const auto expert_regions = nativeQuantisedPackedRegionSizes(
             kRowsPerExpert, kColumns, *info);
-        const auto compact_slab_regions = nativeVnniPackedRegionSizes(
+        const auto compact_slab_regions = nativeQuantisedPackedRegionSizes(
             kTotalRows, kColumns, *info);
         const auto allocation = reusableDeviceVnniAllocationFormat(*info);
-        const NativeVnniFormatInfo allocation_info{
+        const NativeQuantisedFormatInfo allocation_info{
             .codebook_id = info->codebook_id,
             .payload_bytes = allocation.payload_bytes_per_block,
             .is_asymmetric = allocation.has_mins,
@@ -697,9 +697,9 @@ TEST_P(VnniUnpackTest, GroupedExpertReusableCapacityMatchesStandaloneForEveryFor
             .has_emins = allocation.has_emins,
             .max_abs_factor = info->max_abs_factor,
         };
-        const auto expert_allocation_regions = nativeVnniPackedRegionSizes(
+        const auto expert_allocation_regions = nativeQuantisedPackedRegionSizes(
             kRowsPerExpert, kColumns, allocation_info);
-        const auto slab_allocation_regions = nativeVnniPackedRegionSizes(
+        const auto slab_allocation_regions = nativeQuantisedPackedRegionSizes(
             kTotalRows, kColumns, allocation_info);
 
         ASSERT_EQ(
@@ -968,12 +968,12 @@ TEST_P(VnniUnpackTest, BoundedBufferedMmapPipelineMatchesAcrossLaneReuse) {
         std::vector<uint16_t> actual_scales(expected_scales.size());
         ASSERT_TRUE(backend_->deviceToHost(
             actual_payload.data(),
-            slot->d_native_vnni_payload,
+            slot->d_native_quantised_payload,
             actual_payload.size(),
             device_id_, stream_));
         ASSERT_TRUE(backend_->deviceToHost(
             actual_scales.data(),
-            slot->d_native_vnni_scales,
+            slot->d_native_quantised_scales,
             actual_scales.size() * sizeof(uint16_t),
             device_id_, stream_));
         ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
@@ -1110,16 +1110,16 @@ TEST_P(
         };
 
     expect_pool_field_equal(
-        whole_payload, chunked->d_native_vnni_payload,
+        whole_payload, chunked->d_native_quantised_payload,
         payload_bytes, "payload");
     expect_pool_field_equal(
-        whole_scales, chunked->d_native_vnni_scales,
+        whole_scales, chunked->d_native_quantised_scales,
         scales_bytes, "scales");
     expect_pool_field_equal(
-        whole_mins, chunked->d_native_vnni_mins,
+        whole_mins, chunked->d_native_quantised_mins,
         mins_bytes, "mins");
     expect_pool_field_equal(
-        whole_emins, chunked->d_native_vnni_emins,
+        whole_emins, chunked->d_native_quantised_emins,
         emins_bytes, "emins");
 
     orchestrator.finalize();

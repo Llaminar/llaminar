@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "MoEOverlayRouteTarget.h"
 
 #include "DeviceMoEOverlayEpochABI.h"
 #include "DeviceMoEOverlayServiceTelemetry.h"
@@ -101,7 +102,7 @@ namespace llaminar2
         Aborted,     ///< Capture closed or failed without a usable graph unit.
     };
 
-    inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
+    inline constexpr uint32_t kDeviceMoEMaxExperts = moe_runtime_abi::kMaxExperts;
     /**
      * @brief Largest transfer-directory slot representable by the runtime ABI.
      *
@@ -164,10 +165,10 @@ namespace llaminar2
     /** @brief Pointer-bearing movable payload and its exact arithmetic identity. */
     struct DeviceMoEExpertDescriptor
     {
-        /** Prepared NativeVNNI views used when weight_format is NativeVNNI. */
-        DeviceNativeVNNIMatrixDesc gate;
-        DeviceNativeVNNIMatrixDesc up;
-        DeviceNativeVNNIMatrixDesc down;
+        /** Prepared NativeQuantised views used when weight_format is NativeQuantised. */
+        DeviceNativeQuantisedMatrixDesc gate;
+        DeviceNativeQuantisedMatrixDesc up;
+        DeviceNativeQuantisedMatrixDesc down;
         /** Contiguous floating views used for FP16, BF16, or FP32 experts. */
         DeviceMoEFloatingMatrixDesc floating_gate;
         DeviceMoEFloatingMatrixDesc floating_up;
@@ -176,16 +177,16 @@ namespace llaminar2
         int32_t owner_participant = -1;
         int32_t local_slot = -1;
         uint32_t flags = 0;
-        DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
-        // Immutable capacity tag for reusable raw storage. NativeVNNI means
+        DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
+        // Immutable capacity tag for reusable raw storage. NativeQuantised means
         // no raw view was allocated, not a conversion or alternate arithmetic.
-        DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
+        DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeQuantised;
         DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
 
         /** @return Whether the declared movable family, rather than a full FFN, exists. */
         [[nodiscard]] constexpr bool movableWeightsReady() const noexcept
         {
-            if (weight_format != DeviceMoEWeightFormat::NativeVNNI)
+            if (weight_format != DeviceMoEWeightFormat::NativeQuantised)
                 return deviceMoEFloatingExpertCopyReady(*this);
             if (!deviceMoEProjectionPayloadValid(*this) || !gate.valid() || !up.valid())
                 return false;
@@ -216,13 +217,15 @@ namespace llaminar2
          *
          * This identity is deliberately distinct from
          * DeviceMoEExpertDescriptor::owner_participant, which is local to one
-         * homogeneous compute domain. Values are stable logical participant
-         * IDs from the global owner map; `-1` means that no overlay endpoint is
-         * assigned. Publishing this array in the same double-buffered bank as
+         * homogeneous compute domain. MoEOverlayRouteTarget encodes either a global
+         * whole participant, the original fixed CPU cohort tier, or absent.
+         * Expert membership changes only by publishing this same bank.
+         * Publishing this array in the same double-buffered bank as
          * residency prevents a captured sparse dispatcher from observing a
          * new owner with an old routing target.
          */
-        int32_t overlay_route_participant[kDeviceMoEMaxExperts] = {};
+        int32_t overlay_route_participant[kDeviceMoEMaxExperts] =
+            {}; ///< Typed whole/cohort target word in this exact epoch.
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
         /// Number of experts resident on more than one participant.
@@ -645,8 +648,8 @@ namespace llaminar2
          *
          * Omission preserves non-overlay callers by deriving each value from
          * the descriptor's domain-local owner. ExpertOverlay construction must
-         * provide the global owner-map values explicitly whenever participant
-         * numbering differs across domains.
+         * provide explicit typed whole/cohort targets from the same global owner map;
+         * a CPU cohort never becomes a domain-local scalar compute owner.
          */
         std::vector<int32_t> overlay_route_participant;
         /**

@@ -11,11 +11,17 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
 namespace llaminar2::moe_rebalance_abi
 {
+    /** Native record identity shared by the host controller and minimal GPU views. */
+    inline constexpr uint32_t kMagic = 0x4d4f4552u;
+    /** Planner success/window-poll wire codes consumed by completed-decision publication. */
+    inline constexpr uint32_t kStatusOk = 0u;
+    inline constexpr uint32_t kStatusWindowNotReady = 1u;
     /**
      * @brief Version of the fixed host/CUDA/ROCm publication records.
      *
@@ -24,7 +30,10 @@ namespace llaminar2::moe_rebalance_abi
      */
     // v16 uses compact format tags plus an explicit movable-projection tag.
     // Descriptor byte size is unchanged, but v15's field interpretation is not.
-    inline constexpr uint32_t kVersion = 16u;
+    // v17 gives the former plan alignment gap an explicit zero-reserved authority.
+    // Existing live-field offsets and the 64-byte command extent are unchanged.
+    // v18 appends the completed native decision receipt to the original controller.
+    inline constexpr uint32_t kVersion = 18u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.
@@ -35,12 +44,19 @@ namespace llaminar2::moe_rebalance_abi
      * participant namespaces happen to use the same integer.
      */
     inline constexpr uint32_t kPlanEntryBytes = 64u;
+    /** Explicit zero word replacing implicit ABI padding, preserved across backends. */
+    inline constexpr uint32_t kPlanEntryReservedOffset = 52u;
+    /** Existing exact demand offset; unaffected by the named reserved word. */
+    inline constexpr uint32_t kPlanEntryActivationCountOffset = 56u;
     /** Immutable native admission proof travels with the existing command sideband. */
     inline constexpr uint32_t kCommandHeaderBytes = 128u;
     /** Authenticated wave completion, including actual payload bytes. */
     inline constexpr uint32_t kWaveProgressBytes = 72u;
     /** Two reusable waves plus the bounded journal prefix and scheduler ticket. */
-    inline constexpr uint32_t kGraphControllerBytes = 360u;
+    inline constexpr uint32_t kGraphControllerBytes = 408u;
+    /** Appended receipt preserves every pre-v18 controller member offset. */
+    inline constexpr uint32_t kCompletedDecisionOffset = 360u;
+    inline constexpr uint32_t kCompletedDecisionBytes = 48u;
     /** Participant-local copy/apply completion with its physical-byte counter. */
     inline constexpr uint32_t kApplyStatusBytes = 104u;
 

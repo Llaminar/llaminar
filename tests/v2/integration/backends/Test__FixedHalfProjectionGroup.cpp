@@ -19,8 +19,11 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 extern "C" bool cudaFp32_stage_batched_projection_pointers(const float **, const float **,
@@ -77,18 +80,32 @@ bool enqueueHalfOracle(DeviceId device, const FixedHalfProjectionGroup &group,
     }
     return true;
 }
+/** @brief Authored reduction operands; no host numeric oracle or runtime result. */
+enum class HalfWitnessInput { One, AlternatingSignedZeros };
+/** @brief Distinct physical half words at two original logical K lanes. */
+struct HalfReductionWitness
+{
+    size_t first, second; ///< Original reduction coordinates.
+    uint16_t first_word, second_word; ///< Exact source words; never host float conversions.
+    HalfWitnessInput input = HalfWitnessInput::One; ///< Independent input pattern.
+};
 /**
  * @brief Prove one compact geometry under adversarial live-row replays.
  * @param device Exact native endpoint. @param m Physical short-row capacity.
  * @param k Reduction width. @param widths Independent positive output extents.
  * @param special Include every half word with NaN/Inf arithmetic witnesses.
+ * @param witness Optional original-lane dual-NaN or signed-zero control, copied during setup.
  */
-void proveHalfGroup(DeviceId device, int m, int k, const std::vector<int> &widths, bool special=false)
+void proveHalfGroup(DeviceId device, int m, int k, const std::vector<int> &widths, bool special=false,
+    std::optional<HalfReductionWitness> witness=std::nullopt)
 {
     auto &context = GPUDeviceContextPool::instance().getContext(device);
     context.submitAndWait([&]
     {
-        SCOPED_TRACE(::testing::Message() << device.toString() << " M=" << m << " K=" << k << " count=" << widths.size());
+        SCOPED_TRACE(::testing::Message() << device.toString() << " M=" << m << " K=" << k << " count=" << widths.size()
+            << " witness=" << bool(witness) << " first=" << (witness?witness->first:0)
+            << " second=" << (witness?witness->second:0) << " first_word=" << (witness?witness->first_word:0)
+            << " second_word=" << (witness?witness->second_word:0));
         auto *backend = getBackendFor(device); void *stream = context.defaultStream();
         requireHalf(backend && stream, "Half group exact backend stream");
         std::vector<uint16_t> input_words(size_t(m)*k);
@@ -98,6 +115,11 @@ void proveHalfGroup(DeviceId device, int m, int k, const std::vector<int> &width
             constexpr uint16_t values[]{0x3c00,0xbc00,0,0x8000,0x7c00,0xfc00,0x7c01,0x7e55};
             for(size_t i=0;i<input_words.size();++i) input_words[i]=values[i%8];
         } else if(special) for(size_t i=0;i<input_words.size();++i) input_words[i]=uint16_t(i*71+17);
+        if(witness) {
+            requireHalf(witness->first<size_t(k) && witness->second<size_t(k),"Half original-lane witness bounds");
+            for(size_t i=0;i<input_words.size();++i)
+                input_words[i]=witness->input==HalfWitnessInput::One?uint16_t(0x3c00):uint16_t((i&1)?0x8000:0);
+        }
         auto input=std::make_unique<FP16Tensor>(std::vector<size_t>{size_t(m),size_t(k)},input_words);
         auto count=TestTensorFactory::createINT32({1});
         auto pointers=TestTensorFactory::createINT32({3*sizeof(void*)/sizeof(int32_t)});
@@ -109,6 +131,14 @@ void proveHalfGroup(DeviceId device, int m, int k, const std::vector<int> &width
             const int n=widths[p]; weight_words.emplace_back(size_t(n)*k);
             for(size_t i=0;i<weight_words.back().size();++i)
                 weight_words.back()[i]=special?uint16_t(i*(k==1?1:193)+(k==1?0:17)):word(i*193+p*113+17);
+            if(witness) {
+                std::fill(weight_words.back().begin(),weight_words.back().end(),
+                    witness->input==HalfWitnessInput::One?uint16_t(0):uint16_t(0x3c00));
+                for(int column=0;column<n;++column) {
+                    weight_words.back()[size_t(column)*k+witness->first]=witness->first_word;
+                    weight_words.back()[size_t(column)*k+witness->second]=witness->second_word;
+                }
+            }
             weights.push_back(std::make_unique<FP16Tensor>(std::vector<size_t>{size_t(n),size_t(k)},weight_words.back()));
             outputs.push_back(TestTensorFactory::createFP32Zeros({size_t(m+1),size_t(n)}));
             oracle_outputs.push_back(TestTensorFactory::createFP32Zeros({size_t(m+1),size_t(n)}));
@@ -172,7 +202,20 @@ void proveHalfGroup(DeviceId device, int m, int k, const std::vector<int> &width
                 backend->deviceToHost(expected[p].data(),oracle_outputs[p]->gpu_data_ptr(),expected[p].size()*4,device.ordinal,stream),"Half group terminal observation");
             requireHalf(backend->synchronizeStream(stream,device.ordinal),"Half group observation complete");
             for(size_t p=0;p<widths.size();++p) {
-                ASSERT_EQ(std::memcmp(observed[p].data(),expected[p].data(),observed[p].size()*4),0) << "projection=" << p << " live=" << live;
+                const int comparison=std::memcmp(observed[p].data(),expected[p].data(),observed[p].size()*4);
+                size_t first_difference=0;
+                if(comparison!=0)
+                    while(first_difference<observed[p].size() &&
+                        std::bit_cast<uint32_t>(observed[p][first_difference])==
+                        std::bit_cast<uint32_t>(expected[p][first_difference])) ++first_difference;
+                ASSERT_EQ(comparison,0) << "projection=" << p << " live=" << live
+                    << " first_word=" << first_difference << " observed=0x" << std::hex
+                    << (first_difference<observed[p].size()?std::bit_cast<uint32_t>(observed[p][first_difference]):0u)
+                    << " expected=0x"
+                    << (first_difference<expected[p].size()?std::bit_cast<uint32_t>(expected[p][first_difference]):0u);
+                if(witness && witness->input==HalfWitnessInput::AlternatingSignedZeros)
+                    for(size_t i=0;i<size_t(live)*widths[p];++i)
+                        EXPECT_EQ(std::bit_cast<uint32_t>(expected[p][i]),0u);
                 for(size_t i=size_t(live)*widths[p];i<observed[p].size();++i)
                     ASSERT_EQ(std::bit_cast<uint32_t>(observed[p][i]),UINT32_C(0x7fc01234));
             }
@@ -196,13 +239,29 @@ void proveHalfBackend(DeviceId device)
         proveHalfGroup(device,m,65,std::vector<int>(widths.begin(),widths.begin()+1+m%8));
         if(::testing::Test::HasFatalFailure()) return;
     }
-    for(int k:{1,63,64,127,128,129,255,256,257,2047,2048,2049,4095,4096,4097})
+    for(int k:{1,63,64,127,128,129,255,256,257,2047,2048,2049,2559,2560,2561,4095,4096,4097})
         for(int m:{1,8,31}) {
             proveHalfGroup(device,m,k,{17,9,3,5});
             if(::testing::Test::HasFatalFailure()) return;
         }
     proveHalfGroup(device,8,1,{65536,32768},true);
     proveHalfGroup(device,8,257,{257,128,32,32},true);
+    // Exact current GDN widths at every observed shard degree and live-row regime.
+    for(int width:{48,24,12})for(int m:{1,9,31})
+        proveHalfGroup(device,m,2560,{width,width});
+    // Distinct signed payloads at every original reduction level, including odd
+    // logical ownership. Compare the unchanged captured width-grouped kernel;
+    // this test never canonicalizes payloads or substitutes a host sum.
+    for(auto edge:{std::pair{0,128},std::pair{1,129},std::pair{0,64},std::pair{0,32},
+                   std::pair{0,16},std::pair{0,8},std::pair{0,4},std::pair{0,2},std::pair{0,1}})
+        for(unsigned signs=0;signs<4;++signs)for(bool reverse:{false,true}) {
+            const uint16_t first=uint16_t((reverse?0x7e22:0x7e11)|((signs&1)?0x8000:0));
+            const uint16_t second=uint16_t((reverse?0x7e11:0x7e22)|((signs&2)?0x8000:0));
+            proveHalfGroup(device,3,256,{2,1},false,HalfReductionWitness{size_t(edge.first),size_t(edge.second),first,second});
+        }
+    for(int k:{257,2560})for(unsigned signs=0;signs<4;++signs)
+        proveHalfGroup(device,9,k,{12,12},false,HalfReductionWitness{0,1,
+            uint16_t((signs&1)?0xbc00:0x3c00),uint16_t((signs&2)?0xbc00:0x3c00),HalfWitnessInput::AlternatingSignedZeros});
 }
 #ifdef HAVE_CUDA
 /** @test CUDA short projection groups retain exact bytes with one native node. */

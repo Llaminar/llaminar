@@ -21,6 +21,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../kernels/attention/AttentionDeviceParams.h"
+#include "../../../kernels/attention/AttentionHeadMapping.h"
 #include "../../../kernels/attention/AttentionWorkspaceContract.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
@@ -39,6 +40,7 @@
 #include "../../../kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
 #include "../../../kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
 #include <cuda_runtime_api.h>
+#include "kernels/cuda/attention/CUDAFlashAttentionHardware.h"
 #endif
 
 #if defined(HAVE_ROCM)
@@ -669,19 +671,10 @@ namespace llaminar2
 #if defined(HAVE_CUDA)
         if (params_.device_id.is_cuda())
         {
-            cudaDeviceProp properties{};
             const int device_index =
                 params_.device_id.toKernelDeviceIndex();
-            const cudaError_t property_status =
-                cudaGetDeviceProperties(&properties, device_index);
-            if (property_status != cudaSuccess)
-            {
-                throw std::runtime_error(
-                    "AttentionComputeStage could not query immutable CUDA "
-                    "capture geometry for " +
-                    params_.device_id.toString() + ": " +
-                    cudaGetErrorString(property_status));
-            }
+            const auto physical = cuda::fa2_policy::bindCUDAFA2Hardware(
+                cudaHardwareMetadata().at(device_index));
 
             const cuda::fa2_policy::FA2PrefillParallelGeometry prefill_geometry{
                 .batch_size = params_.batch_size,
@@ -689,7 +682,7 @@ namespace llaminar2
                 .local_query_heads = params_.n_heads,
                 .head_dim = params_.head_dim,
                 .kv_capacity = workspace_kv_capacity,
-                .sm_count = properties.multiProcessorCount,
+                .sm_count = physical.sm_count,
                 .requested_axis = params_.execution_policy.prefill_parallel_axis,
                 .visible_kv_heads = params_.n_kv_heads,
                 .head_start = params_.head_start,
@@ -1336,10 +1329,10 @@ namespace llaminar2
             return false;
         }
 
-        if (params_.n_heads % params_.n_kv_heads != 0)
+        if (!attention::isValidHeadMapping({params_.n_heads, params_.n_kv_heads,
+                params_.head_start, params_.gqa_n_rep}))
         {
-            LOG_ERROR("[AttentionComputeStage] n_heads (" << params_.n_heads
-                                                          << ") must be divisible by n_kv_heads (" << params_.n_kv_heads << ")");
+            LOG_ERROR("[AttentionComputeStage] Invalid local or original global GQA head mapping");
             return false;
         }
 

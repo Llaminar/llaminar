@@ -14,6 +14,7 @@
 #include "execution/moe/MoEOverlayEconomyEvidenceExchange.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "utils/DebugEnv.h"
+#include "utils/RecordedMigrationEvidence.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
@@ -145,6 +146,9 @@ namespace llaminar2::test
                                 : MoEOverlayResidencyWaveProgress::Failed;
             }
 
+            /** @return Independently bound recorded payload extent before completion. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override {return measurement_.bytes;}
+
             /** @brief Expose timing only after the transfer terminal. */
             std::optional<ExpertTierProjectionTransferMeasurement>
             completedMeasurement() const noexcept override
@@ -243,6 +247,12 @@ namespace llaminar2::test
                 result.status = MoEOverlayResidencyStageStartStatus::Started;
                 result.inactive_bank =
                     std::make_unique<ProfileBank>(observations);
+                for(std::size_t m=0;m<transaction.migrations.size();++m) {
+                    const auto &edge=transaction.migrations[m];
+                    result.measurement_geometries.push_back(recordedWholeMigrationGeometry(
+                        edge.source.owner_participant,edge.destination.owner_participant,0,0));
+                    for(std::size_t role=0;role<3;++role)result.measurement_operations.push_back({m,role,true});
+                }
                 const std::size_t operation_count =
                     transaction.migrations.size() * 3u;
                 for (std::size_t index = 0; index < operation_count; ++index)
@@ -458,13 +468,13 @@ namespace llaminar2::test
             ExpertTierWeightProjection role,
             int N,
             int K,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             return {
                 .projection = role,
                 .N = N,
                 .K = K,
-                .format = ExpertWeightFormat::nativeVnni({
+                .format = ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock,
                     .present = true,
@@ -476,7 +486,7 @@ namespace llaminar2::test
         MoEOverlayLayerWeightManifest layerManifest(
             int layer,
             int width,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             return {
                 .layer_idx = layer,
@@ -501,7 +511,7 @@ namespace llaminar2::test
         }
 
         /** @brief Complete robust physical row suitable for catalog expansion. */
-        MoEOverlayParticipantLayerMigrationMeasurement migrationRow(
+        MoEOverlayTargetLayerMigrationMeasurement migrationRow(
             int source,
             int destination,
             int layer)
@@ -523,7 +533,7 @@ namespace llaminar2::test
             }
             row.wave_wall_nanoseconds = 200;
             row.wave_sample_count = 3;
-            return row;
+            return MoEOverlayTargetLayerMigrationMeasurement::fromWhole(row);
         }
 
         /** @brief Complete production-owned profiler fixture. */
@@ -734,7 +744,7 @@ namespace llaminar2::test
         ASSERT_NE(sealed, nullptr);
         auto incompatible = *sealed;
         ASSERT_FALSE(incompatible.rows.empty());
-        ++incompatible.rows.front().layer;
+        ++incompatible.rows.front().coordinate.layer;
         ASSERT_TRUE(incompatible.valid());
 
         EXPECT_THROW(
@@ -750,12 +760,8 @@ namespace llaminar2::test
         MoEOverlayEconomyEvidenceMerger,
         MigrationProfileCompletesComplementaryRanksAndRejectsIdentityDrift)
     {
-        const MoEOverlayMigrationMeasurementCoordinate coordinate{
-            .source_participant = 0,
-            .destination_participant = 1,
-            .layer = 0,
-        };
-        const MoEOverlayMigrationProfileEvidence rank_zero{
+        const auto coordinate = recordedWholeMigrationCoordinate(0, 1, 0);
+        MoEOverlayMigrationProfileEvidence rank_zero{
             .profile_sequence = 19,
             .coordinate = coordinate,
             .local_measurements = {
@@ -763,7 +769,7 @@ namespace llaminar2::test
                 partialMigration(1, 0, 1, {0}, 0),
             },
         };
-        const MoEOverlayMigrationProfileEvidence rank_one{
+        MoEOverlayMigrationProfileEvidence rank_one{
             .profile_sequence = 19,
             .coordinate = coordinate,
             .local_measurements = {
@@ -771,6 +777,8 @@ namespace llaminar2::test
                 partialMigration(1, 0, 1, {1, 2}, 1),
             },
         };
+        rank_zero.context=attachRecordedMigrationContext(rank_zero.local_measurements);
+        rank_one.context=attachRecordedMigrationContext(rank_one.local_measurements);
         ASSERT_TRUE(rank_zero.valid());
         ASSERT_TRUE(rank_one.valid());
 
@@ -779,8 +787,9 @@ namespace llaminar2::test
                 {rank_zero, rank_one});
         ASSERT_TRUE(merged.valid());
         ASSERT_EQ(merged.measurements.size(), 2u);
-        for (const auto &migration : merged.measurements)
+        for (const auto &described : merged.measurements)
         {
+            const auto migration=scalarMoEOverlayMigrationMeasurement(described);
             EXPECT_TRUE(std::all_of(
                 migration.projections.begin(),
                 migration.projections.end(),
@@ -882,9 +891,9 @@ namespace llaminar2::test
         ExactLayerCatalogProfilesRepresentativesAndExpandsTheFullMatrix)
     {
         const std::vector<MoEOverlayLayerWeightManifest> manifest{
-            layerManifest(0, 96, native_vnni_formats::Q4_0),
-            layerManifest(1, 96, native_vnni_formats::Q4_0),
-            layerManifest(2, 128, native_vnni_formats::Q4_0),
+            layerManifest(0, 96, native_quantised_formats::Q4_0),
+            layerManifest(1, 96, native_quantised_formats::Q4_0),
+            layerManifest(2, 128, native_quantised_formats::Q4_0),
         };
         MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
         ASSERT_EQ(catalog.groups().size(), 2u);
@@ -935,10 +944,10 @@ namespace llaminar2::test
         for (int layer = 0; layer < 16; ++layer)
         {
             manifest.push_back(
-                layerManifest(layer, 96, native_vnni_formats::Q4_0));
+                layerManifest(layer, 96, native_quantised_formats::Q4_0));
         }
         manifest.push_back(
-            layerManifest(16, 128, native_vnni_formats::Q4_0));
+            layerManifest(16, 128, native_quantised_formats::Q4_0));
 
         const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
         ASSERT_EQ(catalog.groups().size(), 2u);
@@ -974,17 +983,17 @@ namespace llaminar2::test
          ColdSingletonFormatEnumeratesEveryMissingPhaseWithoutBorrowing)
     {
         std::vector<MoEOverlayLayerWeightManifest> manifest{
-            layerManifest(0, 256, native_vnni_formats::Q4_K),
-            layerManifest(1, 256, native_vnni_formats::Q5_K),
-            layerManifest(2, 256, native_vnni_formats::Q4_K),
+            layerManifest(0, 256, native_quantised_formats::Q4_K),
+            layerManifest(1, 256, native_quantised_formats::Q5_K),
+            layerManifest(2, 256, native_quantised_formats::Q4_K),
         };
         // Match the failure's mixed triplets: Q4_K/Q4_K/Q5_K in common
         // layers, Q5_K/Q5_K/Q6_K in the otherwise identical singleton.
         for (auto &layer : manifest)
         {
             const auto &down = layer.layer_idx == 1
-                                   ? native_vnni_formats::Q6_K
-                                   : native_vnni_formats::Q5_K;
+                                   ? native_quantised_formats::Q6_K
+                                   : native_quantised_formats::Q5_K;
             layer.projections[2] = projectionManifest(
                 ExpertTierWeightProjection::Down, 64, 256, down);
         }
@@ -1024,9 +1033,9 @@ namespace llaminar2::test
          PreparedSamplesCompleteColdClassesWithoutBecomingRuntimeCounters)
     {
         const MoEOverlayEconomyCalibrationLayerCatalog catalog({
-            layerManifest(0, 256, native_vnni_formats::Q4_K),
-            layerManifest(1, 256, native_vnni_formats::Q5_K),
-            layerManifest(2, 256, native_vnni_formats::Q4_K),
+            layerManifest(0, 256, native_quantised_formats::Q4_K),
+            layerManifest(1, 256, native_quantised_formats::Q5_K),
+            layerManifest(2, 256, native_quantised_formats::Q4_K),
         });
         const auto topology = ExpertHistogramProductionTopology::uniform(
             3, kAllExpertHistogramProductionSources);
@@ -1069,8 +1078,8 @@ namespace llaminar2::test
          PreparedEvidenceCannotHideMissingOrMalformedCoordinates)
     {
         const MoEOverlayEconomyCalibrationLayerCatalog catalog({
-            layerManifest(0, 256, native_vnni_formats::Q4_K),
-            layerManifest(1, 256, native_vnni_formats::Q5_K),
+            layerManifest(0, 256, native_quantised_formats::Q4_K),
+            layerManifest(1, 256, native_quantised_formats::Q5_K),
         });
         const auto topology = ExpertHistogramProductionTopology::uniform(
             2, kAllExpertHistogramProductionSources);
@@ -1098,8 +1107,8 @@ namespace llaminar2::test
          MissingPlanSelectsPricedMembersNotTheTransferRepresentative)
     {
         const MoEOverlayEconomyCalibrationLayerCatalog catalog({
-            layerManifest(0, 256, native_vnni_formats::Q4_K),
-            layerManifest(1, 256, native_vnni_formats::Q4_K),
+            layerManifest(0, 256, native_quantised_formats::Q4_K),
+            layerManifest(1, 256, native_quantised_formats::Q4_K),
         });
         const ExpertHistogramProductionTopology topology(
             {{true, true, true}, {true, true, true}},
@@ -1124,7 +1133,7 @@ namespace llaminar2::test
          MissingPlanRejectsMalformedEvidenceBeforeReportingGaps)
     {
         const MoEOverlayEconomyCalibrationLayerCatalog catalog({
-            layerManifest(0, 256, native_vnni_formats::Q4_K),
+            layerManifest(0, 256, native_quantised_formats::Q4_K),
         });
         const auto topology = ExpertHistogramProductionTopology::uniform(
             1, kAllExpertHistogramProductionSources);
@@ -1157,7 +1166,7 @@ namespace llaminar2::test
          MissingPlanKeepsAllSourceCodebooksAndFloatingFormatsDistinct)
     {
         std::vector<MoEOverlayLayerWeightManifest> manifest;
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             manifest.push_back(layerManifest(
                 static_cast<int>(manifest.size()), 256, *source.metadata));
@@ -1165,7 +1174,7 @@ namespace llaminar2::test
         for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
         {
             auto layer = layerManifest(
-                static_cast<int>(manifest.size()), 256, native_vnni_formats::Q4_K);
+                static_cast<int>(manifest.size()), 256, native_quantised_formats::Q4_K);
             for (auto &projection : layer.projections)
                 projection.format = ExpertWeightFormat::floating(type);
             manifest.push_back(std::move(layer));
@@ -1229,7 +1238,7 @@ namespace llaminar2::test
             });
 
         const std::vector<MoEOverlayLayerWeightManifest> manifest{
-            layerManifest(0, 96, native_vnni_formats::Q4_0),
+            layerManifest(0, 96, native_quantised_formats::Q4_0),
         };
         auto catalog = std::make_shared<
             MoEOverlayEconomyCalibrationLayerCatalog>(manifest);
@@ -1430,9 +1439,9 @@ namespace llaminar2::test
         for (const int first : {0, 32, 40})
         {
             const MoEOverlayEconomyCalibrationLayerCatalog catalog({
-                layerManifest(first, 96, native_vnni_formats::Q4_0),
-                layerManifest(first + 1, 96, native_vnni_formats::Q4_0),
-                layerManifest(first + 2, 128, native_vnni_formats::Q4_0),
+                layerManifest(first, 96, native_quantised_formats::Q4_0),
+                layerManifest(first + 1, 96, native_quantised_formats::Q4_0),
+                layerManifest(first + 2, 128, native_quantised_formats::Q4_0),
             });
             EXPECT_EQ(catalog.firstModelLayer(), first);
             EXPECT_EQ(catalog.layerCount(), 3u);
@@ -1447,12 +1456,12 @@ namespace llaminar2::test
             const auto expanded = catalog.expand(measurements);
             ASSERT_EQ(expanded.rows.size(), 6u);
             for (const auto &row : expanded.rows)
-                EXPECT_TRUE(row.layer >= first && row.layer < first + 3);
-            measurements.rows.front().layer = first + 3;
+                EXPECT_TRUE(row.coordinate.layer >= first && row.coordinate.layer < first + 3);
+            measurements.rows.front().coordinate.layer = first + 3;
             EXPECT_THROW((void)catalog.expand(measurements), std::invalid_argument);
         }
-        const MoEOverlayEconomyCalibrationLayerCatalog left({layerManifest(32, 96, native_vnni_formats::Q4_0)});
-        const MoEOverlayEconomyCalibrationLayerCatalog right({layerManifest(40, 96, native_vnni_formats::Q4_0)});
+        const MoEOverlayEconomyCalibrationLayerCatalog left({layerManifest(32, 96, native_quantised_formats::Q4_0)});
+        const MoEOverlayEconomyCalibrationLayerCatalog right({layerManifest(40, 96, native_quantised_formats::Q4_0)});
         EXPECT_NE(left.identity(), right.identity());
     }
 
@@ -1462,9 +1471,9 @@ namespace llaminar2::test
         for (const int first : {0, 32, 40})
         {
             const MoEOverlayEconomyCalibrationLayerCatalog catalog({
-                layerManifest(first, 256, native_vnni_formats::Q4_K),
-                layerManifest(first + 1, 256, native_vnni_formats::Q5_K),
-                layerManifest(first + 2, 256, native_vnni_formats::Q4_K),
+                layerManifest(first, 256, native_quantised_formats::Q4_K),
+                layerManifest(first + 1, 256, native_quantised_formats::Q5_K),
+                layerManifest(first + 2, 256, native_quantised_formats::Q4_K),
             });
             const auto topology = ExpertHistogramProductionTopology::uniform(3, kAllExpertHistogramProductionSources, first);
             const std::vector<MoEOverlayParticipantLayerServiceTotals> live{
@@ -1536,3 +1545,5 @@ namespace llaminar2::test
         EXPECT_THROW((void)MoEOverlayEconomyEvidenceMerger::mergeService(wrong_rank, owners, topology), std::invalid_argument);
     }
 } // namespace llaminar2::test
+
+#include "CalibrationCoordinateIdentityContract.inc"

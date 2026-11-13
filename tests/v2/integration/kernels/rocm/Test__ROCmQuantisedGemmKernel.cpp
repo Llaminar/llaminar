@@ -2990,9 +2990,9 @@ namespace llaminar2
             TEST_F(ROCmQuantisedGemmIntegrationTest, DownProjStage_RealQwen2Layer0SnapshotInputParity_ForceCK)
             {
                 // CK (Composable Kernel) path requires INT8-VNNI format weights for row-major
-                // repack. Q4_0 models are packed as native-VNNI only, so CK has no weights to
-                // consume. Skip until a Q8_0 test model is used or CK gains native-VNNI support.
-                GTEST_SKIP() << "CK path requires INT8-VNNI weights; Q4_0 test model is native-VNNI only";
+                // repack. Q4_0 models are packed as native-quantised only, so CK has no weights to
+                // consume. Skip until a Q8_0 test model is used or CK gains native-quantised support.
+                GTEST_SKIP() << "CK path requires INT8-VNNI weights; Q4_0 test model is native-quantised only";
 
                 if (!has_rocm_device_)
                 {
@@ -3614,7 +3614,7 @@ namespace llaminar2
             // =============================================================================
             //
             // These tests verify the end-to-end dispatch logic introduced in Phase 1/2:
-            //   - Native-VNNI formats (Q4_0, IQ4_NL) → native-VNNI GEMV/GEMM path
+            //   - NativeQuantised formats (Q4_0, IQ4_NL) → native-quantised GEMV/GEMM path
             //   - INT8-VNNI formats (Q8_0, Q8_1) → INT8 requant + CK GEMM path
             //
             // Each test:
@@ -3622,8 +3622,8 @@ namespace llaminar2
             //   2. Calls multiply_tensor (auto-dispatches based on packed fields)
             //   3. Compares GPU output against CPU FP32 reference
             //
-            // Complements the dedicated NativeVNNI_GEMM/GEMV test files that cover
-            // all dispatch paths exhaustively for native-VNNI formats.
+            // Complements the dedicated NativeQuantised_GEMM/GEMV test files that cover
+            // all dispatch paths exhaustively for native-quantised formats.
 
             namespace
             {
@@ -3697,9 +3697,9 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-                // Verify INT8 path was used (not native-VNNI)
+                // Verify INT8 path was used (not native-quantised)
                 EXPECT_FALSE(packed.int8_data.empty()) << "Q8_0 must use INT8 path";
-                EXPECT_TRUE(packed.native_vnni_payload.empty()) << "Q8_0 must NOT use native-VNNI";
+                EXPECT_TRUE(packed.native_quantised_payload.empty()) << "Q8_0 must NOT use native-quantised";
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
                 ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
@@ -3754,7 +3754,7 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
                 ASSERT_FALSE(packed.int8_data.empty());
-                ASSERT_TRUE(packed.native_vnni_payload.empty());
+                ASSERT_TRUE(packed.native_quantised_payload.empty());
 
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
                 auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -3810,7 +3810,7 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
                 ASSERT_FALSE(packed.int8_data.empty());
-                ASSERT_TRUE(packed.native_vnni_payload.empty());
+                ASSERT_TRUE(packed.native_quantised_payload.empty());
 
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
                 auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -4032,7 +4032,7 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
                 EXPECT_FALSE(packed.int8_data.empty());
-                EXPECT_TRUE(packed.native_vnni_payload.empty());
+                EXPECT_TRUE(packed.native_quantised_payload.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
                 ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
@@ -4075,7 +4075,7 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
                 EXPECT_FALSE(packed.int8_data.empty());
-                EXPECT_TRUE(packed.native_vnni_payload.empty());
+                EXPECT_TRUE(packed.native_quantised_payload.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
                 ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
@@ -4137,7 +4137,7 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
                 EXPECT_FALSE(packed.int8_data.empty());
-                EXPECT_TRUE(packed.native_vnni_payload.empty());
+                EXPECT_TRUE(packed.native_quantised_payload.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
                 ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
@@ -4164,10 +4164,10 @@ namespace llaminar2
             }
 
             /**
-             * @test End-to-end multiply_tensor for Q4_0 (native-VNNI path) — decode (M=1)
+             * @test End-to-end multiply_tensor for Q4_0 (native-quantised path) — decode (M=1)
              *
-             * Verifies that Q4_0 weights go through native-VNNI packing and the
-             * native-VNNI GEMV path produces correct results for single-token decode.
+             * Verifies that Q4_0 weights go through native-quantised packing and the
+             * native-quantised GEMV path produces correct results for single-token decode.
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q4_0_Decode_M1)
             {
@@ -4183,8 +4183,8 @@ namespace llaminar2
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-                // Verify native-VNNI path was used (not INT8)
-                EXPECT_FALSE(packed.native_vnni_payload.empty()) << "Q4_0 must use native-VNNI";
+                // Verify native-quantised path was used (not INT8)
+                EXPECT_FALSE(packed.native_quantised_payload.empty()) << "Q4_0 must use native-quantised";
                 EXPECT_TRUE(packed.int8_data.empty()) << "Q4_0 must NOT use INT8 path";
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4212,7 +4212,7 @@ namespace llaminar2
             }
 
             /**
-             * @test End-to-end multiply_tensor for Q4_0 (native-VNNI path) — prefill (M=64)
+             * @test End-to-end multiply_tensor for Q4_0 (native-quantised path) — prefill (M=64)
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q4_0_Prefill_M64)
             {
@@ -4227,7 +4227,7 @@ namespace llaminar2
 
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-                EXPECT_FALSE(packed.native_vnni_payload.empty());
+                EXPECT_FALSE(packed.native_quantised_payload.empty());
                 EXPECT_TRUE(packed.int8_data.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4255,7 +4255,7 @@ namespace llaminar2
             }
 
             /**
-             * @test Prefill bias is applied on the native-VNNI dispatch path (Q4_0).
+             * @test Prefill bias is applied on the native-quantised dispatch path (Q4_0).
              *
              * This covers the same bias plumbing used by Qwen2 fused QKV prefill
              * projections, but through the single-projection multiply_tensor API.
@@ -4270,7 +4270,7 @@ namespace llaminar2
                 auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-                EXPECT_FALSE(packed.native_vnni_payload.empty());
+                EXPECT_FALSE(packed.native_quantised_payload.empty());
                 EXPECT_TRUE(packed.int8_data.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4317,7 +4317,7 @@ namespace llaminar2
             }
 
             /**
-             * @test End-to-end multiply_tensor for IQ4_NL (native-VNNI path) — decode (M=1)
+             * @test End-to-end multiply_tensor for IQ4_NL (native-quantised path) — decode (M=1)
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_IQ4_NL_Decode_M1)
             {
@@ -4332,7 +4332,7 @@ namespace llaminar2
 
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-                EXPECT_FALSE(packed.native_vnni_payload.empty());
+                EXPECT_FALSE(packed.native_quantised_payload.empty());
                 EXPECT_TRUE(packed.int8_data.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4362,7 +4362,7 @@ namespace llaminar2
             /**
              * @test Cross-path consistency: same dimensions, different formats
              *
-             * Verifies that Q8_0 (INT8-VNNI) and Q4_0 (native-VNNI) both produce
+             * Verifies that Q8_0 (INT8-VNNI) and Q4_0 (native-quantised) both produce
              * valid outputs for the same shape. While the outputs will differ due to
              * different quantization methods, both should have high cosine similarity
              * against their respective FP32 references.
@@ -4385,9 +4385,9 @@ namespace llaminar2
                 ROCmPackedWeights packed_q8;
                 ASSERT_TRUE(packWeightsToROCm(w_q8.get(), packed_q8));
                 EXPECT_FALSE(packed_q8.int8_data.empty());
-                EXPECT_TRUE(packed_q8.native_vnni_payload.empty());
+                EXPECT_TRUE(packed_q8.native_quantised_payload.empty());
 
-                // --- Q4_0 (native-VNNI path) ---
+                // --- Q4_0 (native-quantised path) ---
                 auto w_q4 = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
                 std::vector<float> W_q4_fp32(static_cast<size_t>(N) * K);
                 w_q4->to_fp32(W_q4_fp32.data());
@@ -4395,7 +4395,7 @@ namespace llaminar2
                 ROCmPackedWeights packed_q4;
                 ASSERT_TRUE(packWeightsToROCm(w_q4.get(), packed_q4));
                 EXPECT_TRUE(packed_q4.int8_data.empty());
-                EXPECT_FALSE(packed_q4.native_vnni_payload.empty());
+                EXPECT_FALSE(packed_q4.native_quantised_payload.empty());
 
                 // Shared input
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
@@ -4438,7 +4438,7 @@ namespace llaminar2
                     cpuFP32GemmRef(in_host, W_q4_fp32.data(), ref.data(), M, N, K);
 
                     float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
-                    LOG_INFO("[Dispatch] CrossPath Q4_0 (native-VNNI): cosine=" << cos);
+                    LOG_INFO("[Dispatch] CrossPath Q4_0 (native-quantised): cosine=" << cos);
                     EXPECT_GT(cos, 0.990f) << "Q4_0 cross-path cosine too low";
 
                     cleanupWorkspace(kernel);
@@ -4446,10 +4446,10 @@ namespace llaminar2
             }
 
             /**
-             * @test End-to-end multiply_tensor for Q5_K (native-VNNI K-quant) — decode (M=1)
+             * @test End-to-end multiply_tensor for Q5_K (native-quantised K-quant) — decode (M=1)
              *
              * Tests a super-block format to ensure the format-conditional logic also
-             * routes K-quant formats through native-VNNI correctly.
+             * routes K-quant formats through native-quantised correctly.
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q5_K_Decode_M1)
             {
@@ -4464,7 +4464,7 @@ namespace llaminar2
 
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-                EXPECT_FALSE(packed.native_vnni_payload.empty()) << "Q5_K must use native-VNNI";
+                EXPECT_FALSE(packed.native_quantised_payload.empty()) << "Q5_K must use native-quantised";
                 EXPECT_TRUE(packed.int8_data.empty()) << "Q5_K must NOT use INT8 path";
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4492,13 +4492,13 @@ namespace llaminar2
             }
 
             /**
-             * @test Fused prefill with pre-packed native-VNNI weights matches separate GEMM
+             * @test Fused prefill with pre-packed native-quantised weights matches separate GEMM
              *
              * This specifically exercises multiply_fused_tensor() for M>1 with
-             * native-VNNI weights. The packed constructor mirrors the main cached
+             * native-quantised weights. The packed constructor mirrors the main cached
              * weight path used by production inference.
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeVnniPackedPath_MatchesSeparate)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeQuantisedPackedPath_MatchesSeparate)
             {
                 if (!has_rocm_device_)
                     GTEST_SKIP() << "No ROCm device available";
@@ -4508,7 +4508,7 @@ namespace llaminar2
                 auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-                ASSERT_FALSE(packed.native_vnni_payload.empty());
+                ASSERT_FALSE(packed.native_quantised_payload.empty());
                 ASSERT_TRUE(packed.int8_data_vnni.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4537,20 +4537,20 @@ namespace llaminar2
                 const float *fused = output_fused->data();
                 const float cos = cosineSim(fused, separate, static_cast<size_t>(M) * N);
 
-                LOG_INFO("[Dispatch] Fused packed native-VNNI Q4_0 cosine=" << cos);
-                EXPECT_GT(cos, 0.9999f) << "Packed native-VNNI fused prefill diverged from separate GEMM";
+                LOG_INFO("[Dispatch] Fused packed native-quantised Q4_0 cosine=" << cos);
+                EXPECT_GT(cos, 0.9999f) << "Packed native-quantised fused prefill diverged from separate GEMM";
 
                 cleanupWorkspace(kernel);
             }
 
             /**
-             * @test Fused native-VNNI prefill applies per-projection biases.
+             * @test Fused native-quantised prefill applies per-projection biases.
              *
              * Mirrors the Qwen2 fused-QKV prefill structure more closely by running
              * multiple biased projections through multiply_fused_tensor() and
              * comparing them against separate bias-aware multiply_tensor() calls.
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeVnniPackedPath_BiasMatchesSeparate)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeQuantisedPackedPath_BiasMatchesSeparate)
             {
                 if (!has_rocm_device_)
                     GTEST_SKIP() << "No ROCm device available";
@@ -4560,7 +4560,7 @@ namespace llaminar2
                 auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-                ASSERT_FALSE(packed.native_vnni_payload.empty());
+                ASSERT_FALSE(packed.native_quantised_payload.empty());
                 ASSERT_TRUE(packed.int8_data_vnni.empty());
 
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -4618,7 +4618,7 @@ namespace llaminar2
                 const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * N);
                 const float v_cos = cosineSim(fused_v->data(), separate_v->data(), static_cast<size_t>(M) * N);
 
-                LOG_INFO("[Dispatch] Fused packed native-VNNI Q4_0 with bias cosine q=" << q_cos
+                LOG_INFO("[Dispatch] Fused packed native-quantised Q4_0 with bias cosine q=" << q_cos
                                                                                         << " k=" << k_cos
                                                                                         << " v=" << v_cos);
                 EXPECT_GT(q_cos, 0.9999f) << "Fused Q projection diverged from separate biased GEMM";
@@ -4884,7 +4884,7 @@ namespace llaminar2
             }
 
             /**
-             * @test Fused prefill with legacy TensorBase-backed native-VNNI weights works
+             * @test Fused prefill with legacy TensorBase-backed native-quantised weights works
              *        for representative metadata families.
              *
              * This covers the legacy upload path fixed here, including:
@@ -4893,7 +4893,7 @@ namespace llaminar2
              *   - IQ4_NL: payload + scales + codebook id
              *   - Q2_K: payload + scales + emins
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeVnniLegacyPath_MetadataFamiliesMatchSeparate)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeQuantisedLegacyPath_MetadataFamiliesMatchSeparate)
             {
                 if (!has_rocm_device_)
                     GTEST_SKIP() << "No ROCm device available";
@@ -4937,10 +4937,10 @@ namespace llaminar2
 
                     ROCmPackedWeights packed;
                     ASSERT_TRUE(packWeightsToROCm(weights.get(), packed)) << test_case.name;
-                    ASSERT_FALSE(packed.native_vnni_payload.empty()) << test_case.name;
-                    ASSERT_FALSE(packed.native_vnni_scales.empty()) << test_case.name;
-                    EXPECT_EQ(!packed.native_vnni_mins.empty(), test_case.expect_mins) << test_case.name;
-                    EXPECT_EQ(!packed.native_vnni_emins.empty(), test_case.expect_emins) << test_case.name;
+                    ASSERT_FALSE(packed.native_quantised_payload.empty()) << test_case.name;
+                    ASSERT_FALSE(packed.native_quantised_scales.empty()) << test_case.name;
+                    EXPECT_EQ(!packed.native_quantised_mins.empty(), test_case.expect_mins) << test_case.name;
+                    EXPECT_EQ(!packed.native_quantised_emins.empty(), test_case.expect_emins) << test_case.name;
 
                     ROCmQuantisedGemmKernel kernel = createLegacyROCmKernelForTest(weights.get(), 0);
                     ASSERT_TRUE(setupWorkspace(kernel, M, N, K)) << test_case.name;
@@ -4966,7 +4966,7 @@ namespace llaminar2
                     const float *fused = output_fused->data();
                     const float cos = cosineSim(fused, separate, static_cast<size_t>(M) * N);
 
-                    LOG_INFO("[Dispatch] Fused legacy native-VNNI " << test_case.name << " cosine=" << cos);
+                    LOG_INFO("[Dispatch] Fused legacy native-quantised " << test_case.name << " cosine=" << cos);
                     EXPECT_GT(cos, 0.9999f) << test_case.name << " fused prefill diverged from separate GEMM";
 
                     cleanupWorkspace(kernel);

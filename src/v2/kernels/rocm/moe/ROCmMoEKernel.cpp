@@ -28,6 +28,7 @@
 #include "../gemm/HipBLASGemmKernel.h"
 #include "../gemm/ROCmWeightPacker.h"
 #include "../gemm/ROCmMoEGroupedPrefillKernels.h"
+#include "../gemm/ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -36,7 +37,7 @@
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/ITensor.h"
 #include "../../../tensors/TensorClasses.h"
-#include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -52,6 +53,23 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+namespace llaminar2::rocm
+{
+/** @copydoc compiledMoERouteOwnedModelPartitionPolicy */
+MoERouteOwnedModelPartitionPolicy compiledMoERouteOwnedModelPartitionPolicy() noexcept
+{
+#if LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES == 1
+    return MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes;
+#elif LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES == 0
+    return MoERouteOwnedModelPartitionPolicy::Serial;
+#elif LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES == 2
+    return MoERouteOwnedModelPartitionPolicy::Automatic;
+#else
+#error "invalid source-bound ROCm owner partition policy"
+#endif
+}
+}
 
 namespace
 {
@@ -91,7 +109,7 @@ namespace
      */
     void appendGroupedDescriptorIdentity(
         std::vector<std::uint64_t> &words,
-        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &descriptor)
     {
         words.push_back(static_cast<std::uint64_t>(
             reinterpret_cast<std::uintptr_t>(descriptor.payload)));
@@ -129,8 +147,8 @@ namespace
      */
     llaminar2::PersistentWorkspacePublicationKey
     groupedDescriptorPublicationKey(
-        const llaminar2::DeviceNativeVNNIMatrixDesc *primary,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *secondary,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *primary,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *secondary,
         int num_experts,
         int d_model,
         int intermediate)
@@ -270,14 +288,14 @@ namespace
 #endif
     }
 
-    /// @brief Returns whether grouped MoE kernels instantiate this native-VNNI codebook.
+    /// @brief Returns whether grouped MoE kernels instantiate this native-quantised codebook.
     bool groupedDecodeSupportsCodebook(uint8_t codebook_id)
     {
         switch (codebook_id)
         {
         case 0:  // Q4_0
         case 4:  // IQ4_NL
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // IQ4_XS original tuple
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: // IQ4_XS original tuple
         case 5:  // Q4_1 / Q4_K
         case 6:  // Q5_0
         case 7:  // Q5_1 / Q5_K
@@ -292,7 +310,7 @@ namespace
         case 16: // IQ1_S
         case 17: // IQ1_M
         case 19: // Q8_0
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -304,7 +322,7 @@ namespace
     {
         switch (codebook_id)
         {
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // Raw source coefficient, not a min
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: // Raw source coefficient, not a min
         case 11: // Mandatory original IQ3_S source nibble; not a minimum
         case 5:  // Q4_1 / Q4_K min correction
         case 7:  // Q5_1 / Q5_K min correction
@@ -315,7 +333,7 @@ namespace
         case 14: // IQ2_XS high half scale
         case 16: // IQ1_S min correction
         case 17: // IQ1_M high half scale
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook: // Expanded asymmetric min correction
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: // Expanded asymmetric min correction
             return true;
         default:
             return false;
@@ -365,15 +383,15 @@ namespace
      * present rather than trusted as an unchecked policy-table index.
      */
     bool validateGroupedSourceIdentity(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeVnniExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
+                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
         }
         const auto *source =
-            llaminar2::native_vnni_formats::forSourceIdentity(
+            llaminar2::native_quantised_formats::forSourceIdentity(
                 desc.source_codebook_id,
                 desc.source_is_superblock != 0);
         return source != nullptr &&
@@ -383,7 +401,7 @@ namespace
 
     /** @return Bit selecting the serial-M1 source arithmetic policy. */
     uint32_t groupedPrefillPolicyCodebookBit(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!validateGroupedSourceIdentity(desc))
             return 0u;
@@ -395,7 +413,7 @@ namespace
     }
 
     bool validateGroupedDownDesc(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int d_model,
         int intermediate)
     {
@@ -408,7 +426,7 @@ namespace
     }
 
     bool validateGroupedGateUpDesc(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int d_model,
         int intermediate)
     {
@@ -420,7 +438,7 @@ namespace
                (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
     }
 
-    bool isBlankGroupedDesc(const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         return desc.payload == nullptr &&
                desc.scales == nullptr &&
@@ -1137,9 +1155,9 @@ extern "C"
         const float *routing_weights,
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -1156,9 +1174,9 @@ extern "C"
     bool hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -1220,9 +1238,9 @@ extern "C"
 
     bool hipMoE_materialize_runtime_prefill_descriptor_tables(
         const void *runtime,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int device_idx,
         void *stream);
@@ -1251,10 +1269,10 @@ extern "C"
         int expert_id, int max_tokens, int d_model,
         int device_idx, void *stream);
 
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
+    bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_descs,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_descs,
         const float *d_weights,
         int8_t *d_swiglu_int8,
         float *d_swiglu_scales,
@@ -1267,10 +1285,10 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+    bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_desc_table,
         const int *d_expert_ids,
         const float *d_weights,
         int8_t *d_swiglu_int8,
@@ -1304,10 +1322,10 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
+    bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
         const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
         const int *d_expert_ids,
         float *const *d_gate_outputs,
         float *const *d_up_outputs,
@@ -1342,7 +1360,7 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+    bool rocmMoE_grouped_gate_up_native_quantised_decode_runtime(
         const float *d_hidden,
         const void *d_runtime_layer,
         const int *d_expert_ids,
@@ -1362,7 +1380,7 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+    bool rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
         const void *d_runtime_layer,
@@ -1470,9 +1488,9 @@ namespace
      */
     int singleCodebookFromMask(uint32_t codebook_mask)
     {
-        const uint32_t iq4_tuple = llaminar2::nativeVnniCodebookMaskBit(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        const uint32_t iq4_tuple = llaminar2::nativeQuantisedCodebookMaskBit(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
         if (codebook_mask & iq4_tuple)
-            codebook_mask &= ~llaminar2::nativeVnniCodebookMaskBit(uint8_t{4});
+            codebook_mask &= ~llaminar2::nativeQuantisedCodebookMaskBit(uint8_t{4});
         if (codebook_mask == 0 ||
             (codebook_mask & (codebook_mask - 1u)) != 0u)
         {
@@ -1519,7 +1537,8 @@ namespace
         int hidden_size,
         int expert_width,
         int expert_count,
-        int top_k)
+        int top_k,
+        llaminar2::MoEPrefillMeasuredOperation operation)
     {
         if (seq_len <= 8)
             return {{"1", "64"}, {"1", "64"}, "direct"};
@@ -1540,7 +1559,8 @@ namespace
         int down_tile_m = 0;
         int down_tile_n = 0;
         int exact_overlay = 0;
-        if (!rocmMoE_grouped_prefill_query_production_pair_config(
+        if (!rocmMoE_grouped_prefill_query_production_pair_config_for_operation(
+                operation,
                 static_cast<uint8_t>(gateup_codebook),
                 static_cast<uint8_t>(down_codebook),
                 seq_len,
@@ -1714,6 +1734,43 @@ namespace
 
 namespace llaminar2
 {
+
+    bool ROCmMoEKernel::beginOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeBeginLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "beginOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeBegin(&packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::retireOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeRetireLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeRetire(&packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationSingleRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeRetireSingleRowBatch(&packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationMultiRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeRetireMultiRowBatch(&packet, device_ordinal_, stream);
+    }
+
 
     bool ROCmMoEKernel::packMoEOverlayActivationDispatch(
         const MoEKernelLaunchContext &launch,
@@ -2180,7 +2237,7 @@ namespace llaminar2
         const char *buffer_name,
         std::size_t slot,
         int num_experts,
-        DeviceNativeVNNIMatrixDesc **device_descs,
+        DeviceNativeQuantisedMatrixDesc **device_descs,
         const char *context)
     {
         if (!buffer_name || !device_descs || num_experts <= 0 ||
@@ -2194,7 +2251,7 @@ namespace llaminar2
         if (!bindWorkspaceBuffer(
                 &base,
                 buffer_name,
-                sizeof(DeviceNativeVNNIMatrixDesc),
+                sizeof(DeviceNativeQuantisedMatrixDesc),
                 context))
         {
             return false;
@@ -2206,7 +2263,7 @@ namespace llaminar2
             static_cast<std::size_t>(
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
         const std::size_t descriptor_stride =
-            slot_bytes / sizeof(DeviceNativeVNNIMatrixDesc);
+            slot_bytes / sizeof(DeviceNativeQuantisedMatrixDesc);
         if (descriptor_stride < static_cast<std::size_t>(num_experts))
         {
             LOG_ERROR("[ROCmMoEKernel] " << context
@@ -2220,7 +2277,7 @@ namespace llaminar2
 
         const std::size_t descriptor_offset = slot * descriptor_stride;
         const std::size_t descriptor_capacity =
-            available / sizeof(DeviceNativeVNNIMatrixDesc);
+            available / sizeof(DeviceNativeQuantisedMatrixDesc);
         if (descriptor_offset + static_cast<std::size_t>(num_experts) >
             descriptor_capacity)
         {
@@ -2233,12 +2290,13 @@ namespace llaminar2
         }
 
         *device_descs =
-            static_cast<DeviceNativeVNNIMatrixDesc *>(base) + descriptor_offset;
+            static_cast<DeviceNativeQuantisedMatrixDesc *>(base) + descriptor_offset;
         return true;
     }
 
     void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        grouped_prefill_grouping_.invalidate();
         d_write_heads_ = nullptr;
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
@@ -2375,7 +2433,7 @@ namespace llaminar2
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
-                        DeviceNativeVNNIMatrixDesc *slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *slot_base = nullptr;
                         if (!bindGroupedDescriptorTableSlot(
                                 MoEWorkspaceBuffers::
                                     ROCM_GROUPED_DOWN_DESC_TABLES,
@@ -2453,7 +2511,7 @@ namespace llaminar2
 
         const size_t desc_bytes =
             static_cast<size_t>(table.num_experts) *
-            sizeof(DeviceNativeVNNIMatrixDesc);
+            sizeof(DeviceNativeQuantisedMatrixDesc);
         const auto publication_result =
             workspace_->getOrCreatePersistentPublication(
                 kROCmGroupedDownDescriptorLeaseDomain,
@@ -2466,7 +2524,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
-                    DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+                    DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
                     if (!bindGroupedDescriptorTableSlot(
                             MoEWorkspaceBuffers::
                                 ROCM_GROUPED_DOWN_DESC_TABLES,
@@ -2556,7 +2614,7 @@ namespace llaminar2
             return false;
         }
 
-        table.device_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->primary_descs);
         table.device_floating_descs = nullptr;
         table.workspace_publication = std::move(publication);
@@ -2609,8 +2667,8 @@ namespace llaminar2
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
-                        DeviceNativeVNNIMatrixDesc *gate_slot_base = nullptr;
-                        DeviceNativeVNNIMatrixDesc *up_slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *gate_slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *up_slot_base = nullptr;
                         if (!bindGroupedDescriptorTableSlot(
                                 MoEWorkspaceBuffers::
                                     ROCM_GROUPED_GATE_DESC_TABLES,
@@ -2710,7 +2768,7 @@ namespace llaminar2
 
         const size_t desc_bytes =
             static_cast<size_t>(table.num_experts) *
-            sizeof(DeviceNativeVNNIMatrixDesc);
+            sizeof(DeviceNativeQuantisedMatrixDesc);
         const auto publication_result =
             workspace_->getOrCreatePersistentPublication(
                 kROCmGroupedGateUpDescriptorLeaseDomain,
@@ -2723,9 +2781,9 @@ namespace llaminar2
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
-                    DeviceNativeVNNIMatrixDesc *device_gate_descs =
+                    DeviceNativeQuantisedMatrixDesc *device_gate_descs =
                         nullptr;
-                    DeviceNativeVNNIMatrixDesc *device_up_descs =
+                    DeviceNativeQuantisedMatrixDesc *device_up_descs =
                         nullptr;
                     if (!bindGroupedDescriptorTableSlot(
                             MoEWorkspaceBuffers::
@@ -2836,9 +2894,9 @@ namespace llaminar2
             return false;
         }
 
-        table.device_gate_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_gate_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->primary_descs);
-        table.device_up_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_up_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->secondary_descs);
         table.device_floating_gate_descs = nullptr;
         table.device_floating_up_descs = nullptr;
@@ -2895,6 +2953,7 @@ namespace llaminar2
 
     void ROCmMoEKernel::resetDynamicState()
     {
+        grouped_prefill_grouping_.invalidate();
         if (!setMoEDevice(device_ordinal_, "resetDynamicState"))
             return;
 
@@ -2909,6 +2968,15 @@ namespace llaminar2
         clearWorkspaceScratchBindings();
         grouped_down_desc_tables_.clear();
         grouped_gateup_desc_tables_.clear();
+    }
+
+    bool ROCmMoEKernel::runMoEOverlayEpochParentAction(
+        const MoEKernelLaunchContext &launch,DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochStatus *status,DeviceMoEOverlayEpochParentAction action)
+    {
+        void *stream=explicitMoELaunchStream(launch,"runMoEOverlayEpochParentAction");
+        if(!stream || !control || !status)return false;
+        return hipMoEOverlayEpochParentAction(control,status,action,device_ordinal_,stream);
     }
 
     bool ROCmMoEKernel::acquireMoEOverlayEpoch(
@@ -3149,6 +3217,39 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::prepareRequiredRouterQ8Hidden(int rows, int width, int top_k)
+    {
+        (void)top_k;
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (router_q8_publication_access_ != MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_->acceptsProducerRows(rows, width))
+        {
+            LOG_ERROR("[ROCmMoEKernel] required Q8 producer geometry/access mismatch");
+            return false;
+        }
+        return ensureRouterQ8HiddenScratchCapacity(rows, width);
+    }
+
+    bool ROCmMoEKernel::publishRequiredRouterQ8Hidden(
+        const float *source, int rows, int width, int top_k, const int *live_rows)
+    {
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k) ||
+            !hipMoE_publish_original_hidden_q8_rows(source, d_router_q8_hidden_,
+                d_router_q8_hidden_scales_, rows, width, device_ordinal_, getStream(), live_rows))
+            return false;
+        publishRouterQ8Hidden(source, rows,
+            isGraphCaptureActive() ||
+                (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
+                isHipStreamCapturing(getStream()),
+            RouterQ8Basis::Original);
+        return true;
+    }
+
     void ROCmMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
         if (router_q8_publication_access_ ==
@@ -3190,7 +3291,8 @@ namespace llaminar2
     void ROCmMoEKernel::publishRouterQ8Hidden(
         const float *source,
         int rows,
-        bool recorded_during_capture) noexcept
+        bool recorded_during_capture,
+        RouterQ8Basis router_basis) noexcept
     {
         if (router_q8_publication_access_ !=
                 MoERouterQ8PublicationAccess::ProducerAndConsumer ||
@@ -3218,7 +3320,7 @@ namespace llaminar2
         publication.blocks_per_row_capacity =
             router_q8_hidden_blocks_cap_;
         publication.capture_recorded = recorded_during_capture;
-        if (routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) == RouterQ8Basis::SignedHadamard32)
+        if (router_basis == RouterQ8Basis::SignedHadamard32)
             PerfStatsCollector::addCounter("kernel", "rocm_moe_router_hadamard32_calls", 1.0,
                 "router", "rocm:" + std::to_string(device_ordinal_),
                 {{"rows", std::to_string(rows)}, {"expert_hidden_basis", "original"}, {"block", "32"}});
@@ -3531,6 +3633,13 @@ namespace llaminar2
         bool used_q8_grouped_router = false;
         bool used_fp16_grouped_router = false;
         invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        const bool router_publishes_q8 = !decode_single_token &&
+            gate_type == TensorType::FP32 && debugEnv().rocm.moe_router_q8;
+        if (!router_publishes_q8 && !publishRequiredRouterQ8Hidden(
+                hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
         if (decode_single_token)
         {
             if (!launchDecodeGateLogitsForGateType(
@@ -3598,7 +3707,8 @@ namespace llaminar2
                             seq_len,
                             isGraphCaptureActive() ||
                                 (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
-                                isHipStreamCapturing(getStream()));
+                                isHipStreamCapturing(getStream()),
+                            routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
                     }
                 }
                 else
@@ -3855,6 +3965,7 @@ namespace llaminar2
         int *d_grouped_token_indices,
         float *d_grouped_weights)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
@@ -4011,7 +4122,7 @@ namespace llaminar2
                                  "ensureGroupedDecodeCapacity(weights)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_down_descs_),
                                  MoEWorkspaceBuffers::ROCM_DECODE_DOWN_DESCS,
-                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeQuantisedMatrixDesc),
                                  "ensureGroupedDecodeCapacity(down_descs)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_swiglu_int8_),
                                  MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,
@@ -4027,7 +4138,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::DOWN_PARTIALS,
                 static_cast<size_t>(num_active) *
                     static_cast<size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<size_t>(d_model) * sizeof(float),
                 "ensureGroupedDecodeCapacity(ordered_down_partials)"))
         {
@@ -4101,7 +4212,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
                 static_cast<size_t>(num_active) *
                     static_cast<size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<size_t>(intermediate) * sizeof(float),
                 "ensureGroupedGateUpCapacity(gate_partials)") ||
             !bindWorkspaceBuffer(
@@ -4109,7 +4220,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
                 static_cast<size_t>(num_active) *
                     static_cast<size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<size_t>(intermediate) * sizeof(float),
                 "ensureGroupedGateUpCapacity(up_partials)"))
         {
@@ -4778,6 +4889,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!prepareRequiredRouterQ8Hidden(plan.physical_rows, plan.d_model, plan.top_k))
+            return false;
+
         const size_t logits_count =
             static_cast<size_t>(plan.physical_rows) *
             static_cast<size_t>(plan.num_experts);
@@ -4957,6 +5071,11 @@ namespace llaminar2
         bool used_q8_grouped_router = false;
         bool used_fp16_grouped_router = false;
         invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        if (!q8_router_requested && !publishRequiredRouterQ8Hidden(
+                d_hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
         if (q8_router_requested)
         {
             if (!ensureRouterQ8HiddenScratchCapacity(seq_len, d_model))
@@ -4993,7 +5112,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 d_hidden,
                 seq_len,
-                isDecodeGraphCaptureActive());
+                isDecodeGraphCaptureActive(),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
         else if (gate_is_fp32)
         {
@@ -5198,7 +5318,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 h,
                 /*rows=*/1,
-                isDecodeGraphCaptureActive());
+                isDecodeGraphCaptureActive(),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -5264,7 +5385,7 @@ namespace llaminar2
         }
 
         if (!runtime_ready && rocm_env.moe_router_wave_topk &&
-            num_experts <= 256 &&
+            num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
             prepared_decode_resident_set_policy_ ==
                 RoutedExpertResidentSetPolicy::UniqueOwner)
         {
@@ -5289,7 +5410,7 @@ namespace llaminar2
             }
         }
 
-        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= 256)
+        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= static_cast<int>(kDeviceMoEMaxExperts))
         {
             runtime_ready = hipMoE_softmax_topk_decode_runtime_wave64(
                 d_route_logits_,
@@ -5494,7 +5615,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 h,
                 /*rows=*/1,
-                isDecodeGraphCaptureActive());
+                isDecodeGraphCaptureActive(),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -5559,7 +5681,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= 256)
+        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= static_cast<int>(kDeviceMoEMaxExperts))
         {
             runtime_ready = hipMoE_softmax_topk_decode_runtime_wave64(
                 d_route_logits_,
@@ -6894,7 +7016,7 @@ namespace llaminar2
     }
 
     int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable(
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int d_model,
         int intermediate,
@@ -6923,7 +7045,7 @@ namespace llaminar2
         {
             return -1;
         }
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -6943,10 +7065,10 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            if (!addNativeVnniExecutionFormat(
+            if (!addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -6967,7 +7089,7 @@ namespace llaminar2
         uint8_t codebook_id = kROCmMoEMixedCodebookSentinel;
         for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
         {
-            const uint32_t bit = nativeVnniCodebookMaskBit(codebook);
+            const uint32_t bit = nativeQuantisedCodebookMaskBit(codebook);
             if ((codebook_mask & bit) == 0u)
                 continue;
             if (groupedPrefillCodebookBit(codebook) == 0u)
@@ -6996,12 +7118,12 @@ namespace llaminar2
         }
 
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_down_desc_tables_[index];
             if (!existing.valid ||
-                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
@@ -7027,7 +7149,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
-        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
                 table,
@@ -7039,9 +7161,109 @@ namespace llaminar2
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
 
+    /** @copydoc IMoEKernel::prepareOwnerGateUpCaptureBinding */
+    std::uint64_t ROCmMoEKernel::prepareOwnerGateUpCaptureBinding(int table_id, int rows,
+                                                                    std::uint64_t expected_intent)
+    {
+        if (isGraphCaptureActive()) throw std::logic_error("owner gate/up capability must be bound before native capture");
+        if (table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) || rows <= 0)
+            throw std::invalid_argument("owner gate/up preparation requires its original table and physical rows");
+        auto &table = grouped_gateup_desc_tables_[table_id];
+        if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up table is not prepared");
+        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
+            table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!selected)
+        {
+            if (expected_intent) throw std::logic_error("owner gate/up intent names an unsupported physical operation");
+            return 0;
+        }
+        if (!expected_intent)
+        {
+            if (table.owner_m1_admission || table.owner_m1_intent)
+                throw std::logic_error("retained owner capability cannot be replaced by an unbound component policy");
+            return 0; // Original explicitly unbound component policy; model declarations validate their own nonzero intent.
+        }
+        const auto plan = rocm::planMoERouteOwnedGateUp(rocm::MoERouteOwnedGateUpGeometry::TN64,
+            {table.codebook_mask, table.policy_codebook_mask}, device_ordinal_,
+            rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes,
+            {.output_columns = table.intermediate, .reduction_columns = table.d_model});
+        if (plan.identity() != expected_intent)
+            throw std::logic_error("owner gate/up table does not match its predeclared immutable intent");
+        if (table.owner_m1_admission)
+        {
+            if (table.owner_m1_intent != expected_intent)
+                throw std::logic_error("owner gate/up capability cannot change behind a retained graph");
+            return table.owner_m1_intent;
+        }
+        auto admission = rocm::admitMoERouteOwnedGateUpGeometry(plan);
+        // Publish only the complete native capability. The original table and
+        // graph retirement own this host metadata; no memory reserve is added.
+        table.owner_m1_admission = std::move(admission);
+        table.owner_m1_intent = expected_intent;
+        return expected_intent;
+    }
+
+    /** @copydoc IMoEKernel::ownerGateUpCaptureBindingSignature */
+    std::uint64_t ROCmMoEKernel::ownerGateUpCaptureBindingSignature(int table_id, int rows) const
+    {
+        if (table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) || rows <= 0)
+            throw std::logic_error("owner gate/up capture binding lost its descriptor table");
+        const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up capture binding lost its prepared storage");
+        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
+            table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!selected) return 0;
+        if (table.owner_m1_admission.has_value() != (table.owner_m1_intent != 0))
+            throw std::logic_error("owner gate/up table lost its complete immutable capability");
+        return table.owner_m1_intent;
+    }
+
+    /** @copydoc ROCmMoEKernel::ownerGateUpAdmissionForCall */
+    const rocm::MoERouteOwnedGateUpAdmission *ROCmMoEKernel::ownerGateUpAdmissionForCall(
+        int table_id, int rows, const MoEPrefillProjectionExecution &execution,
+        rocm::MoERouteOwnedProjectionShape shape) const
+    {
+        if (!execution.executesGateUp() || execution.executesDown() || rows != 1 ||
+            table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size())) return nullptr;
+        const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
+            table.descriptor_source != MoEDecodeDescriptorSource::RuntimePlacementTable) return nullptr;
+        if (!table.owner_m1_admission && !table.owner_m1_intent)
+            return nullptr; // Existing unbound component path, not a declared graph policy.
+        if (!table.owner_m1_admission || !table.owner_m1_intent)
+            throw std::logic_error("owner gate/up table lost its complete immutable capability");
+        if (rocm::currentMoERouteOwnedGateUpGeometry())
+            throw std::logic_error("prepared model owner capability cannot be overridden by a diagnostic scope");
+        // A bound operation cannot silently execute under a different shape.
+        if (shape.output_columns != table.intermediate || shape.reduction_columns != table.d_model)
+            throw std::logic_error("owner M1 gate/up requires its exact cold model capability");
+        return &*table.owner_m1_admission;
+    }
+
+    /** @copydoc ROCmMoEKernel::recordOwnerGateUpCaptureSubmissions */
+    void ROCmMoEKernel::recordOwnerGateUpCaptureSubmissions(
+        const rocm::MoERouteOwnedGateUpLaunchSet &completed, std::uint64_t intent) const
+    {
+        if (!PerfStatsCollector::isDomainEnabled("kernel")) return;
+        for (std::size_t index = 0; index < completed.leaf_count; ++index)
+        {
+            const auto &leaf = completed.leaves[index];
+            PerfStatsCollector::addCounter("kernel", "rocm_moe_owner_m1_partition_submissions", 1.0,
+                "submission", DeviceId::rocm(device_ordinal_).toString(),
+                {{"observation", "host_execute_or_capture"}, {"partition_execution", "four_worker_planes"},
+                 {"intent", std::to_string(intent)}, {"execution_codebook", std::to_string(leaf.execution_codebook)},
+                 {"n", std::to_string(leaf.n)}, {"k", std::to_string(leaf.k)},
+                 {"worker_planes", std::to_string(leaf.partition_worker_planes)},
+                 {"grid_x", std::to_string(leaf.grid_x)}, {"grid_y", std::to_string(leaf.grid_y)}, {"grid_z", std::to_string(leaf.grid_z)},
+                 {"block_threads", std::to_string(leaf.block_x)},
+                 {"dynamic_shared_bytes", std::to_string(leaf.resources.dynamic_shared_memory_bytes)},
+                 {"native_function", std::to_string(reinterpret_cast<std::uintptr_t>(leaf.resources.function))}});
+        }
+    }
+
     int ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables(
-        const DeviceNativeVNNIMatrixDesc *gate_descs,
-        const DeviceNativeVNNIMatrixDesc *up_descs,
+        const DeviceNativeQuantisedMatrixDesc *gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *up_descs,
         int num_experts,
         int d_model,
         int intermediate,
@@ -7070,7 +7292,7 @@ namespace llaminar2
         {
             return -1;
         }
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7093,7 +7315,7 @@ namespace llaminar2
                 return -1;
             }
 
-            if (!areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id))
+            if (!areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id))
             {
                 LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Gate/up codebook mismatch for expert "
                           << expert_id << ": gate=" << static_cast<int>(gate_desc.codebook_id)
@@ -7109,12 +7331,12 @@ namespace llaminar2
                 return -1;
             }
             const auto add_descriptor = [&](
-                                            const DeviceNativeVNNIMatrixDesc &desc)
+                                            const DeviceNativeQuantisedMatrixDesc &desc)
             {
-                return addNativeVnniExecutionFormat(
+                return addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7137,7 +7359,7 @@ namespace llaminar2
         uint8_t codebook_id = kROCmMoEMixedCodebookSentinel;
         for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
         {
-            const uint32_t bit = nativeVnniCodebookMaskBit(codebook);
+            const uint32_t bit = nativeQuantisedCodebookMaskBit(codebook);
             if ((codebook_mask & bit) == 0u)
                 continue;
             if (groupedPrefillCodebookBit(codebook) == 0u)
@@ -7162,12 +7384,12 @@ namespace llaminar2
         }
 
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
             if (!existing.valid ||
-                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_gate_descs ||
                 !existing.device_up_descs ||
                 existing.num_experts != num_experts ||
@@ -7197,7 +7419,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
-        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
                 table,
@@ -7387,7 +7609,7 @@ namespace llaminar2
 
     bool ROCmMoEKernel::updateGroupedExpertDownDescriptorTable(
         int descriptor_table_id,
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int d_model,
         int intermediate)
@@ -7409,7 +7631,7 @@ namespace llaminar2
 
         auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid ||
-            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             !table.device_descs ||
             !table.workspace_publication ||
             table.num_experts != num_experts ||
@@ -7422,7 +7644,7 @@ namespace llaminar2
         const bool runtime_mutable =
             table.descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7430,10 +7652,10 @@ namespace llaminar2
                 continue;
             if (!desc.valid() || !validateGroupedDownDesc(desc, d_model, intermediate))
                 return false;
-            if (!addNativeVnniExecutionFormat(
+            if (!addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7467,7 +7689,7 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         if (!workspace_->rewritePersistentPublication(
                 kROCmGroupedDownDescriptorLeaseDomain,
                 groupedDescriptorPublicationKey(
@@ -7519,8 +7741,8 @@ namespace llaminar2
 
     bool ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables(
         int descriptor_table_id,
-        const DeviceNativeVNNIMatrixDesc *gate_descs,
-        const DeviceNativeVNNIMatrixDesc *up_descs,
+        const DeviceNativeQuantisedMatrixDesc *gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *up_descs,
         int num_experts,
         int d_model,
         int intermediate)
@@ -7542,7 +7764,7 @@ namespace llaminar2
 
         auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid ||
-            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             !table.device_gate_descs ||
             !table.device_up_descs || !table.workspace_publication ||
             table.num_experts != num_experts ||
@@ -7555,7 +7777,7 @@ namespace llaminar2
         const bool runtime_mutable =
             table.descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7569,19 +7791,19 @@ namespace llaminar2
                 return false;
             }
             if (!gate_desc.valid() || !up_desc.valid() ||
-                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
+                !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateGroupedGateUpDesc(gate_desc, d_model, intermediate) ||
                 !validateGroupedGateUpDesc(up_desc, d_model, intermediate))
             {
                 return false;
             }
             const auto add_descriptor = [&](
-                                            const DeviceNativeVNNIMatrixDesc &desc)
+                                            const DeviceNativeQuantisedMatrixDesc &desc)
             {
-                return addNativeVnniExecutionFormat(
+                return addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7617,7 +7839,7 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         if (!workspace_->rewritePersistentPublication(
                 kROCmGroupedGateUpDescriptorLeaseDomain,
                 groupedDescriptorPublicationKey(
@@ -8026,7 +8248,7 @@ namespace llaminar2
                   table.weight_format,
                   device_ordinal_,
                   getStream())
-            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            : rocmMoE_grouped_gate_up_native_quantised_decode_table(
                   d_hidden,
                   table.device_gate_descs,
                   table.device_up_descs,
@@ -8206,7 +8428,7 @@ namespace llaminar2
          * runtime placement. Split-K variants are deliberately absent because
          * reducing partition totals changes the FP32 addition tree.
          */
-        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+        const bool ok = rocmMoE_grouped_gate_up_native_quantised_decode_table(
             d_hidden,
             table.device_gate_descs,
             table.device_up_descs,
@@ -8327,7 +8549,7 @@ namespace llaminar2
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
 
-        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+        const bool ok = rocmMoE_grouped_gate_up_native_quantised_decode_runtime(
             d_hidden,
             runtime_layer,
             d_expert_ids,
@@ -8598,9 +8820,9 @@ namespace llaminar2
         if (descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable)
         {
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -8939,11 +9161,11 @@ namespace llaminar2
          * placement.  Therefore mutable and immutable placement differ only in
          * where the table values are published, not in GEMV arithmetic.
          */
-        const DeviceNativeVNNIMatrixDesc *decode_gate_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_gate_descs =
             gateup_table.device_gate_descs;
-        const DeviceNativeVNNIMatrixDesc *decode_up_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_up_descs =
             gateup_table.device_up_descs;
-        const DeviceNativeVNNIMatrixDesc *decode_down_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_down_descs =
             down_table.device_descs;
         const DeviceMoEFloatingMatrixDesc *decode_floating_gate_descs =
             gateup_table.device_floating_gate_descs;
@@ -8953,9 +9175,9 @@ namespace llaminar2
             down_table.device_floating_descs;
         if (use_runtime_descriptors)
         {
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -9108,11 +9330,11 @@ namespace llaminar2
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
         /*
-         * NativeVNNI decode has no consumer for the intermediate FP32 gate/up
+         * NativeQuantised decode has no consumer for the intermediate FP32 gate/up
          * rows.  Publish the exact decode-equivalent Q8 SwiGLU rows directly
          * from the ordered partial reducer.  Floating-point weights retain
          * their own fixed-tree FP32 contract and therefore do not enter this
-         * NativeVNNI publication path.
+         * NativeQuantised publication path.
          */
         const bool gateup_ok = floating
             ? rocmMoE_grouped_gate_up_floating_decode_table(
@@ -9129,7 +9351,7 @@ namespace llaminar2
                   gateup_table.weight_format,
                   device_ordinal_,
                   stream)
-            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            : rocmMoE_grouped_gate_up_native_quantised_decode_table(
                   d_hidden,
                   decode_gate_descs,
                   decode_up_descs,
@@ -9165,7 +9387,7 @@ namespace llaminar2
         }
 
         /*
-         * The NativeVNNI branch consumes the Q8 rows published immediately
+         * The NativeQuantised branch consumes the Q8 rows published immediately
          * above on this exact stream.  No event or synchronization is needed
          * inside one stream; the boolean is a strict data-contract selector,
          * not permission to infer readiness from pointer non-nullness.
@@ -9186,7 +9408,7 @@ namespace llaminar2
                   down_table.weight_format,
                   device_ordinal_,
                   stream)
-            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            : rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
                   d_down_gate_ptrs,
                   d_down_up_ptrs,
                   decode_down_descs,
@@ -9349,7 +9571,7 @@ namespace llaminar2
                   table.weight_format,
                   device_ordinal_,
                   getStream())
-            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            : rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
                   d_gate_ptrs,
                   d_up_ptrs,
                   table.device_descs,
@@ -9505,7 +9727,7 @@ namespace llaminar2
          * non-local experts, so masked and unmasked decode share one reduction
          * tree without floating-point atomics.
          */
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+        const bool ok = rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
             d_grouped_gate_ptrs_,
             d_grouped_up_ptrs_,
             table.device_descs,
@@ -9596,7 +9818,7 @@ namespace llaminar2
             return false;
         }
 
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+        const bool ok = rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime(
             d_gate_ptrs,
             d_up_ptrs,
             runtime_layer,
@@ -9630,7 +9852,7 @@ namespace llaminar2
         ITensor *const *up_tensors,
         const int *expert_ids,
         const float *expert_weights,
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_active,
         ITensor *output,
         int d_model,
@@ -9654,7 +9876,7 @@ namespace llaminar2
             if (expert_ids[i] < 0 || !down_descs[i].valid() ||
                 down_descs[i].n != d_model || down_descs[i].k != intermediate ||
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
-                !areNativeVnniGateUpCodebooksCompatible(
+                !areNativeQuantisedGateUpCodebooksCompatible(
                     down_descs[i].codebook_id, codebook_id) ||
                 (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
                 (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
@@ -9666,12 +9888,12 @@ namespace llaminar2
         // Preserve the old IQ4_NL/IQ4_XS mixed-down domain: the LUT decode
         // is shared, but physical24 resolves only its own raw source factors.
         for (int i = 0; i < num_active; ++i)
-            if (down_descs[i].codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
-                codebook_id = kNativeVnniIQ4XSSourceScaleCodebook;
+            if (down_descs[i].codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
+                codebook_id = kNativeQuantisedIQ4XSSourceScaleCodebook;
 
         if (!groupedDecodeSupportsCodebook(codebook_id))
         {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-VNNI codebook "
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-quantised codebook "
                       << static_cast<int>(codebook_id));
             return false;
         }
@@ -9714,7 +9936,7 @@ namespace llaminar2
                                  hipMemcpyHostToDevice, stream);
         if (err == hipSuccess)
             err = hipMemcpyAsync(d_grouped_down_descs_, down_descs,
-                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeQuantisedMatrixDesc),
                                  hipMemcpyHostToDevice, stream);
         if (err != hipSuccess)
         {
@@ -9723,7 +9945,7 @@ namespace llaminar2
             return false;
         }
 
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode(
+        const bool ok = rocmMoE_grouped_swiglu_down_native_quantised_decode(
             d_grouped_gate_ptrs_,
             d_grouped_up_ptrs_,
             d_grouped_down_descs_,
@@ -9761,6 +9983,7 @@ namespace llaminar2
         bool filter_to_local_runtime_experts,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (!runtime_layer || !routing_indices || !routing_weights)
@@ -9812,6 +10035,7 @@ namespace llaminar2
         int top_k,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(
             ROCmKernelType::MOE_ROUTE,
             static_cast<hipStream_t>(getStream()));
@@ -9856,6 +10080,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(
             ROCmKernelType::MOE_ROUTE,
             static_cast<hipStream_t>(getStream()));
@@ -9912,9 +10137,9 @@ namespace llaminar2
             group_slots_cap_ = max_slots;
         }
 
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -9975,6 +10200,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
@@ -10030,9 +10256,9 @@ namespace llaminar2
             group_slots_cap_ = max_slots;
         }
 
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -10449,6 +10675,7 @@ namespace llaminar2
         ITensor *routing_indices, ITensor *routing_weights,
         int seq_len, int num_experts, int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginAllRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
@@ -10555,7 +10782,7 @@ namespace llaminar2
 
         const bool use_small_grouping =
             total_slots <= 64 &&
-            num_experts <= 256 &&
+            num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
             top_k <= 16;
         if (use_small_grouping)
         {
@@ -10605,6 +10832,7 @@ namespace llaminar2
                         {"top_k", std::to_string(top_k)}});
             }
 
+            std::move(grouping_publication).publish();
             return true;
         }
 
@@ -10661,6 +10889,7 @@ namespace llaminar2
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -10671,6 +10900,7 @@ namespace llaminar2
         int num_experts,
         int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginSelectedRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
@@ -10838,6 +11068,7 @@ namespace llaminar2
              {"num_experts", std::to_string(num_experts)},
              {"mask_active_experts", std::to_string(group_expert_mask_active_experts_)},
              {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -10968,6 +11199,7 @@ namespace llaminar2
 
     bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
     {
+        grouped_prefill_grouping_.invalidate();
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -11331,7 +11563,12 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
-if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
+        const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model});
+        rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
+        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model}, owner_admission);
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0 ||
             seq_len > std::numeric_limits<int>::max() / top_k ||
             execution.modelColumns() != d_model)
@@ -11357,6 +11594,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
 
@@ -11577,7 +11815,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     down_table.policy_codebook_mask,
                     device_ordinal_,
                     producer_stream,
-                    execution);
+                    execution,
+                    grouped_prefill_grouping_.scope(), owner_admission,
+                    owner_admission ? &owner_completed : nullptr);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11590,6 +11830,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjection] pipeline failed for layer");
             return false;
         }
+
+        if (owner_admission)
+            recordOwnerGateUpCaptureSubmissions(owner_completed, gateup_table.owner_m1_intent);
 
         if (reuse_router_q8_hidden)
         {
@@ -11615,7 +11858,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     d_model,
                     intermediate,
                     num_experts,
-                    top_k);
+                    top_k,
+                    execution.measuredOperation(
+                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                      : MoEPrefillOutputLayout::TokenRows,
+                        grouped_prefill_grouping_.scope()));
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m
@@ -11678,6 +11925,12 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model});
+        rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
+        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model}, owner_admission);
+        grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
         // Mutable placement never owns immutable column slices. Binding a
@@ -11687,7 +11940,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             LOG_ERROR("Sliced MoE down execution requires the immutable fixed-down descriptor table");
             return false;
         }
-if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0 ||
             seq_len > std::numeric_limits<int>::max() / top_k ||
             execution.modelColumns() != d_model)
@@ -11730,6 +11983,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -11782,9 +12036,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
          * resolves the same persistent addresses without hidden publication
          * kernels of its own.
          */
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -11957,7 +12211,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     down_table.policy_codebook_mask,
                     device_ordinal_,
                     producer_stream,
-                    execution);
+                    execution,
+                    MoEPrefillRouteScope::SelectedRoutes, owner_admission,
+                    owner_admission ? &owner_completed : nullptr);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11969,6 +12225,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] grouped ROCm pipeline failed");
             return false;
         }
+
+        if (owner_admission)
+            recordOwnerGateUpCaptureSubmissions(owner_completed, gateup_table.owner_m1_intent);
 
         if (reuse_router_q8_hidden)
         {
@@ -11994,7 +12253,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     d_model,
                     intermediate,
                     num_experts,
-                    top_k);
+                    top_k,
+                    execution.measuredOperation(
+                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                      : MoEPrefillOutputLayout::TokenRows,
+                        MoEPrefillRouteScope::SelectedRoutes));
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m

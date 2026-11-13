@@ -9,18 +9,23 @@
  * exchange registers within the subgroup. No shared scratch or block barrier
  * is necessary. CUDA uses eight partitions per lane; supported HIP wave64
  * targets use four so all lanes issue contiguous weight transactions.
+ * The device compiler must prove wave64 on each target, including native gfx1100;
+ * chip-family names cannot establish the physical shuffle width.
  */
 #pragma once
 
 #include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/common/ROCmCompiledWaveContract.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 
 namespace llaminar2::device_moe_floating_warp
 {
 #if defined(__HIPCC__)
-    constexpr int width = 64;
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX9__)
-#error "Floating expert launch mapping requires the supported HIP wave64 ISA"
+    constexpr int width = static_cast<int>(rocmOrderedWaveWidth);
+#if defined(__HIP_DEVICE_COMPILE__)
+    // This intrinsic exists only when the compiler actually selects wave64.
+    static_assert(__builtin_amdgcn_is_invocable(__builtin_amdgcn_inverse_ballot_w64),
+                  "Floating expert launch mapping requires explicit HIP wave64 compilation");
 #endif
 #else
     constexpr int width = 32;

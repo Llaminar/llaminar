@@ -13,7 +13,7 @@
 namespace llaminar2
 {
     /**
-     * @brief Convert common GPU packed bytes into final CPU NativeVNNI units.
+     * @brief Convert common GPU packed bytes into final CPU NativeQuantised units.
      *
      * The destination is device staging memory whose bytes are already in the
      * final CPU execution representation. The call allocates nothing, never
@@ -37,7 +37,7 @@ namespace llaminar2
         void *stream) noexcept;
 
     /**
-     * @brief Convert streamed CPU NativeVNNI units into common GPU packed data.
+     * @brief Convert streamed CPU NativeQuantised units into common GPU packed data.
      *
      * The source is device staging memory filled from an incoming CPU stream;
      * the destination is the preallocated final CUDA projection. The call is

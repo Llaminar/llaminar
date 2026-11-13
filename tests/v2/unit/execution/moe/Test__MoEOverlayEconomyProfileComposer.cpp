@@ -10,7 +10,7 @@
 
 #include "execution/moe/MoEOverlayEconomyProfileComposer.h"
 #include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <gtest/gtest.h>
 
@@ -117,10 +117,10 @@ namespace llaminar2::test
                 .projection = projection,
                 .N = N,
                 .K = K,
-                .format = ExpertWeightFormat::nativeVnni({
-                    .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+                .format = ExpertWeightFormat::nativeQuantised({
+                    .codebook_id = native_quantised_formats::Q4_0.codebook_id,
                     .is_superblock =
-                        native_vnni_formats::Q4_0.is_superblock,
+                        native_quantised_formats::Q4_0.is_superblock,
                     .present = true,
                 }),
             };
@@ -239,20 +239,21 @@ namespace llaminar2::test
         }
 
         /** @brief Locate one retained participant/layer service row. */
-        const MoERoutedParticipantLayerPhaseServiceCost &participantServiceRow(
+        MoERoutedParticipantLayerPhaseServiceCost participantServiceRow(
             const MoERoutedTierServiceProfile &profile,
             int participant,
             int layer)
         {
+            const auto rows = profile.participantCosts();
             const auto found = std::find_if(
-                profile.participant_costs.begin(),
-                profile.participant_costs.end(),
+                rows.begin(),
+                rows.end(),
                 [&](const auto &row)
                 {
                     return row.participant_id == participant &&
                            row.layer == layer;
                 });
-            if (found == profile.participant_costs.end())
+            if (found == rows.end())
             {
                 throw std::logic_error(
                     "Composed profile omitted a participant service row");
@@ -276,6 +277,76 @@ namespace llaminar2::test
             };
         }
     } // namespace
+
+    TEST(MoEOverlayEconomyProfileComposer, PreparedSampleSkipsEquivalentLayerWithoutOriginalTargetResident)
+    {
+        auto placement = arbitraryPriorityPlan();
+        placement.routed_tiers[1].max_experts_per_layer = 6;
+        placement.placements[0].routed_expert_tier.assign(6, 1);
+        auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
+        snapshot->epoch = 1;
+        snapshot->placement_plan = std::make_shared<const MoERoutedExpertPlacementPlan>(placement);
+        snapshot->owner_map = MoEExpertOwnerMap::build(placement);
+        std::vector<std::vector<int>> owners(2, std::vector<int>(6));
+        for (const auto &owner : snapshot->owner_map.owners())
+            owners.at(owner.layer_idx).at(owner.expert_id) = owner.owner_participant;
+        snapshot->layered_ownership = MoELayeredExpertOwnership(3, std::move(owners));
+        ASSERT_TRUE(snapshot->valid());
+        const auto catalog = std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+            std::vector<MoEOverlayLayerWeightManifest>{serviceLayer(0, 32), serviceLayer(1, 32)});
+        ASSERT_EQ(catalog->groups().size(), 1u);
+        const auto topology = ExpertHistogramProductionTopology::forRetainedExecution(
+            2, 2, ExpertHistogramServingRegime::Serial);
+        const auto prepared = MoEOverlayPreparedTargetServicePlan::checked(snapshot, catalog, topology);
+        const auto target = MoEOverlayRouteTarget::whole(0);
+        for (int layer : {0, 1})
+        {
+            const auto &entry = prepared->entry({target, layer});
+            for (std::size_t phase = 0; phase < kExpertHistogramProductionSourceCount; ++phase)
+                if (topology.requiresServiceEvidence(layer, phase))
+                {
+                    EXPECT_EQ(entry.sample_layers[phase], 1);
+                    const auto expert = prepared->sampleExpert(entry, phase);
+                    EXPECT_EQ(snapshot->owner_map.placementFor(1, expert)->owner_participant, 0);
+                }
+        }
+        // Removing every actual resident fails; equivalent metadata alone is
+        // never a sample source or a reason to reload an unowned expert.
+        placement.placements[1].routed_expert_tier.assign(6, 1);
+        auto empty = std::make_shared<MoEOverlayResidencySnapshot>(*snapshot);
+        empty->placement_plan = std::make_shared<const MoERoutedExpertPlacementPlan>(placement);
+        empty->owner_map = MoEExpertOwnerMap::build(placement);
+        std::vector<std::vector<int>> empty_owners(2, std::vector<int>(6));
+        for (const auto &owner : empty->owner_map.owners())
+            empty_owners.at(owner.layer_idx).at(owner.expert_id) = owner.owner_participant;
+        empty->layered_ownership = MoELayeredExpertOwnership(3, std::move(empty_owners));
+        ASSERT_TRUE(empty->valid());
+        EXPECT_THROW((void)MoEOverlayPreparedTargetServicePlan::checked(empty, catalog, topology),
+                     std::invalid_argument);
+    }
+
+    TEST(MoEOverlayEconomyProfileComposer, ColdWholeAdaptersRetainOneCanonicalVectorAndRejectCohorts)
+    {
+        MoERoutedTierServiceProfile service;
+        const std::vector<MoERoutedParticipantLayerPhaseServiceCost> whole_service{
+            {0, 0, {3, 5, 7}}, {1, 0, {11, 13, 17}}};
+        service.setParticipantCosts(whole_service);
+        ASSERT_EQ(service.target_costs.size(), whole_service.size());
+        EXPECT_EQ(service.participantCosts()[1].nanoseconds_per_activation,
+                  whole_service[1].nanoseconds_per_activation);
+        service.target_costs[1].target = MoEOverlayRouteTarget::cpuCohort(1);
+        EXPECT_THROW((void)service.participantCosts(), std::invalid_argument);
+        EXPECT_EQ(service.target_costs.size(), 2u);
+        MoEOverlayMigrationCostProfile movement;
+        const std::vector<MoEOverlayParticipantLayerMigrationCost> whole_movement{
+            {0, 1, 0, 19, 23}};
+        movement.setWholeCosts(whole_movement);
+        ASSERT_EQ(movement.costs.size(), 1u);
+        EXPECT_EQ(movement.wholeCosts()[0].transfer_and_repack_ns, 19u);
+        movement.costs[0].coordinate.destination_target = MoEOverlayRouteTarget::cpuCohort(1);
+        EXPECT_THROW((void)movement.wholeCosts(), std::invalid_argument);
+        EXPECT_EQ(movement.costs.size(), 1u);
+    }
 
     TEST(
         MoEOverlayEconomyProfileComposer,
@@ -327,33 +398,33 @@ namespace llaminar2::test
                 second.service->costs[index].nanoseconds_per_activation);
         }
         ASSERT_EQ(
-            first.service->participant_costs.size(),
-            second.service->participant_costs.size());
+            first.service->participantCosts().size(),
+            second.service->participantCosts().size());
         for (std::size_t index = 0;
-             index < first.service->participant_costs.size();
+             index < first.service->participantCosts().size();
              ++index)
         {
             EXPECT_EQ(
-                first.service->participant_costs[index].participant_id,
-                second.service->participant_costs[index].participant_id);
+                first.service->participantCosts()[index].participant_id,
+                second.service->participantCosts()[index].participant_id);
             EXPECT_EQ(
-                first.service->participant_costs[index].layer,
-                second.service->participant_costs[index].layer);
+                first.service->participantCosts()[index].layer,
+                second.service->participantCosts()[index].layer);
             EXPECT_EQ(
-                first.service->participant_costs[index]
+                first.service->participantCosts()[index]
                     .nanoseconds_per_activation,
-                second.service->participant_costs[index]
+                second.service->participantCosts()[index]
                     .nanoseconds_per_activation);
         }
         ASSERT_EQ(
-            first.migration->costs.size(),
-            second.migration->costs.size());
+            first.migration->wholeCosts().size(),
+            second.migration->wholeCosts().size());
         for (std::size_t index = 0;
-             index < first.migration->costs.size();
+             index < first.migration->wholeCosts().size();
              ++index)
         {
-            const auto &lhs = first.migration->costs[index];
-            const auto &rhs = second.migration->costs[index];
+            const auto lhs = first.migration->wholeCosts()[index];
+            const auto rhs = second.migration->wholeCosts()[index];
             EXPECT_EQ(lhs.source_participant, rhs.source_participant);
             EXPECT_EQ(
                 lhs.destination_participant,
@@ -927,7 +998,7 @@ namespace llaminar2::test
             }
             for (std::size_t row = 0; row < profiles.migration->costs.size(); ++row)
             {
-                EXPECT_EQ(profiles.migration->costs[row].layer, baseline.migration->costs[row].layer + first);
+                EXPECT_EQ(profiles.migration->costs[row].coordinate.layer, baseline.migration->costs[row].coordinate.layer + first);
                 EXPECT_EQ(profiles.migration->costs[row].transfer_and_repack_ns, baseline.migration->costs[row].transfer_and_repack_ns);
             }
             EXPECT_NE(profiles.service->identity, baseline.service->identity);
@@ -969,3 +1040,5 @@ namespace llaminar2::test
         }
     }
 } // namespace llaminar2::test
+
+#include "TargetMigrationNormalizationContract.inc"

@@ -15,7 +15,7 @@ Recent parity debugging established that this contract is the source of the curr
 
 That result changes the framing of the work:
 
-- This is not a narrow arithmetic bug in `ROCmQuantisedGemmKernel_native_VNNI.hip`.
+- This is not a narrow arithmetic bug in `ROCmQuantisedGemmKernel_native_quantised.hip`.
 - This is a **contract problem** in how activations are quantized and represented.
 - The correct fix is a coordinated redesign of the ROCm activation-quantization pipeline, not more kernel-local patching.
 
@@ -33,7 +33,7 @@ From `tests/v2/integration/kernels/rocm/Test__ROCmQuantisedGemmKernel.cpp`:
 
 Interpretation:
 
-- ROCm native-VNNI GEMM is correctly implementing the current quantized contract.
+- ROCm native-quantised GEMM is correctly implementing the current quantized contract.
 - The failing contract is **row-wise activation quantization granularity**.
 - At least for the investigated layer-0 Qwen2 `down_proj` prefill case, **blockwise activation quantization removes the observed parity loss**.
 
@@ -41,7 +41,7 @@ Interpretation:
 
 - The layer-0 `FFN_DOWN` defect is not explained by incorrect native Q4_0 decode.
 - The ROCm kernel path is not silently using the fused QKV logic; `FFN_DOWN` goes through normal `GEMMStage -> ROCmQuantisedGemmKernel::multiply_tensor(...)`.
-- `LLAMINAR_ROCM_FORCE_CK=1` is currently not a useful discriminator for this native-VNNI route because CK fallback expects VNNI source weights and later hits an unimplemented branch.
+- `LLAMINAR_ROCM_FORCE_CK=1` is currently not a useful discriminator for this native-quantised route because CK fallback expects VNNI source weights and later hits an unimplemented branch.
 
 ### Why This Needs a Sprint
 
@@ -99,8 +99,8 @@ Kernel-side quantization and scaling live in:
 
 Native decode kernels that currently consume row-scale activation metadata:
 
-- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
-- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_quantised.hip`
 
 INT8/VNNI fallback or alternate routes that also depend on row-scale activation metadata:
 
@@ -136,11 +136,11 @@ Likely new abstraction:
   - scale dtype
   - packed activation layout
 
-### 2. GEMV Native-VNNI Decode Path
+### 2. GEMV NativeQuantised Decode Path
 
 Primary file:
 
-- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip`
 
 Current assumption to remove:
 
@@ -149,19 +149,19 @@ Current assumption to remove:
 Required change:
 
 - consume per-block activation scales in the same block loop that already handles per-block weight scales
-- define the activation block contract for all supported `NativeVNNIFormat` variants
+- define the activation block contract for all supported `NativeQuantisedFormat` variants
 - decide whether activation blocks are always 32 elements or format-dependent
 
 Why this matters:
 
 - decode is already block-aware on the weight side; activation quantization must become equally block-aware or parity will remain path-dependent
 
-### 3. GEMM Native-VNNI Prefill Path
+### 3. GEMM NativeQuantised Prefill Path
 
 Primary files:
 
 - `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
-- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_quantised.hip`
 
 Current assumption to remove:
 
@@ -194,7 +194,7 @@ Decision needed:
 Recommendation:
 
 - do not block the sprint on making CK elegant
-- but do make fallback behavior explicit and testable, because today the CK debug path is incomplete for native-VNNI-prepared weights
+- but do make fallback behavior explicit and testable, because today the CK debug path is incomplete for native-quantised-prepared weights
 
 ### 5. Fused Multi-Projection Paths
 
@@ -297,7 +297,7 @@ Initial recommendation:
 
 - use block size 32 first because:
   - it already fixed the investigated parity case
-  - it aligns with existing native-VNNI weight block granularity for common formats
+  - it aligns with existing native-quantised weight block granularity for common formats
   - it minimizes redesign ambiguity for decode/application logic
 
 ### Interface Goal
@@ -373,7 +373,7 @@ Deliverables:
 
 Primary files:
 
-- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip`
 - `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
 
 ### Workstream 4: Native GEMM Upgrade
@@ -386,7 +386,7 @@ Deliverables:
 
 Primary files:
 
-- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_quantised.hip`
 - `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
 
 ### Workstream 5: Compatibility and Fallbacks
@@ -395,7 +395,7 @@ Deliverables:
 
 - explicit migration stance for CK and INT8-VNNI fallback routes
 - either blockwise support or clearly isolated compatibility shims
-- fix or document the unusable `LLAMINAR_ROCM_FORCE_CK` debug path for native-VNNI weights
+- fix or document the unusable `LLAMINAR_ROCM_FORCE_CK` debug path for native-quantised weights
 
 Primary files:
 
@@ -445,7 +445,7 @@ Why first:
 
 Exit criteria:
 
-- M=1 native-VNNI decode passes parity against blockwise reference
+- M=1 native-quantised decode passes parity against blockwise reference
 - fused QKV / Gate-Up paths still reuse a single quantization pass
 
 ### Milestone 3: Prefill GEMM Conversion
@@ -509,7 +509,7 @@ The fallback path is already not a reliable debug discriminator.
 Mitigation:
 
 - explicitly decide whether CK remains a first-class parity path in this sprint
-- if not, mark it as non-authoritative for native-VNNI debugging until compatibility work lands
+- if not, mark it as non-authoritative for native-quantised debugging until compatibility work lands
 
 ---
 
@@ -557,7 +557,7 @@ Guardrail:
 ## Implementation Sequence
 
 This section is the execution plan for the coding phase. The order matters because
-the native-VNNI decode path is already structurally close to blockwise support,
+the native-quantised decode path is already structurally close to blockwise support,
 while the INT8-VNNI decode path still assumes a row-wise activation scale contract.
 
 ### Phase 1: Add Row-Wise Pathology Detection
@@ -599,29 +599,29 @@ Deliverables:
 - launcher API exposes a detection-capable variant
 - debug logging can report how often fallback is triggered
 
-### Phase 2: Native-VNNI Decode Fallback
+### Phase 2: NativeQuantised Decode Fallback
 
 Goal:
 
-- make `M=1` native-VNNI decode correct for pathological rows by falling back to blockwise activation quantization
+- make `M=1` native-quantised decode correct for pathological rows by falling back to blockwise activation quantization
 
 Implementation:
 
 - update `ROCmQuantisedGemmKernel::multiply_tensor(...)` in `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
 - row-wise decode flow becomes:
   - launch row-wise quantization with detection
-  - if no pathology, proceed with existing row-wise native-VNNI GEMV
+  - if no pathology, proceed with existing row-wise native-quantised GEMV
   - if pathology detected, launch existing blockwise quantization kernel
-  - rerun native-VNNI GEMV with `d_scales_A_blockwise`
+  - rerun native-quantised GEMV with `d_scales_A_blockwise`
 
 Notes:
 
-- native-VNNI GEMV already accepts `d_scale_A_blockwise` in `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
-- this phase should not require a new native-VNNI GEMV kernel family
+- native-quantised GEMV already accepts `d_scale_A_blockwise` in `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip`
+- this phase should not require a new native-quantised GEMV kernel family
 
 Deliverables:
 
-- pathological native-VNNI decode rows transparently take the blockwise path
+- pathological native-quantised decode rows transparently take the blockwise path
 - non-pathological rows preserve the current row-wise fast path
 
 ### Phase 3: Shared Fused Decode Quantization
@@ -635,14 +635,14 @@ Implementation:
 - update `ROCmQuantisedGemmKernel::multiply_fused_tensor(...)` in `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
 - shared decode quantization flow becomes:
   - quantize once row-wise with detection
-  - if all participating projections are native-VNNI and no pathology is detected, reuse row-wise metadata
+  - if all participating projections are native-quantised and no pathology is detected, reuse row-wise metadata
   - if pathology is detected, quantize once blockwise and pass `d_scales_A_blockwise` to all compatible projections
 
 Deliverables:
 
 - QKV decode retains one quantization pass
 - Gate/Up decode retains one quantization pass
-- native-VNNI fused decode paths can switch contracts without requantizing per projection
+- native-quantised fused decode paths can switch contracts without requantizing per projection
 
 ### Phase 4: INT8-VNNI Decode Blockwise Kernel Family
 
@@ -711,11 +711,11 @@ Expected additions:
 Changes:
 
 - wire the detection-aware row-wise quantizer into `multiply_tensor(...)`
-- wire native-VNNI decode fallback to blockwise quantization
+- wire native-quantised decode fallback to blockwise quantization
 - update `multiply_fused_tensor(...)` to preserve shared-quantization reuse with fallback
 - add any workspace binding for pathology status buffers if they are made workspace-managed
 
-### `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+### `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip`
 
 Changes:
 
@@ -779,16 +779,16 @@ Required additions:
 
 - host reference helper for blockwise activation quantization
 - synthetic pathological-row generator
-- decode-native-VNNI row-wise vs blockwise correctness test
+- decode-native-quantised row-wise vs blockwise correctness test
 - fused decode shared-quantization fallback test
 - INT8-VNNI blockwise decode correctness test once the kernel family exists
 
 Suggested new cases:
 
 1. `PathologicalRow_DetectsFallback_M1`
-2. `NativeVNNI_DecodeFallback_MatchesBlockwiseReference`
-3. `NativeVNNI_FusedQKV_FallbackQuantizesOnce`
-4. `NativeVNNI_FusedGateUp_FallbackQuantizesOnce`
+2. `NativeQuantised_DecodeFallback_MatchesBlockwiseReference`
+3. `NativeQuantised_FusedQKV_FallbackQuantizesOnce`
+4. `NativeQuantised_FusedGateUp_FallbackQuantizesOnce`
 5. `Int8VNNI_BlockwiseDecode_MatchesReference`
 6. `Int8VNNI_BlockwiseDecode_SelfReduceParity`
 7. `Int8VNNI_BlockwiseDecode_ScatterReduceParity`
@@ -803,7 +803,7 @@ Primary existing perf files:
 Required additions:
 
 - decode benchmark rows that explicitly trigger the pathology detector
-- side-by-side row-wise vs blockwise decode timing for native-VNNI
+- side-by-side row-wise vs blockwise decode timing for native-quantised
 - side-by-side row-wise vs blockwise decode timing for INT8-VNNI after the new kernels land
 - fallback-hit-rate reporting for synthetic and realistic activation distributions
 
@@ -845,16 +845,16 @@ Done when:
 
 Done when:
 
-- native-VNNI decode automatically reroutes pathological rows through the existing blockwise quantizer
+- native-quantised decode automatically reroutes pathological rows through the existing blockwise quantizer
 - fused decode paths preserve quantize-once reuse even when blockwise fallback is selected
 
-### Requirement 3: Provide blockwise GEMV kernels for native-VNNI and INT8-VNNI
+### Requirement 3: Provide blockwise GEMV kernels for native-quantised and INT8-VNNI
 
 Done when:
 
-- native-VNNI decode blockwise path is covered by parity and perf tests
+- native-quantised decode blockwise path is covered by parity and perf tests
 - INT8-VNNI decode has a blockwise-capable direct and split-K kernel family
-- dynamic fallback or always-blockwise policy can be enabled for both native-VNNI and INT8-VNNI decode
+- dynamic fallback or always-blockwise policy can be enabled for both native-quantised and INT8-VNNI decode
 
 ---
 
@@ -863,7 +863,7 @@ Done when:
 ### In Scope
 
 - ROCm quantized GEMV and GEMM activation quantization contract
-- native-VNNI decode and prefill paths
+- native-quantised decode and prefill paths
 - fused ROCm multi-projection paths
 - workspace and validation tooling required to support the new contract
 
@@ -871,7 +871,7 @@ Done when:
 
 - broad CPU activation quantization redesign
 - CUDA parity work unless interface changes force a synchronized update
-- unrelated native-VNNI format expansion work
+- unrelated native-quantised format expansion work
 
 Note:
 

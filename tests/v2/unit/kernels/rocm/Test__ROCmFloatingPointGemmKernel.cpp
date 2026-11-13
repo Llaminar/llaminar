@@ -5,7 +5,8 @@
  * Tests the ROCmFloatingPointGemmKernel which wraps hipBLAS for FP32/FP16/BF16
  * GEMM operations on AMD GPUs (MI50, MI100, MI250, etc.)
  * Retiring expert adapters must leave context-owned library resources alive
- * and must never drain unrelated inference streams.
+ * and must never drain unrelated inference streams. Direct-kernel fixtures own
+ * exact-stream input preparation and output allocation just as graph stages do.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -909,6 +910,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlp
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
+/** @test Explicitly prepared grouped FP32 rows retain serial bytes without incidental launch delays. */
 TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234MatchSerialDecodeRows)
 {
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
@@ -916,6 +918,13 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
 
     const size_t N = 48, K = 256;
     const std::array<int, 3> verifier_rows = {2, 3, 4};
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    const auto device = DeviceId::rocm(rocm_device_id_);
+
+    // Direct kernel tests own the preparation boundary that graph stages normally
+    // provide. Upload on the exact consumer stream and allocate outputs without
+    // an unrelated upload: pointer-publication latency is not an ordering edge.
 
     auto weights_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
     auto weights_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
@@ -929,8 +938,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
         weights_beta->mutable_data()[i] = weight_dist(rng);
     }
 
-    ASSERT_TRUE(weights_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-    ASSERT_TRUE(weights_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    TransferEngine::prepareDeviceInput(weights_alpha.get(), device, stream);
+    TransferEngine::prepareDeviceInput(weights_beta.get(), device, stream);
 
     ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_);
     ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_);
@@ -945,8 +954,6 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
     alpha_kernel.bindWorkspace(&workspace);
     beta_kernel.bindWorkspace(&workspace);
 
-    hipStream_t stream = nullptr;
-    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     alpha_kernel.setGPUStream(stream);
     beta_kernel.setGPUStream(stream);
 
@@ -962,9 +969,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
             std::vector<size_t>{static_cast<size_t>(M), N});
         auto output_beta = std::make_unique<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(M), N});
-        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-        ASSERT_TRUE(output_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-        ASSERT_TRUE(output_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+        TransferEngine::prepareDeviceInput(input.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(output_alpha.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(output_beta.get(), device, stream);
 
         std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
             {&alpha_kernel, output_alpha.get(), static_cast<int>(N), nullptr, "alpha_grouped"},
@@ -989,9 +996,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
                 std::vector<size_t>{size_t{1}, N});
             auto beta_serial = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{size_t{1}, N});
-            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-            ASSERT_TRUE(alpha_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-            ASSERT_TRUE(beta_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            TransferEngine::prepareDeviceInput(row_input.get(), device, stream);
+            TransferEngine::prepareDeviceOutput(alpha_serial.get(), device, stream);
+            TransferEngine::prepareDeviceOutput(beta_serial.get(), device, stream);
 
             std::vector<ITensorGemm::TensorProjectionDesc> serial_projections = {
                 {&alpha_kernel, alpha_serial.get(), static_cast<int>(N), nullptr, "alpha_serial"},

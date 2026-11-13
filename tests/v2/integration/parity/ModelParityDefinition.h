@@ -10,17 +10,27 @@
  * production case must prove a fresh fill, a full restore, and a partial
  * restore through one retained runner. Generated test names are output only;
  * runtime policy is projected directly from the typed case and is never
- * recovered by parsing a GoogleTest name.
+ * recovered by parsing a GoogleTest name. Explicit numerical-only candidates
+ * retain their diagnostic campaigns without becoming runtime/control authorities.
+ * Dynamic-depth expectations use the declared model ceiling; the standard
+ * full-matrix depth and retained graph storage do not override that request.
+ * Discovery population and selected execution membership remain separate typed
+ * facts. An observed native pipeline has no physical addresses until original
+ * inventory binding; independent stage expert policies lower into their named
+ * domains without installing a competing model-wide placement authority.
  */
 
 #pragma once
 
 #include "ParityTestBase.h"
 #include "ModelParityGenerationWorkload.h"
+#include "ModelParityPairedWorkload.h"
 #include "ModelParityCrossHostE2E.h"
+#include "../../utils/ObservedISAPipelinePlacement.h"
 
 #include "backends/GlobalDeviceAddress.h"
 #include "config/ActivationPrecisionPolicy.h"
+#include "config/OrchestrationPlanningPolicy.h"
 #include "execution/config/RoutedExpertPolicy.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -43,10 +53,76 @@
 
 namespace llaminar2::test::parity
 {
+    /**
+     * @brief Stable requested-storage matrix identity, separate from resolved placement.
+     * @param preference Explicit typed requested axis, never inferred from a test name.
+     * @return Existing RAM/mmap suffixes or new distinct Automatic/VRAM suffixes.
+     * @throws std::invalid_argument For an unknown requested preference.
+     */
+    inline std::string ngramStorageTestName(ImmutableRowStoragePreference preference)
+    {
+        switch (preference)
+        {
+        case ImmutableRowStoragePreference::Automatic: return "NgramAuto_";
+        case ImmutableRowStoragePreference::VRAM: return "NgramVRAM_";
+        case ImmutableRowStoragePreference::RAM: return "NgramRAM_";
+        case ImmutableRowStoragePreference::MemoryMapped: return "NgramMmap_";
+        case ImmutableRowStoragePreference::HostAdaptiveRAMSSD: return "NgramHostAdaptiveRAMSSD_";
+        case ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD: return "NgramAdaptiveVRAMRAMSSD_";
+        }
+        throw std::invalid_argument("invalid model parity ngram storage preference");
+    }
+
+    /** @return Complete adaptive request identity, retaining every existing whole-tier name unchanged. */
+    inline std::string ngramStorageTestName(const ImmutableRowTablePolicy &policy)
+    {
+        policy.validate();const auto prefix=ngramStorageTestName(policy.storage);
+        if(policy.isFixedHeadSharded())return prefix+"FixedHeadSharded_";
+        if(policy.isGPUAdaptive())
+        {
+            const auto &g=policy.gpu_adaptive;const auto &h=g.host;
+            std::string placement;
+            if(g.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+            {
+                placement="DeclaredOwners_";
+                for(const auto &owner:g.placement.owners)
+                    placement+="R"+std::to_string(owner.participant.world_rank)+(owner.participant.backend==DeviceType::CUDA?std::string{"CUDA"}:std::string{"ROCm"})+std::to_string(owner.participant.ordinal)+
+                        "C"+std::to_string(owner.maximum_cache_rows)+"B"+std::to_string(owner.cache_physical_byte_limit)+"_";
+                placement+="CoordinatorR"+std::to_string(g.placement.coordinator->world_rank)+(g.placement.coordinator->backend==DeviceType::CUDA?std::string{"CUDA"}:std::string{"ROCm"})+std::to_string(g.placement.coordinator->ordinal)+"_";
+            }
+            // An engaged C0 cache still selects the combined transaction.
+            // Preserve that distinction and every explicit consumer ceiling in
+            // matrix identity; no cache setting may overwrite another result.
+            std::string local;
+            if(g.local_hot_cache) {
+                const auto& request=*g.local_hot_cache;
+                local="LocalHot_C"+std::to_string(request.maximum_cache_rows)+"_B"+std::to_string(request.cache_physical_byte_limit)+
+                    "_A"+std::to_string(request.policy.aging_accesses)+"_P"+std::to_string(request.policy.protected_numerator)+
+                    "of"+std::to_string(request.policy.protected_denominator)+"_";
+                for(const auto& consumer:request.consumer_overrides)
+                    local+="ConsumerR"+std::to_string(consumer.participant.world_rank)+
+                        (consumer.participant.backend==DeviceType::CUDA?"CUDA":"ROCm")+std::to_string(consumer.participant.ordinal)+
+                        "C"+std::to_string(consumer.maximum_cache_rows)+"B"+std::to_string(consumer.cache_physical_byte_limit)+"_";
+            }
+            return prefix+(g.source_backing==AdaptiveImmutableRowBacking::RAM?"SourceRAM_":"")+placement+local+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
+                "_A"+std::to_string(g.gpu_policy.aging_accesses)+"_P"+std::to_string(g.gpu_policy.protected_numerator)+
+                "of"+std::to_string(g.gpu_policy.protected_denominator)+"_H"+std::to_string(h.maximum_cache_rows)+
+                "_B"+std::to_string(h.cache_physical_byte_limit)+"_A"+std::to_string(h.policy.aging_accesses)+
+                "_P"+std::to_string(h.policy.protected_numerator)+"of"+std::to_string(h.policy.protected_denominator)+
+                "_W"+std::to_string(policy.window_bytes)+"_N"+std::to_string(policy.window_count)+"_";
+        }
+        if(!policy.isHostAdaptive())return prefix;
+        const auto &a=policy.host_adaptive;
+        return prefix+"C"+std::to_string(a.maximum_cache_rows)+"_B"+std::to_string(a.cache_physical_byte_limit)+
+            "_A"+std::to_string(a.policy.aging_accesses)+"_P"+std::to_string(a.policy.protected_numerator)+
+            "of"+std::to_string(a.policy.protected_denominator)+"_W"+std::to_string(policy.window_bytes)+
+            "_N"+std::to_string(policy.window_count)+"_";
+    }
+
     /** Deepest fixed/adaptive MTP draft policy in the canonical matrix. */
     inline constexpr int kModelParityRequiredMaximumMTPDepth = 15;
 
-    /** MTP execution policy selected by one generated parity case. */
+    /** Typed MTP policy; explicit runtime qualification axes do not enlarge the canonical matrix. */
     enum class ModelParityMTP : std::uint8_t
     {
         Off,
@@ -55,6 +131,9 @@ namespace llaminar2::test::parity
         Depth3,
         Depth15,
         DynamicDepth,
+        // Runtime-only qualification axes; the canonical matrix below stays unchanged.
+        Depth5,
+        Depth6,
     };
 
     /**
@@ -350,6 +429,8 @@ namespace llaminar2::test::parity
     {
         std::string test_id;             ///< Stable GoogleTest-safe model identifier.
         std::string model_path;          ///< Default real GGUF path or first split.
+        /** Optional second native source; absence retains main-only/inline-MTP identity. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
         std::string reference_directory; ///< Authenticated reference pack.
         std::string prompt;              ///< Exact reference prompt, if overridden.
         std::vector<int> token_ids;       ///< Exact reference tokens, if pre-resolved.
@@ -419,6 +500,13 @@ namespace llaminar2::test::parity
             const ModelParityParticipant &) = default;
     };
 
+    /** @brief Declarative native architecture request; physical addresses require original inventory binding. */
+    struct ModelParityObservedNativePipeline
+    {
+        DeviceType backend = DeviceType::ROCm;
+        std::string native_isa;
+    };
+
     /**
      * @brief General typed topology shared by dense, MoE, and overlay parity.
      *
@@ -436,7 +524,7 @@ namespace llaminar2::test::parity
             ModelParityTopologyKind::SingleDevice;
         std::vector<ModelParityParticipant> participants;
         Collective collective = Collective::None;
-        int mpi_ranks = 1;
+        int mpi_ranks = 1; ///< Original discovery launch population; selected execution has its own existing membership.
         std::vector<int> pipeline_stage_sizes;
         std::vector<float> pipeline_weights;
         Collective tensor_parallel_collective = Collective::None;
@@ -445,10 +533,60 @@ namespace llaminar2::test::parity
         /** Per-stage TP collectives for mixed-vendor pipelines; empty uses the common scalar. */
         std::vector<Collective> pipeline_tensor_parallel_collectives;
 
+        /** Unbound requests contain no invented physical participant addresses. */
+        std::optional<ModelParityObservedNativePipeline> observed_native_pipeline;
+        /** Original discovery membership; participant owners use its compact execution namespace. */
+        std::optional<ExecutionRankSelection> execution_rank_selection;
+        /** One authored routed compute policy per pipeline stage; empty keeps ordinary domains. */
+        std::vector<RoutedExpertComputePolicy> pipeline_routed_compute_policies;
+
+        /** @return Actual admitted execution population without hiding discovery size. */
+        [[nodiscard]] int executionRankCount() const noexcept
+        {
+            return execution_rank_selection ? execution_rank_selection->size() :
+                observed_native_pipeline ? 1 : mpi_ranks;
+        }
+
+        /** @return Whether only a native ISA/cardinality request exists, without physical ownership. */
+        [[nodiscard]] bool needsObservedPipelineBinding() const noexcept
+        {
+            return observed_native_pipeline && participants.empty();
+        }
+
+        /**
+         * @brief Bind the requested stage sizes through the original discovered ISA/UUID/NUMA authority.
+         * @param inventory Complete original discovery namespace, before production rank selection.
+         * @return Physical stage addresses and exact discovery-to-execution selection, preserving all mode axes.
+         * @throws std::invalid_argument For incomplete, already-bound or ambiguous hardware/ownership.
+         */
+        [[nodiscard]] ModelParityTopologyDefinition bindObservedPipeline(const ClusterInventory &inventory) const
+        {
+            if (!needsObservedPipelineBinding() || execution_rank_selection ||
+                kind != ModelParityTopologyKind::RankLocalPipelineParallel ||
+                inventory.world_size != mpi_ranks || pipeline_stage_sizes.empty())
+                throw std::invalid_argument("Observed parity pipeline requires its unbound original discovery request");
+            std::vector<std::size_t> sizes;
+            for (const int size : pipeline_stage_sizes)
+            {
+                if (size <= 0) throw std::invalid_argument("Observed parity pipeline stage size must be positive");
+                sizes.push_back(static_cast<std::size_t>(size));
+            }
+            const auto selected = ::llaminar2::test::ObservedISAPipelinePlacement::require(inventory,
+                observed_native_pipeline->backend, observed_native_pipeline->native_isa, sizes);
+            auto result = *this;
+            result.execution_rank_selection = selected.selection();
+            const auto &owner = inventory.ranks.at(selected.discovery_owner);
+            for (const auto &stage : selected.stages)
+                for (const auto device : stage)
+                    result.participants.push_back({GlobalDeviceAddress::fromLocalDeviceId(device,
+                        owner.hostname, owner.cpu.numa_node), 0});
+            return result;
+        }
+
         /** @return Whether this topology enables ExpertOverlay matrix axes. */
         [[nodiscard]] bool isExpertOverlay() const noexcept
         {
-            return expert_overlay_plan != nullptr;
+            return expert_overlay_plan != nullptr || !pipeline_routed_compute_policies.empty();
         }
     };
 
@@ -492,6 +630,8 @@ namespace llaminar2::test::parity
     struct ModelParityFeatureMatrix
     {
         ModelParityAxisProfile mtp = ModelParityAxisProfile::Disabled;
+        /** Explicit native ngram modes; empty preserves models without row tables. */
+        std::vector<ImmutableRowTablePolicy> ngram_storage;
         /**
          * Matched Dynamic timing cohort for this exact model/topology.
          *
@@ -586,7 +726,9 @@ namespace llaminar2::test::parity
      * The containing definition owns model and topology. All remaining axes
      * are exact, typed matches: tags neither multiply nor prune parity cells.
      * An absent owner/movement pair selects non-overlay cells only. Expansion
-     * rejects a tag that matches no cell or overlaps another tag.
+     * rejects a tag that matches no cell, matches multiple cells or overlaps
+     * another tag. An explicit ngram profile compares the complete production
+     * request; an omitted profile is accepted only when selection is unambiguous.
      */
     struct ModelParityE2ESelection
     {
@@ -596,6 +738,12 @@ namespace llaminar2::test::parity
         std::optional<RoutedExpertOwnerOrder> owner_order;
         std::optional<ModelParityExpertMovement> movement;
         ModelParityPrefillGraphPolicy prefill_graph;
+        /**
+         * Exact production request profile, including windows, adaptive ceilings
+         * and replacement policy. Absence preserves legacy exact-one selection;
+         * it never resolves Automatic or chooses a default among storage axes.
+         */
+        std::optional<ImmutableRowTablePolicy> ngram_table_policy;
         ModelParityE2EProfile profile;
         /**
          * Remote variants use this cell's model/runtime policies and automatic
@@ -604,6 +752,27 @@ namespace llaminar2::test::parity
          */
         std::vector<ModelParityRemoteCPUHosts> remote_cpu_overlays;
     };
+
+    /** @brief Source-owned authority for runtime inventories versus numerical-only diagnostics. */
+    enum class ModelParityInventoryRole : std::uint8_t
+    {
+        Canonical = 0, ///< Existing generation/control, HTTP and benchmark inventory authority.
+        NumericalDiagnostic = 1 ///< Explicit numerical campaign only; never runtime eligibility.
+    };
+
+    /** @brief Validate the closed inventory role before export or matrix expansion.
+     * @param role Producer-declared authority, independent of names or numerical limits.
+     * @return Stable metadata spelling. Canonical remains implicit in schema1 exports.
+     * @throws std::invalid_argument For an unknown role. */
+    [[nodiscard]] inline const char *modelParityInventoryRoleName(ModelParityInventoryRole role)
+    {
+        switch (role)
+        {
+        case ModelParityInventoryRole::Canonical: return "canonical";
+        case ModelParityInventoryRole::NumericalDiagnostic: return "numerical_diagnostic";
+        }
+        throw std::invalid_argument("Unknown model parity inventory role");
+    }
 
     /**
      * @brief Complete suite-owned declaration for one model and one topology.
@@ -628,6 +797,10 @@ namespace llaminar2::test::parity
         std::vector<ModelParityE2ESelection> e2e_certifiable;
         /** One continuous regression workload shared by all policies and controls. */
         ModelParityGenerationWorkload generation_workload;
+        /** Optional source-bound accuracy/timing obligations, never an eligibility grant. */
+        std::optional<ModelParityPairedWorkload> paired_workload;
+        /** Numerical diagnostics retain their tests without claiming runtime/control authority. */
+        ModelParityInventoryRole inventory_role = ModelParityInventoryRole::Canonical;
     };
 
     /** Placement and durable movement axes present only on ExpertOverlay. */
@@ -680,6 +853,8 @@ namespace llaminar2::test::parity
         BackendThresholds thresholds;
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
         KVCachePrecision kv_cache_precision = KVCachePrecision::FP16;
+        /** Exact row-store policy selected by this cell, absent for ordinary models. */
+        std::optional<ImmutableRowTablePolicy> ngram_table_policy;
         ModelParityMTP mtp = ModelParityMTP::Off;
         /** Explicit recursive aggregate floor; absent retains the global 0.99. */
         std::optional<float> mtp_recursive_aggregate_cosine_floor;
@@ -712,6 +887,10 @@ namespace llaminar2::test::parity
         std::vector<ModelParityRemoteCPUHosts> remote_cpu_overlays;
         /** Actual-output obligation, independent of the short deep-parity prompts. */
         ModelParityGenerationWorkload generation_workload;
+        /** Optional source-bound accuracy/timing obligations, never an eligibility grant. */
+        std::optional<ModelParityPairedWorkload> paired_workload;
+        /** Numerical diagnostics retain their tests without claiming runtime/control authority. */
+        ModelParityInventoryRole inventory_role = ModelParityInventoryRole::Canonical;
 
         /** @return Whether this cell executes an MTP generation policy. */
         [[nodiscard]] constexpr bool mtpEnabled() const noexcept
@@ -734,6 +913,21 @@ namespace llaminar2::test::parity
          */
         [[nodiscard]] bool requiresCanonicalTPAllreduceMTPDiagnostics() const
         {
+            if (mtpEnabled() && expert_overlay &&
+                !topology.pipeline_routed_compute_policies.empty())
+            {
+                const auto &sizes = topology.pipeline_stage_sizes;
+                const int tail_count = sizes.empty() ? 1 : sizes.back();
+                if (topology.needsObservedPipelineBinding())
+                    return tail_count > 2 && topology.observed_native_pipeline->backend != DeviceType::CPU;
+                if (tail_count <= 0 || static_cast<std::size_t>(tail_count) > topology.participants.size())
+                    throw std::logic_error("Pipeline expert diagnostics require complete tail participants");
+                const auto tail_size = static_cast<std::size_t>(tail_count);
+                if (tail_size <= 2u) return false;
+                const auto first = topology.participants.end() - static_cast<std::ptrdiff_t>(tail_size);
+                return first->address.isGPU() && std::all_of(first, topology.participants.end(),
+                    [&](const auto &member) { return member.address.device_type == first->address.device_type; });
+            }
             if (!mtpEnabled() || !expert_overlay ||
                 !topology.expert_overlay_plan)
             {
@@ -788,9 +982,14 @@ namespace llaminar2::test::parity
                 return 2;
             case ModelParityMTP::Depth3:
                 return 3;
+            case ModelParityMTP::Depth5:
+                return 5;
+            case ModelParityMTP::Depth6:
+                return 6;
             case ModelParityMTP::Depth15:
-            case ModelParityMTP::DynamicDepth:
                 return kModelParityRequiredMaximumMTPDepth;
+            case ModelParityMTP::DynamicDepth:
+                return model.maximum_mtp_draft_depth;
             }
             return 0;
         }
@@ -843,6 +1042,7 @@ namespace llaminar2::test::parity
             const std::string prefill_name =
                 prefill_graph.testNameFragment();
             return model.test_id + "_" + topology.test_id + "_" +
+                   (ngram_table_policy ? ngramStorageTestName(*ngram_table_policy) : std::string{}) +
                    (expert_overlay
                         ? expert_overlay->testName() + "_"
                         : std::string{}) +
@@ -865,13 +1065,17 @@ namespace llaminar2::test::parity
          */
         [[nodiscard]] TestConfig toTestConfig() const
         {
+            if (topology.observed_native_pipeline &&
+                (topology.needsObservedPipelineBinding() || !topology.execution_rank_selection))
+                throw std::logic_error("Observed parity pipeline must bind original inventory before runtime configuration");
             TestConfig config;
             config.name = testName();
             config.parallelism = legacyParallelism();
             config.collective = topology.collective;
             config.thresholds = thresholds;
-            config.mpi_ranks = topology.mpi_ranks;
+            config.mpi_ranks = topology.executionRankCount();
             config.model_path = model.model_path;
+            config.shared_predictor = model.shared_predictor;
             config.snapshot_dir = model.reference_directory;
             config.prompt = model.prompt;
             config.token_ids = model.token_ids;
@@ -904,20 +1108,52 @@ namespace llaminar2::test::parity
                     config.devices.push_back(ParityDeviceType::CPU);
             }
 
+            // Rank-local typed declarations have exact addresses. Keep that
+            // source authority through the legacy adapter instead of reducing
+            // sparse ordinals to counts of family entries. Cross-rank inventory
+            // binding keeps its existing owner-specific prerequisite contract.
+            if (!config.is_cross_rank())
+            {
+                std::vector<GlobalDeviceAddress> participants;
+                participants.reserve(topology.participants.size());
+                for (const auto &participant : topology.participants)
+                    participants.push_back(participant.address);
+                // Declared ngram storage is an independent physical endpoint.
+                // It contributes hardware prerequisites without joining the
+                // compute participants, collectives or snapshot device list.
+                if (ngram_table_policy && ngram_table_policy->isGPUAdaptive() &&
+                    ngram_table_policy->gpu_adaptive.placement.mode ==
+                        AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+                {
+                    for (const auto &storage :
+                         ngram_table_policy->gpu_adaptive.placement.declaredParticipants())
+                    {
+                        if (storage.world_rank != 0)
+                            throw std::invalid_argument(
+                                "Rank-local parity storage endpoint belongs to another rank");
+                        participants.push_back(storage.backend == DeviceType::CUDA
+                            ? GlobalDeviceAddress::cuda(storage.ordinal)
+                            : GlobalDeviceAddress::rocm(storage.ordinal));
+                    }
+                }
+                config.local_hardware_requirements =
+                    ParityHardwareRequirements::fromParticipants(participants);
+            }
+
             if (expert_overlay)
             {
                 config.routed_expert_owner_order =
                     expert_overlay->owner_order;
-                config.moe_routed_expert_plan =
-                    std::make_shared<MoERoutedExpertPlacementPlan>(
-                        *topology.expert_overlay_plan);
-                config.moe_routed_expert_plan->owner_order =
-                    expert_overlay->owner_order;
-                config.moe_routed_expert_plan->residency_policy =
-                    expert_overlay->movement ==
-                            ModelParityExpertMovement::Dynamic
-                        ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
-                        : RoutedExpertResidencyPolicy::StaticById;
+                if (topology.expert_overlay_plan)
+                {
+                    config.moe_routed_expert_plan =
+                        std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+                    config.moe_routed_expert_plan->owner_order = expert_overlay->owner_order;
+                    config.moe_routed_expert_plan->residency_policy =
+                        expert_overlay->movement == ModelParityExpertMovement::Dynamic
+                            ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
+                            : RoutedExpertResidencyPolicy::StaticById;
+                }
                 config.moe_movement_expectation =
                     requiresPhysicalExpertMovement()
                         ? ParityMoEMovementExpectation::PhysicalMovement
@@ -970,6 +1206,7 @@ namespace llaminar2::test::parity
         {
             config.activation_precision = activationConfigValue();
             config.kv_cache_precision = kvCacheConfigValue();
+            if (ngram_table_policy) config.ngram_table_policy = *ngram_table_policy;
 
             // Prefix restore is a production invariant, not a generated axis.
             // The parity fixture resolves authenticated-prompt block geometry
@@ -1017,16 +1254,16 @@ namespace llaminar2::test::parity
                             ModelParityExpertMovement::Dynamic
                         ? MoERebalanceRuntimeMode::Dynamic
                         : MoERebalanceRuntimeMode::Off;
-                config.moe_routed_expert_plan =
-                    std::make_shared<MoERoutedExpertPlacementPlan>(
-                        *topology.expert_overlay_plan);
-                config.moe_routed_expert_plan->owner_order =
-                    expert_overlay->owner_order;
-                config.moe_routed_expert_plan->residency_policy =
-                    expert_overlay->movement ==
-                            ModelParityExpertMovement::Dynamic
-                        ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
-                        : RoutedExpertResidencyPolicy::StaticById;
+                if (topology.expert_overlay_plan)
+                {
+                    config.moe_routed_expert_plan =
+                        std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+                    config.moe_routed_expert_plan->owner_order = expert_overlay->owner_order;
+                    config.moe_routed_expert_plan->residency_policy =
+                        expert_overlay->movement == ModelParityExpertMovement::Dynamic
+                            ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
+                            : RoutedExpertResidencyPolicy::StaticById;
+                }
             }
         }
 
@@ -1053,8 +1290,15 @@ namespace llaminar2::test::parity
             const std::string &resolved_model_path,
             int current_rank) const
         {
+            if (topology.observed_native_pipeline &&
+                (topology.needsObservedPipelineBinding() || !topology.execution_rank_selection))
+                throw std::logic_error("Observed parity pipeline must bind original inventory before runtime configuration");
             OrchestrationConfig config = OrchestrationConfig::defaults();
             config.model_path = resolved_model_path;
+            config.mpi_procs = topology.mpi_ranks;
+            config.execution_rank_selection = topology.execution_rank_selection;
+            if (topology.execution_rank_selection) config.planning_mode = OrchestrationPlanningMode::Apply;
+            config.shared_predictor = model.shared_predictor;
             config.max_seq_len = model.max_seq_len;
             config.batch_size = 1;
             config.device_mode = DeviceAssignmentMode::AUTO;
@@ -1084,7 +1328,7 @@ namespace llaminar2::test::parity
             {
                 config.device_mode = DeviceAssignmentMode::EXPLICIT;
                 std::vector<bool> installed(
-                    static_cast<std::size_t>(topology.mpi_ranks), false);
+                    static_cast<std::size_t>(topology.executionRankCount()), false);
                 for (const auto &participant : topology.participants)
                 {
                     if (!participant.world_rank)
@@ -1224,6 +1468,11 @@ namespace llaminar2::test::parity
                             domain.devices.size(),
                             1.0f / static_cast<float>(domain.devices.size()));
                     }
+                    if (!topology.pipeline_routed_compute_policies.empty())
+                    {
+                        domain.routed_compute_policy = topology.pipeline_routed_compute_policies.at(stage);
+                        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+                    }
                     config.domain_definitions.push_back(std::move(domain));
                     config.pp_stage_definitions.push_back(PPStageDefinition{
                         .stage_id = static_cast<int>(stage),
@@ -1241,7 +1490,7 @@ namespace llaminar2::test::parity
              * shape to validation and legacy fixture hooks, but it must not
              * synthesize a competing flat TP/PP map beside the named domains.
              */
-            if (topology.isExpertOverlay())
+            if (topology.expert_overlay_plan)
             {
                 applyRuntimePolicy(config);
                 return config;
@@ -1263,12 +1512,12 @@ namespace llaminar2::test::parity
             case ModelParityTopologyKind::NodeTensorParallel:
                 installExplicitRankDevices();
                 config.tp_scope = TPScope::NODE_LOCAL;
-                config.tp_degree = topology.mpi_ranks;
+                config.tp_degree = topology.executionRankCount();
                 break;
             case ModelParityTopologyKind::GlobalTensorParallel:
                 installExplicitRankDevices();
                 config.tp_scope = TPScope::GLOBAL;
-                config.tp_degree = topology.mpi_ranks;
+                config.tp_degree = topology.executionRankCount();
                 break;
             case ModelParityTopologyKind::NodePipelineParallel:
                 installPipeline(true);
@@ -1361,6 +1610,10 @@ namespace llaminar2::test::parity
                 return "MTPDepth2";
             case ModelParityMTP::Depth3:
                 return "MTPDepth3";
+            case ModelParityMTP::Depth5:
+                return "MTPDepth5";
+            case ModelParityMTP::Depth6:
+                return "MTPDepth6";
             case ModelParityMTP::Depth15:
                 return "MTPDepth15";
             case ModelParityMTP::DynamicDepth:
@@ -1427,7 +1680,8 @@ namespace llaminar2::test::parity
         [[nodiscard]] const TestConfig &getTestConfig() const
         {
             const std::string case_name = GetParam().testName();
-            if (!test_config_ || test_config_->name != case_name)
+            if (!test_config_ || test_config_->name != case_name ||
+                test_config_->shared_predictor != GetParam().model.shared_predictor)
                 test_config_ = GetParam().toTestConfig();
             return *test_config_;
         }
@@ -1488,6 +1742,27 @@ namespace llaminar2::test::parity
     {
         const auto &model = definition.model;
         const auto &topology = definition.topology;
+        (void)modelParityInventoryRoleName(definition.inventory_role);
+        if (definition.inventory_role == ModelParityInventoryRole::NumericalDiagnostic &&
+            !definition.e2e_certifiable.empty())
+            throw std::invalid_argument("Numerical diagnostics cannot declare runtime certification eligibility");
+        if (definition.paired_workload)
+            definition.paired_workload->validate(model.model_path,
+                model.shared_predictor ? std::optional<std::string>(model.shared_predictor->path())
+                                       : std::nullopt);
+        std::vector<std::optional<ImmutableRowTablePolicy>> ngram_policies;
+        if (definition.features.ngram_storage.empty()) ngram_policies.emplace_back(std::nullopt);
+        else
+        {
+            std::set<std::string> storage_modes;
+            for (const auto &policy : definition.features.ngram_storage)
+            {
+                policy.validate();
+                if (!storage_modes.insert(ngramStorageTestName(policy)).second)
+                    throw std::invalid_argument("model parity ngram storage modes must be unique");
+                ngram_policies.emplace_back(policy);
+            }
+        }
         const auto is_test_identifier = [](const std::string &value)
         {
             return !value.empty() &&
@@ -1520,12 +1795,21 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "model parity model/topology ids must contain only letters, digits, and underscores");
         }
-        if (topology.test_id.empty() || topology.participants.empty() ||
+        if (topology.test_id.empty() ||
+            (topology.participants.empty() && !topology.needsObservedPipelineBinding()) ||
             topology.mpi_ranks <= 0)
         {
             throw std::invalid_argument(
                 "model parity requires a named topology, participants, and positive MPI size");
         }
+        if (topology.observed_native_pipeline &&
+            (topology.kind != ModelParityTopologyKind::RankLocalPipelineParallel ||
+             topology.observed_native_pipeline->backend == DeviceType::CPU ||
+             topology.observed_native_pipeline->native_isa.empty() ||
+             topology.observed_native_pipeline->native_isa.find(':') != std::string::npos ||
+             topology.pipeline_stage_sizes.empty() ||
+             topology.needsObservedPipelineBinding() == bool(topology.execution_rank_selection)))
+            throw std::invalid_argument("Observed parity pipeline needs a complete ISA request or its original bound membership");
         if (definition.precisions.activation.empty() ||
             definition.precisions.kv_cache.empty() ||
             definition.features.prefill_graph.empty())
@@ -1615,6 +1899,10 @@ namespace llaminar2::test::parity
                     "model parity prefill graph profiles must be unique");
             }
         }
+        if (definition.thresholds.final_logit_mean_kl &&
+            (!definition.thresholds.final_logit_mean_kl->valid() ||
+             definition.thresholds.final_logit_mean_kl->decode_steps != model.decode_steps))
+            throw std::invalid_argument("Final-logit policy requires finite positive budgets and the exact declared teacher trajectory");
         if (definition.features.mtp == ModelParityAxisProfile::Standard &&
             model.maximum_mtp_draft_depth <
                 kModelParityRequiredMaximumMTPDepth)
@@ -1696,7 +1984,7 @@ namespace llaminar2::test::parity
                     "model parity recursive MTP cosine overrides must be unique by policy");
             }
         }
-        if (topology.isExpertOverlay() &&
+        if (topology.expert_overlay_plan &&
             !topology.expert_overlay_plan->enabled)
         {
             throw std::invalid_argument(
@@ -1776,6 +2064,10 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "single-device parity topology must declare exactly one participant");
         }
+        if (topology.execution_rank_selection)
+            for (const int rank : topology.execution_rank_selection->discoveryRanks())
+                if (rank >= topology.mpi_ranks)
+                    throw std::invalid_argument("parity execution selection exceeds its original discovery population");
         const bool cross_rank =
             topology.kind == ModelParityTopologyKind::NodeTensorParallel ||
             topology.kind == ModelParityTopologyKind::NodePipelineParallel ||
@@ -1809,7 +2101,7 @@ namespace llaminar2::test::parity
             topology.kind == ModelParityTopologyKind::GlobalTensorParallel)
         {
             require_uniform_cross_rank_head_shards(
-                topology.mpi_ranks, "cross-rank TP parity topology");
+                topology.executionRankCount(), "cross-rank TP parity topology");
         }
         else if (topology.kind ==
                  ModelParityTopologyKind::NodePipelineParallel)
@@ -1834,19 +2126,19 @@ namespace llaminar2::test::parity
                     "cross-rank pipeline stage " + std::to_string(stage));
             }
         }
-        if (cross_rank && topology.mpi_ranks < 2)
+        if (cross_rank && topology.executionRankCount() < 2)
         {
             throw std::invalid_argument(
                 "cross-rank parity topology requires at least two MPI ranks");
         }
-        if (!cross_rank && topology.mpi_ranks != 1)
+        if (!cross_rank && topology.executionRankCount() != 1)
         {
             throw std::invalid_argument(
                 "rank-local parity topology requires exactly one MPI rank");
         }
 
         std::vector<bool> rank_has_participant(
-            static_cast<std::size_t>(topology.mpi_ranks), false);
+            static_cast<std::size_t>(topology.executionRankCount()), false);
         bool has_inventory_bound_participant = false;
         for (std::size_t participant_index = 0;
              participant_index < topology.participants.size();
@@ -1877,7 +2169,7 @@ namespace llaminar2::test::parity
                 continue;
             }
             if (*participant.world_rank < 0 ||
-                *participant.world_rank >= topology.mpi_ranks)
+                *participant.world_rank >= topology.executionRankCount())
             {
                 throw std::invalid_argument(
                     "model parity participant names an out-of-range MPI rank");
@@ -1926,11 +2218,21 @@ namespace llaminar2::test::parity
                 topology.pipeline_stage_sizes.end(), std::size_t{0},
                 [](std::size_t total, int size)
                 { return total + static_cast<std::size_t>(size); });
-            if (grouped_participants != topology.participants.size())
+            if (!topology.needsObservedPipelineBinding() && grouped_participants != topology.participants.size())
             {
                 throw std::invalid_argument(
                     "pipeline stage sizes must cover every topology participant exactly once");
             }
+        }
+        if (!topology.pipeline_routed_compute_policies.empty())
+        {
+            if (!pipeline || topology.expert_overlay_plan ||
+                topology.pipeline_routed_compute_policies.size() != pipeline_stage_count ||
+                std::any_of(topology.pipeline_routed_compute_policies.begin(),
+                    topology.pipeline_routed_compute_policies.end(), [](auto policy) {
+                        return policy == RoutedExpertComputePolicy::Unspecified;
+                    }))
+                throw std::invalid_argument("pipeline expert policies require exactly one typed policy per stage and no model-wide overlay");
         }
         if (!topology.pipeline_tensor_parallel_collectives.empty() &&
             (!pipeline || topology.pipeline_tensor_parallel_collectives.size() !=
@@ -1989,6 +2291,7 @@ namespace llaminar2::test::parity
                     for (const auto &prefill_graph :
                          definition.features.prefill_graph)
                     {
+                        for (const auto &ngram_policy : ngram_policies)
                         for (const auto mtp : mtp_policies)
                         {
                             BackendThresholds thresholds =
@@ -2062,6 +2365,7 @@ namespace llaminar2::test::parity
                                 .thresholds = std::move(thresholds),
                                 .activation_precision = activation,
                                 .kv_cache_precision = kv_cache,
+                                .ngram_table_policy = ngram_policy,
                                 .mtp = mtp,
                                 .mtp_recursive_aggregate_cosine_floor =
                                     mtp_recursive_aggregate_cosine_floor,
@@ -2090,6 +2394,8 @@ namespace llaminar2::test::parity
                                 .tp_allreduce_precision_override =
                                     definition.tp_allreduce_precision_override,
                                 .generation_workload = definition.generation_workload,
+                                .paired_workload = definition.paired_workload,
+                                .inventory_role = definition.inventory_role,
                             };
                             if (!names.insert(test_case.testName()).second)
                             {
@@ -2106,6 +2412,7 @@ namespace llaminar2::test::parity
         for (const auto &selection : definition.e2e_certifiable)
         {
             const auto &profile = selection.profile;
+            if (selection.ngram_table_policy) selection.ngram_table_policy->validate();
             (void)modelParityE2EThinkingModesName(profile.thinking_modes);
             if (selection.owner_order.has_value() != selection.movement.has_value() ||
                 profile.context_length <= 0 || profile.minimum_prompt_tokens <= 0 ||
@@ -2138,6 +2445,7 @@ namespace llaminar2::test::parity
                 if (test_case.activation_precision != selection.activation ||
                     test_case.kv_cache_precision != selection.kv_cache ||
                     test_case.mtp != selection.mtp ||
+                    (selection.ngram_table_policy && test_case.ngram_table_policy != selection.ngram_table_policy) ||
                     test_case.prefill_graph != selection.prefill_graph ||
                     test_case.expert_overlay.has_value() != selection.owner_order.has_value())
                     continue;

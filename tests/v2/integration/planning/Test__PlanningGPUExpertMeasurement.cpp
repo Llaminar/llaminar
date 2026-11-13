@@ -6,6 +6,8 @@
  * GPU backends must execute every phase through the production sampler, and all
  * source, prepared, staging, workspace and graph owners must retire afterwards.
  * These are functional lifecycle tests, not throughput or model-math certificates.
+ * Source-backed startup experts cover exactly decode and prefill; live grouped
+ * verifier service is certified separately through prepared runtime endpoints.
  */
 #include "planning/PlanningGPUExpertMeasurement.h"
 #include "backends/BackendManager.h"
@@ -100,7 +102,9 @@ namespace
                     EXPECT_EQ(result.input_width, 256u);
                     EXPECT_EQ(result.intermediate_width, 512u);
                     EXPECT_GT(result.prepared_bytes, 0u);
-                    ASSERT_EQ(result.phases.size(), 3u);
+                    ASSERT_EQ(result.phases.size(), 2u);
+                    EXPECT_EQ(result.phases[0].phase,ExpertHistogramSource::DecodeToken);
+                    EXPECT_EQ(result.phases[1].phase,ExpertHistogramSource::PrefillChunk);
                     for (const auto &phase : result.phases)
                     {
                         EXPECT_GT(phase.graph_nodes, 0u);
@@ -108,7 +112,7 @@ namespace
                         EXPECT_EQ(phase.service.completedWork(), 3.0 * 6 * phase.rows * 256 * 512);
                         EXPECT_NE(phase.service.provenance().find("expert=7"), std::string::npos);
                         EXPECT_NE(phase.service.provenance().find("repeated-same-prepared-expert"), std::string::npos);
-                        EXPECT_NE(phase.service.provenance().find("retained graph native events"), std::string::npos);
+                        EXPECT_NE(phase.service.provenance().find("one contiguous original body warmup before clock start; timed_invocations=3; one ordered parent launch"), std::string::npos);
                     }
                     expectRetired(*memory, device);
                 }

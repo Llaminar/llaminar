@@ -258,7 +258,7 @@ namespace llaminar2
             moe_graph_stability != PrefillMoEGraphStability::Stable)
             return PrefillGraphRejectReason::ActiveMoERebalancing;
 
-        if (collective_nodes && !collective_nodes->empty() &&
+        if (graph.requiresCollectiveRuntimeCapture(collective_nodes) &&
             !collectives_graph_capturable &&
             !heterogeneous_segmentation_admitted)
             return PrefillGraphRejectReason::CollectiveNodesPresent;
@@ -292,7 +292,7 @@ namespace llaminar2
             {
                 const bool declared_heterogeneous_boundary =
                     heterogeneous_segmentation_admitted &&
-                    (node->stage->isCollectiveStage() ||
+                    ((node->stage->isCollectiveStage() && !node->stage->isParticipantLocalCapturedTransfer()) ||
                      node->stage->isManualGraphBoundary()) &&
                     (!padded_bucket ||
                      node->stage

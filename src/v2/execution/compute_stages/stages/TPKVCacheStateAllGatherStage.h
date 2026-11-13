@@ -1,6 +1,11 @@
 /**
  * @file TPKVCacheStateAllGatherStage.h
- * @brief LocalTP handoff from TP-local prefill K/V rows to replicated decode KV rows.
+ * @brief Exact CPU/native-GPU prefill handoff into replicated decode KV rows.
+ *
+ * Live projection prefixes alone enter the collective. CPU ownership is the
+ * declared logical participant, including NUMA endpoints sharing DeviceId::cpu;
+ * GPU ownership retains its exact producer stream and native captured launch.
+ * All compact/gathered payload bytes belong to the existing admitted workspace.
  */
 
 #pragma once
@@ -23,8 +28,10 @@ namespace llaminar2
      * Phase-split dense execution keeps prefill attention projections tensor
      * parallel, then switches decode to mirrored dense weights. The decode cache
      * therefore must be seeded with full K/V rows during prefill. This stage
-     * allgathers compact local K/V rows on the active LocalTP stream and
-     * deinterleaves the rank-contiguous payload into per-token full-width rows.
+     * allgathers compact local K/V rows using the exact CPU participant or
+     * active GPU LocalTP stream, then deinterleaves the participant-contiguous
+     * payload into per-token full-width rows. CPU empty work joins metadata
+     * without touching payload; no backend changes the admitted cache layout.
      */
     class TPKVCacheStateAllGatherStage final : public IComputeStage, public IWorkspaceConsumer
     {
@@ -87,6 +94,17 @@ namespace llaminar2
     private:
         Params params_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        std::string host_k_stage_name_; ///< Retained protocol identity; no execution-time concatenation.
+        std::string host_v_stage_name_; ///< Separate K/V rounds cannot cross-match.
+
+        /**
+         * @brief Execute the first-class CPU handoff on host-owned live spans.
+         * @return True only after both exact gathers and row publications finish.
+         *
+         * Packing/deinterleaving uses byte copies in fixed participant order;
+         * scratch is exclusively borrowed from the already admitted workspace.
+         */
+        bool executeHost();
 
         std::string gatheredKBufferName() const;
         std::string gatheredVBufferName() const;

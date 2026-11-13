@@ -133,7 +133,8 @@ namespace llaminar2
                 const double normalize = 10.0 * geometry.local_key_heads * geometry.d_k;
                 result.push_back({layer, invocation.rows(), PlanningGDNStateWork{geometry,
                     rows * (recurrence + convolution + normalize),
-                    2.0 * geometry.localPayloadBytes(1),
+                    2.0 * (device.device.is_cpu() ? geometry.localPayloadBytes(1) :
+                        sizeof(float) * static_cast<std::size_t>(geometry.local_conv_state_floats + geometry.local_recurrence_state_floats)),
                     sizeof(float) * rows * (geometry.local_qkv_dim + values)}});
             }
         }

@@ -1372,7 +1372,7 @@ feature completeness. Do not remove MoE PP or floating Dynamic candidates from
 automatic search to make a selection appear successful.
 
 Floating Dynamic: inference already supported typed FP16/BF16/FP32 descriptors,
-but the transfer directory and pack/unpack readiness still required NativeVNNI.
+but the transfer directory and pack/unpack readiness still required NativeQuantised.
 Both CUDA and ROCm now accept those floating formats through the existing
 transaction lifecycle:
 
@@ -2806,13 +2806,13 @@ The focused gate passes 10/10 groups in 41.34s; both new regressions pass in
 declaration already used the active team. With two actual workers and a future
 budget of eight, ordinary/grouped execution rejected the correctly sized bank
 and fused execution silently changed its K reduction tree. The new regression
-failed on both AVX2 and AVX-512 before the fix. `nativeVNNIInvocationWorkerCount`
-now supplies declaration, all NativeVNNI execution paths and diagnostics. Tests
+failed on both AVX2 and AVX-512 before the fix. `nativeQuantisedInvocationWorkerCount`
+now supplies declaration, all NativeQuantised execution paths and diagnostics. Tests
 also cover the inverse case (eight actual workers, future budget two), every
 canonical quantized format and serial-row byte equivalence. No quantizer,
 weight format, microkernel, reduction algorithm or synchronization was changed.
 
-`planNativeVNNIFusedRows` resolves each member's actual format/policy, shape,
+`planNativeQuantisedFusedRows` resolves each member's actual format/policy, shape,
 rows and schedule. A typed route distinguishes full-K, output-tile-local trees
 and shared partials. Shared extents use checked arithmetic and disjoint member
 offsets; the existing economical private-tree route still needs zero shared
@@ -2837,7 +2837,7 @@ GPU-aligned experts. None of this is permission to cap worker counts or alter
 arithmetic. Measured automatic ranking, full native prerequisites, Release
 economy, Docker/Azure certification and the requested commit/push remain open.
 
-Previous continuation (2026-09-15): **Ordinary/grouped CPU NativeVNNI ordered
+Previous continuation (2026-09-15): **Ordinary/grouped CPU NativeQuantised ordered
 partials now borrow invocation-owned storage. The focused build passes for
 18 correctness and six performance executables; 23 selected test groups plus
 their setup fixture pass in 57.70s. Both CPU workspace groups passed 20/20
@@ -2903,7 +2903,7 @@ changed. Quantization publishes through the existing OpenMP team when one is
 already active, without creating a team solely to pack a single input.
 
 CPU graph admission includes local TP geometry, routed expert fanout and tied
-terminal weights. Direct Unit, sparse/service, NativeVNNI and standalone tensor
+terminal weights. Direct Unit, sparse/service, NativeQuantised and standalone tensor
 fixtures explicitly supply their own workspace instead of depending on hidden
 allocation. The all-format workspace proof covers missing/undersized banks,
 inactive-tail canaries, serial/grouped byte equality, both numerical policies,
@@ -3098,7 +3098,7 @@ flowchart TD
 ```
 
 **Newly identified ordinary-CPU admission boundary (not fixed):**
-`CPUNativeVNNIGemmKernel::multiply_tensor` ignores its workspace argument and
+`CPUNativeQuantisedGemmKernel::multiply_tensor` ignores its workspace argument and
 calls helpers retaining thread-local activation Q8 blocks, K-partition sums,
 and nonzero-beta output scratch. The fused helper has another retained arena
 with OpenMP `single/copyprivate` pointer publication. These allocations are
@@ -3106,7 +3106,7 @@ not owned by the sampler's PMA and can outlive it. A temporary sampler lease
 would falsely report retirement; replacing the ordinary kernel by the expert
 arithmetic path would measure the wrong implementation. No such shortcut was
 added. The current estimator now declares CPU SwiGLU storage, but these
-ordinary NativeVNNI scratch buffers are still undeclared.
+ordinary NativeQuantised scratch buffers are still undeclared.
 
 The proper next slice is a production CPU workspace contract: preserve existing
 quantization and reduction order, make scratch geometry shared by declaration
@@ -3425,7 +3425,7 @@ AVX512/AVX2 image certification remains pending after that implementation.
 Accounting follow-up identified during this slice: ordinary CPU admission in
 `WeightMemoryEstimator::getCPUPackedBytesPerWeight` still uses a generic 1.125
 bytes/weight for quantized tensors. That is not the exact layout for every
-NativeVNNI encoding. This slice's source sampler uses the exact preparation
+NativeQuantised encoding. This slice's source sampler uses the exact preparation
 contribution instead; it did not silently change ordinary runtime admission.
 When consolidating that older estimator, distinguish initial source-prepared
 storage from reusable migration slots, and borrowed dense floating storage from
@@ -3561,7 +3561,7 @@ Focused logs: `/tmp/planning-pool-binding-integration-20260915.log` and
 `/tmp/planning-pool-binding-unit-20260915.log`.
 
 The first full prerequisite attempt stopped during build: the existing
-`NativeVNNIExpertTransferParityTest.h` fixture had relied on backend declarations
+`NativeQuantisedExpertTransferParityTest.h` fixture had relied on backend declarations
 being included indirectly by the old GPU helper. Its direct CUDA/ROCm includes
 are now explicit. No test ran in that failed attempt; its separate failed
 receipt is preserved. The corrected canonical run passed **656 Unit + 197

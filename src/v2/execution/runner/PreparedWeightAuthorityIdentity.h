@@ -5,18 +5,37 @@
  * A reused model keeps the original PMA and prepared bytes. These identities
  * reject changes that would require different ownership or admission before any
  * new runner borrows those bytes; they are not checksums of weight/cache data.
+ * Validated reuse carries the original complete admitted metadata without
+ * resolving defaults again or creating a second policy authority.
  */
 #pragma once
 #include <memory>
 #include <string>
+#include <vector>
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
     struct MoERoutedExpertPlacementPlan;
+    struct MoEExpertOverlayExecutionPlan;
     struct OrchestrationConfig;
     class ResolvedRankOrchestration;
     class AdmittedMoEPipelineMemory;
     struct MTPRuntimeConfig;
+    struct RuntimeConfig;
+
+    /**
+     * @brief Project only actual prepared-weight owners from original admitted tier semantics.
+     * @param plan Original placement with frozen quotas and complete expert ownership.
+     * @param execution Original resolved rank/domain descriptors and dense weight roles.
+     * @return Ordered unique local devices, excluding only exclusively proven-empty routed owners.
+     * @throws std::logic_error For inconsistent original tier or resolved endpoint identity.
+     *
+     * This projection affects prepared-record requirements only. It never removes
+     * execution workers, ngram storage, sources, runtime arenas or physical lifetimes.
+     */
+    std::vector<DeviceId> admittedOverlayPreparedWeightDevices(
+        const MoERoutedExpertPlacementPlan& plan, const MoEExpertOverlayExecutionPlan& execution);
 
     /**
      * @brief Compare the physical MTP preparation contract for dense and MoE reuse.
@@ -28,6 +47,18 @@ namespace llaminar2
      * physical contract. Predictor replication and terminal-head sharding do.
      */
     bool retainedMTPWeightAuthorityMatches(const MTPRuntimeConfig &retained, const MTPRuntimeConfig &requested);
+
+    /**
+     * @brief Restore the complete immutable admission after original prepared-model validation.
+     * @param current New runtime whose model, weight and topology identity already matched.
+     * @param original Runtime that authored the retained physical admission.
+     * @param world_rank Exact current physical rank, independent of execution-device ordinals.
+     * @throws std::exception For changed native source/control block, rank, lookup request or attention request.
+     * @note All compatibility checks precede publication. Exactly seven admitted projections
+     * are restored; active MTP, sampling, precision, scheduling and other request policy remain fresh.
+     * No defaults, placement, capacities, programs, graphs or native owners are recomputed.
+     */
+    void restoreRetainedAdmittedRuntime(RuntimeConfig& current,const RuntimeConfig& original,int world_rank);
 
     /**
      * @brief Serialize ordered placement and capacity-affecting policy.

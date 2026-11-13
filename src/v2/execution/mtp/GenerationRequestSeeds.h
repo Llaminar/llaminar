@@ -38,6 +38,9 @@ public:
     /** @return Immutable metadata, never a host shadow of device progress. */
     [[nodiscard]] std::span<const uint64_t> values() const noexcept { return seeds_; }
 
+    /** @return Exact immutable admission seeds, never device progress. */
+    bool operator==(const GenerationRequestSeeds &) const = default;
+
 private:
     std::vector<uint64_t> seeds_; ///< Owned request metadata, independent of caller lifetime.
 };

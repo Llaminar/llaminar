@@ -12,6 +12,7 @@
 #pragma once
 
 #include "LeastLoadedExpertAssignment.h"
+#include "DeviceMoERuntimeABI.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +20,7 @@
 
 namespace llaminar2
 {
-    inline constexpr uint32_t kDeviceMoELLEPPlannerMaxExperts = 256u;
+    inline constexpr uint32_t kDeviceMoELLEPPlannerMaxExperts = moe_runtime_abi::kMaxExperts;
     inline constexpr uint32_t kDeviceMoELLEPPlannerMaxParticipants = 8u;
 
     /**

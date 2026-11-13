@@ -1,0 +1,124 @@
+/**
+ * @file QwenSparseSnapshotMemory.h
+ * @brief Selected main-QSA native state and authored metadata in the existing snapshot BOM.
+ *
+ * Live reference pool rows cannot price a captured full-capacity state slot;
+ * raw indexer GEMM outputs also retain source-owned payloads when packs do not
+ * publish that distinct checkpoint.
+ * This pure projection uses the same source shapes and layout as real stage
+ * descriptors. Only PMA owns reservation, materialization and release.
+ */
+#pragma once
+#include "GraphSnapshotMemoryCapacity.h"
+#include "planning/ModelMemoryProfile.h"
+#include "snapshots/Qwen4ExpSnapshotGeometry.h"
+#include "kernels/qwen4exp/QwenSparseAttention.h"
+#include <algorithm>
+#include <limits>
+#include <span>
+
+namespace llaminar2
+{
+/** @brief Disjoint additional components, without repricing ordinary token payloads. */
+struct QwenSparseSnapshotMemory
+{
+    /** Native pooled-state and raw-query payloads absent from the reference envelope. */
+    std::size_t native_state_payload_bytes = 0;
+    std::size_t authored_metadata_bytes = 0;
+    /** @return Checked total contribution to the single GraphSnapshotArena owner. */
+    std::size_t totalBytes() const { return snapshot_storage_detail::add(native_state_payload_bytes, authored_metadata_bytes); }
+};
+/** @brief Checked owner/request product; no row count or pool frontier is read. */
+inline std::size_t qwenSparseSnapshotMultiply(std::size_t a, std::size_t b)
+{
+    if (a && b > std::numeric_limits<std::size_t>::max() / a)
+        throw std::overflow_error("QSA native snapshot owner extent overflows size_t");
+    return a * b;
+}
+/**
+ * @brief Resolve exact native capacities and bounded slot overhead for selected main producers.
+ * @param model Authenticated metadata, including explicit main sparse layer identities.
+ * @param mainLayers Exact main decoder layer count; a predictor is not a sparse main layer.
+ * @param first First resident main layer, inclusive.
+ * @param last Last resident main layer, inclusive.
+ * @param context Native admitted per-request context capacity.
+ * @param requests Actual request capacity; tokenRows is per request, not flattened twice.
+ * @param tokenRows Maximum physical token rows in an admitted ordinary graph.
+ * @param owners Existing retained forward arena inventory, never a token-derived multiplier.
+ * @param selected Frozen source-output selection; raw queries use native geometry,
+ *        while other roles authenticate their existing reference headers.
+ * @return Native pooled payload plus source-authored metadata/slot padding exactly once.
+ *
+ * Token query/selection payload remains in the caller's reference envelope.
+ * The metadata envelope retains Decode's 16+48R flat raw-query record or R
+ * separate 16+48 prepared-query records, while Prefill still submits TokenRows.
+ * Each selected pool's live NPY payload was excluded there and is replaced
+ * here by its native context-capacity bank. A semantic alias is one selected
+ * output; different producer occurrences/owners remain distinct. Dense0 has no
+ * sparse main source identity, and CPU callers never enter this GPU projection.
+ */
+inline QwenSparseSnapshotMemory qwenSparseSnapshotMemory(
+    const Qwen4ExpMemoryGeometry &model, int mainLayers, int first, int last, int context, int requests,
+    int tokenRows, std::size_t owners, std::span<const GraphSnapshotSourceOutput> selected)
+{
+    QwenSparseSnapshotMemory result;
+    if (selected.empty()) return result;
+    if (mainLayers <= 0 || first < 0 || last < first ||
+        last >= mainLayers || context <= 0 || requests <= 0 || tokenRows <= 0 || !owners)
+        throw std::invalid_argument("QSA snapshots require exact sparse-main geometry and retained arena owners");
+    if (model.indexer_head_dimension != qwen4exp::QwenSparseIndexDim ||
+        model.indexer_query_heads != qwen4exp::QwenSparseIndexHeads ||
+        model.compression_ratio != qwen4exp::QwenSparsePool ||
+        model.maximum_selected_tokens != qwen4exp::QwenSparseSelected)
+        throw std::invalid_argument("QSA snapshots disagree with authenticated native indexer geometry");
+    const auto instances = qwenSparseSnapshotMultiply(static_cast<std::size_t>(requests), owners);
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto &source = selected[index];
+        if (std::find(selected.begin(), selected.begin() + index, source) != selected.begin() + index)
+            throw std::invalid_argument("QSA snapshot source selection contains a duplicate producer");
+        if (source.layer() >= mainLayers ||
+            std::find(model.sparse_decoder_layers.begin(), model.sparse_decoder_layers.end(),
+                static_cast<unsigned>(source.layer())) == model.sparse_decoder_layers.end())
+            throw std::invalid_argument("QSA snapshot source is absent from the admitted sparse-main manifest");
+        if (source.layer() < first || source.layer() > last) continue;
+        // Raw and prepared indexer queries share exact M-by-512 storage,
+        // while retaining distinct producer identities in the selected BOM.
+        const auto role = (source.role() == GraphSnapshotSourceRole::QwenSparseQuery ||
+            source.role() == GraphSnapshotSourceRole::QwenSparseRawQuery) ? Qwen4ExpSnapshotOutput::PreparedQuery :
+            source.role() == GraphSnapshotSourceRole::QwenSparsePooledKeys ? Qwen4ExpSnapshotOutput::PooledKeys :
+            Qwen4ExpSnapshotOutput::SelectedIndices;
+        auto shape = qwen4ExpSparseSnapshotShape(role, tokenRows, context, model.maximum_selected_tokens);
+        auto metadataInstances=instances;
+        // A retained owner admits both unchanged Prefill TokenRows and Decode
+        // authored intervals. Price their explicit maximum metadata envelope.
+        // Raw GEMM has one flattened R*M producer; prepared Q has R independent
+        // M-row producers. Only PMA materializes these declared bytes.
+        if(source.role()==GraphSnapshotSourceRole::QwenSparseRawQuery) {
+            const auto flattened=qwenSparseSnapshotMultiply(static_cast<std::size_t>(requests),static_cast<std::size_t>(tokenRows));
+            if(flattened>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+                throw std::overflow_error("Raw query snapshot physical rows exceed native geometry");
+            shape.geometry.rows=static_cast<int>(flattened);
+            shape.geometry.kind=DiagnosticSnapshotCopyKind::AuthoredTokenRows;
+            shape.geometry.requests=requests;
+            metadataInstances=owners;
+        } else if(source.role()==GraphSnapshotSourceRole::QwenSparseQuery) {
+            shape.geometry.kind=DiagnosticSnapshotCopyKind::AuthoredTokenRows;
+            shape.geometry.requests=1;
+        }
+        const auto layout = snapshotStorageLayout(shape.storageShape());
+        // Raw GEMM is an independent native producer absent from older packs.
+        // Its flattened source shape owns its payload exactly once per arena;
+        // prepared-query files are never used as a substitute raw shape.
+        if (source.replacesReferencePayload() || source.role() == GraphSnapshotSourceRole::QwenSparseRawQuery)
+            result.native_state_payload_bytes = snapshot_storage_detail::add(result.native_state_payload_bytes,
+                qwenSparseSnapshotMultiply(layout.payload_storage_bytes, metadataInstances));
+        // Relative payload-to-header padding and absolute slot alignment are
+        // both physical bytes. The bound is per actual selected descriptor;
+        // it does not spend unrelated payload slack on missing headers.
+        result.authored_metadata_bytes = snapshot_storage_detail::add(result.authored_metadata_bytes,
+            qwenSparseSnapshotMultiply(qwen4ExpSnapshotMetadataBytes(shape), metadataInstances));
+    }
+    (void)result.totalBytes();
+    return result;
+}
+} // namespace llaminar2

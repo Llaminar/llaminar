@@ -7,6 +7,10 @@
  */
 
 #include "BackendRouter.h"
+#include "planning/RankHardwareOwnership.h"
+#include "LocalPPTransferSelection.h"
+#include "execution/local_execution/orchestrators/PipelineGraphExecutionPlan.h"
+#include <set>
 #include "backends/HostBackend.h"
 #include "backends/MPIBackend.h"
 #include "backends/UPIBackend.h"
@@ -27,6 +31,113 @@ namespace llaminar2
     // =========================================================================
     // BackendRouter Implementation
     // =========================================================================
+
+    PipelineRouterAdmission PipelineRouterAdmission::admit(
+        std::shared_ptr<IMPIContext> context,const std::vector<std::vector<GlobalDeviceAddress>>& stages,
+        const PipelineGraphExecutionPlan& execution)
+    {
+        std::vector<GlobalDeviceAddress> participants;
+        if(execution.segmentCount()!=stages.size())
+            throw std::invalid_argument("PP router stage domains differ from the actual graph execution plan");
+        const bool graph_native=execution.nativeSegmentCount()==execution.segmentCount();
+        std::size_t stage_index=0;
+        for(const auto& stage:stages) {
+            if(stage.empty())throw std::invalid_argument("PP router admission omitted a stage domain");
+            participants.insert(participants.end(),stage.begin(),stage.end());
+            std::vector<DeviceId> actual;
+            for(const auto& device:stage)actual.push_back(device.toLocalDeviceId());
+            if(execution.segments()[stage_index++].participants!=actual)
+                throw std::invalid_argument("PP router stage order differs from actual graph owners");
+        }
+        if(!context || stages.size()<2 || participants.empty())
+            throw std::invalid_argument("Captured PP router requires its original communicator and participants");
+        const auto inventory=context->clusterInventory();
+        if(!inventory || inventory->world_size!=context->world_size() ||
+            inventory->ranks.size()!=static_cast<std::size_t>(context->world_size()) ||
+            context->rank()<0 || context->rank()>=context->world_size())
+            throw std::invalid_argument("Captured PP router requires the original communicator inventory namespace");
+        const auto& rank=inventory->getRank(context->rank());
+        std::set<DeviceId> endpoints;
+        std::set<std::string> gpu_uuids;
+        for(const auto& participant:participants)
+        {
+            if(participant.hostname!="localhost" && participant.hostname!=rank.hostname)
+                throw std::invalid_argument("Captured PP router participant belongs to a foreign host");
+            const auto device=participant.toLocalDeviceId();
+            if(device.is_cpu())
+            {
+                if(!rankOwnsCPUNode(rank,participant.numa_node))
+                    throw std::invalid_argument("Captured PP router CPU participant lacks original NUMA ownership");
+                continue;
+            }
+            if(!endpoints.insert(device).second)
+                throw std::invalid_argument("PP router has duplicate original GPU participants");
+            requireRankLocalGPUOwnership(rank,device,"PP router");
+            const auto found=std::find_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto& gpu) {
+                return gpu.type==device.type && gpu.local_device_id==device.ordinal;
+            });
+            if(found->uuid.empty() || !gpu_uuids.insert(found->uuid).second ||
+                (participant.hasValidNuma() && participant.numa_node!=found->numa_node))
+                throw std::invalid_argument("Captured PP router lost original GPU UUID/NUMA identity");
+        }
+        std::vector<CopyEdge> edges;
+        if(!graph_native)for(std::size_t stage=1;stage<stages.size();++stage) {
+            const auto& sources=stages[stage-1];
+            const auto& destinations=stages[stage];
+            // Config::fromPlan constructs a LocalTP stage exactly when its
+            // authored participant population exceeds one. Match the original
+            // runtime source-TP priority, including TP-to-TP boundaries.
+            const auto selection=localPPBoundarySelection(sources.size()>1,sources.size(),
+                [&](std::size_t index){return sources[index].toLocalDeviceId();},
+                destinations.size()>1,destinations.size(),
+                [&](std::size_t index){return destinations[index].toLocalDeviceId();});
+            const auto source=sources[selection.source].toLocalDeviceId();
+            const auto target=destinations[selection.destination].toLocalDeviceId();
+            if(source!=target)edges.push_back({source,target});
+        }
+        return PipelineRouterAdmission(std::move(context),inventory,participants,std::move(edges));
+    }
+
+    BackendRouter::BackendRouter(PipelineRouterAdmission admission,
+        std::unique_ptr<IBackendFactory> factory)
+        :mpi_ctx_(admission.context()),cluster_inventory_(admission.inventory()),
+         factory_(factory?std::move(factory):std::make_unique<DefaultBackendFactory>()),
+         pipeline_admission_(std::move(admission))
+    {
+        // Graph-native PP declares no router edges. Generic/hybrid PP reserves
+        // only initial boundary-copy endpoints; each destination TP broadcast
+        // retains its own existing communicator. No visible spare joins here.
+        for(const auto type:{CollectiveBackendType::NCCL,CollectiveBackendType::RCCL,CollectiveBackendType::HOST}) {
+            if(!pipelineCopyBackendRequired(type))continue;
+            const auto family=type==CollectiveBackendType::NCCL?DeviceType::CUDA:DeviceType::ROCm;
+            DeviceGroupBuilder builder;
+            builder.setName(type==CollectiveBackendType::NCCL?"pp_cuda_copy_edges":
+                type==CollectiveBackendType::RCCL?"pp_rocm_copy_edges":"pp_host_copy_edges").setScope(CollectiveScope::LOCAL);
+            std::set<DeviceId> included;
+            for(const auto& edge:pipeline_admission_->copyEdges()) {
+                const bool host_edge=!edge.source.is_gpu() || !edge.target.is_gpu() || edge.source.type!=edge.target.type;
+                const bool uses_backend=type==CollectiveBackendType::HOST?host_edge:
+                    edge.source.type==family && edge.target.type==family;
+                if(!uses_backend)continue;
+                for(const auto endpoint:{edge.source,edge.target})if(included.insert(endpoint).second)builder.addDevice(endpoint);
+            }
+            auto* backend=getOrCreateBackend(type);
+            if(!backend || !backend->initialize(builder.build()))
+                throw std::runtime_error("PP declared native copy communicator admission failed");
+        }
+    }
+
+    bool BackendRouter::pipelineCopyBackendRequired(CollectiveBackendType type) const noexcept
+    {
+        if(!pipeline_admission_)return true;
+        for(const auto& edge:pipeline_admission_->copyEdges()) {
+            if(type==CollectiveBackendType::NCCL && edge.source.is_cuda() && edge.target.is_cuda())return true;
+            if(type==CollectiveBackendType::RCCL && edge.source.is_rocm() && edge.target.is_rocm())return true;
+            if(type==CollectiveBackendType::HOST &&
+                (!edge.source.is_gpu() || !edge.target.is_gpu() || edge.source.type!=edge.target.type))return true;
+        }
+        return false;
+    }
 
     BackendRouter::BackendRouter(
         std::shared_ptr<IMPIContext> mpi_ctx,
@@ -231,6 +342,7 @@ namespace llaminar2
 
     ICollectiveBackend *BackendRouter::getBackend(const DeviceGroup &group)
     {
+        if(pipeline_admission_)throw std::logic_error("PP copy router cannot admit another collective group");
         // Check cache first
         std::string key = makeGroupKey(group);
         auto it = group_backend_cache_.find(key);
@@ -264,6 +376,7 @@ namespace llaminar2
 
     ICollectiveBackend *BackendRouter::getBackend(CollectiveBackendType type)
     {
+        if(pipeline_admission_)throw std::logic_error("PP copy router does not expose mutable backend ownership");
         return getOrCreateBackend(type);
     }
 
@@ -316,6 +429,9 @@ namespace llaminar2
 
     ICollectiveBackend *BackendRouter::getBackendForCopy(DeviceId src, DeviceId dst)
     {
+        if(pipeline_admission_ && std::none_of(pipeline_admission_->copyEdges().begin(),
+            pipeline_admission_->copyEdges().end(),[&](const auto& edge) { return edge.source==src && edge.target==dst; }))
+            throw std::logic_error("PP copy is outside its admitted directed boundary edges");
         // Same device = no transfer needed, but return a backend anyway
         if (src == dst)
         {
@@ -433,6 +549,7 @@ namespace llaminar2
 
     bool BackendRouter::initializeBackend(CollectiveBackendType type, const DeviceGroup &group)
     {
+        if(pipeline_admission_)throw std::logic_error("PP copy router cannot admit another collective group");
         ICollectiveBackend *backend = getOrCreateBackend(type);
         if (!backend)
         {
@@ -647,6 +764,7 @@ namespace llaminar2
 
     void BackendRouter::registerUPIBackend(std::unique_ptr<UPICollectiveBackend> backend)
     {
+        if(pipeline_admission_)throw std::logic_error("PP copy router cannot adopt another domain backend");
         if (backend)
         {
             LOG_DEBUG("BackendRouter: Registering UPI backend (domain rank=" << backend->domainRank()
@@ -702,6 +820,9 @@ namespace llaminar2
 
     ICollectiveBackend *BackendRouter::getOrCreateBackend(CollectiveBackendType type)
     {
+        if(!pipelineCopyBackendRequired(type))
+            throw std::logic_error("PP router backend is outside its declared copy edges");
+
         switch (type)
         {
         case CollectiveBackendType::MPI:
@@ -870,6 +991,21 @@ namespace llaminar2
         const ClusterInventory &cluster_inventory)
     {
         instance_ = std::make_unique<BackendRouter>(std::move(mpi_ctx), cluster_inventory);
+    }
+
+    void GlobalBackendRouter::initForPipeline(PipelineRouterAdmission admission)
+    {
+        if(instance_) {
+            const auto& prior=instance_->pipeline_admission_;
+            if(!prior || prior->context()!=admission.context() || &prior->inventory()!=&admission.inventory() ||
+                prior->participants()!=admission.participants() ||
+                prior->copyEdges().size()!=admission.copyEdges().size() ||
+                !std::equal(prior->copyEdges().begin(),prior->copyEdges().end(),admission.copyEdges().begin(),
+                    [](const auto& a,const auto& b){return a.source==b.source && a.target==b.target;}))
+                throw std::logic_error("PP router cannot replace a live unrelated transport owner");
+            return; // Reuse the same original immutable transport authority.
+        }
+        instance_=std::make_unique<BackendRouter>(std::move(admission));
     }
 
     bool GlobalBackendRouter::initForTests()

@@ -7,6 +7,8 @@
  * reparse command lines, rediscover hardware, or mistake an expert-only rank's
  * CPU control endpoint for its compute devices. These values never drive
  * execution, allocation, sampling or placement decisions.
+ * GPU identity includes the original PCI bridge ancestry and observed mutual
+ * peers so selected domain locality can be audited without probing live GPUs.
  */
 #pragma once
 
@@ -17,10 +19,13 @@
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/PersistentStateMemoryEstimator.h"
+#include "planning/ObservedPeerGrouping.h"
 #include "utils/PerfStatsCollector.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <map>
 #include <set>
+#include <vector>
 #include <stdexcept>
 
 namespace llaminar2
@@ -112,23 +117,41 @@ namespace llaminar2
         const std::map<DeviceId, ServerParticipantRole> &participants,
         const RankExecutionPlan &plan, const ModelMemoryProfile &model)
     {
-        if (model.n_layers <= 0 || model.mtp_layer_count < 0 || model.mtp_layer_count >= model.n_layers)
+        // Flash Next declares main blocks separately from its exported predictor;
+        // other Qwen exports include that trailing block in n_layers. Reuse the
+        // canonical profile boundary rather than subtracting nextn twice.
+        const int main_layers = model.mainLayerCount();
+        const int total_layers = model.totalLayerCount();
+        if (main_layers <= 0 || total_layers < main_layers)
             throw std::invalid_argument("Server attention evidence requires complete model layer geometry");
-        const int main_layers = model.n_layers - model.mtp_layer_count;
         const auto has_attention = [&](int first, int end) {
-            if (first < 0 || end < first || end > model.n_layers)
+            if (first < 0 || end < first || end > total_layers)
                 throw std::invalid_argument("Server attention evidence has an invalid layer interval");
             for (int layer = first; layer < end; ++layer)
                 if (PersistentStateMemoryEstimator::isFullAttentionLayer(model, layer)) return true;
             return false;
         };
         const bool predictor_attention = plan.runtime.mtp.enabled && plan.has_lm_head &&
-            has_attention(main_layers, model.n_layers);
+            has_attention(main_layers, total_layers);
         const size_t stages = plan.local_pp_devices.size();
         if (stages && (plan.local_pp_layer_boundaries.size() != stages + 1 ||
             (!plan.local_pp_stage_tp_info.empty() && plan.local_pp_stage_tp_info.size() != stages)))
             throw std::invalid_argument("Server attention evidence requires complete pipeline ownership");
-        std::string devices, attention;
+        // Family obligations are independent: a dense MTP sidecar cannot certify
+        // missing sparse-trunk work on the same device.
+        enum class AttentionFamily { Flash, Sparse };
+        const auto has_family = [&](int first, int end, AttentionFamily family) {
+            for (int layer = first; layer < end; ++layer)
+            {
+                if (!PersistentStateMemoryEstimator::isFullAttentionLayer(model, layer)) continue;
+                const auto selected = model.flash_next &&
+                    model.flashNextLayerKind(layer) == Qwen4ExpLayerKind::QSA
+                    ? AttentionFamily::Sparse : AttentionFamily::Flash;
+                if (selected == family) return true;
+            }
+            return false;
+        };
+        std::string devices, attention, flash_attention, sparse_attention;
         for (const auto &[device, role] : participants)
         {
             if (!devices.empty()) devices += ',';
@@ -166,10 +189,20 @@ namespace llaminar2
                 if (!has_attention(first, end) && !owns_predictor) continue;
                 if (!attention.empty()) attention += ',';
                 attention += device.toString();
+                const auto append_family = [&](std::string &list, AttentionFamily family) {
+                    if (!has_family(first, end, family) &&
+                        !(owns_predictor && has_family(main_layers, total_layers, family))) return;
+                    if (!list.empty()) list += ',';
+                    list += device.toString();
+                };
+                append_family(flash_attention, AttentionFamily::Flash);
+                append_family(sparse_attention, AttentionFamily::Sparse);
             }
         }
         return {{"schema", "1"}, {"source", "resolved_execution_plan"},
-                {"devices", devices}, {"attention_devices", attention}};
+                {"devices", devices}, {"attention_devices", attention},
+                {"flash_attention_devices", flash_attention},
+                {"sparse_attention_devices", sparse_attention}};
     }
 
     /**
@@ -227,7 +260,7 @@ namespace llaminar2
      * @param device Selected local participant, never an idle discoverable GPU.
      * @param inventory Exact execution-communicator rank inventory.
      * @param numa_node CPU binding from the admitted rank plan.
-     * @return Startup-only tags joining local ordinals to physical node/UUID/NUMA and GPU PCI endpoint.
+     * @return Startup-only physical identity, PCI ancestry and original mutual-peer facts.
      * @throws std::invalid_argument For incomplete or ambiguous observed identity.
      *
      * Distinct ranks may see the same GPU under different ordinals. UUIDs keep
@@ -241,6 +274,7 @@ namespace llaminar2
             !device.is_valid() || (!device.is_cpu() && !device.is_gpu()))
             throw std::invalid_argument("Server participant evidence requires physical rank/device identity");
         std::string physical_id, pci_bus_address;
+        PerfStatsCollector::Tags gpu_tags;
         if (device.is_cpu())
         {
             if (numa_node < 0 || (inventory.cpu.numa_node >= 0 && inventory.cpu.numa_node != numa_node))
@@ -259,12 +293,93 @@ namespace llaminar2
             pci_bus_address = DevicePCIAddress::parse(gpu.pci_bus_address).toString();
             if (physical_id.empty())
                 throw std::invalid_argument("Server GPU participant lacks a physical UUID");
+            // Preserve nearest-bridge-first order. Missing ancestry is unknown;
+            // an endpoint's bus prefix must never be interpreted as a switch.
+            std::vector<std::string> ancestry;
+            std::set<std::string> unique_bridges;
+            for (const auto &bridge : gpu.pcie_upstream_bdfs)
+            {
+                const auto address = DevicePCIAddress::parse(bridge).toString();
+                if (!unique_bridges.insert(address).second || address == pci_bus_address)
+                    throw std::invalid_argument("Server GPU participant has contradictory PCI ancestry");
+                ancestry.push_back(address);
+            }
+            const auto &matrix = device.type == DeviceType::CUDA ? inventory.p2p_cuda : inventory.p2p_rocm;
+            const int count = device.type == DeviceType::CUDA ? inventory.p2p_cuda_count : inventory.p2p_rocm_count;
+            const auto observed_count = std::count_if(inventory.gpus.begin(), inventory.gpus.end(),
+                [&](const auto &peer) { return peer.type == device.type; });
+            const bool observed = count > 0 && count == observed_count &&
+                matrix.size() == static_cast<std::size_t>(count) * static_cast<std::size_t>(count);
+            std::set<std::string> mutual;
+            if (observed)
+            {
+                const ObservedPeerGrouping facts(inventory);
+                for (const auto &peer : inventory.gpus)
+                    if (peer.type == device.type && facts.mutuallyAccessible(
+                            device, DeviceId{peer.type, peer.local_device_id}))
+                        mutual.insert(peer.uuid);
+            }
+            gpu_tags = {{"numa_node", std::to_string(gpu.numa_node)}, {"native_isa", gpu.native_isa},
+                {"pcie_upstream_bdfs", nlohmann::json(ancestry).dump()},
+                {"peer_access_matrix_observed", observed ? "true" : "false"},
+                {"mutual_peer_physical_ids", nlohmann::json(mutual).dump()}};
         }
-        return {{"schema", "1"}, {"source", "resolved_execution_plan"},
+        PerfStatsCollector::Tags tags{{"schema", "1"}, {"source", "resolved_execution_plan"},
                 {"identity_source", "communicator_cluster_inventory"},
                 {"node_id", std::to_string(inventory.node_id)},
                 {"backend", deviceTypeToString(device.type)}, {"physical_id", physical_id},
                 {"pci_bus_address", pci_bus_address}};
+        tags.insert(gpu_tags.begin(), gpu_tags.end());
+        return tags;
+    }
+
+    /**
+     * @brief Observe exact selected CPU endpoints independently of the GPU primary NUMA.
+     * @param device Already-selected execution participant.
+     * @param inventory Original communicator-owned physical rank observation.
+     * @param plan Original admitted rank plan.
+     * @param config Frozen resolved configuration, including overlay domain ownership.
+     * @param world_size Original execution communicator size.
+     * @return One GPU/ordinary record, or deduplicated original overlay CPU NUMA records.
+     * @throws std::invalid_argument For unselected, unresolved or conflicting ownership.
+     *
+     * This startup-only projection never resolves a physical NUMA from a GPU or
+     * guesses CPU zero. Every endpoint still passes the existing inventory guard.
+     */
+    inline std::vector<PerfStatsCollector::Tags> serverExecutionParticipantRecords(
+        DeviceId device, const RankInventory &inventory, const RankExecutionPlan &plan,
+        const OrchestrationConfig &config, int world_size)
+    {
+        const auto selected = serverExecutionParticipants(plan, config, world_size);
+        if (inventory.rank != plan.rank || !selected.contains(device))
+            throw std::invalid_argument("Server participant observation is not owned by this selected rank");
+        if (!device.is_cpu() || !config.moe_routed_expert_plan ||
+            !config.moe_routed_expert_plan->usesExpertOverlayAuthority())
+            return {serverExecutionParticipantTags(device, inventory, plan.numa_node)};
+        const auto overlay = resolveMoEExpertOverlayExecutionPlan(config.moe_routed_expert_plan,
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = plan.rank, .world_size = world_size});
+        const auto &local = overlay.currentRankPlan();
+        std::set<int> endpoints;
+        for (const auto &domain : overlay.domains)
+        {
+            if (!local.ownsDomain(domain.name)) continue;
+            for (const auto &participant : domain.participants)
+            {
+                if (!participant.world_rank_known || participant.world_rank != plan.rank ||
+                    !participant.address.isCPU() || participant.address.toLocalDeviceId() != device)
+                    continue;
+                if (participant.address.numa_node < 0)
+                    throw std::invalid_argument("Server overlay CPU participant lacks resolved NUMA ownership");
+                endpoints.insert(participant.address.numa_node);
+            }
+        }
+        if (endpoints.empty())
+            throw std::invalid_argument("Server overlay CPU participant lacks its original selected endpoint");
+        std::vector<PerfStatsCollector::Tags> records;
+        for (const auto numa : endpoints)
+            records.push_back(serverExecutionParticipantTags(device, inventory, numa));
+        return records;
     }
 
     /**

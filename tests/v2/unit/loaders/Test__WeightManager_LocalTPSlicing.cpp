@@ -6,6 +6,10 @@
  * weight slicing for LOCAL tensor parallelism:
  * - Weight category detection (isQKVWeight, isFFNGateUpWeight, etc.)
  * - Row slicing utility (sliceRowRange)
+ * - Immutable TP declaration ownership across parallel participant setup and replacement
+ *
+ * Owning-snapshot regressions use the actual WeightManager publication APIs and
+ * original QueryInterval/GDN declarations without loading weights or initializing GPUs.
  *
  * Note: Full WeightManager integration tests that require model loading
  * are in tests/v2/integration/.
@@ -17,6 +21,14 @@
 #include "TestTensorFactory.h"
 #include <memory>
 #include <cstring>
+#include "mocks/MockModelLoader.h"
+#include <array>
+#include <atomic>
+#include <barrier>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -237,6 +249,181 @@ namespace llaminar2
             ASSERT_NE(rocm_fp32, nullptr) << "ROCm slice should be FP32";
             EXPECT_FALSE(TestTensorFactory::hasNaNOrInf(cuda_fp32));
             EXPECT_FALSE(TestTensorFactory::hasNaNOrInf(rocm_fp32));
+        }
+
+        namespace
+        {
+            /**
+             * @brief Construct an actual canonical immutable QueryInterval/GDN declaration.
+             * @param degree Complete symbolic GPU membership count, with no native initialization.
+             * @return Fresh publication owner; the existing distributor owns every interval.
+             */
+            std::shared_ptr<TensorParallelConfig> snapshotAssignment(int degree)
+            {
+                constexpr std::array ordinals{19, 7, 11, 3, 23, 5, 17, 2};
+                std::vector<DeviceId> devices;
+                for (int i = 0; i < degree; ++i)
+                    devices.push_back(DeviceId::rocm(ordinals[static_cast<size_t>(i)]));
+                return std::make_shared<TensorParallelConfig>(TensorParallelConfig::equalSplit(
+                    degree, 24, 2, 640, 248320, std::move(devices), KVHeadCoveragePolicy::QueryInterval,
+                    QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}})));
+            }
+
+            /**
+             * @brief Validate each retained snapshot through the production const declaration API.
+             * @param snapshot Owning publication lease; absence is an error, never a skipped read.
+             * @return Complete source, alignment, physical membership and interval agreement.
+             */
+            bool validSnapshot(const std::shared_ptr<const TensorParallelConfig> &snapshot)
+            {
+                if (!snapshot || !snapshot->validate() || snapshot->worldSize() < 2 || snapshot->worldSize() > 8 ||
+                    snapshot->kvHeadCoveragePolicy() != KVHeadCoveragePolicy::QueryInterval ||
+                    snapshot->totalHeads() != 24 || snapshot->totalKVHeads() != 2 ||
+                    snapshot->totalDFF() != 640 || snapshot->totalVocab() != 248320 ||
+                    snapshot->queryHeadGranularity() != 3 || !snapshot->queryHeadPartitionDeclaration() ||
+                    !snapshot->kvHeadCoverageDeclaration())
+                    return false;
+                const auto &query = *snapshot->queryHeadPartitionDeclaration();
+                const auto &coverage = *snapshot->kvHeadCoverageDeclaration();
+                if (query.originalQueryHeads() != 24 || query.consumers() !=
+                        std::vector<OriginalGDNHeadGeometry>{{16, 48}} ||
+                    coverage.query_heads != 24 || coverage.kv_heads != 2)
+                    return false;
+                constexpr std::array ordinals{19, 7, 11, 3, 23, 5, 17, 2};
+                int next_head = 0;
+                for (int rank = 0; rank < snapshot->worldSize(); ++rank)
+                {
+                    const auto &actual = snapshot->forRank(rank);
+                    const auto required = resolveQueryKVHeadCoverage(coverage, actual.head_start, actual.head_count);
+                    if (actual.local_rank != rank || actual.device != DeviceId::rocm(ordinals[static_cast<size_t>(rank)]) ||
+                        actual.head_start != next_head || actual.head_count <= 0 ||
+                        actual.head_start % 3 != 0 || actual.head_count % 3 != 0 ||
+                        actual.kv_head_start != required.first || actual.kv_head_count != required.count)
+                        return false;
+                    next_head += actual.head_count;
+                }
+                return next_head == 24;
+            }
+        } // namespace
+
+        /**
+         * @test Both real publication APIs preserve an older reader's immutable owner.
+         *
+         * The writer completes on a separate thread before any old declaration is
+         * inspected. Weak ownership proves replacement retires the original only
+         * after the final reader lease, rather than merely leaving readable memory.
+         */
+        TEST_F(Test__WeightManager_LocalTPSlicing, TensorParallelSnapshotRetainsReplacedQueryIntervalOwner)
+        {
+            static_assert(std::is_same_v<decltype(std::declval<const WeightManager &>().tensorParallelConfig()),
+                std::shared_ptr<const TensorParallelConfig>>, "TP declarations require an owning immutable snapshot");
+            MockModelLoader loader;
+            WeightManager manager(loader);
+            EXPECT_EQ(manager.tensorParallelConfig(), nullptr);
+            for (const bool configure_writer : {false, true})
+            {
+                auto original = snapshotAssignment(3);
+                std::weak_ptr<const TensorParallelConfig> retired = original;
+                manager.setTensorParallelConfig(std::move(original));
+                auto reader = manager.tensorParallelConfig();
+                ASSERT_TRUE(reader);
+                EXPECT_TRUE(validSnapshot(reader));
+                EXPECT_EQ(reader->worldSize(), 3);
+                std::jthread writer([&] {
+                    if (configure_writer)
+                    {
+                        WeightManagerConfig config;
+                        config.tp_config = snapshotAssignment(5);
+                        manager.configure(config);
+                    }
+                    else
+                        manager.setTensorParallelConfig(snapshotAssignment(5));
+                });
+                writer.join();
+                EXPECT_FALSE(retired.expired());
+                EXPECT_TRUE(validSnapshot(reader));
+                EXPECT_EQ(reader->worldSize(), 3);
+                const auto current = manager.tensorParallelConfig();
+                ASSERT_TRUE(current);
+                EXPECT_TRUE(validSnapshot(current));
+                EXPECT_EQ(current->worldSize(), 5);
+                EXPECT_NE(current.get(), reader.get());
+                auto final_reader = reader;
+                reader.reset();
+                EXPECT_FALSE(retired.expired());
+                final_reader.reset();
+                EXPECT_TRUE(retired.expired());
+            }
+        }
+
+        /**
+         * @test Four builders retain old declarations while both writers publish fresh owners.
+         *
+         * Every round authenticates an initial lease before replacement, overlaps
+         * fresh snapshot reads with a bounded publication sweep, then checks that
+         * retained old declaration after all replacements. No null/failed read is
+         * skipped and no worker performs GTest assertions or accesses tensor data.
+         */
+        TEST_F(Test__WeightManager_LocalTPSlicing, TensorParallelSnapshotConcurrentReplacementKeepsEveryReadValid)
+        {
+            MockModelLoader loader;
+            WeightManager manager(loader);
+            constexpr int readers = 4, rounds = 32, reads_per_round = 64;
+            std::barrier cohort(readers + 1);
+            std::array<std::atomic<int>, readers> failures{};
+            std::array<std::atomic<int>, readers> checks{};
+            std::vector<std::jthread> workers;
+            workers.reserve(readers);
+            for (int worker = 0; worker < readers; ++worker)
+                workers.emplace_back([&, worker] {
+                    for (int round = 0; round < rounds; ++round)
+                    {
+                        cohort.arrive_and_wait(); // The initial owner is fully published.
+                        const auto retained = manager.tensorParallelConfig();
+                        if (!validSnapshot(retained)) ++failures[worker];
+                        ++checks[worker];
+                        cohort.arrive_and_wait(); // Every reader now owns that exact generation.
+                        for (int read = 0; read < reads_per_round; ++read)
+                        {
+                            const auto current = manager.tensorParallelConfig();
+                            if (!validSnapshot(current)) ++failures[worker];
+                            ++checks[worker];
+                            std::this_thread::yield();
+                        }
+                        cohort.arrive_and_wait(); // All replacements and fresh reads are complete.
+                        if (!validSnapshot(retained) || retained->worldSize() != 2 + round % 7)
+                            ++failures[worker];
+                        ++checks[worker];
+                        cohort.arrive_and_wait(); // Retained reads complete before the next generation.
+                    }
+                });
+            for (int round = 0; round < rounds; ++round)
+            {
+                manager.setTensorParallelConfig(snapshotAssignment(2 + round % 7));
+                cohort.arrive_and_wait();
+                cohort.arrive_and_wait();
+                for (int publication = 0; publication < reads_per_round; ++publication)
+                {
+                    auto next = snapshotAssignment(2 + (round + publication + 1) % 7);
+                    if (publication % 2 == 0)
+                    {
+                        WeightManagerConfig config;
+                        config.tp_config = std::move(next);
+                        manager.configure(config);
+                    }
+                    else
+                        manager.setTensorParallelConfig(std::move(next));
+                    std::this_thread::yield();
+                }
+                cohort.arrive_and_wait();
+                cohort.arrive_and_wait();
+            }
+            for (auto &worker : workers) worker.join();
+            for (int worker = 0; worker < readers; ++worker)
+            {
+                EXPECT_EQ(failures[worker].load(), 0) << "reader " << worker;
+                EXPECT_EQ(checks[worker].load(), rounds * (reads_per_round + 2)) << "reader " << worker;
+            }
         }
 
     } // namespace test

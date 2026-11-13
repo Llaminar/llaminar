@@ -9,8 +9,9 @@
  * - BF16Tensor: BF16 addition with conversion
  * - FP16Tensor: FP16 addition with conversion
  *
- * NOTE: Q8_1 tests require Q8_1Tensor (not raw Q8_1Block buffers).
- * Q8_1Tensor tests are deferred until Q8_1Tensor supports construction from raw data.
+ * Q8_1 inputs retain immutable quantized source bytes. Output buffers use the
+ * original mutable activation constructor; immutable weight publication must
+ * never be used as a shortcut to create writable stage output.
  */
 
 #include <gtest/gtest.h>
@@ -223,7 +224,7 @@ TEST_F(ResidualAddStagePrecisionTest, Q8_1_BasicAddition)
     // Create Q8_1 tensors via quantization
     auto input = makeQ8_1Tensor(1, n, in_fp32);
     auto residual = makeQ8_1Tensor(1, n, res_fp32);
-    auto output = makeQ8_1Tensor(1, n, std::vector<float>(n, 0.0f)); // Zero-initialized
+    auto output = makeQ8_1Tensor(1, n); // Zero-initialized
 
     ASSERT_NE(input, nullptr);
     ASSERT_NE(residual, nullptr);
@@ -274,7 +275,7 @@ TEST_F(ResidualAddStagePrecisionTest, Q8_1_QwenDimensions)
     // Create Q8_1 tensors
     auto input = makeQ8_1Tensor(1, d_model, in_fp32);
     auto residual = makeQ8_1Tensor(1, d_model, res_fp32);
-    auto output = makeQ8_1Tensor(1, d_model, std::vector<float>(d_model, 0.0f));
+    auto output = makeQ8_1Tensor(1, d_model);
 
     ResidualAddStage::Params params;
     params.input = input.get();
@@ -321,10 +322,10 @@ TEST_F(ResidualAddStagePrecisionTest, Q8_1_MatchesDirectSIMD)
     // Create Q8_1 tensors for ResidualAddStage
     auto input = makeQ8_1Tensor(1, n, in_fp32);
     auto residual = makeQ8_1Tensor(1, n, res_fp32);
-    auto output_stage = makeQ8_1Tensor(1, n, std::vector<float>(n, 0.0f));
+    auto output_stage = makeQ8_1Tensor(1, n);
 
     // Create separate Q8_1 tensors for direct SIMD call
-    auto output_simd = makeQ8_1Tensor(1, n, std::vector<float>(n, 0.0f));
+    auto output_simd = makeQ8_1Tensor(1, n);
 
     // Execute via ResidualAddStage
     ResidualAddStage::Params params;

@@ -126,6 +126,11 @@ namespace llaminar2
     class CPURingKVCache : public ICPUKVCache
     {
     public:
+        /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+        qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream) override;
+
         /// @brief Concrete tensor type for K storage at this precision.
         using KTensorT = typename detail::CPUKVCacheTensor<KPrecision>::Type;
 
@@ -369,6 +374,8 @@ namespace llaminar2
         int num_layers() const override { return n_layers_; }
 
         /** @brief Maximum batch size (number of concurrent sequences). */
+        /** @copydoc IKVCache::request_capacity */
+        int request_capacity() const override { return batch_size_; }
         int batch_size() const override { return batch_size_; }
 
         /** @brief The configured memory layout mode (POSITION_MAJOR or HEAD_MAJOR). */

@@ -12,7 +12,7 @@
 #include <array>
 #include <bit>
 #include "../../utils/IQ4XSOriginalEquationSource.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 namespace llaminar2::test
 {
 /** @brief Retain the caller's worker policy across bounded source preparation. */
@@ -35,12 +35,12 @@ TEST_F(IQ4XSOriginalEquation, OrdinaryFiniteFactorWithFixedQ8)
     for(int sub=1;sub<8;++sub)block.scales_h|=uint16_t(2u<<(2*sub));
     std::vector<uint8_t> bytes(sizeof(block));std::memcpy(bytes.data(),&block,sizeof(block));
     IQ4_XSTensor source({1,32},bytes);
-    cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
-    ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(&source,packed));
+    cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+    ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(&source,packed));
     Q8_1Block input{};input.d=0x3c00u;input.qs[0]=1;input.qs[31]=127;input.sum_qs=128;
     const auto unchanged=input;float output=-123.0f;
     ASSERT_EQ(float(double(fp16_to_fp32(block.d))*3.0*128.0),384.375f);
-    cpu::native_vnni::gemv_native_vnni_scalar(packed,&input,&output,1,1);
+    cpu::native_quantised::gemv_native_quantised_scalar(packed,&input,&output,1,1);
     EXPECT_EQ(std::bit_cast<uint32_t>(output),std::bit_cast<uint32_t>(384.375f));
     EXPECT_EQ(std::memcmp(&input,&unchanged,sizeof(input)),0);
     EXPECT_EQ(std::memcmp(source.raw_data(),bytes.data(),bytes.size()),0);
@@ -51,15 +51,15 @@ TEST_F(IQ4XSOriginalEquation, AllCoefficientsOriginalFactorsAndIQ4NLCompatibilit
     using namespace iq4xs_original_equation;
     for(const auto format:{Format::IQ4XS,Format::IQ4NL})
     {
-        auto original=source(format);cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
-        ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(original.view.get(),packed));
+        auto original=source(format);cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+        ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(original.view.get(),packed));
         std::array<Q8_1Block,k/32> input{};std::vector<float> actual(original.n);
         for(int active:{0,1,7,8})for(int sign:{1,-1})
         {
             input={};for(auto &q:input)q.d=0x3c00u;
             input[active].qs[0]=int8_t(sign);input[active].qs[31]=int8_t(sign*127);input[active].sum_qs=128*sign;
             const auto unchanged=input;
-            cpu::native_vnni::gemv_native_vnni_scalar(packed,input.data(),actual.data(),original.n,k/32);
+            cpu::native_quantised::gemv_native_quantised_scalar(packed,input.data(),actual.data(),original.n,k/32);
             for(int n=0;n<original.n;++n)
                 EXPECT_EQ(std::bit_cast<uint32_t>(actual[n]),std::bit_cast<uint32_t>(expected(original,n,active,sign)))
                     <<"format="<<int(format)<<" column="<<n<<" block="<<active<<" sign="<<sign;

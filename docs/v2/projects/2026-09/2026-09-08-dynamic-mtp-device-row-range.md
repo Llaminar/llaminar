@@ -348,7 +348,7 @@ physical scratch indexing. The existing verifier RAII scope now also carries
 immutable row geometry through nested tensor adapters, rejecting mismatched
 physical extents and restoring its enclosing scope even after exceptions.
 This is host recording metadata, not a host copy of the changing device count.
-CUDA/ROCm NativeVNNI and fixed-order FP16/BF16/FP32 projection and SwiGLU bridges
+CUDA/ROCm NativeQuantised and fixed-order FP16/BF16/FP32 projection and SwiGLU bridges
 copy the descriptor into their retained kernel arguments.
 
 Qwen FFN, QKV/GDN and attention-output graphs now borrow the existing verifier

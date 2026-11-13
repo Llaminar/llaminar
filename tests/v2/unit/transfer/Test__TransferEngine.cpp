@@ -9,10 +9,15 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
+#include "execution/moe/ExpertTierGpuPeerTransferLane.h"
+#include <limits>
 
 #include "tensors/CoherenceState.h"
 #include "transfer/TransferEngine.h"
 #include "transfer/TransferMethod.h"
+#include "utils/KernelProfiler.h"
+#include "utils/PerfStatsCollector.h"
 
 // For execute tests
 #include "backends/DeviceId.h"
@@ -23,6 +28,10 @@
 #include "../../mocks/MockWorkerGPUContext.h"
 #include "../../utils/TestTensorFactory.h"
 
+#include <array>
+#include <exception>
+#include <optional>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -247,7 +256,7 @@ namespace
     class ReclamationBackendSpy final : public MockBackend
     {
     public:
-        ReclamationBackendSpy() : MockBackend(DeviceType::CUDA) {}
+        explicit ReclamationBackendSpy(DeviceType type=DeviceType::CUDA) : MockBackend(type) {}
 
         /** @brief Return the configured raw backend result and record identity. */
         DeviceMemoryCacheReclamationResult
@@ -321,6 +330,8 @@ namespace
             receipt.diagnostic = runtime_reset_succeeds
                                      ? "injected runtime reset"
                                      : "injected runtime reset failure";
+            receipt.tracked_device_allocations = runtime_tracked_allocations;
+            receipt.tracked_device_allocation_bytes = runtime_tracked_bytes;
             if (runtime_reset_succeeds)
                 ++runtime_generation;
             return receipt;
@@ -344,6 +355,8 @@ namespace
         int calls = 0; ///< Number of public-authority invocations.
         int last_device_id = -1; ///< Exact ordinal forwarded by TransferEngine.
         bool runtime_reset_succeeds = true; ///< Injected reset outcome.
+        size_t runtime_tracked_allocations = 0u; ///< Storage unexpectedly present at reset.
+        size_t runtime_tracked_bytes = 0u; ///< Exact remaining canonical bytes at reset.
         std::uint64_t runtime_generation = 1u; ///< Current fake runtime identity.
         int runtime_reset_calls = 0; ///< Exclusive runtime-reset invocations.
         int last_runtime_reset_device_id = -1; ///< Exact reset ordinal.
@@ -493,38 +506,64 @@ TEST(Test__TransferEngine_StagingSlab, UnpreparedCopyFailsWithoutThrowingOrGPUWo
     }
 }
 
-TEST(Test__TransferEngine_ExecutionStreamPool,
-     InvalidGeometryFailsBeforeAnyDeviceContextIsRequired)
-{
-    TransferEngine engine;
-    const PersistentTransferExecutionLane invalid_lane;
+namespace {
+/** The public authority cannot create any native execution lane without its original permit. */
+template<class Engine> concept UnadmittedExecutionPool = requires(const Engine& engine) {
+    engine.allocatePersistentTransferExecutionLanes(size_t{1},DeviceId::cuda(0),std::string("unadmitted"));
+};
+static_assert(!UnadmittedExecutionPool<TransferEngine>);
+}
 
-    EXPECT_FALSE(invalid_lane.valid());
-    EXPECT_EQ(invalid_lane.device(), DeviceId::invalid());
-    EXPECT_THROW((void)invalid_lane.stream(), std::logic_error);
-    EXPECT_THROW(
-        (void)engine.allocatePersistentTransferExecutionLanes(
-            0u,
-            DeviceId::cuda(0),
-            "unit_invalid_zero_width"),
-        std::invalid_argument);
-    EXPECT_THROW(
-        (void)engine.allocatePersistentTransferExecutionLanes(
-            1u,
-            DeviceId::cpu(),
-            "unit_invalid_cpu_endpoint"),
-        std::invalid_argument);
-    EXPECT_THROW(
-        (void)engine.allocatePersistentTransferExecutionLanes(
-            1u,
-            DeviceId::cuda(0),
-            ""),
-        std::invalid_argument);
-    // Function preparation can synchronize a native module loader, so reject
-    // even valid pool geometry before attempting a context lookup in capture.
-    GraphCaptureGuard capture_guard;
-    EXPECT_THROW((void)engine.allocatePersistentTransferExecutionLanes(
-        1u, DeviceId::cuda(0), "unit_forbidden_capture_preparation"), std::logic_error);
+/** @brief Explicit component handles remain usable infrastructure but cannot mint original authority. */
+TEST(Test__TransferEngine_ExecutionStreamPool, ComponentScopeCannotEnterOriginalPeerEventOwner)
+{
+    for(const auto device:{DeviceId::cuda(7),DeviceId::rocm(11)}) {
+        auto owner=std::make_shared<int>(17);
+        std::weak_ptr<int> weak=owner;
+        auto lane=ComponentTransferExecutionPoolFixtureAccess::recordedComponentForReplay(
+            owner,reinterpret_cast<void*>(0x1000),device);
+        owner.reset();
+        EXPECT_FALSE(weak.expired());ASSERT_TRUE(lane.valid());
+        EXPECT_EQ(lane.stream(),reinterpret_cast<void*>(0x1000));
+        EXPECT_THROW((void)lane.originalContext(),std::logic_error);
+        EXPECT_THROW((void)ExpertTierGpuPeerTransferLane((ExpertTierGpuPeerTransferLane::Config{
+            .source_device=device,.destination_device=device,.execution=lane,
+            .lane_name="component_cannot_mint_original"})),std::logic_error);
+        auto copied=lane;
+        lane={};EXPECT_FALSE(weak.expired());EXPECT_TRUE(copied.valid());
+        copied={};EXPECT_TRUE(weak.expired());
+    }
+    for(const auto stream:std::array<void*,3>{nullptr,reinterpret_cast<void*>(1),reinterpret_cast<void*>(2)}) {
+        auto lane=ComponentTransferExecutionPoolFixtureAccess::recordedComponentForReplay(
+            std::make_shared<int>(1),stream,DeviceId::cuda(0));
+        EXPECT_FALSE(lane.valid());EXPECT_THROW((void)lane.stream(),std::logic_error);
+        EXPECT_THROW((void)lane.originalContext(),std::logic_error);
+    }
+}
+
+TEST(Test__TransferEngine_ExecutionStreamPool, OriginalBOMRejectsInvalidGeometryAndScalesActualLanes)
+{
+    const PhysicalMemoryResource host{2,DeviceId::cpu(),size_t{1}<<50,size_t{1}<<50};
+    for(const auto device:{DeviceId::cuda(7),DeviceId::rocm(11)}) {
+        const PhysicalMemoryResource gpu{2,device,size_t{1}<<50,size_t{1}<<50};
+        const auto one=TransferEngine::persistentTransferExecutionLanesBOM(1,host,gpu);
+        for(const size_t count:{1u,2u,3u,7u,32u,65u}) {
+            const auto quote=TransferEngine::persistentTransferExecutionLanesBOM(count,host,gpu);
+            ASSERT_EQ(quote.resources().size(),one.resources().size());
+            for(size_t r=0;r<quote.resources().size();++r) {
+                EXPECT_TRUE(quote.resources()[r].resource().sameAllocator(one.resources()[r].resource()));
+                EXPECT_EQ(quote.resources()[r].bytes(PhysicalMemoryOwner::NativeAuxiliaryStream),
+                    count*one.resources()[r].bytes(PhysicalMemoryOwner::NativeAuxiliaryStream));
+            }
+        }
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(0,host,gpu),std::invalid_argument);
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(std::numeric_limits<size_t>::max(),host,gpu),std::overflow_error);
+        auto foreign=host;foreign.world_rank=3;
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(1,foreign,gpu),std::invalid_argument);
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(1,host,host),std::invalid_argument);
+    }
+    const PersistentTransferExecutionLane invalid;
+    EXPECT_FALSE(invalid.valid());EXPECT_THROW(invalid.stream(),std::logic_error);
 }
 
 TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)
@@ -565,6 +604,102 @@ TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)
         std::invalid_argument);
     EXPECT_EQ(backend.free_memory_calls, 0);
     reclamation_backend_spy = nullptr;
+}
+
+/** @test Native startup cleanup needs no dummy tensor and retains the original reset semantics. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRetirementResetsAndReplays)
+{
+    for (const auto device : {DeviceId::cuda(52), DeviceId::rocm(52)})
+    {
+        ReclamationBackendSpy backend(device.is_cuda()?DeviceType::CUDA:DeviceType::ROCm);
+        backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+        reclamation_backend_spy=&backend;
+        TransferEngine engine(&resolveReclamationBackend);
+        for (unsigned replay=0;replay<3;++replay)
+        {
+            auto ticket=engine.beginExclusiveNativeContextRetirement(device);
+            EXPECT_EQ(ticket.expectedRetiredBytes(),0u);
+            EXPECT_EQ(ticket.canonicalAllocationsBeforeOwnerRelease(),0u);
+            const auto receipt=engine.completeExclusiveModelRetirement(std::move(ticket));
+            EXPECT_EQ(receipt.device,device);
+            EXPECT_EQ(receipt.intent,DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement);
+            EXPECT_TRUE(receipt.runtime_reset_invoked);
+            EXPECT_EQ(receipt.runtime_post_reset_state,DeviceRuntimePostResetState::Quiescent);
+            EXPECT_EQ(receipt.successor_runtime_generation,receipt.retired_runtime_generation+1);
+            EXPECT_EQ(receipt.expected_retired_bytes,0u);
+            EXPECT_EQ(receipt.canonical_allocations_before_runtime_reset,0u);
+            EXPECT_EQ(receipt.canonical_allocation_bytes_before_runtime_reset,0u);
+            EXPECT_EQ(receipt.driverBytesVisibleSinceOwnerRelease(),0u);
+            EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::logic_error);
+        }
+        EXPECT_EQ(backend.runtime_reset_calls,3);
+        EXPECT_EQ(backend.free_memory_calls,3); // No post-reset query can reactivate a context.
+        EXPECT_EQ(backend.calls,0);
+        reclamation_backend_spy=nullptr;
+    }
+}
+
+/** @test Neither zero bytes nor zero owners alone proves an empty canonical ledger. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRejectsUnknownOrLiveStorage)
+{
+    for (const auto device : {DeviceId::cuda(52),DeviceId::rocm(52)})
+    {
+        ReclamationBackendSpy backend(device.is_cuda()?DeviceType::CUDA:DeviceType::ROCm);
+        reclamation_backend_spy=&backend;
+        TransferEngine engine(&resolveReclamationBackend);
+        for (const auto ledger : {DeviceAllocationAccounting{.supported=false},
+                DeviceAllocationAccounting{.supported=true,.active_allocations=1,.active_bytes=0},
+                DeviceAllocationAccounting{.supported=true,.active_allocations=0,.active_bytes=1},
+                DeviceAllocationAccounting{.supported=true,.active_allocations=1,.active_bytes=64}})
+        {
+            backend.allocation_accounting=ledger;
+            EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(device),std::runtime_error);
+        }
+        EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(DeviceId::cpu()),std::invalid_argument);
+        EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(DeviceId::invalid()),std::invalid_argument);
+        backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+        {
+            GraphCaptureGuard capture;
+            EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(device),std::logic_error);
+        }
+        EXPECT_EQ(backend.free_memory_calls,0);
+        EXPECT_EQ(backend.runtime_reset_calls,0);
+        reclamation_backend_spy=nullptr;
+    }
+}
+
+/** @test An empty start cannot forge a reset receipt or permit a second completion. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRequiresSuccessfulReset)
+{
+    ReclamationBackendSpy backend;
+    backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+    backend.runtime_reset_succeeds=false;
+    reclamation_backend_spy=&backend;
+    TransferEngine engine(&resolveReclamationBackend);
+    auto ticket=engine.beginExclusiveNativeContextRetirement(DeviceId::cuda(52));
+    EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::runtime_error);
+    EXPECT_FALSE(ticket.valid());
+    EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::logic_error);
+    EXPECT_EQ(backend.runtime_reset_calls,1);
+    reclamation_backend_spy=nullptr;
+}
+
+/** @test Completion still rejects any allocation reported at the reset boundary. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRejectsIncompleteRetirement)
+{
+    for (const auto device : {DeviceId::cuda(52),DeviceId::rocm(52)})
+    {
+        ReclamationBackendSpy backend(device.is_cuda()?DeviceType::CUDA:DeviceType::ROCm);
+        backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+        backend.runtime_tracked_allocations=1;
+        backend.runtime_tracked_bytes=64;
+        reclamation_backend_spy=&backend;
+        TransferEngine engine(&resolveReclamationBackend);
+        auto ticket=engine.beginExclusiveNativeContextRetirement(device);
+        EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::runtime_error);
+        EXPECT_FALSE(ticket.valid());
+        reclamation_backend_spy=nullptr;
+    }
 }
 
 TEST(Test__TransferEngine_Reclamation, PublicAuthorityReturnsCompleteReceipt)
@@ -799,6 +934,12 @@ protected:
         };
     }
 
+    /** @brief Clear the borrowed resolver before the fixture releases its backend. */
+    void TearDown() override
+    {
+        s_mock_ = nullptr;
+    }
+
     // Static mock pointer for the resolver lambda
     static MockBackend *s_mock_;
     std::shared_ptr<MockBackend> mock_backend_;
@@ -806,6 +947,157 @@ protected:
 };
 
 MockBackend *Test__TransferEngine_Execute::s_mock_ = nullptr;
+
+namespace
+{
+    /** @brief Enable the existing transfer evidence authority for one device-free test. */
+    class ScopedExecuteTransferEvidence final
+    {
+    public:
+        /** @brief Save the process policy and select only physical transfer counters. */
+        ScopedExecuteTransferEvidence()
+        {
+            for (const char *key : {"LLAMINAR_PERF_STATS_SUMMARY", "LLAMINAR_PERF_STATS_FILTER"})
+            {
+                const char *previous = std::getenv(key);
+                previous_.emplace_back(key, previous ? std::optional<std::string>(previous) : std::nullopt);
+            }
+            setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+            setenv("LLAMINAR_PERF_STATS_FILTER", "transfer", 1);
+            PerfStatsCollector::reset();
+        }
+
+        /** @brief Restore the policy and clear observations on every assertion exit. */
+        ~ScopedExecuteTransferEvidence()
+        {
+            for (const auto &[key, previous] : previous_)
+                if (previous) setenv(key.c_str(), previous->c_str(), 1);
+                else unsetenv(key.c_str());
+            PerfStatsCollector::reset();
+        }
+
+        /** @return The actual existing profiler counter, never a requested extent. */
+        static double bytes(const char *name)
+        {
+            double result = 0;
+            for (const auto &record : PerfStatsCollector::snapshot({"transfer"}))
+                if (record.kind == PerfStatRecord::Kind::Counter && record.name == name)
+                    result += record.value;
+            return result;
+        }
+
+    private:
+        std::vector<std::pair<std::string, std::optional<std::string>>> previous_;
+    };
+
+    /** @brief Reject a selected physical leg before any backend copy is submitted. */
+    class ExecuteLegFailureBackend final : public MockBackend
+    {
+    public:
+        /** @brief Use host allocations without initializing any GPU backend. */
+        ExecuteLegFailureBackend() : MockBackend(DeviceType::CUDA) {}
+
+        /** @brief Reject an upload or delegate to the real mock memcpy and byte recorder. */
+        bool hostToDevice(void *dst, const void *src, size_t bytes, int device, void *stream) override
+        {
+            return !reject_upload && MockBackend::hostToDevice(dst, src, bytes, device, stream);
+        }
+
+        /** @brief Reject a download or delegate to the real mock memcpy and byte recorder. */
+        bool deviceToHost(void *dst, const void *src, size_t bytes, int device, void *stream) override
+        {
+            return !reject_download && MockBackend::deviceToHost(dst, src, bytes, device, stream);
+        }
+
+        bool reject_upload = false; ///< Reject before the upload submission.
+        bool reject_download = false; ///< Reject before the download submission.
+    };
+}
+
+/** @brief Exact live physical bytes are counted once for both logical GPU backends. */
+TEST_F(Test__TransferEngine_Execute, PhysicalByteEvidenceTracksLiveLegs)
+{
+    ScopedExecuteTransferEvidence evidence;
+    ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("transfer"));
+    ASSERT_TRUE(TransferProfiler::isEnabled());
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+    std::array<unsigned char, 64> host{};
+    auto release = [&](void *ptr) { mock_backend_->free(ptr, 0); };
+    std::unique_ptr<void, decltype(release)> source(mock_backend_->allocate(64, 0), release);
+    std::unique_ptr<void, decltype(release)> destination(mock_backend_->allocate(64, 0), release);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(destination, nullptr);
+    for (DeviceId gpu : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (size_t live : {32u, 12u, 0u, 4u, 0u})
+        {
+            SCOPED_TRACE(gpu.toString());
+            SCOPED_TRACE(live);
+            for (auto method : {TransferMethod::HOST_TO_DEVICE, TransferMethod::DEVICE_TO_HOST,
+                                TransferMethod::HOST_STAGED, TransferMethod::NOOP})
+            {
+                const double h2d = evidence.bytes("h2d_bytes");
+                const double d2h = evidence.bytes("d2h_bytes");
+                TransferRequest request;
+                request.source.host_ptr = host.data();
+                request.source.device_ptr = source.get();
+                request.source.size_bytes = live;
+                request.source.device = gpu;
+                request.target_device = gpu.type == DeviceType::CUDA ? DeviceId::rocm(0) : DeviceId::cuda(0);
+                request.target_ptr = destination.get();
+                request.method = method;
+                // The canonical host boundary omits empty transfers entirely.
+                if (live != 0u) ASSERT_TRUE(engine.execute(request).success);
+                const bool upload = method == TransferMethod::HOST_TO_DEVICE || method == TransferMethod::HOST_STAGED;
+                const bool download = method == TransferMethod::DEVICE_TO_HOST || method == TransferMethod::HOST_STAGED;
+                EXPECT_EQ(evidence.bytes("h2d_bytes") - h2d, upload ? static_cast<double>(live) : 0.0);
+                EXPECT_EQ(evidence.bytes("d2h_bytes") - d2h, download ? static_cast<double>(live) : 0.0);
+            }
+        }
+    }
+}
+
+/** @brief Rejected legs count nothing; an earlier completed staging leg remains observable. */
+TEST_F(Test__TransferEngine_Execute, PhysicalByteEvidencePreservesPartialFailure)
+{
+    ScopedExecuteTransferEvidence evidence;
+    ExecuteLegFailureBackend backend;
+    s_mock_ = &backend;
+    TransferEngine engine(resolver_);
+    std::array<unsigned char, 64> host{};
+    auto release = [&](void *ptr) { backend.free(ptr, 0); };
+    std::unique_ptr<void, decltype(release)> source(backend.allocate(64, 0), release);
+    std::unique_ptr<void, decltype(release)> destination(backend.allocate(64, 0), release);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(destination, nullptr);
+    TransferRequest request;
+    request.source.host_ptr = host.data();
+    request.source.device_ptr = source.get();
+    request.source.size_bytes = 12;
+    request.source.device = DeviceId::cuda(0);
+    request.target_device = DeviceId::rocm(0);
+    request.target_ptr = destination.get();
+    for (auto method : {TransferMethod::HOST_TO_DEVICE, TransferMethod::DEVICE_TO_HOST,
+                        TransferMethod::HOST_STAGED})
+    {
+        request.method = method;
+        backend.reject_upload = true;
+        backend.reject_download = true;
+        EXPECT_FALSE(engine.execute(request).success);
+        EXPECT_EQ(evidence.bytes("h2d_bytes"), 0.0);
+        EXPECT_EQ(evidence.bytes("d2h_bytes"), 0.0);
+    }
+    request.method = TransferMethod::HOST_STAGED;
+    backend.reject_download = false;
+    EXPECT_FALSE(engine.execute(request).success);
+    EXPECT_EQ(evidence.bytes("h2d_bytes"), 0.0);
+    EXPECT_EQ(evidence.bytes("d2h_bytes"), 12.0);
+    EXPECT_EQ(backend.getTransferStats().d2h_bytes, 12u);
+    EXPECT_EQ(backend.getTransferStats().h2d_bytes, 0u);
+    s_mock_ = mock_backend_.get();
+}
+
 
 TEST_F(Test__TransferEngine_Execute, HostToDevice_RecordsTransfer)
 {
@@ -1679,6 +1971,35 @@ protected:
 };
 
 FailableEventMockBackend *Test__TransferEngine_EventFailure::s_failable_mock_ = nullptr;
+
+/** @test A completed pipeline host handoff is consumed without a second physical download. */
+TEST_F(Test__TransferEngine_EventFailure, PipelineHostCopyReusesPublishedLiveRows)
+{
+    TransferEngine engine(resolver_);
+    auto source = createTensorOnDeviceWithEvent();
+    auto destination = TestTensorFactory::createFP32({4, 4});
+    for (int replay = 0; replay < 20; ++replay) {
+        const size_t live = std::array<size_t, 5>{16, 1, 7, 3, 16}[replay % 5];
+        auto *produced = static_cast<float *>(source->gpu_data_ptr());
+        for (size_t index = 0; index < source->numel(); ++index)
+            produced[index] = static_cast<float>(100 * replay + index);
+        TransferEngine::publishDeviceWrite(source, DeviceId::cuda(0), mockProducerStream());
+        std::fill_n(destination->mutable_data(), destination->numel(), -1.0F);
+        const auto before = mock_->getTransferStats();
+        ASSERT_TRUE(engine.transferActivation(source.get(), DeviceId::cpu(), live * sizeof(float)).success);
+        ASSERT_TRUE(source->hostValid());
+        const auto published = mock_->getTransferStats();
+        ASSERT_EQ(published.d2h_count - before.d2h_count, 1u);
+        ASSERT_EQ(published.d2h_bytes - before.d2h_bytes, live * sizeof(float));
+        for (int consume = 0; consume < 2; ++consume) {
+            ASSERT_TRUE(engine.copyActivation(source.get(), destination.get(), DeviceId::cpu(), live * sizeof(float)).success);
+            EXPECT_EQ(mock_->getTransferStats().d2h_count, published.d2h_count);
+            EXPECT_EQ(mock_->getTransferStats().d2h_bytes, published.d2h_bytes);
+            for (size_t index = 0; index < destination->numel(); ++index)
+                EXPECT_EQ(destination->data()[index], index < live ? produced[index] : -1.0F);
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // downloadFull: the host observes bytes only after the exact D2H event.
@@ -2646,16 +2967,12 @@ TEST_F(
             .producer_stage_index = 0,
         }},
     }};
-    GraphCaptureDependencyLedger ledger(
-        DeviceId::cuda(0), capture_stream, std::move(stages), "invalid_order");
-
-    GraphCaptureGuard capture_guard(&ledger);
-    ScopedGraphCaptureStage consumer_scope(&invalid_consumer_stage);
+    // The typed schedule now rejects an impossible dependency at construction,
+    // before capture can begin or any input can be consumed.
     EXPECT_THROW(
-        TransferEngine::requireDeviceInput(
-            tensor.get(), DeviceId::cuda(0), capture_stream),
+        (void)GraphCaptureDependencyLedger(
+            DeviceId::cuda(0), capture_stream, std::move(stages), "invalid_order"),
         std::logic_error);
-    consumer_scope.complete();
 }
 
 TEST_F(
@@ -2751,4 +3068,359 @@ TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitSuccess_Succeeds)
     // Should succeed without needing synchronize fallback
     EXPECT_TRUE(result.success);
     EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+}
+
+/** @test Immutable source bytes are a third exact owner class, never prepared-weight alias slack. */
+TEST(Test__TransferEngine_Reclamation, ImmutableRowTableRetentionIsExactAndOverflowChecked)
+{
+    const ModelDeviceMemoryRetention immutable_only{.device=DeviceId::cuda(0),.immutable_table_bytes=384};
+    EXPECT_TRUE(immutable_only.valid()); EXPECT_EQ(immutable_only.totalBytes(),384u);
+    const ModelDeviceMemoryRetention mixed{.device=DeviceId::cuda(0),.prepared_weight_bytes=300,
+        .reusable_workspace_bytes=64,.immutable_table_bytes=20};
+    EXPECT_TRUE(mixed.valid()); EXPECT_EQ(mixed.totalBytes(),384u);
+    const ModelDeviceMemoryRetention overflow{.device=DeviceId::cuda(0),
+        .prepared_weight_bytes=std::numeric_limits<size_t>::max()-1,
+        .reusable_workspace_bytes=1,.immutable_table_bytes=1};
+    EXPECT_FALSE(overflow.valid()); EXPECT_THROW((void)overflow.totalBytes(),std::overflow_error);
+    ReclamationBackendSpy backend; backend.result=successfulRawReclamationResult();
+    reclamation_backend_spy=&backend; TransferEngine engine(&resolveReclamationBackend);
+    auto over=mixed; ++over.immutable_table_bytes;
+    EXPECT_THROW((void)engine.beginExclusiveModelRetirement(over),std::runtime_error);
+    auto ticket=engine.beginExclusiveModelRetirement(mixed);
+    EXPECT_EQ(ticket.expectedRetiredBytes(),384u);
+    EXPECT_NO_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)));
+    EXPECT_EQ(backend.runtime_reset_calls,1);
+    reclamation_backend_spy=nullptr;
+}
+
+/** @brief One event must cover both a packet and its graph-authored row scalar. */
+TEST_F(Test__TransferEngine_Execute, InputForkAcquiresEveryBoundedSourceBeforeRecording) {
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+    FP32Tensor packet({8}, DeviceId::cpu());
+    INT32Tensor count({1}), foreign_count({1});
+    for (auto *tensor : std::array<TensorBase *,3>{&packet, &count, &foreign_count})
+        tensor->setBackendForTesting(mock_backend_.get());
+    const auto device = DeviceId::cuda(0);
+    auto *producer = reinterpret_cast<void *>(0x1070);
+    auto *consumer = reinterpret_cast<void *>(0x1080);
+    auto *ready = reinterpret_cast<void *>(0x1090);
+    for (auto *tensor : std::array<TensorBase *,3>{&packet, &count, &foreign_count})
+        TransferEngine::prepareDeviceOutput(tensor, device, producer);
+    TransferEngine::publishGraphOwnedDeviceWrite(&packet, device);
+    // Packet ready is insufficient: allocation alone is not count publication.
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count), device, producer, ready), std::runtime_error);
+    // Existing callers retain their original single-source proof.
+    auto single = engine.acquireDeviceInputFork(engine.recordDeviceInputFork(&packet,device,producer,ready),consumer);
+    EXPECT_TRUE(single.includesSource(&packet));
+    EXPECT_FALSE(single.includesSource(&count));
+    TransferEngine::publishGraphOwnedDeviceWrite(&count, device);
+    const auto acquired = engine.acquireDeviceInputFork(engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),device,producer,ready),consumer);
+    EXPECT_TRUE(acquired.valid());
+    EXPECT_EQ(acquired.sourceOwner(), &packet);
+    EXPECT_EQ(acquired.consumerStream(), consumer);
+    EXPECT_TRUE(acquired.includesSource(&packet));
+    EXPECT_TRUE(acquired.includesSource(&count));
+    EXPECT_FALSE(acquired.includesSource(&foreign_count));
+    EXPECT_FALSE(acquired.includesSource(nullptr));
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,packet),device,producer,ready),std::invalid_argument);
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),device,nullptr,ready),std::invalid_argument);
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),DeviceId::cuda(1),producer,ready),std::runtime_error);
+    // No movement is introduced by either fork: only existing event DAG edges.
+    const auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+    EXPECT_EQ(stats.d2d_count, 0u);
+}
+
+/** @brief Native receipt mutation must acquire its existing controller before the packet's same event. */
+TEST_F(Test__TransferEngine_Execute, InputForkRequiresPublishedDistinctControllerObservation) {
+    s_mock_ = mock_backend_.get();TransferEngine engine(resolver_);
+    FP32Tensor packet({8},DeviceId::cpu());INT32Tensor count({1}),controller({72}),foreign({72});
+    const auto device=DeviceId::cuda(0);auto *producer=reinterpret_cast<void *>(0x2070);
+    auto *consumer=reinterpret_cast<void *>(0x2080);auto *ready=reinterpret_cast<void *>(0x2090);
+    for(auto *tensor:std::array<TensorBase *,4>{&packet,&count,&controller,&foreign}) {
+        tensor->setBackendForTesting(mock_backend_.get());TransferEngine::prepareDeviceOutput(tensor,device,producer);
+    }
+    for(auto *tensor:std::array<TensorBase *,3>{&packet,&count,&foreign})
+        TransferEngine::publishGraphOwnedDeviceWrite(tensor,device);
+    // Packet and count are ready; an allocated controller is not publication.
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanionAndObservation(packet,count,controller),device,producer,ready),std::runtime_error);
+    TransferEngine::publishGraphOwnedDeviceWrite(&controller,device);
+    const auto acquire=[&](const auto &sources){return engine.acquireDeviceInputFork(
+        engine.recordDeviceInputFork(sources,device,producer,ready),consumer);};
+    const auto ordinary=acquire(DeviceTransferForkSources::withCompanion(packet,count));
+    EXPECT_FALSE(ordinary.includesSource(&controller));
+    const auto wrong=acquire(DeviceTransferForkSources::withCompanionAndObservation(packet,count,foreign));
+    EXPECT_FALSE(wrong.includesSource(&controller));EXPECT_TRUE(wrong.includesSource(&foreign));
+    const auto exact=acquire(DeviceTransferForkSources::withCompanionAndObservation(packet,count,controller));
+    EXPECT_TRUE(exact.includesSource(&packet));EXPECT_TRUE(exact.includesSource(&count));
+    EXPECT_TRUE(exact.includesSource(&controller));EXPECT_FALSE(exact.includesSource(&foreign));
+    EXPECT_EQ(exact.consumerStream(),consumer);
+    for(auto *alias:std::array<ITensor *,2>{&packet,&count})
+        EXPECT_THROW((void)engine.recordDeviceInputFork(
+            DeviceTransferForkSources::withCompanionAndObservation(packet,count,*alias),device,producer,ready),std::invalid_argument);
+    const auto stats=mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count,0u);EXPECT_EQ(stats.d2h_count,0u);EXPECT_EQ(stats.d2d_count,0u);
+}
+
+namespace
+{
+/** @brief One original allocation token; replay must never revisit its registry. */
+class CapturedStorageBackendSpy final : public MockBackend
+{
+public:
+    explicit CapturedStorageBackendSpy(DeviceType type) : MockBackend(type), type_(type) {}
+    /** @copydoc IBackend::retainNativeAllocation */
+    NativeAllocationCaptureLease retainNativeAllocation(const void *pointer, size_t bytes, int ordinal) override
+    {
+        ++acquisitions;
+        if (sealed) throw std::logic_error("Replay reacquired native allocation registry");
+        return NativeAllocationCaptureLease::acquire(token, base, extent, device_,
+                                                     pointer, bytes, DeviceId(type_, ordinal));
+    }
+    std::shared_ptr<const NativeAllocationCaptureIdentity> token =
+        std::make_shared<NativeAllocationCaptureIdentity>();
+    const void *base = nullptr;
+    size_t extent = 0;
+    int acquisitions = 0;
+    bool sealed = false;
+    inline static IBackend *selected = nullptr;
+    DeviceType type_;
+    DeviceId device_ = DeviceId::invalid();
+};
+
+/** @brief Expose only the mapped/native kind switch for a rejected-binding negative. */
+class CapturedStorageTensor final : public FP32Tensor
+{
+public:
+    CapturedStorageTensor() : FP32Tensor({4, 4}) {}
+    void setMappedKindForNegative(bool mapped) { is_mapped_ = mapped; }
+};
+
+/** @brief Existing FP32 tensor semantics with an explicitly mutable borrowed view identity. */
+class CapturedStorageView final : public FP32Tensor
+{
+public:
+    explicit CapturedStorageView(TensorBase &tensor) : FP32Tensor({4, 4}), owner(&tensor) {}
+    TensorBase *transferStorageOwner() override { return owner; }
+    const TensorBase *transferStorageOwner() const override { return owner; }
+    void *gpu_data_ptr() override { return const_cast<void *>(std::as_const(*this).gpu_data_ptr()); }
+    const void *gpu_data_ptr() const override
+    {
+        return pointer_override ? pointer_override : owner->gpu_data_ptr();
+    }
+    std::optional<DeviceId> current_device() const override
+    {
+        return device_override ? device_override : owner->current_device();
+    }
+    TensorBase *owner;
+    const void *pointer_override = nullptr;
+    std::optional<DeviceId> device_override;
+};
+} // namespace
+
+/** @test Actual TransferEngine replay validates immutable bindings without registry access. */
+void proveCapturedStorageReplay(DeviceId device)
+{
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    CapturedStorageBackendSpy backend(device.type);
+    backend.device_ = device;
+    CapturedStorageBackendSpy::selected = &backend;
+    /** @brief Retire the test resolver on fatal assertions as well as normal exit. */
+    struct SelectionRetirement
+    {
+        ~SelectionRetirement() { CapturedStorageBackendSpy::selected = nullptr; }
+    } selection_retirement;
+    TransferEngine engine([](DeviceId) { return CapturedStorageBackendSpy::selected; });
+    auto tensor = std::make_unique<CapturedStorageTensor>();
+    tensor->setBackendForTesting(&backend);
+    ASSERT_TRUE(engine.upload(tensor.get(), device).success);
+    backend.base = tensor->gpu_data_ptr();
+    backend.extent = tensor->size_bytes();
+    CapturedStorageView view(*tensor);
+    auto lease = engine.retainCapturedDeviceStorage(view, device, 64);
+    ASSERT_EQ(backend.acquisitions, 1);
+    backend.sealed = true;
+    {
+        GraphCaptureGuard capture;
+        for (int replay = 0; replay < 256; ++replay)
+            EXPECT_NO_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64));
+        EXPECT_THROW(engine.retainCapturedDeviceStorage(view, device, 64), std::logic_error);
+    }
+    EXPECT_EQ(backend.acquisitions, 1);
+    EXPECT_THROW(NativeAllocationCaptureLease::requireUnborrowed(backend.token), std::logic_error);
+
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, DeviceId(device.type, 1), 64), std::logic_error);
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 60), std::logic_error);
+    view.pointer_override = static_cast<const std::byte *>(backend.base) + 4;
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    view.pointer_override = nullptr;
+    view.device_override = DeviceId(device.type, 1);
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    view.device_override.reset();
+
+    // Equal bytes/pointer/device cannot authorize a different tensor storage owner.
+    auto foreign = TestTensorFactory::createFP32Ones({4, 4});
+    view.pointer_override = backend.base;
+    view.device_override = device;
+    view.owner = foreign.get();
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    view.owner = tensor.get();
+    tensor->setMappedKindForNegative(true);
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    tensor->setMappedKindForNegative(false);
+    CapturedStorageBackendSpy other(device.type);
+    CapturedStorageBackendSpy::selected = &other;
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    CapturedStorageBackendSpy::selected = &backend;
+    EXPECT_EQ(backend.acquisitions, 1);
+    EXPECT_EQ(other.acquisitions, 0);
+    CapturedStorageBackendSpy::selected = nullptr;
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    CapturedStorageBackendSpy::selected = &backend;
+    EXPECT_NO_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64));
+    EXPECT_EQ(backend.acquisitions, 1);
+    CapturedStorageBackendSpy::selected = nullptr;
+    lease.reset();
+    EXPECT_NO_THROW(NativeAllocationCaptureLease::requireUnborrowed(backend.token));
+}
+
+/** @test CUDA replay preserves its original native allocation authority without registry reads. */
+TEST(TransferCapturedStorageReplay, CUDAOneColdBorrowAndConstantRegistryFreeValidation)
+{
+    proveCapturedStorageReplay(DeviceId::cuda(0));
+}
+
+/** @test ROCm replay obeys the same original-allocation and stale-binding contract. */
+TEST(TransferCapturedStorageReplay, ROCmOneColdBorrowAndConstantRegistryFreeValidation)
+{
+    proveCapturedStorageReplay(DeviceId::rocm(0));
+}
+
+namespace
+{
+    /** @brief Deferred fake DMA proves that cold metadata owns its source through exact completion. */
+    class ColdMetadataBackend final : public MockBackend
+    {
+    public:
+        explicit ColdMetadataBackend(DeviceType type):MockBackend(type) {}
+        inline static ColdMetadataBackend *selected=nullptr,*foreign_selected=nullptr;
+        inline static DeviceId expected=DeviceId::invalid();
+        std::vector<std::string> order;
+        bool fail_create=false,fail_upload=false,fail_record=false,fail_wait=false;
+        const void *source=nullptr;void *destination=nullptr;size_t bytes=0;
+        std::function<void()> before_completion;
+        void *createEvent(int device) override {
+            order.push_back("create");return fail_create?nullptr:MockBackend::createEvent(device);
+        }
+        bool hostToDeviceOnStream(void *dst,const void *src,size_t count,int,void *stream) override {
+            EXPECT_EQ(stream,mockProducerStream());order.push_back("upload");
+            destination=dst;source=src;bytes=count;return !fail_upload;
+        }
+        bool recordEvent(void *event,int device,void *stream) override {
+            EXPECT_EQ(stream,mockProducerStream());order.push_back("record");
+            return !fail_record && MockBackend::recordEvent(event,device,stream);
+        }
+        bool waitForEvent(void *event,int device) override {
+            order.push_back("wait");if(before_completion)before_completion();
+            if(fail_wait)return false;
+            std::memcpy(destination,source,bytes);return MockBackend::waitForEvent(event,device);
+        }
+        void destroyEvent(void *event,int device) override {
+            order.push_back("destroy");MockBackend::destroyEvent(event,device);
+        }
+        bool synchronize(int) override { ADD_FAILURE()<<"Cold metadata must use its exact completion event";return false; }
+    };
+    /** @brief Bound function-pointer resolvers retire even after a fatal test assertion. */
+    struct ColdMetadataSelection final
+    {
+        ColdMetadataBackend *prior,*prior_foreign;
+        DeviceId prior_device;
+        ColdMetadataSelection(ColdMetadataBackend &backend,DeviceId device,ColdMetadataBackend *foreign=nullptr)
+            :prior(ColdMetadataBackend::selected),prior_foreign(ColdMetadataBackend::foreign_selected),
+             prior_device(ColdMetadataBackend::expected)
+        {
+            ColdMetadataBackend::selected=&backend;ColdMetadataBackend::foreign_selected=foreign;
+            ColdMetadataBackend::expected=device;
+        }
+        ~ColdMetadataSelection() {
+            ColdMetadataBackend::selected=prior;ColdMetadataBackend::foreign_selected=prior_foreign;
+            ColdMetadataBackend::expected=prior_device;
+        }
+    };
+}
+
+/** @test Both native backend shapes copy only admitted metadata after capture exclusion and exact completion. */
+TEST(TransferColdDeviceMetadata, ExactOwnerBoundsAndSourceLifetimeReplay)
+{
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm}) {
+        ColdMetadataBackend backend(type),other(type);
+        const DeviceId device{type,7};
+        ColdMetadataSelection selection(backend,device,&other);
+        TransferEngine engine([](DeviceId actual)->IBackend*{
+            EXPECT_EQ(actual,ColdMetadataBackend::expected);return ColdMetadataBackend::selected;
+        });
+        auto destination=engine.allocateDeviceTransferBuffer(32,device);
+        std::memset(destination->mutableDeviceData(),0xa5,32);
+        std::array<std::byte,8> source{};source.fill(std::byte{0x39});
+        backend.before_completion=[&]{
+            EXPECT_EQ(source.front(),std::byte{0x39});
+            EXPECT_EQ(static_cast<const uint8_t*>(destination->deviceData())[8],0xa5);
+        };
+        engine.initializeDeviceMetadata(*destination,8,source,mockProducerStream());
+        EXPECT_EQ(backend.order,(std::vector<std::string>{"create","upload","record","wait","destroy"}));
+        source.fill(std::byte{0});
+        const auto *result=static_cast<const uint8_t*>(destination->deviceData());
+        for(size_t i=0;i<32;++i)EXPECT_EQ(result[i],i>=8 && i<16?0x39:0xa5);
+        backend.order.clear();
+        for(const auto stream:std::array<void*,3>{nullptr,reinterpret_cast<void*>(1),reinterpret_cast<void*>(2)})
+            EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,stream),std::invalid_argument);
+        EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,{},mockProducerStream()),std::invalid_argument);
+        EXPECT_THROW(engine.initializeDeviceMetadata(*destination,25,source,mockProducerStream()),std::invalid_argument);
+        EXPECT_THROW(engine.initializeDeviceMetadata(*destination,SIZE_MAX,source,mockProducerStream()),std::invalid_argument);
+        {GraphCaptureGuard capture;EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::invalid_argument);}
+        TransferEngine foreign([](DeviceId actual)->IBackend*{
+            EXPECT_EQ(actual,ColdMetadataBackend::expected);return ColdMetadataBackend::foreign_selected;
+        });
+        EXPECT_THROW(foreign.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::logic_error);
+        // Invalid/unbound device storage cannot be returned by the public factory.
+        EXPECT_THROW(engine.allocateDeviceTransferBuffer(8,DeviceId::cpu()),std::invalid_argument);
+        TransferEngine missing([](DeviceId)->IBackend*{return nullptr;});
+        EXPECT_THROW(missing.allocateDeviceTransferBuffer(8,device),std::runtime_error);
+        EXPECT_TRUE(backend.order.empty());EXPECT_TRUE(other.order.empty());
+    }
+}
+
+/** @test Rejected enqueue cleans up; accepted enqueue cannot unwind live source bytes after lost completion. */
+TEST(TransferColdDeviceMetadata, FailedCompletionCannotReleaseAcceptedSource)
+{
+    ColdMetadataBackend backend(DeviceType::CUDA);
+    ColdMetadataSelection selection(backend,DeviceId::cuda(7));
+    TransferEngine engine([](DeviceId actual)->IBackend*{
+        EXPECT_EQ(actual,ColdMetadataBackend::expected);return ColdMetadataBackend::selected;
+    });
+    auto destination=engine.allocateDeviceTransferBuffer(16,DeviceId::cuda(7));
+    const std::array<std::byte,8> source{};
+    backend.fail_create=true;
+    EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::runtime_error);
+    EXPECT_EQ(backend.order,(std::vector<std::string>{"create"}));
+    backend.fail_create=false;backend.fail_upload=true;backend.order.clear();
+    EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::runtime_error);
+    EXPECT_EQ(backend.order,(std::vector<std::string>{"create","upload","destroy"}));
+    for(bool fail_record:{false,true}) {
+        EXPECT_EXIT({
+            std::set_terminate([]{std::_Exit(77);});
+            struct SourceScope { ~SourceScope(){std::_Exit(88);} } retained_source;
+            backend.fail_upload=false;backend.fail_record=fail_record;backend.fail_wait=!fail_record;
+            engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream());
+            std::_Exit(99);
+        },::testing::ExitedWithCode(77),"");
+    }
 }

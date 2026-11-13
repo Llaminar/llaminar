@@ -70,6 +70,7 @@ namespace llaminar2
                 params_.request_row_capacity,
                 params_.bucket_seq_len,
                 params_.pad_token_id,
+                params_.require_exact_rows,
                 params_.device_id.gpu_ordinal(),
                 stream,
                 params_.chunk_token_ids_device,

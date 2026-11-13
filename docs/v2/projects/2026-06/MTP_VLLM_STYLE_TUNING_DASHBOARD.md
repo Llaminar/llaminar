@@ -1,9 +1,28 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Current qualification frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)).
-This dashboard stays below 200 lines. Older measurements and investigations are
-preserved in [the October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md)
-and [the project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
+Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep below 200 lines and 15,000 bytes;
+history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
+
+GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip,
+post-packaging Unit782/782 and five loader checks pass. Matched Qwen3.6 ROCm
+decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter
+batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
+The incoming branch's 1,362 gates, 13 model cells and +1.9/+5.5/+5.9% depth-2/3/4 decode
+results compare against older develop, with changed work; they do not qualify this merge.
+Historical CPU scope and prefill cost: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
+
+## Active QFN frontier — 2026-10-28
+
+The user accepted the confirmation controller as the QFN ROCm TP4 default;
+speed misses remain diagnostic. Current repetition benchmark: dynamic 101.05
+decode tok/s, fresh Off 43.40, dated Castagna 98.16; token IDs agree.
+R13 Unit/preflight passes 2,978 tests with 29 hardware skips. Post-audit Unit
+passes 786/786; nine HTTP modes pass. The ten-phase OpenCode app completes with
+128 tool calls, two errors, 65 app tests and independent acceptance passing.
+Native-token and archive-auditor repairs pass focused regressions. The original
+app aggregate remains red for an unresolved AMDGPU USERPTR workqueue warning
+and cannot retroactively certify its reclaimed archive. Full certification is open.
+[Live plan](../2026-10/QFN_MTP_TP4_TUNING.md). Historical hybrid results do not qualify QFN.
 
 ## Completed evidence
 
@@ -62,24 +81,14 @@ post-run artifact collector rejected the stage-scoped movement schema. The
 server retired normally with clean driver diagnostics; the preserved native
 evidence passes after correcting the collector. MoE timing was not started.
 
-## Current r39 qualification
+## Historical r39 qualification
 
-The movement-artifact reader and prefix-epoch observer now preserve every PP
-stage. Their focused cases, old-code negative controls and matching builds pass.
-r39 completed 1,682 passed tests and 26 hardware skips, with no test failures;
-its driver audit failed on one archived MI50 `SetWorkloadMask` firmware message.
-All 100 targeted follow-up executions passed with clean driver windows and
-complete retirement. The user waived only that archived firmware finding for
-local progress; later driver checks remain mandatory. Fresh dense/MoE smoke
-passed at context 262,144 with dynamic MTP, emoji and full/partial prefix reuse.
-r39 benchmark medians were dense 692.26/33.25 and MoE 1,661.09/182.49 prefill/decode
-tokens/s. The native processes retired normally with clean driver diagnostics.
-The corrected benchmark reader admits unused prepared buckets while proving all
-consumed rows; its old-reader negative control and twelve corruption variants
-pass. No inference source changed or benchmark was rerun for that reader fix.
-The resource observer originally rejected a valid MiB DRM mapping. r90 integrates
-explicit binary-unit parsing, 53 passing scope/resource tests and its focused
-preflight entry without repeating the app sessions.
+r39 passed 1,682 tests with 26 hardware skips. The user waived one archived MI50
+firmware finding only; 100 follow-ups and later driver windows were clean.
+Dense/MoE smoke passed at context 262,144 with dynamic MTP and prefix reuse.
+Prefill/decode medians: dense 692.26/33.25, MoE 1,661.09/182.49 tokens/s.
+The project plan retains movement, benchmark-reader and MiB-observer repair
+evidence. Those collector repairs did not require repeating the app sessions.
 
 ## Remaining gates
 

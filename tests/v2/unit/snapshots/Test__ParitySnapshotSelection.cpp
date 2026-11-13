@@ -79,3 +79,5 @@ namespace llaminar2::test::parity
         EXPECT_FALSE(selection.requires_post_collective_key);
     }
 } // namespace llaminar2::test::parity
+
+#include "CPUJointSnapshotOwnershipContract.inc"

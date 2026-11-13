@@ -21,6 +21,8 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 #include <mpi.h>
@@ -783,6 +785,10 @@ TEST_F(Test__CollectiveSingleRank, TrivialDomainSkipsCollective)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
@@ -794,6 +800,7 @@ int main(int argc, char **argv)
     int result = RUN_ALL_TESTS();
 
     // Finalize MPI
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
 
     return result;

@@ -18,6 +18,7 @@
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "collective/ITPContext.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../../utils/CPURouterKernelTestAdmission.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockMPIContext.h"
@@ -947,6 +948,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
         gate[index] = static_cast<float>(static_cast<int>(index % 17u) - 8) * 0.015625f;
 
     CPUMoEKernel transported_kernel;
+    llaminar2::test::admitCPURouterKernelForTest(transported_kernel,rows,d_model);
     ASSERT_TRUE(transported_kernel.publishTransportedRouterQ8Hidden(
         hidden.data(), rows, d_model));
     const Q8_1Block *const transported =
@@ -955,6 +957,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     ASSERT_NE(transported, nullptr);
 
     CPUMoEKernel routed_kernel;
+    llaminar2::test::admitCPURouterKernelForTest(routed_kernel,rows,d_model);
     MoERoutingResult routing;
     ASSERT_TRUE(routed_kernel.route(
         hidden.data(),
@@ -980,6 +983,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     std::vector<Q8_1Block> serial_rows(
         static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
     CPUMoEKernel serial_kernel;
+    llaminar2::test::admitCPURouterKernelForTest(serial_kernel,1,d_model);
     for (int row = 0; row < rows; ++row)
     {
         const float *const source =
@@ -1026,12 +1030,20 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
         expert_major_source_rows.size() *
         static_cast<size_t>(blocks_per_row));
     CPUMoEKernel expert_major_kernel;
+    const std::array<int, 5> compact_sources{0, 1, 7, 12, rows - 1};
+    const std::array<int, 10> original_routes{1, -1, 5, -1, 2, 3, 4, -1, 0, -1};
+    const std::array<int, 6> inverse_routes{0, 1, 2, 3, 4, 5};
+    std::array<int, 6> retired_permutation{0, 1, 2, 3, 4, 5};
+    const auto publication_schedule = CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
+        expert_major_source_rows, retired_permutation, original_routes, inverse_routes, 2,
+        std::span<const int>(compact_sources), rows);
+    ASSERT_TRUE(publication_schedule);
     ASSERT_TRUE(
         expert_major_kernel.publishTransportedRouterQ8HiddenExpertMajor(
             hidden.data(),
             rows,
             d_model,
-            expert_major_source_rows,
+            *publication_schedule,
             expert_major));
     for (size_t output_row = 0;
          output_row < expert_major_source_rows.size();
@@ -1052,20 +1064,19 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
             << output_row;
     }
 
-    const std::vector<int> invalid_source_rows = {0, rows};
     EXPECT_FALSE(
         expert_major_kernel.publishTransportedRouterQ8HiddenExpertMajor(
             hidden.data(),
-            rows,
+            rows - 1,
             d_model,
-            invalid_source_rows,
+            *publication_schedule,
             expert_major));
     EXPECT_FALSE(
         expert_major_kernel.publishTransportedRouterQ8HiddenExpertMajor(
             hidden.data(),
             rows,
             d_model,
-            expert_major_source_rows,
+            *publication_schedule,
             std::span<Q8_1Block>(expert_major.data(), 1u)));
 }
 

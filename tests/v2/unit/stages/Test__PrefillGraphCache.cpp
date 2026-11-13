@@ -2484,3 +2484,67 @@ TEST_F(PrefillGraphCacheGPUTest, NodeCount_ZeroForEmptyCapture)
 }
 
 #endif // HAVE_ROCM || HAVE_CUDA
+
+/** @test Exact fixed-pipeline widths tile the immutable suffix and price every retained owner. */
+TEST(Test__PrefillGraphCache, ExactFixedPipelineWidthScheduleReplay)
+{
+    constexpr auto exact = PrefillChunkWidthPolicy::ExactRetained;
+    EXPECT_EQ(exactPrefillGraphWidths(1), (std::vector<int>{1}));
+    EXPECT_EQ(exactPrefillGraphWidths(384),
+        (std::vector<int>{1, 2, 4, 8, 16, 32, 64, 128, 256, 384}));
+    EXPECT_EQ(exactPrefillGraphWidths(513),
+        (std::vector<int>{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 513}));
+    EXPECT_EQ(exactPrefillGraphCacheEntries(384), 12u);
+    EXPECT_EQ(exactPrefillGraphCacheEntries(513, 13), 13u);
+    EXPECT_EQ(exactPrefillGraphCacheEntries(513, 20), 13u);
+    EXPECT_THROW((void)exactPrefillGraphCacheEntries(513, 12), std::invalid_argument);
+    EXPECT_THROW((void)exactPrefillGraphCacheEntries(0), std::invalid_argument);
+
+    const auto replay = [&](int maximum, int first, const std::vector<int> &expected) {
+        int logical_rows = 0;
+        for (const int width : expected) logical_rows += width;
+        const auto widths = exactPrefillGraphWidths(maximum);
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(widths, first, logical_rows, exact);
+        const auto schedule = planPrefillChunkSchedule(policy);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), expected.size());
+        int frontier = first;
+        for (std::size_t index = 0; index < expected.size(); ++index)
+        {
+            const auto &chunk = schedule.chunks[index];
+            EXPECT_EQ(chunk.chunk_index, index);
+            EXPECT_EQ(chunk.token_offset, frontier);
+            EXPECT_EQ(chunk.real_count, expected[index]);
+            EXPECT_EQ(chunk.bucket_seq_len, expected[index]);
+            EXPECT_TRUE(std::binary_search(widths.begin(), widths.end(), chunk.bucket_seq_len));
+            frontier += chunk.real_count;
+        }
+        EXPECT_EQ(frontier, first + logical_rows);
+    };
+    for (int request = 0; request < 4; ++request)
+    {
+        SCOPED_TRACE(request);
+        replay(384, 0, {384, 384});
+        replay(384, 311, {384, 128, 1});
+        replay(513, 0, {513, 512});
+        replay(513, 73, {513, 256, 32, 1});
+        replay(513, 311, {});
+        replay(513, 0, {1});
+    }
+
+    const std::vector<std::vector<int>> malformed_widths{
+        {1, 4, 8}, {1, 2, 2, 4, 8}, {0, 1, 2, 4, 8}, {2, 1, 4, 8}};
+    for (const auto &widths : malformed_widths)
+    {
+        const auto malformed = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(widths, 9, 3, exact);
+        EXPECT_FALSE(planPrefillChunkSchedule(malformed));
+    }
+    auto malformed = PrefillChunkSchedulerPolicy::forRetainedBucketFamily({1, 2, 4, 8}, 9, 3, exact);
+    malformed.fixed_chunk_real_tokens = 8;
+    EXPECT_FALSE(planPrefillChunkSchedule(malformed));
+    const auto ordinary = planPrefillChunkSchedule(
+        PrefillChunkSchedulerPolicy::forRetainedBucketFamily({2, 0, 1, 4, 8, 2}, 9, 3));
+    ASSERT_TRUE(ordinary);
+    ASSERT_EQ(ordinary.chunks.size(), 1u);
+    EXPECT_EQ(ordinary.chunks.front().bucket_seq_len, 4);
+}

@@ -43,6 +43,9 @@ namespace llaminar2
         int main_gdn_layers = 0;
         int mtp_full_attention_layers = 0;
         int mtp_gdn_layers = 0;
+        /** QSA-only auxiliary owners, separate from dense/full-attention KV owners. */
+        int main_sparse_attention_layers = 0;
+        int mtp_sparse_attention_layers = 0;
 
         /** @return All non-KV persistent contributions; the physical authority admits them. */
         size_t stateBytes() const noexcept

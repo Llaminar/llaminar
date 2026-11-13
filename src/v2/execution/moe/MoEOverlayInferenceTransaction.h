@@ -22,17 +22,37 @@
 
 #include "MoEOverlayActivationEpochABI.h"
 #include "MoEOverlayInferenceInterferenceProbe.h"
+#include "execution/mtp/MTPConditionForwardPurpose.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 namespace llaminar2
 {
+    class MoEOverlayInferenceOriginalSlotDomain;
+    class MoEOverlayInferenceOriginalSlot;
+
+    /**
+     * @brief Passive completed identity of one finite original host-placement scope.
+     *
+     * Sequence IDs are the original coordinator's monotonic IDs. Their half-open
+     * interval contains only fully retired descendants; no independent epoch or
+     * completion counter is maintained. This value cannot admit execution.
+     */
+    struct MoEOverlayInferencePlacementScopeObservation final
+    {
+        std::uint64_t placement_epoch = 0; ///< Original live parent epoch.
+        std::uint64_t first_sequence_id = 0; ///< First original descendant ID.
+        std::uint64_t next_sequence_id = 0; ///< Exclusive end after terminal proof.
+    };
+
     class MoEExpertOwnerMap;
     class IModelLoader;
 
@@ -58,6 +78,22 @@ namespace llaminar2
         Complete = 2, ///< Close the current outer inference command successfully.
         Abort = 3, ///< Close the command fatally with a positive error code.
     };
+
+    /**
+     * @brief Name one exact retained scalar MTP condition, independent of row count.
+     * @param purpose Original public condition ownership passed to the tail runner.
+     * @return The only matching fixed-ticket graph role.
+     * @throws std::invalid_argument For an unknown condition purpose.
+     */
+    [[nodiscard]] MoEOverlayInferenceGraphRole moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose purpose);
+
+    /**
+     * @brief Recover the original retained condition purpose from an authenticated role.
+     * @param role Explicit condition role; MainDecode remains ordinary decode.
+     * @return The matching original public condition policy.
+     * @throws std::invalid_argument For ordinary, verifier, sidecar or unknown roles.
+     */
+    [[nodiscard]] MTPConditionForwardPurpose moeOverlayPipelineConditionForwardPurpose(MoEOverlayInferenceGraphRole role);
 
     /**
      * @brief Fixed command-ring capacity for one retained MTP graph family.
@@ -183,18 +219,64 @@ namespace llaminar2
         int target_world_rank);
 
     /**
+     * @brief Bind one original rank-local continuation to its expert endpoints.
+     * @param owner_map Complete frozen placement authority.
+     * @param graph_family Existing admitted main/MTP graph family.
+     * @param source_participant_id Actual continuation participant identifier.
+     * @param target_participant_ids Strictly ordered non-continuation endpoints.
+     * @return Existing transaction identity with the same real rank at both ends.
+     * @throws std::invalid_argument for missing, foreign, or duplicate endpoints.
+     *
+     * This construction does not create an MPI follower or confer native
+     * submission permission. The original Rank owner retains admission and all
+     * endpoint terminals; distributed channel constructors still require two
+     * different world ranks.
+     */
+    [[nodiscard]] MoEOverlayInferenceTopologyIdentity
+    makeMoEOverlayRankLocalInferenceTopologyIdentity(
+        const MoEExpertOwnerMap &owner_map,
+        const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
+        int source_participant_id,
+        std::span<const int> target_participant_ids);
+
+    /**
+     * @brief Authority authenticating placement in a retained transaction.
+     *
+     * ResidencyEpoch requires a real positive host-observed residency epoch.
+     * RetainedGraph carries zero: immutable dense/static placement is authenticated by
+     * the topology/workspace, while graph-stable MoE authenticates its actual
+     * live residency ticket inside the original device activation protocol.
+     * ControllerPlacementEpoch names the existing participant-local controller
+     * and its applied mask/replica version; its real initial value can be zero.
+     * Zero alone never selects either authority.
+     */
+    enum class MoEOverlayInferencePlacementIdentityKind : std::uint32_t
+    {
+        ResidencyEpoch = 0, ///< Positive original residency authority observation.
+        RetainedGraph = 1, ///< Frozen graph authority; no host residency observation.
+        ControllerPlacementEpoch = 2, ///< Existing participant controller; initial zero is valid.
+    };
+
+    /**
      * @brief Dynamic identity of one root-published outer inference command.
      *
      * `request_generation` changes on request reset. `command_id` increases for
      * every prefill/decode command inside that request. `initial_placement_epoch`
-     * is the first RCU residency epoch the command may acquire; later execution
-     * tickets may name a newer published epoch, but never an older one.
+     * is the first RCU residency epoch the command may acquire in ResidencyEpoch
+     * mode; later execution tickets may name a newer published epoch, never an
+     * older one. ControllerPlacementEpoch uses the original participant's
+     * canonical placement version, including initial zero. RetainedGraph mode
+     * requires zero and authenticates frozen placement through topology/workspace.
+     * Original pipeline commands name the terminal source's ordering authority;
+     * independent stages retain their own exact capture/workspace identities.
      */
     struct MoEOverlayInferenceCommandIdentity
     {
         std::uint64_t request_generation = 0;
         std::uint64_t command_id = 0;
         std::uint64_t initial_placement_epoch = 0;
+        MoEOverlayInferencePlacementIdentityKind placement_identity_kind =
+            MoEOverlayInferencePlacementIdentityKind::ResidencyEpoch; ///< Explicit zero-epoch authority.
 
         /** @return Whether this identity can open a transaction sequence. */
         [[nodiscard]] bool valid() const noexcept;
@@ -215,7 +297,9 @@ namespace llaminar2
     struct MoEOverlayInferenceTransactionTicket
     {
         static constexpr std::uint32_t kMagic = 0x54494F4Du; // "MOIT"
-        static constexpr std::uint32_t kABIVersion = 4u;
+        // Version 7 authenticates placement authority in the former reserved word.
+        // Earlier tickets cannot distinguish retained placement from a missing epoch.
+        static constexpr std::uint32_t kABIVersion = 7u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -271,7 +355,8 @@ namespace llaminar2
         std::int32_t prefill_schedule_real_rows = 0;
         std::int32_t prefill_schedule_execution_rows = 0;
         std::int32_t prefill_schedule_transaction_count = 0;
-        std::int32_t prefill_schedule_reserved = 0;
+        MoEOverlayInferencePlacementIdentityKind placement_identity_kind =
+            MoEOverlayInferencePlacementIdentityKind::ResidencyEpoch; ///< Authenticated placement authority.
         std::uint64_t prefill_schedule_fingerprint = 0;
 
         /** @return Model-lifetime topology identity carried by this ticket. */
@@ -425,6 +510,14 @@ namespace llaminar2
          * @throws std::invalid_argument for an invalid topology or capacity.
          */
         explicit MoEOverlayInferenceTransactionProtocol(Config config);
+        /** @brief Withdraw native resource borrowing before original slot storage dies. */
+        ~MoEOverlayInferenceTransactionProtocol();
+        // This instance is the sole original slot owner retained by native
+        // resource domains. Copying or relocating it would fork that authority.
+        MoEOverlayInferenceTransactionProtocol(const MoEOverlayInferenceTransactionProtocol &) = delete;
+        MoEOverlayInferenceTransactionProtocol &operator=(const MoEOverlayInferenceTransactionProtocol &) = delete;
+        MoEOverlayInferenceTransactionProtocol(MoEOverlayInferenceTransactionProtocol &&) = delete;
+        MoEOverlayInferenceTransactionProtocol &operator=(MoEOverlayInferenceTransactionProtocol &&) = delete;
 
         /**
          * @brief Open one root-published command at its initial placement epoch.
@@ -496,6 +589,23 @@ namespace llaminar2
             return slots_.size();
         }
 
+        /**
+         * @brief Bind native resources to this original immutable slot roster.
+         * @return Cold shared domain whose count is the actual protocol slot count.
+         * @throws std::logic_error If a copied/moved protocol aliases another owner.
+         */
+        [[nodiscard]] std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>
+        originalSlotDomain() const;
+
+        /**
+         * @brief Name only an exact accepted and submitted original native slot.
+         * @param ticket Original publication retained by this protocol.
+         * @return Checked immutable slot token, without a hot allocation or new admission.
+         * @throws std::invalid_argument If the ticket is absent, unsubmitted or stale.
+         */
+        [[nodiscard]] MoEOverlayInferenceOriginalSlot originalSubmittedSlot(
+            const MoEOverlayInferenceTransactionTicket &ticket) const;
+
         /** @return Immutable model/topology identity authenticated by this protocol. */
         [[nodiscard]] const MoEOverlayInferenceTopologyIdentity &
         topologyIdentity() const noexcept
@@ -504,6 +614,7 @@ namespace llaminar2
         }
 
     private:
+        friend class MoEOverlayInferenceOriginalSlotDomain;
         /** @brief Fixed metadata owned by one registered transport slot. */
         struct Slot
         {
@@ -526,6 +637,7 @@ namespace llaminar2
 
         Config config_;
         std::vector<Slot> slots_;
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> original_slot_domain_; ///< Cold immutable resource identity of THIS protocol roster.
         MoEOverlayInferenceProtocolState state_ =
             MoEOverlayInferenceProtocolState::Idle;
         MoEOverlayInferenceCommandIdentity active_command_{};

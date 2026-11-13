@@ -13,12 +13,29 @@
 #include "backends/CPUExecutionGeometry.h"
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/WeightMemoryEstimator.h"
 #include "kernels/attention/AttentionExecutionPolicy.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include <cstddef>
 #include <optional>
+#include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 
 namespace llaminar2
 {
+class MoEExpertProjectionOwnership;
+class PlanningTensorIndex;
+/** @brief Every environment-selected arithmetic/attention input consumed by canonical workspace quoting. */
+struct WorkspacePlanningPolicy {
+    GDNProjectionArithmetic gdn_projection_arithmetic;
+    MoERouterArithmetic moe_router_arithmetic;
+    int cuda_fa2_q_warp_groups, cuda_fa2_hd256_pv_warps, cuda_fa2_tile_kv;
+    /** @return Current public policy snapshot; query bodies never reread global selectors. */
+    static WorkspacePlanningPolicy current();
+    bool operator==(const WorkspacePlanningPolicy &) const = default;
+};
 
 /**
  * @brief Immutable graph and device geometry used by workspace admission.
@@ -30,6 +47,7 @@ namespace llaminar2
  */
 struct WorkspaceMemoryGeometry
 {
+    std::shared_ptr<const PlanningTensorIndex> source_tensor_index; ///< Exact immutable source owner, never another ledger.
     DeviceId device = DeviceId::invalid(); ///< Participant being admitted.
     /**
      * CUDA SMs, ROCm CUs, or configured physical-core CPU workers.
@@ -37,7 +55,9 @@ struct WorkspaceMemoryGeometry
      */
     int device_compute_units = 0;
     CPUExecutionGeometry cpu_execution; ///< Exact participant cache/ISA observation for CPU admission.
-    int batch_size = 1; ///< Maximum simultaneously admitted requests.
+    int batch_size = 1; ///< Ordinary/prefill graph batch, independent of verifier request capacity.
+    /** Maximum authored ordinary output demand; independent of retained MTP. */
+    OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
     int max_context_rows = 1; ///< Stable KV-cache capacity in token rows.
     bool owns_embedding = false; ///< Participant publishes token-ID state.
@@ -54,11 +74,19 @@ struct WorkspaceMemoryGeometry
     int first_layer = 0; ///< First model layer owned by this participant.
     int last_layer = -1; ///< Last model layer owned by this participant.
     int total_shards = 1; ///< Tensor-parallel degree for local dimensions.
+    /**
+     * Original native LocalTP prefill-to-replicated-decode handoff. Presence
+     * comes from the continuation's explicit phase policy, local collective and
+     * linked primary assignment; full maximum workspace widths never infer it.
+     * Its named per-layer banks coexist with ordinary scratch and are separate
+     * from kernel-owned live recurrent state. CPU/non-native/no-prefill is absent.
+     */
+    std::optional<gdn_live_state_workspace::Geometry> gdn_live_state_handoff;
     bool apportioned_routed_experts = false; ///< Experts are whole-owner slices, not TP slices.
     /**
      * @brief Whether backend dispatch may be queried on this local device.
      *
-     * CUDA NativeVNNI prefill scratch depends on the launch policy selected
+     * CUDA NativeQuantised prefill scratch depends on the launch policy selected
      * for the concrete GPU. Metadata-only and remote-device estimates leave
      * this false and retain the conservative device-free envelope. Runtime
      * admission sets it only after the local backend context exists, allowing
@@ -72,6 +100,24 @@ struct WorkspaceMemoryGeometry
      * Zero means no MTP graph family is materialized on this participant.
      */
     int mtp_target_query_rows = 0;
+    /**
+     * Exact generation request capacity from DevicePlanConfig, independent of
+     * the prefill batch. GPU verifier flat rows must partition it exactly.
+     */
+    int generation_request_capacity = 1;
+    /**
+     * Explicit typed GPU retained workspace contribution for prerequisite
+     * planning/tests. Production builders leave this absent until one shared
+     * stage/planner policy is qualified; absence retains legacy row snapshots.
+     * This is not a CLI policy, inferred fallback or second geometry ledger.
+     */
+    std::optional<gdn_workspace::GPURetainedRecurrenceWorkspace> gpu_gdn_retention;
+    /**
+     * Exact admitted dense/cache layout of an authenticated QFN predictor.
+     * Null preserves existing non-QFN pricing; QFN MTP requires this value
+     * before any BOM contribution. Source presence never implies replication.
+     */
+    std::optional<MTPShiftedKVHeadLayout> mtp_dense_layout;
     /** Terminal projection ownership retained by the MTP graph family. */
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
@@ -93,11 +139,37 @@ struct WorkspaceMemoryGeometry
     TensorType attention_kv_format = TensorType::FP32; ///< Actual native attention operands.
     attention::AttentionVisibilityPolicy attention_visibility =
         attention::AttentionVisibilityPolicy::General; ///< Model schema's immutable visibility.
+    /// Frozen QFN HC-up arithmetic, shared with exact stage workspace declarations.
+    QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+    /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
+    QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
+    QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
+    QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /** Actual graph-owned global source uses, projected from the same weight BOM.
+     * Retained verifier rows do not grant an earlier PP stage a predictor or head.
+     * Standalone callers retain the historical complete-model scope explicitly. */
+    WeightComponentScope weight_components = WeightComponentScope::EmbeddingAndTerminal;
+
+    WorkspacePlanningPolicy planning_policy = WorkspacePlanningPolicy::current();
+    bool operator==(const WorkspaceMemoryGeometry &) const = default;
 };
 
 class WorkspaceMemoryEstimator
 {
 public:
+    /**
+     * @brief Project a source operand onto the declared graph's workspace consumers.
+     * @param tensor Canonical tensor role and model-global source layer.
+     * @param profile Complete metadata, including dormant or other-stage sources.
+     * @param geometry Actual main interval, global component scope and retained row geometry.
+     * @return Whether this graph constructs a workspace consumer of the source.
+     * @throws std::invalid_argument For an invalid global component scope.
+     */
+    [[nodiscard]] static bool ownsProjectionSource(const TensorSizeInfo &tensor,
+        const ModelMemoryProfile &profile, const WorkspaceMemoryGeometry &geometry);
+
     /**
      * @brief Estimate dense kernel workspace from explicit dimensions.
      *
@@ -149,6 +221,26 @@ public:
         const WorkspaceMemoryGeometry& geometry);
 
     /**
+     * @brief Live calibration envelope for one original resident GPU expert.
+     * @param profile Original stacked expert metadata; its expert count is not rewritten.
+     * @param geometry Exact physical device and owned model-layer interval.
+     * @return Shared named workspace for the actual decode/prefill/verifier probe rows.
+     * @throws std::invalid_argument For incomplete source metadata or a non-GPU owner.
+     */
+    static size_t estimatePreparedExpertService(
+        const ModelMemoryProfile& profile,
+        const WorkspaceMemoryGeometry& geometry);
+
+    /**
+     * @brief Compile the fixed decode/prefill startup witness with the live kernel formulas.
+     * @param profile Original source expert projection metadata.
+     * @param geometry Exact GPU owner and owned source-layer interval.
+     * @return Stable-name workspace union for the two measured startup phases.
+     * @throws std::invalid_argument For missing expert metadata or a non-GPU owner.
+     */
+    static size_t estimateStartupExpertService(const ModelMemoryProfile &profile,const WorkspaceMemoryGeometry &geometry);
+
+    /**
      * @brief Estimate one sparse ExpertOverlay endpoint's invocation workspace.
      *
      * This covers both legal endpoint graph forms without charging terminal
@@ -168,6 +260,15 @@ public:
     static size_t estimateRoutedExpertParticipant(
         const ModelMemoryProfile& profile,
         const WorkspaceMemoryGeometry& geometry);
+    /** @brief Price the same CPU invocation contract for one original source-native F fragment.
+     * @param profile Unmodified original model/source metadata, including complete expert E.
+     * @param geometry Existing exact CPU rows/worker policy.
+     * @param original_projection Checked original source N/K and exact member F interval.
+     * @return The same kernel-owned workspace union, using role-local N/K without a compact profile shadow.
+     * @throws std::invalid_argument For non-CPU, foreign source or non-fragment ownership.
+     */
+    static size_t estimateRoutedExpertParticipant(const ModelMemoryProfile& profile,
+        const WorkspaceMemoryGeometry& geometry,const MoEExpertProjectionOwnership& original_projection);
 };
 
 } // namespace llaminar2

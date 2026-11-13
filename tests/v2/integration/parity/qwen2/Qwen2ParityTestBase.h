@@ -23,6 +23,7 @@
  */
 
 #pragma once
+#include "planning/ExecutionRankMembership.h"
 
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
@@ -103,11 +104,6 @@ namespace llaminar2::test::parity::qwen2
 #endif
     }
 
-    inline bool isPcieBarAvailable()
-    {
-        return getCudaDeviceCount() > 0 && getRocmDeviceCount() > 0;
-    }
-
     // =============================================================================
     // Qwen2-Specific Hardware Availability Check (extends base check)
     // =============================================================================
@@ -133,28 +129,8 @@ namespace llaminar2::test::parity::qwen2
         if (cfg.is_local_pp() && cfg.is_hybrid_pp_tp())
             effective_collective = cfg.tp_collective;
 
-        switch (effective_collective)
-        {
-        case Collective::NCCL:
-            if (!isNcclAvailable())
-                return "NCCL not available";
-            break;
-        case Collective::RCCL:
-            if (!isRcclAvailable())
-                return "RCCL not available";
-            break;
-        case Collective::HETEROGENEOUS:
-            if (!isPcieBarAvailable())
-                return "HETEROGENEOUS requires both CUDA and ROCm devices";
-            break;
-        case Collective::MPI:
-        case Collective::HOST:
-        case Collective::None:
-            // These are always available
-            break;
-        }
-
-        return std::nullopt;
+        return parityCollectiveCapabilityFailure(
+            effective_collective, isNcclAvailable(), isRcclAvailable());
     }
 
     // =============================================================================
@@ -794,6 +770,35 @@ namespace llaminar2::test::parity::qwen2
          */
         virtual void applyModelOverrides() {}
 
+        /**
+         * @brief Bind the prompt from its typed proof authority before capture sizing.
+         * Native exact replay retains declared token IDs without opening an HF
+         * pack. Reference numerics imports and requires its authenticated pack.
+         * Both paths configure the original exact prefill capture bucket.
+         */
+        void bindParityPrefillPrompt()
+        {
+            // Exact replay owns its declared native prompt. Only numerical
+            // proofs import the authenticated HF prefill trajectory below.
+            if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
+            {
+                ASSERT_FALSE(config_.token_ids.empty())
+                    << "Native exact replay requires its declared original prompt tokens";
+                configureExactProductionParityPrefillGraphBucket();
+                return;
+            }
+
+            auto reference_tokens = readPrefillTokensFromMetadata();
+            if (productionParityCampaignEnabled())
+            {
+                ASSERT_FALSE(reference_tokens.empty())
+                    << "Production parity reference metadata has no token_ids";
+            }
+            if (!reference_tokens.empty())
+                config_.token_ids = std::move(reference_tokens);
+            configureExactProductionParityPrefillGraphBucket();
+        }
+
         /** @brief Project the complete numerical contract before model/graph admission. */
         void SetUp() override
         {
@@ -805,6 +810,7 @@ namespace llaminar2::test::parity::qwen2
             config_.early_layers_count = thresholds.early_layers_count;
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
+            config_.final_logit_mean_kl = thresholds.final_logit_mean_kl;
             config_.prefill_kl_threshold = thresholds.prefill_kl_threshold;
             config_.mtp_kl_threshold = thresholds.mtp_kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
@@ -824,15 +830,7 @@ namespace llaminar2::test::parity::qwen2
                 return;
             }
 
-            auto reference_tokens = readPrefillTokensFromMetadata();
-            if (productionParityCampaignEnabled())
-            {
-                ASSERT_FALSE(reference_tokens.empty())
-                    << "Production parity reference metadata has no token_ids";
-            }
-            if (!reference_tokens.empty())
-                config_.token_ids = std::move(reference_tokens);
-            configureExactProductionParityPrefillGraphBucket();
+            bindParityPrefillPrompt();
         }
     };
 
@@ -910,13 +908,13 @@ namespace llaminar2::test::parity::qwen2
              * prepared payloads the bounded context must own.
              */
             std::ostringstream key;
-            key << config_.model_path
+            key << config_.model_path << parityPredictorIdentity(config_.shared_predictor)
                 << "|strategy=" << static_cast<int>(strategy)
                 << "|parallelism=" << static_cast<int>(cfg().parallelism)
                 << "|collective=" << static_cast<int>(cfg().collective)
                 << "|tp_collective=" << static_cast<int>(cfg().tp_collective)
                 << "|activation=" << static_cast<int>(cfg().activation_precision)
-                << "|routed_compute="
+                << "|expert_compute="
                 << static_cast<int>(cfg().routed_expert_compute_policy)
                 << "|routed_owner_order="
                 << static_cast<int>(cfg().routed_expert_owner_order)
@@ -932,6 +930,25 @@ namespace llaminar2::test::parity::qwen2
             key << "|pp_weights=";
             for (const float weight : cfg().pp_weights)
                 key << std::setprecision(9) << weight << ',';
+            if constexpr (requires(const Derived &fixture)
+                          { fixture.modelParityCase().ngram_table_policy; })
+            {
+                // Native tables are model-owned physical storage. Changing an
+                // admitted RAM/mmap policy must retire the previous authority,
+                // even when ordinary prepared weights and topology are equal.
+                const auto &policy = static_cast<const Derived *>(this)
+                                         ->modelParityCase().ngram_table_policy;
+                if (policy)
+                    key << "|ngram_storage=" << static_cast<int>(policy->storage)
+                        << "|ngram_window_bytes=" << policy->window_bytes
+                        << "|ngram_window_count=" << policy->window_count;
+                if(policy && policy->isHostAdaptive())
+                {
+                    const auto &a=policy->host_adaptive;
+                    key << "|ngram_adaptive=" << a.maximum_cache_rows << ',' << a.cache_physical_byte_limit << ','
+                        << a.policy.aging_accesses << ',' << a.policy.protected_numerator << ',' << a.policy.protected_denominator;
+                }
+            }
             if (cfg().moe_routed_expert_plan)
             {
                 const auto &plan = *cfg().moe_routed_expert_plan;
@@ -1044,6 +1061,7 @@ namespace llaminar2::test::parity::qwen2
             // Per-test overrides (from TestConfig)
             if (!cfg().model_path.empty())
                 config_.model_path = cfg().model_path;
+            config_.shared_predictor = cfg().shared_predictor;
             if (!cfg().snapshot_dir.empty())
                 config_.snapshot_dir = cfg().snapshot_dir;
             if (!cfg().prompt.empty())
@@ -1137,17 +1155,32 @@ namespace llaminar2::test::parity::qwen2
                 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
                 MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-                if (world_size != 1)
+                const auto* selected=dynamic_cast<const MPIContext*>(mpi_ctx_.get());
+                const auto* membership=selected?selected->executionMembership():nullptr;
+                if (membership)
                 {
-                    if (productionParityCampaignEnabled())
-                    {
-                        FAIL() << "Production LOCAL TP/PP campaign requires -np 1 (got "
-                               << world_size << ")";
-                    }
-                    GTEST_SKIP() << "LOCAL TP/PP test must run with -np 1 (got " << world_size << ")";
+                    // The exact selected context was authenticated by its
+                    // observed fixture before the legacy configuration exists.
+                    ASSERT_EQ(membership->discoverySize(),world_size);
+                    ASSERT_EQ(membership->executionRank(rank),0);
+                    ASSERT_EQ(selected->rank(),0);
+                    ASSERT_EQ(selected->world_size(),1);
+                    ASSERT_EQ(cfg().mpi_ranks,1);
+                    ASSERT_NE(selected->communicator(),MPI_COMM_NULL);
                 }
-
-                mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+                else
+                {
+                    if (world_size != 1)
+                    {
+                        if (productionParityCampaignEnabled())
+                        {
+                            FAIL() << "Production LOCAL TP/PP campaign requires -np 1 (got "
+                                   << world_size << ")";
+                        }
+                        GTEST_SKIP() << "LOCAL TP/PP test must run with -np 1 (got " << world_size << ")";
+                    }
+                    mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+                }
             }
             // MPI setup for cross-rank (NodeLocal or Global, requires multiple ranks)
             else if (cfg().is_cross_rank())
@@ -1272,6 +1305,16 @@ namespace llaminar2::test::parity::qwen2
             ASSERT_TRUE(hasOrchestrationRunner())
                 << "Production parity must enter through the server-facing runner";
 
+            runProductionParityCampaignOnInitializedRunner();
+        }
+
+        /**
+         * @brief Run the unchanged canonical comparisons on the already admitted authority.
+         * @note Distributed fixtures put original followers in the production worker loop first.
+         */
+        void runProductionParityCampaignOnInitializedRunner()
+        {
+            ASSERT_TRUE(hasOrchestrationRunner());
             const auto prefill = runPrefillParity();
             assertParity(prefill);
 
@@ -1428,16 +1471,22 @@ namespace llaminar2::test::parity::qwen2
             }
         }
 
-        /** @brief Install deterministic greedy sampling on the active production runner. */
-        void installProductionParitySampling()
+        /** @return The single canonical deterministic greedy law used by numerical and public-generation proofs. */
+        static SamplingParams productionParitySamplingParams()
         {
-            ASSERT_NE(orch_runner_.get(), nullptr);
             SamplingParams greedy;
             greedy.temperature = 0.0f;
             greedy.top_k = 1;
             greedy.top_p = 1.0f;
             greedy.seed = 1;
-            orch_runner_->setSamplingParams(greedy);
+            return greedy;
+        }
+
+        /** @brief Install deterministic greedy sampling on the active production runner. */
+        void installProductionParitySampling()
+        {
+            ASSERT_NE(orch_runner_.get(), nullptr);
+            orch_runner_->setSamplingParams(productionParitySamplingParams());
         }
 
         /**

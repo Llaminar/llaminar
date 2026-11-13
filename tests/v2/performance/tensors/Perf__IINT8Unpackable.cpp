@@ -17,8 +17,12 @@
  * - Simple formats (32-element blocks): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, IQ4_NL
  * - K-Quant formats (256-element superblocks): Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
  * - IQuant formats (256-element superblocks): IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_S, IQ1_M
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include <chrono>
 #include <iomanip>
@@ -538,6 +542,8 @@ TEST_F(Perf__IINT8Unpackable, SuperblockUnpackThroughput)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

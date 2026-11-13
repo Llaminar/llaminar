@@ -6,9 +6,18 @@
  * ordinal. Proposals are checked through the real model-aware rank compiler and
  * reusable config codec. These tests establish placement semantics only; no
  * synthetic memory number or observed core count is treated as cost evidence.
+ *
+ * Original QFN declarations and actual nonordinal endpoint fixtures cover every
+ * supported head degree without loading model tensors or initializing GPUs.
+ * Automatic PP keeps stage-owned MoE authorities and exact positive stage-width
+ * constraints, independently of physical NUMA IDs or local GPU cardinality.
  */
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/TensorParallelSourceDeclaration.h"
+#include "planning/MoEOverlayMemoryPlanInputs.h"
+#include "planning/MoEOverlayPlanningInputs.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "app/RuntimeInitPhase.h"
 #include "config/OrchestrationConfigDocument.h"
@@ -16,9 +25,13 @@
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "utils/NUMATopology.h"
 #include "../../utils/PlanningGGUFFixture.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
+#include "../../fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
+#include <numeric>
 #include <set>
 
 using namespace llaminar2;
@@ -49,6 +62,25 @@ namespace
                 profile.tensors.push_back(std::move(tensor));
             }
         return PlanningModelMetadata(std::move(profile), 4);
+    }
+
+    /**
+     * @brief Declare this metadata fixture's complete observed no-peer topology.
+     * @param original Authored rank inventory; no native runtime is queried.
+     * @details Sparse ordinals retain discovery order. Every directed edge is
+     * explicitly unavailable; missing observations must remain production errors.
+     */
+    void declareNoPeerTopology(ClusterInventory &original)
+    {
+        for (auto &rank : original.ranks)
+            for (const auto family : {DeviceType::CUDA, DeviceType::ROCm}) {
+                const auto count = std::count_if(rank.gpus.begin(), rank.gpus.end(),
+                    [family](const auto &gpu) { return gpu.type == family; });
+                auto &matrix = family == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+                auto &degree = family == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count;
+                degree = static_cast<int>(count);
+                matrix.assign(static_cast<std::size_t>(count * count), false);
+            }
     }
 
     /** @return Distinct physical hosts whose NUMA IDs are not communicator ranks. */
@@ -82,10 +114,15 @@ namespace
             gpu.type = backend;
             gpu.local_device_id = index * 2 + 3;
             gpu.numa_node = inventory.ranks[rank].cpu.numa_node;
-            gpu.uuid = std::string(deviceTypeToString(backend)) + "-" + std::to_string(index);
+            // This helper creates distinct physical cards. Shared observations
+            // explicitly copy a card later; never publish conflicting locality
+            // before a fixture has a chance to rename a newly created device.
+            gpu.uuid = std::string(deviceTypeToString(backend)) + "-" +
+                std::to_string(rank) + "-" + std::to_string(index);
             gpu.compute_units = 64;
             inventory.ranks[rank].gpus.push_back(std::move(gpu));
         }
+        declareNoPeerTopology(inventory);
         inventory.buildNodeAggregations();
     }
 
@@ -412,11 +449,11 @@ TEST(AutomaticOrchestrationCandidates, CrossRankMoETPRetainsOneExplicitAuthority
         }
 }
 
-TEST(AutomaticOrchestrationCandidates, PipelinesTryEveryRealMainLayerBoundaryInBothDirections)
+TEST(AutomaticOrchestrationCandidates, PipelinesKeepCardinalContiguousLayersInBothDirections)
 {
     const auto inventory = hosts(2);
     const auto proposals = candidates(request({DeviceType::CPU}, {OrchestrationStrategy::PipelineParallel}), inventory);
-    ASSERT_EQ(proposals.size(), 6u);
+    ASSERT_EQ(proposals.size(), 2u);
     std::set<std::pair<int, int>> splits;
     for (const auto &proposal : proposals)
     {
@@ -424,6 +461,8 @@ TEST(AutomaticOrchestrationCandidates, PipelinesTryEveryRealMainLayerBoundaryInB
         const auto &first = proposal.config.pp_stage_definitions[0];
         const auto &last = proposal.config.pp_stage_definitions[1];
         EXPECT_EQ(first.first_layer, 0);
+        EXPECT_EQ(first.last_layer, 1);
+        EXPECT_EQ(last.first_layer, 2);
         EXPECT_EQ(last.first_layer, first.last_layer + 1);
         EXPECT_EQ(last.last_layer, 3) << "The MTP block cannot enter the main pipeline";
         EXPECT_TRUE(splits.emplace(proposal.membership.discoveryRanks().front(), last.first_layer).second);
@@ -448,7 +487,7 @@ TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsKeepAutomaticTPAndPPChoi
         }
         config.automatic_planning.only_strategies = {OrchestrationStrategy::PipelineParallel};
         const auto pp = candidates(config, inventory);
-        ASSERT_EQ(pp.size(), 36u); // Twelve ordered pairs, three legal layer splits.
+        ASSERT_EQ(pp.size(), 12u); // Twelve ordered pairs, one cardinal layer partition.
         for (const auto &proposal : pp)
         {
             ASSERT_EQ(proposal.config.domain_definitions.size(), 2u);
@@ -468,7 +507,7 @@ TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsRequireBothVendorsInHybr
     auto config = request({DeviceType::CUDA, DeviceType::ROCm}, {OrchestrationStrategy::PipelineParallel});
     config.automatic_planning.device_counts = {{DeviceType::CUDA, 2}, {DeviceType::ROCm, 2}};
     const auto proposals = candidates(config, inventory);
-    ASSERT_EQ(proposals.size(), 36u); // Six ROCm subsets, both orders, three splits.
+    ASSERT_EQ(proposals.size(), 12u); // Six ROCm subsets, both orders, one cardinal partition.
     for (const auto &proposal : proposals)
     {
         ASSERT_EQ(proposal.config.domain_definitions.size(), 2u);
@@ -504,6 +543,10 @@ TEST(AutomaticOrchestrationCandidates,
         if (gpu.type == DeviceType::ROCm)
             gpu.numa_node = inventory.ranks[1].cpu.numa_node;
     inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    // Shared visibility adds GPU records after cards() sealed the initial
+    // fixture matrices. Publish the same explicit no-peer observations for
+    // both observers before any complete rank-local cohort is compiled.
+    declareNoPeerTopology(inventory);
     inventory.buildNodeAggregations();
 
     auto config = request({DeviceType::CUDA, DeviceType::ROCm},
@@ -511,7 +554,7 @@ TEST(AutomaticOrchestrationCandidates,
     config.automatic_planning.device_counts =
         {{DeviceType::CUDA, 2}, {DeviceType::ROCm, 4}};
     const auto proposals = candidates(config, inventory, true);
-    ASSERT_EQ(proposals.size(), 8u); // Both continuation directions and dense policies.
+    ASSERT_EQ(proposals.size(), 4u); // Both continuation directions/dense policies, with only NUMA-local owners.
     for (const auto &proposal : proposals)
     {
         EXPECT_EQ(proposal.membership.discoveryRanks().size(), 2u);
@@ -544,6 +587,10 @@ TEST(AutomaticOrchestrationCandidates,
         if (gpu.type == DeviceType::ROCm)
             gpu.numa_node = inventory.ranks[1].cpu.numa_node;
     inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    // Shared visibility adds GPU records after cards() sealed the initial
+    // fixture matrices. Publish the same explicit no-peer observations for
+    // both observers before any complete rank-local cohort is compiled.
+    declareNoPeerTopology(inventory);
     inventory.buildNodeAggregations();
 
     auto config = request({DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm},
@@ -705,41 +752,130 @@ TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsUsePhysicalNotRankCardin
     EXPECT_EQ(proposals.front().config.moe_routed_expert_plan->domains[1].participants.size(), 2u);
 }
 
-/**
- * @brief Default MoE auto search never publishes an authority-less PP plan.
- *
- * The default policy admits every implemented strategy.  A dense pipeline
- * proposal does not encode routed-expert domains or continuation ownership,
- * so treating it as a MoE candidate made an otherwise valid local GPU search
- * fail while compiling an unrelated proposal.  Every emitted routed-model
- * candidate must instead compile with the sole typed ExpertOverlay authority.
- */
-TEST(AutomaticOrchestrationCandidates,
-     DefaultMoESearchExcludesAuthoritylessPipelineCandidates)
+/** @test Default MoE search now uses the installed stage-owned PP authority rather than excluding the family. */
+TEST(AutomaticOrchestrationCandidates, DefaultMoESearchIncludesStageOwnedPipelineCandidates)
 {
-    auto inventory = hosts(1);
-    cards(inventory, 0, DeviceType::ROCm, 2);
-    auto config = request(
-        {DeviceType::ROCm},
-        {OrchestrationStrategy::SingleDevice,
-         OrchestrationStrategy::TensorParallel,
-         OrchestrationStrategy::PipelineParallel,
-         OrchestrationStrategy::ExpertOverlay});
-
-    const auto proposals = candidates(config, inventory, true);
-    ASSERT_FALSE(proposals.empty());
-    for (const auto &proposal : proposals)
-    {
-        EXPECT_NE(proposal.strategy, OrchestrationStrategy::PipelineParallel);
-        if (proposal.strategy != OrchestrationStrategy::SingleDevice)
-        {
+    auto inventory=hosts(1);cards(inventory,0,DeviceType::ROCm,2);
+    auto config=request({DeviceType::ROCm},{OrchestrationStrategy::SingleDevice,
+        OrchestrationStrategy::TensorParallel,OrchestrationStrategy::PipelineParallel,OrchestrationStrategy::ExpertOverlay});
+    const auto proposals=candidates(config,inventory,true);ASSERT_FALSE(proposals.empty());
+    std::size_t pipelines=0;
+    for(const auto& proposal:proposals) {
+        if(proposal.strategy==OrchestrationStrategy::PipelineParallel) {
+            ++pipelines;EXPECT_FALSE(proposal.config.moe_routed_expert_plan);
+            ASSERT_EQ(proposal.config.pp_stage_definitions.size(),2u);
+        } else if(proposal.strategy!=OrchestrationStrategy::SingleDevice) {
             ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
-            EXPECT_TRUE(
-                proposal.config.moe_routed_expert_plan
-                    ->usesExpertOverlayAuthority());
+            EXPECT_TRUE(proposal.config.moe_routed_expert_plan->usesExpertOverlayAuthority());
         }
-        compile(proposal, true);
+        compile(proposal,true);
     }
+    EXPECT_EQ(pipelines,2u);
+}
+
+/** @test Positive exact widths retain every disjoint grouping with one cardinal layer partition, including unequal and three-stage plans. */
+TEST(AutomaticOrchestrationCandidates, PipelineWidthsAreExactAcrossGeneralPositiveGroups)
+{
+    for(const auto widths:{std::vector<int>{1,2},std::vector<int>{2,1,1},std::vector<int>{1,1,1,1}}) {
+        SCOPED_TRACE(::testing::PrintToString(widths));
+        auto inventory=hosts(1);cards(inventory,0,DeviceType::ROCm,4);
+        auto config=request({DeviceType::ROCm},{OrchestrationStrategy::PipelineParallel});
+        config.automatic_planning.pipeline_stage_widths=widths;
+        config.automatic_planning.device_counts=std::vector{AutomaticBackendDeviceCount{DeviceType::ROCm,
+            std::accumulate(widths.begin(),widths.end(),0)}};
+        const auto proposals=candidates(config,inventory);ASSERT_FALSE(proposals.empty());
+        std::set<std::vector<int>> partitions;
+        for(const auto& proposal:proposals) {
+            ASSERT_EQ(proposal.strategy,OrchestrationStrategy::PipelineParallel);
+            ASSERT_EQ(proposal.config.domain_definitions.size(),widths.size());
+            std::set<int> physical;
+            std::vector<int> boundaries;
+            for(std::size_t stage=0;stage<widths.size();++stage) {
+                EXPECT_EQ(proposal.config.domain_definitions[stage].devices.size(),std::size_t(widths[stage]));
+                for(const auto& device:proposal.config.domain_definitions[stage].devices)
+                    EXPECT_TRUE(physical.insert(device.device_ordinal).second);
+                const auto& interval=proposal.config.pp_stage_definitions[stage];
+                EXPECT_LE(interval.first_layer,interval.last_layer);boundaries.push_back(interval.last_layer);
+            }
+            EXPECT_EQ(proposal.config.pp_stage_definitions.front().first_layer,0);
+            EXPECT_EQ(proposal.config.pp_stage_definitions.back().last_layer,3);
+            partitions.insert(boundaries);compile(proposal);
+        }
+        EXPECT_EQ(partitions.size(),1u);
+    }
+}
+
+/** @test Exact widths remain general beyond local group sizes; absent switch/P2P facts never prohibit valid native domains. */
+TEST(AutomaticOrchestrationCandidates, PipelineWidthsRemainGeneralWithoutSwitchOrDirectPeerFacts)
+{
+    for(const int width:{1,2,3,4,5,8,9}) {
+        SCOPED_TRACE(width);
+        auto inventory=hosts(1);cards(inventory,0,DeviceType::ROCm,width+1);
+        auto config=request({DeviceType::ROCm},{OrchestrationStrategy::PipelineParallel});
+        config.automatic_planning.pipeline_stage_widths=std::vector<int>{width,1};
+        config.automatic_planning.device_counts=std::vector{AutomaticBackendDeviceCount{DeviceType::ROCm,width+1}};
+        const auto proposals=candidates(config,inventory);ASSERT_FALSE(proposals.empty());
+        for(const auto& proposal:proposals) {
+            EXPECT_EQ(proposal.config.domain_definitions.front().devices.size(),std::size_t(width));
+            EXPECT_EQ(proposal.config.domain_definitions.back().devices.size(),1u);
+            EXPECT_EQ(proposal.membership.discoveryRanks(),std::vector<int>{0});
+        }
+    }
+}
+
+/** @test MoE GPU PP preserves original rank/NUMA, explicit hybrid arithmetic, fixed-head storage and full15 MTP. */
+TEST(AutomaticOrchestrationCandidates, RoutedPipelineWidthsRetainGateUpStorageAndDynamicMTP)
+{
+    auto inventory=hosts(2);cards(inventory,1,DeviceType::ROCm,4);
+    auto config=request({DeviceType::ROCm},{OrchestrationStrategy::PipelineParallel});
+    config.automatic_planning.pipeline_stage_widths=std::vector<int>{2,2};
+    config.automatic_planning.device_counts=std::vector{AutomaticBackendDeviceCount{DeviceType::ROCm,4}};
+    config.routed_expert_compute_policy=RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+    config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+    config.ngram_table_policy={.storage=ImmutableRowStoragePreference::VRAM,
+        .distribution=ImmutableRowTableDistribution::FixedHeadSharded};
+    config.mtp.enabled=true;config.mtp.draft_tokens=1;config.mtp.graph_capacity_draft_tokens=15;
+    config.mtp.depth_policy.mode=MTPDepthPolicyMode::Dynamic;
+    config.mtp.depth_policy.min_depth=1;config.mtp.depth_policy.max_depth=15;
+    const auto proposals=candidates(config,inventory,true);ASSERT_FALSE(proposals.empty());
+    for(const auto& proposal:proposals) {
+        EXPECT_EQ(proposal.membership.discoveryRanks(),std::vector<int>{1});
+        EXPECT_FALSE(proposal.config.moe_routed_expert_plan);
+        EXPECT_EQ(proposal.config.ngram_table_policy,config.ngram_table_policy);
+        EXPECT_EQ(proposal.config.mtp.enabled,config.mtp.enabled);
+        EXPECT_EQ(proposal.config.mtp.graph_capacity_draft_tokens,15);
+        EXPECT_EQ(proposal.config.mtp.depth_policy.mode,MTPDepthPolicyMode::Dynamic);
+        EXPECT_EQ(proposal.config.mtp.depth_policy.min_depth,1);
+        EXPECT_EQ(proposal.config.mtp.depth_policy.max_depth,15);
+        ExecutionPlanBuilder builder;
+        const auto resolved=ResolvedRankOrchestration::resolve(proposal.config,model(true),
+            proposal.membership.inventory(),builder,0);
+        ASSERT_EQ(resolved.pipelineStages().size(),2u);
+        EXPECT_FALSE(resolved.pipelineStages().front().scope().has_lm_head);
+        EXPECT_TRUE(resolved.pipelineStages().back().scope().has_lm_head);
+        for(const auto& stage:resolved.pipelineStages()) {
+            const auto& placement=*stage.config().moe_routed_expert_plan;
+            ASSERT_EQ(placement.domains.size(),1u);ASSERT_EQ(placement.routed_tiers.size(),1u);
+            EXPECT_EQ(placement.domains.front().routed_compute_policy,RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            EXPECT_EQ(placement.domains.front().owner_rank,0);
+            for(const auto& device:placement.domains.front().participants)
+                EXPECT_EQ(device.numa_node,inventory.ranks[1].cpu.numa_node);
+        }
+    }
+}
+
+/** @test No fitting ordered groups means no substitute topology; physical output-column constraints remain hard. */
+TEST(AutomaticOrchestrationCandidates, PipelineWidthInfeasibilityNeverPublishesAnotherTopology)
+{
+    auto inventory=hosts(1);cards(inventory,0,DeviceType::ROCm,3);
+    auto config=request({DeviceType::ROCm},{OrchestrationStrategy::PipelineParallel});
+    config.automatic_planning.pipeline_stage_widths=std::vector<int>{2,2};
+    EXPECT_TRUE(candidates(config,inventory,true).empty());
+    config.automatic_planning.pipeline_stage_widths=std::vector<int>{1,2};
+    config.routed_expert_compute_policy=RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+    EXPECT_TRUE(candidates(config,inventory,true).empty());
+    config.automatic_planning.pipeline_stage_widths=std::vector<int>{1,1,1,1,1};
+    EXPECT_TRUE(candidates(config,inventory).empty());
 }
 
 TEST(AutomaticOrchestrationCandidates, RemoteCPUOverlaysRebaseEveryOwnerAndPreserveServingPolicy)
@@ -919,4 +1055,183 @@ TEST(AutomaticOrchestrationCandidates, InvalidIntentOrObservationFailsBeforePubl
     cards(inventory, 0, DeviceType::CUDA, 1);
     inventory.ranks[0].gpus[0].uuid.clear();
     EXPECT_THROW(candidates(request({DeviceType::CUDA}, {OrchestrationStrategy::SingleDevice}), inventory), std::invalid_argument);
+}
+
+/** @test Automatic candidates retain exact query coverage; independent expert-column constraints remain explicit. */
+TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmentsAndPreservesExpertLimits)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(int degree=2;degree<=8;++degree)
+    {
+        auto inventory=hosts(1);cards(inventory,0,backend,degree);
+        auto &observed=inventory.ranks.front();
+        observed.cpu.memory_bytes=observed.cpu.free_memory_bytes=observed.cpu_memory_bytes=256ull<<30;
+        observed.cpu_execution=test::kSyntheticCPUExecutionGeometry;
+        for(auto &gpu:observed.gpus)gpu.memory_bytes=gpu.free_memory_bytes=256ull<<30;
+        // A complete authored no-peer matrix is real typed input; absence is not treated as no peer access.
+        if(backend==DeviceType::CUDA){observed.p2p_cuda_count=degree;observed.p2p_cuda.assign(degree*degree,false);}
+        else {observed.p2p_rocm_count=degree;observed.p2p_rocm.assign(degree*degree,false);}
+        auto config=request({backend},{OrchestrationStrategy::TensorParallel});
+        config.mtp.enabled=false;config.mtp.graph_capacity_draft_tokens=0;
+        config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        config.ngram_table_policy.storage=ImmutableRowStoragePreference::RAM;
+        config.automatic_planning.device_counts={{backend,degree}};
+        std::size_t proposed=0;
+        visitAutomaticOrchestrationCandidates(config,source.metadata(),inventory,[&](const auto &proposal)
+        {
+            ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+            const auto &placement=*proposal.config.moe_routed_expert_plan;
+            if(placement.continuation_domain_spec.effectiveDensePolicy()!=DenseParallelPolicy::TensorParallel)return;
+            ++proposed;
+            ASSERT_EQ(placement.domains.size(),1u);
+            const auto domain=placement.domains.front().toExecutionDomainDefinition();
+            ASSERT_EQ(domain.participants.size(),degree);
+            EXPECT_EQ(domain.resolveRoutedComputePolicy(placement.routed_tiers.size()),RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            std::vector<DeviceId> members;for(const auto &endpoint:domain.participants)members.push_back(endpoint.toLocalDeviceId());
+            const auto declaration=resolveProfileTPDeclaration(source.metadata().memoryProfile(),
+                TensorParallelMainPlacement::FullMainRankLocal,config.mtp,
+                placement.continuation_domain_spec.effectiveDensePolicy(),members);
+            ASSERT_EQ(declaration.coverage(),KVHeadCoveragePolicy::QueryInterval);
+            const auto actual=declaration.partition(members,{},source.metadata().memoryProfile().d_ff,
+                source.metadata().memoryProfile().vocab_size);
+            ExecutionPlanBuilder builder;
+            const auto compiled=ResolvedRankOrchestration::resolve(proposal.config,source.metadata(),
+                proposal.membership.inventory(),builder,0);
+            const auto &plan=compiled.rankPlan();
+            // Real overlay admission input, not the ordinary-rank BOM or duplicated capacity arithmetic.
+            ASSERT_TRUE(compiled.overlayExecution());
+            const auto &installed=*compiled.config().moe_routed_expert_plan;
+            const auto policy=resolveMoEOverlayCapacityAdmissionPolicy(installed,compiled.config(),1,48,512);
+            const MoEOverlayInferenceGraphFamilyIdentity family{.graph_family_generation=1,.main_layer_count=48,
+                .mtp_source_layers={},.max_graph_rows=32,.max_decode_rows=1,.max_request_count=1,.max_mtp_draft_depth=0};
+            const std::vector<int> buckets{1,8,32};
+            auto input=buildMoEOverlayMemoryPlanInputs({.model=source.metadata().memoryProfile(),.rank_plan=plan,
+                .config=compiled.config(),.inventory=proposal.membership.inventory(),.execution=*compiled.overlayExecution(),
+                .capacity_policy=policy,.retained_mtp=plan.runtime.mtp,.graph_family=family,
+                .prefill={.bucket_rows=buckets,.minimum_sequence_rows=1,.maximum_cached_buckets=16},
+                .gpu_weight_load={.maximum_source_bytes=4096}},32);
+            // RAM lookup on a GPU declares a CPU service. Supply the same typed
+            // fixture evidence as admission tests, without probing the host runtime.
+            input.local_capacity.retained_host_services=test::planningHostServiceProjection();
+            // Each real RAM-lookup consumer also owns its boundary ordering
+            // event. Price those exact authored endpoints through the sealed
+            // recorded source; this metadata replay creates no GPU workers.
+            input.local_capacity.native_ordering_events=
+                test::NativeOrderingEventGroupReplayAccess::projection(members);
+            const auto fixed=MoEOverlayLocalCapacityPlanner::plan(input.local_capacity);
+            ASSERT_NE(fixed.physical_memory_admission,nullptr);
+            const auto &bom=fixed.device_inputs;
+            // An overlay may append expert-only physical owners; locate each exact continuation device.
+            for(const auto &expected:actual.assignments())
+            {
+                const auto found=std::find_if(bom.begin(),bom.end(),[&](const auto &entry)
+                    {return entry.device==expected.device && entry.tensor_parallel_assignment.has_value();});
+                ASSERT_NE(found,bom.end());const auto &local=*found->tensor_parallel_assignment;
+                const auto *physical=fixed.physical_memory_admission->plan().find({0,expected.device});
+                ASSERT_NE(physical,nullptr);
+                EXPECT_GT(physical->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u)
+                    << "Original RAM consumer lost its recorded mandatory event contribution";
+                EXPECT_EQ(local.head_start,expected.head_start);EXPECT_EQ(local.head_count,expected.head_count);
+                EXPECT_EQ(local.kv_head_start,expected.kv_head_start);EXPECT_EQ(local.kv_head_count,expected.kv_head_count);
+            }
+        });
+        const bool expert_columns_fit=MoEProjectionArenaGeometry::hasIntegralOutputPartition(2560,degree);
+        EXPECT_EQ(proposed>0,expert_columns_fit)<<"Head coverage is valid1..8; owned expert columns impose a separate source constraint";
+    }
+}
+
+/** @test Complete visibility must not give a remote rank automatic GPU ownership. */
+TEST(AutomaticOrchestrationCandidates, RankLocalGPUOwnershipPreservesDiscoveryAndBothVendors)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = hosts(2);
+        inventory.ranks[0].node_id = inventory.ranks[1].node_id = 23;
+        inventory.ranks[0].hostname = inventory.ranks[1].hostname = "shared-host";
+        cards(inventory, 1, backend, 2);
+        inventory.ranks[0].gpus = inventory.ranks[1].gpus;
+        inventory.buildNodeAggregations();
+        const auto original = inventory.ranks[0].gpus.size();
+        const auto proposals = candidates(request({backend}, {OrchestrationStrategy::SingleDevice}), inventory);
+        ASSERT_EQ(proposals.size(), 2u);
+        for (const auto &proposal : proposals)
+        {
+            EXPECT_EQ(proposal.membership.discoveryRanks(), std::vector<int>({1}));
+            compile(proposal);
+        }
+        EXPECT_EQ(inventory.ranks[0].gpus.size(), original);
+        EXPECT_EQ(inventory.ranks[1].gpus.size(), original);
+    }
+}
+
+
+/** @test Original GPU population never emits zero-head shards, including beyond eight cards. */
+TEST(AutomaticOrchestrationCandidates, EveryOriginalTensorParticipantHasPositiveSourceSlicesReplay)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const bool gdn : {false, true})
+    {
+        auto inventory = hosts(1);
+        cards(inventory, 0, backend, 9);
+        std::reverse(inventory.ranks.front().gpus.begin(), inventory.ranks.front().gpus.end());
+        const auto source = model();
+        auto profile = source.memoryProfile();
+        profile.n_heads = 8;
+        profile.head_dim = profile.d_model / profile.n_heads;
+        profile.n_kv_heads = 2;
+        profile.gdn_group_count = gdn ? 8 : 0;
+        profile.gdn_time_step_rank = gdn ? 8 : 0;
+        const auto enumerate = [&](int count) {
+            auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+            config.automatic_planning.device_counts = {{backend, count}};
+            std::size_t proposals = 0;
+            ExecutionPlanBuilder builder;
+            visitAutomaticOrchestrationCandidates(config, PlanningModelMetadata(profile, 4), inventory,
+                [&](const auto &candidate) {
+                    ++proposals;
+                    const auto resolved = ResolvedRankOrchestration::resolve(candidate.config,
+                        PlanningModelMetadata(profile, 4), candidate.membership.inventory(), builder, 0);
+                    EXPECT_TRUE(resolved.rankPlan().validate().empty());
+                });
+            return proposals;
+        };
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            std::size_t infeasible = 1;
+            EXPECT_NO_THROW(infeasible = enumerate(9));
+            EXPECT_EQ(infeasible, 0u);
+            EXPECT_GT(enumerate(8), 0u);
+            profile.n_heads = 16;
+            profile.head_dim = profile.d_model / profile.n_heads;
+            profile.gdn_group_count = gdn ? 16 : 0;
+            profile.gdn_time_step_rank = gdn ? 16 : 0;
+            if (!gdn) EXPECT_GT(enumerate(9), 0u);
+            profile.n_heads = 8;
+            profile.head_dim = profile.d_model / profile.n_heads;
+            profile.gdn_group_count = gdn ? 8 : 0;
+            profile.gdn_time_step_rank = gdn ? 8 : 0;
+        }
+    }
+}
+
+/** @test Cardinal automatic PP is positive, proportional, contiguous and deterministic for arbitrary stage widths. */
+TEST(AutomaticOrchestrationCandidates, CardinalPipelineLayerCountsCoverOddAndUnequalStages)
+{
+    struct Case {int layers;std::vector<int> widths,expected;};
+    for(const auto &item:std::vector<Case>{{48,{4,4},{24,24}},{5,{1,1},{3,2}},
+        {8,{1,3},{2,6}},{7,{1,3,2},{1,4,2}},{11,{1,2,1},{3,5,3}},
+        {3,{100,1,1},{1,1,1}},{1,{9},{1}},{5,{1,1,1,1,1},{1,1,1,1,1}}}) {
+        SCOPED_TRACE(::testing::PrintToString(item.widths));
+        const auto counts=automaticPipelineLayerCounts(item.layers,item.widths);
+        EXPECT_EQ(counts,item.expected);ASSERT_EQ(counts.size(),item.widths.size());
+        int next=0;
+        for(const int count:counts){EXPECT_GT(count,0);const int first=next;next+=count;EXPECT_EQ(next-first,count);}
+        EXPECT_EQ(next,item.layers);
+        EXPECT_EQ(automaticPipelineLayerCounts(item.layers,item.widths),counts);
+    }
+    EXPECT_THROW(automaticPipelineLayerCounts(0,std::vector<int>{1}),std::invalid_argument);
+    EXPECT_THROW(automaticPipelineLayerCounts(3,std::vector<int>{}),std::invalid_argument);
+    EXPECT_THROW(automaticPipelineLayerCounts(3,std::vector<int>{1,0}),std::invalid_argument);
+    EXPECT_THROW(automaticPipelineLayerCounts(3,std::vector<int>{1,-1}),std::invalid_argument);
+    EXPECT_THROW(automaticPipelineLayerCounts(1,std::vector<int>{1,1}),std::invalid_argument);
 }

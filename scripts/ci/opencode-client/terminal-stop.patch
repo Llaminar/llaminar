@@ -1,0 +1,21 @@
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index 0f85d44..98ad060 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -1318,6 +1318,16 @@ const layer = Layer.effect(
+ 
+             if (result === "stop") return "break" as const
+             if (result === "compact") {
++              // A completed turn must become idle before proactive compaction.
++              // Retain its usage so the next user turn still compacts before
++              // generation; never invent a continuation after a terminal stop.
++              const parts = yield* MessageV2.parts(handle.message.id)
++              if (
++                handle.message.finish === "stop" &&
++                !parts.some(
++                  (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
++                )
++              ) return "continue" as const
+               yield* compaction.create({
+                 sessionID,
+                 agent: lastUser.agent,

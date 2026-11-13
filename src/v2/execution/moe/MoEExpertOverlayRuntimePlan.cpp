@@ -315,7 +315,7 @@ namespace llaminar2
             throw std::runtime_error(
                 "MoE expert overlay continuation domain '" + name +
                 "' has multiple participants but no graph-native collective runtime: scope=" +
-                executionDomainScopeToString(scope) + ", routed_compute=" +
+                executionDomainScopeToString(scope) + ", expert_compute=" +
                 routedExpertComputePolicyToString(routed_compute_policy));
         }
     }
@@ -439,14 +439,14 @@ namespace llaminar2
             out << "\n  domain " << domain.name
                 << ": scope=" << executionDomainScopeToString(domain.scope)
                 << " backend=" << collectiveBackendTypeToString(domain.backend)
-                << " routed_compute="
+                << " expert_compute="
                 << routedExpertComputePolicyToString(domain.routed_compute_policy)
-                << " routed_phase="
+                << " expert_phase="
                 << routedExpertPhasePolicyToString(domain.routed_phase_policy)
-                << " routed_decode_assignment="
+                << " expert_decode_assignment="
                 << routedExpertAssignmentPolicyToString(
                        domain.routed_decode_assignment_policy)
-                << " routed_prefill_assignment="
+                << " expert_prefill_assignment="
                 << routedExpertAssignmentPolicyToString(
                        domain.routed_prefill_assignment_policy)
                 << " participants=" << domain.participants.size()
@@ -550,12 +550,15 @@ namespace llaminar2
         auto runtime_plan = std::make_shared<MoEExpertOverlayRuntimePlan>(
             std::move(plan), options.current_world_rank, std::move(domains), std::move(routed_tiers));
 
-        LOG_DEBUG("[MoEExpertOverlayRuntimePlan] Resolved overlay topology: continuation_domain="
+        // Automatic admission revisits this geometry for many candidates.
+        // Keep participant details at TRACE; the selected orchestration
+        // reports lifecycle summaries through its owning runner.
+        LOG_TRACE("[MoEExpertOverlayRuntimePlan] Resolved overlay topology: continuation_domain="
                  << runtime_plan->sourcePlan().continuation_domain
                  << " continuation_device=" << runtime_plan->continuationDevice().to_string()
                  << " domains=" << runtime_plan->domains().size()
                  << " routed_tiers=" << runtime_plan->routedTiers().size());
-        LOG_DEBUG("[MoEExpertOverlayRuntimePlan] " << runtime_plan->diagnostics());
+        LOG_TRACE("[MoEExpertOverlayRuntimePlan] " << runtime_plan->diagnostics());
         return runtime_plan;
     }
 

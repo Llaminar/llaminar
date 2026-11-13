@@ -7,6 +7,8 @@
  * the mandatory fresh/full/partial prefix-restore lifecycle.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "Qwen3ModelParityDefinitions.h"
 #include "Qwen3ParityTestBase.h"
 
@@ -154,13 +156,17 @@ INSTANTIATE_TEST_SUITE_P(
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();
 
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
 
     std::cout.flush();

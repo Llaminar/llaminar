@@ -307,7 +307,7 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_UnbindClearsDeviceSpecif
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm GPU available";
 
-    ROCmEmbeddingKernelT kernel;
+    ROCmEmbeddingKernelT kernel(0);
     DeviceId device = DeviceId::rocm(0);
     auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024);
     ScopedGPUStream stream(device);
@@ -327,8 +327,7 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_UnbindClearsDeviceSpecif
     kernel.bindWorkspace(nullptr);
     kernel.setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
     EXPECT_FALSE(kernel.hasDynamicStateActive())
-        << "Unbind must clear device-specific workspace bindings, including "
-           "bindings created while device_idx_ was unspecified";
+        << "Unbind must withdraw the exact owner's workspace binding";
 #endif
 }
 

@@ -145,6 +145,9 @@ namespace llaminar2
             config_.staging.device() != config_.device)
             throw std::invalid_argument(
                 "Remote ExpertOverlay GPU lane requires one matching persistent staging slice");
+        if (config_.staging.hostAccess() != HostTransferAccess::CrossProcessReadable)
+            throw std::invalid_argument(
+                "Remote ExpertOverlay GPU lane requires cross-process-readable registered host staging; local-only native backing cannot enter MPI");
         if (!config_.execution.valid() ||
             config_.execution.device() != config_.device)
             throw std::invalid_argument(
@@ -598,7 +601,7 @@ namespace llaminar2
         std::string *error) noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const std::size_t bytes = layout.chunkBytes(unit_count);
+        const std::size_t bytes = layout.chunkBytes(unit_count,first_unit);
         if (!canSubmitLocked(owner, true, error) || !layout.valid() ||
             layout.direction !=
                 ExpertTierWeightConversionDirection::GpuToCpu ||
@@ -713,7 +716,7 @@ namespace llaminar2
         std::string *error) noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const std::size_t bytes = layout.chunkBytes(unit_count);
+        const std::size_t bytes = layout.chunkBytes(unit_count,first_unit);
         if (!canSubmitLocked(owner, false, error) || !layout.valid() ||
             layout.direction !=
                 ExpertTierWeightConversionDirection::CpuToGpu ||
@@ -1241,10 +1244,7 @@ namespace llaminar2
             !manifest_.identity.source_device.is_gpu() ||
             !manifest_.carriesFloatingBytes() ||
             manifest_.format_kind != format.kind ||
-            manifest_.N != source.n || manifest_.K != source.k ||
-            manifest_.region_bytes !=
-                std::array<std::uint64_t, 4>{
-                    source.bytes, 0u, 0u, 0u})
+            manifest_.source_projection.rows!=source.n || manifest_.source_projection.columns!=source.k)
         {
             throw std::invalid_argument(
                 error.empty()
@@ -1292,10 +1292,14 @@ namespace llaminar2
         if (floating_source_.valid())
         {
             return region_ == 0u
-                ? static_cast<const std::uint8_t *>(
-                      floating_source_.data) +
-                      region_offset_
-                : nullptr;
+                ? static_cast<const std::uint8_t *>(floating_source_.data)+[&] {
+                    const auto& owned=manifest_.source_projection;const auto& destination=manifest_.destination_projection;
+                    const size_t element=ExpertWeightFormat::floating(floating_source_.type).floatingElementBytes();
+                    const size_t row_bytes=size_t(manifest_.K)*element;
+                    const size_t row=std::max(owned.first_row,destination.first_row)-owned.first_row+region_offset_/row_bytes;
+                    const size_t column=std::max(owned.first_column,destination.first_column)-owned.first_column;
+                    return (row*owned.columns+column)*element+region_offset_%row_bytes;
+                }() : nullptr;
         }
         const std::uint8_t *base = nullptr;
         switch (region_)
@@ -1338,12 +1342,11 @@ namespace llaminar2
         bool submitted = false;
         if (cpu_layout_)
         {
-            const auto first_unit = static_cast<std::uint32_t>(
-                emitted_bytes_ / cpu_layout_->cpu_block_stride);
+            const auto first_unit=expertTierWireUnitAt(*cpu_layout_,emitted_bytes_);
             const auto remaining = cpu_layout_->unit_count - first_unit;
             const auto units = std::min(
                 cpu_layout_->maximum_units_per_chunk, remaining);
-            const auto bytes = cpu_layout_->chunkBytes(units);
+            const auto bytes = cpu_layout_->chunkBytes(units,first_unit);
             active_header_.region = 0;
             active_header_.region_offset = emitted_bytes_;
             active_header_.payload_bytes =
@@ -1370,8 +1373,12 @@ namespace llaminar2
             }
             const std::uint64_t remaining =
                 manifest_.region_bytes[region_] - region_offset_;
-            const std::uint64_t bytes = std::min<std::uint64_t>(
-                remaining, manifest_.maximum_chunk_bytes);
+            std::uint64_t bytes = std::min<std::uint64_t>(remaining,manifest_.maximum_chunk_bytes);
+            if(manifest_.carriesFloatingBytes() &&
+               (manifest_.source_projection.columns!=manifest_.K || manifest_.destination_projection.columns!=manifest_.K)) {
+                const size_t row_bytes=size_t(manifest_.K)*ExpertWeightFormat::floating(floating_source_.type).floatingElementBytes();
+                bytes=std::min(bytes,row_bytes-region_offset_%row_bytes);
+            }
             active_header_.region = static_cast<std::uint8_t>(region_);
             active_header_.region_offset = region_offset_;
             active_header_.payload_bytes =
@@ -1391,7 +1398,7 @@ namespace llaminar2
     MoEOverlayResidencyWaveProgress
     MoEOverlayGpuRemoteProjectionSource::pollNextChunk(
         MoEOverlayRemoteProjectionChunkView *chunk,
-        std::string *error) noexcept
+        std::string *error, std::span<std::uint8_t> staging) noexcept
     {
         if (!chunk || aborted_ || complete_ || payload_outstanding_)
         {
@@ -1681,11 +1688,7 @@ namespace llaminar2
                 descriptor.type);
             if (!descriptor.valid() || !format.valid() ||
                 manifest.format_kind != format.kind ||
-                manifest.N != descriptor.n ||
-                manifest.K != descriptor.k ||
-                manifest.region_bytes !=
-                    std::array<std::uint64_t, 4>{
-                        descriptor.bytes, 0u, 0u, 0u})
+                manifest.destination_projection.rows!=descriptor.n || manifest.destination_projection.columns!=descriptor.k)
             {
                 setGpuRemoteError(
                     error,
@@ -1745,11 +1748,12 @@ namespace llaminar2
         bool range_valid = false;
         if (cpu_layout_)
         {
-            range_valid = header.region == 0 &&
-                          (header.region_offset %
-                           cpu_layout_->cpu_block_stride) == 0 &&
-                          (payload.size() %
-                           cpu_layout_->cpu_block_stride) == 0;
+            const auto first=expertTierWireUnitAt(*cpu_layout_,header.region_offset);
+            const auto end=expertTierWireUnitAt(*cpu_layout_,header.region_offset+payload.size());
+            range_valid=header.region==0 && first<end && end<=cpu_layout_->unit_count &&
+                end-first<=cpu_layout_->maximum_units_per_chunk &&
+                expertTierWirePrefix(*cpu_layout_,first)==header.region_offset &&
+                expertTierWirePrefix(*cpu_layout_,end)==header.region_offset+payload.size();
         }
         else
         {
@@ -1759,6 +1763,11 @@ namespace llaminar2
                           payload.size() <=
                               manifest_->region_bytes[header.region] -
                                   header.region_offset;
+        }
+        if(range_valid && manifest_->carriesFloatingBytes()) {
+            const ExpertWeightFormat format{.kind=manifest_->format_kind};const size_t row_bytes=size_t(manifest_->K)*format.floatingElementBytes();
+            if(manifest_->source_projection.columns!=manifest_->K || manifest_->destination_projection.columns!=manifest_->K)
+                range_valid=payload.size()<=row_bytes-header.region_offset%row_bytes;
         }
         if (!range_valid)
         {
@@ -1801,12 +1810,9 @@ namespace llaminar2
         bool submitted = false;
         if (cpu_layout_)
         {
-            const auto first_unit = static_cast<std::uint32_t>(
-                active_header_.region_offset /
-                cpu_layout_->cpu_block_stride);
-            const auto units = static_cast<std::uint32_t>(
-                active_payload_.size() /
-                cpu_layout_->cpu_block_stride);
+            const auto first_unit=expertTierWireUnitAt(*cpu_layout_,active_header_.region_offset);
+            const auto final_unit=expertTierWireUnitAt(*cpu_layout_,active_header_.region_offset+active_payload_.size());
+            const auto units=final_unit-first_unit;
             submitted = lane_->submitCpuToGpuRepack(
                 this,
                 *cpu_layout_,
@@ -1821,7 +1827,14 @@ namespace llaminar2
             auto *base = gpuRegionPointer(active_header_.region);
             submitted = lane_->submitGpuBlobWrite(
                 this,
-                base + active_header_.region_offset,
+                base + [&] {
+                    if(!manifest_->carriesFloatingBytes())return size_t(active_header_.region_offset);
+                    const auto& owned=manifest_->destination_projection;const auto& source=manifest_->source_projection;
+                    const ExpertWeightFormat format{.kind=manifest_->format_kind};const size_t element=format.floatingElementBytes(),row_bytes=size_t(manifest_->K)*element;
+                    const size_t row=std::max(owned.first_row,source.first_row)-owned.first_row+active_header_.region_offset/row_bytes;
+                    const size_t column=std::max(owned.first_column,source.first_column)-owned.first_column;
+                    return (row*owned.columns+column)*element+active_header_.region_offset%row_bytes;
+                }(),
                 active_payload_,
                 error);
         }

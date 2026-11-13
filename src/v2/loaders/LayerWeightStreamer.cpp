@@ -1,6 +1,9 @@
 /**
  * @file LayerWeightStreamer.cpp
  * @brief Weight streaming implementation for Option B (STREAMING mode)
+ *
+ * Source-size inspection is metadata-only. Requesting a CPU tensor would now
+ * construct a genuine final CPU consumer and must never serve as a size probe.
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -10,6 +13,7 @@
 #include "../tensors/Tensors.h"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 
 namespace llaminar2
@@ -408,12 +412,10 @@ namespace llaminar2
         auto weight_names = getLayerWeightNames(layer_idx);
         for (const auto &name : weight_names)
         {
-            // Get the CPU weight to check its size
-            auto weight = weight_manager_->getWeightForDevice(name, DeviceId::cpu(), layer_idx);
-            if (weight)
-            {
-                total += weight->size_bytes();
-            }
+            const size_t bytes = weight_manager_->originalWeightSourceBytes(name);
+            if (bytes > std::numeric_limits<size_t>::max() - total)
+                throw std::overflow_error("Layer source byte extent overflow");
+            total += bytes;
         }
 
         return total;

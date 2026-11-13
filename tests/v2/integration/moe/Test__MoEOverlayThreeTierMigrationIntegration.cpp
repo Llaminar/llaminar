@@ -12,6 +12,7 @@
  * CUDA-hot/CPU-cold case additionally swaps complete experts in both directions.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -536,7 +537,7 @@ namespace llaminar2
         struct PhysicalProjectionFlow
         {
             HostGpuExpertPackedProjection expected_gpu;
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             ExpertTierWeightDeviceLayout gpu_to_cpu_layout;
             ExpertTierWeightDeviceLayout cpu_to_gpu_layout;
             std::unique_ptr<DevicePackedProjection> gpu_source;
@@ -620,8 +621,7 @@ namespace llaminar2
                             .slot_capacity = blob_slots_per_device,
                             .execution_lane_capacity = blob_slots_per_device,
                             .execution_streams =
-                                TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+                                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         std::min<std::size_t>(
                                             blob_slots_per_device,
                                             4u),
@@ -638,8 +638,7 @@ namespace llaminar2
                             .slot_capacity = blob_slots_per_device,
                             .execution_lane_capacity = blob_slots_per_device,
                             .execution_streams =
-                                TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+                                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         std::min<std::size_t>(
                                             blob_slots_per_device,
                                             4u),
@@ -652,10 +651,10 @@ namespace llaminar2
                         });
 
                     const auto *source_format =
-                        native_vnni_formats::forSourceIdentity(5, true);
+                        native_quantised_formats::forSourceIdentity(5, true);
                     if (!source_format)
                         throw std::runtime_error(
-                            "Q4_K source format is absent from NativeVNNI catalog");
+                            "Q4_K source format is absent from NativeQuantised catalog");
 
                     for (int expert = 0; expert < 3; ++expert)
                     {
@@ -787,8 +786,7 @@ namespace llaminar2
                                                            1u,
                                                            DeviceId::rocm(0))
                                                        .front(),
-                                        .execution = TransferEngine::instance()
-                                                         .allocatePersistentTransferExecutionLanes(
+                                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                              1u,
                                                              DeviceId::rocm(0),
                                                              "three_tier:" + identity)
@@ -819,8 +817,7 @@ namespace llaminar2
                                                            1u,
                                                            DeviceId::cuda(0))
                                                        .front(),
-                                        .execution = TransferEngine::instance()
-                                                         .allocatePersistentTransferExecutionLanes(
+                                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                              1u,
                                                              DeviceId::cuda(0),
                                                              "three_tier:" + identity)
@@ -1277,7 +1274,7 @@ namespace llaminar2
         struct CudaCpuProjectionFlow
         {
             HostGpuExpertPackedProjection expected_gpu;
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             ExpertTierWeightDeviceLayout gpu_to_cpu_layout;
             ExpertTierWeightDeviceLayout cpu_to_gpu_layout;
             std::unique_ptr<DevicePackedProjection> gpu_source;
@@ -1341,11 +1338,11 @@ namespace llaminar2
                     }
 
                     const auto *source_format =
-                        native_vnni_formats::forSourceIdentity(5, true);
+                        native_quantised_formats::forSourceIdentity(5, true);
                     if (!source_format)
                     {
                         throw std::runtime_error(
-                            "Q4_K source format is absent from NativeVNNI catalog");
+                            "Q4_K source format is absent from NativeQuantised catalog");
                     }
 
                     for (int expert = 0; expert < 2; ++expert)
@@ -1435,8 +1432,7 @@ namespace llaminar2
                                                        1u,
                                                        DeviceId::cuda(0))
                                                    .front(),
-                                    .execution = TransferEngine::instance()
-                                                     .allocatePersistentTransferExecutionLanes(
+                                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                          1u,
                                                          DeviceId::cuda(0),
                                                          "cuda_cpu_rotation:" + identity)

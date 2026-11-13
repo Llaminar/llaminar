@@ -7,9 +7,14 @@
  * resolver, so frontends cannot install a different topology from the runner.
  * It performs no discovery, MPI, weight loading, allocation, or memory admission.
  * A resolved topology is an input to PhysicalMemoryAuthority, not a reservation.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #pragma once
 
+#include "execution/global_pp/GlobalPPTopology.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/moe/MoEExpertOverlayAuthorityPlan.h"
@@ -36,6 +41,8 @@ namespace llaminar2
     class ResolvedMoEPipelineStage final
     {
     public:
+        /** @return Original global stage ID; local PP uses its canonical ordered index. */
+        [[nodiscard]] int stageId() const noexcept { return stage_id_; }
         /** @return Main-model interval and global embedding/output ownership. */
         [[nodiscard]] const FactoryPPStageConfig &scope() const noexcept { return scope_; }
         /** @return Stage-only normalized policy and expert domain declarations. */
@@ -53,10 +60,12 @@ namespace llaminar2
          * @param config Normalized child expert and serving policy.
          * @param rank_plan Child projection of the retained parent rank plan.
          * @param execution Bound child expert authority role on that rank.
+         * @param stage_id Original canonical stage ID retained by the global/local pipeline.
          */
         ResolvedMoEPipelineStage(FactoryPPStageConfig scope, OrchestrationConfig config,
-            RankExecutionPlan rank_plan, MoEExpertOverlayExecutionPlan execution)
-            : scope_(scope), config_(std::move(config)), rank_plan_(std::move(rank_plan)), execution_(std::move(execution)) {}
+            RankExecutionPlan rank_plan, MoEExpertOverlayExecutionPlan execution, int stage_id)
+            : stage_id_(stage_id), scope_(scope), config_(std::move(config)), rank_plan_(std::move(rank_plan)), execution_(std::move(execution)) {}
+        int stage_id_ = -1;
         FactoryPPStageConfig scope_;
         OrchestrationConfig config_;
         RankExecutionPlan rank_plan_;
@@ -81,6 +90,7 @@ namespace llaminar2
          * @param inventory Exact immutable inventory for this rank namespace.
          * @param builder Canonical rank/shard compiler, also injectable by tests.
          * @param rank Rank in that inventory; negative or absent ranks are errors.
+         * @param terminal_projection Ordinary diagnostic output demand, frozen before child projection.
          * @return Validated topology with no resources materialized.
          * @throws std::invalid_argument for invalid topology, inventory or policy.
          * @throws std::logic_error for an unimplemented explicit execution form.
@@ -90,7 +100,8 @@ namespace llaminar2
             const PlanningModelMetadata &model,
             const ClusterInventory &inventory,
             IExecutionPlanBuilder &builder,
-            int rank);
+            int rank,
+            OrdinaryTerminalProjectionCapacity terminal_projection = {});
 
         /** @return Configuration after hardware/authority/MTP normalization. */
         [[nodiscard]] const OrchestrationConfig &config() const noexcept { return config_; }
@@ -102,7 +113,10 @@ namespace llaminar2
         /** @return Explicit origin for passive diagnostics, never an execution decision. */
         [[nodiscard]] MoEExpertOverlayAuthorityPlanDisposition overlayOrigin() const noexcept
         { return overlay_origin_; }
-        /** @return Ordered local PP expert stages; empty for ordinary execution. */
+        /** @return Original complete cross-rank topology, absent for rank-local PP. */
+        [[nodiscard]] const std::optional<GlobalPPTopology> &globalPipeline() const noexcept
+        { return global_pipeline_; }
+        /** @return Ordered expert stages physically owned by this rank. */
         [[nodiscard]] const std::vector<ResolvedMoEPipelineStage> &pipelineStages() const noexcept
         { return pipeline_stages_; }
 
@@ -118,5 +132,6 @@ namespace llaminar2
         std::optional<MoEExpertOverlayExecutionPlan> overlay_execution_;
         MoEExpertOverlayAuthorityPlanDisposition overlay_origin_;
         std::vector<ResolvedMoEPipelineStage> pipeline_stages_;
+        std::optional<GlobalPPTopology> global_pipeline_;
     };
 }

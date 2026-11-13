@@ -1,8 +1,16 @@
 /**
  * @file INT32Tensor.cpp
- * @brief INT32 tensor implementation for accumulator storage
+ * @brief INT32Tensor native storage with source-owned device-only setup roots.
+ *
+ * Ordinary tensors retain their existing host representations. The private
+ * adaptive-root constructor creates no host payload or dequantized mirror;
+ * its source-owned PMA factory materializes only the exact admitted native
+ * device bytes through TransferEngine. Host access to that arm rejects.
  * @author David Sanftenberg
  * @date 2025-11-05
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 #include "TensorClasses.h"
@@ -10,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <cstring>
 
 namespace llaminar2
@@ -116,6 +125,34 @@ namespace llaminar2
     // CONSTRUCTORS
     // =============================================================================
 
+    INT32Tensor::INT32Tensor(const std::vector<size_t> &shape, DeviceId device, DeviceOnlyStorageTag)
+        : device_only_(true), shape_(shape), device_(device), scale_(1.0f), device_data_(nullptr),
+          raw_data_released_(true)
+    {
+        if (!device.is_gpu() || !device.is_valid() || shape.empty())
+            throw std::invalid_argument("Device-only native root requires a positive GPU shape");
+        std::size_t elements = 1;
+        for (const auto dimension : shape)
+        {
+            if (!dimension || dimension > std::numeric_limits<std::size_t>::max() / elements)
+                throw std::overflow_error("Device-only native root extent is zero or overflows");
+            elements *= dimension;
+        }
+        if (elements > std::numeric_limits<std::size_t>::max() / sizeof(int32_t))
+            throw std::overflow_error("Device-only native root bytes overflow");
+        // TransferEngine allocates only the admitted device storage later; no
+        // host vector is resized, first-touched, copied or dequantized here.
+    }
+
+    INT32Tensor::INT32Tensor(const std::vector<size_t> &shape, AlignedVector<int32_t> storage, DeviceId device)
+        : shape_(shape), device_(device), host_int32_data_(std::move(storage)), scale_(1.0f), device_data_(nullptr)
+    {
+        if (!device.is_valid() || !device.is_cpu() || shape.empty())
+            throw std::invalid_argument("INT32Tensor owned CPU storage requires shape and exact CPU home device");
+        if (host_int32_data_.size() != nativeTensorExtent(shape, 1, 1))
+            throw std::invalid_argument("INT32Tensor owned storage does not match logical element count");
+    }
+
     INT32Tensor::INT32Tensor(const std::vector<size_t> &shape)
         : shape_(shape), device_(DeviceId::cpu()), scale_(1.0f), device_data_(nullptr)
     {
@@ -202,6 +239,7 @@ namespace llaminar2
 
     const float *INT32Tensor::data() const
     {
+        if (device_only_) throw std::logic_error("Device-only native root has no host materialization");
         assertValid("INT32Tensor::data");
         // Dequantize to cache on demand
         size_t total_elements = 1;
@@ -222,6 +260,7 @@ namespace llaminar2
 
     float *INT32Tensor::mutable_data()
     {
+        if (device_only_) throw std::logic_error("Device-only native root has no mutable host materialization");
         LOG_ERROR("[INT32Tensor] mutable_data() not supported (read-only tensor)");
         return nullptr;
     }

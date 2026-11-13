@@ -1,4 +1,14 @@
+/**
+ * @file PreparedWeightTestHarness.h
+ * @brief Stable prepared binding fixtures with exact preallocation admission.
+ *
+ * Executable CPU fixtures install one final-storage authority before packing;
+ * descriptor-only fixtures retain their explicit test registration semantics.
+ */
 #pragma once
+#include <array>
+#include <utility>
+#include "CPUPreparedStoreTestAdmission.h"
 
 #include "loaders/PreparedWeightStore.h"
 
@@ -47,16 +57,34 @@ namespace llaminar2::test
         PreparedWeightRef ref;
     };
 
+    /**
+     * @brief Prepare the actual full matrix and admit its declared retained slices.
+     * @param tensor Original immutable source retained by the caller.
+     * @param device Exact physical preparation allocator.
+     * @param canonical_name Original source role used by the store identity.
+     * @param model_id Fixture-local prepared namespace.
+     * @param slices Complete distinct physical output intervals resolved later.
+     * @return Executable source binding and sole admitted prepared-store owner.
+     */
     inline PreparedGemmFixture makePreparedGemmFixture(
         TensorBase *tensor,
         DeviceId device,
         const std::string &canonical_name,
-        ModelContextId model_id = ModelContextId{9900})
+        ModelContextId model_id = ModelContextId{9900},
+        std::initializer_list<std::pair<size_t, size_t>> slices = {})
     {
         PreparedGemmFixture fixture;
         fixture.model_id = model_id;
         fixture.binding = makePreparedWeightTestBinding(tensor, device, canonical_name, model_id);
         fixture.store = std::make_unique<PreparedWeightStore>(model_id);
+        if (device.is_cpu())
+        {
+            std::vector<CPUPreparedStoreTestSlice> inventory;
+            for (const auto &[first, end] : slices) inventory.push_back({tensor, first, end});
+            const std::array<const TensorBase *, 1> full{tensor};
+            admitCPUPreparedStoreForTest(*fixture.store, full, device,
+                PhysicalMemoryOwner::PrimaryModelWeights, inventory);
+        }
         fixture.ref = fixture.store->prepareGemm(fixture.binding);
         return fixture;
     }
@@ -108,6 +136,7 @@ namespace llaminar2::test
             "blk." + std::to_string(layer) + ".ffn_up.weight",
             model_id);
         fixture.store = std::make_unique<PreparedWeightStore>(model_id);
+        if (device.is_cpu()) admitCPUPreparedStoreForTest(*fixture.store, {gate, up}, device);
         fixture.gate_ref = fixture.store->prepareGemm(fixture.gate_binding);
         fixture.up_ref = fixture.store->prepareGemm(fixture.up_binding);
         return fixture;
@@ -152,6 +181,7 @@ namespace llaminar2::test
             "blk." + std::to_string(layer) + "." + name_prefix + "_down.weight",
             model_id);
         fixture.store = std::make_unique<PreparedWeightStore>(model_id);
+        if (device.is_cpu()) admitCPUPreparedStoreForTest(*fixture.store, {gate, up, down}, device);
         fixture.gate_ref = fixture.store->prepareGemm(fixture.gate_binding);
         fixture.up_ref = fixture.store->prepareGemm(fixture.up_binding);
         fixture.down_ref = fixture.store->prepareGemm(fixture.down_binding);
@@ -196,6 +226,7 @@ namespace llaminar2::test
             "blk." + std::to_string(layer) + ".attn_v.weight",
             model_id);
         fixture.store = std::make_unique<PreparedWeightStore>(model_id);
+        if (device.is_cpu()) admitCPUPreparedStoreForTest(*fixture.store, {q, k, v}, device);
         fixture.q_ref = fixture.store->prepareGemm(fixture.q_binding);
         fixture.k_ref = fixture.store->prepareGemm(fixture.k_binding);
         fixture.v_ref = fixture.store->prepareGemm(fixture.v_binding);

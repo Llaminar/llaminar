@@ -11,6 +11,8 @@
  * - Backend selection: NCCL, RCCL, or HOST based on device types
  * - Pipeline stages retain independent, checked expert-runtime bindings;
  *   only TP siblings within one stage share a residency authority.
+ * - A resident input publication preserves the preceding result; a main-row
+ *   advance retires it and republishes only explicitly requested host logits.
  *
  * Design philosophy:
  * - Extends IRankOrchestrator (which extends IInferenceRunner)
@@ -43,11 +45,22 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * CPU serial storage declarations survive admission and runtime projection.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #pragma once
 
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "execution/local_execution/graph/IRetainedGraphStorageBoundary.h"
+#include "../../factory/TestableInferenceRunnerOverrides.h"
+
 #include "IRankOrchestrator.h"
+#include <exception>
+#include <algorithm>
 #include "TPWorkerPool.h"
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
@@ -64,14 +77,22 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <type_traits>
 #include <memory>
 #include <optional>
 #include <vector>
 #include <string>
 
 // Forward declaration for fromPlan() factory method
+namespace llaminar2::test {
+    struct RankRetainedStorageRetirementReplayAccess;
+    struct RankPipelineHostPublicationTestAccess;
+}
+
 namespace llaminar2
 {
+    class IGlobalTPContext;
+    class ResolvedImmutableRowTablePlacement;
     class ReusableExecutionWorkspaceRegistry;
     class MoEOverlayNodeLocalRouteExchange;
     struct RankExecutionPlan;
@@ -201,6 +222,13 @@ namespace llaminar2
         };
 
         /**
+         * @brief Borrow the actual runner-resolved immutable PP execution declaration.
+         * @return Original plan, after child graph owner construction and before forwards.
+         * @throws std::logic_error If this rank has no declared PP graph ownership.
+         */
+        const PipelineGraphExecutionPlan& pipelineGraphExecutionPlan() const;
+
+        /**
          * @brief Configuration for multi-device orchestration
          *
          * Specifies devices, weights, backend, and inference parameters.
@@ -240,7 +268,13 @@ namespace llaminar2
 
             // =================================================================
             // Common Configuration
+            /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+            std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
             // =================================================================
+
+            /// Immutable admitted participant projection shared by LocalTP and pipeline children.
+            std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
+                attention_participants;
 
             /// Maximum sequence length
             size_t max_seq_len = 4096;
@@ -252,6 +286,9 @@ namespace llaminar2
              * buckets and serial graph-family workspaces remain symmetric.
              */
             int resident_graph_rows = 0;
+
+            /** Authored ordinary terminal output demand, shared by every participant. */
+            OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
 
             /// Batch size for inference
             int batch_size = 1;
@@ -274,6 +311,10 @@ namespace llaminar2
 
             /// Prefix-state cache feature gates and storage limits.
             PrefixCacheRuntimeConfig prefix_cache;
+            ImmutableRowTablePolicy ngram_table_policy; ///< Rank-owned native PLE storage policy.
+            ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled; ///< Original planned phase policy.
+            std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement; ///< Exact PMA-selected rank placement.
+            std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services; ///< SAME pre-quota rank declaration retained by every TP/PP child.
 
             /// Multi-token prediction feature gates and verification mode.
             MTPRuntimeConfig mtp;
@@ -307,6 +348,9 @@ namespace llaminar2
             /// and its per-device runners.
             std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
+            /// Explicit model-light child admission; concrete factories reject it.
+            TestableInferenceRunnerOverrides test_runner_overrides;
+
             /**
              * @brief Whether rank setup allocates or adopts its complete weight set.
              *
@@ -332,6 +376,8 @@ namespace llaminar2
             /** Process-local immutable prepared banks keyed by residency epoch. */
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
                 moe_expert_overlay_participant_residency;
+        /** Original CPU expert-domain context; participant-local graph edges borrow, never recreate it. */
+        std::shared_ptr<IGlobalTPContext> moe_expert_overlay_cpu_joint_context;
 
             /// Lifetime owner for the authority's allocation-free route histogram.
             std::shared_ptr<DecodeExpertHistogram>
@@ -339,6 +385,8 @@ namespace llaminar2
 
             /// Optional MPI context used by MoE overlay domain-worker commands.
             std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+            /** Exact admitted parent MPI owner for local pipeline membership; never WORLD/self reconstructed. */
+            std::shared_ptr<IMPIContext> original_pipeline_mpi_ctx;
 
             /** Pre-rendezvoused node-local activation channels for child graphs. */
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
@@ -347,6 +395,13 @@ namespace llaminar2
             /** Mapped all-GPU controller pages retained by every child graph. */
             std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
                 moe_device_controller_fabric;
+
+            /**
+             * Actual auxiliary expert ownership, constructed after continuation
+             * banks and before the original final host-weight release gate.
+             * This is independent of continuation TP membership.
+             */
+            std::optional<MoEOverlayParticipantGraphRunnerConfig> rank_local_expert_endpoints;
 
             /**
              * One process-local sparse route fabric shared by continuation
@@ -467,6 +522,12 @@ namespace llaminar2
              * stage's owner epoch, histogram or prepared-bank registry.
              */
             [[nodiscard]] Config forPipelineStage(std::size_t stage_index) const;
+            /**
+             * @brief Install one original local/global stage's sealed expert runtime.
+             * @param binding Exact stage whose scope and devices this child already declares.
+             * @throws std::invalid_argument Before mutation for foreign scope or existing owners.
+             */
+            void installPipelineStageRuntime(const MoEOverlayPipelineStageBinding &binding);
         };
 
         // =====================================================================
@@ -528,14 +589,16 @@ namespace llaminar2
             const Config &config,
             std::unique_ptr<ILocalTPContext> tp_ctx = nullptr);
 
-        /// Destructor
+        /** @brief Retire composed PP parents before their borrowed participant owners. */
         ~RankOrchestrator() override;
 
-        // Non-copyable, movable
+        // Native callbacks and borrowed topology retain this owner's address.
+        // Move unique_ptr ownership; replacing a live rank by member-wise moves
+        // would retire transport before its original participant graphs.
         RankOrchestrator(const RankOrchestrator &) = delete;
         RankOrchestrator &operator=(const RankOrchestrator &) = delete;
-        RankOrchestrator(RankOrchestrator &&) noexcept;
-        RankOrchestrator &operator=(RankOrchestrator &&) noexcept;
+        RankOrchestrator(RankOrchestrator &&) = delete;
+        RankOrchestrator &operator=(RankOrchestrator &&) = delete;
 
         // =====================================================================
         // IInferenceRunner Interface (from IRankOrchestrator)
@@ -550,6 +613,11 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @return true if forward pass succeeded on all devices
          */
+        /** @copydoc IInferenceRunner::admitSparseQueryExecutionProgram */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override;
+        /** @copydoc IInferenceRunner::endSparseQueryExecutionProgram */
+        void endSparseQueryExecutionProgram() noexcept override;
+
         bool forward(const int *tokens, int seq_len) override;
         bool forwardPrefill(const int *tokens, int seq_len) override;
         /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */
@@ -1076,6 +1144,9 @@ namespace llaminar2
         bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,
             int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::publishMTPDirectTokenHistory */
+        bool publishMTPDirectTokenHistory(int target_sample_slot,
+            MTPDirectTokenHistoryDisposition disposition) override;
         /** @copydoc IInferenceRunner::publishForcedDeviceResidentConditionToken */
         bool publishForcedDeviceResidentConditionToken(
             int32_t token,
@@ -1175,6 +1246,7 @@ namespace llaminar2
             int draft_depth,
             DeviceGenerationLoopTopology topology,
             DeviceGenerationSamplingMode sampling_mode) override;
+        bool prepareDeviceResidentGenerationContinuation(DeviceGenerationSamplingMode sampling_mode) override;
         bool launchDeviceResidentGeneration() override;
         bool observeDeviceGenerationDispatchTicket(
             sampling_math::DeviceGenerationDispatchTicket *out_ticket)
@@ -1310,6 +1382,11 @@ namespace llaminar2
         deviceMoERebalanceHostedObservationSchedule()
             const noexcept override;
 
+        /** @return Original owned auxiliary endpoints, absent for ordinary/single-domain ranks. */
+        std::shared_ptr<MoEOverlayParticipantGraphRunner> rankLocalExpertEndpoints() const noexcept
+        {
+            return rank_local_expert_endpoints_;
+        }
         /** @brief Concatenate exact controller runtime bindings from all children. */
         std::vector<MoEOverlayDeviceControllerRuntimeBinding>
         moeOverlayDeviceControllerRuntimeBindings() const override;
@@ -1611,6 +1688,8 @@ namespace llaminar2
             const std::string &domain_id) const override;
         MoEOverlayAuthorityExecutionKind
         moeOverlayAuthorityExecution() const override;
+        /** @copydoc IInferenceRunner::requireMoEPipelineRuntimeOwnership */
+        void requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const override;
         bool deviceResidentMoEOverlayMaintenanceReady() const override;
 
         struct MoEExpertMaskSnapshot
@@ -1685,8 +1764,152 @@ namespace llaminar2
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:
+        /** @brief Original source invocation retained across all TP participant launches and terminal closes. */
+        friend struct test::RankRetainedStorageRetirementReplayAccess;
+        /**
+         * @brief Snapshot distinct original model-published source owners, independently of child success.
+         * @param consumers Canonical ModelContext entries, locked by the caller during enumeration.
+         * @param belongs Predicate authenticating the original parent or an actual returned child.
+         * @return Each selected non-null participant once, in canonical publication order.
+         * @note Failed constructors can publish sources without returning a DGO. Their model entries
+         * still own retirement obligations; a successful-child roster is not a publication ledger.
+         */
+        template<class Consumers, class Belongs>
+        static auto originalPublishedStorageParticipants(const Consumers& consumers, Belongs belongs)
+        {
+            using Owner = decltype(consumers.begin()->second.participants);
+            std::vector<Owner> originals;
+            for (const auto& [device, consumer] : consumers) {
+                const auto& original = consumer.participants;
+                if (original && belongs(device, original) &&
+                    std::find(originals.begin(), originals.end(), original) == originals.end())
+                    originals.push_back(original);
+            }
+            return originals;
+        }
+        /**
+         * @brief Retire every original participant and its group, preserving the first failure.
+         * @param participants Original participant owners, in authored order.
+         * @param retire Terminal-only operation on one original owner; it must retain native failure guards.
+         * @param finish Original CPU/adopted-right cleanup, attempted even when a participant fails.
+         * @param afterProof Channel admission retirement, called only after all required native proofs succeed.
+         * @throws The first missing-proof exception, otherwise the first retired-service failure, after every owner is attempted.
+         * @note This does not authorize data clearing after missing native completion proof.
+         */
+        template<class Participants,class Retire,class Finish,class AfterProof>
+        static void retireOriginalStorageParticipants(const Participants& participants,Retire retire,Finish finish,AfterProof afterProof) {
+            std::exception_ptr semantic, unproven;
+            const auto observe = [&](auto &&operation) {
+                try { operation(); }
+                catch (const RetiredStorageRequestFailure &) {
+                    if (!semantic) semantic = std::current_exception();
+                }
+                catch (...) {
+                    if (!unproven) unproven = std::current_exception();
+                }
+            };
+            for (const auto &participant : participants)
+                observe([&] { retire(participant); });
+            observe(finish);
+            // Channel retirement is not CPU cleanup: it is permitted only
+            // after every required original native endpoint is proven retired.
+            if (!unproven) observe(afterProof);
+            // A later missing native proof outranks any earlier service failure.
+            if (unproven) std::rethrow_exception(unproven);
+            if (semantic) std::rethrow_exception(semantic);
+        }
+        /**
+         * @brief Prove original source producers before releasing mapped storage waits on a failed host attempt.
+         * @param participants Actual original source/reader DGO owners.
+         * @param cancel Same original request CPU/reader/native failure signal, never a storage-release guess.
+         * @param prove Producer-only original native terminal publication; no follower terminal wait.
+         * @param cancelStorage Exact original StorageOwners cancellation, permitted only after every source proof.
+         * @throws First unproven terminal/cancellation failure after attempting every source producer.
+         */
+        template<class Participants,class Cancel,class Prove,class CancelStorage>
+        static void failOriginalSourceAttempt(const Participants& participants,Cancel cancel,Prove prove,CancelStorage cancelStorage) {
+            std::exception_ptr cancellation_failure;
+            try { cancel(); } catch (...) { cancellation_failure=std::current_exception(); }
+            retireOriginalStorageParticipants(participants,prove,[]{},[&] {
+                // Every original producer is now physically proven. Attempt
+                // exact storage cancellation even if the earlier failure
+                // signal reported an ownership error, then retain its first
+                // exception. Neither cancellation phase may manufacture the
+                // typed semantic "already retired" classification.
+                try { cancelStorage(); }
+                catch (...) { if (!cancellation_failure) cancellation_failure=std::current_exception(); }
+                if (cancellation_failure) {
+                    try { std::rethrow_exception(cancellation_failure); }
+                    catch (const std::exception& failure) {
+                        std::throw_with_nested(std::runtime_error(std::string("Original source cancellation phase failed: ")+failure.what()));
+                    }
+                    catch (...) {
+                        std::throw_with_nested(std::runtime_error("Original source cancellation phase failed with a non-standard exception"));
+                    }
+                }
+            });
+        }
+        /** @brief Close a failed host attempt off all original participant workers before outer publisher abort drains owners. */
+        void failRetainedSourceAttempt(const char* operation) noexcept;
+        /** @brief Withdraw collected source-specific TP failure captures before final channel teardown or source rearm. */
+        void retireRetainedSourceFailureCallback();
+        /**
+         * @brief Consume every original constructor result before propagating failure.
+         * @param futures Exactly the submitted construction jobs; no replacement jobs.
+         * @param retain Nonthrowing transfer into the original pre-reserved child owner.
+         * @param abort Signal the original cohort before waiting for another result.
+         * @param first Original async-launch failure, if submission was partial.
+         * @return First original exception after all submitted jobs were consumed.
+         * This helper owns no protocol state and grants no native completion proof.
+         */
+        template<class Futures, class Retain, class Abort>
+        static std::exception_ptr collectOriginalParticipantConstructors(
+            Futures& futures, Retain retain, Abort abort, std::exception_ptr first = {})
+        {
+            using Result = decltype(futures.front().get());
+            static_assert(std::is_nothrow_invocable_v<Retain, Result>);
+            const auto signal = [&] {
+                try { abort(); }
+                catch (...) { if (!first) first = std::current_exception(); }
+            };
+            if (first) signal();
+            for (auto& future : futures) {
+                try {
+                    auto result = future.get();
+                    if (result.failure) {
+                        if (!first) first = result.failure;
+                        signal();
+                    }
+                    retain(std::move(result));
+                } catch (...) {
+                    if (!first) first = std::current_exception();
+                    signal();
+                }
+            }
+            return first;
+        }
+        struct RetainedSourceAdmission;
+        std::unique_ptr<RetainedSourceAdmission> retained_source_admission_;
+        /** @brief Arm every original source channel before any TP participant can launch. */
+        void prepareRetainedSourceAdmission();
+        /**
+         * @brief Await every original native/adopted right before classifying failed service retirement.
+         * @param prior_unproven Original cancellation-identity failure; preserve it after attempting all peers.
+         * @throws RetiredStorageRequestFailure Only after all native proofs; any missing proof remains fatal.
+         */
+        void awaitRetainedSourceAdmission(std::exception_ptr prior_unproven = {});
+
         /** @return The sole TP publication root; PP stages retain independent namespaces. */
         const IInferenceRunner *moeOptimizationOwner() const;
+        /**
+         * @brief Construct the sole participant pool using its original execution ownership.
+         * @param participants Original selected child-owner vector, including PP stages.
+         * @return GPU-control partition placement for flat homogeneous GPU ranks;
+         *         CPU/mixed/nested pipeline compute retains inherited placement.
+         * @throws std::exception For missing child identities or failed cold construction.
+         */
+        [[nodiscard]] std::unique_ptr<TPWorkerPool> makeParticipantWorkerPool(
+            const std::vector<std::unique_ptr<IInferenceRunner>> &participants) const;
         // =====================================================================
         // Private Constructor (for createForTest)
         // =====================================================================
@@ -1708,6 +1931,12 @@ namespace llaminar2
          * @brief Initialize device runners from configuration
          */
         void initializeDeviceRunners();
+
+        /** @brief Retire all original child graph borrowers, then detach runtime
+         * storage authorities before any child arena or collective context dies.
+         * Also closes successfully constructed siblings after a constructor fails.
+         */
+        void retireChildTopologyBeforeSharedStorageDetach();
 
         /**
          * @brief Whether this rank owns the main forward logits boundary.
@@ -2037,11 +2266,17 @@ namespace llaminar2
          * abort NCCL/RCCL communicators after a fatal cancellation.
          */
         std::unique_ptr<ILocalTPContext> tp_ctx_;
+        std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> replicated_ple_cohort_; ///< Source/cohort metadata; actual Rank request and child authorities remain unchanged.
+        /** @return Actual full-main DGO child order for immutable local rollback provenance. */
+        std::vector<const IInferenceRunner *> replicatedPLEPrefixOwners() const;
 
         /// LOCAL PP context for inter-stage transfers (PP mode)
         std::unique_ptr<ILocalPPContext> pp_ctx_;
 
-        /** Native pipeline collective owner outlives every participant graph.
+        /** Native pipeline collective/edges outlive every participant graph.
+         * The rank destructor first retires the separately composed parents while
+         * their borrowed DGO events/streams are alive. Reverse member destruction
+         * then releases participant graphs before this remaining transport owner.
          * Only the tail owns generation; followers own their layer state. */
         std::unique_ptr<PipelineDeviceGeneration> pp_device_generation_;
 
@@ -2056,6 +2291,8 @@ namespace llaminar2
          * is the mandatory NCCL/RCCL graph-reference release order.
          */
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners_;
+        /** Original same-rank expert parent family; never inserted into the TP cohort. */
+        std::shared_ptr<MoEOverlayParticipantGraphRunner> rank_local_expert_endpoints_;
 
         /// PP stage runners (when stages are TP domains, these are RankOrchestrator)
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
@@ -2452,6 +2689,13 @@ namespace llaminar2
                 IInferenceRunner &,
                 const DeviceResidentLogicalSequenceStateHandle &)> &child_operation);
 
+        /** @brief Distinguish a pending input from an operation that replaces main logits. */
+        enum class LocalTPConditionEffect
+        {
+            PublishInput,
+            ForwardMainRow,
+        };
+
         /**
          * @brief Dispatch one scalar main-condition transition to every TP child.
          *
@@ -2459,9 +2703,17 @@ namespace llaminar2
          * can select that child's target slot or resident mailbox. The helper owns
          * worker-pool entry, profiler context propagation, timeout handling, and
          * exception propagation; it never serializes participants or request state.
+         * A main-row advance invalidates old host output before any participant
+         * mutates it, then gathers one row only when host decode observation was
+         * explicitly enabled. Input-only publication preserves the preceding row.
+         * @param operation_name Diagnostic identity, never a policy selector.
+         * @param effect Typed distinction between input publication and model execution.
+         * @param child_operation Concurrent participant operation with its local index.
+         * @return True after every participant and any requested result publication complete.
          */
         bool dispatchLocalTPMTPMainCondition(
             const char *operation_name,
+            LocalTPConditionEffect effect,
             const std::function<bool(IInferenceRunner &, size_t)> &child_operation);
 
         /**
@@ -2555,6 +2807,23 @@ namespace llaminar2
         bool validateMirroredLocalTPChildOutcomesComplete(
             const std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
             const char *context_name);
+
+        /** @brief The owning pipeline retires borrowed complete one-shot domain forwards. */
+        friend class PipelineDeviceGeneration;
+        /** @brief Device-free fixture drives this same private completion and its real logits gatherer. */
+        friend struct test::RankPipelineHostPublicationTestAccess;
+        /**
+         * @brief Publish optional current host logits and retire one completed local domain row.
+         * @details Called only by the enclosing pipeline after independent device
+         * terminal validation, exact-stream output publication and mailbox retirement.
+         * An enabled tail observation consumes those existing child publications;
+         * hidden or device-only domains perform no host gather. Public geometry
+         * advances only after the optional observation succeeds; device KV remains
+         * the execution authority.
+         * @throws std::logic_error For an invalid domain or missing retained observation owner.
+         * @throws std::runtime_error When the original current-row gather fails.
+         */
+        void retirePipelineForwardOnlyDomain();
 
         /**
          * @brief Invalidate the rank token that aggregates child logical mailboxes.

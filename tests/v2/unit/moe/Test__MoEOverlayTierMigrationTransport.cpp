@@ -200,14 +200,13 @@ namespace llaminar2::test
 
             /** @brief Copy pointer-free evidence without waiting. */
             bool recordCompletedWave(
-                const std::vector<MoEOverlayCompletedMigrationMeasurement> &
-                    measurements,
+                std::vector<MoEOverlayCompletedMigrationMeasurement> &&measurements,
                 std::string *error) noexcept override
             {
                 ++observations_->measurement_sink_calls;
                 observations_->bank_prepares_seen_by_measurement_sink =
                     observations_->bank_begin_prepares;
-                recorded = measurements;
+                recorded = std::move(measurements);
                 if (!accept_)
                 {
                     if (error)
@@ -1157,3 +1156,5 @@ namespace llaminar2::test
         }
     }
 } // namespace llaminar2::test
+
+#include "PhysicalMeasurementQuoteDrainContract.inc"

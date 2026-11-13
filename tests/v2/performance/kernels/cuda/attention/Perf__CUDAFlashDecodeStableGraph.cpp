@@ -15,6 +15,7 @@
  * collection remains focused on one production launch.
  */
 
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include <gtest/gtest.h>
 
 #ifdef HAVE_CUDA
@@ -248,6 +249,7 @@ namespace
                 fail("No CUDA device");
                 return;
             }
+            llaminar2::initializeCUDAHardwareMetadata();
             if (cudaSetDevice(0) != cudaSuccess ||
                 cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
                 cudaEventCreate(&start_) != cudaSuccess ||

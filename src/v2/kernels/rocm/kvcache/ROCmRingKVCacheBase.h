@@ -88,6 +88,8 @@ namespace llaminar2
         /** @brief Return the first canonical row, including recurrent-only caches. */
         const int *deviceSequenceCachedTokenCountPtr(int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
+        /** @brief Exact canonical head/count prefix, excluding model rollback suffixes. */
+        size_t deviceSequenceStateMetadataBytes() const override { return sequence_geometry_.checkpointBytes(); }
         size_t deviceSequenceStateCheckpointBytes() const override;
         bool captureDeviceSequenceStateCheckpoint(
             int seq_idx,
@@ -109,6 +111,8 @@ namespace llaminar2
         // Common Accessors
         // =====================================================================
 
+        /** @copydoc IKVCache::request_capacity */
+        int request_capacity() const override { return batch_size_; }
         int batch_size() const { return batch_size_; }
         int n_kv_heads() const override { return n_kv_heads_; }
         int head_dim() const { return head_dim_; }

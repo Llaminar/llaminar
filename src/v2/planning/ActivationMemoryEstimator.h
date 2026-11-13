@@ -16,6 +16,7 @@
 
 namespace llaminar2
 {
+class GraphArenaStorageLayout;
 
 /**
  * @brief Complete runtime geometry that changes a captured activation arena.
@@ -26,8 +27,10 @@ namespace llaminar2
  */
 struct ActivationGraphMemoryGeometry
 {
+    std::optional<ImmutableRowLookupExecution> ngram_lookup; ///< Absent only for the unresolved higher-priority BOM.
     int batch_size = 1;             ///< Requests represented by the main graph.
     int resident_graph_rows = 1;    ///< Largest retained prefill bucket.
+    int context_tokens = 0;         ///< Explicit admitted per-request context; required for sparse state.
     int local_d_ff = 0;             ///< Participant-local dense FFN width.
     int local_n_heads = 0;          ///< Participant-local query head count.
     int local_n_kv_heads = 0;       ///< Participant-local KV head count.
@@ -43,15 +46,50 @@ struct ActivationGraphMemoryGeometry
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         ///< Frozen physical expert layout; determines which publication banks exist.
     int mtp_target_query_rows = 2;  ///< Flattened maximum verifier-row capacity.
+    int retained_mtp_candidate_rows = 0; ///< Explicit retained QSA target bank; zero when MTP capacity is absent.
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
     int generation_request_capacity = 1; ///< Retained sampler request rows, including disabled MTP capacity.
+    int ngram_fixed_head_participants = 0; ///< Source-declared native cohort P2/4/8; zero outside fixed-head lookup.
+    int ngram_fixed_pipeline_local_heads = 0; ///< Actual PLE reader's assembled source heads.
+    int ngram_fixed_pipeline_gathered_heads = 0; ///< Exact gather storage, including no bank for a singleton.
+    std::size_t ngram_fixed_pipeline_scratch_words = 0; ///< Exact original addressed endpoint arena root.
+    qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
+        qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic consumed
+                                                            ///< by execution.
+    qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform; ///< Same frozen scalar as actual graph dimensions.
+    MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout = MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
+        ///< Existing predictor ownership also determines its retained Q/K/V and FFN arena widths.
+    bool local_hot_terminal_observation = false; ///< Original combined policy admits one separate terminal-only arena root.
+    /** @return Exact complete declaration identity, including every policy and ownership field. */
+    bool operator==(const ActivationGraphMemoryGeometry &) const = default;
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */
 class ActivationMemoryEstimator
 {
 public:
+    /**
+     * @brief Declare the CPU arena from the production model schema.
+     * @param profile Exact source metadata, including hybrid projection geometry.
+     * @param geometry Admitted participant row and sharding envelope.
+     * @param device Exact CPU allocator identity.
+     * @return Resolved physical roots consumed by the same arena registration API.
+     */
+    static GraphArenaStorageLayout declareCPUStorage(const ModelMemoryProfile &profile,
+        const ActivationGraphMemoryGeometry &geometry, DeviceId device);
+
+    /**
+     * @brief Price only tier-specific PLE arena roles using the canonical declaration inventory.
+     * @param profile Exact source metadata.
+     * @param geometry Frozen graph envelope with concrete ngram_lookup.
+     * @param device Actual graph participant.
+     * @return Incremental lookup scratch/protocol bytes absent from the unresolved base.
+     * @throws std::invalid_argument For absent tier or malformed Flash Next geometry.
+     */
+    static std::size_t immutableLookupArenaBytes(const ModelMemoryProfile &profile,
+        const ActivationGraphMemoryGeometry &geometry, DeviceId device);
+
     /**
      * @brief Estimate the common transformer BufferArena owner set.
      *
@@ -72,7 +110,7 @@ public:
     );
 
     /**
-     * @brief Estimate the logical BufferArena ownership for a model profile.
+     * @brief Price the physical BufferArena ownership for a model profile.
      *
      * This overload includes architecture-specific projection buffers inferred
      * from the GGUF tensor inventory, plus the declarative MTP and MoE owners
@@ -81,8 +119,9 @@ public:
      *
      * @param profile GGUF-derived model and tensor geometry.
      * @param geometry Complete participant-local captured graph geometry.
-     * @param device Device being admitted; activation ownership is symmetric
-     *        across backends, but retaining the device makes the API explicit.
+     * @param device Allocator being admitted. CPU roots use their exact native
+     *        AlignedVector allocation rounding individually; GPU roots retain
+     *        the native tensor byte extent.
      * @return Required bytes for the graph-owned BufferArena tensors.
      */
     static size_t estimate(

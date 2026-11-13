@@ -8,10 +8,17 @@
  * Qwen-family graph builders (Qwen2, Qwen3, Qwen3.5).
  * Contains shared infrastructure: forward graph construction, FFN,
  * embedding, LM head, TP/PP support, arena management.
+ * Arena MTP target rows follow retained admission independently of execution policy.
+ * Immutable source views are prepared once; every family retains fresh stages.
+ * Enabled GPU setup diagnostics aggregate host graph-construction categories;
+ * CPU inference construction is deliberately excluded from clock sampling.
  */
 
 #include "QwenGraphBase.h"
+#include "../TerminalInputWeights.h"
+#include "../../execution/prefix_cache/ResidualRowGeometry.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
@@ -47,6 +54,76 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Accumulate cold GPU graph-construction host costs without stage logging.
+         *
+         * GPU graph construction is setup-only. CPU graphs can be rebuilt during
+         * inference, so they deliberately never sample these clocks. Layer costs
+         * are disjoint; remainder includes embedding, terminal wiring and other
+         * host work. Nested manifest timings emitted by the FFN builder overlap
+         * FFN time and must not be added to this summary.
+         */
+        class ColdForwardBuildTiming final
+        {
+            using Clock = std::chrono::steady_clock; ///< Host setup clock only.
+        public:
+            /** @brief Begin optional setup attribution.
+             * @param device Original graph participant; CPU timing is disabled.
+             */
+            explicit ColdForwardBuildTiming(DeviceId device)
+                : enabled_(device.is_gpu() && PerfStatsCollector::isDomainEnabled("forward_graph")), device_(device)
+            { if (enabled_) started_ = Clock::now(); }
+
+            /** @brief Start one host-only layer construction category.
+             * @return Timer origin, or a default value when disabled.
+             */
+            auto begin() const { return enabled_ ? Clock::now() : Clock::time_point{}; }
+
+            /** @brief Accumulate one disjoint category without allocation.
+             * @param category Binding, attention, FFN or merge slot (0..3).
+             * @param started Origin returned by begin().
+             */
+            void end(unsigned category, Clock::time_point started)
+            {
+                if (enabled_) {
+                    elapsed_[category] += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started).count();
+                    ++samples_[category];
+                }
+            }
+
+            /** @brief Emit one successful graph summary and bounded PerfStats categories.
+             * @param nodes Actual constructed graph node count.
+             */
+            void finish(std::size_t nodes) const
+            {
+                if (!enabled_) return;
+                const auto total = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started_).count();
+                const auto remainder = total-elapsed_[0]-elapsed_[1]-elapsed_[2]-elapsed_[3];
+                const auto device = device_.to_string();
+                constexpr const char *names[]{"layer_binding", "attention", "ffn", "merge", "remainder"};
+                for (unsigned i=0;i<5;++i) {
+                    PerfStatsCollector::recordTimingNs("forward_graph", "cold_graph_build_host", i<4 ? elapsed_[i] : remainder,
+                        "setup", device, {{"phase", names[i]}});
+                    if (i<4)
+                        PerfStatsCollector::addCounter("forward_graph", "cold_graph_build_samples", samples_[i],
+                            "setup", device, {{"phase", names[i]}});
+                }
+                LOG_INFO("[ColdForwardGraphBuild] complete device=" << device
+                    << " nodes=" << nodes << " total_ms=" << total/1.0e6
+                    << " binding_ms=" << elapsed_[0]/1.0e6 << " attention_ms=" << elapsed_[1]/1.0e6
+                    << " ffn_ms=" << elapsed_[2]/1.0e6 << " merge_ms=" << elapsed_[3]/1.0e6
+                    << " remainder_ms=" << remainder/1.0e6 << " layer_samples=" << samples_[0]
+                    << " attention_samples=" << samples_[1] << " ffn_samples=" << samples_[2]
+                    << " merge_samples=" << samples_[3]);
+            }
+        private:
+            bool enabled_; ///< Existing enabled PerfStats path, restricted to GPU setup.
+            DeviceId device_; ///< Exact original participant identity.
+            Clock::time_point started_{}; ///< Whole graph setup origin.
+            std::int64_t elapsed_[4]{}; ///< Disjoint scalar category totals.
+            std::uint64_t samples_[4]{}; ///< Actual category invocation counts.
+        };
+
         int embeddingVocabOffsetForDevice(const GraphConfig &config, DeviceId device)
         {
             if (!config.tp_config)
@@ -408,11 +485,58 @@ namespace llaminar2
 
     void QwenGraphBase::setModelContext(std::shared_ptr<IModelContext> model_ctx)
     {
+        requireUnpreparedForwardSource("setModelContext");
         model_ctx_ = std::dynamic_pointer_cast<ModelContext>(std::move(model_ctx));
         if (!model_ctx_)
         {
             LOG_DEBUG("[QwenGraphBase] setModelContext ignored non-ModelContext instance");
         }
+    }
+
+    void QwenGraphBase::requireUnpreparedForwardSource(const char *operation) const
+    {
+        forward_graph_template_.requireUnprepared(operation);
+    }
+
+    const QwenGraphBase::ForwardGraphRecipe *QwenGraphBase::preparedForwardRecipe() const noexcept
+    {
+        return forward_graph_template_.prepared() ? &forward_graph_template_.recipe() : nullptr;
+    }
+
+    void QwenGraphBase::prepareForwardGraphTemplate(DeviceId device)
+    {
+        // Validate before recipe publication: a rejected cold participant or
+        // absent source must leave ordinary setup setters available.
+        if (device == DeviceId::invalid() || device != config_.default_device)
+            throw std::invalid_argument("Qwen forward template requires its original valid participant");
+        if (config_.n_layers < 0 || (config_.n_layers > 0 && !hasLayerWeightSource()))
+            throw std::invalid_argument("Qwen forward template requires its original layer weight source");
+        const auto before = forward_graph_template_.preparations();
+        const auto &recipe = forward_graph_template_.prepare([&] {
+            return ForwardGraphRecipe{device, &weight_bindings_,
+                &decode_replicated_dense_weight_bindings_, &weights_};
+        });
+        if (recipe.device != device)
+            throw std::invalid_argument("Qwen forward template requires its original participant");
+        if (forward_graph_template_.preparations() != before)
+            PerfStatsCollector::addCounter("forward_graph", "immutable_template_preparations", 1.0,
+                "template", device.to_string());
+    }
+
+    PreparedGraphTemplateStats QwenGraphBase::forwardGraphTemplateStats() const
+    {
+        return {.preparations = forward_graph_template_.preparations(),
+            .specialization_attempts = forward_graph_template_.specializationAttempts()};
+    }
+
+    void QwenGraphBase::beginForwardGraphSpecialization(DeviceId device)
+    {
+        prepareForwardGraphTemplate(device);
+        (void)forward_graph_template_.beginSpecialization();
+        PerfStatsCollector::addCounter("forward_graph", "immutable_template_specializations", 1.0,
+            "graph", device.to_string(),
+            {{"grouped_verifier", config_.grouped_mtp_verifier ? "true" : "false"},
+             {"all_position_logits", config_.compute_all_position_logits ? "true" : "false"}});
     }
 
     bool QwenGraphBase::hasLayerWeightSource() const
@@ -435,7 +559,10 @@ namespace llaminar2
                (decode_replicated_dense_weight_bindings_.get_layer_weights ? "present" : "missing") +
                " embedding=" + state(decode_replicated_dense_weight_bindings_.embedding_table) +
                " final_norm=" + state(decode_replicated_dense_weight_bindings_.final_norm) +
-               " lm_head=" + state(decode_replicated_dense_weight_bindings_.lm_head);
+               " lm_head=" + state(decode_replicated_dense_weight_bindings_.lm_head) +
+               " hc_norm=" + state(decode_replicated_dense_weight_bindings_.hyper_connection_head.norm) +
+               " hc_down=" + state(decode_replicated_dense_weight_bindings_.hyper_connection_head.down) +
+               " hc_up=" + state(decode_replicated_dense_weight_bindings_.hyper_connection_head.up);
     }
 
     bool QwenGraphBase::useDecodeReplicatedDenseWeights() const
@@ -463,8 +590,20 @@ namespace llaminar2
 
     bool QwenGraphBase::hasMirroredMTPHeadWeightSource() const
     {
-        return decode_replicated_dense_weight_bindings_.final_norm != nullptr &&
-               decode_replicated_dense_weight_bindings_.lm_head != nullptr;
+        return hasRequiredTerminalInputWeights(config_, decode_replicated_dense_weight_bindings_) &&
+               legacyTensor(decode_replicated_dense_weight_bindings_.lm_head) != nullptr;
+    }
+
+    const HyperConnectionWeights<const WeightBinding *> &
+    QwenGraphBase::modelHyperConnectionHeadBindings() const
+    {
+        const auto &selected = useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights()
+                                   ? decode_replicated_dense_weight_bindings_
+                                   : weight_bindings_;
+        if (!hasRequiredTerminalInputWeights(config_, selected))
+            throw std::runtime_error(
+                "[QwenGraphBase] Selected terminal mixer requires complete model-owned norm/down/up bindings");
+        return selected.hyper_connection_head;
     }
 
     bool QwenGraphBase::mirroredMTPHeadConfigured() const
@@ -553,7 +692,10 @@ namespace llaminar2
         switch (request.norm_source)
         {
         case FinalNormSource::ModelOutputNorm:
-            policy.norm_gamma = modelFinalNorm();
+            // The QFN terminal mixer validates and binds its complete norm/down/up
+            // chain in addBranchHeadRead; it never consumes an ordinary RMS gain.
+            if (!config_.flash_next)
+                policy.norm_gamma = modelFinalNorm();
             break;
         case FinalNormSource::MTPSidecarNorm:
             policy.norm_gamma = request.mtp_norm;
@@ -604,7 +746,14 @@ namespace llaminar2
     int QwenGraphBase::serialEquivalentLMHeadPartitionWidth(
         bool column_parallel) const
     {
-        if (column_parallel || !useMirroredMTPHeadWeights())
+        return serialEquivalentLMHeadPartitionWidth(column_parallel,
+            useMirroredMTPHeadWeights() ? FinalHeadPolicy::MirroredMTPFullVocabulary : FinalHeadPolicy::PrimaryFullVocabulary);
+    }
+
+    int QwenGraphBase::serialEquivalentLMHeadPartitionWidth(
+        bool column_parallel, FinalHeadPolicy head_policy) const
+    {
+        if (column_parallel || head_policy != FinalHeadPolicy::MirroredMTPFullVocabulary)
             return 0;
 
         if (config_.vocab_local <= 0 || config_.vocab_size <= 0 ||
@@ -833,7 +982,7 @@ namespace llaminar2
         IKVCache *kv_cache,
         DeviceId device) const
     {
-        if (!kv_cache || !device.is_gpu())
+        if (!kv_cache || (!device.is_gpu() && !device.is_cpu()))
             return false;
         if (!config_.dense_tp_enabled ||
             !config_.dense_tp_decode_replicated ||
@@ -865,7 +1014,9 @@ namespace llaminar2
         if (!mtp_kv_cache_only_graph_active_ &&
             (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights()))
             return false;
-        if (total_tokens <= 1)
+        // Explicit one-row Prefill is still sharded. Decode's replicated
+        // projection was excluded above by its actual typed graph scope.
+        if (total_tokens <= 0)
             return false;
         if (config_.n_kv_heads <= 0 ||
             config_.head_dim <= 0 ||
@@ -1071,25 +1222,28 @@ namespace llaminar2
 
     LayerWeightBindings QwenGraphBase::layerWeightBindingsForGraph(int layer_idx) const
     {
+        const auto *recipe = preparedForwardRecipe();
+        const auto &primary = recipe ? *recipe->primary : weight_bindings_;
+        const auto &replicated = recipe ? *recipe->replicated_dense : decode_replicated_dense_weight_bindings_;
         LayerWeightBindings bindings;
-        if (weight_bindings_.get_layer_weights)
-            bindings = weight_bindings_.get_layer_weights(layer_idx);
+        if (primary.get_layer_weights)
+            bindings = primary.get_layer_weights(layer_idx);
 
         if (useReplicatedAttentionStateWeights() &&
-            decode_replicated_dense_weight_bindings_.get_layer_weights)
+            replicated.get_layer_weights)
         {
             bindings = mergeReplicatedAttentionBindings(
                 bindings,
-                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+                replicated.get_layer_weights(layer_idx));
         }
 
         if ((useDecodeReplicatedDenseWeights() ||
              useReplicatedMTPSidecarDenseWeights()) &&
-            decode_replicated_dense_weight_bindings_.get_layer_weights)
+            replicated.get_layer_weights)
         {
             bindings = mergeDenseDecodeBindings(
                 bindings,
-                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+                replicated.get_layer_weights(layer_idx));
         }
 
         return bindings;
@@ -1097,10 +1251,13 @@ namespace llaminar2
 
     LayerWeights QwenGraphBase::layerWeightsForGraph(int layer_idx) const
     {
-        if (weight_bindings_.get_layer_weights)
+        const auto *recipe = preparedForwardRecipe();
+        const auto &primary = recipe ? *recipe->primary : weight_bindings_;
+        const auto &legacy = recipe ? *recipe->legacy : weights_;
+        if (primary.get_layer_weights)
             return toLegacyLayerWeights(layerWeightBindingsForGraph(layer_idx));
-        if (weights_.get_layer_weights)
-            return weights_.get_layer_weights(layer_idx);
+        if (legacy.get_layer_weights)
+            return legacy.get_layer_weights(layer_idx);
         return {};
     }
 
@@ -1157,7 +1314,7 @@ namespace llaminar2
             if (useMirroredMTPHeadWeights() && !hasMirroredMTPHeadWeightSource())
             {
                 throw std::runtime_error(
-                    "[QwenGraphBase] Mirrored MTP head was requested but replicated final_norm/lm_head bindings are missing: " +
+                    "[QwenGraphBase] Mirrored MTP head was requested but replicated model terminal input/lm_head bindings are missing: " +
                     describeDecodeReplicatedDenseBindingState());
             }
             TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.lm_head);
@@ -1577,7 +1734,9 @@ namespace llaminar2
             moe.routed_expert_plan &&
             moe.routed_expert_plan->usesExpertOverlayAuthority();
         return retainsMTPGraphCapacity(mtp) || phase_split_dense_graphs ||
-               tiered_overlay_graphs;
+               tiered_overlay_graphs || (ordinary_terminal_projection.hasExplicitRows() &&
+                   lm_head_column_parallel && mtp.terminal_head_policy == MTPTerminalHeadPolicy::VocabularySharded &&
+                   hasNativeLocalVocabularyGather());
     }
 
     bool GraphConfig::hasUnifiedPP() const
@@ -1830,6 +1989,9 @@ namespace llaminar2
             return dependency_node;
 
         const auto &binding = *input.shifted_mtp_prefill;
+        if (input.batch_size <= 0 || input.seq_len <= 0 ||
+            input.batch_size > std::numeric_limits<int>::max() / input.seq_len)
+            throw std::invalid_argument("Shifted MTP residual packing requires positive representable request rows");
         const int total_tokens = input.batch_size * input.seq_len;
         const bool main_prefill =
             input.execution_phase == ForwardExecutionPhase::Prefill &&
@@ -1860,27 +2022,31 @@ namespace llaminar2
             throw std::runtime_error(
                 "Qwen GPU shifted MTP prefill requires depth-zero MTP weight bindings");
         }
-        if (!buffers_.current_hidden || !buffers_.layer_buffers.normalized ||
-            buffers_.current_hidden->rows() <
-                static_cast<size_t>(total_tokens) ||
-            buffers_.layer_buffers.normalized->rows() <
-                static_cast<size_t>(total_tokens))
-        {
-            throw std::runtime_error(
-                "Qwen GPU shifted MTP prefill exceeds its persistent hidden-state arena capacity");
-        }
+        if (!buffers_.current_hidden || !binding.terminal_hidden_archive)
+            throw std::invalid_argument("Shifted MTP residual packing requires source and terminal archive owners");
+        const ResidualRowGeometry residual_rows(config_.residualWidth());
+        (void)residual_rows.bytesForRows(buffers_.current_hidden->shape(), total_tokens);
+        (void)residual_rows.bytesForRows(binding.terminal_hidden_archive->shape(), input.batch_size);
+        const auto compute_shape = buffers_.layer_buffers.normalized
+            ? std::span<const std::size_t>(buffers_.layer_buffers.normalized->shape()) : std::span<const std::size_t>{};
+        const auto wide_shape = binding.output.norm_hidden
+            ? std::span<const std::size_t>(binding.output.norm_hidden->shape()) : std::span<const std::size_t>{};
+        const auto scratch = residual_rows.scratchSource(config_.d_model, compute_shape, wide_shape, total_tokens);
+        const bool wide = scratch == ResidualRowGeometry::ScratchSource::ResidualRows;
+        TensorBase *packed_hidden = wide ? binding.output.norm_hidden : buffers_.layer_buffers.normalized;
+        const BufferId packed_hidden_id = wide ? BufferId::MTP_NORM_HIDDEN : BufferId::NORMALIZED;
 
         const std::string prepare_node =
             "mtp_shifted_prefill_prepare_and_archive";
         HiddenStateRowsSelectStage::Params prepare_params{
             .device_id = device,
             .input = buffers_.current_hidden,
-            .output = buffers_.layer_buffers.normalized,
+            .output = packed_hidden,
             .seq_len = total_tokens,
-            .d_model = config_.d_model,
+            .d_model = residual_rows.columns(),
             .selected_row_count = total_tokens,
             .input_buffer_id = BufferId::HIDDEN_STATE,
-            .output_buffer_id = BufferId::NORMALIZED,
+            .output_buffer_id = packed_hidden_id,
             .device_row_index_source =
                 HiddenStateRowsSelectStage::DeviceRowIndexSource::
                     ShiftedPrefillTransaction,
@@ -1899,6 +2065,7 @@ namespace llaminar2
                 binding.shifted_token_ids_device,
             .shifted_position_ids_output_device =
                 binding.shifted_position_ids_device,
+            .shifted_cache_origin = config_.mtpShiftedCacheOrigin(),
             .shifted_append_lengths_output_device =
                 binding.append_lengths_device,
             .terminal_hidden_archive =
@@ -1922,7 +2089,7 @@ namespace llaminar2
             .draft_token_ids = nullptr,
             .draft_token_ids_device =
                 binding.shifted_token_ids_device,
-            .terminal_hidden = buffers_.layer_buffers.normalized,
+            .terminal_hidden = packed_hidden,
             .kv_cache = binding.kv_cache,
             .position_ids = nullptr,
             .position_ids_device =
@@ -1935,8 +2102,9 @@ namespace llaminar2
             .device_state_publication_stream =
                 input.device_state_publication_stream,
             .device = device,
-            .terminal_hidden_buffer_id = BufferId::NORMALIZED,
+            .terminal_hidden_buffer_id = packed_hidden_id,
             .kv_cache_only = true,
+            .graph_submission_intent = input.graph_submission_intent,
         };
         MTPForwardOutput mtp_output = binding.output;
         ComputeGraph mtp_kv_graph = buildMTPGraph(
@@ -1983,7 +2151,7 @@ namespace llaminar2
             binding.terminal_hidden_archive->rows() <
                 static_cast<size_t>(binding.request_count) ||
             binding.terminal_hidden_archive->cols() <
-                static_cast<size_t>(config_.d_model))
+                static_cast<size_t>(config_.residualWidth()))
         {
             throw std::runtime_error(
                 "Qwen MTP main decode requires a complete graph-integrated "
@@ -2001,7 +2169,7 @@ namespace llaminar2
             .input = buffers_.current_hidden,
             .output = binding.terminal_hidden_archive,
             .seq_len = total_tokens,
-            .d_model = config_.d_model,
+            .d_model = config_.residualWidth(),
             .selected_row_count = binding.request_count,
             .selected_row_indices = std::move(selected_rows),
             .input_buffer_id = BufferId::HIDDEN_STATE,
@@ -2026,10 +2194,74 @@ namespace llaminar2
         return publication_node;
     }
 
+    TensorBase *QwenGraphBase::canonicalMainLogitsDestination(
+        const ForwardInput &input, bool column_parallel) const
+    {
+        auto *source = graphLMHeadOutput(column_parallel);
+        if (!input.mtp_main_terminal_logits)
+            return source;
+        return source == buffers_.logits_local
+            ? input.mtp_main_terminal_logits->local
+            : input.mtp_main_terminal_logits->full;
+    }
+
+    std::string QwenGraphBase::maybeAddMTPMainTerminalLogitsPublication(
+        ComputeGraph &graph, const ForwardInput &input,
+        const std::string &dependency_node, DeviceId device,
+        bool column_parallel, bool all_positions)
+    {
+        if (!input.mtp_main_terminal_logits)
+            return dependency_node;
+        const auto &binding = *input.mtp_main_terminal_logits;
+        auto *source = graphLMHeadOutput(column_parallel);
+        const bool local = source == buffers_.logits_local;
+        auto *destination = canonicalMainLogitsDestination(input, column_parallel);
+        const int columns = local ? binding.local_columns : binding.full_columns;
+        const int source_rows = all_positions ? input.batch_size * input.seq_len : input.batch_size;
+        const int first_row = all_positions ? input.seq_len - 1 : 0;
+        if (!device.is_gpu() || input.execution_phase != ForwardExecutionPhase::Decode ||
+            (input.execution_role != ForwardExecutionRole::MainInference &&
+             input.execution_role != ForwardExecutionRole::MTPCondition) ||
+            !binding.validForRequestCount(input.batch_size) || !source || !destination ||
+            columns <= 0 || source->native_type() != TensorType::FP32 ||
+            destination->native_type() != TensorType::FP32 ||
+            source->rows() < source_rows || source->cols() < columns ||
+            destination->rows() < 1 || destination->cols() < columns ||
+            source->cols() > std::numeric_limits<int>::max() || destination->cols() > std::numeric_limits<int>::max() ||
+            (input.seq_len != 1 && input.batch_size != 1))
+        {
+            throw std::logic_error("MTP canonical logits require the original live vocabulary surface and physical row strides");
+        }
+        if (source == destination)
+            return dependency_node;
+        HiddenStateRowsSelectStage::Params params;
+        params.device_id = device;
+        params.input = source;
+        params.output = destination;
+        params.seq_len = source_rows;
+        params.d_model = columns;
+        // The canonical vocabulary bank is request zero, as in the CPU
+        // accepted-state publisher. Batched consumers keep the original bank.
+        params.selected_row_count = 1;
+        params.device_row_index_source = HiddenStateRowsSelectStage::DeviceRowIndexSource::FixedContiguousRange;
+        params.fixed_contiguous_row_start = first_row;
+        params.input_buffer_id = logitsBufferId(local, all_positions);
+        params.output_buffer_id = local ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        params.row_copy_policy.source_stride = static_cast<int>(source->cols());
+        params.row_copy_policy.destination_stride = static_cast<int>(destination->cols());
+        constexpr const char *name = "mtp_main_terminal_logits_publish";
+        graph.addNode(name, ComputeStageFactory::createHiddenStateRowsSelect(std::move(params)), device);
+        graph.addDependency(name, dependency_node);
+        graph.setTerminalNode(name);
+        return name;
+    }
+
     ComputeGraph QwenGraphBase::buildFullForwardGraph(
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        ColdForwardBuildTiming setup_timing(config_.default_device);
+        ForwardInputConstructionScope model_input_scope(*this,input);
         const int total_tokens = input.batch_size * input.seq_len;
         PrefillCollectiveRowsScope collective_rows_scope(*this, input);
         ForwardExecutionPhaseScope execution_phase_scope(
@@ -2041,7 +2273,7 @@ namespace llaminar2
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
 
-        if (!modelEmbeddingTable() || !modelFinalNorm() || !modelLMHead())
+        if (!modelEmbeddingTable() || (!config_.flash_next && !modelFinalNorm()) || !modelLMHead())
         {
             LOG_ERROR("[QwenGraphBase] Weights not set! Call setWeights() first.");
             throw std::runtime_error("QwenStandardGraph weights not initialized");
@@ -2053,9 +2285,12 @@ namespace llaminar2
             throw std::runtime_error("QwenStandardGraph buffers not initialized");
         }
 
+        beginForwardGraphSpecialization(config_.default_device);
+
         DeviceId device = config_.default_device;
 
         ComputeGraph graph;
+        auto invocation_prefix=addModelInvocationPrefix(graph,input,config_.default_device,ModelInvocationShape::FullLocal);
 
         // -------------------------------------------------------------------------
         // Stage 1: Embedding Lookup
@@ -2065,6 +2300,8 @@ namespace llaminar2
         TensorBase *embed_output = (buffers_.layer_buffers.residual && config_.isHybridQ16())
                                        ? buffers_.layer_buffers.residual
                                        : buffers_.current_hidden;
+
+        embed_output = embeddingDestination(embed_output);
 
         EmbeddingStage::Params embed_params;
         embed_params.embed_table = modelEmbeddingTable();
@@ -2077,7 +2314,7 @@ namespace llaminar2
         embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
         embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         embed_params.device_id = config_.default_device;
-        embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
+        embed_params.output_buffer_id = embeddingBufferId();
         embed_params.mpi_ctx = mpi_ctx_.get();
         embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
         embed_params.prepared_store = prepared_weight_store_;
@@ -2085,6 +2322,7 @@ namespace llaminar2
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
                       device);
+        if(!invocation_prefix->terminal().empty())graph.addDependency("embedding",invocation_prefix->terminal());
 
         // -------------------------------------------------------------------------
         // Stage 1b: Embedding AllReduce (vocab-parallel embedding sharding)
@@ -2100,7 +2338,7 @@ namespace llaminar2
             auto allreduce_stage = createTPAllreduceStage(
                 embed_output, allreduce_count, device, -1,
                 /*is_attention=*/false, "embedding_allreduce",
-                BufferId::HIDDEN_STATE);
+                embeddingBufferId());
             if (allreduce_stage)
             {
                 graph.addNode("embedding_allreduce", std::move(allreduce_stage), device);
@@ -2118,10 +2356,13 @@ namespace llaminar2
         prev_node = maybeAddEmbeddingDiagnosticCheckpoints(
             graph,
             embed_output,
-            BufferId::HIDDEN_STATE,
+            embeddingBufferId(),
             prev_node,
             total_tokens,
             device);
+
+        prev_node = addEmbeddingTrunkExpansion(graph, embed_output,
+            buffers_.current_hidden, prev_node, total_tokens, device);
 
         const int *position_ids =
             validatedHostPositionRows(input, "Qwen standard forward graph");
@@ -2136,8 +2377,12 @@ namespace llaminar2
         // Build complete graphs for each layer
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
+            prev_node=addModelLayerInput(graph,input,layer,device,prev_node,*invocation_prefix);
             // Get layer weights
+            auto category_started = setup_timing.begin();
             LayerWeights layer_weights = layerWeightsForGraph(layer);
+            setup_timing.end(0, category_started);
+            category_started = setup_timing.begin();
 
             // Build attention graph for this layer
             // Pass sequence_lengths for proper batch-aware attention masking
@@ -2147,6 +2392,9 @@ namespace llaminar2
                 input.sequence_lengths, input.position_ids_device,
                 input.sequence_lengths_device);
 
+            setup_timing.end(1, category_started);
+            category_started = setup_timing.begin();
+
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
             if (attn_last.empty())
@@ -2155,6 +2403,9 @@ namespace llaminar2
             // Merge attention graph, connecting to previous node
             graph.merge(std::move(attn_graph), prev_node);
 
+            setup_timing.end(3, category_started);
+            category_started = setup_timing.begin();
+
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
@@ -2162,6 +2413,9 @@ namespace llaminar2
                 input.device_state_publication_stream,
                 input.sequence_lengths_device,
                 static_cast<const int32_t *>(input.position_ids_device));
+
+            setup_timing.end(2, category_started);
+            category_started = setup_timing.begin();
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -2173,6 +2427,7 @@ namespace llaminar2
 
             // Use the determined FFN terminal as the prev node for next layer
             prev_node = ffn_last;
+            setup_timing.end(3, category_started);
         }
 
         // -------------------------------------------------------------------------
@@ -2304,14 +2559,18 @@ namespace llaminar2
             input,
             prev_node,
             device);
+        prev_node = maybeAddMTPMainTerminalLogitsPublication(graph, input, prev_node,
+            device, use_column_parallel, lm_layout.compute_all_positions);
         sealInferenceTransactionGraph(graph, prev_node);
 
-        // Set output
+        // Preserve original graph semantic output for immediate scalar/batch sampling.
         output.logits = graphLMHeadOutput(use_column_parallel);
 
         LOG_DEBUG("[QwenGraphBase] Built full forward graph with "
                   << graph.size() << " nodes");
 
+        invocation_prefix->requireConsumed();
+        setup_timing.finish(graph.size());
         return graph;
     }
 
@@ -2327,6 +2586,9 @@ namespace llaminar2
         bool has_embedding,
         bool has_lm_head)
     {
+        ForwardInputConstructionScope model_input_scope(*this,input);
+        PrefillCollectiveRowsScope collective_rows_scope(*this,input);
+        ForwardExecutionPhaseScope execution_phase_scope(*this,input.execution_phase);
         const int total_tokens = input.batch_size * input.seq_len;
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
 
@@ -2352,7 +2614,7 @@ namespace llaminar2
             LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
             throw std::runtime_error("QwenStandardGraph embedding weights not initialized");
         }
-        if (has_lm_head && (!modelFinalNorm() || !modelLMHead()))
+        if (has_lm_head && ((!config_.flash_next && !modelFinalNorm()) || !modelLMHead()))
         {
             LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
             throw std::runtime_error("QwenStandardGraph LM head weights not initialized");
@@ -2378,6 +2640,7 @@ namespace llaminar2
         DeviceId device = config_.default_device;
 
         ComputeGraph graph;
+        auto invocation_prefix=addModelInvocationPrefix(graph,input,config_.default_device,ModelInvocationShape::Partial);
         std::string prev_node;
 
         // -------------------------------------------------------------------------
@@ -2391,6 +2654,8 @@ namespace llaminar2
                                            ? buffers_.layer_buffers.residual
                                            : buffers_.current_hidden;
 
+            embed_output = embeddingDestination(embed_output);
+
             EmbeddingStage::Params embed_params;
             embed_params.embed_table = modelEmbeddingTable();
             embed_params.token_ids = input.token_ids;
@@ -2402,7 +2667,7 @@ namespace llaminar2
             embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
             embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
             embed_params.device_id = config_.default_device;
-            embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
+            embed_params.output_buffer_id = embeddingBufferId();
             embed_params.mpi_ctx = mpi_ctx_.get();
             embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
             embed_params.prepared_store = prepared_weight_store_;
@@ -2410,6 +2675,7 @@ namespace llaminar2
             graph.addNode("embedding",
                           ComputeStageFactory::createEmbedding(embed_params),
                           device);
+            if(!invocation_prefix->terminal().empty())graph.addDependency("embedding",invocation_prefix->terminal());
             prev_node = "embedding";
 
             // Stage 1b: Embedding AllReduce (vocab-parallel embedding sharding)
@@ -2423,7 +2689,7 @@ namespace llaminar2
                 auto allreduce_stage = createTPAllreduceStage(
                     embed_output, allreduce_count, device, -1,
                     /*is_attention=*/false, "embedding_allreduce",
-                    BufferId::HIDDEN_STATE);
+                    embeddingBufferId());
                 if (allreduce_stage)
                 {
                     graph.addNode("embedding_allreduce", std::move(allreduce_stage), device);
@@ -2431,6 +2697,8 @@ namespace llaminar2
                     prev_node = "embedding_allreduce";
                 }
             }
+            prev_node = addEmbeddingTrunkExpansion(graph, embed_output,
+                buffers_.current_hidden, prev_node, total_tokens, device);
         }
         else if (input.external_hidden_state)
         {
@@ -2462,6 +2730,8 @@ namespace llaminar2
             throw std::runtime_error("PP stage without embedding requires external_hidden_state");
         }
 
+        beginForwardGraphSpecialization(config_.default_device);
+
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (subset for this PP stage)
         // -------------------------------------------------------------------------
@@ -2471,6 +2741,7 @@ namespace llaminar2
         // Build graphs for assigned layer range [first_layer, last_layer)
         for (int layer = first_layer; layer < last_layer; ++layer)
         {
+            prev_node=addModelLayerInput(graph,input,layer,device,prev_node,*invocation_prefix);
             // Get layer weights
             LayerWeights layer_weights = layerWeightsForGraph(layer);
 
@@ -2627,7 +2898,8 @@ namespace llaminar2
                 lm_layout.seq_len,
                 device);
 
-            // Set output logits
+            prev_node = maybeAddMTPMainTerminalLogitsPublication(graph, input, prev_node,
+                device, use_column_parallel, lm_layout.compute_all_positions);
             output.logits = graphLMHeadOutput(use_column_parallel);
         }
         else
@@ -2643,6 +2915,7 @@ namespace llaminar2
         LOG_DEBUG("[QwenGraphBase] Built partial forward graph with "
                   << graph.size() << " nodes for layers [" << first_layer << ", " << last_layer << ")");
 
+        invocation_prefix->requireConsumed();
         return graph;
     }
 
@@ -2654,6 +2927,7 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        ForwardInputConstructionScope model_input_scope(*this,input);
         // =====================================================================
         // 1. Validate prerequisites
         // =====================================================================
@@ -2686,6 +2960,7 @@ namespace llaminar2
         // 2. Prepare execution context
         // =====================================================================
         ComputeGraph graph;
+        auto invocation_prefix=addModelInvocationPrefix(graph,input,config_.default_device,ModelInvocationShape::UnifiedPipeline);
         std::string prev_node;
         int total_tokens = input.batch_size * input.seq_len;
 
@@ -2746,6 +3021,8 @@ namespace llaminar2
                                                ? buffers_.layer_buffers.residual
                                                : buffers_.current_hidden;
 
+                embed_output = embeddingDestination(embed_output);
+
                 EmbeddingStage::Params embed_params;
                 embed_params.embed_table = modelEmbeddingTable();
                 embed_params.token_ids = input.token_ids;
@@ -2776,7 +3053,7 @@ namespace llaminar2
                         -1,
                         /*is_attention=*/false,
                         "embedding_allreduce",
-                        BufferId::HIDDEN_STATE);
+                        embeddingBufferId());
                     if (allreduce_stage)
                     {
                         graph.addNode("embedding_allreduce", std::move(allreduce_stage), stage_device);
@@ -2784,6 +3061,9 @@ namespace llaminar2
                         prev_node = "embedding_allreduce";
                     }
                 }
+
+                prev_node = addEmbeddingTrunkExpansion(graph, embed_output,
+                    buffers_.current_hidden, prev_node, total_tokens, stage_device);
 
                 LOG_DEBUG("[QwenGraphBase] Added embedding stage on device " << stage_device.to_string());
             }
@@ -2813,6 +3093,7 @@ namespace llaminar2
 
             for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
             {
+                prev_node=addModelLayerInput(graph,input,layer,stage_device,prev_node,*invocation_prefix);
                 // Get layer weights
                 LayerWeights layer_weights = layerWeightsForGraph(layer);
 
@@ -2923,7 +3204,7 @@ namespace llaminar2
             // -----------------------------------------------------------------
             if (pp_stage.has_lm_head)
             {
-                if (!modelFinalNorm() || !modelLMHead())
+                if ((!config_.flash_next && !modelFinalNorm()) || !modelLMHead())
                 {
                     LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
                     throw std::runtime_error("LM head weights not initialized for unified PP graph");
@@ -3020,6 +3301,8 @@ namespace llaminar2
                     .stage_name = "lm_head_allgather",
                 });
 
+                prev_node = maybeAddMTPMainTerminalLogitsPublication(graph, input, prev_node,
+                    stage_device, use_column_parallel, lm_layout.compute_all_positions);
                 output.logits = graphLMHeadOutput(use_column_parallel);
 
                 LOG_DEBUG("[QwenGraphBase] Added LM head stage on device " << stage_device.to_string());
@@ -3029,6 +3312,7 @@ namespace llaminar2
         LOG_DEBUG("[QwenGraphBase] Built unified pipeline graph with " << graph.size()
                                                                        << " nodes across " << config_.pipeline_config->numStages() << " PP stages");
 
+        invocation_prefix->requireConsumed();
         return graph;
     }
 
@@ -3117,12 +3401,15 @@ namespace llaminar2
                   << total_tokens << " tokens");
 
         ComputeGraph graph;
+        TensorBase *embedding = embeddingDestination(output_hidden);
+        std::string terminal = "embedding";
 
         EmbeddingStage::Params params;
         params.embed_table = modelEmbeddingTable();
         params.token_ids = input.token_ids;
         params.token_ids_device = input.token_ids_device;
-        params.output = output_hidden;
+        params.output = embedding;
+        params.output_buffer_id = embeddingBufferId();
         params.num_tokens = total_tokens;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
@@ -3140,20 +3427,24 @@ namespace llaminar2
         {
             const size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
             auto allreduce_stage = createTPAllreduceStage(
-                output_hidden,
+                embedding,
                 allreduce_count,
                 config_.default_device,
                 -1,
                 /*is_attention=*/false,
                 "embedding_allreduce",
-                BufferId::HIDDEN_STATE);
+                embeddingBufferId());
             if (allreduce_stage)
             {
                 graph.addNode("embedding_allreduce", std::move(allreduce_stage), config_.default_device);
                 graph.addDependency("embedding_allreduce", "embedding");
+                terminal = "embedding_allreduce";
             }
         }
 
+        terminal = addEmbeddingTrunkExpansion(graph, embedding, output_hidden,
+            terminal, total_tokens, config_.default_device);
+        graph.setTerminalNode(terminal);
         return graph;
     }
 
@@ -3234,18 +3525,30 @@ namespace llaminar2
                     config_.live_mtp_request_batch_condition,
             });
 
-        // Final RMSNorm
-        RMSNormStage::Params norm_params;
-        norm_params.input = hidden_states;
-        norm_params.output = hidden_states; // In-place norm
-        norm_params.gamma = final_projection.norm_gamma;
-        norm_params.eps = config_.rms_norm_eps;
-        norm_params.seq_len = total_tokens;
-        norm_params.device_id = device;
+        TensorBase *head_rows = hidden_states;
+        BufferId head_rows_id = BufferId::HIDDEN_STATE;
+        if (config_.flash_next)
+        {
+            head_rows = buffers_.layer_buffers.normalized;
+            head_rows_id = BufferId::NORMALIZED;
+            addBranchHeadRead(graph, hidden_states, head_rows, {}, total_tokens,
+                              device, BufferId::HIDDEN_STATE);
+        }
+        else
+        {
+            // Final RMSNorm
+            RMSNormStage::Params norm_params;
+            norm_params.input = hidden_states;
+            norm_params.output = hidden_states; // In-place norm
+            norm_params.gamma = final_projection.norm_gamma;
+            norm_params.eps = config_.rms_norm_eps;
+            norm_params.seq_len = total_tokens;
+            norm_params.device_id = device;
 
-        graph.addNode("final_norm",
-                      ComputeStageFactory::createRMSNorm(norm_params),
-                      device);
+            graph.addNode("final_norm",
+                          ComputeStageFactory::createRMSNorm(norm_params),
+                          device);
+        }
 
         // =================================================================
         // LM Head Projection - Column-Parallel or Full
@@ -3265,10 +3568,10 @@ namespace llaminar2
                                                                   << " lm_head_vocab_size=" << lm_head_vocab_size
                                                                   << " lm_head_output=" << lm_head_output);
 
-        TensorBase *lm_head_input = hidden_states;
+        TensorBase *lm_head_input = head_rows;
         std::string lm_head_dependency = "final_norm";
         int lm_head_seq_len = total_tokens;
-        BufferId lm_head_input_buffer_id = BufferId::HIDDEN_STATE;
+        BufferId lm_head_input_buffer_id = head_rows_id;
         bool lm_head_compute_all_positions =
             config_.compute_all_position_logits ||
             config_.live_mtp_request_batch_condition;
@@ -3320,14 +3623,14 @@ namespace llaminar2
                     "standalone LM-head row-select");
 
                 HiddenStateRowsSelectStage::Params row_params;
-                row_params.input = hidden_states;
+                row_params.input = head_rows;
                 row_params.output = scratch_rows;
                 row_params.seq_len = total_tokens;
                 row_params.d_model = config_.d_model;
                 row_params.selected_row_count = row_count;
                 row_params.selected_row_indices = std::move(selected_rows);
                 row_params.device_id = device;
-                row_params.input_buffer_id = BufferId::HIDDEN_STATE;
+                row_params.input_buffer_id = head_rows_id;
                 row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
                 if (device.is_gpu())
                 {
@@ -3694,10 +3997,10 @@ namespace llaminar2
 
         // Model-level weights
         tensors.model_weights["embedding_table"] = modelEmbeddingTable();
-        tensors.model_weights["final_norm"] = modelFinalNorm();
+        tensors.model_weights["final_norm"] = config_.flash_next ? nullptr : modelFinalNorm();
         tensors.model_weights["lm_head"] = modelLMHead();
         tensors.model_weight_bindings["embedding_table"] = modelEmbeddingBinding();
-        tensors.model_weight_bindings["final_norm"] = modelFinalNormBinding();
+        tensors.model_weight_bindings["final_norm"] = config_.flash_next ? nullptr : modelFinalNormBinding();
         tensors.model_weight_bindings["lm_head"] = modelLMHeadBinding();
 
         // Layer weight accessor
@@ -3913,8 +4216,18 @@ namespace llaminar2
         if (config.local_vocab <= 0)
             config.local_vocab = config_.vocab_size;
 
+        // Arena storage follows admitted retained capacity. Disabled execution
+        // with no retained family owns only the schema's single-row placeholder;
+        // its configured execution-depth policy cannot create live MTP capacity.
+        const int mtp_storage_target_rows = std::max(1, resolveMTPRetainedTargetQueryRows(config_.mtp));
         config.custom_formulas["mtp_target_query_rows"] =
-            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
+            static_cast<size_t>(mtp_storage_target_rows);
+        // Ordinary request-batched prefill selects one terminal row per
+        // admitted request even with no speculative graph family. Share this
+        // compact input bank with verifier selection without enlarging MTP
+        // projection/state scratch or deriving capacity from execution depth.
+        config.custom_formulas["terminal_logit_row_capacity"] = static_cast<size_t>(
+            std::max(std::max(1, config_.max_request_count), mtp_storage_target_rows));
         /*
          * Grouped verification remains bounded by configured speculative depth,
          * while graph-integrated shifted prefill performs one KV-only MTP pass
@@ -3924,7 +4237,7 @@ namespace llaminar2
         config.custom_formulas["mtp_kv_prefill_rows"] =
             static_cast<size_t>(std::max(
                 std::max(1, seq_len),
-                resolveMTPMaxTargetQueryRows(config_.mtp)));
+                mtp_storage_target_rows));
 
         /*
          * Main prefill remains TP-sharded when only the compact MTP predictor
@@ -3970,7 +4283,7 @@ namespace llaminar2
          */
         const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
             config_.mtpTerminalLogitsLayout(),
-            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp)),
+            static_cast<size_t>(mtp_storage_target_rows),
             static_cast<size_t>(config_.vocab_size));
         config.custom_formulas["mtp_gather_rows"] = mtp_gather.rows();
         config.custom_formulas["mtp_gather_vocab"] = mtp_gather.columns();
@@ -3995,6 +4308,9 @@ namespace llaminar2
         BufferId input_buffer_id,
         const int32_t *sequence_lengths_device)
     {
+        if (config_.flash_next)
+            return addBranchHeadRead(graph, hidden, normalized_out, prev_node,
+                                     n_tokens, device, input_buffer_id);
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
         norm_params.output = normalized_out;
@@ -4078,7 +4394,8 @@ namespace llaminar2
         const TensorBase *buffer,
         size_t count,
         DeviceId device,
-        const std::optional<std::string> &precision_override) const
+        const std::optional<std::string> &precision_override,
+        std::optional<ForwardExecutionPhase> phase_override) const
     {
         TPAllreducePlan plan{
             .arithmetic_policy =
@@ -4093,7 +4410,11 @@ namespace llaminar2
          * speculative execution is required to be observationally equivalent
          * to the exact same M1 graph with speculation disabled.
          */
-        if (!forwardPhaseAllowsDecodeTopology())
+        if (phase_override && *phase_override != ForwardExecutionPhase::Prefill && *phase_override != ForwardExecutionPhase::Decode)
+            throw std::invalid_argument("TP arithmetic requires an explicit supported forward phase");
+        const bool decode = phase_override ? *phase_override == ForwardExecutionPhase::Decode
+                                           : forwardPhaseAllowsDecodeTopology();
+        if (!decode)
             return plan;
 
         if (!config_.tp_ctx || !config_.tp_ctx->isLocal() ||
@@ -4140,7 +4461,8 @@ namespace llaminar2
         std::optional<BufferId> tensor_buffer_id,
         std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings,
         std::optional<std::string> precision_override,
-        std::optional<NativeAllreduceRequestRows> request_rows) const
+        std::optional<NativeAllreduceRequestRows> request_rows,
+        std::optional<ForwardExecutionPhase> phase_override) const
     {
         if (request_rows && (!config_.tp_ctx || !config_.tp_ctx->isLocal() ||
             (config_.tp_ctx->backend() != CollectiveBackendType::NCCL &&
@@ -4168,7 +4490,8 @@ namespace llaminar2
                     buffer,
                     count,
                     device,
-                    precision_override);
+                    precision_override,
+                    phase_override);
             params.arithmetic_policy = arithmetic_plan.arithmetic_policy;
             params.precision = arithmetic_plan.transport_precision;
             params.tensor_buffer_id = tensor_buffer_id;
@@ -4180,7 +4503,7 @@ namespace llaminar2
             // prefix directly. The matrix stride remains fixed in the arena;
             // the materializer, not the host, controls its useful wire extent.
             const auto backend = config_.tp_ctx->backend();
-            if (config_.tp_ctx->isLocal() &&
+            if (!phase_override && config_.tp_ctx->isLocal() &&
                 (backend == CollectiveBackendType::NCCL || backend == CollectiveBackendType::RCCL) &&
                 buffer && buffer->cols() > 0 && count % buffer->cols() == 0)
             {
@@ -4288,7 +4611,7 @@ namespace llaminar2
         return {local_n_heads, local_n_kv_heads};
     }
 
-    std::string QwenGraphBase::addPreAttentionNorm(
+    std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> QwenGraphBase::addPreAttentionNorm(
         ComputeGraph &graph,
         const std::string &prefix,
         ActivationBuffers &buffers,
@@ -4296,10 +4619,28 @@ namespace llaminar2
         int total_tokens,
         int layer_idx,
         DeviceId device,
-        bool check_hybrid_q16)
+        bool check_hybrid_q16,
+        GraphLayerWorkload workload)
     {
+        if (workload != GraphLayerWorkload::MainDecoder && workload != GraphLayerWorkload::MTPDepth)
+            throw std::invalid_argument("Pre-attention norm requires an explicit main or MTP workload");
+        if (config_.flash_next)
+        {
+            if (mtp_kv_cache_only_graph_active_)
+            {
+                addBranchAttentionReadOnly(graph, prefix, buffers, layer_idx, total_tokens, device);
+                return std::nullopt;
+            }
+            return addBranchBlockRead(graph, prefix, buffers, layer_idx,
+                                      total_tokens, device, ResidualBlock::Attention);
+        }
         const std::string node_name = prefix + "attn_norm";
-        const bool use_fused = (!check_hybrid_q16 || !config_.isHybridQ16()) &&
+        // An inline predictor's physical source can lie beyond every main
+        // decoder layer. Its FC already publishes the complete input residual;
+        // there is no preceding sidecar FFN delta in ATTN_PROJ to accumulate.
+        // Keep that data-flow contract separate from weight/cache ordinals.
+        const bool use_fused = workload == GraphLayerWorkload::MainDecoder &&
+                               (!check_hybrid_q16 || !config_.isHybridQ16()) &&
                                layer_idx > config_.pp_layer_offset;
 
         if (use_fused)
@@ -4338,7 +4679,7 @@ namespace llaminar2
                           device);
         }
 
-        return node_name;
+        return std::nullopt;
     }
 
     bool QwenGraphBase::addQKNorms(
@@ -4567,8 +4908,12 @@ namespace llaminar2
         const std::string &rope_dependency,
         const std::vector<std::string> &cache_source_dependencies,
         bool layer_idx_is_cache_local,
-        int first_seq_idx)
+        int first_seq_idx,
+        const Qwen4ExpPredictorProjectionLayout *predictor_layout)
     {
+        if (predictor_layout && (!kv_cache || kv_cache->n_kv_heads()!=predictor_layout->kvHeads() ||
+            kv_cache->kv_head_start()!=predictor_layout->kvHeadStart() || device!=predictor_layout->device()))
+            throw std::invalid_argument("Predictor append must preserve its authenticated native cache projection/head/device layout");
         int total_tokens = batch_size * seq_len;
         const int kv_stage_layer = kvCacheLayerForGraphStage(
             kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
@@ -4596,11 +4941,11 @@ namespace llaminar2
              * and corrupt every request shorter than the physical graph width.
              */
             const int32_t *kv_append_lengths_device =
-                config_.live_mtp_request_batch_condition
+                !predictor_layout && config_.live_mtp_request_batch_condition
                     ? nullptr
                     : request_sequence_lengths_device;
             const bool phase_split_handoff =
-                needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+                !predictor_layout && needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
             ITensor *append_K = buffers.K;
             ITensor *append_V = buffers.V;
             std::optional<BufferId> append_k_buffer_id = buffers.idFor(BufferId::K_PROJ);
@@ -4620,7 +4965,9 @@ namespace llaminar2
                     LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires a LocalTP context");
                     throw std::runtime_error("phase-split prefill KV handoff requires LocalTP context");
                 }
-                if (!local_tp->supportsRawAllgatherOnStreamGraphCapture())
+                if (device.is_cpu() && local_tp->backend() != CollectiveBackendType::HOST)
+                    throw std::runtime_error("phase-split CPU prefill KV handoff requires the declared HOST LocalTP domain");
+                if (device.is_gpu() && !local_tp->supportsRawAllgatherOnStreamGraphCapture())
                 {
                     LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires graph-capturable raw allgather");
                     throw std::runtime_error("phase-split prefill KV handoff requires graph-capturable raw allgather");
@@ -4729,11 +5076,60 @@ namespace llaminar2
         return rope_dependency;
     }
 
+    std::optional<std::string> QwenGraphBase::addModelAttentionConsumer(
+        ComputeGraph &graph, const AttentionConsumerBinding &binding)
+    {
+        (void)graph;
+        (void)binding;
+        return std::nullopt;
+    }
+
+    std::string QwenGraphBase::addModelAttentionPreparation(
+        ComputeGraph &graph,const AttentionConsumerBinding &binding)
+    {
+        (void)graph;(void)binding;return {};
+    }
+
+    std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> QwenGraphBase::addModelInvocationPrefix(
+        ComputeGraph&,const ForwardInput&,DeviceId,ModelInvocationShape)
+    {
+        if(config_.ngram_lookup_schedule!=GraphConfig::NgramLookupSchedule::ConsumerScheduled)
+            throw std::invalid_argument("This model does not implement the requested early current lookup candidate");
+        return std::make_unique<ModelInvocationPrefix>();
+    }
+
+    std::string QwenGraphBase::addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
+        int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &prefix)
+    {
+        (void)graph;(void)input;(void)layer;(void)device;(void)prefix;return dependency;
+    }
+
+    const ForwardInput &QwenGraphBase::modelForwardInput() const
+    {
+        if(!forward_input_construction_)
+            throw std::logic_error("Model extension requires a complete scoped ForwardInput during graph construction");
+        return *forward_input_construction_;
+    }
+
+    FullAttentionLayerIdentity QwenGraphBase::mainAttentionIdentity(int source, const IKVCache *cache) const
+    {
+        // Hybrid caches retain public global layer coordinates; plain PP caches
+        // expose compact local indices. Compression remains entirely cache-owned.
+        const auto index = dynamic_cast<const IHybridKVCache *>(cache)
+            ? GraphCacheLayerIndex::ModelGlobal : GraphCacheLayerIndex::CacheLocal;
+        const int end = config_.total_n_layers > 0 ? config_.total_n_layers
+                                                 : config_.pp_layer_offset + config_.n_layers;
+        return FullAttentionLayerIdentity::main(
+            LayerGraphSourceIdentity::main(source, end, config_.pp_layer_offset, index),
+            config_.flash_next ? GraphAttentionConsumer::Selected : GraphAttentionConsumer::Dense);
+    }
+
     std::string QwenGraphBase::addKVCacheAndAttention(
         ComputeGraph &graph,
         const std::string &prefix,
         ActivationBuffers &buffers,
-        int layer_idx,
+        const LayerWeights &consumer_weights,
+        const FullAttentionLayerIdentity &identity,
         int seq_len,
         int batch_size,
         int local_n_heads,
@@ -4747,30 +5143,50 @@ namespace llaminar2
         const attention::AttentionExecutionPolicy &execution_policy,
         const std::string &rope_dependency,
         const std::vector<std::string> &cache_source_dependencies,
-        bool layer_idx_is_cache_local)
+        const Qwen4ExpPredictorProjectionLayout *predictor_layout)
     {
+        if ((identity.source().sourcePolicy()==GraphLayerSourcePolicy::Qwen4ExpSharedPredictor) != (predictor_layout!=nullptr))
+            throw std::invalid_argument("Shared predictor attention requires its explicit authenticated projection layout");
         (void)position_ids_device;
         int total_tokens = batch_size * seq_len;
-        const int kv_stage_layer = kvCacheLayerForGraphStage(
-            kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
+        const int layer_idx = identity.source().sourceLayer();
+        const int kv_stage_layer = identity.source().cacheLayer();
         const bool phase_split_handoff =
-            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+            !predictor_layout && needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
 
-        const std::string kv_append_dependency =
-            addKVCacheAppend(
-                graph,
-                prefix,
-                buffers,
-                layer_idx,
-                seq_len,
-                batch_size,
-                kv_cache,
-                request_sequence_lengths_device,
-                device,
-                execution_policy,
-                rope_dependency,
-                cache_source_dependencies,
-                layer_idx_is_cache_local);
+        // This handoff precedes every get_k/get_v, gather and dense attention
+        // decision. A sparse model therefore consumes persistent native bytes
+        // without accidentally admitting a converted full-bank producer.
+        if (!buffers.normalized || !buffers.Q || !buffers.attn_output)
+            throw std::invalid_argument("Attention consumer handoff requires prepared input, Q and output arena views");
+        AttentionConsumerBinding consumer{
+            .layerIdentity=identity,.weights=consumer_weights,.prefix=prefix,.device=device,
+            .projectionInput={*buffers.normalized,buffers.idFor(BufferId::NORMALIZED)},
+            .preparedQuery={*buffers.Q,buffers.idFor(BufferId::Q_PROJ)},
+            .output={*buffers.attn_output,buffers.idFor(BufferId::ATTN_OUTPUT)},
+            .cache=kv_cache,.modelLayer=layer_idx,.cacheLayer=kv_stage_layer,
+            .queryRows=total_tokens,.requests=batch_size,.queryHeads=local_n_heads,
+            .kvHeads=phase_split_handoff ? config_.n_kv_heads : local_n_kv_heads,
+            .queryHeadStart=local_n_heads==config_.n_heads ? 0 : config_.head_start,
+            .kvHeadStart=kv_cache ? kv_cache->kv_head_start() : 0,
+            .keyPolicy=execution_policy.key_cache,
+            .projectionInputReady=prefix+"attn_norm",.preparedQueryReady=rope_dependency,
+            .nativeCacheReady={}};
+        consumer.requireLayerIdentity();
+        const auto model_preparation=addModelAttentionPreparation(graph,consumer);
+        auto append_dependencies=cache_source_dependencies;
+        if(!model_preparation.empty()) append_dependencies.push_back(model_preparation);
+        const std::string kv_append_dependency=addKVCacheAppend(
+            graph,prefix,buffers,kv_stage_layer,seq_len,batch_size,kv_cache,
+            request_sequence_lengths_device,device,execution_policy,rope_dependency,
+            append_dependencies,/*layer_idx_is_cache_local=*/true,0,predictor_layout);
+        consumer.nativeCacheReady=kv_append_dependency;
+        if(!model_preparation.empty())
+            graph.addDependency(kv_append_dependency,model_preparation);
+        if (auto terminal=addModelAttentionConsumer(graph,consumer))
+            return *terminal;
+        if (identity.consumer() == GraphAttentionConsumer::Selected)
+            throw std::logic_error("Flash Next full-attention layer requires a native selected-index graph consumer");
 
         // --- Determine K/V source for attention ---
         ITensor *K_for_attn = buffers.K;
@@ -4965,7 +5381,9 @@ namespace llaminar2
         DeviceId device,
         const std::string &dependency,
         const std::string &wo_node_suffix,
-        std::optional<DeviceRowRange> verifier_rows)
+        std::optional<DeviceRowRange> verifier_rows,
+        Qwen4ExpProjectionArithmetic arithmetic,
+        QuantizedActivationOperandPrecision activation_precision)
     {
         if (!wo_weight)
             return dependency;
@@ -4983,7 +5401,9 @@ namespace llaminar2
         const bool force_decode_equivalent_wo_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            config_.usesMTPGroupedDecodeEquivalentRows();
+            (config_.usesMTPGroupedDecodeEquivalentRows() ||
+             arithmetic == Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier ||
+             activation_precision == QuantizedActivationOperandPrecision::TwoTermQ8);
 
         std::string wo_node = prefix + wo_node_suffix;
         graph.addNode(wo_node,
@@ -5005,6 +5425,7 @@ namespace llaminar2
                           .verifier_row_range = verifier_rows,
                           .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
                           .prepared_store = prepared_weight_store_,
+                          .quantized_operand_precision = activation_precision,
                       }),
                       device);
         graph.addDependency(wo_node, dependency);
@@ -5020,16 +5441,25 @@ namespace llaminar2
         int layer_idx,
         DeviceId device,
         const std::string &dependency,
-        const std::string &allreduce_node_suffix)
+        const std::string &allreduce_node_suffix,
+        const Qwen4ExpPredictorProjectionLayout *predictor_layout,
+        std::optional<DeviceRowRange> predictor_rows)
     {
         if (!wo_weight ||
             !isRowParallelSharded(wo_weight) ||
             !needsTPAllreduce() ||
-            !attentionTPAllreduceEnabledForCurrentGraph())
+            !(predictor_layout ? predictor_layout->attentionNeedsReduction()
+                               : attentionTPAllreduceEnabledForCurrentGraph()))
         {
             return dependency;
         }
 
+        if (static_cast<bool>(predictor_layout) != predictor_rows.has_value() ||
+            (predictor_rows && (predictor_rows->physicalRows() != total_tokens || predictor_rows->captureIdentity().repeats_per_row!=1)))
+            throw std::invalid_argument("Predictor Wo collective requires the same original token-row authority");
+        std::optional<NativeAllreduceRequestRows> native_rows;
+        if (predictor_rows && predictor_rows->countOwner() && device.is_gpu())
+            native_rows.emplace(1,total_tokens,config_.d_model,predictor_rows->countOwner());
         const size_t allreduce_count =
             static_cast<size_t>(total_tokens) *
             static_cast<size_t>(config_.d_model);
@@ -5041,7 +5471,8 @@ namespace llaminar2
             layer_idx,
             /*is_attention=*/true,
             allreduce_node,
-            buffers.idFor(BufferId::ATTN_PROJ));
+            buffers.idFor(BufferId::ATTN_PROJ), {}, std::nullopt, native_rows,
+            predictor_layout ? std::optional{ForwardExecutionPhase::Decode} : std::nullopt);
         if (!allreduce_stage)
             return dependency;
 

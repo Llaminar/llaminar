@@ -85,8 +85,12 @@ protected:
         summary.prefix_request.partial_hit = true;
         summary.prefix_request.storage_tier = "ram";
         summary.mtp_request.enabled = true;
+        // Two depth-three transactions attempt six drafts: one full prefix
+        // accepts three, while the other rejects its suffix without acceptance.
+        summary.mtp_request.draft_steps = 6;
         summary.mtp_request.accepted_tokens = 3;
         summary.mtp_request.rejected_tokens = 1;
+        summary.mtp_request.acceptance_rate = .5;
         summary.mtp_request.depth_policy_mode = "dynamic";
         summary.mtp_request.min_depth = 1;
         summary.mtp_request.max_depth = 15;
@@ -196,7 +200,10 @@ protected:
         EXPECT_EQ(complete["tokens"]["prompt"], 200);
         EXPECT_EQ(complete["tokens"]["completion"], 2);
         EXPECT_EQ(complete["prefix_cache"]["token_reuse_rate"], .8);
-        EXPECT_EQ(complete["mtp"]["acceptance_rate"], .75);
+        EXPECT_EQ(complete["mtp"]["draft_tokens"], 12);
+        EXPECT_EQ(complete["mtp"]["acceptance_rate"], .5);
+        EXPECT_EQ(complete["last_request"]["mtp"]["draft_tokens"], 6);
+        EXPECT_EQ(complete["last_request"]["mtp"]["acceptance_rate"], .5);
         EXPECT_EQ(complete["timings"]["ttft"]["samples"], 2);
         EXPECT_GT(complete["last_request"]["timings"]["queue_seconds"].get<double>(), 0);
         EXPECT_GE(complete["last_request"]["timings"]["ttft_seconds"].get<double>(),

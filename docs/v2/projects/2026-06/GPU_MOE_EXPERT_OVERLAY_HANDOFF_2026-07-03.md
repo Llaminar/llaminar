@@ -173,7 +173,7 @@ This is the sprint path so far, in compact but complete form.
 
 1. Started a new branch for GPU MoE expert rebalancing.
 2. Verified the GPU MoE packed expert format direction:
-   CUDA and ROCm active GPU MoE path use a backend-neutral NativeVNNI-style
+   CUDA and ROCm active GPU MoE path use a backend-neutral NativeQuantised-style
    packed layout, so same-backend GPU arrivals should be descriptor/blob copies,
    not CPU serialize/deserialize/repack.
 3. Generalized expert movement beyond CPU NodeLocal domains:

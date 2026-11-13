@@ -5,11 +5,14 @@
  * Rank zero polls remote passive-target windows while model weights load. The
  * polling thread is always joined before the final collective barrier and
  * window release, including when graph initialization throws.
+ * Polling is independent control work: thread construction borrows only the
+ * admitted OpenMP partition and restores the creator before returning.
  */
 
 #include "WeightLoadProgressAggregator.h"
 #include "WeightLoadProgress.h"
 #include "../utils/Logger.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <cstring>
@@ -165,9 +168,20 @@ namespace llaminar2
         if (polling_.load(std::memory_order_acquire) || poll_thread_.joinable())
             throw std::logic_error("[ProgressAggregator] Polling was started more than once");
 
+        // Reject unsupported compute-region entry before publishing any active
+        // state. Disabled binding retains the caller's exact native mask.
+        const ScopedOpenMPPartitionAffinity control_affinity;
         renderer_ = std::move(renderer);
         polling_.store(true, std::memory_order_release);
-        poll_thread_ = std::thread(&WeightLoadProgressAggregator::pollLoop, this);
+        try
+        {
+            poll_thread_ = std::thread(&WeightLoadProgressAggregator::pollLoop, this);
+        }
+        catch (...)
+        {
+            polling_.store(false, std::memory_order_release);
+            throw;
+        }
     }
 
     void WeightLoadProgressAggregator::stopPolling()

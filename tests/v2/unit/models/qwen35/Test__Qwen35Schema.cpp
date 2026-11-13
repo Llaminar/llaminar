@@ -1758,6 +1758,12 @@ TEST_F(Qwen35GraphBuildTest, PhaseSplitDenseDecodeUsesFullGDNResolverGeometryOnE
  */
 TEST_F(Qwen35GraphBuildTest, PhaseSplitFAGateUsesActualHeadsInsteadOfRetainedCapacity)
 {
+    // The sharded prefill hands full KV state to replicated decode through
+    // the same explicit CPU LocalTP domain as production.
+    MockLocalTPContext local_tp;
+    local_tp.setDevices({GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    local_tp.setBackend(CollectiveBackendType::HOST);
+    config_.tp_ctx = &local_tp;
     config_.qkv_column_parallel = true;
     config_.dense_tp_enabled = true;
     config_.dense_tp_decode_replicated = true;
@@ -1781,6 +1787,9 @@ TEST_F(Qwen35GraphBuildTest, PhaseSplitFAGateUsesActualHeadsInsteadOfRetainedCap
     auto q = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
     auto k = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
     auto v = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
+    const size_t full_kv_width = static_cast<size_t>(config_.n_kv_heads * config_.head_dim);
+    auto k_full = TestTensorFactory::createFP32({capacity_rows, full_kv_width});
+    auto v_full = TestTensorFactory::createFP32({capacity_rows, full_kv_width});
     auto context = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
     auto projected = TestTensorFactory::createFP32({capacity_rows, d});
     ActivationBuffers buffers;
@@ -1789,6 +1798,8 @@ TEST_F(Qwen35GraphBuildTest, PhaseSplitFAGateUsesActualHeadsInsteadOfRetainedCap
     buffers.Q = q.get();
     buffers.K = k.get();
     buffers.V = v.get();
+    buffers.K_full_prefill = k_full.get();
+    buffers.V_full_prefill = v_full.get();
     buffers.attn_output = context.get();
     buffers.attn_proj = projected.get();
     buffers.extensions[BufferId::FA_Q_RAW] = q_raw.get();
@@ -1815,6 +1826,7 @@ TEST_F(Qwen35GraphBuildTest, PhaseSplitFAGateUsesActualHeadsInsteadOfRetainedCap
 
         auto graph = builder.buildAttentionGraph(layer, buffers, 3, rows, 1,
                                                  stub_cache_.get(), nullptr, DeviceId::cpu());
+        EXPECT_EQ(graph.getNode("layer3_tp_kv_state_allgather") != nullptr, !decode);
         const auto *gate_node = graph.getNode("layer3_attn_output_gate");
         const auto *split_node = graph.getNode("layer3_q_gate_split");
         const auto *context_node = graph.getNode("layer3_attention");
@@ -2006,4 +2018,24 @@ TEST(Test__IGraphBuilder_ResetState, DefaultImplementation_IsNoOp)
     // ensureGDNStates() is a no-op, states are empty
     Qwen35Graph graph(config, nullptr);
     EXPECT_NO_THROW(graph.resetState());
+}
+
+/** @test A QFN-only diagnostic selection cannot change ordinary Qwen GDN projection arithmetic. */
+TEST_F(Qwen35GraphBuildTest, QFNOutputPolicyCannotAlterOrdinaryGDNGraph)
+{
+    config_.qfn_gdn_output_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    ASSERT_EQ(config_.flash_next, nullptr);
+    Qwen35Graph builder(config_, nullptr);
+    auto graph = builder.buildAttentionGraph(layer_, buffers_, 0, 2, 1,
+        stub_cache_.get(), nullptr, DeviceId::cpu());
+    const auto *output = graph.getNode("layer0_gdn_out_proj");
+    ASSERT_NE(output, nullptr);
+    const auto *stage = dynamic_cast<const GEMMStage *>(output->stage.get());
+    ASSERT_NE(stage, nullptr);
+    EXPECT_EQ(stage->getParams().quantized_operand_precision, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(stage->getParams().B, ssm_out_weight_.get());
+    EXPECT_EQ(stage->getParams().k, config_.gdn.inner_size);
+    EXPECT_EQ(stage->getParams().n, config_.d_model);
+    EXPECT_EQ(stage->getParams().alpha, 1.0f);
+    EXPECT_EQ(stage->getParams().beta, 0.0f);
 }

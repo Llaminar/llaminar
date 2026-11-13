@@ -59,6 +59,19 @@ namespace llaminar2
         ExpertShadowSlots,        ///< Inactive RCU expert-arrival banks.
         RoutedExpertWeights,      ///< Live prepared routed experts.
         NativeExecutionContext,   ///< Driver-private storage retained until native context retirement.
+        ImmutableTableStorage,    ///< Native RAM row table or bounded SSD mapping residency.
+        ImmutableLookupStaging,   ///< Exact mapped request/native-row response and device lookup scratch.
+        NativeReadAheadFamily,    ///< Certified opaque one-stream/two-event retained family.
+        NativeReadAheadParentTerminal, ///< Independently certified one-event parent baseline.
+        NativeImmutableLookupOrderingEvent, ///< Certified existing lookup setup/publication/retirement event program.
+        RetainedHostServiceStorage, ///< Exact admitted CPU service stack and compiled worker object.
+        RetainedHostServiceRuntime, ///< Separately qualified process-retained libc/TLS backing.
+        NativePreparationGraphExecutable, ///< Closed startup calibration graph, isolated from serving reservations.
+        NativeStorageGraphExecutable, ///< Retained storage graph definitions, isolated from model/follower reservations.
+        NativeCPUCollectiveDomain, ///< Opaque native CPU domain, released only after original communicator/backend retirement.
+        NativeCPUCollectiveProcessPool, ///< Incremental first-domain MPI pool, retained through original MPI_Finalize.
+        NativeAuxiliaryStream,    ///< Certified ordinary stream, retained by its exact native owner.
+        NativeTransferEvent,     ///< Exact peer completion/timestamp event family, original physical lifetime.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -96,6 +109,10 @@ namespace llaminar2
             return "local_collective";
         case PhysicalMemoryOwner::NativeGraphExecutable:
             return "native_graph_executable";
+        case PhysicalMemoryOwner::NativeStorageGraphExecutable:
+            return "native_storage_graph_executable";
+        case PhysicalMemoryOwner::NativePreparationGraphExecutable:
+            return "native_preparation_graph_executable";
         case PhysicalMemoryOwner::GraphSnapshotArena:
             return "graph_snapshot_arena";
         case PhysicalMemoryOwner::WeightLoadStaging:
@@ -110,6 +127,28 @@ namespace llaminar2
             return "routed_expert_weights";
         case PhysicalMemoryOwner::NativeExecutionContext:
             return "native_execution_context";
+        case PhysicalMemoryOwner::ImmutableTableStorage:
+            return "immutable_table_storage";
+        case PhysicalMemoryOwner::ImmutableLookupStaging:
+            return "immutable_lookup_staging";
+        case PhysicalMemoryOwner::NativeReadAheadFamily:
+            return "native_read_ahead_family";
+        case PhysicalMemoryOwner::NativeReadAheadParentTerminal:
+            return "native_read_ahead_parent_terminal";
+        case PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent:
+            return "native_immutable_lookup_ordering_event";
+        case PhysicalMemoryOwner::RetainedHostServiceStorage:
+            return "retained_host_service_storage";
+        case PhysicalMemoryOwner::RetainedHostServiceRuntime:
+            return "retained_host_service_runtime";
+        case PhysicalMemoryOwner::NativeCPUCollectiveDomain:
+            return "native_cpu_collective_domain";
+        case PhysicalMemoryOwner::NativeCPUCollectiveProcessPool:
+            return "native_cpu_collective_process_pool";
+        case PhysicalMemoryOwner::NativeTransferEvent:
+            return "native_transfer_event";
+        case PhysicalMemoryOwner::NativeAuxiliaryStream:
+            return "native_auxiliary_stream";
         case PhysicalMemoryOwner::Count:
             break;
         }

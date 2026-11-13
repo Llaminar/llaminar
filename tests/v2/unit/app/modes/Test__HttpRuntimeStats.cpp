@@ -303,7 +303,8 @@ TEST(Test__HttpRuntimeStats, DisabledBypassedAndMTPPolicies)
     EXPECT_EQ(snapshot["mtp"]["draft_tokens"], 40);
     EXPECT_EQ(snapshot["mtp"]["verifier_runs"], 18);
     EXPECT_EQ(snapshot["mtp"]["depth_updates"], 5);
-    EXPECT_DOUBLE_EQ(snapshot["mtp"]["acceptance_rate"].get<double>(), .75);
+    EXPECT_DOUBLE_EQ(snapshot["mtp"]["acceptance_rate"].get<double>(), .6);
+    EXPECT_DOUBLE_EQ(snapshot["last_request"]["mtp"]["acceptance_rate"].get<double>(), .6);
     EXPECT_EQ(snapshot["last_request"]["mtp"]["depth_policy"], "dynamic");
     EXPECT_EQ(snapshot["last_request"]["mtp"]["max_depth"], 15);
 }
@@ -514,14 +515,17 @@ TEST(Test__HttpRuntimeStats, HTTPStatusInventoryIncludesEveryResponseClass)
     EXPECT_EQ(s["requests"]["started"], 0);
 }
 
-/** @brief Unequal speculative windows require token-weighted, not request-averaged acceptance. */
-TEST(Test__HttpRuntimeStats, MTPAcceptanceWeightsVerifiedTokens)
+/** @brief Unequal attempted-draft windows require token weighting independently of rejection/test counts. */
+TEST(Test__HttpRuntimeStats, MTPAcceptanceWeightsAttemptedDraftTokens)
 {
     HttpRuntimeStats stats;
-    for (const auto &[accepted, rejected] : {std::pair{1U, 1U}, {9U, 1U}})
+    // A partial depth-four transaction attempts four drafts; two depth-six
+    // transactions attempt twelve. Rejection counts only one suffix per case.
+    for (const auto &[attempted, accepted, rejected] : {std::tuple{4U, 1U, 1U}, {12U, 9U, 1U}})
     {
         auto summary = prefix(100, 0);
         summary.mtp_request.enabled = true;
+        summary.mtp_request.draft_steps = attempted;
         summary.mtp_request.accepted_tokens = accepted;
         summary.mtp_request.rejected_tokens = rejected;
         summary.mtp_request.stochastic_accept_tests = accepted + rejected;
@@ -530,9 +534,11 @@ TEST(Test__HttpRuntimeStats, MTPAcceptanceWeightsVerifiedTokens)
         request.complete(100, 20, summary, HttpRuntimeStats::Delivery::Completed);
     }
     const auto s = stats.snapshot();
-    EXPECT_DOUBLE_EQ(s["mtp"]["acceptance_rate"].get<double>(), 10.0 / 12);
+    EXPECT_EQ(s["mtp"]["draft_tokens"], 16);
+    EXPECT_DOUBLE_EQ(s["mtp"]["acceptance_rate"].get<double>(), 10.0 / 16);
     EXPECT_DOUBLE_EQ(s["mtp"]["stochastic_acceptance_rate"].get<double>(), 10.0 / 12);
-    EXPECT_DOUBLE_EQ(s["last_request"]["mtp"]["acceptance_rate"].get<double>(), .9);
+    EXPECT_EQ(s["last_request"]["mtp"]["draft_tokens"], 12);
+    EXPECT_DOUBLE_EQ(s["last_request"]["mtp"]["acceptance_rate"].get<double>(), .75);
 }
 
 /** @brief Polling cannot expose a partially published next request or rewrite the previous one. */
@@ -642,4 +648,69 @@ TEST(Test__HttpRuntimeStats, ConcurrentResetCannotMixEpochTotals)
         EXPECT_EQ(snapshot["http"]["status_codes"].value("200", 0ULL), http_count);
     }
     publisher.join();
+}
+
+/**
+ * @brief Terminal and cumulative draft acceptance use attempted-token weight.
+ *
+ * Rejected transactions describe protocol outcomes, not discarded suffix token
+ * counts. Distinct request sizes prove ratio-of-sums arithmetic; retirement of
+ * a pre-reset request must never repopulate the new measurement epoch.
+ */
+TEST(Test__HttpRuntimeStats, MTPAcceptanceUsesDraftAttemptsAndPreservesResetEpoch)
+{
+    HttpRuntimeStats stats;
+    const auto terminal = [](uint64_t drafts, uint64_t accepted, uint64_t rejected,
+                             uint64_t stochastic_tests, uint64_t stochastic_accepts) {
+        RequestRuntimeSummary result;
+        auto &mtp = result.mtp_request;
+        mtp.enabled = true;
+        mtp.draft_steps = drafts;
+        mtp.accepted_tokens = accepted;
+        mtp.rejected_tokens = rejected;
+        mtp.stochastic_accept_tests = stochastic_tests;
+        mtp.stochastic_accepts = stochastic_accepts;
+        return result;
+    };
+    {
+        auto request = stats.beginRequest();
+        // Four depth-five outcomes5,5,1,1 accept12/20 draft tokens, rejecting
+        // only two transactions. Accepted/(accepted+rejected) would report12/14.
+        request.complete(10, 16, terminal(20, 12, 2, 10, 8), HttpRuntimeStats::Delivery::Completed);
+    }
+    auto snapshot = stats.snapshot();
+    EXPECT_DOUBLE_EQ(snapshot["mtp"]["acceptance_rate"].get<double>(), .6);
+    EXPECT_DOUBLE_EQ(snapshot["last_request"]["mtp"]["acceptance_rate"].get<double>(), .6);
+    EXPECT_DOUBLE_EQ(snapshot["mtp"]["stochastic_acceptance_rate"].get<double>(), .8);
+    {
+        auto request = stats.beginRequest();
+        request.complete(10, 5, terminal(10, 3, 1, 2, 1), HttpRuntimeStats::Delivery::Completed);
+    }
+    snapshot = stats.snapshot();
+    EXPECT_EQ(snapshot["mtp"]["draft_tokens"], 30);
+    EXPECT_EQ(snapshot["mtp"]["accepted_tokens"], 15);
+    EXPECT_EQ(snapshot["mtp"]["rejected_tokens"], 3);
+    EXPECT_DOUBLE_EQ(snapshot["mtp"]["acceptance_rate"].get<double>(), .5);
+    EXPECT_DOUBLE_EQ(snapshot["last_request"]["mtp"]["acceptance_rate"].get<double>(), .3);
+    EXPECT_DOUBLE_EQ(snapshot["mtp"]["stochastic_acceptance_rate"].get<double>(), .75);
+    EXPECT_DOUBLE_EQ(snapshot["last_request"]["mtp"]["stochastic_acceptance_rate"].get<double>(), .5);
+    {
+        auto stale = stats.beginRequest();
+        stats.reset();
+        EXPECT_EQ(stats.snapshot()["requests"]["active"], 1);
+        stale.complete(10, 16, terminal(20, 12, 2, 10, 8), HttpRuntimeStats::Delivery::Completed);
+    }
+    snapshot = stats.snapshot();
+    EXPECT_EQ(snapshot["requests"]["active"], 0);
+    EXPECT_EQ(snapshot["mtp"]["requests"], 0);
+    EXPECT_EQ(snapshot["mtp"]["draft_tokens"], 0);
+    EXPECT_TRUE(snapshot["mtp"]["acceptance_rate"].is_null());
+    EXPECT_TRUE(snapshot["last_request"].is_null());
+    {
+        auto zero = stats.beginRequest();
+        zero.complete(10, 1, terminal(0, 0, 0, 0, 0), HttpRuntimeStats::Delivery::Completed);
+    }
+    snapshot = stats.snapshot();
+    EXPECT_TRUE(snapshot["mtp"]["acceptance_rate"].is_null());
+    EXPECT_TRUE(snapshot["last_request"]["mtp"]["acceptance_rate"].is_null());
 }

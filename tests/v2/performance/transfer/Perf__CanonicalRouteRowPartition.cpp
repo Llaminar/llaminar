@@ -25,6 +25,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "collective/LocalTPContext.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
+#include "../../fixtures/moe/NodeLocalRouteExchangeReplayAccess.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #endif
@@ -153,7 +154,7 @@ namespace
         std::vector<std::unique_ptr<MoEOverlayNodeLocalRouteExchange>> exchanges;
         for (int owner = 0; owner < (partitioned ? 2 : 1); ++owner)
         {
-            auto exchange = std::make_unique<MoEOverlayNodeLocalRouteExchange>(
+            auto exchange = test::NodeLocalRouteExchangeReplayAccess::createUnique(
                 MoEOverlayNodeLocalRouteExchange::Config{
                     .devices = {devices[0], devices[1]}, .root_device = devices[owner],
                     .identity = "captured_row_fold_economy"});

@@ -10,9 +10,29 @@
 #pragma once
 #include "backends/DeviceId.h"
 #include "kernels/common/DeviceRowRange.h"
+#include <algorithm>
+#include <stdexcept>
 
 namespace llaminar2
 {
+    /**
+     * @brief Bind one resident wave of the exact loaded column-copy function.
+     * @param processors Admitted physical SM/CU count for the exact owning device.
+     * @param resident_blocks Actual function occupancy for this runtime/program and launch geometry.
+     * @param elements Existing retained-capacity element count, not a host observation of live rows.
+     * @param threads Exact block width used by the occupancy observation and kernel launch.
+     * @return The unchanged minimum of resident-wave and capacity-covering block counts.
+     * @throws std::invalid_argument For incomplete physical/function/geometry observations.
+     * @note Occupancy is an input on every binding, never cached as an immutable physical fact.
+     */
+    [[nodiscard]] inline int residentColumnAssemblyBlockCount(
+        int processors, int resident_blocks, long long elements, int threads)
+    {
+        if (processors <= 0 || resident_blocks <= 0 || elements < 0 || threads <= 0)
+            throw std::invalid_argument("Column assembly requires complete physical and loaded-function geometry");
+        return static_cast<int>(std::min(static_cast<long long>(processors) * resident_blocks,
+            (elements + threads - 1) / threads));
+    }
     /**
      * @brief Enqueue the existing native column deinterleave kernel on one exact stream.
      * @param device Participant-local physical GPU.

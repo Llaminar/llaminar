@@ -13,7 +13,7 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/PackedWeightsSerialization.h"
 #include "kernels/cpu/gemm/CPUPackedWeights.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "execution/moe/ExpertWeightTransfer.h"
 #include "backends/DeviceId.h"
 #include "utils/TestTensorFactory.h"
@@ -26,7 +26,7 @@
 using namespace llaminar2;
 using KF = llaminar::v2::kernels::KernelFactory;
 using namespace llaminar2::test;
-using namespace llaminar2::cpu::native_vnni;
+using namespace llaminar2::cpu::native_quantised;
 using namespace llaminar2::packed_weights_serialization;
 
 // ---------------------------------------------------------------------------

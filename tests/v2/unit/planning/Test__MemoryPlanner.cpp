@@ -8,15 +8,41 @@
  * stable sparse-route buffers before captured graph construction begins.
  * Native FP16 admission also authenticates the configured codec and declared
  * schema visibility against exact local and replicated attention geometry.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
+#include "execution/moe/MoEOverlayActivationBatchInventory.h"
+#include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "utils/PrefillGraphBucketDefaults.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/mtp/MTPForwardConstruction.h"
+#include "models/qwen/LayerGraphIdentity.h"
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
+#include "fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "backends/NativeContextRuntimePolicy.h"
+#include <atomic>
+#include <latch>
+#include <thread>
+#include <dlfcn.h>
+#include "mocks/MockWorkerGPUContext.h"
+#include "memory/CPUCompactPacketStorageLayout.h"
+#include "planning/ServingSnapshotArenaInventory.h"
+#include "planning/RankMemoryPlanInputs.h"
+#include "loaders/ImmutableRowTable.h"
+#include "planning/PlanningModelMetadata.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
+#include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "memory/CPUGroupedMoEStorageLayout.h"
+#include "memory/CPURouterQ8StorageLayout.h"
 #include "utils/DebugEnv.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "models/qwen35/Qwen35Schema.h"
 #include "collective/DeviceCountedAllGather.h"
+#include "collective/VocabularyGatherWorkspaceContract.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "planning/MemoryPlan.h"
@@ -35,6 +61,9 @@
 #include "backends/DeviceId.h"
 
 #include <memory>
+#include <set>
+#include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
+#include "../../mocks/MockLocalTPContext.h"
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -43,6 +72,23 @@ using namespace llaminar2;
 
 namespace
 {
+/** @brief Recorded constructor on its original mapped object extent; no SDK API executes. */
+class SourcePlanningWorker final:public llaminar2::testing::MockWorkerGPUContext {
+public:SourcePlanningWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack>):MockWorkerGPUContext(ordinal){}
+};
+/** @brief Retire only the actual original recorded population through its existing reset observer. */
+class PlanningSourceRetirement final {
+public:
+    PlanningSourceRetirement(std::shared_ptr<NativeContextPreparation> source,std::span<const DeviceId> devices)
+        :source_(std::move(source)),devices_(devices.begin(),devices.end()){}
+    ~PlanningSourceRetirement(){
+        for(const auto device:devices_){auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+            test::NativeContextPreparationReplayAccess::physicalReset(scope);}
+        if(source_->memory()->phase()==PhysicalMemoryAuthorityPhase::Preparing)source_->retireUnadmitted();
+    }
+private:std::shared_ptr<NativeContextPreparation> source_;std::vector<DeviceId> devices_;
+};
+
 
     ModelMemoryProfile createTestProfile()
     {
@@ -234,6 +280,24 @@ namespace
         return config;
     }
 
+/** @brief Author this fixture's exact CPU endpoint/controller and bounded family policy. */
+    void declareCPUSerialFixture(DevicePlanConfig &config, const ModelMemoryProfile &profile)
+    {
+        if (!config.device.is_cpu()) return;
+        const int rows = config.serial_routed_expert_compact_rows > 0
+            ? config.serial_routed_expert_compact_rows : config.batch_size * config.activation_seq_len;
+        auto admission = std::make_shared<CPUSerialExpertStorageAdmission>();
+        admission->allocator = {config.world_rank, config.device};
+        for (int participant = 0; participant < config.serial_routed_expert_participant_count; ++participant)
+            admission->participant_ids.push_back(participant);
+        admission->controller_devices = {config.device};
+        admission->envelope = std::make_shared<const CPUSerialExpertStorageEnvelope>(
+            config.device, rows, 1, profile.d_model, profile.expert_used_count,
+            std::vector<int>{1,2,4,8,16,32,64,128,256,512,1024,2048,4096}, 1, 16,
+            true, CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,
+            profile.expert_feed_forward_length, profile.expert_count);
+        config.cpu_serial_expert_storage = std::move(admission);
+    }
 } // anonymous namespace
 
 /** @test Canonical physical admission charges each compact domain edge once on CPU and GPU. */
@@ -247,28 +311,52 @@ TEST(Test__MemoryPlanner, CountedProjectionTransportHasOneCanonicalPhysicalBOM)
     constexpr auto staging_owner = PhysicalMemoryOwner::ActivationTransportStaging;
     for (const auto first : {DeviceId::cuda(0), DeviceId::rocm(0)})
     for (const int degree : {2, 4, 8})
-    for (const auto coverage : {PeerAccessCoverage::None, PeerAccessCoverage::Partial, PeerAccessCoverage::Complete})
+    for (const int clique : {1, 2, degree})
     {
+        RankInventory observed;
+        observed.rank = 0;
+        std::vector<DeviceId> members;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            members.push_back(first.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant));
+            observed.gpus.push_back({.type = first.type, .local_device_id = participant});
+        }
+        auto &matrix = first.is_cuda() ? observed.p2p_cuda : observed.p2p_rocm;
+        auto &count = first.is_cuda() ? observed.p2p_cuda_count : observed.p2p_rocm_count;
+        count = degree;matrix.resize(std::size_t(degree) * degree);
+        for (int i = 0; i < degree; ++i) for (int j = 0; j < degree; ++j)
+            matrix[std::size_t(i) * degree + j] = i != j && i / clique == j / clique;
+        const auto topology = std::make_shared<const DeviceCountedAllGatherTopology>(
+            DeviceCountedAllGatherTopology::resolve(observed, members));
         std::vector<DevicePlanConfig> configs;
         for (int participant = 0; participant < degree; ++participant)
         {
-            auto config = overlayDeviceConfig(first.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant));
+            auto config = overlayDeviceConfig(members[participant]);
+            config.world_rank = 0;
             config.shard_index = participant; config.total_shards = degree;
             config.local_tp_backend = first.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
             config.routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
-            config.projection_peer_access = coverage;
-            config.associated_host_memory = PhysicalMemoryResource{.world_rank = -1, .device = DeviceId::cpu(),
+            config.projection_exchange_topology = topology;
+            config.associated_host_memory = PhysicalMemoryResource{.world_rank = 0, .device = DeviceId::cpu(),
                 .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
             configs.push_back(config);
         }
         const auto plan = MemoryPlanner::plan(profile, configs);
-        const auto geometry = DeviceCountedAllGather::memoryFor(degree,
-            MoEProjectionArenaGeometry::resolve(profile, degree).packetCapacityBytes(32));
+        std::size_t expected_host = 0, expected_device = 0;
+        for (int p = 0; p < degree; ++p)
+        {
+            const auto quote = topology->memoryFor(p,
+                MoEProjectionArenaGeometry::resolve(profile, degree).packetCapacityBytes(32));
+            expected_host += quote.host_bytes;expected_device += quote.device_bytes;
+        }
         std::size_t host_bytes = 0, device_bytes = 0;
         for (const auto &row : plan.devices)
             (row.device().is_cpu() ? host_bytes : device_bytes) += row.bom().bytes(staging_owner);
-        EXPECT_EQ(host_bytes, coverage == PeerAccessCoverage::None ? degree * geometry.host_bytes : 0u);
-        EXPECT_EQ(device_bytes, coverage == PeerAccessCoverage::None ? degree * geometry.device_bytes : 0u);
+        EXPECT_EQ(host_bytes, expected_host);
+        EXPECT_EQ(device_bytes, expected_device);
+        auto mismatched = configs;
+        mismatched.front().shard_index = degree - 1;
+        EXPECT_THROW(MemoryPlanner::plan(profile, mismatched), std::invalid_argument);
     }
 }
 
@@ -684,6 +772,7 @@ TEST(Test__MemoryPlanner,
     cfg.device_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
     cfg.device_free_bytes = cfg.device_total_bytes;
     cfg.batch_size = 2;
+    cfg.generation_request_capacity = 2; // The two declared request banks own the retained rows.
     cfg.max_seq_len = 128;
     cfg.kv_precision = "fp16";
     cfg.total_shards = 4;
@@ -903,6 +992,8 @@ TEST(Test__MemoryPlanner,
     cfg.captured_serving_graphs = {
         .prefill_bucket_rows = {32, 64, 128},
         .fixed_executable_count = 2u,
+        .verifier_graph_family = MTPVerifierGraphFamily::BoundedBuckets,
+        .generation_domain = DeviceGenerationExecutionDomain::NativeDomain,
     };
 
     const auto plan_64 = MemoryPlanner::plan(profile, {cfg});
@@ -960,20 +1051,23 @@ TEST(Test__MemoryPlanner,
     cfg.captured_serving_graphs =
         resolveCapturedServingGraphMemoryInventory(
             {32, 64, 128},
-            retained_mtp);
+            retained_mtp,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain);
     EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 12u);
-    const MTPGraphOwnerPlan owner_plan(retained_mtp);
+    const MTPGraphOwnerPlan owner_plan(retained_mtp, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
     EXPECT_EQ(owner_plan.sidecarGraphSlots(), 21u);
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
     EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 15u);
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
-    EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
-    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+    EXPECT_EQ(owner_plan.controllerGraphSlots(), 5u);
+    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 83u);
     EXPECT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
     EXPECT_EQ(
         cfg.captured_serving_graphs.mtp_graph_owners
             .auxiliaryExecutableSlotCount(),
-        107u);
+        108u);
     EXPECT_EQ(
         resolveMTPRetainedDeviceGenerationFragmentCapacity(15),
         375u)
@@ -991,7 +1085,11 @@ TEST(Test__MemoryPlanner,
                 .model_graph_topology_variant_count = 1u,
                 .auxiliary_executable_count =
                     owner_plan.generalAuxiliaryExecutableSlotCount() +
-                    OrdinaryGenerationGraphPlan::additionalExecutableCount(cfg.device, true),
+                    OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        cfg.device,
+                        true,
+                        declaredDeviceGenerationExecutionPolicy(cfg.device.type, *cfg.captured_serving_graphs.generation_domain),
+                        cfg.captured_serving_graphs.generation_parent_role),
                 .bounded_helper_executable_count =
                     owner_plan.boundedHelperExecutableSlotCount(),
             }));
@@ -1000,6 +1098,163 @@ TEST(Test__MemoryPlanner,
         estimateCapturedGraphExecutableBytes(
             cfg.device,
             /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u));
+}
+
+/** @test Exact hosted width owners are admitted before any request, with ordinary M1 charged once. */
+TEST(Test__MemoryPlanner, ExactHostedVerifierFamilyPricesEveryModelAndPublicationOwner)
+{
+    constexpr std::size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    const auto profile = createTestProfile();
+    for (bool initially_enabled : {false, true})
+    for (auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (auto parent_role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        MTPRuntimeConfig retained;
+        retained.enabled = initially_enabled;
+        retained.draft_tokens = 3;
+        retained.graph_capacity_draft_tokens = 15;
+        const auto exact_family = resolveMTPVerifierGraphFamily(MTPVerifierExecutionRole::HostedCapturedTransactions);
+        const bool follower = parent_role == MTPGenerationParentRole::PipelineFollower;
+        const auto exact = resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained,
+            exact_family,
+            parent_role,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            1u);
+        const auto bounded = resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            parent_role,
+            DeviceGenerationExecutionDomain::NativeDomain);
+        EXPECT_EQ(exact.fixed_executable_count, 34u); // Ordinary M1 + prefix bridge + 32 MTP forwards.
+        EXPECT_EQ(bounded.fixed_executable_count, 12u);
+        const auto &owners = exact.mtp_graph_owners;
+        EXPECT_EQ(owners.speculativePublicationWidthCount(), 15u);
+        EXPECT_EQ(owners.speculativePublicationGraphSlots(), 15u);
+        EXPECT_EQ(owners.generationParentWidthCount(), follower ? 15u : 1u);
+        EXPECT_EQ(owners.generationParentGraphSlots(), follower ? 15u : 1u);
+        EXPECT_EQ(owners.samplerHelperWidthCount(), 15u);
+        EXPECT_EQ(owners.samplerHelperGraphSlots(), follower ? 0u : 30u);
+        EXPECT_EQ(owners.controllerGraphSlots(), follower ? 30u : 47u);
+        EXPECT_EQ(owners.auxiliaryExecutableSlotCount(), follower ? 30u : 150u);
+        EXPECT_EQ(owners.generalAuxiliaryExecutableSlotCount(), follower ? 30u : 67u);
+        EXPECT_EQ(owners.boundedHelperExecutableSlotCount(), follower ? 0u : 83u);
+        EXPECT_EQ(owners.sidecarGraphSlots(), bounded.mtp_graph_owners.sidecarGraphSlots());
+        EXPECT_EQ(owners.verifierPreparationGraphSlots(), bounded.mtp_graph_owners.verifierPreparationGraphSlots());
+        EXPECT_EQ(owners.terminalHiddenGraphSlots(), bounded.mtp_graph_owners.terminalHiddenGraphSlots());
+        const auto two_programs = resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained,
+            exact_family,
+            parent_role,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            2u);
+        EXPECT_EQ(two_programs.fixed_executable_count, 68u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.speculativePublicationGraphSlots(), 30u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.generationParentGraphSlots(), follower ? 30u : 2u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperWidthCount(), 15u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperGraphSlots(), follower ? 0u : 30u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.controllerGraphSlots(), follower ? 60u : 63u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.boundedHelperExecutableSlotCount(), follower ? 0u : 83u);
+
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_compute_units = 82;
+        cfg.device_total_bytes = 64u * GiB;
+        cfg.device_free_bytes = cfg.device_total_bytes;
+        cfg.batch_size = 1;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 64;
+        cfg.kv_precision = "fp16";
+        cfg.captured_serving_graphs = exact;
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        EXPECT_EQ(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(
+            device, CapturedGraphExecutableInventory{
+                .model_graph_identity_count = 36u, // Two admitted prefills plus the 34 fixed owners.
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count = owners.generalAuxiliaryExecutableSlotCount() +
+                    OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        device,
+                        true,
+                        declaredDeviceGenerationExecutionPolicy(device.type, *exact.generation_domain),
+                        parent_role),
+                .bounded_helper_executable_count = owners.boundedHelperExecutableSlotCount(),
+            }));
+    }
+    const auto empty = resolveCapturedServingGraphMemoryInventory(
+        {},
+        {},
+        MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::HostedBoundary);
+    EXPECT_EQ(empty.fixed_executable_count, 1u); // Existing ordinary M1 alone.
+    EXPECT_EQ(empty.mtp_graph_owners.speculativePublicationWidthCount(), 0u);
+    EXPECT_EQ(empty.mtp_graph_owners.samplerHelperWidthCount(), 0u);
+    EXPECT_EQ(empty.mtp_graph_owners.samplerHelperGraphSlots(), 0u);
+    EXPECT_EQ(empty.mtp_graph_owners.auxiliaryExecutableSlotCount(), 0u);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {},
+        {},
+        static_cast<MTPVerifierGraphFamily>(99),
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain), std::invalid_argument);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {},
+        {},
+        MTPVerifierGraphFamily::ExactRows,
+        static_cast<MTPGenerationParentRole>(99),
+        DeviceGenerationExecutionDomain::HostedBoundary), std::invalid_argument);
+}
+
+/** @test Every exact sampler geometry is admitted once and shared across immutable query programs. */
+TEST(Test__MemoryPlanner, ExactHostedSamplerHelpersRemainSharedAcrossQueryPrograms)
+{
+    for (int capacity = 1; capacity <= kMaximumSupportedMTPDraftDepth; ++capacity)
+    for (int initial_depth = 1; initial_depth <= capacity; ++initial_depth)
+    for (auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    for (bool initially_enabled : {false, true})
+    for (auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        MTPRuntimeConfig config;
+        config.enabled = initially_enabled;
+        config.draft_tokens = initial_depth;
+        config.graph_capacity_draft_tokens = capacity;
+        config.depth_policy.mode = mode;
+        config.depth_policy.min_depth = 1;
+        config.depth_policy.initial_depth = initial_depth;
+        config.depth_policy.max_depth = initial_depth;
+        const MTPGraphOwnerPlan one(config, family, role);
+        const MTPGraphOwnerPlan two(config, family, role, 2u);
+        const std::size_t expected_widths = family == MTPVerifierGraphFamily::ExactRows
+            ? mtpVerifierGraphFamilyWidthCount(capacity + 1, family) : 1u;
+        EXPECT_EQ(one.samplerHelperWidthCount(), expected_widths);
+        EXPECT_EQ(two.samplerHelperWidthCount(), expected_widths);
+        EXPECT_EQ(one.samplerHelperGraphSlots(), role == MTPGenerationParentRole::Controller ? 2u * expected_widths : 0u);
+        EXPECT_EQ(two.samplerHelperGraphSlots(), one.samplerHelperGraphSlots());
+        EXPECT_EQ(one.controllerGraphSlots(), one.samplerHelperGraphSlots() +
+            one.generationParentGraphSlots() + one.speculativePublicationGraphSlots() + one.directTokenHistoryGraphSlots());
+        EXPECT_EQ(two.controllerGraphSlots(), two.samplerHelperGraphSlots() +
+            two.generationParentGraphSlots() + two.speculativePublicationGraphSlots() + two.directTokenHistoryGraphSlots());
+        EXPECT_EQ(two.controllerGraphSlots() - one.controllerGraphSlots(),
+            one.generationParentGraphSlots() + one.speculativePublicationGraphSlots());
+        EXPECT_EQ(two.boundedHelperExecutableSlotCount(), one.boundedHelperExecutableSlotCount());
+    }
+    // Capacity belongs to setup even if the first request only selects rows4.
+    MTPRuntimeConfig shallow;
+    shallow.enabled = true;
+    shallow.draft_tokens = 3;
+    shallow.graph_capacity_draft_tokens = 15;
+    const MTPGraphOwnerPlan admitted(shallow, MTPVerifierGraphFamily::ExactRows, MTPGenerationParentRole::Controller);
+    EXPECT_EQ(admitted.samplerHelperWidthCount(), 15u);
+    EXPECT_EQ(admitted.samplerHelperGraphSlots(), 30u);
+    EXPECT_EQ(admitted.controllerGraphSlots(), 47u);
+    shallow.graph_capacity_draft_tokens = 0;
+    EXPECT_EQ(MTPGraphOwnerPlan(shallow, MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller).samplerHelperWidthCount(), 3u);
 }
 
 TEST(Test__MemoryPlanner,
@@ -1881,6 +2136,63 @@ TEST(Test__MemoryPlanner, CapturedPipelineChannelAccountingIsExactAndBackendSymm
     EXPECT_THROW(PipelineTransferMemory::forRows(std::numeric_limits<size_t>::max(), 2, 1), std::overflow_error);
 }
 
+/**
+ * @brief Original rank PMAs admit only the CPU allocator that owns physical mapped pages.
+ *
+ * Replay both backend orders and original ranks through the actual planner and
+ * materialization ledger. A receiver with zero host bytes has no CPU authority;
+ * querying or claiming that absent allocator must remain a hard error rather
+ * than manufacturing a second host budget or a zero-valued live ledger.
+ */
+TEST(Test__MemoryPlanner, CapturedPipelineOriginalRankHostAuthorityLifecycle)
+{
+    const auto profile = createTestProfile();
+    constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
+    const auto geometry = PipelineTransferMemory::forRows(profile.d_model, 8, 1);
+    for (const bool reverse : {false, true})
+    for (int rank = 0; rank != 2; ++rank)
+    {
+        SCOPED_TRACE(::testing::Message() << "reverse=" << reverse << " original_rank=" << rank);
+        DevicePlanConfig cfg;
+        cfg.world_rank = rank;
+        cfg.device = (bool(rank) == reverse) ? DeviceId::cuda(1) : DeviceId::rocm(3);
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+        cfg.device_compute_units = 128;
+        cfg.max_seq_len = 256;
+        cfg.activation_seq_len = 8;
+        cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = rank, .device = DeviceId::cpu(),
+            .total_bytes = 64ull << 30, .admission_available_bytes = 64ull << 30};
+        cfg.captured_pipeline_boundaries = {rank == 0 ? PipelineBoundarySide::EarlierDomain :
+            PipelineBoundarySide::LaterDomain};
+        auto certificate = std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
+            MemoryPlanner::plan(profile, {cfg}).physicalPlan());
+        PhysicalMemoryAuthority authority(certificate, rank);
+        ASSERT_TRUE(authority.contains(cfg.device));
+        EXPECT_EQ(authority.contains(DeviceId::cpu()), rank == 0);
+        if (rank == 0)
+        {
+            EXPECT_EQ(authority.plannedBytes(DeviceId::cpu(), owner), geometry.host_bytes_per_boundary);
+            for (int replay = 0; replay != 3; ++replay)
+            {
+                {
+                    auto lease = authority.claimNewAllocation(DeviceId::cpu(), owner, geometry.host_bytes_per_boundary);
+                    EXPECT_EQ(authority.claimedBytes(DeviceId::cpu(), owner,
+                        PhysicalMemoryMaterializationKind::NewAllocation), geometry.host_bytes_per_boundary);
+                }
+                EXPECT_EQ(authority.claimedBytes(DeviceId::cpu(), owner,
+                    PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+            }
+        }
+        else
+        {
+            EXPECT_THROW(authority.claimedBytes(DeviceId::cpu(), owner,
+                PhysicalMemoryMaterializationKind::NewAllocation), std::out_of_range);
+            EXPECT_THROW(authority.claimNewAllocation(DeviceId::cpu(), owner, 1), std::out_of_range);
+        }
+        EXPECT_EQ(authority.plannedBytes(cfg.device, owner), geometry.device_bytes_per_boundary);
+    }
+}
+
 TEST(Test__MemoryPlanner,
      MirroredTerminalHeadIsPricedForSerialOracleWhenMTPIsOff)
 {
@@ -2047,6 +2359,8 @@ TEST(Test__MemoryPlanner,
     profile.mtp_layer_count = 1;
 
     DevicePlanConfig config = overlayDeviceConfig(DeviceId::rocm(0));
+    config.mtp_routed_expert_weight_authority =
+        MTPRoutedExpertWeightAuthority::ExpertOverlay;
     config.shard_index = 0;
     config.total_shards = 2;
     config.local_tp_backend = CollectiveBackendType::RCCL;
@@ -2903,6 +3217,7 @@ TEST(Test__MemoryPlanner, CPUOverlayContinuationAdmitsCompactProjectionWorkspace
         cfg.serial_routed_expert_participant_count = 1;
         cfg.serial_routed_expert_compact_rows = declared_rows;
         const int token_rows = declared_rows > 0 ? declared_rows : batch * cfg.activation_seq_len;
+        declareCPUSerialFixture(cfg, profile);
 
         // Remove only the expert matrices to isolate their named workspace
         // contribution from the independent attention family in the same BOM.
@@ -2942,7 +3257,8 @@ TEST(Test__MemoryPlanner, CPUOverlayContinuationAdmitsCompactProjectionWorkspace
             auto follower = cfg;
             follower.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
             follower.weight_residency = DeviceWeightResidency::selectedRoutedExpertsOnly(8, {1});
-            EXPECT_EQ(MemoryPlanner::plan(profile, {follower}).devices.front().workspace_bytes(), required);
+            EXPECT_EQ(MemoryPlanner::plan(profile, {follower}).devices.front().workspace_bytes(),
+                required + follower.cpu_serial_expert_storage->envelope->admitted()->workspaceBytes());
         }
     }
     auto invalid = overlayDeviceConfig(DeviceId::cpu());
@@ -2967,6 +3283,7 @@ TEST(Test__MemoryPlanner, OverlayCompactWorkspaceCapacityIsFlattenedOnEveryBacke
         cfg.routed_expert_compact_buffer_lifetime = RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
         cfg.serial_routed_expert_participant_count = 1;
         cfg.serial_routed_expert_compact_rows = 31;
+        declareCPUSerialFixture(cfg, profile);
         const auto one = MemoryPlanner::plan(profile, {cfg}).devices.front().workspace_bytes();
         ASSERT_GT(one, 0u);
         for (int batch : {2, 3, 8})
@@ -3508,4 +3825,1577 @@ TEST(Test__MemoryPlanner, AttentionOperandCodecClassificationIsStrict)
         EXPECT_EQ(KVCacheMemoryEstimator::attentionExecutionFormat(name), TensorType::FP16) << name;
     EXPECT_THROW(KVCacheMemoryEstimator::attentionExecutionFormat("fp16-extra"), std::invalid_argument);
     EXPECT_THROW(KVCacheMemoryEstimator::attentionExecutionFormat(""), std::invalid_argument);
+}
+
+/** @test Hosted storage shares one exact host owner while every actual GPU binds the sealed tier. */
+TEST(Test__MemoryPlanner, NgramStorageHasOneExactHostOwnerAcrossGpuParticipants)
+{
+    // The shared config fixture intentionally has no learned FA/GDN matrices.
+    // Full activation admission is source-inventory driven, so supply this
+    // synthetic model's complete projection geometry before comparing the
+    // frozen base plus concrete lookup delta with the full resolved plan.
+    auto directory=test::qwen4MetadataFixture(false);
+    const auto projection=[&](const char *name,std::uint64_t rows,std::uint64_t columns) {
+        directory.tensors.push_back({.name=name,.dimensions={rows,columns},.type=GGUFTensorType::F16});
+    };
+    projection("blk.3.attn_q.weight",6144,2560);
+    projection("blk.3.attn_gate.weight",6144,2560);
+    projection("blk.0.attn_qkv.weight",10240,2560);
+    projection("blk.0.ssm_out.weight",2560,6144);
+    projection("blk.0.ssm_alpha.weight",48,2560);
+    projection("blk.0.ssm_beta.weight",48,2560);
+    const auto profile = ModelMemoryProfile::fromGGUF(directory);
+    DevicePlanConfig first;
+    first.world_rank = 0; first.device = DeviceId::cuda(0); first.device_compute_units = 82;
+    first.device_total_bytes = 64ull << 30; first.device_free_bytes = 60ull << 30;
+    first.max_seq_len = 64;
+    first.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = 0, .device = DeviceId::cpu(), .total_bytes = 128ull << 30,
+        .admission_available_bytes = 120ull << 30};
+    // One original CPU0 observation owns native and table storage. NUMA1 is
+    // preserved separately as execution locality, not invented extra capacity.
+    first.ngram_host_placement=ImmutableRowTableHostPlacement::onNode(1);
+    const std::array nativeDevices{DeviceId::cuda(0),DeviceId::rocm(0)};
+    const std::array nativeObserved{*first.associated_host_memory,
+        PhysicalMemoryResource{0,nativeDevices[0],first.device_total_bytes,first.device_free_bytes},
+        PhysicalMemoryResource{0,nativeDevices[1],first.device_total_bytes,first.device_free_bytes}};
+    using SourceAccess=test::NativeContextPreparationReplayAccess;
+    for(const auto device:nativeDevices)SourceAccess::seed(device,[device](std::shared_ptr<PreparedGPUWorkerStack> root){
+        return SourceAccess::construct<SourcePlanningWorker>(std::move(root),device.gpu_ordinal());});
+    auto nativeSource=SourceAccess::source<SourcePlanningWorker>(nativeDevices,nativeObserved);
+    PlanningSourceRetirement retirement(nativeSource,nativeDevices);
+    for(const auto device:nativeDevices){auto original=nativeSource->acquire(device);}
+    nativeSource->freezeForPlanning();
+    first.native_context_preparation=nativeSource;
+    first.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(nativeDevices);
+    first.retained_host_services=test::planningHostServiceDeclarations(0,std::array{
+        RetainedHostServiceInstance{0,nativeDevices[0],RetainedHostServiceRole::ImmutableLookupIO},
+        RetainedHostServiceInstance{0,nativeDevices[1],RetainedHostServiceRole::ImmutableLookupIO}});
+    auto second = first; second.device = DeviceId::rocm(0);
+    const std::vector<std::vector<DevicePlanConfig>> groups{{first,second}};
+    const auto input = MemoryPlanner::immutableRowTablePlacementInput(profile,groups,*first.associated_host_memory,first.ngram_host_placement);
+    EXPECT_EQ(input.hostPlacement(),ImmutableRowTableHostPlacement::onNode(1));
+    auto invented=first;invented.associated_host_memory->device=DeviceId{DeviceType::CPU,1};
+    invented.ngram_execution_policy=ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM,65536,3};
+    try{(void)MemoryPlanner::plan(profile,{invented});FAIL()<<"Invented physical CPU1 bank accepted with an actual source";}
+    catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("canonical CPU0"),std::string::npos);}
+    std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> final;
+    for (const auto requested : {ImmutableRowStoragePreference::RAM,ImmutableRowStoragePreference::MemoryMapped})
+    {
+        // The actual request freezes hosted execution before the lowest-priority
+        // table placement. It must not add the worker as a late mode surcharge.
+        const ImmutableRowTablePolicy policy{requested,65536,3};
+        first.ngram_execution_policy=second.ngram_execution_policy=policy;
+        first.ngram_table_placement.reset();second.ngram_table_placement.reset();
+        const std::vector<std::vector<DevicePlanConfig>> originalGroups{{first,second}};
+        const auto baseline=MemoryPlanner::plan(profile,originalGroups.front());
+        const auto admission=MemoryPlanner::immutableRowTableAdmissionRequest(
+            profile,policy,originalGroups,{},first.ngram_host_placement);
+        ASSERT_TRUE(admission.has_value());
+        const auto selected=ImmutableRowTablePlacementPlanner::select(*admission,baseline.physicalPlan());
+        first.ngram_table_placement=selected.placement;second.ngram_table_placement=selected.placement;
+        const auto plan=MemoryPlanner::plan(profile,{first,second});
+        const auto *host=plan.physicalPlan().find({0,DeviceId::cpu()});
+        ASSERT_NE(host,nullptr);
+        EXPECT_GT(host->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+        EXPECT_EQ(host->resource().total_bytes,nativeObserved[0].total_bytes);
+        EXPECT_EQ(selected.placement->hostPlacement(),ImmutableRowTableHostPlacement::onNode(1));
+        EXPECT_EQ(plan.physicalPlan().find({0,DeviceId{DeviceType::CPU,1}}),nullptr);
+        final=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.physicalPlan());
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ImmutableTableStorage),
+            ImmutableRowTable::physicalBytesForNativeExtent(profile.flash_next->ple_table_native_bytes,
+                selected.placement->storagePolicy()));
+        const auto selected_mismatch=selected.physical_plan.requiredFootprintMismatch(plan.physicalPlan());
+        const auto resolved_mismatch=plan.physicalPlan().requiredFootprintMismatch(selected.physical_plan);
+        EXPECT_FALSE(selected_mismatch.has_value())<<selected_mismatch.value_or("");
+        EXPECT_FALSE(resolved_mismatch.has_value())<<resolved_mismatch.value_or("");
+        for (const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        {
+            const auto *actual=plan.physicalPlan().find({0,device});
+            const auto *prior=baseline.physicalPlan().find({0,device});
+            ASSERT_NE(actual,nullptr);ASSERT_NE(prior,nullptr);
+            EXPECT_EQ(actual->bytes(PhysicalMemoryOwner::ImmutableTableStorage),0u);
+            EXPECT_EQ(actual->bytes(PhysicalMemoryOwner::PrimaryModelWeights),prior->bytes(PhysicalMemoryOwner::PrimaryModelWeights));
+        }
+    }
+    const auto originalMemory=nativeSource->memory();nativeSource->admitFinal(final);
+    EXPECT_EQ(nativeSource->memory(),originalMemory);EXPECT_EQ(originalMemory->admission(),final);
+}
+
+
+/** @test NUMA1 is retained as locality while an independent CPU1 physical budget is rejected. */
+TEST(Test__MemoryPlanner, NgramRejectsInventedCPU1PhysicalHostAllocator){
+    const PhysicalMemoryResource host{0,DeviceId::cpu(),128u<<20,120u<<20};
+    const std::array consumers{PhysicalMemoryResource{0,DeviceId::cuda(0),64u<<20,60u<<20}};
+    const auto extent=ImmutableRowTableExtent::fromNative(GGUFTensorType::F32,1024,16);
+    const auto placement=ImmutableRowTableHostPlacement::onNode(1);
+    const auto valid=ImmutableRowTablePlacementInput::forConsumers(extent,host,consumers,placement);
+    EXPECT_EQ(valid.host().device,DeviceId::cpu());EXPECT_EQ(valid.hostPlacement(),placement);
+    auto invented=host;invented.device=DeviceId{DeviceType::CPU,1};
+    try{(void)ImmutableRowTablePlacementInput::forConsumers(extent,invented,consumers,placement);FAIL()<<"Invented CPU1 physical host accepted";}
+    catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("canonical CPU0"),std::string::npos);}
+}
+
+/** @test Only the named lookup ordering contribution can join hosted mode costs; higher-priority ownership remains frozen. */
+TEST(Test__MemoryPlanner, NgramOrderingModeCostsRejectContextWeightAndKVOwners){
+    const PhysicalMemoryResource host{0,DeviceId::cpu(),8u<<20,8u<<20},gpu{0,DeviceId::cuda(0),4u<<20,4u<<20};
+    const std::array consumers{gpu};
+    const auto input=ImmutableRowTablePlacementInput::forConsumers(ImmutableRowTableExtent::fromNative(GGUFTensorType::F32,1024,16),host,consumers);
+    const std::array devices{gpu.device};const auto projection=test::NativeOrderingEventGroupReplayAccess::projection(devices);
+    const auto ordering=projection.bom(NativeOrderingEventProgram::lookupSubmissionRetirement(),host,gpu);
+    const ImmutableRowTablePolicy policy{ImmutableRowStoragePreference::RAM,65536,2};
+    ImmutableRowTableModeContributions modes{std::nullopt,ordering,ordering};
+    PhysicalMemoryPlanBuilder fixed;fixed.add(host,PhysicalMemoryOwner::PrimaryModelWeights,1u);fixed.add(gpu,PhysicalMemoryOwner::PrimaryModelWeights,1u);const auto base=fixed.build();
+    const auto admitted=ImmutableRowTablePlacementPlanner::select(policy,input,base,modes);
+    EXPECT_GT(admitted.physical_plan.find({0,host.device})->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+    EXPECT_GT(admitted.physical_plan.find({0,gpu.device})->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+    for(const auto owner:{PhysicalMemoryOwner::NativeExecutionContext,PhysicalMemoryOwner::PrimaryModelWeights,PhysicalMemoryOwner::KVCache}){
+        PhysicalMemoryPlanBuilder mixed(ordering);mixed.add(gpu,owner,1u);auto bad=modes;bad.ram=mixed.build();
+        try{(void)ImmutableRowTablePlacementPlanner::select(policy,input,base,bad);FAIL()<<"Higher-priority owner entered lookup mode";}
+        catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("higher-priority"),std::string::npos);}
+    }
+    const std::array cpuConsumers{host};
+    const auto cpuOnly=ImmutableRowTablePlacementInput::forConsumers(input.extent(),host,cpuConsumers);
+    PhysicalMemoryPlanBuilder phantom;phantom.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,1u);
+    EXPECT_THROW(ImmutableRowTablePlacementPlanner::select(policy,cpuOnly,base, {std::nullopt,phantom.build(),phantom.build()}),std::invalid_argument);
+}
+
+/** @test Final table admission derives one frozen host and rejects missing or conflicting owners. */
+TEST(Test__MemoryPlanner, NgramFinalHostComesFromActualConsumerInputs)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    const ImmutableRowTablePolicy policy{ImmutableRowStoragePreference::RAM, 65536, 3};
+    DevicePlanConfig first;
+    first.ngram_execution_policy = policy;
+    first.world_rank = 2;
+    first.device = DeviceId::cuda(0);
+    first.device_compute_units = 64;
+    first.max_seq_len = 64;
+    first.device_total_bytes = first.device_free_bytes = 64ull << 30;
+    first.associated_host_memory = PhysicalMemoryResource{
+        2, DeviceId::cpu(), 128ull << 30, 120ull << 30};
+    const std::array originalDevices{DeviceId::cuda(0),DeviceId::rocm(1)};
+    first.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+    first.retained_host_services=test::planningHostServiceDeclarations(2,std::array{
+        RetainedHostServiceInstance{2,originalDevices[0],RetainedHostServiceRole::ImmutableLookupIO},
+        RetainedHostServiceInstance{2,originalDevices[1],RetainedHostServiceRole::ImmutableLookupIO}});
+    auto second = first;
+    second.device = DeviceId::rocm(1);
+    auto expert = first;
+    expert.device = DeviceId{DeviceType::CPU, 7};
+    expert.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    expert.associated_host_memory.reset();
+    std::vector<std::vector<DevicePlanConfig>> groups{{first, second, expert}};
+    const auto request = MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy());
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->input.host().world_rank, 2);
+    EXPECT_EQ(request->input.host().device, DeviceId::cpu());
+    EXPECT_EQ(request->input.consumers().size(), 2u);
+    EXPECT_TRUE(request->input.hostPlacement().usesTaskPolicy());
+    const auto bound = MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},
+        ImmutableRowTableHostPlacement::fromObservedNUMANode(3));
+    ASSERT_TRUE(bound);
+    EXPECT_EQ(bound->input.host().device, DeviceId::cpu());
+    EXPECT_EQ(bound->input.hostPlacement(), ImmutableRowTableHostPlacement::onNode(3));
+
+    groups[0][1].associated_host_memory.reset();
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+    groups[0][1] = second;
+    groups[0][1].associated_host_memory->device = DeviceId{DeviceType::CPU, 3};
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+    groups[0][1] = second;
+    groups[0][1].associated_host_memory->world_rank = 9;
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+    groups[0][1] = second;
+    groups[0][1].associated_host_memory->total_bytes += 4096;
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+
+    // A CPU continuation already is its host owner; an expert-only CPU does
+    // not select storage for a PLE consumer and cannot supply a missing host.
+    first.device = DeviceId::cpu();
+    first.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    first.device_compute_units = 8;
+    first.associated_host_memory.reset();
+    groups = {{first, expert}};
+    const auto cpu = MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy());
+    ASSERT_TRUE(cpu);
+    EXPECT_EQ(cpu->input.host().device, first.device);
+    EXPECT_FALSE(cpu->input.permitsVRAM());
+    groups = {{expert}};
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()));
+}
+
+/** @test Each consumer authenticates its own original upload tuple, including unequal mixed GPUs. */
+TEST(Test__MemoryPlanner, NgramVRAMEligibilityUsesEachOriginalUploadGeometry)
+{
+    const auto profile=ModelMemoryProfile::fromGGUF(test::qwen4MetadataFixture(false));
+    DevicePlanConfig first;
+    first.world_rank=0;first.device=DeviceId::cuda(0);first.max_seq_len=64;first.device_total_bytes=64ull<<30;
+    first.device_free_bytes=60ull<<30;first.associated_host_memory=PhysicalMemoryResource{0,DeviceId::cpu(),128ull<<30,120ull<<30};
+    const auto row=static_cast<std::size_t>(profile.flash_next->ple_table_row_bytes);
+    const auto wide=resolveGPUWeightLoadMemoryGeometry(row+4096,{.staging_stream_count=1,.staging_budget_bytes=4096});
+    first.ordinary_weight_load_geometry=wide;
+    first.weight_load_staging={wide.staging_bytes,wide.host_staging_bytes};
+    const std::array originalDevices{DeviceId::cuda(0),DeviceId::rocm(1)};
+    first.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+    auto second=first;second.device=DeviceId::rocm(1);
+    const auto other=resolveGPUWeightLoadMemoryGeometry(row+8192,{.staging_stream_count=2,.staging_budget_bytes=8192});
+    second.ordinary_weight_load_geometry=other;
+    second.weight_load_staging={other.staging_bytes,other.host_staging_bytes};
+    auto expert_only=first;
+    expert_only.device=DeviceId{DeviceType::CPU,2};
+    expert_only.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    expert_only.weight_load_staging={};expert_only.ordinary_weight_load_geometry.reset();
+    std::vector<std::vector<DevicePlanConfig>> groups{{first,second,expert_only}};
+    const auto placement_input=MemoryPlanner::immutableRowTablePlacementInput(profile,groups,*first.associated_host_memory);
+    EXPECT_TRUE(placement_input.permitsVRAM());
+    EXPECT_EQ(placement_input.consumers().size(),2u);
+    const auto bindings=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+    ASSERT_EQ(bindings.size(),2u);
+    const ImmutableRowTablePolicy resident{ImmutableRowStoragePreference::VRAM,65536,3};
+    EXPECT_TRUE(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,bindings).vram);
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,{}).vram);
+    ASSERT_GT(row,1u);
+    const auto narrow=resolveGPUWeightLoadMemoryGeometry(row-1,{.staging_stream_count=1,.staging_budget_bytes=0});
+    groups.front()[1].ordinary_weight_load_geometry=narrow;
+    groups.front()[1].weight_load_staging={narrow.staging_bytes,narrow.host_staging_bytes};
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,
+        MemoryPlanner::immutableRowTableUploadBindings(profile,groups)).vram);
+    auto foreign=bindings;foreign.front().consumer.device=DeviceId::cuda(7);
+    EXPECT_THROW(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,foreign),std::invalid_argument);
+}
+
+/** @test Native and hosted PP participants price distinct zero-output source and parent per query program. */
+TEST(Test__MemoryPlanner, NativePipelineForwardOnlyParentHasNamedPhysicalBOM)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto domain : {DeviceGenerationExecutionDomain::NativeDomain, DeviceGenerationExecutionDomain::HostedBoundary})
+    for (const size_t programs : {1u, 2u})
+    {
+        auto profile = createTestProfile();
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_compute_units = 82;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL * GiB;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 64;
+        cfg.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+            {64},
+            {},
+            resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(declaredDeviceGenerationExecutionPolicy(
+                device.type, domain))),
+            MTPGenerationParentRole::Controller,
+            domain, programs);
+        const auto ordinary = MemoryPlanner::plan(profile, {cfg});
+        cfg.pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::Participant;
+        const auto pipeline = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_EQ(ordinary.devices.size(), 1u);
+        ASSERT_EQ(pipeline.devices.size(), 1u);
+        EXPECT_EQ(pipeline.devices.front().captured_graph_bytes() - ordinary.devices.front().captured_graph_bytes(),
+            estimateCapturedGraphExecutableBytes(device, CapturedGraphExecutableInventory{
+                .model_graph_identity_count = 0u,
+                .model_graph_topology_variant_count = 0u,
+                .auxiliary_executable_count = OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(programs, PipelineForwardOnlyGraphOwner::Participant)}));
+    }
+}
+
+/** @test Native and captured-domain PP declarations own parents independently of transport. */
+TEST(Test__MemoryPlanner, ForwardOnlyBOMFollowsOriginalNativePipelineProjection)
+{
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int topology : {0, 1, 2}) // singleton homogeneous, nested TP, mixed vendor
+    {
+        RankExecutionPlan parent;
+        parent.rank = 0;
+        const auto first = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 0));
+        const auto second_type = topology == 2 ? (type == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA) : type;
+        const auto second = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(second_type, topology == 2 ? 0 : 1));
+        parent.local_pp_devices = {first, second};
+        parent.local_pp_layer_boundaries = {0, 2, 4};
+        if (topology == 1)
+            parent.local_pp_stage_tp_info = {{.devices = {first,
+                GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 2))}},
+                {.devices = {second, GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 3))}}};
+        DevicePlanConfig cfg;
+        cfg.world_rank = 0;
+        cfg.device = first.toLocalDeviceId();
+        cfg.first_layer = 0;
+        cfg.last_layer = 1;
+        cfg.execution_role = DeviceExecutionMemoryRole::ContinuationGraph;
+        cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+            .device = DeviceId::cpu(), .total_bytes = 4096, .admission_available_bytes = 4096};
+        PipelineStageTransferMemory::forStage(parent, 0).bind(cfg);
+        EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
+        EXPECT_THROW(PipelineStageTransferMemory::forStage(parent, 0).bind(cfg), std::invalid_argument);
+        // Nested TP preserves the native outer PP transport. Its source
+        // leader owns one reverse receive and one send per actual tail member;
+        // the legacy singleton boundary has its separate fixed fence inventory.
+        if (topology != 2)
+        {
+            ASSERT_TRUE(cfg.local_pipeline_backend);
+            EXPECT_EQ(*cfg.local_pipeline_backend, type == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        }
+        else EXPECT_FALSE(cfg.local_pipeline_backend);
+        EXPECT_EQ(cfg.native_pipeline_byte_endpoints, topology == 1 ? 3u : 0u);
+        EXPECT_EQ(cfg.captured_pipeline_boundaries.size(), topology == 2 ? 1u : 0u);
+        EXPECT_FALSE(cfg.pipeline_native_activation_fanout);
+    }
+}
+
+/** @test Frozen domains assign exactly one parent/program to every actual GPU, including TP siblings. */
+TEST(Test__MemoryPlanner, CapturedDomainForwardOnlyOwnersIncludeEveryPhysicalParticipant)
+{
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+    for (int members = 1; members <= 8; ++members)
+    {
+        RankExecutionPlan parent;
+        parent.rank = 0;
+        const auto other = type == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA;
+        const auto first = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 0));
+        const auto tail = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(other, 0));
+        parent.local_pp_devices = {first, tail};
+        parent.local_pp_layer_boundaries = {0, 2, 4};
+        parent.local_pp_stage_tp_info.resize(2);
+        for (int member = 0; member < members; ++member)
+        {
+            parent.local_pp_stage_tp_info[0].devices.push_back(
+                GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, member)));
+            parent.local_pp_stage_tp_info[1].devices.push_back(
+                GlobalDeviceAddress::fromLocalDeviceId(DeviceId(other, member)));
+        }
+        for (size_t stage = 0; stage != 2; ++stage)
+        {
+            const auto transfer = PipelineStageTransferMemory::forStage(parent, stage);
+            for (const auto &member : parent.local_pp_stage_tp_info[stage].devices)
+            {
+                DevicePlanConfig cfg;
+                cfg.world_rank = 0;
+                cfg.device = member.toLocalDeviceId();
+                cfg.first_layer = static_cast<int>(stage) * 2;
+                cfg.last_layer = cfg.first_layer + 1;
+                cfg.execution_role = DeviceExecutionMemoryRole::ContinuationGraph;
+                cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+                    .device = DeviceId::cpu(), .total_bytes = 4096, .admission_available_bytes = 4096};
+                transfer.bind(cfg);
+                EXPECT_FALSE(cfg.local_pipeline_backend);
+                EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
+                for (const size_t programs : {1u, 2u})
+                    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+                        programs, cfg.pipeline_forward_only_graph_owner), 2u * programs);
+                EXPECT_THROW(transfer.bind(cfg), std::invalid_argument);
+            }
+        }
+    }
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+        2u, PipelineForwardOnlyGraphOwner::None), 0u);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+        1u, static_cast<PipelineForwardOnlyGraphOwner>(255)), std::invalid_argument);
+    DevicePlanConfig invalid;
+    invalid.device = DeviceId::cpu();
+    invalid.pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::Participant;
+    EXPECT_THROW(MemoryPlanner::plan(createTestProfile(), {invalid}), std::invalid_argument);
+    invalid.pipeline_forward_only_graph_owner = static_cast<PipelineForwardOnlyGraphOwner>(255);
+    EXPECT_THROW(MemoryPlanner::plan(createTestProfile(), {invalid}), std::invalid_argument);
+}
+
+/**
+ * @test Original source geometry and actual stage declarations own handoff bytes.
+ *
+ * Sparse parser-native source metadata is never loaded as model weights. The
+ * existing stage query supplies the descriptors; only collective membership is
+ * mocked. Global layer subranges, scalar families, non-native contexts and
+ * already-full primary state preserve their actual stage-selection boundaries.
+ */
+TEST(Test__MemoryPlanner, ReplicatedDecodeIncludesActualGDNHandoffWorkspace)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    const GDNLinkedLiveStateGeometry geometry{
+        .global_key_heads = profile.gdn_group_count,
+        .global_value_heads = profile.gdn_time_step_rank,
+        .key_width = profile.gdn_state_size,
+        .value_width = profile.gdn_state_size,
+        .conv_history_length = profile.gdn_conv_kernel_size - 1};
+    for (const DeviceId first : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int degree : {2, 4, 8})
+    {
+        const auto backend = first.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        std::vector<GlobalDeviceAddress> addresses;
+        std::vector<DeviceId> devices;
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            devices.emplace_back(first.type, rank);
+            addresses.push_back(first.is_cuda() ? GlobalDeviceAddress::cuda(rank) : GlobalDeviceAddress::rocm(rank));
+        }
+        test::MockLocalTPContext collective;
+        collective.setDevices(addresses);
+        collective.setBackend(backend);
+        const auto assignment = TensorParallelConfig::proportionalSplit(devices,
+            std::vector<float>(static_cast<size_t>(degree), 1.f), profile.n_heads,
+            profile.n_kv_heads, profile.d_ff, profile.vocab_size);
+        for (const auto [first_layer, last_layer] : {std::pair{0, 47}, std::pair{12, 27}})
+        {
+            WorkspaceRequirements actual_stages;
+            std::set<int> layers;
+            for (const auto &tensor : profile.tensors)
+                if (tensor.name.ends_with(".ssm_out.weight") &&
+                    tensor.layer_index >= first_layer && tensor.layer_index <= last_layer)
+                    layers.insert(tensor.layer_index);
+            ASSERT_EQ(layers.size(), first_layer == 0 ? 36u : 12u);
+            for (const int layer : layers)
+            {
+                GDNLiveStateAllGatherStage::Params params;
+                params.device_id = first;
+                params.tp_ctx = &collective;
+                params.layer_idx = layer;
+                params.tp_device_idx = 0;
+                params.geometry = geometry;
+                GDNLiveStateAllGatherStage stage(params);
+                const auto one = stage.getWorkspaceRequirements(9);
+                ASSERT_EQ(one.buffers.size(), 6u);
+                for (const auto &descriptor : one.buffers)
+                {
+                    EXPECT_TRUE(descriptor.name.ends_with("_layer" + std::to_string(layer)));
+                    EXPECT_EQ(descriptor.alignment, 256u);
+                    EXPECT_TRUE(descriptor.required);
+                    EXPECT_EQ(descriptor.regime, WorkspaceExecutionRegime::Any);
+                    EXPECT_EQ(descriptor.content_lifetime, WorkspaceContentLifetime::ParticipantExecution);
+                }
+                actual_stages.merge(one);
+            }
+            EXPECT_EQ(actual_stages.buffers.size(), layers.size() * 6u);
+            const auto handoff_bytes = actual_stages.total_bytes_with_alignment();
+            if (degree == 4 && first_layer == 0)
+            {
+                EXPECT_EQ(handoff_bytes, 264757248u);
+            }
+            for (const auto [batch, rows] : {std::pair{1, 1}, std::pair{1, 9},
+                                           std::pair{1, 512}, std::pair{2, 1}})
+            {
+                auto cfg = overlayDeviceConfig(first);
+                const std::array originalDevices{first};
+                cfg.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+                cfg.world_rank = 0;
+                cfg.device_total_bytes = cfg.device_free_bytes = 1ull << 40;
+                cfg.total_shards = degree;
+                cfg.local_tp_backend = backend;
+                cfg.bindTensorParallelAssignment(assignment.forRank(0));
+                cfg.first_layer = first_layer;
+                cfg.last_layer = last_layer;
+                cfg.max_seq_len = 4096;
+                cfg.activation_seq_len = rows;
+                cfg.batch_size = batch;
+                cfg.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+                    profile.expert_count, std::vector<int>(static_cast<size_t>(profile.n_layers), 0));
+                cfg.ngram_execution_policy = ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM, 65536, 1024};
+                cfg.retained_host_services=test::planningHostServiceDeclarations(0,std::array{
+                    RetainedHostServiceInstance{0,first,RetainedHostServiceRole::ImmutableLookupIO}});
+                cfg.ngram_host_placement = ImmutableRowTableHostPlacement::fromObservedNUMANode(0);
+                cfg.associated_host_memory = PhysicalMemoryResource{
+                    .world_rank = 0, .device = DeviceId::cpu(),
+                    .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+                const auto find = [&](const MemoryPlan &plan) -> const DeviceMemoryPlan * {
+                    for (const auto &device : plan.devices)
+                        if (device.device() == first) return &device;
+                    return nullptr;
+                };
+                const auto primary = MemoryPlanner::plan(profile, {cfg});
+                cfg.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
+                const auto phase_split = MemoryPlanner::plan(profile, {cfg});
+                const auto *before = find(primary);
+                const auto *after = find(phase_split);
+                ASSERT_NE(before, nullptr);
+                ASSERT_NE(after, nullptr);
+                // Even the admitted M=1 prefill family owns a TP-local producer.
+                // Its successor full bank must be ready for replicated decode.
+                EXPECT_GE(after->workspace_bytes(), before->workspace_bytes() + handoff_bytes)
+                    << "participant=" << first.toString() << " batch=" << batch << " rows=" << rows << " degree=" << degree;
+                auto without_native = cfg;
+                without_native.local_tp_backend.reset();
+                const auto nonlocal = MemoryPlanner::plan(profile, {without_native});
+                const auto *without = find(nonlocal);
+                ASSERT_NE(without, nullptr);
+                EXPECT_EQ(after->workspace_bytes() - without->workspace_bytes(), handoff_bytes);
+
+                if (first_layer == 0)
+                {
+                    auto implicit_end = cfg;
+                    implicit_end.last_layer = -1;
+                    const auto default_scope = MemoryPlanner::plan(profile, {implicit_end});
+                    ASSERT_NE(find(default_scope), nullptr);
+                    EXPECT_EQ(find(default_scope)->workspace_bytes(), after->workspace_bytes());
+                }
+
+                // The same declared maximum layout is not a linked-local
+                // producer when its original primary assignment is already full.
+                auto full = assignment.forRank(0);
+                full.head_start = 0; full.head_count = profile.n_heads;
+                full.kv_head_start = 0; full.kv_head_count = profile.n_kv_heads;
+                full.d_ff_start = 0; full.d_ff_count = profile.d_ff;
+                full.vocab_start = 0; full.vocab_count = profile.vocab_size;
+                auto full_primary = cfg;
+                full_primary.bindTensorParallelAssignment(full);
+                const auto full_native = MemoryPlanner::plan(profile, {full_primary});
+                full_primary.local_tp_backend.reset();
+                const auto full_nonlocal = MemoryPlanner::plan(profile, {full_primary});
+                ASSERT_NE(find(full_native), nullptr);
+                ASSERT_NE(find(full_nonlocal), nullptr);
+                EXPECT_EQ(find(full_native)->workspace_bytes(), find(full_nonlocal)->workspace_bytes());
+            }
+        }
+    }
+
+    // A scalar CPU primary cannot request a TP replica sidecar. Preserve this
+    // original admission guard instead of fabricating native CPU membership.
+    auto cpu = overlayDeviceConfig(DeviceId::cpu());
+    cpu.world_rank = -1;
+    cpu.device_total_bytes = cpu.device_free_bytes = 1ull << 40;
+    cpu.total_shards = 1;
+    cpu.first_layer = 0;
+    cpu.last_layer = profile.mainLayerCount() - 1;
+    cpu.activation_seq_len = 9;
+    cpu.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {cpu}), std::invalid_argument);
+}
+
+/**
+ * @test Ordinary native terminal publication owns full logits without an MTP family.
+ *
+ * Keep the planner's historical target-row default deliberately untouched:
+ * workspace propagation must mask it to zero while mtp_enabled is false. An
+ * ordinary singleton gather needs no transpose scratch, predictor weights or
+ * recurrent checkpoints. The no-native comparison differs only in publication.
+ */
+TEST(Test__MemoryPlanner, OrdinaryNativeVocabularyHasNoRetainedMTPOrSingletonScratch)
+{
+    const auto profile = createTestProfile();
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4, 8})
+    {
+        SCOPED_TRACE(DeviceId(backend, 0).toString() + "/" + std::to_string(degree));
+        DevicePlanConfig cfg;
+        cfg.device = DeviceId(backend, 0);
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        cfg.device_compute_units = 60;
+        cfg.total_shards = degree;
+        cfg.first_layer = 0;
+        cfg.last_layer = profile.n_layers - 1;
+        cfg.batch_size = 1;
+        cfg.max_seq_len = cfg.activation_seq_len = 64;
+        cfg.mtp_enabled = false;
+        cfg.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        cfg.local_tp_backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        ASSERT_EQ(cfg.terminalLogitsCollective(true), MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather);
+        EXPECT_EQ(cfg.terminalLogitsCollective(false), MTPTerminalLogitsCollective::None);
+        MTPRuntimeConfig no_mtp;
+        no_mtp.enabled = false;
+        no_mtp.graph_capacity_draft_tokens = 0;
+        no_mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+        EXPECT_FALSE(retainsMTPGraphCapacity(no_mtp));
+        cfg.additional_weight_sets = resolveAdditionalPersistentWeightSets(
+            DenseParallelPolicy::TensorParallel, degree, no_mtp);
+        EXPECT_TRUE(cfg.additional_weight_sets.empty());
+        const auto native = MemoryPlanner::plan(profile, {cfg});
+        cfg.local_tp_backend.reset(); // Explicit global/non-local shard owns no native publication.
+        EXPECT_EQ(cfg.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
+        const auto without_native = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_EQ(native.devices.size(), 1u);
+        ASSERT_EQ(without_native.devices.size(), 1u);
+        EXPECT_EQ(native.devices.front().workspace_bytes(), without_native.devices.front().workspace_bytes());
+        EXPECT_EQ(native.devices.front().additional_weight_bytes(), 0u);
+        EXPECT_EQ(native.devices.front().checkpoint_state_bytes(), 0u);
+    }
+}
+
+/** @test Ordinary native scratch follows declared output rows, never prompt/MTP placeholders. */
+TEST(Test__MemoryPlanner, OrdinaryProjectedRowsPriceExactNativeBank)
+{
+    const auto profile = createTestProfile();
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4, 8})
+    {
+        DevicePlanConfig cfg;
+        cfg.device = DeviceId(backend, 0);
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        cfg.device_compute_units = 60;
+        cfg.total_shards = degree;
+        cfg.last_layer = profile.n_layers - 1;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 512;
+        cfg.batch_size = 1;
+        cfg.mtp_enabled = false; // Keep the inactive target-row placeholder unchanged.
+        cfg.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        cfg.local_tp_backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        const auto singleton = MemoryPlanner::plan(profile, {cfg});
+        for (const int rows : {2, 16, 512})
+        {
+            cfg.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(rows);
+            const auto diagnostic = MemoryPlanner::plan(profile, {cfg});
+            const auto bank = VocabularyGatherWorkspaceContract::requirements(rows, profile.vocab_size);
+            EXPECT_EQ(diagnostic.devices.front().workspace_bytes() - singleton.devices.front().workspace_bytes(),
+                      bank.total_bytes_with_alignment());
+            EXPECT_EQ(diagnostic.devices.front().additional_weight_bytes(), 0u);
+            EXPECT_EQ(diagnostic.devices.front().checkpoint_state_bytes(), 0u);
+        }
+        cfg.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(513);
+        EXPECT_THROW(MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
+        cfg.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+        cfg.local_tp_backend.reset(); // Global/non-native ownership contributes no transpose bank.
+        const auto global = MemoryPlanner::plan(profile, {cfg});
+        cfg.ordinary_terminal_projection = {};
+        const auto global_single = MemoryPlanner::plan(profile, {cfg});
+        EXPECT_EQ(global.devices.front().workspace_bytes(), global_single.devices.front().workspace_bytes());
+        cfg.local_tp_backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        cfg.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+        EXPECT_EQ(cfg.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
+    }
+    DevicePlanConfig cpu;
+    cpu.device = DeviceId::cpu();
+    cpu.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    cpu.device_compute_units = 8;
+    cpu.device_total_bytes = cpu.device_free_bytes = 64ULL << 30;
+    cpu.max_seq_len = cpu.activation_seq_len = 512;
+    const auto singleton = MemoryPlanner::plan(profile, {cpu});
+    cpu.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+    const auto diagnostic = MemoryPlanner::plan(profile, {cpu});
+    EXPECT_EQ(cpu.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
+    EXPECT_EQ(diagnostic.devices.front().workspace_bytes(), singleton.devices.front().workspace_bytes());
+}
+
+
+/** @test Extra main-query programs add only their real native owners, never duplicated sidecars/helpers. */
+TEST(Test__MemoryPlanner, SparseQueryProgramInventoryPricesOnlyAdditionalMainOwners)
+{
+    for(bool retains:{false,true}){
+        MTPRuntimeConfig policy;
+        policy.enabled=false;
+        policy.graph_capacity_draft_tokens=retains?15:0;
+        const auto one=resolveCapturedServingGraphMemoryInventory(
+            {32,64},
+            policy,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain);
+        const auto two=resolveCapturedServingGraphMemoryInventory(
+            {32,64},
+            policy,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain,
+            2u);
+        EXPECT_EQ(one.sparse_query_program_count,1u);
+        EXPECT_EQ(two.sparse_query_program_count,2u);
+        EXPECT_EQ(two.prefill_bucket_rows,one.prefill_bucket_rows);
+        EXPECT_EQ(two.fixed_executable_count,2u*one.fixed_executable_count);
+        EXPECT_EQ(two.mtp_graph_owners.sidecarGraphSlots(),one.mtp_graph_owners.sidecarGraphSlots());
+        EXPECT_EQ(two.mtp_graph_owners.boundedHelperExecutableSlotCount(),one.mtp_graph_owners.boundedHelperExecutableSlotCount());
+        EXPECT_EQ(two.mtp_graph_owners.controllerGraphSlots(),one.mtp_graph_owners.controllerGraphSlots()+(retains?2u:0u));
+        EXPECT_EQ(one.mtp_graph_owners.speculativePublicationGraphSlots(), retains ? 1u : 0u);
+        EXPECT_EQ(two.mtp_graph_owners.speculativePublicationGraphSlots(), retains ? 2u : 0u);
+        EXPECT_EQ(two.mtp_graph_owners.generalAuxiliaryExecutableSlotCount(),
+            one.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + (retains ? 2u : 0u));
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant),2u);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(2u, PipelineForwardOnlyGraphOwner::Participant),4u);
+        for(auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+            EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                device,
+                retains,
+                declaredDeviceGenerationExecutionPolicy(device.type,DeviceGenerationExecutionDomain::NativeDomain),
+                MTPGenerationParentRole::Controller,
+                2u),
+                2u*OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                    device,
+                    retains,
+                    declaredDeviceGenerationExecutionPolicy(device.type,DeviceGenerationExecutionDomain::NativeDomain),
+                    MTPGenerationParentRole::Controller));
+    }
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {32},
+        MTPRuntimeConfig{},
+        MTPVerifierGraphFamily::BoundedBuckets,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain,
+        0u),std::invalid_argument);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {32},
+        MTPRuntimeConfig{},
+        MTPVerifierGraphFamily::BoundedBuckets,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain,
+        3u),std::invalid_argument);
+    EXPECT_THROW((void)MTPGraphOwnerPlan(MTPRuntimeConfig{},MTPVerifierGraphFamily::BoundedBuckets,MTPGenerationParentRole::Controller,3u),std::invalid_argument);
+    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::rocm(0),
+        false,
+        DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions,
+        MTPGenerationParentRole::Controller,
+        3u),std::invalid_argument);
+    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(3u, PipelineForwardOnlyGraphOwner::Participant),std::invalid_argument);
+}
+
+/** @test Dedicated scalar diagnostic arenas multiply; proven wide/condition lanes and Dense0 stay shared. */
+TEST(Test__MemoryPlanner, SparseQueryProgramSnapshotOwnersMatchPhysicalSharing)
+{
+    const auto one=ServingSnapshotArenaInventory::ordinary(true,true,7u,1u);
+    const auto two=ServingSnapshotArenaInventory::ordinary(true,true,7u,1u,2u);
+    EXPECT_EQ(one.scalarMainOwners(),2u);
+    EXPECT_EQ(two.scalarMainOwners(),4u);
+    EXPECT_EQ(two.wideMainOwners(),one.wideMainOwners());
+    EXPECT_EQ(two.conditionMainOwners(),one.conditionMainOwners());
+    EXPECT_EQ(two.predictorOwners(),one.predictorOwners());
+    const MainSnapshotPhasePayload payload{.wide_main_bytes=1024u,.scalar_main_bytes=128u,.separate_reference_bytes=17u};
+    EXPECT_EQ(payload.bytesFor(two)-payload.bytesFor(one),2u*128u);
+    EXPECT_THROW((void)ServingSnapshotArenaInventory::ordinary(true,false,0u,0u,0u),std::invalid_argument);
+    EXPECT_THROW((void)ServingSnapshotArenaInventory::ordinary(true,false,0u,0u,3u),std::invalid_argument);
+}
+
+/** @test Complete-main sparse topology determines immutable programs, independent of stage scope. */
+TEST(Test__MemoryPlanner, SparseQueryProfileProjectionExcludesPredictorOnlyLayers)
+{
+    ModelMemoryProfile profile;
+    profile.n_layers = 4;
+    profile.mtp_layer_count = 1;
+    EXPECT_EQ(profile.sparseQueryProgramCount(), 1u);
+    profile.flash_next.emplace();
+    profile.flash_next->sparse_decoder_layers = {4};
+    EXPECT_EQ(profile.sparseQueryProgramCount(), 1u); // Predictor-only sparse geometry is not a main program.
+    profile.flash_next->sparse_decoder_layers = {3, 4};
+    EXPECT_EQ(profile.sparseQueryProgramCount(), 2u);
+    profile.n_layers = -1;
+    EXPECT_THROW(profile.sparseQueryProgramCount(), std::invalid_argument);
+}
+
+/** @test Two main-query programs price both retained prefill families and the actual hosted tail. */
+TEST(Test__MemoryPlanner, SparseQueryProgramBOMPricesBothPrefillProgramsAndHostedCudaTail)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_total_bytes = config.device_free_bytes = 64ull << 30;
+    config.device_compute_units = 60;
+    config.max_seq_len = 4096;
+    config.activation_seq_len = 64;
+    MTPRuntimeConfig retained;
+    retained.graph_capacity_draft_tokens = 15;
+    for (const auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        config.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+            {32, 64},
+            retained,
+            MTPVerifierGraphFamily::ExactRows,
+            role,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            2u);
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        const auto &serving = config.captured_serving_graphs;
+        const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(config.device, true, DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions, role, 2u);
+        const CapturedGraphExecutableInventory expected{
+            .model_graph_identity_count = 4u + serving.fixed_executable_count,
+            .model_graph_topology_variant_count = 1u,
+            .auxiliary_executable_count = serving.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + ordinary,
+            .bounded_helper_executable_count = serving.mtp_graph_owners.boundedHelperExecutableSlotCount()};
+        EXPECT_EQ(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(config.device, expected));
+        auto wrong_prefill = expected;
+        wrong_prefill.model_graph_identity_count -= 2u; // Original count omitted the second retained prefill program.
+        EXPECT_NE(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(config.device, wrong_prefill));
+    }
+}
+
+/** @test A per-GPU BOM rejects missing or contradictory execution declarations before pricing. */
+TEST(Test__MemoryPlanner, CapturedServingFamilyMustMatchDeclaredGpuDomain)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_total_bytes = config.device_free_bytes = 64ull << 30;
+    config.device_compute_units = 60;
+    config.max_seq_len = 4096;
+    config.activation_seq_len = 64;
+    MTPRuntimeConfig retained;
+    retained.graph_capacity_draft_tokens = 15;
+    config.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+        {32},
+        retained,
+        MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain);
+    EXPECT_THROW(MemoryPlanner::plan(profile,{config}), std::invalid_argument); // CUDA native requires bounded.
+    config.device = DeviceId::rocm(0);
+    EXPECT_NO_THROW(MemoryPlanner::plan(profile,{config})); // ROCm native domain declares hosted exact.
+    config.device = DeviceId::cuda(0);
+    config.captured_serving_graphs.generation_domain = DeviceGenerationExecutionDomain::HostedBoundary;
+    EXPECT_NO_THROW(MemoryPlanner::plan(profile,{config}));
+    config.captured_serving_graphs.verifier_graph_family = MTPVerifierGraphFamily::BoundedBuckets;
+    EXPECT_THROW(MemoryPlanner::plan(profile,{config}), std::invalid_argument);
+    config.captured_serving_graphs.generation_domain.reset();
+    EXPECT_THROW(MemoryPlanner::plan(profile,{config}), std::invalid_argument);
+}
+
+/**
+ * @test One flat scalar history owner is admitted for each MTP controller.
+ * @details Depth, request capacity, query programs and initial request enablement
+ * do not multiply this owner. Its one bounded-helper charge reaches the actual
+ * backend byte estimator; followers and absent retained capacity own none.
+ */
+TEST(Test__MemoryPlanner, MTPDirectTokenHistoryOwnerIsSingleBoundedControllerHelper)
+{
+    for (int requests = 1; requests <= 8; ++requests)
+    for (int depth : {1, 3, 15})
+    for (std::size_t programs : {1u, 2u})
+    for (bool enabled : {false, true})
+    for (auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    for (auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        MTPRuntimeConfig policy;
+        policy.enabled = enabled;
+        policy.draft_tokens = 1;
+        policy.graph_capacity_draft_tokens = depth;
+        policy.max_request_batch = requests;
+        policy.depth_policy.mode = mode;
+        const MTPGraphOwnerPlan owners(policy, family, role, programs);
+        const std::size_t direct = role == MTPGenerationParentRole::Controller ? 1u : 0u;
+        EXPECT_EQ(owners.directTokenHistoryGraphSlots(), direct);
+        EXPECT_EQ(owners.controllerGraphSlots(), owners.samplerHelperGraphSlots() +
+            owners.generationParentGraphSlots() + owners.speculativePublicationGraphSlots() + direct);
+        const auto bounded_without_direct = owners.boundedHelperExecutableSlotCount() - direct;
+        const auto total_without_direct = owners.auxiliaryExecutableSlotCount() - direct;
+        EXPECT_EQ(owners.generalAuxiliaryExecutableSlotCount() + bounded_without_direct,
+                  total_without_direct);
+        for (auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            CapturedGraphExecutableInventory inventory{
+                .model_graph_identity_count = 1u,
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count = owners.generalAuxiliaryExecutableSlotCount(),
+                .bounded_helper_executable_count = bounded_without_direct,
+            };
+            const auto without_direct = estimateCapturedGraphExecutableBytes(device, inventory);
+            inventory.bounded_helper_executable_count += direct;
+            EXPECT_EQ(estimateCapturedGraphExecutableBytes(device, inventory), without_direct + direct *
+                GPUGraphMemoryContract::reservationBytesPerExecutable(device, GPUGraphExecutableClass::BoundedFlatHelper));
+        }
+    }
+    for (auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        const MTPGraphOwnerPlan absent(MTPRuntimeConfig{}, MTPVerifierGraphFamily::ExactRows, role);
+        EXPECT_EQ(absent.directTokenHistoryGraphSlots(), 0u);
+        EXPECT_EQ(absent.auxiliaryExecutableSlotCount(), 0u);
+    }
+}
+
+/** @test Every independently retained controller is explicit in the serial workspace BOM. */
+TEST(Test__MemoryPlanner, CPUDeclaredSerialControllersRequireExactWorkspaceConcurrency)
+{
+    const auto profile = createMoEOverlayProfile();
+    auto config = overlayDeviceConfig(DeviceId::cpu());
+    config.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    // This profile owns both routed layers; concurrency must not be tested
+    // through an incomplete per-layer residency declaration.
+    config.weight_residency = DeviceWeightResidency::selectedRoutedExpertsOnly(
+        profile.expert_count,std::vector<int>(static_cast<size_t>(profile.n_layers),2));
+    config.routed_expert_compact_buffer_lifetime = RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    config.serial_routed_expert_participant_count = 2;
+    config.serial_routed_expert_compact_rows = 31;
+    declareCPUSerialFixture(config,profile);
+    const auto single = MemoryPlanner::plan(profile,{config}).devices.front().workspace_bytes();
+    auto declared = std::make_shared<CPUSerialExpertStorageAdmission>(*config.cpu_serial_expert_storage);
+    declared->controller_devices.push_back(DeviceId{DeviceType::CPU,1});
+    std::sort(declared->controller_devices.begin(),declared->controller_devices.end());
+    config.cpu_serial_expert_storage = declared;
+    EXPECT_THROW((void)MemoryPlanner::plan(profile,{config}),std::invalid_argument);
+    config.concurrent_workspace_owners = declared->controller_devices.size();
+    EXPECT_EQ(MemoryPlanner::plan(profile,{config}).devices.front().workspace_bytes(),single*2);
+}
+
+namespace
+{
+/**
+ * @brief Reproduce the existing named-workspace source projection for this
+ * tiny CPU fixture with balanced TP; the grouped physical roots are intentionally
+ * priced independently through their shared production declaration.
+ */
+size_t ordinaryCPUNamedWorkspace(const ModelMemoryProfile &profile,const DevicePlanConfig &cfg)
+{
+    WorkspaceMemoryGeometry geometry{
+        .device=cfg.device,.device_compute_units=cfg.device_compute_units,
+        .cpu_execution=cfg.cpu_execution,.batch_size=cfg.batch_size,
+        .ordinary_terminal_projection=cfg.ordinary_terminal_projection,
+        .resident_graph_rows=cfg.activation_seq_len,.max_context_rows=cfg.max_seq_len,
+        .owns_embedding=cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph && cfg.owns_embedding,
+        .shard_index=cfg.shard_index,.local_d_ff=std::max(1,profile.d_ff/cfg.total_shards),
+        .local_query_head_start=cfg.shard_index*std::max(1,profile.n_heads/cfg.total_shards),
+        .local_query_heads=std::max(1,profile.n_heads/cfg.total_shards),
+        .local_kv_head_start=cfg.shard_index*std::max(1,profile.n_kv_heads/cfg.total_shards),
+        .local_kv_heads=std::max(1,profile.n_kv_heads/cfg.total_shards),
+        .first_layer=cfg.first_layer,.last_layer=cfg.last_layer,
+        .total_shards=cfg.total_shards,
+        .apportioned_routed_experts=cfg.weight_residency.selectsRoutedExperts(),
+        .runtime_device_policy_available=cfg.runtime_device_policy_available,
+        .mtp_target_query_rows=cfg.mtp_enabled?cfg.mtp_target_query_rows:0,
+        .generation_request_capacity=cfg.generation_request_capacity,
+    };
+    if(cfg.weight_residency.selectsRoutedExperts() ||
+        cfg.execution_role==DeviceExecutionMemoryRole::RoutedExpertParticipant)
+        geometry.compact_routed_expert_token_rows=cfg.serial_routed_expert_compact_rows>0?
+            cfg.serial_routed_expert_compact_rows:cfg.batch_size*cfg.activation_seq_len;
+    if(cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph)
+        geometry.attention_kv_format=KVCacheMemoryEstimator::attentionExecutionFormat(cfg.kv_precision);
+    return cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph?
+        WorkspaceMemoryEstimator::estimate(profile,geometry):
+        WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile,geometry);
+}
+}
+/** @test One canonical eight-root bundle covers ordinary and retained CPU rows, once per concurrent owner. */
+TEST(Test__MemoryPlanner, OrdinaryCPUGroupedRootsUseExactDeclarationAndOwnerMultiplicity)
+{
+    const auto profile=createMoEOverlayProfile(); // F=64 exceeds D=32.
+    for(const auto device:{DeviceId::cpu(),DeviceId{DeviceType::CPU,1}})
+    for(const bool retained:{false,true})
+    for(const int degree:{1,2})
+    for(const size_t owners:{1u,3u})
+    {
+        auto cfg=overlayDeviceConfig(device);cfg.batch_size=2;cfg.activation_seq_len=3;
+        cfg.mtp_enabled=retained;cfg.mtp_target_query_rows=17;cfg.total_shards=degree;
+        cfg.concurrent_workspace_owners=owners;
+        const size_t rows=retained?17u:6u; // Target rows are already flattened.
+        const auto expected=CPUGroupedMoEStorageLayout::declare(rows,profile.d_model,
+            profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,device);
+        const auto planned=MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes();
+        EXPECT_EQ(planned,(ordinaryCPUNamedWorkspace(profile,cfg)+expected.physicalBytes())*owners)
+            << "device="<<device.to_string()<<" retained="<<retained<<" degree="<<degree<<" owners="<<owners;
+    }
+}
+/** @test Retained local endpoints retain original compact rows and model top-k, without flattening K twice. */
+TEST(Test__MemoryPlanner, RetainedNonserialCPUGroupedRootsPreserveCompactRowsAndModelTopK)
+{
+    const auto profile=createMoEOverlayProfile();auto cfg=overlayDeviceConfig(DeviceId{DeviceType::CPU,1});
+    cfg.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{2,2});
+    cfg.batch_size=2;cfg.activation_seq_len=3;cfg.serial_routed_expert_compact_rows=11;
+    cfg.mtp_enabled=true;cfg.mtp_target_query_rows=7;
+    const auto grouped=CPUGroupedMoEStorageLayout::declare(11,profile.d_model,
+        profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped.physicalBytes());
+}
+/** @test A PP interval without a routed graph stage must not acquire grouped roots from global model metadata. */
+TEST(Test__MemoryPlanner, CPUGroupedRootsRespectActualRoutedLayerInventory)
+{
+    auto profile=createMoEOverlayProfile();
+    std::erase_if(profile.tensors,[](const auto &tensor){return tensor.layer_index==1 &&
+        (tensor.name.ends_with(".ffn_gate_exps.weight") || tensor.name.ends_with(".ffn_up_exps.weight") ||
+         tensor.name.ends_with(".ffn_down_exps.weight"));});
+    for(const int layer:{0,1})
+    {
+        auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.first_layer=cfg.last_layer=layer;
+        const auto grouped=CPUGroupedMoEStorageLayout::declare(size_t(cfg.activation_seq_len),profile.d_model,
+            profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            ordinaryCPUNamedWorkspace(profile,cfg)+(layer==0?grouped.physicalBytes():0u))<<"PP layer="<<layer;
+    }
+}
+/** @test An existing immutable serial envelope owns the bundle; ordinary admission must not add another copy. */
+TEST(Test__MemoryPlanner, DeclaredCPUSerialBundleHasNoOrdinaryDuplicate)
+{
+    const auto profile=createMoEOverlayProfile();auto cfg=overlayDeviceConfig(DeviceId::cpu());
+    cfg.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{2,2});
+    cfg.routed_expert_compact_buffer_lifetime=RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    cfg.serial_routed_expert_participant_count=2;cfg.serial_routed_expert_compact_rows=11;
+    declareCPUSerialFixture(cfg,profile);
+    const auto grouped=cfg.cpu_serial_expert_storage->envelope->admitted()->workspaceBytes();
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped*2u);
+    // A real retained endpoint remains present at an initially empty epoch;
+    // topology identities, not current ownership, retain the serial bundle.
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{0,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped*2u);
+}
+
+/** @test Empty selected portable endpoints and dense-only serial continuations own no grouped stage. */
+TEST(Test__MemoryPlanner, CPUGroupedRootsFollowEndpointTopologyForSelectedZeroOwners)
+{
+    const auto profile=createMoEOverlayProfile();
+    for(const auto lifetime:{RoutedExpertCompactBufferLifetime::PerLayerGraphOwned,
+                             RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant})
+    {
+        auto cfg=overlayDeviceConfig(DeviceId{DeviceType::CPU,1});
+        cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,{0,0});
+        cfg.routed_expert_compact_buffer_lifetime=lifetime;
+        cfg.serial_routed_expert_participant_count=0;
+        ASSERT_EQ(cfg.cpu_serial_expert_storage,nullptr);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            ordinaryCPUNamedWorkspace(profile,cfg));
+    }
+    // Per-layer endpoint masks are layer-local: positive ownership outside
+    // this PP interval cannot author an otherwise absent local stage.
+    auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.first_layer=cfg.last_layer=1;
+    cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+        profile.expert_count,{2,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg));
+}
+
+/** @test Dormant predictor expert parents are absent; a retained terminal-owned predictor uses the same bundle. */
+TEST(Test__MemoryPlanner, CPUGroupedRootsRespectRetainedPredictorOwnership)
+{
+    auto profile=createMoEOverlayProfile();profile.mtp_layer_count=1;
+    // Ordinary Qwen metadata includes its predictor in n_layers. The only
+    // routed parent is the trailing predictor; the main PP interval is dense.
+    std::erase_if(profile.tensors,[](const auto &tensor){return tensor.layer_index==0 &&
+        (tensor.name.ends_with(".ffn_gate_exps.weight") || tensor.name.ends_with(".ffn_up_exps.weight") ||
+         tensor.name.ends_with(".ffn_down_exps.weight"));});
+    for(const bool retained:{false,true})
+    {
+        auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.last_layer=0;
+        cfg.mtp_enabled=retained;cfg.mtp_target_query_rows=37;
+        const auto grouped=CPUGroupedMoEStorageLayout::declare(37,profile.d_model,
+            profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            ordinaryCPUNamedWorkspace(profile,cfg)+(retained?grouped.physicalBytes():0u));
+    }
+}
+
+namespace
+{
+/** @brief Add canonical source-owned router matrices absent from the legacy expert-only metadata fixture. */
+ModelMemoryProfile cpuRouterPlanningProfile()
+{
+    auto profile=createMoEOverlayProfile();
+    for(int layer=0;layer<profile.n_layers;++layer)
+    {
+        TensorSizeInfo tensor; tensor.name="blk."+std::to_string(layer)+".ffn_gate_inp.weight";
+        tensor.layer_index=layer;tensor.K=profile.d_model;
+        tensor.elements=size_t(profile.expert_count)*size_t(profile.d_model);
+        tensor.quant_type="F32";tensor.native_bytes=tensor.elements*sizeof(float);
+        profile.total_native_bytes+=tensor.native_bytes;profile.tensors.push_back(std::move(tensor));
+    }
+    return profile;
+}
+}
+/** @test Router-only continuations own precisely one Q8 publication root even at zero selected experts. */
+TEST(Test__MemoryPlanner, CPUOnlyRouterPublicationUsesCanonicalPhysicalRoot)
+{
+    const auto profile=cpuRouterPlanningProfile();
+    for(const auto device:{DeviceId::cpu(),DeviceId{DeviceType::CPU,1}})
+    for(const bool retained:{false,true})
+    for(const size_t owners:{1u,2u})
+    {
+        auto cfg=overlayDeviceConfig(device);cfg.batch_size=2;cfg.activation_seq_len=3;
+        cfg.mtp_enabled=retained;cfg.mtp_target_query_rows=17;cfg.concurrent_workspace_owners=owners;
+        cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(profile.expert_count,{0,0});
+        const auto router=CPURouterQ8StorageLayout::declare(retained?17:6,profile.d_model,device);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            (ordinaryCPUNamedWorkspace(profile,cfg)+router.physicalBytes())*owners);
+    }
+}
+/** @test Same-manager grouped storage supplies its router root exactly once. */
+TEST(Test__MemoryPlanner, CPUOrdinaryRouterCoalescesWithItsGroupedExpertBundle)
+{
+    const auto profile=cpuRouterPlanningProfile();auto cfg=overlayDeviceConfig(DeviceId::cpu());
+    const auto grouped=CPUGroupedMoEStorageLayout::declare(size_t(cfg.activation_seq_len),profile.d_model,
+        profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped.physicalBytes());
+}
+/** @test A transported serial endpoint's kernel cannot provide a separate continuation router's backing. */
+TEST(Test__MemoryPlanner, CPUSerialEndpointDoesNotAliasContinuationRouterPublication)
+{
+    const auto profile=cpuRouterPlanningProfile();auto cfg=overlayDeviceConfig(DeviceId{DeviceType::CPU,1});
+    cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(profile.expert_count,{0,0});
+    cfg.routed_expert_compact_buffer_lifetime=RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    cfg.serial_routed_expert_participant_count=2;cfg.serial_routed_expert_compact_rows=11;
+    declareCPUSerialFixture(cfg,profile);
+    const auto endpoint=cfg.cpu_serial_expert_storage->envelope->admitted()->workspaceBytes();
+    const auto router=CPURouterQ8StorageLayout::declare(size_t(cfg.activation_seq_len),profile.d_model,cfg.device);
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+endpoint*2u+router.physicalBytes());
+    cfg.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{0,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+endpoint*2u);
+}
+/** @test A router outside the current PP interval cannot author a local root. */
+TEST(Test__MemoryPlanner, CPURouterPublicationRespectsActualGraphScope)
+{
+    auto profile=cpuRouterPlanningProfile();
+    std::erase_if(profile.tensors,[](const auto &tensor){return tensor.layer_index==1 &&
+        tensor.name.ends_with(".ffn_gate_inp.weight");});
+    auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.first_layer=cfg.last_layer=1;
+    cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(profile.expert_count,{0,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),ordinaryCPUNamedWorkspace(profile,cfg));
+}
+
+/** @test Per-layer CPU packet BOM uses exactly the common four native roots for each layer. */
+TEST(Test__MemoryPlanner, CpuPerLayerPacketUsesExactIndependentRootDeclarations)
+{
+    const auto profile=createMoEOverlayProfile();
+    for(const auto device:{DeviceId::cpu(),DeviceId(DeviceType::CPU,1)})
+    for(const int batch:{1,2})
+    {
+        auto config=overlayDeviceConfig(device);
+        config.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+        config.batch_size=batch;config.activation_seq_len=3;
+        config.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,
+            std::vector<int>(static_cast<size_t>(profile.n_layers),2));
+        const auto layout=CPUCompactPacketStorageLayout::declare(size_t(batch)*3,
+            profile.d_model,profile.expert_used_count,device);
+        auto plan=MemoryPlanner::plan(profile,{config});
+        ASSERT_EQ(plan.devices.size(),1u);
+        EXPECT_EQ(plan.devices.front().activation_bytes(),layout.physicalBytes()*profile.n_layers);
+        config.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{2,0});
+        plan=MemoryPlanner::plan(profile,{config});
+        EXPECT_EQ(plan.devices.front().activation_bytes(),layout.physicalBytes());
+    }
+}
+
+/** @brief Followers retain native main/publication parents without acquiring terminal helper owners. */
+TEST(Test__MemoryPlanner, MTPFollowerExecutableOwnershipPreservesRegistryGeometry)
+{
+    for (const int depth : {1, 3, 15})
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+    for (const auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (std::size_t programs = 1; programs <= kSparseQueryExecutionProgramCount; ++programs)
+    {
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        config.draft_tokens = depth;
+        config.graph_capacity_draft_tokens = depth;
+        config.max_request_batch = 2;
+        config.depth_policy.mode = mode;
+        config.depth_policy.max_depth = depth;
+        const MTPGraphOwnerPlan controller(config, family, MTPGenerationParentRole::Controller, programs);
+        const MTPGraphOwnerPlan follower(config, family, MTPGenerationParentRole::PipelineFollower, programs);
+        EXPECT_EQ(follower.parentRole(), MTPGenerationParentRole::PipelineFollower);
+        EXPECT_EQ(follower.verifierPreparationRegistryCapacity(), controller.verifierPreparationRegistryCapacity());
+        EXPECT_EQ(follower.draftPublicationRegistryCapacity(), controller.draftPublicationRegistryCapacity());
+        EXPECT_GT(follower.verifierPreparationRegistryCapacity(), 0u);
+        EXPECT_EQ(follower.sidecarGraphSlots(), 0u);
+        EXPECT_EQ(follower.terminalHiddenGraphSlots(), 0u);
+        EXPECT_EQ(follower.draftPublicationGraphSlots(), 0u);
+        EXPECT_EQ(follower.verifierPreparationGraphSlots(), 0u);
+        EXPECT_EQ(follower.samplerHelperGraphSlots(), 0u);
+        EXPECT_EQ(follower.boundedHelperExecutableSlotCount(), 0u);
+        EXPECT_EQ(follower.auxiliaryExecutableSlotCount(), follower.generationParentGraphSlots() +
+            follower.speculativePublicationGraphSlots());
+        EXPECT_EQ(follower.generalAuxiliaryExecutableSlotCount(), follower.auxiliaryExecutableSlotCount());
+        EXPECT_GT(follower.generationParentGraphSlots(), 0u);
+        EXPECT_EQ(follower.speculativePublicationGraphSlots(), controller.speculativePublicationGraphSlots());
+    }
+}
+
+/**
+ * @brief Replay the real weight BOM across retained policies and PP ownership.
+ *
+ * Only the terminal main stage owns the learned trailing predictor. Both
+ * phase-split decode and a separately replicated predictor obey the same
+ * physical routed-parent authority. Off with retained capacity reserves the
+ * same setup as enabled MTP, independent of request-time enablement.
+ */
+TEST(Test__MemoryPlanner, MTPReplicaRoutedAuthorityReplaysTerminalAndRetainedSetup)
+{
+    auto profile = createMoEOverlayProfile();
+    // Two main layers and one trailing learned predictor let the terminal
+    // stage begin at global layer one, catching local/global offset mistakes.
+    const auto original_tensors = profile.tensors;
+    for (const auto &tensor : original_tensors)
+    {
+        if (tensor.layer_index != 1)
+            continue;
+        auto predictor = tensor;
+        predictor.name.replace(0, 5, "blk.2");
+        predictor.layer_index = 2;
+        profile.total_native_bytes += predictor.native_bytes;
+        profile.tensors.push_back(std::move(predictor));
+    }
+    profile.n_layers = 3;
+    profile.mtp_layer_count = 1;
+    std::size_t predictor_parent_bytes = 0;
+    for (const auto &tensor : profile.tensors)
+        if (tensor.layer_index == 2 && isRoutedExpertRole(inferWeightRole(tensor.name)))
+            predictor_parent_bytes += tensor.native_bytes;
+    ASSERT_GT(predictor_parent_bytes, 0u);
+
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const auto dense_policy : {DenseParallelPolicy::TensorParallel,
+                                       DenseParallelPolicy::PrefillTensorParallelDecodeReplicated})
+            for (const int first_layer : {1, 0})
+                for (const bool enabled : {false, true, false})
+                {
+                    SCOPED_TRACE(device.toString() + " first=" + std::to_string(first_layer) +
+                        " enabled=" + std::to_string(enabled));
+                    auto config = overlayDeviceConfig(device);
+                    config.first_layer = first_layer;
+                    config.last_layer = first_layer;
+                    config.owns_embedding = first_layer == 0;
+                    config.total_shards = 2;
+                    if (device.is_gpu())
+                        config.local_tp_backend = device.is_cuda()
+                            ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                    MTPRuntimeConfig mtp;
+                    mtp.enabled = enabled;
+                    mtp.draft_tokens = 3;
+                    mtp.graph_capacity_draft_tokens = 3;
+                    mtp.sidecar_dense_policy = MTPSidecarDensePolicy::ReplicatedPerParticipant;
+                    mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+                    config.mtp_enabled = retainsMTPGraphCapacity(mtp);
+                    ASSERT_TRUE(config.mtp_enabled);
+                    config.additional_weight_sets = resolveAdditionalPersistentWeightSets(
+                        dense_policy, config.total_shards, mtp);
+                    config.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+                        profile.expert_count, std::vector<int>(3, 0));
+                    config.mtp_routed_expert_weight_authority = MTPRoutedExpertWeightAuthority::ExpertOverlay;
+                    if (device.is_cpu()) declareCPUSerialFixture(config, profile);
+                    const auto overlay = MemoryPlanner::plan(profile, {config});
+                    config.mtp_routed_expert_weight_authority = MTPRoutedExpertWeightAuthority::SidecarParticipant;
+                    const auto ordinary = MemoryPlanner::plan(profile, {config});
+                    ASSERT_EQ(overlay.devices.size(), 1u);
+                    ASSERT_EQ(ordinary.devices.size(), 1u);
+                    const auto &overlay_device = overlay.devices.front();
+                    const auto &ordinary_device = ordinary.devices.front();
+                    EXPECT_EQ(ordinary_device.weight_bytes(), overlay_device.weight_bytes());
+                    EXPECT_EQ(ordinary_device.additional_weight_bytes(),
+                        overlay_device.additional_weight_bytes() +
+                            (first_layer == 1 ? predictor_parent_bytes : 0u));
+                    if (first_layer == 0 && dense_policy == DenseParallelPolicy::TensorParallel)
+                        EXPECT_EQ(overlay_device.additional_weight_bytes(), 0u);
+                    if (first_layer == 1)
+                        EXPECT_GT(overlay_device.additional_weight_bytes(), 0u)
+                            << "The predictor's non-routed operands remain admitted";
+                    // Exact replay must reproduce physical owner totals after
+                    // another authority/pipeline case has been planned.
+                    const auto replay = MemoryPlanner::plan(profile, {config});
+                    EXPECT_EQ(replay.devices.front().additional_weight_bytes(),
+                        ordinary_device.additional_weight_bytes());
+                }
+    EXPECT_EQ(DevicePlanConfig{}.mtp_routed_expert_weight_authority,
+        MTPRoutedExpertWeightAuthority::SidecarParticipant);
+    auto bad = overlayDeviceConfig(DeviceId::cuda(0));
+    bad.mtp_routed_expert_weight_authority = static_cast<MTPRoutedExpertWeightAuthority>(99);
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {bad}), std::invalid_argument);
+}
+
+/** @test Original native obligations enter actual fixed planning once before optional capacity, surviving same-state final admission. */
+TEST(Test__MemoryPlanner, OriginalNativeSourceMandatoryBeforeQuotaAndSamePMAReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto device=DeviceId::cuda(87);
+    Access::seed(device,[](std::shared_ptr<PreparedGPUWorkerStack> root){return Access::construct<SourcePlanningWorker>(std::move(root),87);});
+    auto source=Access::source<SourcePlanningWorker>(device,4ull<<30);const auto original=source->memory();
+    {auto worker=source->acquire(device);EXPECT_EQ(worker.memory(),original);}
+    source->freezeForPlanning();const auto declaration=source->mandatoryBOM();
+    DevicePlanConfig cfg;cfg.world_rank=0;cfg.device=device;cfg.device_total_bytes=cfg.device_free_bytes=4ull<<30;
+    cfg.device_compute_units=80;cfg.max_seq_len=64;cfg.activation_seq_len=1;cfg.first_layer=0;cfg.last_layer=23;
+    const auto profile=createTestProfile();const auto base=MemoryPlanner::plan(profile,{cfg}).physicalPlan();
+    cfg.native_context_preparation=source;
+    const auto complete=MemoryPlanner::plan(profile,{cfg}).physicalPlan();ASSERT_TRUE(complete.fits());
+    auto foreign=cfg;foreign.device=DeviceId::cuda(86);
+    EXPECT_THROW((void)MemoryPlanner::plan(profile,{foreign}),std::invalid_argument);
+    for(const auto& native:declaration.resources()){
+        const auto* before=base.find(PhysicalMemoryAllocatorIdentity{native.resource().world_rank,native.resource().device});const auto* after=complete.find(PhysicalMemoryAllocatorIdentity{native.resource().world_rank,native.resource().device});ASSERT_NE(after,nullptr);
+        for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i){const auto owner=PhysicalMemoryBOM::ownerAt(i);
+            EXPECT_EQ(after->bytes(owner),(before?before->bytes(owner):0u)+native.bytes(owner));}
+    }
+    auto certificate=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(complete);
+    source->admitFinal(certificate);EXPECT_EQ(source->memory(),original);EXPECT_EQ(original->admission(),certificate);
+    EXPECT_EQ(original->phase(),PhysicalMemoryAuthorityPhase::Admitted);
+    EXPECT_EQ(source->mandatoryBOM().totalBytes(),declaration.totalBytes());
+    EXPECT_THROW(source->retireUnadmitted(),std::logic_error);
+    auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);Access::physicalReset(scope);
+}
+
+/** @test A setup failure before worker creation retires only its own empty population, repeatedly without native calls. */
+TEST(Test__MemoryPlanner, OriginalNativeSourceUninstalledFailureCleanupReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto device=DeviceId::cuda(85);
+    auto source=Access::source<SourcePlanningWorker>(device,4ull<<30);
+    EXPECT_EQ(source->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+    EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory()),std::logic_error);
+    EXPECT_NO_THROW(source->retireUnadmitted());
+    EXPECT_NO_THROW(source->retireUnadmitted());
+    EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory()),std::logic_error);
+}
+
+/** @test A runtime-policy mutation cannot certify an already initialized native population. */
+TEST(Test__MemoryPlanner, OriginalNativeRuntimePolicyMutationReplay){
+    for(const auto& [backend,name]:std::array{
+        std::pair{DeviceType::CUDA,"CUBLAS_WORKSPACE_CONFIG"},
+        std::pair{DeviceType::CUDA,"CUBLASLT_LOG_LEVEL"},
+        std::pair{DeviceType::ROCm,"ROC_AQL_QUEUE_SIZE"},
+        std::pair{DeviceType::ROCm,"ROCBLAS_LAYER"},
+        std::pair{DeviceType::ROCm,"HIPBLAS_LOG_LEVEL"},
+        std::pair{DeviceType::ROCm,"HIPBLASLT_TENSILE_LIBPATH"},
+        std::pair{DeviceType::ROCm,"HSA_ENABLE_SDMA"}}){
+        SCOPED_TRACE(name);const auto& policy=NativeContextRuntimePolicy::original(backend);const auto before=policy.identity();
+        const auto* previous=std::getenv(name);const std::optional<std::string> saved=previous?std::optional<std::string>(previous):std::nullopt;
+        const auto changed=saved.value_or("")+"-changed-after-original-startup";
+        ASSERT_EQ(::setenv(name,changed.c_str(),1),0);EXPECT_THROW((void)policy.identity(),std::logic_error);
+        if(saved)ASSERT_EQ(::setenv(name,saved->c_str(),1),0);else ASSERT_EQ(::unsetenv(name),0);
+        EXPECT_EQ(policy.identity(),before);
+    }
+}
+/** @test Exact already-loaded provider closure remains stable and rejects missing symbols, without loading a native runtime. */
+TEST(Test__MemoryPlanner, OriginalNativeLoadedClosureReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto first=Access::loadedClosure(reinterpret_cast<const void*>(&::getpid));
+    EXPECT_EQ(first.size(),64u);
+    EXPECT_EQ(Access::loadedClosure(reinterpret_cast<const void*>(&::getpid)),first);
+    EXPECT_THROW((void)Access::loadedClosure(nullptr),std::runtime_error);
+}
+
+/** @test Loader-owned closure snapshot tolerates unrelated concurrent module loads and unloads. */
+TEST(Test__MemoryPlanner, OriginalNativeLoadedClosureConcurrentModuleReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto first=Access::loadedClosure(reinterpret_cast<const void*>(&::getpid));
+    std::atomic<std::size_t> completed=0;std::atomic<bool> failed=false;
+    std::latch first_attempt(1);
+    std::jthread loader([&](std::stop_token stop){while(!stop.stop_requested()){
+        auto* module=::dlopen(LLAMINAR_NATIVE_CLOSURE_REPLAY_MODULE,RTLD_NOW|RTLD_LOCAL);
+        if(!module){failed=true;if(completed.load()==0)first_attempt.count_down();break;}
+        auto* function=::dlsym(module,"llaminarNativeClosureReplayValue");
+        if(!function || reinterpret_cast<int(*)()>(function)()!=17)failed=true;
+        if(::dlclose(module)!=0)failed=true;
+        if(completed.fetch_add(1)==0)first_attempt.count_down();
+    }});
+    // Require actual loader work before timing-independent assertions, even
+    // when a busy CI worker delays the new thread's first scheduling slice.
+    first_attempt.wait();
+    for(int iteration=0;iteration<20;++iteration)EXPECT_EQ(Access::loadedClosure(reinterpret_cast<const void*>(&::getpid)),first);
+    loader.request_stop();loader.join();EXPECT_FALSE(failed);EXPECT_GT(completed.load(),0u);
+}
+
+#include "LocalNativePreparationBOMContract.inc"
+
+/** @test Batch storage follows actual retained sources and original layer ordinals at arbitrary bounds. */
+TEST(Test__MemoryPlanner, MappedBatchOriginalSourceInventoryContract)
+{
+    const std::vector<int> buckets{1, 3, 8, 33};
+    for (const int layers : {1, 3, 48})
+    for (const int depth : {0, 1, 3, 7})
+    for (const auto verifier : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (const std::size_t programs : {1u, 2u})
+    {
+        MTPRuntimeConfig mtp;
+        mtp.enabled = depth != 0;
+        mtp.draft_tokens = std::max(1, depth);
+        MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 41, .main_layer_count = layers,
+            .max_graph_rows = 33, .max_decode_rows = std::max(1, depth + 1),
+            .max_request_count = 1, .max_mtp_draft_depth = depth, .first_model_layer = 5};
+        for (int source = 0; source < depth; ++source) family.mtp_source_layers.push_back(5 + layers + source);
+        const auto inventory = MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 1, mtp, verifier, programs);
+        const auto serving = resolveCapturedServingGraphMemoryInventory({}, mtp, verifier,
+            MTPGenerationParentRole::Controller, DeviceGenerationExecutionDomain::HostedBoundary, programs);
+        EXPECT_EQ(inventory->mainGraphIdentityCount(),
+            (buckets.size() + kExpertOverlayPrefillGraphIdentityReserve) * programs + serving.fixed_executable_count);
+        EXPECT_EQ(inventory->sources().size(), inventory->mainGraphIdentityCount() + (family.mtp_source_layers.empty() ? 0u : 4u));
+        ForwardInput input;
+        input.batch_size = 1; input.seq_len = 3;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        for (int ordinal = 0; ordinal < layers; ++ordinal)
+        {
+            const auto layer = LayerGraphSourceIdentity::main(5 + ordinal, 5 + layers, 5, GraphCacheLayerIndex::CacheLocal);
+            EXPECT_NO_THROW(inventory->require(input, layer, 3, ordinal));
+            EXPECT_THROW(inventory->require(input, layer, 3, ordinal + 1), std::invalid_argument);
+        }
+        const auto first = LayerGraphSourceIdentity::main(5, 5 + layers, 5, GraphCacheLayerIndex::CacheLocal);
+        input.seq_len = 34;
+        EXPECT_THROW(inventory->require(input, first, 34, 0), std::invalid_argument);
+        input.seq_len = 1;
+        input.execution_phase = static_cast<ForwardExecutionPhase>(99);
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.graph_submission_intent = static_cast<ForwardGraphSubmissionIntent>(99);
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        input.execution_role = ForwardExecutionRole::MTPCondition;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        if (depth) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
+        else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        // Serving materializes this source as MTPCondition, not an ordinary
+        // MainInference decode. Retained-Off absence must still reject it.
+        input.state_transaction = ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+        if (depth) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
+        else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.state_transaction = ForwardStateTransaction::Ordinary;
+        int token = 0;
+        input.token_ids_device = &token;
+        input.mtp_sidecar_capture_role = MTPSidecarCaptureRole::Full;
+        for (int source = 0; source < depth; ++source)
+        {
+            const auto predictor = LayerGraphSourceIdentity::inlinePredictor(family.mtp_source_layers[source], source);
+            for (const auto role : {MTPSidecarCaptureRole::Full, MTPSidecarCaptureRole::Chained})
+            for (const bool device_token : {false, true})
+            {
+                MTPForwardInput learned;
+                learned.capture_role = role;
+                learned.draft_token_ids = &token;
+                learned.draft_token_ids_device = device_token ? &token : nullptr;
+                const auto projected = mtpForwardConstructionInput(learned);
+                EXPECT_EQ(projected.mtp_sidecar_capture_role, role);
+                if (source == 0) EXPECT_NO_THROW(inventory->require(projected, predictor, 1, 0));
+                else EXPECT_THROW(inventory->require(projected, predictor, 1, 0), std::invalid_argument);
+                learned.capture_role = static_cast<MTPSidecarCaptureRole>(99);
+                EXPECT_THROW(mtpForwardConstructionInput(learned), std::invalid_argument);
+                learned.capture_role = role;
+                learned.kv_cache_only = true;
+                const auto kv_only = mtpForwardConstructionInput(learned);
+                EXPECT_THROW(inventory->require(kv_only, predictor, 1, 0), std::invalid_argument);
+            }
+            EXPECT_THROW(inventory->require(input, predictor, 1, 1), std::invalid_argument);
+        }
+        input.token_ids_device = nullptr;
+        input.mtp_sidecar_capture_role.reset();
+        input.execution_role = ForwardExecutionRole::MainInference;
+        input.state_transaction = static_cast<ForwardStateTransaction>(99);
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.state_transaction = ForwardStateTransaction::ForwardOnlyCondition;
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        const auto pipeline_inventory = MoEOverlayActivationBatchInventory::declare(
+            family, buckets, 33, 1, mtp, verifier, programs, PipelineForwardOnlyGraphOwner::Participant);
+        EXPECT_NO_THROW(pipeline_inventory->require(input, first, 1, 0));
+        EXPECT_EQ(pipeline_inventory->mainGraphIdentityCount(), inventory->mainGraphIdentityCount());
+        EXPECT_EQ(pipeline_inventory->sources().size(), inventory->sources().size() + programs);
+        input.state_transaction = ForwardStateTransaction::Ordinary;
+        input.sparse_query_execution_program = SparseQueryExecutionProgram::ProvenNoRanking;
+        if (programs == 2) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
+        else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, std::vector<int>{3, 1}, 33, 1, mtp, verifier, programs), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 32, 1, mtp, verifier, programs), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 2, mtp, verifier, programs), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 1, mtp,
+            static_cast<MTPVerifierGraphFamily>(99), programs), std::invalid_argument);
+    }
+}
+
+/** @test Serving bridge admission preserves the declared owner across retained MTP policies. */
+TEST(Test__MemoryPlanner, MappedBatchRestoredPrefixServingRoleAdmission)
+{
+    using Inventory = MoEOverlayActivationBatchInventory;
+    for (const bool enabled : {false, true})
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+    for (const int depth : {1, 3, 15})
+    {
+        SCOPED_TRACE(::testing::Message() << "enabled=" << enabled
+            << " mode=" << int(mode) << " retained_depth=" << depth);
+        MTPRuntimeConfig mtp;
+        mtp.enabled = enabled;
+        mtp.graph_capacity_draft_tokens = depth;
+        mtp.draft_tokens = 1;
+        mtp.depth_policy.mode = mode;
+        mtp.depth_policy.min_depth = 1;
+        mtp.depth_policy.max_depth = depth;
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 41, .main_layer_count = 2, .mtp_source_layers = {9},
+            .max_graph_rows = 16, .max_decode_rows = depth + 1,
+            .max_request_count = 1, .max_mtp_draft_depth = depth, .first_model_layer = 5};
+        const std::array buckets{1, 16};
+        // Use the production declaration, including every neighboring condition
+        // and verifier source. The one-row bridge must not borrow their identity.
+        const auto inventory = Inventory::declare(family, buckets, 16, 1, mtp,
+            MTPVerifierGraphFamily::BoundedBuckets, 2);
+        for (const auto role : {ForwardExecutionRole::MTPCondition, ForwardExecutionRole::MainInference})
+        for (const auto intent : {ForwardGraphSubmissionIntent::Execute,
+                                 ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch})
+        for (const auto program : {SparseQueryExecutionProgram::RankingPossible,
+                                  SparseQueryExecutionProgram::ProvenNoRanking})
+        {
+            ForwardInput input;
+            input.batch_size = input.seq_len = 1;
+            input.execution_role = role;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.state_transaction = ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+            input.graph_submission_intent = intent;
+            input.sparse_query_execution_program = program;
+            EXPECT_EQ(isGraphIntegratedShiftedMTPTransaction(role, input.execution_phase,
+                input.state_transaction, 1, 1), role == ForwardExecutionRole::MTPCondition);
+            for (int ordinal = 0; ordinal < 2; ++ordinal)
+            {
+                const auto layer = LayerGraphSourceIdentity::main(5 + ordinal, 7, 5, GraphCacheLayerIndex::CacheLocal);
+                EXPECT_NO_THROW(inventory->require(input, layer, 1, ordinal));
+                EXPECT_THROW(inventory->require(input, layer, 1, 1 - ordinal), std::invalid_argument);
+                auto invalid = input;
+                invalid.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+                EXPECT_THROW(inventory->require(invalid, layer, 1, ordinal), std::invalid_argument);
+                invalid = input;
+                invalid.execution_phase = ForwardExecutionPhase::Prefill;
+                EXPECT_THROW(inventory->require(invalid, layer, 1, ordinal), std::invalid_argument);
+                invalid = input;
+                invalid.seq_len = 2;
+                EXPECT_THROW(inventory->require(invalid, layer, 2, ordinal), std::invalid_argument);
+                EXPECT_THROW(inventory->require(input, layer, 2, ordinal), std::invalid_argument);
+                // Removing only this source proves a neighboring one-row
+                // condition/decode cannot accidentally authenticate the bridge.
+                std::vector<Inventory::Source> without_bridge;
+                for (const auto &source : inventory->sources())
+                    if (source.kind != Inventory::SourceKind::RestoredPrefixBridge)
+                        without_bridge.push_back(source);
+                const auto unadmitted = Inventory::declareSources(without_bridge);
+                EXPECT_THROW(unadmitted->require(input, layer, 1, ordinal), std::invalid_argument);
+            }
+            const auto foreign_layer = LayerGraphSourceIdentity::main(7, 8, 5, GraphCacheLayerIndex::CacheLocal);
+            EXPECT_THROW(inventory->require(input, foreign_layer, 1, 0), std::invalid_argument);
+            auto unadmitted_program = input;
+            unadmitted_program.sparse_query_execution_program = static_cast<SparseQueryExecutionProgram>(99);
+            EXPECT_THROW(inventory->require(unadmitted_program, LayerGraphSourceIdentity::main(
+                5, 7, 5, GraphCacheLayerIndex::CacheLocal), 1, 0), std::invalid_argument);
+        }
+    }
+}
+
+/** Exact component source declarations neither invent reserves nor relax original invocation checks. */
+TEST(Test__MemoryPlanner, MappedBatchExplicitSourceInventoryContract)
+{
+    using Inventory=MoEOverlayActivationBatchInventory;
+    const std::array sources{
+        Inventory::Source{Inventory::SourceKind::Decode,0,SparseQueryExecutionProgram::RankingPossible,1,1,{5},{},{}},
+        Inventory::Source{Inventory::SourceKind::PrefillBucket,0,SparseQueryExecutionProgram::RankingPossible,3,3,{5},{},{}},
+        Inventory::Source{Inventory::SourceKind::Draft,1,SparseQueryExecutionProgram::RankingPossible,1,1,{9},MTPSidecarCaptureRole::Full,Inventory::DraftTokenSource::Host}};
+    const auto inventory=Inventory::declareSources(sources);
+    EXPECT_EQ(inventory->sources().size(),3u);
+    EXPECT_EQ(inventory->mainGraphIdentityCount(),2u);
+    ForwardInput input;input.seq_len=1;input.execution_phase=ForwardExecutionPhase::Decode;
+    const auto main=LayerGraphSourceIdentity::main(5,6,5,GraphCacheLayerIndex::CacheLocal);
+    EXPECT_NO_THROW(inventory->require(input,main,1,0));
+    input.execution_phase=ForwardExecutionPhase::Prefill;input.seq_len=3;
+    EXPECT_NO_THROW(inventory->require(input,main,3,0));
+    input.seq_len=2;
+    EXPECT_THROW(inventory->require(input,main,2,0),std::invalid_argument);
+    EXPECT_THROW(Inventory::declareSources({}),std::invalid_argument);
+    for(int malformed=0;malformed<9;++malformed){
+        auto changed=sources;
+        if(malformed==0)changed[0].physical_rows=0;
+        if(malformed==1)changed[0].maximum_rows=0;
+        if(malformed==2)changed[0].model_layers={5,5};
+        if(malformed==3)changed[0].sidecar_role=MTPSidecarCaptureRole::Full;
+        if(malformed==4)changed[2].sidecar_role=MTPSidecarCaptureRole::KVOnly;
+        if(malformed==5)changed[2].family_ordinal=0;
+        if(malformed==6)changed[1]=changed[0];
+        if(malformed==7)changed[1].maximum_rows=4;
+        if(malformed==8)changed[2].query_program=SparseQueryExecutionProgram::ProvenNoRanking;
+        EXPECT_THROW(Inventory::declareSources(changed),std::invalid_argument)<<malformed;
+    }
+    auto indistinguishable_draft=sources[2];
+    indistinguishable_draft.query_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    const std::array duplicate_draft{sources[2],indistinguishable_draft};
+    EXPECT_THROW(Inventory::declareSources(duplicate_draft),std::invalid_argument);
+    int token=0;MTPForwardInput learned;learned.draft_token_ids=&token;
+    learned.batch_size=learned.seq_len=1;learned.capture_role=MTPSidecarCaptureRole::Full;
+    const auto predictor=LayerGraphSourceIdentity::inlinePredictor(9,0);
+    EXPECT_NO_THROW(inventory->require(mtpForwardConstructionInput(learned),predictor,1,0));
+    learned.capture_role=MTPSidecarCaptureRole::Chained;
+    EXPECT_THROW(inventory->require(mtpForwardConstructionInput(learned),predictor,1,0),std::invalid_argument);
 }

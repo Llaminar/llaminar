@@ -5,7 +5,9 @@
  * A frozen GGUF parent uses [K,N,E] storage, whereas a GEMM view is [N,K].
  * Logical expert IDs may be noncontiguous and need not equal physical E slots.
  * This immutable value resolves that mapping once and composes an optional
- * projection-ownership interval without allocating, repacking or changing K.
+ * projection-ownership rectangle without allocating or repacking. A narrow K
+ * interval requires an already compact original-format source: it is never a
+ * smaller-stride reinterpretation of the unsliced parent.
  * It owns no weight bytes, placement decisions, or physical-memory accounting.
  */
 #pragma once
@@ -26,7 +28,7 @@ namespace llaminar2
     class MoEExpertSourceView final
     {
     public:
-        /** @brief A contiguous full-K matrix plus its original logical identity. */
+        /** @brief A contiguous compact matrix plus its original logical N/K/E identity. */
         struct Matrix
         {
             size_t rows;
@@ -127,16 +129,35 @@ namespace llaminar2
             const auto projection = ownership->projection(role);
             if (ids_.back() >= ownership->geometry().experts ||
                 (!slice_.inner_is_presliced && experts_ != static_cast<size_t>(ownership->geometry().experts)) ||
-                columns_ != static_cast<size_t>(projection.source_columns) || slice_.row_start != 0 ||
                 (slice_.source_cols != 0 && slice_.source_cols != static_cast<size_t>(projection.source_rows)) ||
-                (slice_.source_rows != 0 && slice_.source_rows != columns_) ||
-                (slice_.row_count != 0 && slice_.row_count != columns_))
+                (slice_.source_rows != 0 && slice_.source_rows != static_cast<size_t>(projection.source_columns)))
                 throw std::invalid_argument("MoE source view disagrees with its projection source identity");
+
+            if (projection.first_column == 0 && projection.columns == projection.source_columns)
+            {
+                // Preserve the existing full-K source view, including ordinary
+                // parents whose original full geometry is implicit in shape.
+                if (columns_ != static_cast<size_t>(projection.columns) || slice_.row_start != 0 ||
+                    (slice_.row_count != 0 && slice_.row_count != columns_))
+                    throw std::invalid_argument("MoE source view disagrees with its full-K projection");
+            }
+            else if (!(slice_.inner_is_presliced &&
+                       slice_.source_cols == static_cast<size_t>(projection.source_rows) &&
+                       slice_.source_rows == static_cast<size_t>(projection.source_columns) &&
+                       slice_.row_start == static_cast<size_t>(projection.first_column) &&
+                       slice_.row_count == static_cast<size_t>(projection.columns) &&
+                       columns_ == static_cast<size_t>(projection.columns)))
+            {
+                // TensorBase::create_view has no independent encoded row stride.
+                // Only the native loader's exact compact K-block materialization
+                // can be viewed here. Never fake K by narrowing an original row.
+                throw std::invalid_argument("MoE K projection requires its exact compact original source interval");
+            }
 
             if (rows_ == static_cast<size_t>(projection.source_rows) && slice_.col_start == 0 &&
                 (slice_.col_count == 0 || slice_.col_count == rows_))
             {
-                // GGUF keeps each complete K row contiguous. The expert's N
+                // The physical compact K row stays contiguous. The expert's N
                 // interval can therefore be viewed before any native repack.
                 result.element_offset += static_cast<size_t>(projection.first_row) * columns_;
             }
@@ -149,14 +170,16 @@ namespace llaminar2
                 // A pre-sliced parent is legal only when its original interval
                 // authenticates this exact partition. Matching N alone is not
                 // enough: a neighbour's slice has the same physical dimensions.
-                throw std::invalid_argument("MoE source view contains a different down-output partition");
+                throw std::invalid_argument("MoE source view contains a different output-row partition");
             }
             result.rows = static_cast<size_t>(projection.rows);
+            result.columns = static_cast<size_t>(projection.columns);
             identity.source_rows = static_cast<size_t>(projection.source_rows);
             identity.source_cols = static_cast<size_t>(projection.source_columns);
             identity.row_start = static_cast<size_t>(projection.first_row);
             identity.row_count = result.rows;
-            identity.col_start = 0;
+            identity.col_start = static_cast<size_t>(projection.first_column);
+            identity.col_count = result.columns;
             return result;
         }
 

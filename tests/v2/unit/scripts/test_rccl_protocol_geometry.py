@@ -7,6 +7,10 @@ vacuous negative controls or a dependency layer missing the production patch.
 """
 
 import copy
+import hashlib
+import os
+import re
+import subprocess
 import importlib.util
 import json
 from pathlib import Path
@@ -33,6 +37,8 @@ class RCCLProtocolProofTests(unittest.TestCase):
         self.library.write_bytes(b"protocol-proof-library-identity")
         self.report = dict(
             schema=1, sources=PROOF.source_identity(), library_sha256=PROOF.digest(self.library),
+            rccl_receipt=("fixture-protocol-" + PROOF.digest(ROOT / PROOF.PATCH)
+                          + "-smallag-" + PROOF.digest(ROOT / PROOF.SMALL_ALLGATHER_PATCH)),
             compiler_version="fixture-compiler", native_source_sha256="source",
             native_arch_source_sha256="architecture-source", observations=[
                 dict(variant=variant, mode=mode, returncode=0 if variant == "native" else 1,
@@ -43,6 +49,112 @@ class RCCLProtocolProofTests(unittest.TestCase):
     def test_complete_bound_report_passes(self):
         """All modes, both polarities and the exact runtime identity are required."""
         PROOF.verify_report(self.report, self.library)
+
+    def test_only_exact_current_repair_suffix_is_accepted(self):
+        """A known later repair is required; stale or arbitrary suffixes are rejected."""
+        current = self.report["rccl_receipt"]
+        old = "fixture-protocol-" + PROOF.digest(ROOT / PROOF.PATCH)
+        for receipt in (None, False, [], "", old, old + "-smallag-" + "0" * 64,
+                        current + "-unknown-policy", current[:-1],
+                        current.replace("-protocol-", "-other-")):
+            with self.subTest(receipt=receipt):
+                changed = copy.deepcopy(self.report)
+                changed["rccl_receipt"] = receipt
+                with self.assertRaisesRegex(RuntimeError, "canonical repair suffix"):
+                    PROOF.verify_report(changed, self.library)
+
+    def test_receipt_suffix_dependencies_are_rebuilt_and_packaged(self):
+        """A policy edit invalidates both the build proof and its installed verifier."""
+        self.assertIn(PROOF.SMALL_ALLGATHER_PATCH, PROOF.INPUTS)
+        registration = (ROOT / "tests/v2/cmake/V2RCCLProtocolDefaultsTests.cmake").read_text()
+        self.assertIn(PROOF.SMALL_ALLGATHER_PATCH, registration)
+        for path, suffix in (("Dockerfile", "-smallag-${rccl_small_allgather_patch_sha}"),
+                             ("src/v2/CMakeLists.txt", "-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")):
+            self.assertIn(suffix, (ROOT / path).read_text())
+
+    def test_actual_canonical_producers_preserve_strict_repair_receipts(self):
+        """Execute real CMake/Docker identity producers against unchanged installed consumers."""
+        def fixture_module(name):
+            spec = importlib.util.spec_from_file_location(name, ROOT / "tests/v2/unit/scripts" / (name + ".py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        thread = fixture_module("test_rccl_thread_lifetime")
+        smallag = fixture_module("test_rccl_small_allgather_policy")
+        thread_case = thread.RCCLThreadProofTests()
+        thread_case.setUp()
+        self.addCleanup(thread_case.doCleanups)
+        smallag_case = smallag.NativeSmallAllGatherProofTests()
+        smallag_case.setUp()
+        self.addCleanup(smallag_case.doCleanups)
+
+        def accepted(receipt):
+            protocol_report = copy.deepcopy(self.report)
+            protocol_report["rccl_receipt"] = receipt
+            PROOF.verify_report(protocol_report, self.library)
+            thread_report = copy.deepcopy(thread_case.report)
+            thread_report["build_receipt"] = receipt
+            thread.PROOF.verify_report(thread_report, thread_case.library)
+            smallag_report = copy.deepcopy(smallag_case.report)
+            smallag_report["rccl_receipt"] = receipt
+            smallag.P.verify(smallag_report, smallag_case.library)
+
+        pairs = [
+            ("USER_P2P", "user_p2p", "rccl-user-p2p-override.patch"),
+            ("SMI", "smi", "rccl-sdk-legacy-smi.patch"),
+            ("COMPLETED", "completed", "rccl-device-completed-broadcast.patch"),
+            ("CAPTURE", "capture", "rccl-hip-capture-event-wait.patch"),
+            ("ROWS", "rows", "rccl-device-live-rows.patch"),
+            ("HOST_STORAGE", "storage", "rccl-native-host-storage.patch"),
+            ("SHM", "shm", "rccl-partial-file-cleanup.patch"),
+            ("SELECTOR", "selector", "rccl-collective-selector-taxonomy.patch"),
+            ("THREAD", "thread", "rccl-created-thread-lifetime.patch"),
+            ("PROTOCOL", "protocol", "rccl-communicator-protocol-defaults.patch"),
+            ("SMALL_ALLGATHER", "small_allgather", "rccl-small-allgather-ll-policy.patch"),
+        ]
+        cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
+        pin = re.search(r'set\(RCCL_GIT_REF "([^"]+)"\)', cmake).group(1)
+        variables = {"RCCL_COMMIT": pin, "RCCL_GPU_TARGETS": "gfx906;gfx1100",
+                     "RCCL_LTO_RECEIPT_HASH": "a" * 64, "RCCL_LTO_PRODUCER_HASH": "b" * 64}
+        environment = dict(os.environ, RCCL_GIT_REF=pin, rccl_lto_receipt_sha="a" * 64,
+                           rccl_lto_producer_sha="b" * 64,
+                           rccl_target_hash=hashlib.sha256(b"gfx906;gfx1100").hexdigest())
+        for upper, lower, patch in pairs:
+            value = PROOF.digest(ROOT / "scripts/docker/patches" / patch)
+            variables["RCCL_" + upper + "_PATCH_HASH"] = value
+            environment["rccl_" + lower + "_patch_sha"] = value
+        start = cmake.index('    set(RCCL_BUILD_ID "')
+        end = cmake.index("    # Check if RCCL build is up-to-date", start)
+        script = self.directory / "receipt.cmake"
+        output = self.directory / "receipt.txt"
+        script.write_text("".join('set(' + key + ' "' + value + '")\n' for key, value in variables.items())
+                          + cmake[start:end] + '\nfile(WRITE "' + str(output) + '" "${RCCL_BUILD_ID}")\n')
+        result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cmake_receipt = output.read_text()
+        docker = (ROOT / "Dockerfile").read_text()
+        producer = next(line.strip().removesuffix("\\").rstrip() for line in docker.splitlines()
+                        if line.strip().startswith("printf '%s\\n' \"p2p-${rccl_user_p2p_patch_sha}"))
+        result = subprocess.run(["bash", "-c", producer], env=environment,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        docker_receipt = result.stdout.strip()
+        self.assertEqual(cmake_receipt, docker_receipt)
+        for receipt in (cmake_receipt, docker_receipt):
+            accepted(receipt)
+            self.assertLess(receipt.index("-llvm-lto-"), receipt.index("-thread-"))
+            self.assertLess(receipt.index("-producer-"), receipt.index("-thread-"))
+            for label, patch in (("thread", thread.PROOF.PATCH), ("protocol", PROOF.PATCH),
+                                 ("smallag", smallag.P.PATCH)):
+                exact = "-" + label + "-" + PROOF.digest(ROOT / patch)
+                for changed in (receipt.replace(exact, ""), receipt.replace(exact, "-" + label + "-" + "0" * 64)):
+                    with self.subTest(label=label, changed=changed), self.assertRaises(RuntimeError):
+                        accepted(changed)
+            compiler_metadata = "-llvm-lto-" + "a" * 64 + "-producer-" + "b" * 64
+            original_order = receipt.replace(compiler_metadata, "") + compiler_metadata
+            with self.assertRaises(RuntimeError):
+                accepted(original_order)
 
     def test_changed_runtime_fails(self):
         """Replacing the selected DSO invalidates earlier proof immediately."""
@@ -101,6 +213,56 @@ class RCCLProtocolProofTests(unittest.TestCase):
                 changed.pop(field)
                 with self.assertRaisesRegex(RuntimeError, "identity"):
                     PROOF.verify_report(changed, self.library)
+
+    def test_original_consumer_preserves_both_hipify_include_layouts(self):
+        """Reverse actual patch hunks with old and SDK 10.1 include placement.
+
+        This is a source-extraction fixture, not fabricated numerical evidence.
+        The builder still compiles the actual native tree and its reversed body.
+        """
+        section = (ROOT / PROOF.PATCH).read_text()
+        baseline = []
+        for hunk in re.split(r"(?m)(?=^@@ )", section)[1:]:
+            header, *lines = hunk.splitlines(keepends=True)
+            first = int(re.match(r"@@ -(\d+)", header)[1])
+            while len(baseline) < first - 1:
+                baseline.append("// unchanged native line\n")
+            baseline.extend(line[1:] for line in lines if line.startswith((" ", "-")))
+        include = b'#include "hip/hip_runtime.h"\n'
+        # Header-first positions cover the observed generated include at line32
+        # and the adjacent longer-header layout at line36. The old layout has
+        # one prepended include; it must not manufacture a second source include.
+        for layout in ("prepended", "header-first-32", "header-first-36"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as directory:
+                body = baseline.copy()
+                prefix = include if layout == "prepended" else b""
+                if not prefix:
+                    generated_line = int(layout.rsplit("-", 1)[1])
+                    body[generated_line - 10] = include.decode()
+                original_bytes = "".join(body).encode()
+                root = Path(directory)
+                source = root / "src/rccl_wrap.cc"
+                source.parent.mkdir()
+                source.write_bytes(original_bytes)
+                subprocess.run(["git", "apply", str(ROOT / PROOF.PATCH)],
+                               cwd=root, check=True, capture_output=True)
+                generated = prefix + source.read_bytes()
+                source.write_bytes(generated)
+                destination = root / "negative/src/rccl_wrap.cc"
+                PROOF.prepare_original_consumer(source, destination)
+                self.assertEqual(destination.read_bytes(), prefix + original_bytes)
+                self.assertEqual(source.read_bytes(), generated)
+                for malformed in (b"", b'#include "hip/hip_runtime_api.h"\n',
+                                  b'// #include "hip/hip_runtime.h"\n'):
+                    source.write_bytes(generated.replace(include, malformed, 1))
+                    with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                            RuntimeError, "canonical first HIP runtime include"):
+                        PROOF.prepare_original_consumer(source, destination)
+                # A consumer without the canonical repair cannot manufacture an
+                # original variant by silently accepting a failed reversal.
+                source.write_bytes(prefix + original_bytes)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    PROOF.prepare_original_consumer(source, destination)
 
     def test_compile_inputs_preserve_definitions_and_headers_without_shell_execution(self):
         """Read the native compile database as structured argument data only."""

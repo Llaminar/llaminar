@@ -10,12 +10,16 @@
  * This infrastructure test alone owns direct native storage; production uses
  * PhysicalMemoryAuthority and TransferEngine. Failures are decided before the
  * bounded cancellation cleanup, so releasing a hold cannot manufacture a pass.
+ * --timed-copy adds the production local-edge start/copy/stop sequence and
+ * requires native finite positive elapsed time as well as the ordering receipt.
+ * The first start has no prior SDMA; later generations reuse the same events.
  */
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -45,22 +49,33 @@ struct HeldGraph {
 struct CopyLane {
     hipStream_t stream{};
     hipEvent_t terminal{};
+    hipEvent_t start{}; ///< Optional native timing record before this lane's SDMA.
+    hipEvent_t stop{}; ///< Optional native timing record after the required frontier.
 };
 
 /**
  * @brief Authenticate progress, exact bytes, event reuse and real dependencies.
- * @param argc Optional count and one explicit negative-control scenario.
- * @param argv Counts are test geometry, never native scheduler overrides.
+ * @param argc Optional count, negative-control scenario and timing selection.
+ * @param argv Counts and --timed-copy are authored test geometry, never scheduler overrides.
  * @return Zero only if completion semantics and every payload byte are correct.
  */
 int main(int argc, char** argv) {
     const unsigned held_count = argc >= 2 ? std::strtoul(argv[1], nullptr, 10) : 1;
     Frontier frontier = Frontier::Independent;
-    if (argc == 3 && std::strcmp(argv[2], "--wait-frontier") == 0)
-        frontier = Frontier::ExternalEvent;
-    else if (argc == 3 && std::strcmp(argv[2], "--compute-frontier") == 0)
-        frontier = Frontier::Compute;
-    else if (argc > 2) return 2;
+    bool timed_copy = false;
+    for (int index = 2; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--timed-copy") == 0 && !timed_copy) {
+            timed_copy = true;
+        } else if (std::strcmp(argv[index], "--wait-frontier") == 0 &&
+                   frontier == Frontier::Independent) {
+            frontier = Frontier::ExternalEvent;
+        } else if (std::strcmp(argv[index], "--compute-frontier") == 0 &&
+                   frontier == Frontier::Independent) {
+            frontier = Frontier::Compute;
+        } else {
+            return 2;
+        }
+    }
     if (held_count > 64 || (held_count == 0 && frontier != Frontier::Independent)) return 2;
 
     setenv("HSA_USERPTR_FOR_PAGED_MEM", "0", 0);
@@ -107,6 +122,10 @@ int main(int argc, char** argv) {
     for (auto& copy : copies) {
         HIP_REQUIRE(hipStreamCreateWithFlags(&copy.stream, hipStreamNonBlocking));
         HIP_REQUIRE(hipEventCreateWithFlags(&copy.terminal, hipEventDisableTiming));
+        if (timed_copy) {
+            HIP_REQUIRE(hipEventCreate(&copy.start));
+            HIP_REQUIRE(hipEventCreate(&copy.stop));
+        }
     }
 
     // Cover submission itself becoming stuck, not only a later event query.
@@ -148,33 +167,69 @@ int main(int argc, char** argv) {
         for (unsigned lane = 0; lane < lane_count; ++lane) {
             auto& copy = copies[(lane + generation) % lane_count];
             const auto destination = output_alias + ((lane + generation) % lane_count) * stride + guard_bytes;
+            if (timed_copy) HIP_REQUIRE(hipEventRecord(copy.start, copy.stream));
             HIP_REQUIRE(hipMemcpyAsync(destination, source, payload_bytes,
                                        hipMemcpyDeviceToDeviceNoCU, copy.stream));
             if (frontier == Frontier::ExternalEvent)
                 HIP_REQUIRE(hipStreamWaitEvent(copy.stream, held_frontier, 0));
             else if (frontier == Frontier::Compute)
                 HIP_REQUIRE(hipStreamWaitValue64(copy.stream, control_alias, 1, hipStreamWaitValueEq));
+            if (timed_copy) HIP_REQUIRE(hipEventRecord(copy.stop, copy.stream));
             HIP_REQUIRE(hipEventRecord(copy.terminal, copy.stream));
             HIP_REQUIRE(hipEventRecord(copy.terminal, copy.stream)); // Same-frontier coalescing.
         }
         unsigned complete = 0;
+        unsigned starts_ready = 0;
+        unsigned stops_ready = 0;
         const auto deadline = std::chrono::steady_clock::now() +
             (frontier == Frontier::Independent ? std::chrono::milliseconds(2000) : std::chrono::milliseconds(10));
         do {
             complete = 0;
+            starts_ready = 0;
+            stops_ready = 0;
             for (const auto& copy : copies) {
                 const auto status = hipEventQuery(copy.terminal);
                 if (status == hipSuccess) ++complete;
                 else if (status != hipErrorNotReady) requireHip(status, "query exact DMA terminal");
+                if (timed_copy) {
+                    const auto start_status = hipEventQuery(copy.start);
+                    const auto stop_status = hipEventQuery(copy.stop);
+                    if (start_status == hipSuccess) ++starts_ready;
+                    else if (start_status != hipErrorNotReady)
+                        requireHip(start_status, "query exact timed start");
+                    if (stop_status == hipSuccess) ++stops_ready;
+                    else if (stop_status != hipErrorNotReady)
+                        requireHip(stop_status, "query exact timed stop");
+                }
             }
-            if (frontier == Frontier::Independent && complete == lane_count) break;
+            if (frontier == Frontier::Independent && complete == lane_count &&
+                (!timed_copy || (starts_ready == lane_count && stops_ready == lane_count))) break;
             std::this_thread::yield();
         } while (std::chrono::steady_clock::now() < deadline);
         const bool expected_completion = frontier == Frontier::Independent ? complete == lane_count : complete == 0;
         const bool independent_bytes = frontier != Frontier::Independent || (expected_completion && verify_bytes());
-        contract_passed &= expected_completion && independent_bytes && !cancelled.load(std::memory_order_acquire);
-        std::printf("held_graphs=%u generation=%u native_terminals=%u/%u contract=%s\n",
-                    held_count, generation, complete, lane_count, contract_passed ? "PASS" : "FAIL");
+        bool timing_passed = true;
+        float elapsed_sum_ms = 0.0f;
+        if (timed_copy && frontier == Frontier::Independent) {
+            timing_passed = starts_ready == lane_count && stops_ready == lane_count;
+            if (timing_passed) {
+                for (const auto& copy : copies) {
+                    float elapsed_ms = 0.0f;
+                    HIP_REQUIRE(hipEventElapsedTime(&elapsed_ms, copy.start, copy.stop));
+                    timing_passed &= std::isfinite(elapsed_ms) && elapsed_ms > 0.0f;
+                    elapsed_sum_ms += elapsed_ms;
+                }
+            }
+        } else if (timed_copy) {
+            // The stop and its ordering receipt cannot outrun a genuine
+            // post-copy dependency. Start readiness is not a substitute.
+            timing_passed = stops_ready == 0;
+        }
+        contract_passed &= expected_completion && independent_bytes && timing_passed &&
+            !cancelled.load(std::memory_order_acquire);
+        std::printf("held_graphs=%u generation=%u native_terminals=%u/%u timed=%u starts=%u stops=%u elapsed_sum_ms=%g contract=%s\n",
+                    held_count, generation, complete, lane_count, unsigned(timed_copy),
+                    starts_ready, stops_ready, double(elapsed_sum_ms), contract_passed ? "PASS" : "FAIL");
         std::fflush(stdout);
         if (!contract_passed) break;
     }
@@ -186,6 +241,14 @@ int main(int argc, char** argv) {
     cancellation.join();
     for (auto& graph : graphs) HIP_REQUIRE(hipStreamSynchronize(graph.stream));
     for (auto& copy : copies) HIP_REQUIRE(hipEventSynchronize(copy.terminal));
+    bool final_timing = true;
+    if (timed_copy) {
+        for (const auto& copy : copies) {
+            float elapsed_ms = 0.0f;
+            HIP_REQUIRE(hipEventElapsedTime(&elapsed_ms, copy.start, copy.stop));
+            final_timing &= std::isfinite(elapsed_ms) && elapsed_ms > 0.0f;
+        }
+    }
     const bool final_bytes = verify_bytes();
     std::printf("terminal_payload_and_guards=%s\n", final_bytes ? "PASS" : "FAIL");
     for (auto& graph : graphs) {
@@ -194,6 +257,10 @@ int main(int argc, char** argv) {
         HIP_REQUIRE(hipStreamDestroy(graph.stream));
     }
     for (auto& copy : copies) {
+        if (timed_copy) {
+            HIP_REQUIRE(hipEventDestroy(copy.stop));
+            HIP_REQUIRE(hipEventDestroy(copy.start));
+        }
         HIP_REQUIRE(hipEventDestroy(copy.terminal));
         HIP_REQUIRE(hipStreamDestroy(copy.stream));
     }
@@ -203,5 +270,5 @@ int main(int argc, char** argv) {
     HIP_REQUIRE(hipFree(source));
     HIP_REQUIRE(hipHostFree(output));
     HIP_REQUIRE(hipHostFree(control));
-    return contract_passed && final_bytes ? 0 : 1;
+    return contract_passed && final_bytes && final_timing ? 0 : 1;
 }

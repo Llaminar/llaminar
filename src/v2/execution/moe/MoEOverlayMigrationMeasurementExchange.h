@@ -6,7 +6,7 @@
  * destination ranks; uninvolved ranks retain explicit empty optionals so the
  * global operation order remains identical.  These types separate the
  * non-blocking transport callback from later collective exchange: a bounded
- * journal captures one local wave without allocation, then the calibration
+ * journal takes one already-owned local wave without allocation or waiting, then the calibration
  * owner merges authenticated rank rows into one complete conservative wave.
  */
 
@@ -33,8 +33,10 @@ namespace llaminar2
      * @brief Single-producer/single-consumer handoff for one completed wave.
      *
      * The transport callback and calibration driver execute on the same
-     * maintenance worker. Constructor-time reserve makes `recordCompletedWave`
-     * allocation-free; an unread observation cannot be overwritten.
+     * maintenance worker. Completion swaps the original wave vector into the
+     * unread slot. Geometry is immutable/shared and sample storage was allocated
+     * before polling; recording neither copies nor allocates nested metadata.
+     * The const-copy overload retains the original scalar-only reserved path.
      */
     class MoEOverlayMigrationMeasurementJournal final
         : public IMoEOverlayMigrationMeasurementSink
@@ -52,10 +54,16 @@ namespace llaminar2
          */
         explicit MoEOverlayMigrationMeasurementJournal(Config config);
 
-        /** @brief Copy one valid local partial wave without allocation or wait. */
+        /** @brief Copy one valid local partial wave without waiting or device work. */
         bool recordCompletedWave(
             const std::vector<MoEOverlayCompletedMigrationMeasurement> &
                 measurements,
+            std::string *error) noexcept;
+
+        /** @brief Take an already-owned completed wave without copying nested metadata.
+         * @param measurements Exact wave-owned observations. @param error Optional rejection reason.
+         * @return Whether the complete observation was accepted atomically. */
+        bool recordCompletedWave(std::vector<MoEOverlayCompletedMigrationMeasurement> &&measurements,
             std::string *error) noexcept override;
 
         /**
@@ -102,7 +110,7 @@ namespace llaminar2
         /**
          * @brief Merge transaction-ordered local rank observations.
          * @param rank_measurements One row vector per participating world rank.
-         * @return Complete rows with all three projections present.
+         * @return Complete legacy projection rows or exact canonical piece rows with every sample present.
          * @throws std::invalid_argument For missing ranks, identity divergence,
          *         inconsistent bytes, duplicate rank-local values, or an
          *         unobserved projection.

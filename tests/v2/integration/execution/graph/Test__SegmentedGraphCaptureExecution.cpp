@@ -23,10 +23,20 @@
  *    after readiness materialization and on replay, never while recording.
  * 8. Capture, initial submission and replay preserve an exact executable-family
  *    evidence identity; sibling setup variants cannot borrow one another's work.
+ * 9. Setup-only retained parents publish the same sealed device/service boundary
+ *    as their actual first launch and repeated reset/replay on CUDA and ROCm.
+ * 10. Maintenance binds transaction observation identity before native capture
+ *     and retains authentic capture/replay phases across reset.
  */
 
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include <gtest/gtest.h>
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
+#include "../../../utils/CPUSerialArenaTestAdmission.h"
+#include "../../../fixtures/execution/RetainedHostServiceFixture.h"
+#include "backends/HostMemoryCapacity.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
+#include "execution/local_execution/orchestrators/MoEMaintenanceObservationContext.h"
 #include <memory>
 #include <span>
 #include <vector>
@@ -593,6 +603,15 @@ namespace
     };
 } // namespace
 
+/** @return Original CPU0 observation before the route roots or ticket worker materialize. */
+PhysicalMemoryResource originalTicketHostResource()
+{
+    const auto capacity=observeSystemMemoryCapacity();
+    if(!capacity.valid() || capacity.admission_available_bytes>capacity.total_bytes)
+        throw std::runtime_error("Original retained-ticket fixture CPU observation unavailable");
+    return {0,DeviceId::cpu(),capacity.total_bytes,capacity.admission_available_bytes};
+}
+
 class CachedGraphReplayExecutionTest : public ::testing::Test
 {
 protected:
@@ -1044,6 +1063,94 @@ TEST_F(CachedGraphReplayExecutionTest, NativeParallelBranchJoinsAfterBodyClose)
         body.reset();
         for (auto &fragment : fragments) fragment.reset();
     });
+}
+
+/**
+ * @test The native executor publishes maintenance capture before replay.
+ *
+ * A small optimized graph supplies real native work without loading a model.
+ * The negative control preserves the original missing-workload defect: native
+ * capture succeeds but cannot author a decode phase. Binding the production
+ * helper before capture makes that same producer publish authentic phases.
+ * Graph reset changes data lifecycle while retaining the exact executable.
+ */
+TEST_F(CachedGraphReplayExecutionTest, MoEMaintenanceObservationNativeReplay)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    ScopedPerfStats perf_stats;
+    FP32Tensor *input = nullptr, *residual = nullptr, *output = nullptr;
+    auto graph = buildNormResidualGraph(1u, 64u, input, residual, output);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+    GraphExecutorConfig config;
+    config.enable_validation = false;
+    DeviceGraphExecutor executor(config);
+    graph_arena_.bindExecutor(executor);
+    const auto execute = [&](DeviceGraphExecutor::GraphSegmentCache &cache)
+    {
+        graph.reset();
+        return executor.executeWithCachedGraphReplay(graph, device_ctx_.get(), cache,
+            gpu_ctx_->defaultStream(), gpu_ctx_, nullptr, false, false, true, {},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+    };
+    const auto phase_count = [&](const char *phase)
+    {
+        double count = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+            if (record.name == "decode_graph_phase" &&
+                record.tags.at("context") == "moe_rebalance_maintenance_atomic" &&
+                record.tags.at("phase") == phase)
+                count += record.value;
+        return count;
+    };
+    {
+        DeviceGraphExecutor::GraphSegmentCache original_defect;
+        original_defect.perf_context = "moe_rebalance_maintenance_atomic";
+        ASSERT_TRUE(execute(original_defect));
+        EXPECT_EQ(original_defect.successful_capture_count, 1u);
+        EXPECT_EQ(original_defect.successful_submission_count, 1u);
+        EXPECT_EQ(phase_count("capture"), 0.0);
+        ASSERT_TRUE(output->ensureOnHost(original_defect.capture_stream));
+    }
+    PerfStatsCollector::reset();
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    dgo_detail::bindMoEMaintenanceReplayContext(cache);
+    ASSERT_TRUE(execute(cache));
+    const auto family = cache.evidence_family;
+    ASSERT_NE(family, 0u);
+    EXPECT_EQ(cache.successful_capture_count, 1u);
+    EXPECT_EQ(phase_count("capture"), 1.0);
+    EXPECT_EQ(phase_count("replay"), 0.0);
+    double executable_nodes = 0.0;
+    for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+        if (record.name == "full_graph_capture_executable_nodes" &&
+            record.tags.at("context") == cache.perf_context)
+        {
+            EXPECT_EQ(record.tags.at("executable_family"), std::to_string(family));
+            executable_nodes += record.value;
+        }
+    EXPECT_GT(executable_nodes, 0.0);
+    ASSERT_TRUE(output->ensureOnHost(cache.capture_stream));
+    assertFiniteAndNonZero(output->data(), output->numel());
+    const std::vector<float> original(output->data(), output->data() + output->numel());
+    for (std::size_t replay = 1u; replay <= 3u; ++replay)
+    {
+        dgo_detail::bindMoEMaintenanceReplayContext(cache);
+        ASSERT_TRUE(execute(cache));
+        ASSERT_TRUE(output->ensureOnHost(cache.capture_stream));
+        EXPECT_EQ(std::memcmp(original.data(), output->data(), original.size() * sizeof(float)), 0);
+        EXPECT_EQ(cache.evidence_family, family);
+        EXPECT_EQ(cache.perf_context, "moe_rebalance_maintenance_atomic");
+        EXPECT_TRUE(cache.replay_workload.valid());
+        EXPECT_TRUE(cache.replay_workload.decode);
+        EXPECT_EQ(cache.replay_workload.m, 1);
+        EXPECT_EQ(cache.successful_capture_count, 1u);
+        EXPECT_EQ(cache.successful_submission_count, replay + 1u);
+        EXPECT_EQ(phase_count("capture"), 1.0);
+        EXPECT_EQ(phase_count("replay"), static_cast<double>(replay));
+        for (const auto &unit : cache.segments) EXPECT_EQ(unit.evidence_family, family);
+    }
 }
 
 TEST_F(CachedGraphReplayExecutionTest, FirstUseMaterializesReplayWithoutSecondMutation)
@@ -1682,7 +1789,7 @@ TEST_F(CachedGraphReplayExecutionTest,
         contribution_elements * sizeof(float);
     const DeviceId device = device_ctx_->deviceId();
     auto epoch_arena = std::make_shared<DeviceMoEOverlayEpochArena>(
-        DeviceMoEOverlayEpochArena::Config{.device_id = device});
+        llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{.device_id = device}));
     DeviceMoEOverlayEpochTicket epoch_fixture{
         .epoch = 301u, .selector = deviceMoEOverlayEpochSelector(1u, 0u)};
     auto *epoch_backend = getBackendFor(device);
@@ -1723,9 +1830,10 @@ TEST_F(CachedGraphReplayExecutionTest,
     const std::array<DeviceId, 1> mapped_devices{device};
     auto ticket_arena =
         TransferEngine::instance().createMappedHostArena(mapped_devices);
-    auto cpu_canonical_arena =
-        std::make_shared<MoELocalExpertSerialBufferArena>(
-            MoELocalExpertSerialBufferArena::Config{
+    auto ticket_worker=RetainedHostServiceFixture::original(
+        RetainedHostServiceRole::ExecutorParentTicket,{0,device});
+    const auto host=originalTicketHostResource();
+    const std::array route_declarations{MoELocalExpertSerialBufferArena::Config{
                 .device_id = DeviceId::cpu(),
                 .row_capacity = bucket_rows,
                 .row_capacity_buckets = {bucket_rows},
@@ -1737,7 +1845,11 @@ TEST_F(CachedGraphReplayExecutionTest,
                 .cpu_canonical_route_gpu_consumer = device,
                 .debug_name =
                     "integration.production_mapped_cpu_canonical_routes",
-            });
+            }};
+    const auto admitted_routes=admitCPUSerialArenasForTest(route_declarations,host,ticket_worker.bom(host));
+    const auto memory=admitted_routes.front().physical_memory_authority;
+    auto cpu_canonical_arena=std::make_shared<MoELocalExpertSerialBufferArena>(admitted_routes.front());
+    ASSERT_EQ(cpu_canonical_arena->physicalMemoryAuthority().get(),memory.get());
     auto contribution_region =
         cpu_canonical_arena->mappedCPUCanonicalRoutes(device);
     ASSERT_NE(contribution_region, nullptr);
@@ -1874,6 +1986,9 @@ TEST_F(CachedGraphReplayExecutionTest,
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    executor.setRetainedParentTicketServiceWorker(
+        PreparedRetainedHostService::materialize(ticket_worker.take(memory)),memory);
+    ASSERT_TRUE(executor.hasRetainedParentTicketServiceWorker());
     graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *const dispatch_stream = gpu_ctx_->defaultStream();
@@ -2071,8 +2186,7 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
         .device = device,
         .slot_capacity = 2u,
         .execution_lane_capacity = 2u,
-        .execution_streams = TransferEngine::instance()
-            .allocatePersistentTransferExecutionLanes(
+        .execution_streams = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                 2u, device, "retained_cpu_ticket_progress"),
         .maximum_bytes = 4096u,
         .name = "retained_cpu_ticket_progress",
@@ -2101,12 +2215,23 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
     const std::array<DeviceId, 1> mapped_devices{device};
     auto ticket_arena =
         TransferEngine::instance().createMappedHostArena(mapped_devices);
-    auto first_contribution_region =
-        TransferEngine::instance().allocateMappedHostRegion(
-            payload_bytes, mapped_devices);
-    auto second_contribution_region =
-        TransferEngine::instance().allocateMappedHostRegion(
-            payload_bytes, mapped_devices);
+    auto ticket_worker=RetainedHostServiceFixture::original(
+        RetainedHostServiceRole::ExecutorParentTicket,{0,device});
+    const auto host=originalTicketHostResource();
+    const MoELocalExpertSerialBufferArena::Config route_declaration{
+        .device_id=DeviceId::cpu(),.row_capacity=bucket_rows,.row_capacity_buckets={bucket_rows},
+        .d_model=d_model,.routing_top_k=top_k,
+        .cpu_canonical_route_storage=MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
+        .cpu_canonical_route_gpu_consumer=device,.debug_name="integration.retained_ticket_routes"};
+    const std::array route_declarations{route_declaration,route_declaration};
+    const auto admitted_routes=admitCPUSerialArenasForTest(route_declarations,host,ticket_worker.bom(host));
+    const auto memory=admitted_routes.front().physical_memory_authority;
+    auto first_routes=std::make_shared<MoELocalExpertSerialBufferArena>(admitted_routes[0]);
+    auto second_routes=std::make_shared<MoELocalExpertSerialBufferArena>(admitted_routes[1]);
+    ASSERT_EQ(first_routes->physicalMemoryAuthority().get(),memory.get());
+    ASSERT_EQ(second_routes->physicalMemoryAuthority().get(),memory.get());
+    auto first_contribution_region=first_routes->mappedCPUCanonicalRoutes(device);
+    auto second_contribution_region=second_routes->mappedCPUCanonicalRoutes(device);
     ASSERT_NE(first_contribution_region, nullptr);
     ASSERT_NE(second_contribution_region, nullptr);
     ASSERT_TRUE(first_contribution_region->isBound());
@@ -2242,6 +2367,9 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    executor.setRetainedParentTicketServiceWorker(
+        PreparedRetainedHostService::materialize(ticket_worker.take(memory)),memory);
+    ASSERT_TRUE(executor.hasRetainedParentTicketServiceWorker());
     graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *const dispatch_stream = gpu_ctx_->defaultStream();
@@ -2321,6 +2449,7 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
         {
             if (record.name != "retained_parent_executable_nodes" &&
                 record.name != "retained_parent_transaction_zero_launches" &&
+                record.name != "retained_parent_materialized_without_launch" &&
                 record.name != "retained_parent_replays")
                 continue;
             EXPECT_EQ(record.device, device.toString());
@@ -2336,7 +2465,7 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
                 nodes += record.value;
             else if (record.name == "retained_parent_transaction_zero_launches")
                 initial += record.value;
-            else
+            else if (record.name == "retained_parent_replays")
                 replays += record.value;
         }
         EXPECT_GT(nodes, 0.0);
@@ -2403,6 +2532,99 @@ TEST_F(CachedGraphReplayExecutionTest,
 {
     expectRetainedParentTicketLifecycle(
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch);
+}
+
+/**
+ * @brief Replay the production setup-only parent publisher on each native backend.
+ *
+ * A device-only parent must advertise its sealed boundary before its first
+ * launch, not acquire that identity later from another lifecycle record. The
+ * existing optimized RMSNorm/residual graph supplies real capture work; reset
+ * and repeated replay retain its executable and reproduce the original bytes.
+ */
+TEST_F(CachedGraphReplayExecutionTest,
+       RetainedParentMaterializationPublishesDeviceBoundaryAcrossReset)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    ScopedPerfStats perf_stats;
+    FP32Tensor *input = nullptr, *residual = nullptr, *output = nullptr;
+    auto graph = buildNormResidualGraph(1u, 64u, input, residual, output);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+    GraphExecutorConfig config;
+    config.enable_validation = false;
+    DeviceGraphExecutor executor(config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "mtp_speculative_state_publication";
+    std::size_t compositions = 0u;
+    const DeviceGraphExecutor::RetainedParentCompositionHook composer =
+        [&](IGPUGraphCapture &parent, const ComputeGraph &,
+            std::span<const DeviceGraphExecutor::GraphSegmentCache::RetainedCaptureUnitTemplateView> units)
+    {
+        ++compositions;
+        if (units.size() != 1u || !units.front().capture || units.front().capture->hasExecutable())
+            return false;
+        const std::array<GPUOrderedTimelineStep, 1> steps{{{
+            .name = "original_device_forward", .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+            .capture = units.front().capture}}};
+        return parent.buildOrderedTimelineTransaction(steps);
+    };
+    const auto execute = [&](DeviceGraphExecutor::GraphInitialSubmissionPolicy policy)
+    {
+        graph.reset();
+        return executor.executeWithCachedGraphReplay(graph, device_ctx_.get(), cache,
+            gpu_ctx_->defaultStream(), gpu_ctx_, nullptr, false, false, true, {},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::RequireCloneableParentComposition,
+            {}, {}, composer, policy);
+    };
+    const auto evidence = [&](double initial_expected, double replay_expected)
+    {
+        double materialized = 0.0, initial = 0.0, replay = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+        {
+            if (record.name != "retained_parent_materialized_without_launch" &&
+                record.name != "retained_parent_executable_nodes" &&
+                record.name != "retained_parent_transaction_zero_launches" &&
+                record.name != "retained_parent_replays") continue;
+            EXPECT_EQ(record.device, device_ctx_->deviceId().toString());
+            ASSERT_TRUE(record.tags.contains("context"));
+            ASSERT_TRUE(record.tags.contains("boundary_authority"));
+            ASSERT_TRUE(record.tags.contains("ticket_service_units"));
+            ASSERT_TRUE(record.tags.contains("child_units"));
+            EXPECT_EQ(record.tags.at("context"), cache.perf_context);
+            EXPECT_EQ(record.tags.at("boundary_authority"), "captured_device_units");
+            EXPECT_EQ(record.tags.at("ticket_service_units"), "0");
+            EXPECT_EQ(record.tags.at("child_units"), "1");
+            if (record.name == "retained_parent_materialized_without_launch") materialized += record.value;
+            if (record.name == "retained_parent_transaction_zero_launches") initial += record.value;
+            if (record.name == "retained_parent_replays") replay += record.value;
+        }
+        EXPECT_EQ(materialized, 1.0);
+        EXPECT_EQ(initial, initial_expected);
+        EXPECT_EQ(replay, replay_expected);
+    };
+    ASSERT_TRUE(execute(DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch));
+    ASSERT_NE(cache.retained_parent_capture, nullptr);
+    const auto *parent = cache.retained_parent_capture.get();
+    ASSERT_TRUE(parent->hasExecutable());
+    EXPECT_EQ(cache.retained_composed_parent_replay.child_unit_count, 1u);
+    EXPECT_TRUE(cache.retained_composed_parent_replay.concurrent_ticket_service_segment_indices.empty());
+    EXPECT_EQ(cache.successful_submission_count, 0u);
+    evidence(0.0, 0.0);
+    std::vector<float> original;
+    for (std::size_t repeat = 0u; repeat < 3u; ++repeat)
+    {
+        ASSERT_TRUE(execute(DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch));
+        ASSERT_TRUE(output->ensureOnHost(cache.capture_stream));
+        assertFiniteAndNonZero(output->data(), output->numel());
+        if (repeat == 0u) original.assign(output->data(), output->data() + output->numel());
+        else EXPECT_EQ(std::memcmp(original.data(), output->data(), original.size() * sizeof(float)), 0);
+        EXPECT_EQ(cache.retained_parent_capture.get(), parent);
+        EXPECT_EQ(compositions, 1u);
+        evidence(1.0, static_cast<double>(repeat));
+    }
 }
 
 TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)

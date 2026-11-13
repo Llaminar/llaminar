@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayInferenceTransaction.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 #include "MoEExpertOwnerMap.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/IModelLoader.h"
@@ -102,9 +103,12 @@ namespace llaminar2
         {
             return role == MoEOverlayInferenceGraphRole::MainPrefill ||
                    role == MoEOverlayInferenceGraphRole::MainDecode ||
+                   role == MoEOverlayInferenceGraphRole::OrdinaryForwardOnly ||
+                   role == MoEOverlayInferenceGraphRole::GenerationAdmission ||
                    role == MoEOverlayInferenceGraphRole::MTPDraft ||
-                   role ==
-                       MoEOverlayInferenceGraphRole::MTPGroupedVerifier;
+                   role == MoEOverlayInferenceGraphRole::MTPGroupedVerifier ||
+                   role == MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation ||
+                   role == MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken;
         }
 
         /** @return Stable diagnostic name for one ticket action. */
@@ -134,10 +138,18 @@ namespace llaminar2
                 return "main_prefill";
             case MoEOverlayInferenceGraphRole::MainDecode:
                 return "main_decode";
+            case MoEOverlayInferenceGraphRole::OrdinaryForwardOnly:
+                return "ordinary_forward_only";
+            case MoEOverlayInferenceGraphRole::GenerationAdmission:
+                return "generation_admission";
             case MoEOverlayInferenceGraphRole::MTPDraft:
                 return "mtp_draft";
             case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
                 return "mtp_grouped_verifier";
+            case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+                return "mtp_condition_speculative_continuation";
+            case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+                return "mtp_condition_committed_serial_token";
             }
             return "invalid";
         }
@@ -156,8 +168,7 @@ namespace llaminar2
         return workspace_generation != 0 &&
                topology_fingerprint_low != 0 &&
                topology_fingerprint_high != 0 && source_world_rank >= 0 &&
-               target_world_rank >= 0 &&
-               source_world_rank != target_world_rank;
+               target_world_rank >= 0;
     }
 
     bool MoEOverlayInferenceGraphFamilyIdentity::valid() const noexcept
@@ -200,6 +211,31 @@ namespace llaminar2
             return 0;
         }
         return final_source_layer - first_model_layer + 1;
+    }
+
+    MoEOverlayInferenceGraphRole moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose purpose)
+    {
+        switch (purpose)
+        {
+        case MTPConditionForwardPurpose::SpeculativeContinuation:
+            return MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation;
+        case MTPConditionForwardPurpose::CommittedSerialToken:
+            return MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken;
+        }
+        throw std::invalid_argument("Pipeline condition ticket has an unknown original purpose");
+    }
+
+    MTPConditionForwardPurpose moeOverlayPipelineConditionForwardPurpose(MoEOverlayInferenceGraphRole role)
+    {
+        switch (role)
+        {
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+            return MTPConditionForwardPurpose::SpeculativeContinuation;
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+            return MTPConditionForwardPurpose::CommittedSerialToken;
+        default:
+            throw std::invalid_argument("Pipeline condition ticket must name an explicit retained purpose");
+        }
     }
 
     MoEOverlayInferenceGraphFamilyIdentity
@@ -282,16 +318,21 @@ namespace llaminar2
         return family;
     }
 
-    MoEOverlayInferenceTopologyIdentity
-    makeMoEOverlayInferenceTopologyIdentity(
+    namespace
+    {
+    /** @brief Hash the complete validated owner topology and retained family. */
+    MoEOverlayInferenceTopologyIdentity makeInferenceTopologyIdentity(
         const MoEExpertOwnerMap &owner_map,
         const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
         int source_world_rank,
-        int target_world_rank)
+        int target_world_rank,
+        int local_source_participant = -1,
+        std::span<const int> local_targets = {})
     {
         if (!graph_family.valid() || source_world_rank < 0 ||
             target_world_rank < 0 ||
-            source_world_rank == target_world_rank)
+            (source_world_rank == target_world_rank &&
+             local_source_participant < 0))
         {
             throw std::invalid_argument(
                 "Cannot fingerprint invalid ExpertOverlay inference graph geometry or rank pair");
@@ -328,6 +369,14 @@ namespace llaminar2
         digest.addString("MoEOverlayInferenceTopology/v2");
         digest.addScalar(source_world_rank);
         digest.addScalar(target_world_rank);
+        if (local_source_participant >= 0)
+        {
+            digest.addString("RankLocalEndpoints/v1");
+            digest.addScalar(local_source_participant);
+            digest.addScalar(static_cast<std::uint64_t>(local_targets.size()));
+            for (const int participant : local_targets)
+                digest.addScalar(participant);
+        }
         digest.addScalar(graph_family.first_model_layer);
         digest.addScalar(graph_family.main_layer_count);
         digest.addScalar(graph_family.max_graph_rows);
@@ -366,10 +415,71 @@ namespace llaminar2
         };
     }
 
+    } // namespace
+
+    MoEOverlayInferenceTopologyIdentity
+    makeMoEOverlayInferenceTopologyIdentity(
+        const MoEExpertOwnerMap &owner_map,
+        const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
+        int source_world_rank,
+        int target_world_rank)
+    {
+        return makeInferenceTopologyIdentity(
+            owner_map, graph_family, source_world_rank, target_world_rank);
+    }
+
+    MoEOverlayInferenceTopologyIdentity
+    makeMoEOverlayRankLocalInferenceTopologyIdentity(
+        const MoEExpertOwnerMap &owner_map,
+        const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
+        int source_participant_id,
+        std::span<const int> target_participant_ids)
+    {
+        const auto *source = owner_map.participantForId(source_participant_id);
+        if (!source || !source->world_rank_known ||
+            source->world_rank < 0 || !source->device.is_gpu() ||
+            target_participant_ids.empty() ||
+            !std::is_sorted(target_participant_ids.begin(), target_participant_ids.end()) ||
+            std::adjacent_find(target_participant_ids.begin(), target_participant_ids.end()) !=
+                target_participant_ids.end())
+        {
+            throw std::invalid_argument(
+                "Rank-local expert endpoints require one original source and ordered unique targets");
+        }
+        for (const int id : target_participant_ids)
+        {
+            const auto *target = owner_map.participantForId(id);
+            if (!target || !target->world_rank_known ||
+                target->world_rank != source->world_rank ||
+                target->domain_name == source->domain_name ||
+                !target->device.is_gpu() ||
+                std::any_of(owner_map.participants().begin(), owner_map.participants().end(),
+                    [&](const auto &continuation)
+                    {
+                        return continuation.domain_name == source->domain_name &&
+                               continuation.world_rank_known &&
+                               continuation.world_rank == source->world_rank &&
+                               continuation.device == target->device;
+                    }))
+            {
+                throw std::invalid_argument(
+                    "Rank-local expert endpoint is absent, foreign, or belongs to the continuation domain");
+            }
+        }
+        return makeInferenceTopologyIdentity(
+            owner_map, graph_family, source->world_rank, source->world_rank,
+            source_participant_id, target_participant_ids);
+    }
+
     bool MoEOverlayInferenceCommandIdentity::valid() const noexcept
     {
-        return request_generation != 0 && command_id != 0 &&
-               initial_placement_epoch != 0;
+        const bool placement_valid =
+            (placement_identity_kind == MoEOverlayInferencePlacementIdentityKind::ResidencyEpoch &&
+             initial_placement_epoch != 0) ||
+            (placement_identity_kind == MoEOverlayInferencePlacementIdentityKind::RetainedGraph &&
+             initial_placement_epoch == 0) ||
+            placement_identity_kind == MoEOverlayInferencePlacementIdentityKind::ControllerPlacementEpoch;
+        return request_generation != 0 && command_id != 0 && placement_valid;
     }
 
     MoEOverlayInferenceTopologyIdentity
@@ -391,6 +501,7 @@ namespace llaminar2
             .request_generation = request_generation,
             .command_id = command_id,
             .initial_placement_epoch = placement_epoch,
+            .placement_identity_kind = placement_identity_kind,
         };
     }
 
@@ -421,18 +532,16 @@ namespace llaminar2
             prefill_schedule_real_rows == 0 &&
             prefill_schedule_execution_rows == 0 &&
             prefill_schedule_transaction_count == 0 &&
-            prefill_schedule_reserved == 0 &&
             prefill_schedule_fingerprint == 0;
         const auto prefill_schedule = prefillScheduleWorkload();
         const bool valid_prefill_schedule =
-            prefill_schedule_reserved == 0 &&
             prefill_schedule.valid() &&
             prefill_schedule.source == ExpertHistogramSource::PrefillChunk &&
             prefill_schedule.speculative_depth == 0;
         if (magic != kMagic || abi_version != kABIVersion ||
             !validAction(action) || !topologyIdentity().valid() ||
             request_generation == 0 || command_id == 0 ||
-            transaction_ordinal == 0 || placement_epoch == 0 ||
+            transaction_ordinal == 0 || !commandIdentity().valid() ||
             (!no_prefill_schedule && !valid_prefill_schedule))
         {
             return false;
@@ -468,6 +577,12 @@ namespace llaminar2
         case MoEOverlayInferenceGraphRole::MainDecode:
             return logical_rows_per_request == 1 && draft_depth == -1 &&
                    sidecar_depth == -1;
+        case MoEOverlayInferenceGraphRole::GenerationAdmission:
+        case MoEOverlayInferenceGraphRole::OrdinaryForwardOnly:
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+            return logical_rows_per_request == 1 && physical_rows_per_request == 1 &&
+                   draft_depth == -1 && sidecar_depth == -1;
         case MoEOverlayInferenceGraphRole::MTPDraft:
             return logical_rows_per_request == 1 && draft_depth > 0 &&
                    sidecar_depth >= 0 && sidecar_depth < draft_depth;
@@ -490,6 +605,7 @@ namespace llaminar2
                << ",transaction=" << transaction_ordinal
                << ",logical_step=" << logical_step_id
                << ",workspace_generation=" << workspace_generation
+               << ",placement_authority=" << static_cast<std::uint32_t>(placement_identity_kind)
                << ",placement_epoch=" << placement_epoch
                << ",retired_decode_progress_tokens="
                << retired_decode_progress_tokens
@@ -580,7 +696,7 @@ namespace llaminar2
                 carries_prefill_schedule
                     ? prefill_schedule_workload.transaction_count
                     : 0,
-            .prefill_schedule_reserved = 0,
+            .placement_identity_kind = command.placement_identity_kind,
             .prefill_schedule_fingerprint =
                 carries_prefill_schedule
                     ? prefill_schedule_workload.schedule_fingerprint
@@ -629,6 +745,7 @@ namespace llaminar2
             .draft_depth = -1,
             .sidecar_depth = -1,
             .error_code = error_code,
+            .placement_identity_kind = command.placement_identity_kind,
         };
         if (!topology.valid() || !command.valid() || !ticket.valid() ||
             placement_epoch < command.initial_placement_epoch)
@@ -652,12 +769,90 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay inference transaction protocol requires valid topology, positive row/request capacities, and non-negative MTP depth");
         }
+        original_slot_domain_ = std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>(
+            new MoEOverlayInferenceOriginalSlotDomain(this, slots_.size(), config_.max_mtp_draft_depth, config_.topology));
+    }
+
+    MoEOverlayInferenceTransactionProtocol::~MoEOverlayInferenceTransactionProtocol()
+    {
+        if (original_slot_domain_)
+        {
+            std::lock_guard lock(original_slot_domain_->ownership_mutex_);
+            if (original_slot_domain_->owner_ == this)
+                original_slot_domain_->owner_ = nullptr;
+        }
+    }
+
+    const MoEOverlayInferenceTransactionProtocol &
+    MoEOverlayInferenceOriginalSlotDomain::requireRetainedOwner(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        if (!owner_ || slot.domain().get() != this ||
+            slot.domain().owner_before(owner_->original_slot_domain_) ||
+            owner_->original_slot_domain_.owner_before(slot.domain()) ||
+            slot.index() >= owner_->slots_.size())
+            throw std::logic_error("Native resource names a foreign or withdrawn original slot owner");
+        const auto &original = owner_->slots_[slot.index()];
+        if (original.state == MoEOverlayInferenceTransactionSlotState::Available ||
+            original.ticket != slot.ticket())
+            throw std::logic_error("Native resource names a retired or replaced original publication slot");
+        return *owner_;
+    }
+
+    void MoEOverlayInferenceOriginalSlotDomain::requireCurrent(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        std::lock_guard lock(ownership_mutex_);
+        (void)requireRetainedOwner(slot);
+    }
+
+    void MoEOverlayInferenceOriginalSlotDomain::requireActiveOwnerLocked(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        const auto &owner = requireRetainedOwner(slot);
+        if (owner.state_ != MoEOverlayInferenceProtocolState::Active ||
+            owner.slots_[slot.index()].state != MoEOverlayInferenceTransactionSlotState::Submitted)
+            throw std::logic_error("Native execution admission lost its original active submitted protocol slot");
+    }
+
+    void MoEOverlayInferenceOriginalSlotDomain::requireActiveAdmission(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        std::lock_guard lock(ownership_mutex_);
+        requireActiveOwnerLocked(slot);
+    }
+
+    std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>
+    MoEOverlayInferenceTransactionProtocol::originalSlotDomain() const
+    {
+        std::lock_guard lock(original_slot_domain_->ownership_mutex_);
+        if (original_slot_domain_->owner_ != this)
+            throw std::logic_error("Native invocation slots require their original protocol owner");
+        return original_slot_domain_;
+    }
+
+    MoEOverlayInferenceOriginalSlot
+    MoEOverlayInferenceTransactionProtocol::originalSubmittedSlot(
+        const MoEOverlayInferenceTransactionTicket &ticket) const
+    {
+        const auto domain = originalSlotDomain();
+        std::lock_guard lock(domain->ownership_mutex_);
+        for (std::size_t index = 0; index < slots_.size(); ++index)
+        {
+            const auto &slot = slots_[index];
+            if (state_ == MoEOverlayInferenceProtocolState::Active &&
+                slot.state == MoEOverlayInferenceTransactionSlotState::Submitted &&
+                slot.ticket == ticket)
+                return MoEOverlayInferenceOriginalSlot(domain, index, ticket);
+        }
+        throw std::invalid_argument("Native invocation has no exact original submitted protocol slot");
     }
 
     bool MoEOverlayInferenceTransactionProtocol::beginCommand(
         const MoEOverlayInferenceCommandIdentity &command,
         std::string *error)
     {
+        std::lock_guard native_slot_lock(original_slot_domain_->ownership_mutex_);
         if (error)
             error->clear();
         if (!command.valid())
@@ -708,6 +903,8 @@ namespace llaminar2
         }
         if (ticket.transaction_ordinal != next_transaction_ordinal_)
             return "ExpertOverlay transaction ordinal is duplicate or out of order";
+        if (ticket.placement_identity_kind != active_command_.placement_identity_kind)
+            return "ExpertOverlay transaction changed its placement authority";
         if (ticket.placement_epoch < current_placement_epoch_)
             return "ExpertOverlay transaction regressed its placement epoch";
         if (ticket.action == MoEOverlayInferenceTransactionAction::Execute)
@@ -736,6 +933,7 @@ namespace llaminar2
     MoEOverlayInferenceTransactionProtocol::accept(
         const MoEOverlayInferenceTransactionTicket &ticket)
     {
+        std::lock_guard native_slot_lock(original_slot_domain_->ownership_mutex_);
         MoEOverlayInferenceAdmission admission;
         admission.error = validateExecutionTicket(ticket);
         if (!admission.error.empty())
@@ -804,6 +1002,7 @@ namespace llaminar2
         MoEOverlayInferenceTransactionSlotState next,
         std::string *error)
     {
+        std::lock_guard native_slot_lock(original_slot_domain_->ownership_mutex_);
         if (error)
             error->clear();
         if (slot_index >= slots_.size())

@@ -52,9 +52,9 @@
 
 ### Task 1.1: Create AVX2 GEMV kernel file
 - **New file**: `src/v2/kernels/cpu/gemm/CPUNativeAVX2Gemv.h`
-- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h` (1630 lines, 39 `vpdpbusd` calls)
+- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemv.h` (1630 lines, 39 `vpdpbusd` calls)
 - **Approach**:
-  1. Copy the structure of `CPUNativeVNNIGemv.h`
+  1. Copy the structure of `CPUNativeQuantisedGemv.h`
   2. Replace all `_mm512_dpbusd_epi32(acc, a, b)` with the AVX2 two-instruction equivalent:
      ```cpp
      // AVX2 emulation of vpdpbusd (u8 × i8 → i32 accumulate)
@@ -66,29 +66,29 @@
   4. Adjust loop counts: ZMM processes 64 bytes, YMM processes 32 bytes, so outer loops iterate 2× more
   5. Replace `_mm512_reduce_add_epi32()` with AVX2 horizontal reduction
   6. Handle tail differently (AVX512 mask registers don't exist in AVX2)
-- **Key functions to port** (all in `CPUNativeVNNIGemv.h`):
-  - `gemv_native_vnni_avx512_chunk_native()` (line ~140–400) — core VNNI GEMV microkernel
-  - `gemv_native_vnni_preq()` (line ~420–650) — pre-quantized activation path
-  - `gemv_native_vnni()` (line ~665–690) — top-level dispatcher
+- **Key functions to port** (all in `CPUNativeQuantisedGemv.h`):
+  - `gemv_native_quantised_avx512_chunk_native()` (line ~140–400) — core VNNI GEMV microkernel
+  - `gemv_native_quantised_preq()` (line ~420–650) — pre-quantized activation path
+  - `gemv_native_quantised()` (line ~665–690) — top-level dispatcher
   - `q8_0_native_gemv()` (line ~650–665) — Q8_0 native bypass path
-  - `gemv_native_vnni_avx512_chunk_native_scalar()` (line ~65–130) — scalar reference (keep as-is for validation)
+  - `gemv_native_quantised_avx512_chunk_native_scalar()` (line ~65–130) — scalar reference (keep as-is for validation)
 - `[ ]` Complete
 
 ### Task 1.2: Create AVX2 weight packer
 - **New file**: `src/v2/kernels/cpu/gemm/CPUNativeAVX2WeightPacker.h`
-- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h` (1132 lines)
+- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h` (1132 lines)
 - **Approach**: The VNNI weight packer interleaves bytes for VNNI lane order. AVX2 needs the same interleave but for 32-byte (256-bit) lanes instead of 64-byte (512-bit). The packed format may differ.
 - **Decision point**: Can AVX2 use the same packed format as VNNI (just process half at a time), or does it need a different interleave? Using the same format is simpler but may leave performance on the table. Start with the same format.
 - `[ ]` Complete
 
 ### Task 1.3: Create AVX2 tile config
 - **New file**: `src/v2/kernels/cpu/gemm/CPUNativeAVX2TileConfig.h`
-- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeVNNITileConfig.h` (~200 lines)
+- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeQuantisedTileConfig.h` (~200 lines)
 - **Change**: Tile sizes based on YMM (256-bit) register count and width instead of ZMM (512-bit).
 - `[ ]` Complete
 
 ### Task 1.4: Add dispatch in GEMM kernel
-- **File**: `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` (586 lines)
+- **File**: `src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h` (586 lines)
 - **Change**: At the top-level `multiply_tensor()` and `multiply_fused_tensor()` methods, add runtime dispatch:
   ```cpp
   if (cpu_supports_avx512_vnni()) {
@@ -105,7 +105,7 @@
 
 ### Task 1.5: Update KernelFactory dispatch
 - **File**: `src/v2/kernels/KernelFactory.cpp` (line ~578–630)
-- **Change**: When `__AVX512VNNI__` is not defined, the `createGemm()` for quantized tensors should still create a working kernel (using AVX2 GEMM). Currently it unconditionally creates `CPUNativeVNNIGemmKernel`.
+- **Change**: When `__AVX512VNNI__` is not defined, the `createGemm()` for quantized tensors should still create a working kernel (using AVX2 GEMM). Currently it unconditionally creates `CPUNativeQuantisedGemmKernel`.
 - `[ ]` Complete
 
 ### Task 1.6: Test parity
@@ -297,10 +297,10 @@
 | File | Lines | What | Current AVX2 | Task |
 |------|-------|------|-------------|------|
 | `src/v2/CMakeLists.txt` | 61 | `-march=native` hardcoded | None | 0.1 |
-| `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h` | 1630 | VNNI GEMV (M=1 decode) | None (39 `vpdpbusd`) | 1.1 |
-| `src/v2/kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h` | 1132 | VNNI weight interleave | Partial (14 AVX2) | 1.2 |
-| `src/v2/kernels/cpu/gemm/CPUNativeVNNITileConfig.h` | ~200 | ZMM tile sizing | None | 1.3 |
-| `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` | 586 | GEMM top-level dispatch | None | 1.4 |
+| `src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemv.h` | 1630 | VNNI GEMV (M=1 decode) | None (39 `vpdpbusd`) | 1.1 |
+| `src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h` | 1132 | VNNI weight interleave | Partial (14 AVX2) | 1.2 |
+| `src/v2/kernels/cpu/gemm/CPUNativeQuantisedTileConfig.h` | ~200 | ZMM tile sizing | None | 1.3 |
+| `src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h` | 586 | GEMM top-level dispatch | None | 1.4 |
 | `src/v2/kernels/KernelFactory.cpp` | ~580–630 | GEMM factory dispatch | None | 1.5 |
 
 ### P1 — Important for performance (functional scalar fallback exists)

@@ -10,6 +10,7 @@ This scoped PR receipt cannot certify complete production prerequisites.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import subprocess
@@ -20,7 +21,7 @@ from production_artifacts import write_json
 from run_production_parity_campaigns import (
     PreflightExecutionLane, discover_production_parity_unit_tests,
     discover_production_test_preflight_registrations, preflight_execution_plan,
-    _preflight_name_regex,
+    _preflight_index_selection,
 )
 
 
@@ -49,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     # Admission authenticates their installation; only the two lanes below run.
     validate(args.installed_build_receipt, build, InstalledTestScope.PRODUCTION)
     units = discover_production_parity_unit_tests(build)
-    plan = preflight_execution_plan(discover_production_test_preflight_registrations(build))
+    registrations = discover_production_test_preflight_registrations(build)
+    plan = preflight_execution_plan(registrations)
     hosts = plan[PreflightExecutionLane.HOST]
     if not units or not hosts:
         raise ValueError("PR gate requires nonempty Unit and host preflight inventories")
@@ -61,12 +63,16 @@ def main(argv: list[str] | None = None) -> int:
     # serial resource ownership; each test retains its own CMake worker budget.
     for lane, tests, parallel in (("unit", units, len(os.sched_getaffinity(0))),
                                    ("host", hosts, 1)):
-        result = subprocess.run([
-            "ctest", "--test-dir", str(build), "--output-on-failure", "--parallel",
-            str(parallel), "--no-tests=error", "-R", _preflight_name_regex(tests),
-            "--output-log", str(output / f"{lane}.log"),
-            "--output-junit", str(output / f"{lane}.xml"),
-        ], check=False)
+        with ExitStack() as selectors:
+            selection = (["-L", "^Unit$"] if lane == "unit" else
+                         ["-I", str(selectors.enter_context(
+                             _preflight_index_selection(build, registrations, tests)))])
+            result = subprocess.run([
+                "ctest", "--test-dir", str(build), "--output-on-failure", "--parallel",
+                str(parallel), "--no-tests=error", *selection,
+                "--output-log", str(output / f"{lane}.log"),
+                "--output-junit", str(output / f"{lane}.xml"),
+            ], check=False)
         evidence = {"complete": False, "return_code": result.returncode,
                     "tests": tests, "test_count": len(tests)}
         report["lanes"][lane] = evidence

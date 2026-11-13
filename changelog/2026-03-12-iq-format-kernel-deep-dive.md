@@ -77,7 +77,7 @@ Compared to the corresponding S/XS variants:
 
 That reduces both metadata traffic and bitfield manipulation.
 
-The ROCm ISA analysis in `src/v2/kernels/rocm/gemm/README.native-vnni-isa-analysis.md` quantifies the effect:
+The ROCm ISA analysis in `src/v2/kernels/rocm/gemm/README.native-quantised-isa-analysis.md` quantifies the effect:
 
 | Format | Global Loads | Decode ALU |
 |--------|--------------|------------|

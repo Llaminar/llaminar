@@ -302,17 +302,17 @@ namespace llaminar2::test
         }
 
         /** @brief Materialize deterministic final Q4_0 CPU execution bytes. */
-        cpu::native_vnni::CPUNativeVNNIPackedWeights cpuProjectionBytes()
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights cpuProjectionBytes()
         {
-            using namespace cpu::native_vnni;
-            CPUNativeVNNIPackedWeights packed;
+            using namespace cpu::native_quantised;
+            CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
-            packed.codebook_id = native_vnni_formats::Q4_0.codebook_id;
+            packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
             packed.payload_bytes = 16;
-            packed.encoding = CPUNativeVNNIEncoding::NibbleLUT;
+            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
@@ -335,16 +335,16 @@ namespace llaminar2::test
         }
 
         /** @brief Materialize deterministic expanded asymmetric Q5_1 bytes. */
-        cpu::native_vnni::CPUNativeVNNIPackedWeights
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights
         cpuAsymmetricProjectionBytes()
         {
-            using namespace cpu::native_vnni;
-            CPUNativeVNNIPackedWeights packed;
+            using namespace cpu::native_quantised;
+            CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
-            packed.codebook_id = native_vnni_formats::Q5_1.codebook_id;
+            packed.codebook_id = native_quantised_formats::Q5_1.codebook_id;
             packed.payload_bytes = 32;
             packed.encoding = preparedEncodingForCodebook(
                 packed.codebook_id);
@@ -373,32 +373,15 @@ namespace llaminar2::test
         Test__MoEOverlayDistributedResidencyProtocol,
         RemoteProjectionLaneBudgetScalesWithConfiguredCyclesAndRejectsOverflow)
     {
-        const MoEOverlayRemoteProjectionLaneBudget one_cycle{
-            .maximum_participants_per_cycle = 3,
-            .maximum_concurrent_cycles = 1,
-            .projections_per_expert = 3,
-        };
-        const MoEOverlayRemoteProjectionLaneBudget two_cycles{
-            .maximum_participants_per_cycle = 3,
-            .maximum_concurrent_cycles = 2,
-            .projections_per_expert = 3,
-        };
+        const MoEOverlayRemoteProjectionLaneBudget one_cycle = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(3, 1, 3);
+        const MoEOverlayRemoteProjectionLaneBudget two_cycles = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(3, 2, 3);
         ASSERT_TRUE(one_cycle.projectionOperationCount().has_value());
         ASSERT_TRUE(two_cycles.projectionOperationCount().has_value());
         EXPECT_EQ(*one_cycle.projectionOperationCount(), 9u);
         EXPECT_EQ(*two_cycles.projectionOperationCount(), 18u);
 
-        const MoEOverlayRemoteProjectionLaneBudget zero_participants{
-            .maximum_participants_per_cycle = 0,
-            .maximum_concurrent_cycles = 2,
-            .projections_per_expert = 3,
-        };
-        const MoEOverlayRemoteProjectionLaneBudget overflowing{
-            .maximum_participants_per_cycle =
-                std::numeric_limits<std::size_t>::max(),
-            .maximum_concurrent_cycles = 2,
-            .projections_per_expert = 3,
-        };
+        const MoEOverlayRemoteProjectionLaneBudget zero_participants = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(0, 2, 3);
+        const MoEOverlayRemoteProjectionLaneBudget overflowing = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(std::numeric_limits<std::size_t>::max(), 2, 3);
         EXPECT_FALSE(
             zero_participants.projectionOperationCount().has_value());
         EXPECT_FALSE(overflowing.projectionOperationCount().has_value());
@@ -415,7 +398,7 @@ namespace llaminar2::test
         const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
             identity, cpu_bytes, /*maximum_chunk_bytes=*/73);
         ASSERT_TRUE(manifest.valid());
-        EXPECT_EQ(manifest.region_bytes[0], cpu_bytes.native_interleaved.size());
+        EXPECT_EQ(manifest.region_bytes[0],1280u); // N32/K64 live columns, not2560-byte resident storage.
         EXPECT_EQ(manifest.region_bytes[1], 0u);
 
         std::array<
@@ -454,7 +437,8 @@ namespace llaminar2::test
         MoEOverlayRemoteProjectionChunkCursor cursor(manifest, regions);
         MoEOverlayRemoteProjectionChunkValidator validator(manifest);
         std::uint64_t chunks = 0;
-        while (auto chunk = cursor.takeNext())
+        std::vector<uint8_t> staging(manifest.maximum_chunk_bytes);
+        while (auto chunk = cursor.takeNext(staging))
         {
             EXPECT_EQ(chunk->header.sequence, chunks);
             EXPECT_LE(chunk->payload.size(), 73u);
@@ -500,9 +484,9 @@ namespace llaminar2::test
         auto fixture = makeTransaction();
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cuda(1), DeviceId::rocm(0));
-        const NativeVnniSourceIdentity source_identity{
-            .codebook_id = native_vnni_formats::Q8_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q8_0.is_superblock,
+        const NativeQuantisedSourceIdentity source_identity{
+            .codebook_id = native_quantised_formats::Q8_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q8_0.is_superblock,
             .present = true,
         };
         std::array<std::uint8_t, 1> byte{};
@@ -526,7 +510,7 @@ namespace llaminar2::test
             identity, normalized, source_identity, 256);
         ASSERT_TRUE(manifest.valid());
         EXPECT_EQ(manifest.source_codebook_id,
-                  native_vnni_formats::Q8_0.codebook_id);
+                  native_quantised_formats::Q8_0.codebook_id);
         EXPECT_EQ(manifest.gpu_codebook_id, 19u)
             << "A normalized promoted GPU expert must not be relabeled as its GGUF codebook";
         EXPECT_EQ(manifest.region_bytes[0], normalized.vnni_bytes);
@@ -617,7 +601,7 @@ namespace llaminar2::test
 
         auto quantized_masquerade = manifest;
         quantized_masquerade.packing =
-            MoEOverlayRemoteProjectionPacking::GpuSeparatedNativeVnni;
+            MoEOverlayRemoteProjectionPacking::GpuSeparatedNativeQuantised;
         quantized_masquerade.manifest_hash =
             quantized_masquerade.computedHash();
         EXPECT_FALSE(quantized_masquerade.valid(&error));
@@ -658,7 +642,7 @@ namespace llaminar2::test
         partial.manifest_hash = partial.computedHash();
         std::string error;
         EXPECT_FALSE(partial.valid(&error));
-        EXPECT_NE(error.find("complete NativeVNNI units"), std::string::npos);
+        EXPECT_NE(error.find("complete NativeQuantised units"), std::string::npos);
         EXPECT_THROW(
             {
                 [[maybe_unused]] const auto rejected =
@@ -688,16 +672,20 @@ namespace llaminar2::test
         MoEOverlayHostRemoteProjectionSource source(
             manifest, regions, std::make_shared<int>(1));
 
+        EXPECT_EQ(cpu_bytes.native_interleaved.size(),2560u);
+        EXPECT_EQ(manifest.total_bytes,1280u);
+        EXPECT_EQ(manifest.cpu_wire_columns_per_unit,3u);
+        std::vector<uint8_t> staging(manifest.maximum_chunk_bytes,0xa5);
         MoEOverlayRemoteProjectionChunkView first;
         std::string error;
         ASSERT_EQ(
-            source.pollNextChunk(&first, &error),
+            source.pollNextChunk(&first, &error,staging),
             MoEOverlayResidencyWaveProgress::Ready)
             << error;
         ASSERT_FALSE(first.payload.empty());
         MoEOverlayRemoteProjectionChunkView forbidden_reuse;
         EXPECT_EQ(
-            source.pollNextChunk(&forbidden_reuse, &error),
+            source.pollNextChunk(&forbidden_reuse, &error,staging),
             MoEOverlayResidencyWaveProgress::Failed);
         EXPECT_NE(error.find("still owned by MPI"), std::string::npos);
 
@@ -708,21 +696,22 @@ namespace llaminar2::test
             MoEOverlayRemoteProjectionChunkHeader{}, &error));
         ASSERT_TRUE(source.acknowledgeChunkSent(first.header, &error)) << error;
 
-        std::uint64_t acknowledged_chunks = 1;
-        while (acknowledged_chunks * manifest.maximum_chunk_bytes <
-               manifest.total_bytes)
+        std::uint64_t acknowledged_chunks = 1,acknowledged_bytes=first.payload.size();
+        while (acknowledged_bytes < manifest.total_bytes)
         {
             MoEOverlayRemoteProjectionChunkView chunk;
             ASSERT_EQ(
-                source.pollNextChunk(&chunk, &error),
+                source.pollNextChunk(&chunk, &error,staging),
                 MoEOverlayResidencyWaveProgress::Ready)
                 << error;
             ASSERT_EQ(chunk.header.sequence, acknowledged_chunks);
             ASSERT_TRUE(source.acknowledgeChunkSent(chunk.header, &error))
                 << error;
+            acknowledged_bytes+=chunk.payload.size();
             ++acknowledged_chunks;
         }
         EXPECT_GT(acknowledged_chunks, 1u);
+        EXPECT_EQ(acknowledged_bytes,1280u);
     }
 
     TEST(
@@ -733,8 +722,8 @@ namespace llaminar2::test
         const auto cpu_bytes = cpuAsymmetricProjectionBytes();
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cuda(0), DeviceId::cpu());
-        const NativeVnniFormatInfo *source_format =
-            native_vnni_formats::forSourceIdentity(
+        const NativeQuantisedFormatInfo *source_format =
+            native_quantised_formats::forSourceIdentity(
                 cpu_bytes.codebook_id, cpu_bytes.is_superblock);
         ASSERT_NE(source_format, nullptr);
         const auto canonical_stream =
@@ -751,7 +740,7 @@ namespace llaminar2::test
             identity, canonical_stream, /*maximum_chunk_bytes=*/4096);
         auto live = expected;
         /* Q5_1 demoted through CPU promotes as normalized INT8+minimum. */
-        live.gpu_codebook_id = kNativeVnniExpandedInt8MinCodebook;
+        live.gpu_codebook_id = kNativeQuantisedExpandedInt8MinCodebook;
         live.gpu_payload_bytes_per_block = 32;
         live.gpu_is_asymmetric = 1;
         live.gpu_has_emins = 0;
@@ -956,7 +945,7 @@ namespace llaminar2::test
             .plan = {.expected_epoch = 1, .num_layers = 1, .num_experts = 4,
                 .histogram_window = window,
                 .entries = std::vector<MoEOverlayAuthoritativeResidencyEntry>(4,
-                    {.candidate_tier_idx = 0, .candidate_owner_participant = 0})},
+                    {.candidate_tier_idx = 0, .candidate_target = MoEOverlayRouteTarget::whole(0)})},
             .execution_fingerprint = {.low = 1, .high = 2},
             .policy_fingerprint = {.low = 3, .high = 4},
         };
@@ -969,7 +958,7 @@ namespace llaminar2::test
         ASSERT_NE(decoded.plan.histogram_window->transaction_demand, nullptr);
         EXPECT_EQ(fingerprintDecodeExpertHistogramWindow(*decoded.plan.histogram_window),
                   fingerprintDecodeExpertHistogramWindow(*window));
-        EXPECT_EQ(decoded.plan.entries.back().candidate_owner_participant, 0);
+        EXPECT_EQ(decoded.plan.entries.back().candidate_target.word(), 0);
         auto alternative = proposal;
         alternative.plan.histogram_window = std::make_shared<const DecodeExpertHistogramWindow>(
             demandWindow(admission, {0, 3, 1, 2}));
@@ -1712,3 +1701,5 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 } // namespace llaminar2::test
+
+#include "ExpertTierRectangularRemoteContract.inc"

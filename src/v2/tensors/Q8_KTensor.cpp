@@ -2,6 +2,8 @@
  * @file Q8_KTensor.cpp
  * @brief Q8_K quantized tensor implementation (8-bit K-quant, 256-element super-blocks)
  * @author David Sanftenberg
+ * Aligned final storage keeps its original CPU allocator identity and lease;
+ * row views inherit that endpoint without copying native blocks.
  */
 
 #include "TensorClasses.h"
@@ -33,16 +35,18 @@ namespace llaminar2
 
     Q8_KTensor::Q8_KTensor(
         const std::vector<size_t> &shape,
-        AlignedVector<uint8_t> raw_data)
+        AlignedVector<uint8_t> raw_data, DeviceId device)
         : shape_(shape),
           is_view_(false),
           raw_data_(std::move(raw_data)),
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
-          device_(DeviceId::cpu()),
+          device_(device),
           device_blocks_(nullptr)
     {
+        if (!device.is_valid() || !device.is_cpu())
+            throw std::invalid_argument("Q8_KTensor owned native storage requires its exact CPU allocator");
         if (shape.empty())
         {
             throw std::invalid_argument("Q8_KTensor: shape cannot be empty");
@@ -75,7 +79,7 @@ namespace llaminar2
           raw_data_ptr_(parent_raw_data),
           view_byte_offset_(byte_offset),
           parent_(parent),
-          device_(DeviceId::cpu()),
+          device_(parent ? parent->home_device() : DeviceId::cpu()),
           device_blocks_(nullptr)
     {
     }

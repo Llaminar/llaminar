@@ -64,6 +64,14 @@ namespace llaminar2
         static NodeTopology detect();
 
         /**
+         * Parse a complete decimal CPU list (e.g., "0-7,16-23").
+         * @param cpu_list_str CPU list string
+         * @return CPU IDs, or empty if any token is malformed, negative or out of range.
+         */
+        static std::vector<int> parseCPUListString(const std::string &cpu_list_str);
+
+
+        /**
          * Create topology from explicit configuration (for testing)
          * @param num_sockets Number of CPU sockets
          * @param numa_nodes_per_socket NUMA nodes per socket
@@ -187,13 +195,6 @@ namespace llaminar2
          * @return Vector of CPU IDs
          */
         static std::vector<int> parseCPUList(const std::string &path);
-
-        /**
-         * Parse a CPU list string (e.g., "0-7,16-23")
-         * @param cpu_list_str CPU list string
-         * @return Vector of CPU IDs
-         */
-        static std::vector<int> parseCPUListString(const std::string &cpu_list_str);
 
         /**
          * Parse memory info from sysfs

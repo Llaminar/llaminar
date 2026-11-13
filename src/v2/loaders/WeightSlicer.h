@@ -50,7 +50,7 @@ namespace llaminar2
          */
         WeightSlicer(const ModelDimensions &dimensions,
                      const WeightShardingConfig &sharding_config,
-                     std::shared_ptr<TensorParallelConfig> tp_config = nullptr);
+                     std::shared_ptr<const TensorParallelConfig> tp_config = nullptr);
 
         // =========================================================================
         // IWeightSlicer implementation
@@ -168,7 +168,7 @@ namespace llaminar2
         // Immutable configuration (set once at construction)
         ModelDimensions dimensions_;
         WeightShardingConfig sharding_config_;
-        std::shared_ptr<TensorParallelConfig> tp_config_;
+        std::shared_ptr<const TensorParallelConfig> tp_config_;
     };
 
 } // namespace llaminar2

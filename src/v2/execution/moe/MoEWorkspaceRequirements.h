@@ -2,7 +2,7 @@
 
 #include "../local_execution/device/WorkspaceDescriptor.h"
 #include "../../tensors/TensorKernels.h"
-#include "../../kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "../../kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "../../kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 
 #include <algorithm>
@@ -282,9 +282,9 @@ namespace llaminar2
             add(reqs, PREFILL_UP, total_slots * static_cast<std::size_t>(intermediate) * sizeof(float));
 
             constexpr int kMaxGateUpPartitions =
-                NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+                NativeQuantisedGroupedDecodePolicy::maximum_k_partitions;
             constexpr int kMaxDownPartitions =
-                NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+                NativeQuantisedGroupedDecodePolicy::maximum_k_partitions;
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
             const std::size_t verifier_splitk_slots =
                 static_cast<std::size_t>(std::min(max_seq_len, kVerifierSplitKTileRows)) *
@@ -357,7 +357,7 @@ namespace llaminar2
             const std::size_t table_descs =
                 static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
                 static_cast<std::size_t>(num_experts) *
-                sizeof(DeviceNativeVNNIMatrixDesc);
+                sizeof(DeviceNativeQuantisedMatrixDesc);
             add(reqs, CUDA_GROUPED_GATE_DESC_TABLES, table_descs);
             add(reqs, CUDA_GROUPED_UP_DESC_TABLES, table_descs);
             add(reqs, CUDA_GROUPED_DOWN_DESC_TABLES, table_descs);
@@ -459,11 +459,11 @@ namespace llaminar2
                 static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
                     kRuntimePointerArrayMaxTopK * sizeof(float *));
             add(reqs, ROCM_DECODE_DOWN_DESCS,
-                decode_slots * sizeof(DeviceNativeVNNIMatrixDesc));
+                decode_slots * sizeof(DeviceNativeQuantisedMatrixDesc));
             const std::size_t table_descs =
                 static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
                 static_cast<std::size_t>(num_experts) *
-                sizeof(DeviceNativeVNNIMatrixDesc);
+                sizeof(DeviceNativeQuantisedMatrixDesc);
             add(reqs, ROCM_GROUPED_GATE_DESC_TABLES, table_descs);
             add(reqs, ROCM_GROUPED_UP_DESC_TABLES, table_descs);
             add(reqs, ROCM_GROUPED_DOWN_DESC_TABLES, table_descs);

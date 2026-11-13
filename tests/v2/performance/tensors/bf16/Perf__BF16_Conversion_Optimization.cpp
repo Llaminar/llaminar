@@ -14,6 +14,7 @@
  * Metrics: GB/s bandwidth, speedup vs baseline, CPU cycles/element
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <chrono>
@@ -542,6 +543,9 @@ namespace
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();

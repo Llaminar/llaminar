@@ -9,7 +9,7 @@
  * allocating a backend or treating a diagnostic byte counter as an authority.
  */
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -23,8 +23,8 @@ namespace llaminar2
         std::vector<ExpertWeightFormat> formats()
         {
             std::vector<ExpertWeightFormat> result;
-            for (const auto &source : native_vnni_formats::kAllSourceFormats)
-                result.push_back(ExpertWeightFormat::nativeVnni({
+            for (const auto &source : native_quantised_formats::kAllSourceFormats)
+                result.push_back(ExpertWeightFormat::nativeQuantised({
                     .codebook_id = source.metadata->codebook_id,
                     .is_superblock = source.metadata->is_superblock, .present = true}));
             for (auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
@@ -40,8 +40,8 @@ namespace llaminar2
         {
             if (format.isFloating())
                 return aligned(std::size_t(n) * k * format.floatingElementBytes());
-            const auto *source = native_vnni_formats::forSourceIdentity(
-                format.native_vnni.codebook_id, format.native_vnni.is_superblock);
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                format.native_quantised.codebook_id, format.native_quantised.is_superblock);
             const auto packing = reusableDeviceVnniAllocationFormat(*source);
             const auto blocks = std::size_t(n) * (k / 32);
             return aligned(blocks * packing.payload_bytes_per_block) + aligned(blocks * 2u) +
@@ -114,7 +114,7 @@ namespace llaminar2
         for (int experts : {1, 24})
         {
             SCOPED_TRACE(::testing::Message() << static_cast<int>(type) << '/' << degree << '/' << experts
-                << '/' << static_cast<int>(format.kind) << '/' << format.native_vnni.codebook_id);
+                << '/' << static_cast<int>(format.kind) << '/' << format.native_quantised.codebook_id);
             const auto source = manifest(format);
             const auto split_plan = plan(type, degree, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
             auto input = MoEOverlayCapacityAdmission::buildResolverInput(split_plan, experts, source, budgets(split_plan), {});

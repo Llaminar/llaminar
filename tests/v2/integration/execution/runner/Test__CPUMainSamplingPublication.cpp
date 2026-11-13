@@ -6,6 +6,8 @@
  * is scripted separately so unwanted sampler collectives fail without hanging.
  */
 #include "utils/CPUForwardSamplingTestFixture.h"
+#include "utils/CPUOrchestratorTestAdmission.h"
+#include "planning/KVCacheMemoryEstimator.h"
 #include "config/TensorParallelConfig.h"
 #include "utils/MPIContext.h"
 #include <algorithm>
@@ -59,7 +61,19 @@ TEST(CPUMainSamplingPublication, PublishedLogitsOwnership)
         // their owner first so reverse-order destruction retires the runner.
         PreparedWeightStore prepared;
         auto builder = std::make_shared<QwenStandardGraph>(fixture.config, mpi);
-        DeviceGraphOrchestrator runner(builder, mpi);
+        auto dependencies = cpuInferenceFixtureDependencies(builder, mpi, 1,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers));
+        // Vocabulary gathering has two participants; attention remains a full
+        // local graph with no declared cache shard on either MPI rank.
+        ASSERT_LE(fixture.config.local_n_kv_heads, 0);
+        EXPECT_EQ(dependencies.physical_memory_authority->plannedBytes(
+            DeviceId::cpu(), PhysicalMemoryOwner::KVCache),
+            KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+                fixture.config.n_layers, 1, fixture.config.max_seq_len,
+                fixture.config.n_kv_heads, fixture.config.head_dim, "fp32", DeviceId::cpu()));
+        auto owner = DeviceGraphOrchestrator::createForTest(std::move(dependencies));
+        auto &runner = *owner;
         auto peer = std::make_shared<ScriptedGlobalTPContext>();
         runner.setGlobalTPContext(peer);
         ASSERT_TRUE(runner.initializeInferenceStateFromArena(

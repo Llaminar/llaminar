@@ -2,7 +2,7 @@
  * @file ExpertTierGpuPeerTransferLane.h
  * @brief Persistent event-polled packed transfer within one GPU backend.
  *
- * CUDA-to-CUDA and ROCm-to-ROCm tiers share the separated NativeVNNI layout,
+ * CUDA-to-CUDA and ROCm-to-ROCm tiers share the separated NativeQuantised layout,
  * so migration is a direct asynchronous blob copy.  This lane owns a named
  * destination auxiliary stream and one reusable completion event.  It joins an
  * exact source producer event when necessary, submits all separated regions,
@@ -25,6 +25,7 @@
 namespace llaminar2
 {
     class IBackend;
+    class NativePeerTransferEventOwnership;
     class IWorkerGPUContext;
 
     /** @brief Host-visible lifecycle of one same-backend GPU transfer. */
@@ -79,6 +80,16 @@ namespace llaminar2
         };
 
         /**
+         * @brief Price the exact fixed native event family before peer-lane materialization.
+         * @param host Original CPU allocator in the GPU owner's world rank.
+         * @param gpu Original destination GPU allocator that owns completion and timing handles.
+         * @param timing Whether the lane retains its two real timestamp events in addition to completion.
+         * @return Canonical original-PMA contribution; it creates no native handle or second ledger.
+         * @throws std::exception For invalid original ownership or an unavailable typed resource family.
+         */
+        static PhysicalMemoryPlan nativeEventsBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,bool timing);
+
+        /**
          * @brief Validate and retain one same-backend directed edge.
          * @throws std::invalid_argument For non-GPU, cross-backend, or unnamed
          *         topology.
@@ -96,7 +107,9 @@ namespace llaminar2
         /**
          * @brief Bind the pooled destination stream and create reusable events.
          * @param error Optional exact setup failure.
-         * @return True when the complete persistent lane exists.
+         * @return True when the same complete persistent lane exists.
+         * A failed setup is absorbing; callers must preserve its first error,
+         * not recreate events against the already-spent original population.
          */
         bool materialize(std::string *error = nullptr) noexcept;
 
@@ -149,6 +162,10 @@ namespace llaminar2
             return !work_may_be_in_flight_;
         }
 
+        /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
+        [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
+        { return submitted_bytes_; }
+
         /** @return Cumulative non-blocking movement evidence. */
         [[nodiscard]] ExpertTierGpuPeerTransferLaneStats stats() const noexcept
         {
@@ -193,8 +210,14 @@ namespace llaminar2
         /** Release resources through the destination runtime without waiting. */
         void releaseQuiescentResources() noexcept;
 
+        /** Setup is one-shot; a failed native attempt cannot silently spend another lifetime's BOM. */
+        enum class MaterializationPhase { Fresh, Ready, Failed };
+        MaterializationPhase materialization_phase_=MaterializationPhase::Fresh;
+        std::string materialization_failure_;
         Config config_;
+        std::unique_ptr<NativePeerTransferEventOwnership> native_events_; ///< Original event handles and admitted retirement duty.
         IBackend *backend_ = nullptr;
+        std::unique_ptr<PreparedGPUContextUsePermit> source_original_; ///< Exact same-PMA source permit, retained through native retirement.
         IWorkerGPUContext *source_context_ = nullptr;
         IWorkerGPUContext *destination_context_ = nullptr;
         int destination_ordinal_ = -1;

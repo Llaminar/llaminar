@@ -17,6 +17,7 @@
 #include "MoEOverlayParticipantMigration.h"
 
 #include <array>
+#include <stdexcept>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,7 +27,9 @@
 
 namespace llaminar2
 {
+    struct MoEOverlayPhysicalLaneDemandPlan;
     struct GGUFModel;
+    class ModelLoader;
     class MoEOverlayMPIRemoteProjectionTransport;
     class MappedTransferProgressEpoch;
     class PhysicalMemoryAuthority;
@@ -66,6 +69,25 @@ namespace llaminar2
         /** @return Whether every role appears exactly once with valid metadata. */
         [[nodiscard]] bool valid() const noexcept;
 
+        /**
+         * @brief Resolve a role independently of valid manifest array permutation.
+         * @param role Original gate/up/down projection enum.
+         * @return Its unique original geometry and format.
+         * @throws std::invalid_argument For an absent, duplicate or invalid role.
+         */
+        [[nodiscard]] const MoEOverlayProjectionWeightManifest &projectionForRole(ExpertTierWeightProjection role) const
+        {
+            const MoEOverlayProjectionWeightManifest *result = nullptr;
+            for (const auto &entry : projections)
+                if (entry.projection == role)
+                {
+                    if (result || !entry.valid()) throw std::invalid_argument("Layer manifest has an invalid or duplicate projection role");
+                    result = &entry;
+                }
+            if (!result) throw std::invalid_argument("Layer manifest omits an original projection role");
+            return *result;
+        }
+
         /** @brief Compare layer identity and all three projection contracts. */
         bool operator==(const MoEOverlayLayerWeightManifest &) const = default;
     };
@@ -93,6 +115,25 @@ namespace llaminar2
         const GGUFModel &model,
         int num_layers,
         int num_experts,
+        int first_model_layer = 0);
+
+    /**
+     * @brief Resolve expert metadata through the original model/predictor source authority.
+     *
+     * A shared predictor stays in its separate immutable artifact. Main and
+     * sidecar expert parents retain global layer IDs and native formats; this
+     * builder never merges directories, loads payloads or drops routed sidecars.
+     *
+     * @param loader Immutable source-aware loader owning main and optional predictor.
+     * @param num_layers Exact owned routed interval, including real routed sidecars.
+     * @param num_experts Exact source expert count on every owned layer.
+     * @param first_model_layer First global identity in the compact routed interval.
+     * @return The same strict native gate/up/down contract as the single-directory builder.
+     * @throws std::invalid_argument For missing, unsupported or incompatible source metadata.
+     */
+    [[nodiscard]] std::vector<MoEOverlayLayerWeightManifest>
+    buildMoEOverlayLayerWeightManifestFromLoader(
+        const ModelLoader &loader, int num_layers, int num_experts,
         int first_model_layer = 0);
 
     /** @brief Process-local evidence for the materialized residency fabric. */
@@ -209,7 +250,7 @@ namespace llaminar2
      * are deliberately capacity-shaped for every catalogued execution format;
      * each arrival still receives its exact decoder and arithmetic-policy
      * identities.  CPU slots retain the exact model source identity and final
-     * NativeVNNI representation.
+     * NativeQuantised representation.
      *
      * Slot and engine ownership remain process-local. When a private remote
      * projection transport is supplied, the fabric composes those local slots
@@ -242,6 +283,8 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry;
             /** Exact epoch and owner map installed in @ref registry. */
             std::shared_ptr<const MoEOverlayResidencySnapshot> initial_snapshot;
+            /** Same immutable original capacity declaration; mandatory for local GPU creators, unnecessary for CPU-only pools. */
+            std::shared_ptr<const MoEOverlayPhysicalLaneDemandPlan> physical_gpu_lane_demand;
             /** Typed source of the terminal durable physical inventory. */
             MoEOverlayPhysicalInventoryAuthority inventory_authority =
                 MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry;
@@ -288,6 +331,12 @@ namespace llaminar2
              * independently event-tracked operations share them round-robin.
              */
             std::size_t maximum_execution_streams = 1;
+            /**
+             * Existing layer-local cycle cap resolved by original admission.
+             * Direct callers retain their prior uncapped layer policy; production
+             * supplies the same explicit limit used by the single lane BOM.
+             */
+            std::size_t maximum_cycles_per_layer = std::numeric_limits<std::size_t>::max();
             /**
              * Collect exact device/host timing evidence on local transfer lanes.
              * Dynamic production enables this for economy certification;
@@ -469,8 +518,22 @@ namespace llaminar2
          * @brief Common physical implementation after either authority validates.
          *
          * Every argument is transport identity or byte/slot work. Keeping the
-         * host transaction and device command wrappers outside this method
-         * prevents the shared data plane from acquiring a second policy input.
+         * device command wrapper outside this method prevents a second policy
+         * input. The optional original transaction is a borrowed authentication
+         * witness for unpublishable cohort shadow arrivals, never reconstructed
+         * placement or an additional movement policy.
+         * @param purpose Original placement, restoration or shadow-calibration intent.
+         * @param expected_epoch Exact installed source epoch.
+         * @param candidate_epoch Exact inactive destination epoch.
+         * @param execution_fingerprint Existing authenticated physical execution identity.
+         * @param migrations Original ordered logical edges.
+         * @param migration_cycles Original closed-cycle grouping.
+         * @param shadow_requirements Original every-destination-member slot bounds.
+         * @param candidate Original host snapshot, null for device commands.
+         * @param device_batch Original device-ledger command, null for host transactions.
+         * @param original_transaction Exact host transaction, null for device commands.
+         * @param local_destination_participants Original sorted local registry participants.
+         * @return Actual owned physical operations or a fenced failure prefix.
          */
         MoEOverlayParticipantPreparedTransfers preparePhysicalTransfers(
             MoEOverlayResidencyTransactionPurpose purpose,
@@ -482,7 +545,9 @@ namespace llaminar2
             const std::vector<MoEOverlayTierMigrationCycle> &migration_cycles,
             const std::vector<MoEOverlayTierShadowRequirement> &
                 shadow_requirements,
+            const MoEOverlayResidencySnapshot *candidate,
             const MoEOverlayDevicePhysicalMovementBatch *device_batch,
+            const MoEOverlayResidencyTransaction *original_transaction,
             const std::vector<int> &local_destination_participants);
 
         /** @brief Retain a completely materialized implementation. */

@@ -17,6 +17,7 @@
 #include "../../backends/DeviceId.h"
 #include "ExpertHistogramSource.h"
 #include "MoELayeredExpertOwnership.h"
+#include "MoEOverlayRouteTarget.h"
 #include "MoEOptimizationStatus.h"
 #include "MoEOverlayTransactionDemand.h"
 #include "RuntimeExpertHistogramDrain.h"
@@ -40,6 +41,7 @@ namespace llaminar2
     class ValidatedDecodeExpertHistogramWindowView;
     class PhysicalMemoryAuthority;
     class DecodeExpertTransactionWindow;
+    class MoEExpertOwnerMap;
 
     /**
      * @brief Admitted transaction payload, required by transaction-cost consumers.
@@ -65,11 +67,21 @@ namespace llaminar2
         /// selects the final owned model layer when omitted (-1).
         int token_boundary_layer_idx = -1;
         std::vector<DeviceId> sockets;
-        /// Complete per-layer expert ownership used by load diagnostics.
-        /// Updated atomically at accepted Dynamic publication boundaries.
+        /// Initial whole-expert ownership used by load diagnostics. The live
+        /// relation is published through updateOwnership(), never by mutating config().
         MoELayeredExpertOwnership ownership;
         /** Complete transaction banks; their maximum row target bounds adaptation. */
         std::optional<ExpertHistogramTransactionConfig> transaction_demand;
+        /** Initial complete placement borrow; exclusive with scalar ownership/sockets.
+         * Construction consumes it into the live ownership authority, so config()
+         * cannot pin an obsolete publication or expose a mutable shared_ptr. */
+        std::shared_ptr<const MoEExpertOwnerMap> placement_ownership;
+    };
+
+    /** @brief Diagnostic logical demand at one complete target; never a physical-member count. */
+    struct ExpertHistogramTargetLoad {
+        MoEOverlayRouteTarget target;
+        uint64_t activations = 0;
     };
 
     /** @brief Typed availability mask in decode/prefill/MTP-routed order. */
@@ -804,8 +816,29 @@ namespace llaminar2
             ExpertHistogramSource source,
             int layer_idx) const;
 
-        /// Get per-socket total activations for a layer [num_sockets]
+        /**
+         * @param layer_idx Original model layer in the scalar ownership arm.
+         * @return Per-participant activation totals for whole expert ownership.
+         * @throws std::logic_error If complete-target ownership is configured.
+         */
         std::vector<uint64_t> socketLoads(int layer_idx) const;
+        /**
+         * @param layer_idx Original model layer.
+         * @return Each complete target's logical activations, counted once per expert.
+         * @throws std::invalid_argument For incomplete canonical placement.
+         */
+        std::vector<ExpertHistogramTargetLoad> targetLoads(int layer_idx) const;
+        /**
+         * @param ownership Original immutable complete placement, borrowed without copying.
+         * @throws std::invalid_argument For a missing map, mixed arms or changed geometry/topology.
+         */
+        void updatePlacementOwnership(std::shared_ptr<const MoEExpertOwnerMap> ownership);
+        /** @return Retained original map owner, or null for the scalar arm. */
+        std::shared_ptr<const MoEExpertOwnerMap> placementOwnership() const;
+        /** @param ownership Immutable candidate map. @return Same logical target imbalance as whole-only scoring.
+         * @throws std::invalid_argument For a foreign ownership arm, layer geometry or physical topology. */
+        ExpertLoadImbalanceStats placementImbalance(const MoEExpertOwnerMap& ownership) const;
+
 
         /// Get weighted activation sum for a specific expert at a layer
         float weightedActivation(int layer_idx, int expert_id) const;
@@ -889,6 +922,8 @@ namespace llaminar2
         /// Human-readable summary of a layer's histogram
         std::string layerSummary(int layer_idx) const;
 
+        /** @return Settings with the initial complete-placement borrow consumed;
+         * use placementOwnership() for the published live map. */
         const DecodeExpertHistogramConfig &config() const { return config_; }
 
     private:
@@ -1008,8 +1043,16 @@ namespace llaminar2
 
         // Ownership is read by diagnostics and replaced only at a safe
         // rebalance boundary, never while route counters are being recorded.
+        /** @brief Score exactly one ownership arm using unchanged per-expert counters/statistics.
+         * @param scalar Whole-only relation, mutually exclusive with complete.
+         * @param complete Original complete placement map, mutually exclusive with scalar.
+         * @return Existing imbalance arithmetic over complete logical vertices. */
+        ExpertLoadImbalanceStats placementImbalanceImpl(const MoELayeredExpertOwnership* scalar,
+            const MoEExpertOwnerMap* complete) const;
         mutable std::mutex ownership_mutex_;
         MoELayeredExpertOwnership ownership_;
+        /** Current complete placement, protected by ownership_mutex_; no shared_ptr is republished through config(). */
+        std::shared_ptr<const MoEExpertOwnerMap> placement_ownership_;
 
         mutable std::mutex runtime_sync_mutex_;
         std::vector<RuntimeHistogramSyncCallback> runtime_sync_callbacks_;

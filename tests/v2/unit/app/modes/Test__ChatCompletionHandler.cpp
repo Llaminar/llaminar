@@ -1019,24 +1019,17 @@ namespace
             .layer = 31, .expert = 75, .cycle_index = 0, .cycle_size = 2,
             .direction = MoEOptimizationMovementDirection::Promotion,
             .axis = MoEOptimizationMovementAxis::Combined,
-            .source_participant = 4, .destination_participant = 1,
+            .source = MoEOptimizationMovementEndpoint::whole(4, authority == MoEOptimizationAuthority::Host
+                ? DeviceId::cpu() : DeviceId::cuda(1), (true) ? std::optional<int>{7} : std::nullopt), .destination = MoEOptimizationMovementEndpoint::whole(1, DeviceId::rocm(3), (false) ? std::optional<int>{99} : std::nullopt),
             .source_priority = 17, .destination_priority = -20,
-            .source_device = authority == MoEOptimizationAuthority::Host
-                ? DeviceId::cpu() : DeviceId::cuda(1),
-            .destination_device = DeviceId::rocm(3),
-            .source_world_rank = 7, .destination_world_rank = 99,
-            .source_world_rank_known = true, .destination_world_rank_known = false,
             .estimated_weight_bytes = (std::uint64_t{1} << 55) + 3,
             .activation_count = 123, .blocking_inference = false,
         };
         auto demotion = promotion;
         demotion.expert = 108;
         demotion.direction = MoEOptimizationMovementDirection::Demotion;
-        std::swap(demotion.source_participant, demotion.destination_participant);
+        std::swap(demotion.source, demotion.destination);
         std::swap(demotion.source_priority, demotion.destination_priority);
-        std::swap(demotion.source_device, demotion.destination_device);
-        std::swap(demotion.source_world_rank, demotion.destination_world_rank);
-        std::swap(demotion.source_world_rank_known, demotion.destination_world_rank_known);
         MoEOptimizationMovementLedger ledger;
         ledger.edges = {promotion, demotion};
         ledger.economy.push_back({
@@ -1072,7 +1065,7 @@ TEST(Test__MoEMovementLedgerJson, ProjectsHostAndDeviceEvidenceWithoutRecounting
     {
         const auto ledger = completedMovementFixture(authority);
         const auto wire = json::parse(moeMovementLedgerJson(ledger).dump());
-        EXPECT_EQ(wire.at("schema"), 2);
+        EXPECT_EQ(wire.at("schema"), 4);
         EXPECT_EQ(wire.at("scope"), "model_lifetime");
         EXPECT_EQ(wire.at("complete"), true);
         ASSERT_EQ(wire.at("edges").size(), 2u);
@@ -1084,14 +1077,14 @@ TEST(Test__MoEMovementLedgerJson, ProjectsHostAndDeviceEvidenceWithoutRecounting
         EXPECT_EQ(edge.at("expert"), 75);
         EXPECT_EQ(edge.at("cycle_index"), 0);
         EXPECT_EQ(edge.at("cycle_size"), 2);
-        EXPECT_EQ(edge.at("source_participant"), 4);
-        EXPECT_EQ(edge.at("destination_participant"), 1);
+        EXPECT_EQ(edge.at("source").at("participant"), 4);
+        EXPECT_EQ(edge.at("destination").at("participant"), 1);
         EXPECT_EQ(edge.at("source_priority"), 17);
         EXPECT_EQ(edge.at("destination_priority"), -20);
-        EXPECT_EQ(edge.at("source_device"), ledger.edges[0].source_device.toString());
-        EXPECT_EQ(edge.at("destination_device"), DeviceId::rocm(3).toString());
-        EXPECT_EQ(edge.at("source_world_rank"), 7);
-        EXPECT_TRUE(edge.at("destination_world_rank").is_null());
+        EXPECT_EQ(edge.at("source").at("device"), ledger.edges[0].source.whole().device.toString());
+        EXPECT_EQ(edge.at("destination").at("device"), DeviceId::rocm(3).toString());
+        EXPECT_EQ(edge.at("source").at("world_rank"), 7);
+        EXPECT_TRUE(edge.at("destination").at("world_rank").is_null());
         EXPECT_TRUE(edge.at("estimated_weight_bytes").is_number_unsigned());
         EXPECT_EQ(edge.at("estimated_weight_bytes").get<std::uint64_t>(), ledger.edges[0].estimated_weight_bytes);
         EXPECT_EQ(edge.at("activation_count"), 123);

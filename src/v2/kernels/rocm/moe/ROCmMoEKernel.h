@@ -21,8 +21,10 @@
 #pragma once
 
 #include "../../IMoEKernel.h"
+#include "../../../config/MoERouterArithmeticPolicy.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../ROCmKernelBase.h"
+#include "../gemm/ROCmMoERouteOwnedTuning.h"
 #include "../../../tensors/TensorType.h"
 #include "../../../execution/moe/MoERuntimePointerWorkspaceOwners.h"
 
@@ -30,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -75,6 +78,15 @@ namespace llaminar2
         void resetDynamicState() override;
 
         /** @copydoc IMoEKernel::packMoEOverlayActivationDispatch */
+        /** @copydoc IMoEKernel::beginOriginalMoEOverlayInvocation */
+        bool beginOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,const MoEOverlayOriginalNativeBeginLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocation */
+        bool retireOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,const MoEOverlayOriginalNativeRetireLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocationBatch */
+        bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,const MoEOverlayActivationSingleRowReturnBatchLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocationBatch */
+        bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,const MoEOverlayActivationMultiRowReturnBatchLaunch&) override;
+
         bool packMoEOverlayActivationDispatch(
             const MoEKernelLaunchContext &launch,
             const MoEOverlayActivationDispatchPackLaunch &packet) override;
@@ -205,6 +217,11 @@ namespace llaminar2
             override;
 
         /** @copydoc IMoEKernel::acquireMoEOverlayEpoch */
+        /** @brief Execute the original arena's captured finite parent Arm/Close action. */
+        bool runMoEOverlayEpochParentAction(const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control, DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochParentAction action) override;
+
         bool acquireMoEOverlayEpoch(
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,
@@ -432,14 +449,14 @@ namespace llaminar2
             ITensor *const *up_tensors,
             const int *expert_ids,
             const float *expert_weights,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_active,
             ITensor *output,
             int d_model,
             int intermediate) override;
 
         int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -447,8 +464,8 @@ namespace llaminar2
                 MoEDecodeDescriptorSource::StaticDescriptorTable) override;
 
         int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -474,15 +491,15 @@ namespace llaminar2
 
         bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate) override;
 
         bool updateGroupedExpertGateUpDescriptorTables(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate) override;
@@ -1032,6 +1049,11 @@ namespace llaminar2
             const std::int32_t *route_participants, ITensor *packet,
             std::size_t packet_byte_offset, const std::uint64_t *packet_bytes, int participant) override;
 
+        /** @copydoc IMoEKernel::prepareOwnerGateUpCaptureBinding */
+        std::uint64_t prepareOwnerGateUpCaptureBinding(int table, int rows, std::uint64_t expected_intent) override;
+        /** @copydoc IMoEKernel::ownerGateUpCaptureBindingSignature */
+        [[nodiscard]] std::uint64_t ownerGateUpCaptureBindingSignature(int table, int rows) const override;
+
         /** @copydoc IMoEKernel::executeGroupedPrefillProjection */
         bool executeGroupedPrefillProjection(
             ITensor *hidden, ITensor *output,
@@ -1250,6 +1272,25 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
+         * @brief Bind required original-Q8 scratch before capture, rejecting geometry drift.
+         * @param rows Immutable physical rows. @param width Original hidden width.
+         * @param top_k Admitted route width used by the existing CUDA scratch owner.
+         * @return Whether the explicit grouped-consumer contract is satisfied.
+         */
+        bool prepareRequiredRouterQ8Hidden(int rows, int width, int top_k);
+
+        /**
+         * @brief Record original-FP32 quantization only for a declared consumer.
+         * @param source Original FP32 hidden. @param rows Physical row capacity.
+         * @param width Hidden width. @param top_k Admitted route width.
+         * @param live_rows Device-owned live prefix, never downloaded.
+         * @return Whether preparation and publication succeeded.
+         */
+        bool publishRequiredRouterQ8Hidden(const float *source, int rows,
+            int width, int top_k, const int *live_rows);
+
+
+        /**
          * @brief Publish Q8 hidden rows produced by the immediately preceding router.
          *
          * @param source FP32 device row base that was quantized by the router.
@@ -1257,11 +1298,13 @@ namespace llaminar2
          * @param recorded_during_capture True when the producer launch was
          *        recorded into the currently active HIP graph rather than run
          *        eagerly.
+         * @param router_basis Actual router transformation; Original for hidden-only publication.
          */
         void publishRouterQ8Hidden(
             const float *source,
             int rows,
-            bool recorded_during_capture) noexcept;
+            bool recorded_during_capture,
+            RouterQ8Basis router_basis) noexcept;
 
         /**
          * @brief Test whether grouped gate/up may consume the router Q8 rows.
@@ -1299,7 +1342,7 @@ namespace llaminar2
             const char *buffer_name,
             std::size_t slot,
             int num_experts,
-            DeviceNativeVNNIMatrixDesc **device_descs,
+            DeviceNativeQuantisedMatrixDesc **device_descs,
             const char *context);
 
         void clearWorkspaceScratchBindings() noexcept;
@@ -1365,11 +1408,11 @@ namespace llaminar2
 
         struct GroupedDownDescriptorTable
         {
-            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_descs;
             int num_experts = 0;
             int d_model = 0;
@@ -1379,14 +1422,14 @@ namespace llaminar2
             uint32_t policy_codebook_mask = 0;
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
-            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             std::size_t workspace_slot = 0;
             bool valid = false;
 
             /** @return Whether the selected descriptor family has device storage. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
-                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                return weight_format == DeviceMoEWeightFormat::NativeQuantised
                            ? device_descs != nullptr
                            : deviceMoEWeightFormatIsFloating(weight_format) &&
                                  device_floating_descs != nullptr;
@@ -1395,14 +1438,14 @@ namespace llaminar2
 
         struct GroupedGateUpDescriptorTable
         {
-            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_up_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_gate_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_up_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_gate_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_up_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_gate_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_up_descs;
             int num_experts = 0;
@@ -1413,20 +1456,44 @@ namespace llaminar2
             uint32_t policy_codebook_mask = 0;
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
-            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             std::size_t workspace_slot = 0;
             bool valid = false;
+
+            std::optional<rocm::MoERouteOwnedGateUpAdmission> owner_m1_admission;
+                ///< Cold graph-local capability; no device state or separate allocation ownership.
+            std::uint64_t owner_m1_intent = 0; ///< Exact immutable declaration signature; zero retains ordinary dispatch.
 
             /** @return Whether both selected descriptor tables are resident. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
-                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                return weight_format == DeviceMoEWeightFormat::NativeQuantised
                            ? device_gate_descs != nullptr && device_up_descs != nullptr
                            : deviceMoEWeightFormatIsFloating(weight_format) &&
                                  device_floating_gate_descs != nullptr &&
                                  device_floating_up_descs != nullptr;
             }
         };
+
+        /**
+         * @brief Borrow the already-prepared owner-only M1 capability before any public GPU work.
+         * @param table Original table handle; no representative/foreign table is substituted.
+         * @param rows Physical row count for this invocation.
+         * @param execution Actual projection phase; complete/down operations retain their own policy.
+         * @param shape Actual named gate/up axes checked against frozen table/capability identity.
+         * @return Explicit immutable capability for the declared model operation, otherwise null.
+         * @throws std::logic_error For a missing/stale/mismatched required model binding.
+         */
+        [[nodiscard]] const rocm::MoERouteOwnedGateUpAdmission *ownerGateUpAdmissionForCall(
+            int table, int rows, const MoEPrefillProjectionExecution &execution,
+            rocm::MoERouteOwnedProjectionShape shape) const;
+        /**
+         * @brief Publish accepted model host-submission evidence after the complete raw call succeeds.
+         * @param completed Caller-owned completed launch set, never a live device/replay ledger.
+         * @param intent Exact immutable table intent included in model capture identity.
+         */
+        void recordOwnerGateUpCaptureSubmissions(const rocm::MoERouteOwnedGateUpLaunchSet &completed,
+                                               std::uint64_t intent) const;
 
         /**
          * @brief Publish or adopt one exact down-descriptor table.
@@ -1524,12 +1591,12 @@ namespace llaminar2
         float *d_staging_weights_ = nullptr; ///< [staging_capacity_] floats on device
         int staging_capacity_ = 0;
 
-        // Grouped decode staging for ROCm native-VNNI MoE down path.
+        // Grouped decode staging for ROCm native-quantised MoE down path.
         const float **d_grouped_gate_ptrs_ = nullptr;
         const float **d_grouped_up_ptrs_ = nullptr;
         int *d_grouped_expert_ids_ = nullptr;
         float *d_grouped_decode_weights_ = nullptr;
-        DeviceNativeVNNIMatrixDesc *d_grouped_down_descs_ = nullptr;
+        DeviceNativeQuantisedMatrixDesc *d_grouped_down_descs_ = nullptr;
         int8_t *d_grouped_swiglu_int8_ = nullptr;
         float *d_grouped_swiglu_scales_ = nullptr;
         /** `[KB][route][N]` ordered split-K scratch; KB plane zero is reusable route output. */
@@ -1539,7 +1606,7 @@ namespace llaminar2
         int grouped_decode_d_model_cap_ = 0;
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
 
-        // Grouped decode staging for ROCm native-VNNI MoE gate/up path.
+        // Grouped decode staging for ROCm native-quantised MoE gate/up path.
         float **d_grouped_gate_output_ptrs_ = nullptr;
         float **d_grouped_up_output_ptrs_ = nullptr;
         int *d_grouped_gateup_expert_ids_ = nullptr;
@@ -1592,6 +1659,8 @@ namespace llaminar2
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
         int *d_group_active_expert_ids_ = nullptr; ///< [min(total_slots,num_experts)] compact active expert ids
         int group_active_expert_slots_ = 0;    ///< Fixed active-expert launch slots from the last small grouping pass
+        MoEPrefillGroupingProvenance grouped_prefill_grouping_;
+            ///< Instance-owned static producer origin; no host copy of live route counts.
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
         int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
 

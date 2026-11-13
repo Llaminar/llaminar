@@ -11,14 +11,33 @@
  */
 
 #include "backends/IBackend.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/compute_stages/stages/MoEOverlayTicketPublishStage.h"
+#include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
 #include "transfer/BackgroundTransferProgressBinding.h"
 #include "transfer/TransferProducerDependency.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include <functional>
 #include "../../mocks/MockBackend.h"
 
 #include <gtest/gtest.h>
+#include "kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "../../mocks/MockWorkerGPUContext.h"
 
 #include <array>
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -100,8 +119,26 @@ namespace
             ++mapped_allocate_count;
             mapped_allocation_bytes = bytes;
             mapped_allocation_ordinal = device_id;
-            void *const allocation =
-                MockBackend::allocateMapped(bytes, device_id, device_ptr);
+            // Only the page-write economy fixture selects this branch. Each
+            // native-API-double allocation then owns complete aligned pages;
+            // protection never reaches malloc metadata or another allocation.
+            void *allocation = nullptr;
+            if (page_aligned_mapped_storage)
+            {
+                const auto page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+                if (!page || bytes % page != 0u)
+                    throw std::invalid_argument("Fixture mapped storage requires whole pages");
+                allocation = std::aligned_alloc(page, bytes);
+                if (allocation)
+                {
+                    page_allocations_.emplace(allocation, bytes);
+                    std::memset(allocation, 0xa7, bytes); // Native memory is not assumed initially zero.
+                }
+                if (device_ptr) *device_ptr = allocation;
+            }
+            else allocation = MockBackend::allocateMapped(bytes, device_id, device_ptr);
+            if (force_null_mapped_alias && device_ptr)
+                *device_ptr = nullptr;
             mapped_allocation_host = allocation;
             mapped_allocation_alias =
                 device_ptr ? *device_ptr : nullptr;
@@ -136,10 +173,30 @@ namespace
         /** @brief Record native mapped retirement before delegating to the mock. */
         void freeMapped(void *host_ptr, int device_id) override
         {
+            if (before_mapped_free)
+                before_mapped_free();
             ++mapped_free_count;
             mapped_free_host = host_ptr;
             mapped_free_ordinal = device_id;
-            MockBackend::freeMapped(host_ptr, device_id);
+            if (page_allocations_.erase(host_ptr)) std::free(host_ptr);
+            else MockBackend::freeMapped(host_ptr, device_id);
+        }
+
+        /**
+         * @brief Authenticate that a protection range lies wholly in fixture-owned pages.
+         * @param address First byte of the proposed page range.
+         * @param bytes Complete protected byte count.
+         * @return True only for one exact live page-aligned API-double allocation.
+         */
+        bool ownsPages(const void* address, size_t bytes) const
+        {
+            const auto start = reinterpret_cast<std::uintptr_t>(address);
+            for (const auto& [base, capacity] : page_allocations_)
+            {
+                const auto first = reinterpret_cast<std::uintptr_t>(base);
+                if (start >= first && start-first <= capacity && bytes <= capacity-(start-first)) return true;
+            }
+            return false;
         }
 
         /** @brief Return the deterministic alias belonging to one exact ordinal. */
@@ -284,6 +341,9 @@ namespace
         MappedTransferWakeState service_wake_value =
             MappedTransferWakeState::InferenceComplete;
         MappedTransferServiceRun service_run = MappedTransferServiceRun::FinitePass;
+        bool page_aligned_mapped_storage = false; ///< Fixture-only dedicated pages, poisoned before TransferEngine initialization.
+        bool force_null_mapped_alias = false;
+        std::function<void()> before_mapped_free;
         bool registration_succeeds = true;
         bool portable_mapped_supported = false;
         bool timeline_calls_succeed = true;
@@ -314,6 +374,7 @@ namespace
         std::vector<MappedProgressCall> progress_calls;
 
     private:
+        std::map<void*, size_t> page_allocations_; ///< Exact fixture native-allocation records; no production admission role.
         std::uintptr_t alias_bias_ = 0u;
         const bool *lifetime_released_ = nullptr;
     };
@@ -367,6 +428,12 @@ namespace
             g_rocm_backend = nullptr;
         }
 
+        /**
+         * @brief Bind the real GPU-shaped ticket while fresh payload-only pages are read-only.
+         * @param device Exact recorded CUDA/ROCm endpoint; no native GPU work is executed.
+         */
+        void proveFreshTicketDoesNotRetouchPayload(DeviceId device);
+
         alignas(64) std::array<std::byte, 1024> pages_{};
         bool lifetime_released_ = false;
         std::unique_ptr<MappedTimelineBackend> cuda_;
@@ -404,6 +471,91 @@ TEST_F(Test__MappedHostTransferRegion, GraphServiceMappedStagingViewsPreserveExa
         }
     }
     EXPECT_THROW((void)engine_.mappedStagingView({}), std::invalid_argument);
+}
+
+/** MPI slabs own ordinary registered pages, with one lifetime for every bounded view. */
+TEST_F(Test__MappedHostTransferRegion, CrossProcessStagingRetainsAccessBoundsAndRegistrationLifetime)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto &backend = device.is_cuda() ? *cuda_ : *rocm_;
+        auto slices = engine_.allocatePersistentTransferStagingSlices(
+            257u, 3u, device, HostTransferAccess::CrossProcessReadable);
+        EXPECT_EQ(backend.mapped_allocate_count, 0u);
+        EXPECT_EQ(backend.register_count, 1u);
+        EXPECT_EQ(backend.registered_bytes, TransferEngine::mappedHostRegionAllocationBytes(771u));
+        for (const auto &slice : slices)
+        {
+            EXPECT_EQ(slice.hostAccess(), HostTransferAccess::CrossProcessReadable);
+            auto view = engine_.mappedStagingView(slice);
+            EXPECT_EQ(view->hostAccess(), HostTransferAccess::CrossProcessReadable);
+            EXPECT_EQ(view->sizeBytes(), 257u);
+            EXPECT_EQ(view->mutableHostData(), slice.mutablePinnedData());
+            EXPECT_EQ(*static_cast<unsigned char *>(view->mutableHostData()), 0u);
+            EXPECT_THROW((void)view->deviceAlias(device, 258u), std::out_of_range);
+        }
+        auto retained = engine_.mappedStagingView(slices[1]);
+        std::memset(retained->mutableHostData(), 0x53, retained->sizeBytes());
+        EXPECT_EQ(*static_cast<unsigned char *>(slices[0].mutablePinnedData()), 0u);
+        EXPECT_EQ(*static_cast<unsigned char *>(slices[2].mutablePinnedData()), 0u);
+        slices.clear();
+        EXPECT_EQ(backend.unregister_count, 0u);
+        EXPECT_EQ(*static_cast<unsigned char *>(retained->mutableHostData()), 0x53u);
+        retained.reset();
+        EXPECT_EQ(backend.unregister_count, 1u);
+    }
+}
+
+/** Native singleton/portable allocation cannot silently replace a required process-readable backing. */
+TEST_F(Test__MappedHostTransferRegion, CrossProcessRegionPreservesEveryBackendAliasAndRollsBackFailure)
+{
+    const std::array devices{DeviceId::cuda(0), DeviceId::cuda(3), DeviceId::rocm(0), DeviceId::rocm(2)};
+    auto region = engine_.allocateMappedHostRegion(4097u, devices, HostTransferAccess::CrossProcessReadable);
+    EXPECT_EQ(region->hostAccess(), HostTransferAccess::CrossProcessReadable);
+    EXPECT_EQ(region->sizeBytes(), TransferEngine::mappedHostRegionAllocationBytes(4097u));
+    for (const auto device : devices) EXPECT_NE(region->deviceAlias(device), nullptr);
+    EXPECT_EQ(cuda_->register_count, 1u);
+    EXPECT_EQ(rocm_->register_count, 1u);
+    EXPECT_EQ(cuda_->mapped_allocate_count, 0u);
+    EXPECT_EQ(rocm_->mapped_allocate_count, 0u);
+    region.reset();
+    EXPECT_EQ(cuda_->unregister_count, 1u);
+    EXPECT_EQ(rocm_->unregister_count, 1u);
+    rocm_->registration_succeeds = false;
+    EXPECT_THROW((void)engine_.allocateMappedHostRegion(4097u, devices,
+        HostTransferAccess::CrossProcessReadable), std::runtime_error);
+    EXPECT_EQ(cuda_->unregister_count, 2u);
+    EXPECT_EQ(rocm_->unregister_count, 1u);
+    EXPECT_THROW((void)engine_.allocateMappedHostRegion(4097u, devices,
+        static_cast<HostTransferAccess>(255)), std::invalid_argument);
+    EXPECT_EQ(cuda_->register_count, 2u);
+    EXPECT_EQ(rocm_->register_count, 2u);
+}
+
+/** Reject a local-only staging slice before resolving a remote lane's native execution resources. */
+TEST_F(Test__MappedHostTransferRegion, CrossProcessEndpointRejectsLocalOnlyStaging)
+{
+    EXPECT_EQ(PersistentTransferStagingSlice{}.hostAccess(), HostTransferAccess::ProcessLocal);
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto slices = engine_.allocatePersistentTransferStagingSlices(257u, 1u, device);
+        EXPECT_EQ(slices[0].hostAccess(), HostTransferAccess::ProcessLocal);
+        EXPECT_EQ(engine_.mappedStagingView(slices[0])->hostAccess(), HostTransferAccess::ProcessLocal);
+        try
+        {
+            MoEOverlayGpuRemoteProjectionLane lane({
+                .device = device,
+                .staging = slices[0],
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name = "rejected_local_only_remote_staging",
+            });
+            FAIL() << "Remote endpoint accepted local-only mapped backing";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("cross-process-readable"), std::string::npos);
+        }
+    }
 }
 
 /** The public authority preserves device, stream, capacity and typed lifetime. */
@@ -1005,4 +1157,433 @@ TEST_F(
     slices.clear();
     EXPECT_EQ(cuda_->unregister_count, snapshot.backing_region_count);
     EXPECT_EQ(rocm_->unregister_count, snapshot.backing_region_count);
+}
+
+/** @test A mapped declaration rejects absent/capacity admission before native allocation. */
+TEST_F(Test__MappedHostTransferRegion, PublicationRootRejectsUnadmittedBackingBeforeNativeAllocation)
+{
+    const DeviceId host{DeviceType::CPU, 1};
+    const CPUMappedPublicationRoot root(123, host, DeviceId::cuda(0));
+    EXPECT_EQ(root.physicalBytes(), TransferEngine::mappedHostRegionAllocationBytes(123));
+    EXPECT_EQ(root.owner(), PhysicalMemoryOwner::ActivationArena);
+    EXPECT_THROW((void)CPUMappedPublicationRoot(1, DeviceId::cuda(0), DeviceId::cuda(0)), std::invalid_argument);
+    EXPECT_THROW((void)CPUMappedPublicationRoot(1, host, DeviceId::cpu()), std::invalid_argument);
+    EXPECT_THROW(engine_.allocateMappedHostRegion(root, {}), std::logic_error);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({0, host, root.physicalBytes(), root.physicalBytes()}, root.owner(), root.physicalBytes() - 1);
+    const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    EXPECT_THROW(engine_.allocateMappedHostRegion(root, memory), std::logic_error);
+    EXPECT_EQ(cuda_->mapped_allocate_count, 0u);
+    EXPECT_EQ(cuda_->register_count, 0u);
+    for (const auto &line : memory->rankAttestation())
+        EXPECT_EQ(line.materialized_new_bytes, 0u);
+}
+
+/** @test Alias ownership retains exactly one physical claim until native free completes. */
+TEST_F(Test__MappedHostTransferRegion, PublicationRootClaimFollowsAliasAndNativeRetirement)
+{
+    const DeviceId host{DeviceType::CPU, 1};
+    const CPUMappedPublicationRoot root(123, host, DeviceId::cuda(0));
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({0, host, root.physicalBytes(), root.physicalBytes()}, root.owner(), root.physicalBytes());
+    const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    const auto live = [&]()
+    {
+        size_t bytes = 0;
+        for (const auto &line : memory->rankAttestation())
+            if (line.owner == root.owner()) bytes += line.materialized_new_bytes;
+        return bytes;
+    };
+    cuda_->before_mapped_free = [&]() { EXPECT_EQ(live(), root.physicalBytes()); };
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        auto region = engine_.allocateMappedHostRegion(root, memory);
+        auto alias = region;
+        EXPECT_EQ(region->sizeBytes(), root.physicalBytes());
+        EXPECT_TRUE(region->hasDevice(root.consumer()));
+        EXPECT_EQ(live(), root.physicalBytes());
+        region.reset();
+        EXPECT_EQ(live(), root.physicalBytes());
+        EXPECT_NE(alias->deviceAlias(root.consumer()), nullptr);
+        alias.reset();
+        EXPECT_EQ(live(), 0u);
+        EXPECT_EQ(cuda_->mapped_free_count, static_cast<size_t>(replay + 1));
+    }
+    // A failed alias publication still frees native storage before retiring
+    // its already-acquired physical claim; no partial region escapes setup.
+    cuda_->force_null_mapped_alias = true;
+    EXPECT_THROW(engine_.allocateMappedHostRegion(root, memory), std::runtime_error);
+    EXPECT_EQ(live(), 0u);
+    EXPECT_EQ(cuda_->mapped_allocate_count, 4u);
+    EXPECT_EQ(cuda_->mapped_free_count, 4u);
+}
+
+/** @test The actual LocalReady owner retains one disjoint CPU staging lease through mapped aliases and failed setup. */
+TEST_F(Test__MappedHostTransferRegion, LocalReadyClaimFollowsOriginalSourceAndAliasRetirement)
+{
+    class ReadyWorker final : public llaminar2::testing::MockWorkerGPUContext
+    {
+    public:
+        ReadyWorker(int ordinal, std::shared_ptr<PreparedGPUWorkerStack>) : MockWorkerGPUContext(ordinal) {}
+    };
+    using Access = NativeContextPreparationReplayAccess;
+    const auto device = DeviceId::cuda(0);
+    Access::seed(device, [](auto stack) { return Access::construct<ReadyWorker>(std::move(stack), 0); });
+    auto source = Access::source<ReadyWorker>(device);
+    {
+        const auto original = source->acquire(device);
+        const auto physical = TransferEngine::mappedHostRegionAllocationBytes(sizeof(std::uint64_t));
+        PhysicalMemoryPlanBuilder extra;
+        extra.add({0, DeviceId::cpu(), 128u<<20, 128u<<20}, PhysicalMemoryOwner::ImmutableLookupStaging, physical);
+        const auto binding = Access::admit(source, extra.build());
+        const auto live = [&]() {
+            std::size_t bytes = 0;
+            for (const auto& line : source->memory()->rankAttestation())
+                if (line.owner == PhysicalMemoryOwner::ImmutableLookupStaging) bytes += line.materialized_new_bytes;
+            return bytes;
+        };
+        cuda_->before_mapped_free = [&]() { EXPECT_EQ(live(), physical); };
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            auto root = qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, device}, source->memory(), engine_);
+            const auto observation = root->retainedOwnerObservation();
+            EXPECT_EQ(observation.authority().get(), source->memory().get());
+            EXPECT_EQ(observation.allocator(), (PhysicalMemoryAllocatorIdentity{0, DeviceId::cpu()}));
+            EXPECT_EQ(observation.tableStorageBytes(), 0u);
+            EXPECT_EQ(observation.lookupStagingBytes(), physical);
+            auto alias = root->mappedRegion();
+            EXPECT_EQ(live(), physical);
+            EXPECT_THROW(engine_.allocateMappedHostRegion(*root, source->memory()), std::logic_error);
+            root.reset();
+            EXPECT_EQ(live(), physical);
+            alias.reset();
+            EXPECT_EQ(live(), 0u);
+        }
+        {
+            GraphCaptureGuard recording;
+            EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, device}, source->memory(), engine_), std::logic_error);
+            EXPECT_EQ(cuda_->mapped_allocate_count, 20u);
+        }
+        EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({1, device}, source->memory(), engine_), std::invalid_argument);
+        EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, DeviceId::cpu()}, source->memory(), engine_), std::invalid_argument);
+        cuda_->force_null_mapped_alias = true;
+        EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, device}, source->memory(), engine_), std::runtime_error);
+        EXPECT_EQ(live(), 0u);
+        EXPECT_EQ(cuda_->mapped_allocate_count, 21u);
+        EXPECT_EQ(cuda_->mapped_free_count, 21u);
+        cuda_->before_mapped_free = {};
+    }
+    // The original source owns actual recorded context retirement; mapped roots
+    // cannot extend or replace its worker generation or authority.
+    auto retirement = GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+    Access::physicalReset(retirement);
+}
+
+
+/** @test Monotonic slices remain byte-zero after earlier slices are dirty and backing growth occurs. */
+TEST_F(Test__MappedHostTransferRegion, ArenaFreshSlicesStayZeroAfterDirtyNeighborsAndGrowth)
+{
+    cuda_->page_aligned_mapped_storage = rocm_->page_aligned_mapped_storage = true;
+    cuda_->portable_mapped_supported = rocm_->portable_mapped_supported = true;
+    for (const std::vector<DeviceId> devices : {
+             std::vector{DeviceId::cuda(0)}, std::vector{DeviceId::rocm(0)},
+             std::vector{DeviceId::cuda(0),DeviceId::cuda(1)},
+             std::vector{DeviceId::rocm(0),DeviceId::rocm(1)},
+             std::vector{DeviceId::cuda(0),DeviceId::rocm(0)}})
+    {
+        auto arena = engine_.createMappedHostArena(devices);
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
+        for (const size_t bytes : {size_t{17},size_t{8192},size_t{65},size_t{32768},size_t{513}})
+        {
+            auto fresh = arena->allocate(bytes,64);
+            const auto* begin = static_cast<const std::byte*>(fresh->mutableHostData());
+            EXPECT_TRUE(std::all_of(begin,begin+bytes,[](std::byte b){return b==std::byte{};}));
+            for (const auto& prior : slices)
+            {
+                const auto* p=static_cast<const std::byte*>(prior->mutableHostData());
+                EXPECT_TRUE(std::all_of(p,p+prior->sizeBytes(),[](std::byte b){return b==std::byte{0x5c};}));
+            }
+            std::memset(fresh->mutableHostData(),0x5c,bytes);
+            slices.push_back(std::move(fresh));
+        }
+        EXPECT_GT(arena->snapshot().backing_region_count,1u);
+        auto retained=slices.front();slices.clear();arena.reset();
+        const auto* p=static_cast<const std::byte*>(retained->mutableHostData());
+        EXPECT_TRUE(std::all_of(p,p+retained->sizeBytes(),[](std::byte b){return b==std::byte{0x5c};}));
+    }
+}
+
+/** @test Actual CPU/GPU-shaped ticket construction and publication reset retain fresh payload bytes. */
+TEST_F(Test__MappedHostTransferRegion, MappedDispatchTicketFreshPayloadAndPublicationLifecycle)
+{
+    cuda_->page_aligned_mapped_storage = rocm_->page_aligned_mapped_storage = true;
+    for (const auto device : {DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        std::shared_ptr<MappedHostTransferArena> arena;
+        if(device.is_gpu())arena=engine_.createMappedHostArena(std::array{device});
+        MoEOverlayDispatchTicketStorage storage;
+        storage.bindFixedCapacity(3,17,2,64,device,7,arena);
+        ASSERT_TRUE(storage.hasValidBoundIdentity());
+        const auto& ticket=storage.ticket();
+        for(const auto* data:{ticket.routing_indices_fp32,ticket.routing_weights_fp32})
+            EXPECT_TRUE(std::all_of(data,data+34,[](float x){return x==0.f;}));
+        for(const auto* data:{ticket.hidden_rows_fp32,ticket.return_rows_fp32})
+            EXPECT_TRUE(std::all_of(data,data+17*64,[](float x){return x==0.f;}));
+        EXPECT_EQ(ticket.header->residency_epoch,0u);
+        EXPECT_EQ(ticket.header->return_logical_row_count,0);
+        EXPECT_THROW(storage.bindFixedCapacity(3,17,2,64,device,7,arena),std::logic_error);
+        ticket.hidden_rows_fp32[0]=19.f;ticket.return_rows_fp32[17*64-1]=23.f;
+        if(device.is_gpu())
+        {
+            auto* spy=device.is_cuda()?cuda_.get():rocm_.get();
+            // The fixture's resolver owns these API-double pages; the real
+            // singleton TransferEngine must not silently adopt that backend.
+            // Positive native publication belongs to the existing GPU fixture.
+            std::string error;
+            EXPECT_FALSE(storage.enqueueCapturedPublication(reinterpret_cast<void*>(0x12340),&error));
+            EXPECT_NE(error.find("mapped 64-bit timeline publication"),std::string::npos);
+            EXPECT_TRUE(spy->timeline_calls.empty());
+            for(unsigned repeat=0;repeat<20;++repeat)
+            {
+                ASSERT_TRUE(storage.armCapturedPublication());
+                EXPECT_TRUE(storage.hasValidBoundIdentity());
+                EXPECT_EQ(ticket.hidden_rows_fp32[0],19.f);
+                EXPECT_EQ(ticket.return_rows_fp32[17*64-1],23.f);
+            }
+            EXPECT_EQ(spy->getSyncCount(),0u);EXPECT_EQ(spy->getStreamSyncCount(),0u);
+        }
+        else EXPECT_TRUE(storage.armCapturedPublication());
+    }
+}
+
+namespace {
+/** @brief Restore fixture-owned page access before its original mapped owner can be released. */
+class ReadOnlyFixturePages final
+{
+public:
+    /**
+     * @brief Protect only an authenticated complete interior page range.
+     * @param address Page-aligned address in a live dedicated backend-spy allocation.
+     * @param bytes Positive page-multiple length wholly contained in that allocation.
+     */
+    ReadOnlyFixturePages(void* address,size_t bytes):address_(address),bytes_(bytes)
+    {if(::mprotect(address_,bytes_,PROT_READ)!=0)throw std::runtime_error("Fixture payload read-only protection failed");}
+    /** @brief Always restore write permission before arena/backend destruction, including test failure. */
+    ~ReadOnlyFixturePages()
+    {if(::mprotect(address_,bytes_,PROT_READ|PROT_WRITE)!=0)std::terminate();}
+    ReadOnlyFixturePages(const ReadOnlyFixturePages&)=delete;
+    ReadOnlyFixturePages& operator=(const ReadOnlyFixturePages&)=delete;
+private:
+    void* address_;size_t bytes_;
+};
+}
+void Test__MappedHostTransferRegion::proveFreshTicketDoesNotRetouchPayload(DeviceId device)
+{
+    auto* spy=device.is_cuda()?cuda_.get():rocm_.get();spy->page_aligned_mapped_storage=true;
+    const auto page=static_cast<size_t>(::sysconf(_SC_PAGESIZE));ASSERT_GT(page,0u);
+    auto arena=engine_.createMappedHostArena(std::array{device});
+    auto first=arena->allocate(8*page,1);auto second=arena->allocate(8*page,1);
+    std::memset(first->mutableHostData(),0x4b,first->sizeBytes());
+    std::memset(second->mutableHostData(),0x4b,second->sizeBytes());
+    auto anchor=arena->allocate(page,1);ASSERT_EQ(arena->snapshot().backing_region_count,3u);
+    auto* expected=static_cast<std::byte*>(anchor->mutableHostData())+page;
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(expected)%64u,0u);
+    auto* protectedBegin=expected+2*page;const auto protectedBytes=2*page;
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(protectedBegin)%page,0u);
+    ASSERT_TRUE(spy->ownsPages(protectedBegin,protectedBytes));
+    ReadOnlyFixturePages protection(protectedBegin,protectedBytes);
+    MoEOverlayDispatchTicketStorage storage;
+    // The literal old second full memset faults on these already-zero interior
+    // pages. Header and publication stores are outside the protected payload.
+    storage.bindFixedCapacity(2,64,2,64,device,9,arena);
+    ASSERT_EQ(static_cast<void*>(storage.ticket().header),expected);
+    ASSERT_GT(storage.allocationBytes(),4*page);
+    EXPECT_TRUE(storage.hasValidBoundIdentity());
+    EXPECT_TRUE(std::all_of(protectedBegin,protectedBegin+protectedBytes,[](std::byte b){return b==std::byte{};}));
+    EXPECT_EQ(*static_cast<const std::byte*>(first->mutableHostData()),std::byte{0x4b});
+    EXPECT_EQ(*static_cast<const std::byte*>(second->mutableHostData()),std::byte{0x4b});
+    EXPECT_EQ(arena->snapshot().backing_region_count,3u);
+}
+/** @test CUDA-shaped actual binder does not rewrite the fresh GPU mapped payload. */
+TEST_F(Test__MappedHostTransferRegion, CUDAMappedDispatchTicketDoesNotRetouchFreshPayloadPages)
+{proveFreshTicketDoesNotRetouchPayload(DeviceId::cuda(0));}
+/** @test ROCm-shaped actual binder has identical fresh-zero and publication ownership. */
+TEST_F(Test__MappedHostTransferRegion, ROCmMappedDispatchTicketDoesNotRetouchFreshPayloadPages)
+{proveFreshTicketDoesNotRetouchPayload(DeviceId::rocm(0));}
+
+/** @test Real declaration-only tickets leave no orphan arena slots before physical capture setup. */
+TEST_F(Test__MappedHostTransferRegion, WorkspaceTicketDeclarationDoesNotRetainNativeBacking)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto arena = engine_.createMappedHostArena(std::array{device});
+        const auto before = arena->snapshot();
+        FP32Tensor hidden({17,64}), ids({17,2}), weights({17,2});
+        const auto paramsFor = [&](std::shared_ptr<MoEOverlayDispatchTicketStorage> storage)
+        {
+            MoEOverlayTicketPublishStage::Params params;
+            params.device_id=device; params.layer_idx=3; params.bucket_rows=17;
+            params.top_k=2; params.d_model=64; params.hidden=&hidden;
+            params.routing_indices=&ids; params.routing_weights=&weights;
+            params.ticket_storage=std::move(storage);
+            return params;
+        };
+        StageBufferRequirements expected;
+        std::size_t declared_bytes=0;
+        {
+            auto declaration = std::make_shared<MoEOverlayDispatchTicketStorage>();
+            declaration->bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+                3,17,2,64,device,7,arena);
+            EXPECT_EQ(arena->snapshot().slice_count,before.slice_count)
+                << "Workspace declaration must not orphan actual mapped ticket slices";
+            EXPECT_EQ(arena->snapshot().backing_region_count,before.backing_region_count)
+                << "Workspace declaration must not allocate native mapped backing";
+            ASSERT_TRUE(declaration->isWorkspaceDeclaration());
+            ASSERT_TRUE(declaration->hasValidConstructionIdentity());
+            EXPECT_FALSE(declaration->isBound());
+            EXPECT_FALSE(declaration->hasValidBoundIdentity());
+            EXPECT_FALSE(declaration->hasCapturedPublicationContract());
+            EXPECT_FALSE(declaration->armCapturedPublication());
+            EXPECT_THROW((void)declaration->ticket(),std::logic_error);
+            declared_bytes=declaration->allocationBytes();
+            auto stage=std::make_unique<MoEOverlayTicketPublishStage>(paramsFor(declaration));
+            expected=stage->getBufferRequirements();
+            EXPECT_FALSE(stage->isGraphCapturable());
+            ComputeGraph graph;graph.addNode("original.ticket.publish",std::move(stage),device);
+            graph.markWorkspaceDeclaration();
+            DeviceGraphExecutor executor;
+            EXPECT_THROW(executor.execute(graph,nullptr),std::invalid_argument);
+            EXPECT_THROW(executor.captureRetainedGraphFragment(graph,nullptr,nullptr),std::invalid_argument);
+            EXPECT_THROW(declaration->bindFixedCapacity(3,17,2,64,device,7,arena),std::logic_error);
+        }
+        // The declaration graph has gone away. Its persistent arena must still
+        // have exactly its ORIGINAL empty state, not abandoned bump positions.
+        const auto after=arena->snapshot();
+        EXPECT_EQ(after.committed_bytes,before.committed_bytes);
+        EXPECT_EQ(after.allocated_bytes,before.allocated_bytes);
+        EXPECT_EQ(after.alignment_padding_bytes,before.alignment_padding_bytes);
+        EXPECT_EQ(after.backing_region_count,before.backing_region_count);
+        EXPECT_EQ(after.slice_count,before.slice_count);
+        auto actual=std::make_shared<MoEOverlayDispatchTicketStorage>();
+        actual->bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            3,17,2,64,device,7,arena);
+        ASSERT_TRUE(actual->hasValidBoundIdentity());
+        EXPECT_EQ(actual->allocationBytes(),declared_bytes);
+        MoEOverlayTicketPublishStage materialized(paramsFor(actual));
+        const auto requirements=materialized.getBufferRequirements();
+        ASSERT_EQ(expected.buffers.size(),requirements.buffers.size());
+        for(std::size_t i=0;i<expected.buffers.size();++i)
+        {
+            EXPECT_EQ(expected.buffers[i].name,requirements.buffers[i].name);
+            EXPECT_EQ(expected.buffers[i].shape,requirements.buffers[i].shape);
+            EXPECT_EQ(expected.buffers[i].tensor_type,requirements.buffers[i].tensor_type);
+            EXPECT_EQ(expected.buffers[i].sizeBytes(),requirements.buffers[i].sizeBytes());
+        }
+        EXPECT_EQ(arena->snapshot().slice_count,2u);
+        actual->ticket().hidden_rows_fp32[0]=19.f;
+        for(unsigned reset=0;reset<20;++reset)
+        {
+            ASSERT_TRUE(actual->armCapturedPublication());
+            EXPECT_EQ(actual->ticket().hidden_rows_fp32[0],19.f);
+            EXPECT_EQ(arena->snapshot().slice_count,2u);
+        }
+    }
+}
+
+/** @test Canonical metadata declarations borrow the same contribution bank without native metadata slots. */
+TEST_F(Test__MappedHostTransferRegion, WorkspaceCanonicalTicketDeclarationRetainsOnlyOriginalGeometry)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto arena=engine_.createMappedHostArena(std::array{device});
+        auto contribution=engine_.allocateMappedHostRegion(34u*64u*sizeof(float),std::array{device});
+        const auto before=arena->snapshot();
+        MoEOverlayCanonicalRouteReturnTicketStorage declaration;
+        declaration.bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+            3,34,64,device,7,contribution,arena);
+        ASSERT_TRUE(declaration.isWorkspaceDeclaration());
+        ASSERT_TRUE(declaration.hasValidConstructionIdentity());
+        EXPECT_FALSE(declaration.hasValidBoundIdentity());
+        EXPECT_EQ(declaration.routeCapacity(),34u);
+        EXPECT_EQ(declaration.layerIndex(),3);
+        EXPECT_EQ(declaration.contributionRowsHost(),contribution->mutableHostData());
+        EXPECT_FALSE(static_cast<bool>(declaration.arm(1)));
+        EXPECT_FALSE(declaration.publishAbort());
+        EXPECT_EQ(declaration.controlDeviceAlias(),nullptr);
+        EXPECT_THROW(declaration.bindFixedCapacity(3,34,64,device,7,contribution,arena),std::logic_error);
+        EXPECT_EQ(arena->snapshot().committed_bytes,before.committed_bytes);
+        EXPECT_EQ(arena->snapshot().slice_count,before.slice_count);
+        MoEOverlayCanonicalRouteReturnTicketStorage actual;
+        actual.bindForGraphConstruction(ForwardGraphSubmissionIntent::Execute,
+            3,34,64,device,7,contribution,arena);
+        ASSERT_TRUE(actual.hasValidBoundIdentity());
+        EXPECT_EQ(actual.routeCapacity(),declaration.routeCapacity());
+        EXPECT_EQ(actual.contributionRowsHost(),declaration.contributionRowsHost());
+        EXPECT_EQ(arena->snapshot().slice_count,1u);
+    }
+    MoEOverlayDispatchTicketStorage arbitrary;
+    EXPECT_FALSE(arbitrary.hasValidConstructionIdentity());
+    EXPECT_THROW(arbitrary.bindForGraphConstruction(static_cast<ForwardGraphSubmissionIntent>(255),
+        0,1,1,1,DeviceId::cpu(),1),std::invalid_argument);
+    MoEOverlayDispatchTicketStorage cpu;
+    cpu.bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+        0,1,1,1,DeviceId::cpu(),1);
+    EXPECT_FALSE(cpu.armCapturedPublication());
+    EXPECT_FALSE(cpu.enqueueCapturedPayload({},reinterpret_cast<void*>(0x12340)));
+    EXPECT_FALSE(cpu.enqueueCapturedPublication(reinterpret_cast<void*>(0x12340)));
+    EXPECT_FALSE(cpu.awaitCapturedPublication());
+    EXPECT_THROW((void)cpu.ticket(),std::logic_error);
+}
+
+/** @test Exact admitted arena sequence, backing geometry and last-alias lifetime share one issuer. */
+TEST_F(Test__MappedHostTransferRegion, AdmittedArenaOriginalSequenceAndAliasRetirement)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+        auto* backend=device.is_cuda()?cuda_.get():rocm_.get();
+        backend->page_aligned_mapped_storage=true;
+        const auto page=TransferEngine::mappedHostRegionAllocationBytes(1);
+        const std::array requests{MappedHostTransferArena::AllocationRequest{13,64},
+            MappedHostTransferArena::AllocationRequest{page+1,64},
+            MappedHostTransferArena::AllocationRequest{17,64}};
+        const auto bytes=MappedHostTransferArena::backingBytes(requests);
+        PhysicalMemoryPlanBuilder plan;
+        plan.add({0,DeviceId::cpu(),bytes,bytes},PhysicalMemoryOwner::ActivationTransportStaging,bytes);
+        plan.add({0,device,bytes,bytes},PhysicalMemoryOwner::ActivationArena,0u);
+        const auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+        auto arena=engine_.createMappedHostArena(std::array{device},memory,requests);
+        EXPECT_THROW(arena->requireDeclarationConsumed(),std::logic_error);
+        EXPECT_THROW(arena->allocate(14,64),std::logic_error);
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
+        for(const auto request:requests)slices.push_back(arena->allocate(request.bytes,request.alignment));
+        EXPECT_NO_THROW(arena->requireDeclarationConsumed());
+        EXPECT_EQ(arena->snapshot().committed_bytes,bytes);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+        EXPECT_THROW(arena->allocate(1,64),std::logic_error);
+        arena.reset();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+        slices.clear();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        backend->force_null_mapped_alias=true;
+        auto failed=engine_.createMappedHostArena(std::array{device},memory,requests);
+        EXPECT_THROW(failed->allocate(requests[0].bytes,requests[0].alignment),std::runtime_error);
+        EXPECT_THROW(failed->requireDeclarationConsumed(),std::logic_error);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        backend->force_null_mapped_alias=false;
+        EXPECT_NO_THROW(failed->allocate(requests[0].bytes,requests[0].alignment));
+        EXPECT_THROW(failed->requireDeclarationConsumed(),std::logic_error); // overdeclared construction
+        failed.reset();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+    EXPECT_THROW(MappedHostTransferArena::backingBytes({}),std::invalid_argument);
+    const std::array invalid{MappedHostTransferArena::AllocationRequest{1,3}};
+    EXPECT_THROW(MappedHostTransferArena::backingBytes(invalid),std::invalid_argument);
 }

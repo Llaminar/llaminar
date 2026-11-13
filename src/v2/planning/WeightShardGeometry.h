@@ -12,11 +12,13 @@
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/local_execution/graph/GraphSchema.h"
+#include "loaders/WeightIdentity.h"
 #include <cstddef>
 #include <optional>
 
 namespace llaminar2
 {
+    class PlanningClassifiedTensor;
     struct ModelMemoryProfile;
     struct TensorSizeInfo;
     class MoEExpertProjectionOwnership;
@@ -47,6 +49,9 @@ namespace llaminar2
         size_t elements_;
         std::optional<WeightShardMatrix> matrix_;
     };
+
+    /** @brief Original source identity is distinct from equal logical matrix dimensions. */
+    enum class WeightSourceStorageView { WholeOriginal, DeclaredSlice };
 
     /**
      * @brief Participant-bound compiler that resolves schema rules once, not per tensor.
@@ -83,6 +88,15 @@ namespace llaminar2
         WeightShardGeometry resolve(const TensorSizeInfo &tensor,
             std::optional<size_t> resident_experts = {}) const;
         /**
+         * @brief Resolve one source-bound retained classification without parsing its name again.
+         * @param tensor View minted only by the exact immutable metadata profile borrowed by this resolver.
+         * @param resident_experts Same explicit residency contract as the original source API.
+         * @return Canonical schema-directed geometry, byte-identical to original source resolution.
+         * @throws std::invalid_argument for a view from another metadata authority.
+         */
+        WeightShardGeometry resolve(const PlanningClassifiedTensor &tensor,
+            std::optional<size_t> resident_experts = {}) const;
+        /**
          * @brief Resolve an explicit projection layout without applying TP twice.
          * @param tensor Complete original routed projection inventory.
          * @param ownership Immutable source/slice contract used by preparation.
@@ -92,7 +106,25 @@ namespace llaminar2
          */
         WeightShardGeometry resolve(const TensorSizeInfo &tensor,
             const MoEExpertProjectionOwnership &ownership, size_t owned_experts) const;
+        /** @brief Apply original projection ownership using a role sealed by this same immutable source. */
+        WeightShardGeometry resolve(const PlanningClassifiedTensor &tensor,
+            const MoEExpertProjectionOwnership &ownership,size_t owned_experts) const;
+        /**
+         * @brief Project the actual schema's source-loading declaration, not just shape equality.
+         * @param tensor Original source whose TP policy is being resolved.
+         * @return Whole original source for an unsharded/replicated view, otherwise a declared slice.
+         *
+         * A full coordinate range under a slicing policy may still carry
+         * presliced runtime metadata and cannot donate a full-source alias.
+         */
+        WeightSourceStorageView sourceStorageView(const TensorSizeInfo &tensor) const;
     private:
+        /** @brief Shared canonical arithmetic; callers supply either original inference or sealed source classification. */
+        WeightShardGeometry resolveClassified(const TensorSizeInfo &tensor,WeightRole role,
+            std::optional<size_t> resident_experts) const;
+        /** @brief Shared original projection arithmetic after role/source authentication. */
+        WeightShardGeometry resolveProjectionClassified(const TensorSizeInfo &tensor,WeightRole role,
+            const MoEExpertProjectionOwnership &ownership,size_t owned_experts) const;
         const ModelMemoryProfile &profile_;
         int shard_index_, total_shards_;
         std::optional<DeviceShardingAssignment> assignment_;

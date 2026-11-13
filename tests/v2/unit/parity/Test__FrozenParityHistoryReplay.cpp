@@ -1,0 +1,1219 @@
+/**
+ * @file Test__FrozenParityHistoryReplay.cpp
+ * @brief Device-free original history, reference and handoff rejection controls.
+ *
+ * Tiny owned files below are metadata test inputs, never GGUF/NPY execution or
+ * model proof. They exercise the same checked request used by the real fixture;
+ * no runner, native buffer, PMA certificate or numerical evidence is created.
+ * Original binding publication also exercises the actual artifact reset helper,
+ * rank-owner isolation and fatal metadata/filesystem failure status.
+ */
+#include "integration/parity/FrozenParityHistoryReplay.h"
+#include "integration/parity/ParityTestBase.h"
+#include "integration/parity/ParityArtifactDirectory.h"
+#include "integration/parity/qwen4exp/Qwen4ExpProductionParityCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpCPUJointParityCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
+#include "integration/parity/ModelParityRuntimeExport.h"
+#include "config/OrchestrationConfigParser.h"
+#include "execution/moe/MoEExpertOverlayAuthorityPlan.h"
+#include <gtest/gtest.h>
+#include "mocks/MockMPIContext.h"
+#include "mocks/MockOrchestrationRunner.h"
+#include <unistd.h>
+
+namespace llaminar2::test::parity
+{
+namespace
+{
+using json = nlohmann::json;
+constexpr const char *Cell = "Qwen4ExpMain/Qwen4ExpMainParityTest.ProductionParity/FrozenSynthetic";
+
+/** @brief Retire only this test's bounded metadata directory. */
+struct MetadataOwner
+{
+    std::filesystem::path root;
+    /** @brief Create private metadata backing, without any device initialization. */
+    MetadataOwner()
+    {
+        char pattern[] = "/tmp/qfn-frozen-replay-unit-XXXXXX";
+        const char *path = ::mkdtemp(pattern);
+        if (!path) throw std::runtime_error("Cannot create test metadata directory");
+        root = path;
+    }
+    /** @brief Release the test's files after every success/failure exit. */
+    ~MetadataOwner()
+    {
+        std::error_code error;
+        std::filesystem::remove_all(root, error);
+    }
+};
+
+/** @brief Build explicit tiny original-source stat metadata for validation only. */
+json descriptor(const MetadataOwner &owner)
+{
+    json shards = json::array();
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto path = owner.root / ("part" + std::to_string(i) + ".gguf");
+        { std::ofstream file(path); file << char('a' + i); }
+        shards.push_back({{"name", path.filename().string()}, {"path", path.string()}, {"bytes", 1},
+                          {"object_identity", accuracy::qfnOriginalSourceStat(path).dump()}});
+    }
+    const auto directory = owner.root / "reference";
+    std::filesystem::create_directory(directory);
+    const auto metadata = directory / "metadata.txt";
+    { std::ofstream file(metadata); file << "token_ids: 1,2\ndecode_tokens: 3,4,5\n"; }
+    const json source = {{"architecture", "qwen4exp"}, {"main_layers", 48}, {"expert_count", 512},
+                         {"vocabulary", 248320}, {"reference_arithmetic", "cpu_fp32"},
+                         {"reference_execution", "incremental_cached"}, {"shards", shards}};
+    const auto config = OrchestrationConfig::defaults();
+    const auto &gemm = debugEnv().gemm;
+    const json arithmetic = {
+        {"gdn_projection", std::string(gdnProjectionArithmeticName(gemm.gdn_projection_arithmetic))},
+        {"moe_router", std::string(moeRouterArithmeticName(resolveMoERouterArithmetic(gemm.moe_router_arithmetic, "qwen4exp")))},
+        {"hc_up", std::string(quantizedActivationOperandPrecisionName(gemm.qfn_hc_up_activation))},
+        {"gdn_output", std::string(quantizedActivationOperandPrecisionName(gemm.qfn_gdn_output_activation))},
+        {"fa_output", std::string(quantizedActivationOperandPrecisionName(gemm.qfn_fa_output_activation))},
+        {"gdn_qkv", std::string(quantizedActivationOperandPrecisionName(gemm.qfn_gdn_qkv_activation))}};
+    return {{"expected_config", json::parse(serializeOrchestrationConfig(config))}, {"arithmetic", arithmetic},
+            {"schema", "llaminar.model-kld-history-replay.v1"}, {"canonical_cell", Cell},
+            {"corpus_manifest_digest", std::string(64, 'a')}, {"source_digest", accuracy::qfnMetadataDigest(source)},
+            {"reference_report_digest", std::string(64, 'b')}, {"full_stage_metadata_digest", *sha256FileHex(metadata)},
+            {"source", source}, {"history_id", "original"}, {"context_group", "short"},
+            {"prompt", "synthetic metadata only"}, {"prompt_ids", {1, 2}}, {"continuation_ids", {3, 4, 5}},
+            {"decode_rows", 2}, {"reference_directory", directory.string()}, {"reference_scope", "full_stages"}};
+}
+
+/**
+ * @brief Exercise the real pre-runner setup state without calling fixture SetUp.
+ *
+ * The tiny history and existing declared snapshot keys are metadata only. No
+ * model, backend, source payload, runner or PMA certificate is constructed.
+ */
+class SnapshotAdmissionGeometryProbe final : public ParityTestBase
+{
+public:
+    /** @brief Restore every original environment value after assertion unwind. */
+    ~SnapshotAdmissionGeometryProbe() override
+    {
+        restoreParityEnvOverrides();
+        PerfStatsCollector::reset();
+    }
+    /** @brief This probe is manually scoped and never registered as a model fixture. */
+    void TestBody() override {}
+    /** @return A diagnostic label only, without a device initialization. */
+    std::string getBackendName() override { return "MetadataOnlyAdmissionGeometry"; }
+    /**
+     * @brief Install original source-owned keys and an explicit inactive serving ladder.
+     * @param rows Authored real prompt row count.
+     * @param replay Optional already-validated frozen history.
+     * @param native_cap Optional exact pipeline's original public serving cap.
+     */
+    void configure(int rows, std::optional<FrozenParityHistoryReplay> replay = std::nullopt,
+                   std::optional<int> native_cap = std::nullopt)
+    {
+        config_.token_ids.assign(static_cast<std::size_t>(rows), 1);
+        config_.graph_snapshot_policy = qwen4exp::qwen4ExpProductionDefinition(
+            qwen4exp::Qwen4ExpParityTopology::CPU).graph_snapshot_policy;
+        frozen_history_replay_ = std::move(replay);
+        native_cap_ = native_cap;
+        setScopedParityEnvOverride("LLAMINAR_PRODUCTION_PARITY", "0");
+        setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "64");
+        setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
+        setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,128,256,512");
+    }
+    /** @brief Install a validated observation and expose its actual capture/reference selection without a runner. */
+    void observation(const FrozenParityHistoryReplay& replay)
+    { frozen_history_replay_=replay;config_.snapshot_dir=replay.referenceDirectory(); }
+    /** @return Actual frozen capture inventory including explicit collective completion edges. */
+    auto captureKeys() const { return paritySnapshotSetupCaptureFilter(); }
+    /** @brief Publish an original scoped environment value for campaign-rejection tests. */
+    void campaignMarker() { setScopedParityEnvOverride("LLAMINAR_PRODUCTION_PARITY", "true"); }
+    /** @return Actual fixture terminal coverage predicate, without inventing an export. */
+    auto terminalComplete() const { return hasCompleteObservationTerminals(); }
+    /** @return Actual scope-dependent generic snapshot presence requirement. */
+    bool requiresStage(const std::string& stage) const { return requiresObservationStagePresence(stage); }
+    /** @brief Exercise terminal-coordinate state transitions without creating native output evidence. */
+    void terminal(int step) { recordObservationTerminal(step); }
+    /** @return Original-coordinate state only, never auxiliary history coverage. */
+    auto originalTerminals() const { return observation_terminal_rows_; }
+    /** @return Explicitly separate auxiliary diagnostic coordinates. */
+    auto auxiliaryTerminals() const { return observation_auxiliary_terminal_rows_; }
+    /** @return Actual reference loader's exclusion decision before any NPY read. */
+    auto reference(const std::string& key) { return loadPyTorchSnapshot(key); }
+    /** @brief Expose the production pre-admission transaction, not a mirrored resolver. */
+    using ParityTestBase::beginProductionParitySnapshotAdmission;
+    using ParityTestBase::configureExactProductionParityPrefillGraphBucket;
+    /** @brief Scope collection for actual host-only native replay counter bodies. */
+    void enablePrefillEvidence()
+    {
+        setScopedParityEnvOverride("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        setScopedParityEnvOverride("LLAMINAR_PERF_STATS_JSON", "1");
+        PerfStatsCollector::reset();
+    }
+    /** @return Effective diagnostic capacity from the same current startup inventory. */
+    int retainedRows() const
+    {
+        return paritySnapshotServingGraphRows(static_cast<int>(config_.token_ids.size()),
+            4096, debugEnv().execution.prefill_graph_bucket_sizes, true, MTPRuntimeConfig{});
+    }
+    /** @return Existing source-owned complete checkpoint policy, unchanged by geometry setup. */
+    const ParityGraphSnapshotPolicy &snapshotPolicy() const { return config_.graph_snapshot_policy; }
+
+protected:
+    /** @return The typed public capacity from the original fixture input. */
+    std::optional<int> productionParityRetainedPrefillCap() const override { return native_cap_; }
+
+private:
+    std::optional<int> native_cap_;
+};
+
+/** @brief Parse a metadata request; no source or reference owner is granted. */
+FrozenParityHistoryReplay checked(const json &value)
+{
+    return FrozenParityHistoryReplay::parse(value, accuracy::qfnMetadataDigest(value), Cell);
+}
+} // namespace
+
+/** @test A partial environment locator cannot silently alter a canonical history. */
+TEST(FrozenParityHistoryReplay, ExplicitCompleteCellAndDigestHandoff)
+{
+    EXPECT_FALSE(FrozenParityHistoryReplay::load("", "", "", Cell));
+    EXPECT_THROW((void)FrozenParityHistoryReplay::load("file", "", "", Cell), std::invalid_argument);
+    EXPECT_THROW((void)FrozenParityHistoryReplay::load("file", std::string(64, 'a'), "other", Cell), std::invalid_argument);
+    MetadataOwner owner;
+    const auto value = descriptor(owner);
+    const auto file = owner.root / "replay.json";
+    { std::ofstream output(file); output << value.dump(); }
+    const auto digest = *sha256FileHex(file);
+    EXPECT_TRUE(FrozenParityHistoryReplay::load(file.string(), digest, Cell, Cell));
+    { std::ofstream output(file, std::ios::app); output << ' '; }
+    EXPECT_THROW((void)FrozenParityHistoryReplay::load(file.string(), digest, Cell, Cell), std::invalid_argument);
+}
+
+/** @test LM-only, foreign-source and incomplete teachers reject before model admission. */
+TEST(FrozenParityHistoryReplay, OriginalScopeSourceAndTrajectoryRequired)
+{
+    MetadataOwner owner;
+    const auto original = descriptor(owner);
+    EXPECT_NO_THROW((void)checked(original));
+    for (int control = 0; control < 8; ++control)
+    {
+        auto bad = original;
+        switch (control)
+        {
+        case 0: bad["reference_scope"] = "final_logits_only"; break;
+        case 1: bad["canonical_cell"] = "foreign"; break;
+        case 2: bad["continuation_ids"] = {3, 4}; break;
+        case 3: bad["decode_rows"] = true; break;
+        case 4: bad["prompt_ids"] = {true}; break;
+        case 5: bad["source_digest"] = std::string(64, 'c'); break;
+        case 6: bad["full_stage_metadata_digest"] = "missing"; break;
+        case 7: bad["history_id"] = "../escape"; break;
+        }
+        EXPECT_THROW((void)checked(bad), std::invalid_argument);
+    }
+}
+
+/** @test The exact frozen source and positive original observation contract cannot be substituted. */
+TEST(FrozenParityHistoryReplay, ActualOriginalStatAndCanonicalWorkRemainBound)
+{
+    MetadataOwner owner;
+    const auto original = descriptor(owner);
+    const auto replay = checked(original);
+    const auto main = original["source"]["shards"][0]["path"].get<std::string>();
+    EXPECT_NO_THROW(replay.requireCanonicalSource(main, std::nullopt, 2));
+    EXPECT_THROW(replay.requireCanonicalSource(main, std::nullopt, 0), std::invalid_argument);
+    EXPECT_THROW(replay.requireCanonicalSource(original["source"]["shards"][1]["path"].get<std::string>(), std::nullopt, 2), std::invalid_argument);
+    const auto replacement = owner.root / "replacement";
+    { std::ofstream file(replacement); file << 'z'; }
+    std::filesystem::rename(replacement, main);
+    EXPECT_THROW(replay.requireCanonicalSource(main, std::nullopt, 2), std::invalid_argument);
+}
+
+/** @test Full-stage metadata owns the original prompt and every Pending teacher. */
+TEST(FrozenParityHistoryReplay, ExactReferencePromptTeachersAndMetadata)
+{
+    MetadataOwner owner;
+    const auto original = descriptor(owner);
+    const auto replay = checked(original);
+    const auto metadata = std::filesystem::path(replay.referenceDirectory()) / "metadata.txt";
+    EXPECT_NO_THROW(replay.requireReference(metadata, {1, 2}, {3, 4, 5}));
+    EXPECT_THROW(replay.requireReference(metadata, {1, 9}, {3, 4, 5}), std::invalid_argument);
+    EXPECT_THROW(replay.requireReference(metadata, {1, 2}, {3, 9, 5}), std::invalid_argument);
+    EXPECT_THROW(replay.requireReference(metadata, {1, 2}, {3, 4}), std::invalid_argument);
+    const auto binding = owner.root / "history_replay_binding.json";
+    EXPECT_THROW(replay.publishBinding(binding, replay.prompt(), {1, 9}, replay.referenceDirectory(), 2), std::invalid_argument);
+    EXPECT_FALSE(std::filesystem::exists(binding));
+    EXPECT_NO_THROW(replay.publishBinding(binding, replay.prompt(), replay.promptIds(), replay.referenceDirectory(), 2));
+    json actual;
+    std::ifstream(binding) >> actual;
+    EXPECT_EQ(actual.at("descriptor_sha256"), replay.identity());
+    EXPECT_EQ(actual.at("continuation_ids"), original.at("continuation_ids"));
+    { std::ofstream file(metadata, std::ios::app); file << "changed\n"; }
+    EXPECT_THROW(replay.requireReference(metadata, {1, 2}, {3, 4, 5}), std::invalid_argument);
+}
+
+/** @test Observer-only controls never replace canonical prefix/path work; placement changes reject. */
+TEST(FrozenParityHistoryReplay, CanonicalIntentSurvivesObserverOnlyControls)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    auto observer = OrchestrationConfig::defaults();
+    observer.prefix_cache.enabled = false;
+    observer.max_seq_len = 2048;
+    observer.n_predict = 3;
+    observer.n_threads = 2;
+    observer.prompt = "different observer control";
+    observer.shared_predictor = SharedPredictorGGUFSource("/synthetic/inactive-metadata.gguf");
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(observer));
+    auto canonical = OrchestrationConfig::defaults();
+    canonical.prefix_cache.enabled = true;
+    EXPECT_NO_THROW(checked(value).requireCanonicalConfiguration(canonical));
+    canonical.tp_degree = 4;
+    EXPECT_THROW(checked(value).requireCanonicalConfiguration(canonical), std::invalid_argument);
+    canonical = OrchestrationConfig::defaults();
+    canonical.kv_cache_precision = "fp32";
+    EXPECT_THROW(checked(value).requireCanonicalConfiguration(canonical), std::invalid_argument);
+    value["arithmetic"]["moe_router"] = "foreign";
+    EXPECT_THROW(checked(value).requireCanonicalConfiguration(OrchestrationConfig::defaults()), std::invalid_argument);
+}
+
+/** @test Required stage geometry is taken from the actual original canonical definition. */
+TEST(FrozenParityHistoryReplay, CanonicalAll48InventoryRemainsMandatory)
+{
+    MetadataOwner owner;
+    const auto replay = checked(descriptor(owner));
+    const auto definition = qwen4exp::qwen4ExpProductionDefinition(qwen4exp::Qwen4ExpParityTopology::CPU);
+    const auto &keys = definition.graph_snapshot_policy.required_prefill_snapshot_keys;
+    ASSERT_FALSE(keys.empty());
+    const auto require_diagnostic = [&](int step, const std::string &key, const char *state) {
+        const auto expected_path = std::filesystem::path(replay.referenceDirectory()) /
+            ((step < 0 ? std::string{} : "decode_step" + std::to_string(step) + "_") + key + ".npy");
+        try
+        {
+            replay.requireSnapshotInventory(keys, step);
+            FAIL() << "Expected the original checkpoint metadata failure";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            const std::string message = error.what();
+            EXPECT_NE(message.find(step < 0 ? "phase=prefill" : "phase=decode"), std::string::npos) << message;
+            EXPECT_NE(message.find(" step=" + std::to_string(step)), std::string::npos) << message;
+            EXPECT_NE(message.find(" key=" + key), std::string::npos) << message;
+            EXPECT_NE(message.find(" path=" + expected_path.string()), std::string::npos) << message;
+            EXPECT_NE(message.find(std::string(" state=") + state), std::string::npos) << message;
+        }
+    };
+    require_diagnostic(-1, keys.front(), "missing");
+    for (const auto &key : keys)
+    {
+        // Deliberately not valid NPY data: this tests only the metadata presence
+        // guard, never numerical or full-reference qualification.
+        std::ofstream file(std::filesystem::path(replay.referenceDirectory()) / (key + ".npy"));
+        file << 'x';
+    }
+    EXPECT_NO_THROW(replay.requireSnapshotInventory(keys, -1));
+    require_diagnostic(0, keys.front(), "missing");
+    const auto last_path = std::filesystem::path(replay.referenceDirectory()) / (keys.back() + ".npy");
+    { std::ofstream empty(last_path, std::ios::trunc); }
+    require_diagnostic(-1, keys.back(), "empty");
+    { std::ofstream restored(last_path); restored << 'x'; }
+    EXPECT_NO_THROW(replay.requireSnapshotInventory(keys, -1));
+    std::filesystem::remove(last_path);
+    require_diagnostic(-1, keys.back(), "missing");
+}
+/** @test Explicit six-step work changes cardinality only and requires the later reference keys. */
+TEST(FrozenParityHistoryReplay, SixStepObservationKeepsLimitsAndRequiresOffsetFive)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    value["decode_rows"] = 6;
+    value["continuation_ids"] = {3, 4, 5, 6, 7, 8, 9};
+    const auto replay = checked(value);
+    int rows = 2;
+    std::optional<FinalLogitMeanKLContract> contract = FinalLogitMeanKLContract{};
+    const float prefill = contract->prefill_maximum, decode = contract->decode_maximum;
+    EXPECT_NO_THROW(replay.applyObservationDepth(rows, contract));
+    EXPECT_EQ(rows, 6);
+    EXPECT_EQ(contract->decode_steps, 6);
+    EXPECT_EQ(contract->prefill_maximum, prefill);
+    EXPECT_EQ(contract->decode_maximum, decode);
+    EXPECT_FALSE(contract->accepts(decode, false));
+    EXPECT_THROW(replay.requireReference(std::filesystem::path(replay.referenceDirectory()) / "metadata.txt",
+                                        {1, 2}, {3, 4, 5}), std::invalid_argument);
+    const auto definition = qwen4exp::qwen4ExpProductionDefinition(qwen4exp::Qwen4ExpParityTopology::CPU);
+    const auto &all_keys = definition.graph_snapshot_policy.required_decode_snapshot_keys;
+    ASSERT_FALSE(all_keys.empty());
+    const std::vector<std::string> bounded_key{all_keys.back()};
+    for (int step = 0; step < 5; ++step)
+    {
+        std::ofstream file(std::filesystem::path(replay.referenceDirectory()) /
+                           ("decode_step" + std::to_string(step) + "_" + bounded_key.front() + ".npy"));
+        file << 'x'; // Metadata presence only; deliberately not a numerical pack.
+        file.close();
+        EXPECT_NO_THROW(replay.requireSnapshotInventory(bounded_key, step));
+    }
+    EXPECT_THROW(replay.requireSnapshotInventory(bounded_key, 5), std::invalid_argument);
+    std::ofstream file(std::filesystem::path(replay.referenceDirectory()) / ("decode_step5_" + bounded_key.front() + ".npy"));
+    file << 'x'; file.close();
+    EXPECT_NO_THROW(replay.requireSnapshotInventory(bounded_key, 5));
+    EXPECT_THROW(replay.requireSnapshotInventory(bounded_key, 6), std::invalid_argument);
+    int divergent = 2;
+    contract->decode_steps = 3;
+    EXPECT_THROW(replay.applyObservationDepth(divergent, contract), std::invalid_argument);
+    EXPECT_EQ(divergent, 2);
+}
+
+/** @test Actual replay metadata must prove the serving bucket, never only materialization. */
+TEST(FrozenParityHistoryReplay, ProductionServingBucketRejectsExactLiveAndMissingReplay)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    auto config = OrchestrationConfig::defaults();
+    config.prefill_max_bucket_size = 512;
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    const auto replay = checked(value);
+    const auto capture = replay.servingPrefillCapture();
+    EXPECT_EQ(capture.bucket_rows, prefillGraphBucketSizes(512));
+    EXPECT_EQ(capture.minimum_rows, kDefaultPrefillGraphMinBucketSize);
+    EXPECT_EQ(capture.selected_rows, capture.bucket_rows.front());
+    PerfStatRecord record;
+    record.kind = PerfStatRecord::Kind::Counter;
+    record.domain = "forward_graph"; record.name = "prefill_graph_phase";
+    record.phase = "prefill"; record.device = "ROCm:0"; record.count = 1; record.value = 1;
+    record.tags = {{"capture_phase", "replay"}, {"real_token_count", "2"},
+                   {"bucket_seq_len", std::to_string(capture.selected_rows)}};
+    std::vector<PerfStatRecord> records{record};
+    const auto proof = replay.servingPrefillEvidence(records, true);
+    EXPECT_EQ(proof.at("physical_rows"), capture.selected_rows);
+    EXPECT_EQ(proof.at("logical_rows"), 2);
+    EXPECT_EQ(proof.at("native_replay_observed"), true);
+    auto cpu = record;
+    cpu.device = "CPU:0";
+    cpu.tags["bucket_seq_len"] = "2";
+    records.push_back(cpu); // A heterogeneous follower performs only its live CPU rows.
+    EXPECT_NO_THROW((void)replay.servingPrefillEvidence(records, true));
+    records.pop_back();
+    records.front().tags["bucket_seq_len"] = "2";
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true), std::invalid_argument);
+    records.front() = record;
+    records.front().tags["capture_phase"] = "materialized_without_launch";
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true), std::invalid_argument);
+    records.clear();
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true), std::invalid_argument);
+    EXPECT_EQ(replay.servingPrefillEvidence(records, false).at("physical_rows"), 2);
+    config.prefill_max_bucket_size = 1;
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    EXPECT_THROW((void)checked(value).servingPrefillCapture(), std::invalid_argument);
+}
+/** @test The complete nine-row history uses its admitted 8+1 family on every selected GPU. */
+TEST(FrozenParityHistoryReplay, SelectedFixedPipelineRequiresOriginalExactChunkReplays)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    value["prompt_ids"] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto config = OrchestrationConfig::defaults();
+    config.n_threads = 2;
+    config.mpi_procs = 2;
+    config.planning_mode = OrchestrationPlanningMode::Apply;
+    config.execution_rank_selection = ExecutionRankSelection({1});
+    config.prefill_max_bucket_size = 64;
+    config.ngram_table_policy = {.storage = ImmutableRowStoragePreference::VRAM,
+                                  .distribution = ImmutableRowTableDistribution::FixedHeadSharded};
+    config.pp_stage_definitions = {{0, "entry", 0, 23}, {1, "tail", 24, 47}};
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    const auto replay = checked(value);
+    EXPECT_EQ(replay.requestedCPUWorkers(), 2);
+    EXPECT_NO_THROW(replay.requireCanonicalConfiguration(config));
+    auto wrong_owner = config;
+    wrong_owner.execution_rank_selection = ExecutionRankSelection({0});
+    EXPECT_THROW(replay.requireCanonicalConfiguration(wrong_owner), std::invalid_argument);
+    wrong_owner.execution_rank_selection.reset();
+    EXPECT_THROW(replay.requireCanonicalConfiguration(wrong_owner), std::invalid_argument);
+
+    const auto requested = replay.servingPrefillCapture();
+    EXPECT_EQ(requested.bucket_rows, prefillGraphBucketSizes(64));
+    EXPECT_EQ(requested.minimum_rows, std::min(64, kDefaultPrefillGraphMinBucketSize));
+    EXPECT_EQ(requested.selected_rows, 0);
+
+    SnapshotAdmissionGeometryProbe probe;
+    probe.configure(9, std::nullopt, 64);
+    ASSERT_NO_FATAL_FAILURE(probe.beginProductionParitySnapshotAdmission());
+    EXPECT_EQ(probe.retainedRows(), 64);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, requested.bucket_rows);
+
+    const auto entry = GlobalDeviceAddress::rocm(2, 1, "observed");
+    const auto member = GlobalDeviceAddress::rocm(4, 1, "observed");
+    const auto tail = GlobalDeviceAddress::rocm(6, 1, "observed");
+    RankExecutionPlan plan;
+    plan.local_pp_devices = {entry, tail};
+    plan.local_pp_stage_tp_info = {{.devices = {entry, member}}, {.devices = {tail}}};
+    plan.runtime.overlay_prefill_schedule = {.graph_row_capacity = 32,
+                                             .bucket_rows = exactPrefillGraphWidths(32)};
+    probe.enablePrefillEvidence();
+    const auto publish = [](const std::string &device, int rows, std::initializer_list<std::uint64_t> words) {
+        PerfStatsCollector::addCounterWithSequence("forward_graph", "prefill_graph_phase", 1, words,
+            "prefill", device, {{"capture_phase", "replay"}, {"real_token_count", std::to_string(rows)},
+                                {"bucket_seq_len", std::to_string(rows)}});
+    };
+    const std::vector<std::string> devices{"ROCm:2", "ROCm:4", "ROCm:6"};
+    for (const auto &device : devices)
+    {
+        publish(device, 8, {0, 0, 8});
+        publish(device, 1, {1, 8, 9});
+    }
+    auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const auto proof = replay.servingPrefillEvidence(records, true, &plan);
+    EXPECT_EQ(proof.at("capture_mode"), "production_exact_retained");
+    EXPECT_EQ(proof.at("bucket_rows"), exactPrefillGraphWidths(32));
+    EXPECT_EQ(proof.at("logical_rows"), 9);
+    EXPECT_EQ(proof.at("physical_rows"), 9);
+    EXPECT_EQ(proof.at("chunks"), json::array({{{"token_offset", 0}, {"logical_rows", 8}, {"physical_rows", 8}},
+                                              {{"token_offset", 8}, {"logical_rows", 1}, {"physical_rows", 1}}}));
+    EXPECT_EQ(proof.at("native_devices"), json::array({"ROCm:2", "ROCm:4", "ROCm:6"}));
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true), std::invalid_argument);
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, false, &plan), std::invalid_argument);
+    const auto tail_chunk = std::find_if(records.begin(), records.end(), [](const auto &record) {
+        return record.device == "ROCm:6" && record.tags.at("bucket_seq_len") == "1";
+    });
+    ASSERT_NE(tail_chunk, records.end());
+    const auto original = *tail_chunk;
+    tail_chunk->tags["capture_phase"] = "materialized_without_launch";
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+    *tail_chunk = original;
+    tail_chunk->tags["bucket_seq_len"] = "8";
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+    *tail_chunk = original;
+    tail_chunk->sequence_minimum_words = tail_chunk->sequence_maximum_words = {1, 7, 8};
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+    *tail_chunk = original;
+    records.push_back(original);
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+
+    // Four equal-width steps retain identical extrema under an interior swap
+    // or duplicate. The original digest must catch both despite that collision.
+    value["prompt_ids"] = std::vector<int>(129, 1);
+    const auto repeated = checked(value);
+    const auto publish_repeated = [&](bool reorder, bool duplicate) {
+        PerfStatsCollector::reset();
+        for (const auto &device : devices)
+        {
+            const bool changed = device == devices.back();
+            publish(device, 32, {0, 0, 32});
+            if (changed && reorder)
+            {
+                publish(device, 32, {2, 64, 96});
+                publish(device, 32, {1, 32, 64});
+            }
+            else
+            {
+                publish(device, 32, {1, 32, 64});
+                if (changed && duplicate)
+                    publish(device, 32, {1, 32, 64});
+                else
+                    publish(device, 32, {2, 64, 96});
+            }
+            publish(device, 32, {3, 96, 128});
+            publish(device, 1, {4, 128, 129});
+        }
+        return PerfStatsCollector::snapshot({"forward_graph"});
+    };
+    const auto repeated_proof = repeated.servingPrefillEvidence(publish_repeated(false, false), true, &plan);
+    ASSERT_EQ(repeated_proof.at("chunks").size(), 5u);
+    EXPECT_EQ(repeated_proof.at("logical_rows"), 129);
+    EXPECT_THROW((void)repeated.servingPrefillEvidence(publish_repeated(true, false), true, &plan),
+                 std::invalid_argument);
+    EXPECT_THROW((void)repeated.servingPrefillEvidence(publish_repeated(false, true), true, &plan),
+                 std::invalid_argument);
+}
+
+/** @test Explicit workers change only the public runner field and reject socket budgets. */
+TEST(FrozenParityHistoryReplay, ExplicitWorkersRejectNarrowedOrBoundExecution)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    value["expected_config"]["configuration"]["n_threads"] = 4;
+    value["expected_config"]["configuration"]["mpi_procs"] = 1;
+    const auto replay = checked(value);
+    auto config = OrchestrationConfig::defaults();
+    const auto original = json::parse(serializeOrchestrationConfig(config));
+    replay.applyCPUWorkers(config);
+    auto projected = json::parse(serializeOrchestrationConfig(config));
+    EXPECT_EQ(config.n_threads, 4);
+    projected["configuration"]["n_threads"] = original["configuration"]["n_threads"];
+    EXPECT_EQ(projected, original);
+    FrozenParityHistoryReplay::CPUExecutionObservation actual{{0, 2, 4, 6}, 4, 4, false, true, "cores"};
+    EXPECT_NO_THROW(replay.requireCPUExecution(actual));
+    actual.physical_cores = 2;
+    EXPECT_THROW(replay.requireCPUExecution(actual), std::invalid_argument);
+    actual.physical_cores = 4;
+    actual.max_workers = 2;
+    EXPECT_THROW(replay.requireCPUExecution(actual), std::invalid_argument);
+    actual.max_workers = 4;
+    actual.unbound = false;
+    EXPECT_THROW(replay.requireCPUExecution(actual), std::invalid_argument);
+    actual.unbound = true;
+    actual.dynamic = true;
+    EXPECT_THROW(replay.requireCPUExecution(actual), std::invalid_argument);
+    value["expected_config"]["configuration"]["n_threads"] = -1;
+    EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
+    value["expected_config"]["configuration"]["n_threads"] = 4;
+    value["expected_config"]["configuration"]["mpi_procs"] = 2;
+    EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
+}
+
+/** @test Real CPU worker records are required only where the declared topology computes on CPU. */
+TEST(FrozenParityHistoryReplay, ActualWorkersRequiredForCPUButNotGPUOnly)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    auto config = OrchestrationConfig::defaults();
+    config.n_threads = 4;
+    config.mpi_procs = 1;
+    config.device_mode = DeviceAssignmentMode::EXPLICIT;
+    config.device_for_this_rank = GlobalDeviceAddress::cpu();
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    FrozenParityHistoryReplay::CPUExecutionObservation actual{{0, 2, 4, 6}, 4, 4, false, true, "cores"};
+    auto replay = checked(value);
+    std::vector<PerfStatRecord> records;
+    EXPECT_THROW(replay.cpuExecutionEvidence(records, actual), std::invalid_argument);
+    PerfStatRecord record;
+    record.kind = PerfStatRecord::Kind::Counter;
+    record.domain = "kernel";
+    record.name = "cpu_moe_router_q8_worker_rows";
+    record.phase = "moe";
+    record.device = "cpu";
+    record.count = 1;
+    record.value = 1;
+    record.tags = {{"workers", "4"}};
+    records.push_back(record);
+    EXPECT_TRUE(replay.cpuExecutionEvidence(records, actual).at("parallel_work_observed").get<bool>());
+    records.front().tags["workers"] = "2";
+    EXPECT_THROW(replay.cpuExecutionEvidence(records, actual), std::invalid_argument);
+    records.front().tags["workers"] = "1";
+    EXPECT_THROW(replay.cpuExecutionEvidence(records, actual), std::invalid_argument);
+    config.device_for_this_rank = GlobalDeviceAddress::cuda(0);
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    const auto gpu = checked(value);
+    const auto proof = gpu.cpuExecutionEvidence({}, actual);
+    EXPECT_FALSE(proof.at("cpu_compute_required").get<bool>());
+    EXPECT_FALSE(proof.at("parallel_work_observed").get<bool>());
+    // A CPU expert domain still owns compute even with a native continuation.
+    config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    RoutedExpertDomain domain;
+    domain.name = "cpu-experts";
+    domain.participants = {GlobalDeviceAddress::cpu()};
+    config.moe_routed_expert_plan->domains.push_back(domain);
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    EXPECT_THROW(checked(value).cpuExecutionEvidence({}, actual), std::invalid_argument);
+}
+
+/**
+ * @test Real CUDA/ROCm adaptive declarations retain the default serving cap identity.
+ * @note Only tiny source/reference metadata is synthetic. Public canonical cases,
+ *       exporter/parser, explicit observer cap and replay comparison are real.
+ */
+TEST(FrozenParityHistoryReplay, ActualAdaptiveCaseResolvesDefaultBucketAndRejectsDifferentCap)
+{
+    for (const auto &cell : qwen4exp::qwen4ExpGPUAdaptiveProductionCases())
+    {
+        SCOPED_TRACE(cell.testName());
+        MetadataOwner owner;
+        auto value = descriptor(owner);
+        auto arguments = modelParityDiagnosticBenchmarkArguments(cell);
+        arguments.insert(arguments.begin(), "frozen-history-unit");
+        std::vector<char *> argv;
+        for (auto &argument : arguments) argv.push_back(argument.data());
+        const auto canonical = OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
+        ASSERT_FALSE(canonical.prefill_max_bucket_size.has_value());
+        auto observer = canonical;
+        observer.prefill_max_bucket_size = kDefaultPrefillGraphMaxBucketSize;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(observer));
+        value["prompt"] = cell.model.prompt;
+        value["prompt_ids"] = cell.model.token_ids;
+        value["continuation_ids"] = {13, 271, 248045};
+        const auto replay = checked(value);
+        EXPECT_NO_THROW(replay.requireCanonicalConfiguration(canonical));
+        const auto capture = replay.servingPrefillCapture();
+        EXPECT_EQ(capture.bucket_rows, defaultPrefillGraphBucketSizes());
+        EXPECT_EQ(capture.minimum_rows, kDefaultPrefillGraphMinBucketSize);
+        EXPECT_EQ(capture.selected_rows, 64);
+        EXPECT_EQ(cell.model.token_ids.size(), 9u);
+        auto explicit_canonical = canonical;
+        explicit_canonical.prefill_max_bucket_size = kDefaultPrefillGraphMaxBucketSize;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(canonical));
+        EXPECT_NO_THROW(checked(value).requireCanonicalConfiguration(explicit_canonical));
+        // Even though this short prompt would still select64, a larger cap
+        // changes retained workspace/graph geometry and cannot compare equal.
+        observer.prefill_max_bucket_size = 1024;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(observer));
+        try
+        {
+            checked(value).requireCanonicalConfiguration(canonical);
+            FAIL() << "Different explicit serving cap was accepted";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("field=prefill_max_bucket_size"), std::string::npos);
+            EXPECT_NE(message.find("canonical=null"), std::string::npos);
+            EXPECT_NE(message.find("observer=1024"), std::string::npos);
+        }
+        observer = canonical;
+        observer.kv_cache_precision = "fp32";
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(observer));
+        try
+        {
+            checked(value).requireCanonicalConfiguration(canonical);
+            FAIL() << "Different canonical arithmetic was accepted";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("field=kv_cache_precision"), std::string::npos);
+            EXPECT_NE(message.find("canonical=\"fp16\""), std::string::npos);
+            EXPECT_NE(message.find("observer=\"fp32\""), std::string::npos);
+        }
+    }
+}
+
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+/** @test Original binding survives real directory reset; the former pre-reset ordering loses it. */
+TEST(FrozenParityHistoryReplay, ArtifactReadyPublicationSurvivesFreshDirectoryReset)
+{
+    MetadataOwner owner;
+    const auto original = descriptor(owner);
+    const auto replay = checked(original);
+    const auto directory = owner.root / "artifacts";
+    const auto binding = directory / "history_replay_binding.json";
+    std::filesystem::create_directories(directory);
+    replay.publishBinding(binding, replay.prompt(), replay.promptIds(), replay.referenceDirectory(), 2);
+    // Negative control reproduces the former lifecycle using the actual publisher.
+    const auto former = prepareParityArtifactDirectory(directory, true, [] {});
+    ASSERT_EQ(former.ready, 1) << former.error;
+    EXPECT_FALSE(std::filesystem::exists(binding));
+    { std::ofstream stale(directory / "old.csv"); stale << "stale"; }
+    int publications = 0;
+    const auto actual = prepareParityArtifactDirectory(directory, true, [&] {
+        ++publications;
+        EXPECT_FALSE(std::filesystem::exists(directory / "old.csv"));
+        replay.publishBinding(binding, replay.prompt(), replay.promptIds(), replay.referenceDirectory(), 2);
+    });
+    ASSERT_EQ(actual.ready, 1) << actual.error;
+    EXPECT_EQ(publications, 1);
+    std::ifstream input(binding);
+    ASSERT_TRUE(input);
+    json observed; input >> observed;
+    EXPECT_EQ(observed.at("descriptor_sha256"), replay.identity());
+    EXPECT_EQ(observed.at("canonical_cell"), original.at("canonical_cell"));
+    EXPECT_EQ(observed.at("prompt_ids"), original.at("prompt_ids"));
+    EXPECT_EQ(observed.at("continuation_ids"), original.at("continuation_ids"));
+    EXPECT_EQ(observed.at("reference_directory"), original.at("reference_directory"));
+    EXPECT_EQ(observed.at("decode_rows"), 2);
+}
+
+/** @test Peers never publish or touch the directory, and owner failures become a failed consensus input. */
+TEST(FrozenParityHistoryReplay, ArtifactReadyPublicationRejectsValidationCloseAndResetFailures)
+{
+    MetadataOwner owner;
+    const auto replay = checked(descriptor(owner));
+    const auto directory = owner.root / "artifacts";
+    const auto binding = directory / "history_replay_binding.json";
+    int publications = 0;
+    const auto peer = prepareParityArtifactDirectory(directory, false, [&] { ++publications; });
+    EXPECT_EQ(peer.ready, 1);
+    EXPECT_EQ(publications, 0);
+    EXPECT_FALSE(std::filesystem::exists(directory));
+    const auto invalid = prepareParityArtifactDirectory(directory, true, [&] {
+        replay.publishBinding(binding, replay.prompt(), {9}, replay.referenceDirectory(), 2);
+    });
+    EXPECT_EQ(invalid.ready, 0);
+    EXPECT_FALSE(invalid.error.empty());
+    EXPECT_FALSE(std::filesystem::exists(binding));
+    const auto close_failure = prepareParityArtifactDirectory(directory, true, [&] {
+        std::filesystem::create_directory(binding);
+        replay.publishBinding(binding, replay.prompt(), replay.promptIds(), replay.referenceDirectory(), 2);
+    });
+    EXPECT_EQ(close_failure.ready, 0);
+    EXPECT_NE(close_failure.error.find("Cannot close"), std::string::npos);
+    const auto blocked = owner.root / "blocked";
+    { std::ofstream file(blocked); file << "not a directory"; }
+    const auto reset_failure = prepareParityArtifactDirectory(blocked / "artifacts", true,
+        [&] { ++publications; });
+    EXPECT_EQ(reset_failure.ready, 0);
+    EXPECT_FALSE(reset_failure.error.empty());
+    EXPECT_EQ(publications, 0);
+}
+
+
+/** @test Standalone admission activates its production lifetime before exact-history setup. */
+TEST(FrozenParityHistoryReplay, StandaloneSnapshotAdmissionUsesExactHistoryBeforeRunnerSetup)
+{
+    SnapshotAdmissionGeometryProbe probe;
+    probe.configure(9);
+    const auto keys = probe.snapshotPolicy().required_prefill_snapshot_keys;
+    ASSERT_FALSE(keys.empty());
+    // This is the original failing call order: inactive SetUp leaves the
+    // serving maximum in place even though the oracle has only nine rows.
+    ASSERT_NO_FATAL_FAILURE(probe.configureExactProductionParityPrefillGraphBucket());
+    EXPECT_EQ(probe.retainedRows(), 512);
+    ASSERT_NO_FATAL_FAILURE(probe.beginProductionParitySnapshotAdmission());
+    EXPECT_EQ(probe.retainedRows(), 9);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, std::vector<int>{9});
+    EXPECT_EQ(probe.snapshotPolicy().required_prefill_snapshot_keys, keys);
+}
+
+/** @test An explicit production-serving diagnosis retains M512 instead of exact-live buckets. */
+TEST(FrozenParityHistoryReplay, StandaloneSnapshotAdmissionPreservesFrozenServingGeometry)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    auto config = OrchestrationConfig::defaults();
+    config.prefill_max_bucket_size = 512;
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    const auto replay = checked(value);
+    const auto serving = replay.servingPrefillCapture();
+    SnapshotAdmissionGeometryProbe probe;
+    probe.configure(2, replay);
+    const auto keys = probe.snapshotPolicy().required_prefill_snapshot_keys;
+    ASSERT_NO_FATAL_FAILURE(probe.beginProductionParitySnapshotAdmission());
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, serving.bucket_rows);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_min_seq, serving.minimum_rows);
+    EXPECT_EQ(probe.retainedRows(), 512);
+    EXPECT_EQ(probe.snapshotPolicy().required_prefill_snapshot_keys, keys);
+}
+
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+/** @test Every exact original active cell retains all identity bytes under filesystem bounds. */
+TEST(FrozenParityHistoryReplay, ArtifactIdentityBoundsExactAndNumericalOriginalCells)
+{
+    std::set<std::filesystem::path> paths;
+    for (const auto &cell : qwen4exp::qwen4ExpOppositeVendorMTPRetained15Cases())
+    {
+        for (const auto *body : {"MTPExactReplay", "ProductionParity"})
+        {
+            const std::string suite = std::string_view(body) == "MTPExactReplay"
+                ? "Qwen4ExpOppositeVendorMTPRetained15Exact/Qwen4ExpMTPExactReplayTest/"
+                : "Qwen4ExpOppositeVendorMTPRetained15/Qwen4ExpMainParityTest/";
+            const auto raw = suite + body + "/" + cell.testName();
+            auto expected = raw;
+            std::replace(expected.begin(), expected.end(), '/', '_');
+            ASSERT_GT(expected.size(), 255u);
+            const auto path = ParityCSVArtifactWriter::testIdentityPath(raw);
+            ASSERT_EQ(path.begin()->string(), "long-identities");
+            ASSERT_EQ(path.filename(), "artifacts");
+            std::string restored;
+            for (auto it = std::next(path.begin()); std::next(it) != path.end(); ++it)
+            {
+                const auto chunk = it->string();
+                EXPECT_LE(chunk.size(), 255u);
+                ASSERT_TRUE(chunk.starts_with('c'));
+                restored += chunk.substr(1);
+            }
+            EXPECT_EQ(restored, expected);
+            EXPECT_TRUE(paths.insert(path).second);
+        }
+    }
+    EXPECT_EQ(paths.size(), 24u);
+}
+
+/** @test Existing bounded numerical paths remain byte-identical; the reserved name escapes itself. */
+TEST(FrozenParityHistoryReplay, ArtifactIdentityPreservesShortNumericsAndEscapesReservedName)
+{
+    for (const auto &cell : qwen4exp::qwen4ExpGPUAdaptiveProductionCases())
+    {
+        for (const auto *body : {"ProductionParity", "SnapshotAdmission"})
+        {
+            auto raw = std::string("Qwen4ExpGPUAdaptive/Qwen4ExpMainParityTest/") +
+                body + "/" + cell.testName();
+            std::replace(raw.begin(), raw.end(), '/', '_');
+            ASSERT_LE(raw.size(), 255u);
+            EXPECT_EQ(ParityCSVArtifactWriter::testIdentityPath(raw), std::filesystem::path(raw));
+        }
+    }
+    EXPECT_EQ(ParityCSVArtifactWriter::testIdentityPath("long-identities"),
+              std::filesystem::path("long-identities") / "clong-identities" / "artifacts");
+    EXPECT_EQ(ParityCSVArtifactWriter::testIdentityPath(std::string(255, 'a')),
+              std::filesystem::path(std::string(255, 'a')));
+    EXPECT_THROW(ParityCSVArtifactWriter::testIdentityPath(""), std::invalid_argument);
+}
+
+/** @test Complete-prefix names cannot make one cell's cleanup delete another cell's artifacts. */
+TEST(FrozenParityHistoryReplay, ArtifactIdentityTerminalLeafKeepsPrefixNeighborsIndependent)
+{
+    MetadataOwner owner;
+    const auto prefix = std::string(480, 'a');
+    const auto a = owner.root / ParityCSVArtifactWriter::testIdentityPath(prefix);
+    const auto b = owner.root / ParityCSVArtifactWriter::testIdentityPath(prefix + "tail");
+    ASSERT_NE(a, b);
+    ASSERT_EQ(*b.lexically_relative(a).begin(), "..");
+    ASSERT_EQ(*a.lexically_relative(b).begin(), "..");
+    ASSERT_EQ(prepareParityArtifactDirectory(a, true, [] {}).ready, 1);
+    ASSERT_EQ(prepareParityArtifactDirectory(b, true, [&] {
+        std::ofstream(b / "neighbor.csv") << "original neighboring cell";
+    }).ready, 1);
+    ASSERT_EQ(prepareParityArtifactDirectory(a, true, [] {}).ready, 1);
+    EXPECT_TRUE(std::filesystem::is_regular_file(b / "neighbor.csv"));
+    // Actual original unbounded owner behavior fails before publication on the same filesystem.
+    EXPECT_EQ(prepareParityArtifactDirectory(owner.root / prefix, true, [] {}).ready, 0);
+}
+
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+namespace
+{
+/** @brief Native publications only; no model, controller admission or backend is constructed. */
+class NativeExactSnapshotRunner : public llaminar2::test::MockOrchestrationRunner
+{
+public:
+    std::map<std::string, std::vector<float>> floating;
+    std::map<std::string, std::vector<std::int64_t>> integers;
+
+    /** @brief Feed original typed runner interfaces consumed by the actual parity owner. */
+    NativeExactSnapshotRunner()
+    {
+        ON_CALL(*this, prefill(::testing::_)).WillByDefault(::testing::Return(true));
+        ON_CALL(*this, getSnapshotKeys()).WillByDefault([this] {
+            std::vector<std::string> result;
+            for (const auto &[key, values] : floating)
+                result.push_back(key);
+            for (const auto &[key, values] : integers)
+                result.push_back(key);
+            return result;
+        });
+        ON_CALL(*this, getSnapshot(::testing::_, ::testing::_))
+            .WillByDefault([this](const std::string &key, size_t &size) -> const float * {
+                if (integers.contains(key))
+                    throw std::logic_error("INT64 publication cannot enter a floating snapshot adapter");
+                const auto found = floating.find(key);
+                size = found == floating.end() ? 0 : found->second.size();
+                return size ? found->second.data() : nullptr;
+            });
+    }
+    /** @return The same immutable typed publication shape used by original runner APIs. */
+    SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+    {
+        if (const auto found = integers.find(key); found != integers.end())
+            return {.size = found->second.size(), .rows = 1, .cols = found->second.size(),
+                    .typed_values = std::span<const std::int64_t>(found->second)};
+        return {};
+    }
+};
+
+/** @brief Invoke actual native-prefill and serial-bank bodies without SetUp/model loading. */
+class NativeExactFixtureOwnerProbe final : public ParityTestBase
+{
+public:
+    /** @brief Keep every original declared QFN row checkpoint; source geometry is not fabricated. */
+    explicit NativeExactFixtureOwnerProbe(MTPParityProofPurpose purpose) : purpose_(purpose)
+    {
+        config_.graph_snapshot_policy = qwen4exp::qwen4ExpProductionDefinition(
+            qwen4exp::Qwen4ExpParityTopology::CPU).graph_snapshot_policy;
+        auto runner = std::make_unique<::testing::NiceMock<NativeExactSnapshotRunner>>();
+        original = runner.get();
+        auto keys = config_.graph_snapshot_policy.required_decode_snapshot_keys;
+        keys.insert(keys.end(), {"EMBEDDING", "FINAL_NORM", "LM_HEAD"});
+        for (const auto &key : keys)
+        {
+            if (!isNativeVerifierRowCheckpoint(key))
+                continue;
+            if (key.ends_with("_PLE_HASH_INDICES"))
+                original->integers[key] = {9'007'199'254'740'993LL};
+            else
+                original->floating[key] = {1.0f};
+        }
+        orch_runner_ = std::move(runner);
+    }
+    /** @brief Manually scoped owner probe never enters the GTest fixture lifecycle. */
+    void TestBody() override {}
+    /** @return Diagnostic name, without backend startup. */
+    std::string getBackendName() override { return "NativeExactOwnerOnly"; }
+    /** @return Typed obligation selected by the actual test owner. */
+    MTPParityProofPurpose mtpParityProofPurpose() const noexcept override
+    {
+        return purpose_;
+    }
+    /** @brief Exercise the actual common prefill body with an original tiny metadata file. */
+    bool prefill(const std::filesystem::path &directory)
+    {
+        config_.snapshot_dir = directory.string();
+        const int token = 13;
+        return executeActiveParityForward(ParityForwardPhase::Prefill, &token, 1);
+    }
+    /** @return Only the existing teacher trajectory, never a second execution owner. */
+    const std::vector<int32_t> &teachers() const
+    {
+        return orchestration_parity_decode_trajectory_;
+    }
+    /** @brief Exercise actual serial-bank admission, not a reconstructed predicate. */
+    std::string retain()
+    {
+        ProductionParityMTPSerialOracleBoundary boundary;
+        boundary.token = 13;
+        boundary.checkpoint_reference = true;
+        boundary.before.initialized = true;
+        boundary.after.initialized = true;
+        return retainProductionParityNativeSerialRow(boundary);
+    }
+    /** @return Exact original integer bank value, proving no floating adaptation. */
+    std::int64_t retainedHash() const
+    {
+        return production_parity_native_serial_integer_rows_.at("layer1_PLE_HASH_INDICES").at(0);
+    }
+    NativeExactSnapshotRunner *original = nullptr;
+private:
+    MTPParityProofPurpose purpose_;
+};
+}
+
+/** @test Native prefill never imports teachers; numerical prefill keeps its exact original trajectory. */
+TEST(FrozenParityHistoryReplay, NativeExactOwnerDoesNotImportNumericalTeacherTokens)
+{
+    MetadataOwner owner;
+    std::ofstream(owner.root / "metadata.txt") << "decode_tokens: 31,7\n";
+    NativeExactFixtureOwnerProbe native(MTPParityProofPurpose::NativeExactReplay);
+    EXPECT_CALL(*native.original, prefill(::testing::ElementsAre(13))).Times(1);
+    EXPECT_TRUE(native.prefill(owner.root));
+    EXPECT_TRUE(native.teachers().empty());
+    NativeExactFixtureOwnerProbe numerical(MTPParityProofPurpose::ReferenceNumerics);
+    EXPECT_CALL(*numerical.original, prefill(::testing::ElementsAre(13))).Times(1);
+    EXPECT_TRUE(numerical.prefill(owner.root));
+    EXPECT_EQ(numerical.teachers(), (std::vector<int32_t>{31, 7}));
+}
+
+/** @test Omitting a declared PLE/FFN row cannot shrink the original snapshot proof silently. */
+TEST(FrozenParityHistoryReplay, NativeExactOwnerRequiresEveryDeclaredEligibleSerialCheckpoint)
+{
+    for (const auto *missing : {"layer1_PLE_HASH_INDICES", "layer1_PLE_GATHER", "layer0_FFN_NORM"})
+    {
+        NativeExactFixtureOwnerProbe probe(MTPParityProofPurpose::NativeExactReplay);
+        probe.original->floating.erase(missing);
+        probe.original->integers.erase(missing);
+        const auto error = probe.retain();
+        EXPECT_NE(error.find(missing), std::string::npos) << error;
+    }
+    NativeExactFixtureOwnerProbe complete(MTPParityProofPurpose::NativeExactReplay);
+    EXPECT_TRUE(complete.retain().empty());
+    EXPECT_EQ(complete.retainedHash(), 9'007'199'254'740'993LL);
+}
+/** @test Exact original CPU joint population retains per-rank public worker requests. */
+TEST(FrozenParityHistoryReplay, OriginalCPUJointWorkersUseTypedWorldMembership)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    const auto& cell=qwen4exp::qwen4ExpCPUJointWorld2NumericalCases().front();
+    auto arguments=modelParityDiagnosticBenchmarkArguments(cell);arguments.insert(arguments.begin(),"history-contract");
+    std::vector<char*> argv;for(auto& argument:arguments)argv.push_back(argument.data());
+    auto config=OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()),argv.data());
+    config.n_threads=2;
+    value["expected_config"]=json::parse(serializeOrchestrationConfig(config));
+    const auto replay=checked(value);
+    EXPECT_EQ(replay.requestedCPUWorkers(),2);
+    FrozenParityHistoryReplay::CPUExecutionObservation actual{{0,2},2,2,false,true,"cores"};
+    EXPECT_NO_THROW(replay.requireCPUExecution(actual));
+    actual.physical_cores=1;
+    EXPECT_THROW(replay.requireCPUExecution(actual),std::invalid_argument);
+    config.mpi_procs=4;
+    value["expected_config"]=json::parse(serializeOrchestrationConfig(config));
+    EXPECT_THROW(checked(value).requestedCPUWorkers(),std::invalid_argument);
+}
+
+/** @brief Configuration-only probe; no factory, model or native owner is constructed. */
+class OriginalContextConfigurationProbe final:public ParityTestBase {
+public:
+    std::shared_ptr<IMPIContext> original;
+    void TestBody() override {}
+    std::string getBackendName() override {return "ContextConfigurationContract";}
+    /** @return Existing optional original owner used by the actual fresh construction branch. */
+    std::shared_ptr<IMPIContext> configuredContext() const {return freshParityMPIContext();}
+    /** @return Historical default remains empty, preserving the original helper branch. */
+    std::shared_ptr<IMPIContext> defaultContext() const {return ParityTestBase::freshParityMPIContext();}
+protected:
+    std::shared_ptr<IMPIContext> freshParityMPIContext() const override {return original;}
+};
+/** @test Fresh context configuration retains original identity without linking production helper bodies. */
+TEST(FrozenParityHistoryReplay, FreshContextConfigurationRetainsOriginalOwnerBeforeAdmission) {
+    OriginalContextConfigurationProbe probe;
+    auto original=std::make_shared<MockMPIContext>();probe.original=original;
+    EXPECT_EQ(probe.configuredContext(),original);EXPECT_FALSE(probe.defaultContext());
+}
+
+} // namespace llaminar2::test::parity
+
+/** @test Dynamic placement diagnostic retains the original frozen source/socket request and real movement obligation. */
+TEST(FrozenParityHistoryReplay, CPUJointDynamicSiblingRetainsOriginalSourceAndRequiresMovement)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test::parity;
+    const auto &original=llaminar2::test::parity::qwen4exp::qwen4ExpCPUJointWorld2NumericalCases().front();
+    const auto &dynamic=llaminar2::test::parity::qwen4exp::qwen4ExpCPUJointWorld2DynamicNumericalCases().front();
+    EXPECT_EQ(dynamic.topology.test_id,original.topology.test_id);
+    EXPECT_EQ(dynamic.topology.mpi_ranks,2);
+    EXPECT_EQ(dynamic.model.model_path,original.model.model_path);
+    ASSERT_TRUE(dynamic.model.shared_predictor);
+    ASSERT_TRUE(original.model.shared_predictor);
+    EXPECT_EQ(dynamic.model.shared_predictor->path(),original.model.shared_predictor->path());
+    EXPECT_EQ(dynamic.mtp,ModelParityMTP::Off);
+    EXPECT_EQ(dynamic.retained_mtp_draft_capacity,0);
+    EXPECT_EQ(dynamic.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+    EXPECT_TRUE(dynamic.requiresPhysicalExpertMovement());
+    std::ostringstream dynamic_metadata,static_metadata;
+    PrintTo(dynamic,&dynamic_metadata);PrintTo(original,&static_metadata);
+    EXPECT_TRUE(nlohmann::json::parse(dynamic_metadata.str()).at("runtime").at("cohort_publication_inference").get<bool>());
+    EXPECT_FALSE(nlohmann::json::parse(static_metadata.str()).at("runtime").contains("cohort_publication_inference"));
+
+    for(int rank=0;rank<2;++rank) {
+        const auto config=dynamic.makeOrchestrationConfig(dynamic.model.model_path,rank);
+        EXPECT_EQ(config.moe_rebalance.mode,MoERebalanceRuntimeMode::Dynamic);
+        // The parity adapter declares topology; production rank resolution
+        // seals the authority before admission, weights, or graphs exist.
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        EXPECT_EQ(config.moe_routed_expert_plan->authority_execution,
+                  MoEOverlayAuthorityExecutionKind::Unresolved);
+        const auto resolved = normalizeMoEExpertOverlayAuthorityPlan({
+            .requested_plan = config.moe_routed_expert_plan,
+            .model_has_routed_experts = true,
+            .world_rank = rank,
+            .residency_maintenance = config.moe_rebalance.mode});
+        ASSERT_TRUE(resolved.plan);
+        EXPECT_EQ(resolved.disposition, MoEExpertOverlayAuthorityPlanDisposition::ExplicitPlan);
+        EXPECT_EQ(resolved.plan->authority_execution, MoEOverlayAuthorityExecutionKind::HostResident);
+        EXPECT_EQ(config.moe_routed_expert_plan->authority_execution,
+                  MoEOverlayAuthorityExecutionKind::Unresolved);
+        EXPECT_EQ(config.moe_routed_expert_plan->domains.back().routed_compute_policy,RoutedExpertComputePolicy::TensorSharded);
+        EXPECT_TRUE(dynamic.toTestConfig().moe_rebalance_exercise.enabled);
+    }
+}
+
+/** @test Actual Dynamic frozen-history worker projection preserves all original source policy. */
+TEST(FrozenParityHistoryReplay, CPUJointDynamicFrozenWorkersPreserveOriginalPolicy)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test::parity;
+    for (const auto &cell : llaminar2::test::parity::qwen4exp::qwen4ExpCPUJointWorld2DynamicNumericalCases())
+    {
+        MetadataOwner owner;
+        auto value = descriptor(owner);
+        auto arguments = modelParityDiagnosticBenchmarkArguments(cell);
+        arguments.insert(arguments.begin(), "dynamic-history-contract");
+        std::vector<char *> argv;
+        for (auto &argument : arguments) argv.push_back(argument.data());
+        auto config = OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
+        ASSERT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+        ASSERT_EQ(config.moe_routed_expert_plan->residency_policy, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        ASSERT_TRUE(cell.requiresPhysicalExpertMovement());
+        // Metadata-only equivalent of the original source-bound worker handoff:
+        // no team, source payload, model, PMA grant or numerical verdict exists.
+        config.n_threads = 28;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+        const auto replay = checked(value);
+        EXPECT_EQ(replay.requestedCPUWorkers(), 28);
+        auto current = config;
+        current.n_threads = 1;
+        EXPECT_NO_THROW(replay.applyCPUWorkers(current));
+        EXPECT_EQ(serializeOrchestrationConfig(current), serializeOrchestrationConfig(config));
+        auto foreign = config;
+        foreign.mpi_procs = 4;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(foreign));
+        EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
+        foreign = config;
+        foreign.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*config.moe_routed_expert_plan);
+        foreign.moe_routed_expert_plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(foreign));
+        EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
+    }
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Exact observation scope controls capture and comparison while full gold remains mandatory. */
+TEST(FrozenParityHistoryReplay, ObservationShardUsesOneExactCaptureAndComparisonAuthority)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    const auto directory=std::filesystem::path(value.at("reference_directory").get<std::string>());
+    const std::vector<std::string> full{"EMBEDDING","LM_HEAD","layer0_FFN_NORM","layer0_FFN_RESIDUAL"};
+    const std::vector<std::string> selected{"EMBEDDING","LM_HEAD","layer0_FFN_NORM"};
+    for(int step=-1;step<2;++step)for(const auto& key:full) {
+        std::ofstream file(directory/((step<0?std::string{}:"decode_step"+std::to_string(step)+"_")+key+".npy"));file<<'x';
+    }
+    value["observation_shard"]={{"schema",1},{"scope","noncertifying"},{"full_keys",full},{"selected_keys",selected}};
+    const auto replay=checked(value);EXPECT_TRUE(replay.hasObservationShard());
+    EXPECT_NO_THROW(replay.requireObservationInventory());
+    EXPECT_TRUE(replay.observesReferenceKey("decode_step1_layer0_FFN_NORM"));
+    EXPECT_FALSE(replay.observesReferenceKey("decode_step1_layer0_FFN_RESIDUAL"));
+    SnapshotAdmissionGeometryProbe probe;probe.configure(2,replay);probe.observation(replay);
+    auto actual=probe.captureKeys();auto expected=selected;std::sort(expected.begin(),expected.end());
+    EXPECT_EQ(actual,expected);
+    EXPECT_FALSE(probe.terminalComplete());
+    EXPECT_TRUE(probe.reference("decode_step1_layer0_FFN_RESIDUAL").empty());
+    const auto path=owner.root/"history_replay_binding.json";
+    replay.publishBinding(path,replay.prompt(),replay.promptIds(),replay.referenceDirectory(),2);
+    std::ifstream stream(owner.root/"history_replay_observation_scope.json");json scope;stream>>scope;
+    EXPECT_FALSE(scope.at("certification_eligible").get<bool>());
+    EXPECT_EQ(scope.at("missing_coverage"),json::array({"layer0_FFN_RESIDUAL"}));
+    EXPECT_EQ(scope.at("terminal_rows_required"),3);
+    // Even an unselected original phase remains mandatory gold.
+    std::filesystem::remove(directory/"decode_step1_layer0_FFN_RESIDUAL.npy");
+    EXPECT_THROW(replay.requireObservationInventory(),std::invalid_argument);
+    {std::ofstream restore(directory/"decode_step1_layer0_FFN_RESIDUAL.npy");restore<<'x';}
+    std::filesystem::remove(directory/"decode_step1_layer0_FFN_NORM.npy");
+    EXPECT_THROW(replay.requireObservationInventory(),std::invalid_argument);
+    auto ordinary=value;ordinary.erase("observation_shard");
+    EXPECT_FALSE(checked(ordinary).hasObservationShard());
+    EXPECT_TRUE(checked(ordinary).observesReferenceKey("layer0_FFN_RESIDUAL"));
+    probe.campaignMarker();
+    EXPECT_THROW((void)checked(value),std::invalid_argument);
+}
+
+/** @test Duplicate, foreign, empty, whole-inventory and incompatible scope requests fail before capture. */
+TEST(FrozenParityHistoryReplay, ObservationShardRejectsIncompatibleOrUnqualifiedCoverage)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    value["observation_shard"]={{"schema",1},{"scope","noncertifying"},
+        {"full_keys",{"EMBEDDING","LM_HEAD","layer0_FFN_NORM"}},{"selected_keys",{"EMBEDDING","LM_HEAD"}}};
+    for(int defect=0;defect<7;++defect) {
+        auto bad=value;auto& shard=bad["observation_shard"];
+        switch(defect) {
+        case 0:shard["selected_keys"].push_back("LM_HEAD");break;
+        case 1:shard["selected_keys"]={"EMBEDDING","foreign"};break;
+        case 2:shard["selected_keys"]=json::array();break;
+        case 3:shard["selected_keys"]=shard["full_keys"];break;
+        case 4:shard["scope"]="complete_campaign";break;
+        case 5:shard["schema"]=2;break;
+        case 6:shard["full_keys"].push_back("LM_HEAD");break;
+        }
+        EXPECT_THROW((void)checked(bad),std::invalid_argument)<<defect;
+    }
+    EXPECT_THROW(checked(value).requireObservationInventory(),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Generic presence guards follow shard ownership while negative probes never supply original terminal coverage. */
+TEST(FrozenParityHistoryReplay, ObservationShardPresenceAndAuxiliaryTerminalsKeepOriginalScope)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    value["observation_shard"]={{"schema",1},{"scope","noncertifying"},
+        {"full_keys",{"EMBEDDING","LM_HEAD","layer0_FFN_NORM","layer0_FFN_RESIDUAL"}},
+        {"selected_keys",{"EMBEDDING","LM_HEAD","layer0_FFN_NORM"}}};
+    SnapshotAdmissionGeometryProbe probe;probe.configure(2,checked(value));
+    EXPECT_TRUE(probe.requiresStage("FFN_NORM"));EXPECT_FALSE(probe.requiresStage("FFN_RESIDUAL"));
+    probe.terminal(-2);EXPECT_FALSE(probe.terminalComplete());EXPECT_TRUE(probe.originalTerminals().empty());
+    EXPECT_EQ(probe.auxiliaryTerminals(),std::set<int>{-2});
+    for(const int step:{-1,0,1})probe.terminal(step);
+    EXPECT_TRUE(probe.terminalComplete());EXPECT_EQ(probe.originalTerminals(),(std::set<int>{-1,0,1}));
+    EXPECT_THROW(probe.terminal(2),std::invalid_argument);
+    value.erase("observation_shard");probe.observation(checked(value));
+    EXPECT_TRUE(probe.requiresStage("FFN_RESIDUAL"));EXPECT_TRUE(probe.terminalComplete());
+}
+}

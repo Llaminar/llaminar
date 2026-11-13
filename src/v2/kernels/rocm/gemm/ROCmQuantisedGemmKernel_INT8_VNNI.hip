@@ -118,8 +118,11 @@
  * Each workgroup covers up to M_TILE M-rows × N_TILE N-cols.  Boundary
  * handling for partial M-tiles (last workgroup) is via per-element
  * bounds checks in loads and stores.
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -502,8 +505,8 @@ void qgemm_int8_vnni_wide_tile_v3_kernel(
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
                 #pragma unroll
                 for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+                    acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn]);
         }
 
         // --- 3. Barrier: all threads done reading cur_buf ---
@@ -557,8 +560,8 @@ void qgemm_int8_vnni_wide_tile_v3_kernel(
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
                 #pragma unroll
                 for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+                    acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn]);
         }
     }
 
@@ -990,8 +993,8 @@ void qgemm_int8_vnni_wide_tile_v7_kernel(
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
                 #pragma unroll
                 for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+                    acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn]);
         }
     };
 
@@ -1354,10 +1357,10 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
             {
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                 const uint4 b_pack4 = *reinterpret_cast<const uint4*>(b_ptr);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3]);
                 a_ptr += 4;
                 b_ptr += b_row_stride_bytes;
             }
@@ -1375,19 +1378,19 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                 if (valid > 0)
                 {
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b0), acc[0], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *reinterpret_cast<const int32_t*>(b0), acc[0]);
                 }
                 if (valid > 1)
                 {
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b1), acc[1], false);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *reinterpret_cast<const int32_t*>(b1), acc[1]);
                 }
                 if (valid > 2)
                 {
-                    acc[2] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b2), acc[2], false);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *reinterpret_cast<const int32_t*>(b2), acc[2]);
                 }
                 if (valid > 3)
                 {
-                    acc[3] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b3), acc[3], false);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *reinterpret_cast<const int32_t*>(b3), acc[3]);
                 }
                 a_ptr += 4;
                 b0 += b_row_stride_bytes;
@@ -1407,8 +1410,8 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
             {
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                 const uint2 b_pack2 = *reinterpret_cast<const uint2*>(b_ptr);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1]);
                 a_ptr += 4;
                 b_ptr += b_row_stride_bytes;
             }
@@ -1424,11 +1427,11 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                 if (valid > 0)
                 {
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b0), acc[0], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *reinterpret_cast<const int32_t*>(b0), acc[0]);
                 }
                 if (valid > 1)
                 {
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b1), acc[1], false);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *reinterpret_cast<const int32_t*>(b1), acc[1]);
                 }
                 a_ptr += 4;
                 b0 += b_row_stride_bytes;
@@ -1444,7 +1447,7 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
         {
             const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
             const int32_t b_packed = *reinterpret_cast<const int32_t*>(b_ptr);
-            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+            acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[0]);
             a_ptr += 4;
             b_ptr += b_row_stride_bytes;
         }
@@ -1663,18 +1666,18 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
 
                     const int32_t a_next = a_row[kt + kg_l + 1];
                     const int off = kg_l * 128 + n_local;
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 0], acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 1], acc[1], false);
-                    acc[2] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 2], acc[2], false);
-                    acc[3] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 3], acc[3], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 0], acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 1], acc[1]);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 2], acc[2]);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 3], acc[3]);
                     a_packed = a_next;
                 }
 
                 const int off_last = (kg_limit - 1) * 128 + n_local;
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_lds[off_last + 0], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_lds[off_last + 1], acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_lds[off_last + 2], acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_lds[off_last + 3], acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off_last + 0], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off_last + 1], acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off_last + 2], acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off_last + 3], acc[3]);
             }
 
             __syncthreads();
@@ -1718,10 +1721,10 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                 }
                 __syncthreads();
 
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, s_b_local[0][lane_x], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, s_b_local[1][lane_x], acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, s_b_local[2][lane_x], acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, s_b_local[3][lane_x], acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[0][lane_x], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[1][lane_x], acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[2][lane_x], acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[3][lane_x], acc[3]);
 
                 __syncthreads();
                 a_ptr += 4;
@@ -1744,8 +1747,8 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                 }
                 __syncthreads();
 
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, s_b_local[0][lane_x], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, s_b_local[1][lane_x], acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[0][lane_x], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[1][lane_x], acc[1]);
 
                 __syncthreads();
                 a_ptr += 4;
@@ -1764,7 +1767,7 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                 }
                 __syncthreads();
 
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, s_b_local[0][lane_x], acc[0], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, s_b_local[0][lane_x], acc[0]);
 
                 __syncthreads();
                 a_ptr += 4;
@@ -1800,10 +1803,10 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                         const int32_t bn2 = b_ptr[2];
                         const int32_t bn3 = b_ptr[3];
 
-                        acc[0] = __builtin_amdgcn_sdot4(a_cur, b0, acc[0], false);
-                        acc[1] = __builtin_amdgcn_sdot4(a_cur, b1, acc[1], false);
-                        acc[2] = __builtin_amdgcn_sdot4(a_cur, b2, acc[2], false);
-                        acc[3] = __builtin_amdgcn_sdot4(a_cur, b3, acc[3], false);
+                        acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b0, acc[0]);
+                        acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b1, acc[1]);
+                        acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b2, acc[2]);
+                        acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b3, acc[3]);
 
                         a_cur = a_nxt;
                         b0 = bn0;
@@ -1814,10 +1817,10 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                         b_ptr += b_row_stride_i32;
                     }
 
-                    acc[0] = __builtin_amdgcn_sdot4(a_cur, b0, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_cur, b1, acc[1], false);
-                    acc[2] = __builtin_amdgcn_sdot4(a_cur, b2, acc[2], false);
-                    acc[3] = __builtin_amdgcn_sdot4(a_cur, b3, acc[3], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b0, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b1, acc[1]);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b2, acc[2]);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_cur, b3, acc[3]);
                 }
             }
             else
@@ -1834,19 +1837,19 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                     const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                     if (valid > 0)
                     {
-                        acc[0] = __builtin_amdgcn_sdot4(a_packed, *b0, acc[0], false);
+                        acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b0, acc[0]);
                     }
                     if (valid > 1)
                     {
-                        acc[1] = __builtin_amdgcn_sdot4(a_packed, *b1, acc[1], false);
+                        acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b1, acc[1]);
                     }
                     if (valid > 2)
                     {
-                        acc[2] = __builtin_amdgcn_sdot4(a_packed, *b2, acc[2], false);
+                        acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b2, acc[2]);
                     }
                     if (valid > 3)
                     {
-                        acc[3] = __builtin_amdgcn_sdot4(a_packed, *b3, acc[3], false);
+                        acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b3, acc[3]);
                     }
                     a_ptr += 4;
                     b0 += b_row_stride_i32;
@@ -1866,10 +1869,10 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                 for (int kg = k_begin; kg < k_end; ++kg)
                 {
                     const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_ptr[0], acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_ptr[1], acc[1], false);
-                    acc[2] = __builtin_amdgcn_sdot4(a_packed, b_ptr[2], acc[2], false);
-                    acc[3] = __builtin_amdgcn_sdot4(a_packed, b_ptr[3], acc[3], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[0], acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[1], acc[1]);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[2], acc[2]);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[3], acc[3]);
                     a_ptr += 4;
                     b_ptr += b_row_stride_i32;
                 }
@@ -1888,19 +1891,19 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                     const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                     if (valid > 0)
                     {
-                        acc[0] = __builtin_amdgcn_sdot4(a_packed, *b0, acc[0], false);
+                        acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b0, acc[0]);
                     }
                     if (valid > 1)
                     {
-                        acc[1] = __builtin_amdgcn_sdot4(a_packed, *b1, acc[1], false);
+                        acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b1, acc[1]);
                     }
                     if (valid > 2)
                     {
-                        acc[2] = __builtin_amdgcn_sdot4(a_packed, *b2, acc[2], false);
+                        acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b2, acc[2]);
                     }
                     if (valid > 3)
                     {
-                        acc[3] = __builtin_amdgcn_sdot4(a_packed, *b3, acc[3], false);
+                        acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b3, acc[3]);
                     }
                     a_ptr += 4;
                     b0 += b_row_stride_i32;
@@ -1921,8 +1924,8 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
             for (int kg = k_begin; kg < k_end; ++kg)
             {
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_ptr[0], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_ptr[1], acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[0], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[1], acc[1]);
                 a_ptr += 4;
                 b_ptr += b_row_stride_i32;
             }
@@ -1939,11 +1942,11 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
                 if (valid > 0)
                 {
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *b0, acc[0], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b0, acc[0]);
                 }
                 if (valid > 1)
                 {
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *b1, acc[1], false);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b1, acc[1]);
                 }
                 a_ptr += 4;
                 b0 += b_row_stride_i32;
@@ -1959,7 +1962,7 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
         {
             const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
             const int32_t b_packed = *reinterpret_cast<const int32_t*>(b_ptr);
-            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+            acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[0]);
             a_ptr += 4;
             b_ptr += b_row_stride_bytes;
         }
@@ -2919,7 +2922,7 @@ void qgemm_int8_vnni_wide_tile_v3_blockwise_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm) \
                     _Pragma("unroll") \
                     for (int nn = 0; nn < N_PER_THREAD; ++nn) \
-                        acc[mm][nn] = __builtin_amdgcn_sdot4(a_reg[mm], b_reg[nn], acc[mm][nn], false);
+                        acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(a_reg[mm], b_reg[nn], acc[mm][nn]);
 
         if constexpr (UNROLL_KK == 0) {
             #pragma clang loop unroll(disable)
@@ -3316,8 +3319,8 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm) \
                     _Pragma("unroll") \
                     for (int nn = 0; nn < N_PER_THREAD; ++nn) \
-                        acc[mm][nn] = __builtin_amdgcn_sdot4( \
-                            a_reg[mm], b_reg[nn], acc[mm][nn], false);
+                        acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4( \
+                            a_reg[mm], b_reg[nn], acc[mm][nn]);
 
             if constexpr (UNROLL_KK == 0) {
                 #pragma clang loop unroll(disable)

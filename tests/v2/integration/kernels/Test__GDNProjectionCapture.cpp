@@ -8,7 +8,12 @@
  * Route counters prove shared quantization and persistent projection streams;
  * repeated native replay proves their output bytes and untouched capacity.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "../../utils/GDNProjectionCaptureHarness.h"
+#include "../../utils/GDNQKVBundleTestHarness.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/ExplicitGPUStream.h"
 #ifdef LLAMINAR_GDN_CAPTURE_CUDA
 #include "backends/cuda/CUDAGraphCapture.h"
 #else
@@ -40,16 +45,14 @@ namespace
         {
             context = std::make_unique<CUDADeviceContext>(device, device.ordinal);
             factory = [device](void *stream) {
-                return std::make_unique<CUDAGraphCapture>(
-                    static_cast<cudaStream_t>(stream), device.ordinal);
+                return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream);
             };
         }
 #else
         {
             context = std::make_unique<ROCmDeviceContext>(device, device.ordinal);
             factory = [device](void *stream) {
-                return std::make_unique<HIPGraphCapture>(
-                    static_cast<hipStream_t>(stream), device.ordinal);
+                return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream);
             };
         }
 #endif
@@ -104,6 +107,81 @@ namespace
     }
 }
 
+namespace
+{
+    /** @brief Retain the real four-source stage on its actual owning GPU worker. */
+    void exerciseQFNQKVBundle(DeviceId device)
+    {
+        DeviceManager::instance().initialize(-1);
+        auto &worker = GPUDeviceContextPool::instance().getContext(device);
+        worker.submitAndWait([&]
+        {
+#ifdef LLAMINAR_GDN_CAPTURE_CUDA
+            CUDADeviceContext context(device, device.ordinal);
+#else
+            ROCmDeviceContext context(device, device.ordinal);
+#endif
+            void *stream = ExplicitGPUStream(worker.defaultStream()).get();
+            GDNQKVBundleFixture fixture(device, context, &worker, stream,
+                2560, {10240, 6144, 48, 48});
+            fixture.prove();
+        });
+    }
+}
+/**
+ * @brief Capture the full original-QFN Q8-to-half producer without changing recurrence/KV math.
+ * @param device Actual native participant whose worker owns every retained graph.
+ */
+static void exerciseQFNFullFP16(DeviceId device)
+{
+    DeviceManager::instance().initialize(-1);
+    auto &worker = GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAndWait([&]
+    {
+#ifdef LLAMINAR_GDN_CAPTURE_CUDA
+        CUDADeviceContext context(device, device.ordinal);
+        GDNProjectionGraphFactory factory = [device](void *stream)
+        { return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream); };
+#else
+        ROCmDeviceContext context(device, device.ordinal);
+        GDNProjectionGraphFactory factory = [device](void *stream)
+        { return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream); };
+#endif
+        const auto &formats = quantizedVerifierFormats();
+        const auto q8 = std::find_if(formats.begin(), formats.end(),
+            [](const auto &format) { return format.tensor_type == TensorType::Q8_0; });
+        ASSERT_NE(q8, formats.end());
+        using Purpose = GDNProjectionRowsPurpose;
+        const std::array rows{GDNProjectionCaptureRows{1, Purpose::Ordinary},
+            GDNProjectionCaptureRows{1, Purpose::Verifier}, GDNProjectionCaptureRows{3, Purpose::Verifier},
+            GDNProjectionCaptureRows{9, Purpose::Ordinary}, GDNProjectionCaptureRows{15, Purpose::Verifier},
+            GDNProjectionCaptureRows{17, Purpose::Ordinary}};
+        ASSERT_NO_FATAL_FAILURE(runGDNProjectionCaptureCase(device, context, factory, *q8, *q8,
+            2560, {10240, 6144, 48, 48}, rows,
+            FloatingActivationOperandPrecision::FP16RNE, FloatingActivationOperandPrecision::FP16RNE, &worker));
+    });
+}
+
+#ifdef LLAMINAR_GDN_CAPTURE_CUDA
+TEST(GDNMixedProjectionCapture, CUDAQFNFullFP16OriginalSourceBundle)
+{ exerciseQFNFullFP16(DeviceId::cuda(0)); }
+#else
+TEST(GDNMixedProjectionCapture, ROCmQFNFullFP16OriginalSourceBundle)
+{ exerciseQFNFullFP16(DeviceId::rocm(0)); }
+#endif
+
+#ifdef LLAMINAR_GDN_CAPTURE_CUDA
+TEST(GDNQKVBundle, CUDAOriginalSourcesCountedCapture)
+{
+    exerciseQFNQKVBundle(DeviceId::cuda(0));
+}
+#else
+TEST(GDNQKVBundle, ROCmOriginalSourcesCountedCapture)
+{
+    exerciseQFNQKVBundle(DeviceId::rocm(0));
+}
+#endif
+
 #ifdef LLAMINAR_GDN_CAPTURE_CUDA
 TEST(GDNMixedProjectionCapture, CUDAProductionShapes) { exercise(DeviceId::cuda(0), false); }
 TEST(GDNMixedProjectionCapture, CUDAAllFormats) { exercise(DeviceId::cuda(0), true); }
@@ -123,11 +201,16 @@ TEST(GDNMixedProjectionCapture, ROCmHalfAlphaBetaAllFormats)
 /** @brief Initialize the process and route counters before native graph tests. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = 0;
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided) != MPI_SUCCESS)
         return 1;
     if (provided < MPI_THREAD_MULTIPLE)
     {
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         MPI_Finalize();
         return 1;
     }
@@ -135,6 +218,7 @@ int main(int argc, char **argv)
     mutableDebugEnv().reload();
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

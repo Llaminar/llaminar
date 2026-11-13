@@ -12,8 +12,13 @@
  * - Basic stage types (RMSNorm, ResidualAdd)
  * - Multi-stage graphs with dependencies
  * - Edge cases (no callback, callback change)
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <memory>
 #include <vector>
@@ -604,6 +609,10 @@ TEST_F(GraphSnapshotCallbackTest, CallbackRebuildsRuntimeDumpInfoAfterExecute)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Initialize MPI
     MPI_Init(&argc, &argv);
 
@@ -614,6 +623,7 @@ int main(int argc, char **argv)
     int result = RUN_ALL_TESTS();
 
     // Finalize MPI
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
 
     return result;

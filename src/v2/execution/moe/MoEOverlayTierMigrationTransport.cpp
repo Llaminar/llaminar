@@ -9,6 +9,8 @@
  */
 
 #include "MoEOverlayTierMigrationTransport.h"
+#include "MoEOverlayMigrationEvidenceContext.h"
+#include "MoEOverlayPhysicalProjectionPieces.h"
 
 #include "../../utils/PerfStatsCollector.h"
 
@@ -20,22 +22,107 @@
 
 namespace llaminar2
 {
+    bool MoEOverlayMigrationPieceMeasurement::valid() const noexcept
+    {
+        return unsigned(projection) < 3 && source_participant >= 0 && destination_participant >= 0 &&
+            intersection && !intersection->empty() && format.valid();
+    }
+
+    bool MoEOverlayMigrationPieceMeasurement::sameIdentity(
+        const MoEOverlayMigrationPieceMeasurement &other) const noexcept
+    {
+        return projection == other.projection && source_participant == other.source_participant &&
+            destination_participant == other.destination_participant && intersection == other.intersection &&
+            format == other.format;
+    }
+
+    std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>
+    MoEOverlayMigrationMeasurementGeometry::checked(
+        std::pair<MoEOverlayPhysicalProjectionTarget, MoEOverlayPhysicalProjectionTarget> targets,
+        std::array<ExpertWeightFormat, 3> formats)
+    {
+        for (const auto &format : formats)
+            if (!format.valid()) throw std::invalid_argument("Measurement geometry requires every original role format");
+        for (const auto *target : {&targets.first, &targets.second})
+            for (std::size_t role = 0; role < 3; ++role)
+            {
+                if (target->members.empty()) throw std::invalid_argument("Measurement target has no members");
+                const auto &first = target->members.front().projections[role];
+                if (first.source_rows <= 0 || first.source_columns <= 0)
+                    throw std::invalid_argument("Measurement target lost original matrix dimensions");
+                const auto full = std::uint64_t(first.source_rows) * std::uint64_t(first.source_columns);
+                std::uint64_t covered = 0;
+                for (std::size_t member = 0; member < target->members.size(); ++member)
+                {
+                    const auto &rectangle = target->members[member].projections[role];
+                    const auto self = ExpertTierWeightProjectionIntersection::between(rectangle, rectangle);
+                    if (rectangle.source_rows != first.source_rows || rectangle.source_columns != first.source_columns)
+                        throw std::invalid_argument("Measurement member changed original matrix dimensions");
+                    const auto area = std::uint64_t(self.rows()) * std::uint64_t(self.columns());
+                    if (area > full - covered) throw std::invalid_argument("Measurement target overcovers original matrix");
+                    covered += area;
+                    for (std::size_t prior = 0; prior < member; ++prior)
+                        if (!ExpertTierWeightProjectionIntersection::between(rectangle,
+                            target->members[prior].projections[role]).empty())
+                            throw std::invalid_argument("Measurement target members overlap");
+                }
+                if (covered != full) throw std::invalid_argument("Measurement target omits original matrix coverage");
+            }
+        const auto expected = physicalMoEOverlayProjectionPieces(targets.first, targets.second);
+        std::vector<MoEOverlayMigrationPieceMeasurement> pieces;
+        pieces.reserve(expected.size());
+        for (const auto &piece : expected)
+            pieces.push_back({piece.projection, piece.source_participant, piece.destination_participant,
+                piece.intersection, formats[unsigned(piece.projection)]});
+        return std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>(
+            new MoEOverlayMigrationMeasurementGeometry(std::move(targets), formats, std::move(pieces)));
+    }
+
+    std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> makePhysicalMoEOverlayMeasurementGeometry(
+        const MoEOverlayTierMigration &migration, const MoEOverlayLayerWeightManifest &manifest,
+        int experts, const MoEExpertOwnerMap &topology)
+    {
+        auto layouts = physicalMoEOverlayProjectionLayouts(migration, manifest, experts, topology);
+        std::array<ExpertWeightFormat, 3> formats;
+        for (std::size_t role = 0; role < formats.size(); ++role)
+            formats[role] = manifest.projectionForRole(static_cast<ExpertTierWeightProjection>(role)).format;
+        return MoEOverlayMigrationMeasurementGeometry::checked(std::move(layouts), formats);
+    }
+
+    bool MoEOverlayMigrationMeasurementGeometry::sameIdentity(
+        const MoEOverlayMigrationMeasurementGeometry &other) const noexcept
+    {
+        return targets_ == other.targets_ && formats_ == other.formats_ && pieces_.size() == other.pieces_.size() &&
+            std::equal(pieces_.begin(), pieces_.end(), other.pieces_.begin(),
+                [](const auto &a, const auto &b) { return a.sameIdentity(b); });
+    }
+
+    bool MoEOverlayMigrationPieceObservation::valid() const noexcept
+    {
+        if (quoted_payload_bytes && *quoted_payload_bytes == 0) return false;
+        return !observation || (observation->valid() && quoted_payload_bytes &&
+            observation->bytes == *quoted_payload_bytes);
+    }
+
     bool MoEOverlayCompletedMigrationMeasurement::valid() const noexcept
     {
-        if (expected_epoch == 0 || candidate_epoch != expected_epoch + 1 ||
-            source_participant < 0 || destination_participant < 0 ||
-            source_participant == destination_participant || layer < 0 ||
-            expert < 0 || wave_wall_nanoseconds == 0)
+        if (expected_epoch == 0 || candidate_epoch == 0 || candidate_epoch != expected_epoch + 1 ||
+            layer < 0 || expert < 0 || wave_wall_nanoseconds == 0) return false;
+        if (geometry)
         {
-            return false;
+            const auto &targets = geometry->targets();
+            const auto source = targets.first.members.size() == 1 ? targets.first.members.front().participant_id : -1;
+            const auto destination = targets.second.members.size() == 1 ? targets.second.members.front().participant_id : -1;
+            if (source_participant != source || destination_participant != destination ||
+                piece_observations.size() != geometry->pieces().size() || piece_observations.empty()) return false;
+            for (const auto &projection : projections) if (projection) return false;
+            return std::all_of(piece_observations.begin(), piece_observations.end(),
+                [](const auto &piece) { return piece.valid(); });
         }
-        return std::all_of(
-            projections.begin(),
-            projections.end(),
-            [](const auto &projection)
-            {
-                return !projection.has_value() || projection->valid();
-            });
+        if (!piece_observations.empty() || source_participant < 0 || destination_participant < 0 ||
+            source_participant == destination_participant) return false;
+        return std::all_of(projections.begin(), projections.end(),
+            [](const auto &projection) { return !projection || projection->valid(); });
     }
 
     namespace
@@ -53,6 +140,26 @@ namespace llaminar2
     bool MoEOverlayTierPreparedWave::valid(
         std::size_t expected_transfer_count) const noexcept
     {
+        if (measurement_geometries.empty() && !measurement_operations.empty()) return false;
+        if (!measurement_geometries.empty())
+        {
+            if (measurement_operations.size() != transfers.size()) return false;
+            std::size_t count = 0;
+            for (const auto &geometry : measurement_geometries)
+            {
+                if (!geometry || geometry->pieces().empty() ||
+                    count > std::numeric_limits<std::size_t>::max() - geometry->pieces().size()) return false;
+                count += geometry->pieces().size();
+            }
+            if (count != measurement_operations.size()) return false;
+            std::size_t flat = 0;
+            for (std::size_t migration = 0; migration < measurement_geometries.size(); ++migration)
+                for (std::size_t piece = 0; piece < measurement_geometries[migration]->pieces().size(); ++piece)
+                {
+                    const auto &coordinate = measurement_operations[flat++];
+                    if (coordinate.migration != migration || coordinate.piece != piece) return false;
+                }
+        }
         const bool all_transfers_owned = std::all_of(
             transfers.begin(),
             transfers.end(),
@@ -63,7 +170,8 @@ namespace llaminar2
         if (status == MoEOverlayResidencyStageStartStatus::Started)
         {
             return inactive_bank != nullptr &&
-                   transfers.size() == expected_transfer_count &&
+                   (measurement_geometries.empty() ? transfers.size() == expected_transfer_count :
+                       transfers.size() == measurement_operations.size()) &&
                    all_transfers_owned;
         }
         if (status == MoEOverlayResidencyStageStartStatus::Deferred)
@@ -204,6 +312,8 @@ namespace llaminar2
              * @param measurement_sink Optional owner of completed measurements.
              * @param require_complete_local_measurements Whether missing local
              *        timing evidence is fatal.
+             * @param measurement_operations Exact operation-to-original-piece map.
+             * @param evidence_context Same original immutable geometry, retained without timing authority.
              */
             CompositeResidencyWave(
                 std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation>>
@@ -220,7 +330,9 @@ namespace llaminar2
                     measurements,
                 std::shared_ptr<IMoEOverlayMigrationMeasurementSink>
                     measurement_sink,
-                bool require_complete_local_measurements)
+                bool require_complete_local_measurements,
+                std::vector<MoEOverlayMigrationOperationMeasurement> measurement_operations = {},
+                std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context = {})
                 : transfers_(std::move(transfers)),
                   transfer_ready_(transfers_.size(), false),
                   transfer_abort_ready_(transfers_.size(), false),
@@ -230,6 +342,8 @@ namespace llaminar2
                   identity_(identity),
                   transfer_progress_authority_(
                       std::move(transfer_progress_authority)),
+                  measurement_operations_(std::move(measurement_operations)),
+                  evidence_context_(std::move(evidence_context)),
                   measurements_(std::move(measurements)),
                   measurement_sink_(std::move(measurement_sink)),
                   require_complete_local_measurements_(
@@ -313,18 +427,24 @@ namespace llaminar2
                     {
                         auto completed_measurement =
                             transfers_[index]->completedMeasurement();
-                        if (completed_measurement &&
-                            completed_measurement->valid())
-                        {
-                            completed_projection_payload_bytes_ =
-                                saturatingExpertTierMeasurementAdd(
-                                    completed_projection_payload_bytes_,
-                                    completed_measurement->bytes);
-                        }
+                        const auto submitted_bytes = transfers_[index]->quotedPayloadBytes();
+                        const bool observed_piece = !measurement_operations_.empty() &&
+                            measurement_operations_[index].requires_local_observation;
+                        // Normal placement may disable timing collection. An
+                        // actual Ready operation still authenticates its bound
+                        // payload quote; do not turn absent clock samples into
+                        // zero physical movement or charge protocol-only work.
+                        if (observed_piece && submitted_bytes && *submitted_bytes)
+                            completed_projection_payload_bytes_ = saturatingExpertTierMeasurementAdd(
+                                completed_projection_payload_bytes_, *submitted_bytes);
+                        else if (completed_measurement && completed_measurement->valid())
+                            completed_projection_payload_bytes_ = saturatingExpertTierMeasurementAdd(
+                                completed_projection_payload_bytes_, completed_measurement->bytes);
                         if (!measurements_.empty())
                         {
-                            const std::size_t migration_index = index / 3u;
-                            const std::size_t projection_index = index % 3u;
+                            const bool explicit_piece = !measurement_operations_.empty();
+                            const std::size_t migration_index = explicit_piece ? measurement_operations_[index].migration : index / 3u;
+                            const std::size_t projection_index = explicit_piece ? measurement_operations_[index].piece : index % 3u;
                             if (migration_index >= measurements_.size())
                             {
                                 failure_ =
@@ -334,6 +454,7 @@ namespace llaminar2
                                 return MoEOverlayResidencyWaveProgress::Failed;
                             }
                             if (require_complete_local_measurements_ &&
+                                (!explicit_piece || measurement_operations_[index].requires_local_observation) &&
                                 (!completed_measurement ||
                                  !completed_measurement->valid()))
                             {
@@ -343,9 +464,48 @@ namespace llaminar2
                                 abortStaged();
                                 return MoEOverlayResidencyWaveProgress::Failed;
                             }
-                            measurements_[migration_index]
-                                .projections[projection_index] =
-                                std::move(completed_measurement);
+                            const auto actual_quote = explicit_piece ? transfers_[index]->quotedPayloadBytes() : std::nullopt;
+                            if (explicit_piece && completed_measurement &&
+                                (!actual_quote || *actual_quote != completed_measurement->bytes))
+                            {
+                                failure_ = "Physical measurement bytes differ from independently bound operation quote";
+                                assignTierTransportError(error, failure_);
+                                abortStaged();
+                                return MoEOverlayResidencyWaveProgress::Failed;
+                            }
+                            if (explicit_piece && measurements_[migration_index].geometry)
+                            {
+                                auto &row = measurements_[migration_index];
+                                if (projection_index >= row.piece_observations.size() ||
+                                    row.piece_observations[projection_index].observation)
+                                {
+                                    failure_ = "Physical measurement repeated or exceeded its sealed piece coordinate";
+                                    assignTierTransportError(error, failure_);
+                                    abortStaged();
+                                    return MoEOverlayResidencyWaveProgress::Failed;
+                                }
+                                auto &piece = row.piece_observations[projection_index];
+                                piece.quoted_payload_bytes = actual_quote;
+                                piece.observation = std::move(completed_measurement);
+                                if (!piece.valid())
+                                {
+                                    failure_ = "Physical measurement bytes differ from the bound operation payload quote";
+                                    assignTierTransportError(error, failure_);
+                                    abortStaged();
+                                    return MoEOverlayResidencyWaveProgress::Failed;
+                                }
+                            }
+                            else
+                            {
+                                if (projection_index >= measurements_[migration_index].projections.size())
+                                {
+                                    failure_ = "Whole measurement operation exceeded its sealed projection cardinality";
+                                    assignTierTransportError(error, failure_);
+                                    abortStaged();
+                                    return MoEOverlayResidencyWaveProgress::Failed;
+                                }
+                                measurements_[migration_index].projections[projection_index] = std::move(completed_measurement);
+                            }
                         }
                         transfer_ready_[index] = true;
                         stats_->transfer_operations_completed.fetch_add(
@@ -432,7 +592,7 @@ namespace llaminar2
                     }
                     std::string measurement_error;
                     if (!measurement_sink_->recordCompletedWave(
-                            measurements_, &measurement_error))
+                            std::move(measurements_), &measurement_error))
                     {
                         failure_ = measurement_error.empty()
                                        ? "ExpertOverlay measurement sink rejected a completed wave"
@@ -441,6 +601,18 @@ namespace llaminar2
                         abortStaged();
                         return MoEOverlayResidencyWaveProgress::Failed;
                     }
+                }
+
+                try
+                {
+                    recordCompletedPhysicalPieces();
+                }
+                catch (const std::exception &exception)
+                {
+                    failure_ = exception.what();
+                    assignTierTransportError(error, failure_);
+                    abortStaged();
+                    return MoEOverlayResidencyWaveProgress::Failed;
                 }
 
                 phase_ = Phase::Staged;
@@ -486,6 +658,89 @@ namespace llaminar2
                          {"purpose", "placement_change"}});
                 }
                 return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            /** @brief Publish only terminal original-piece observations from actual completed operations.
+             * Geometry and rank were retained from the prepared physical factory; timing is optional.
+             * @throws std::invalid_argument For a missing quote or foreign observation identity.
+             */
+            void recordCompletedPhysicalPieces() const
+            {
+                if (!identity_.recordsOptimizationTransferEvidence() || !evidence_context_)
+                    return;
+                const auto &edges = evidence_context_->identities();
+                for (std::size_t operation = 0; operation < measurement_operations_.size(); ++operation)
+                {
+                    const auto &binding = measurement_operations_[operation];
+                    if (!binding.requires_local_observation) continue;
+                    if (binding.migration >= edges.size())
+                        throw std::invalid_argument("Completed physical operation has a foreign original migration ordinal");
+                    const auto &edge = edges[binding.migration];
+                    const auto &geometry = *edge.geometry;
+                    const bool cohort = geometry.targets().first.members.size() > 1 ||
+                        geometry.targets().second.members.size() > 1;
+                    if (binding.observer_world_rank < 0)
+                    {
+                        if (cohort) throw std::invalid_argument("Completed cohort operation omitted its original fabric rank");
+                        continue; // Checked legacy whole fixtures make no per-piece rank claim.
+                    }
+                    if (binding.piece >= geometry.pieces().size() || operation >= transfers_.size())
+                        throw std::invalid_argument("Completed physical operation has a foreign original piece ordinal");
+                    const auto &piece = geometry.pieces()[binding.piece];
+                    const auto from = std::find_if(geometry.targets().first.members.begin(),
+                        geometry.targets().first.members.end(), [&](const auto &member) {
+                            return member.participant_id == piece.source_participant;
+                        });
+                    const auto to = std::find_if(geometry.targets().second.members.begin(),
+                        geometry.targets().second.members.end(), [&](const auto &member) {
+                            return member.participant_id == piece.destination_participant;
+                        });
+                    if (from == geometry.targets().first.members.end() || to == geometry.targets().second.members.end() ||
+                        (binding.observer_world_rank != from->world_rank && binding.observer_world_rank != to->world_rank))
+                        throw std::invalid_argument("Completed physical piece observer is not an original endpoint rank");
+                    const auto bytes = transfers_[operation]->quotedPayloadBytes();
+                    if (!transfer_ready_[operation] || !bytes || !*bytes || !piece.intersection)
+                        throw std::invalid_argument("Completed physical piece omitted its actual ready operation payload quote");
+                    const auto targetWord = [](const MoEOverlayPhysicalProjectionTarget &target) {
+                        return target.members.size() == 1 ? target.members.front().participant_id :
+                            MoEOverlayRouteTarget::cpuCohort(target.tier_idx).word();
+                    };
+                    const auto &intersection = *piece.intersection;
+                    const auto &source = intersection.source();
+                    const auto &destination = intersection.destination();
+                    PerfStatsCollector::addCounter("moe_overlay_residency", "physical_migration_pieces_completed", 1.0,
+                        "maintenance", perf_device_,
+                        {{"schema_version", "1"}, {"purpose", "placement_change"},
+                         {"candidate_epoch", std::to_string(edge.candidate_epoch)},
+                         {"layer", std::to_string(edge.layer)}, {"expert", std::to_string(edge.expert)},
+                         {"migration_index", std::to_string(binding.migration)},
+                         {"piece_index", std::to_string(binding.piece)},
+                         {"piece_count", std::to_string(geometry.pieces().size())},
+                         {"source_target", std::to_string(targetWord(geometry.targets().first))},
+                         {"destination_target", std::to_string(targetWord(geometry.targets().second))},
+                         {"source_participant", std::to_string(piece.source_participant)},
+                         {"destination_participant", std::to_string(piece.destination_participant)},
+                         {"source_world_rank", std::to_string(from->world_rank)},
+                         {"destination_world_rank", std::to_string(to->world_rank)},
+                         {"observer_world_rank", std::to_string(binding.observer_world_rank)},
+                         {"projection", std::to_string(static_cast<unsigned>(piece.projection))},
+                         {"format_kind", std::to_string(static_cast<unsigned>(piece.format.kind))},
+                         {"codebook", std::to_string(piece.format.native_quantised.codebook_id)},
+                         {"is_superblock", piece.format.native_quantised.is_superblock ? "true" : "false"},
+                         {"source_original_rows", std::to_string(source.source_rows)},
+                         {"source_original_columns", std::to_string(source.source_columns)},
+                         {"source_first_row", std::to_string(source.first_row)}, {"source_rows", std::to_string(source.rows)},
+                         {"source_first_column", std::to_string(source.first_column)}, {"source_columns", std::to_string(source.columns)},
+                         {"destination_original_rows", std::to_string(destination.source_rows)},
+                         {"destination_original_columns", std::to_string(destination.source_columns)},
+                         {"destination_first_row", std::to_string(destination.first_row)}, {"destination_rows", std::to_string(destination.rows)},
+                         {"destination_first_column", std::to_string(destination.first_column)}, {"destination_columns", std::to_string(destination.columns)},
+                         {"intersection_first_row", std::to_string(intersection.firstRow())},
+                         {"intersection_first_column", std::to_string(intersection.firstColumn())},
+                         {"intersection_rows", std::to_string(intersection.rows())},
+                         {"intersection_columns", std::to_string(intersection.columns())},
+                         {"payload_bytes", std::to_string(*bytes)}});
+                }
             }
 
             /** @brief Return the exact local prepare-to-ready interval. */
@@ -842,6 +1097,9 @@ namespace llaminar2
             CompositeResidencyWaveIdentity identity_;
             std::shared_ptr<IMoEOverlayTransferProgressAuthority>
                 transfer_progress_authority_;
+            std::vector<MoEOverlayMigrationOperationMeasurement> measurement_operations_;
+            std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context_; ///< Original metadata retained independently of timing.
+
             std::vector<MoEOverlayCompletedMigrationMeasurement>
                 measurements_;
             std::shared_ptr<IMoEOverlayMigrationMeasurementSink>
@@ -903,7 +1161,60 @@ namespace llaminar2
             transaction.migrations.size() * config_.projections_per_expert;
         MoEOverlayTierPreparedWave prepared =
             config_.factory->prepare(transaction);
-        if (!prepared.valid(expected_transfer_count))
+        const bool cohort = std::any_of(transaction.migrations.begin(), transaction.migrations.end(),
+            [](const auto &migration) { return bool(migration.source.shard_cohort) || bool(migration.destination.shard_cohort); });
+        bool described_targets_match = true;
+        if (!prepared.measurement_geometries.empty())
+        {
+            described_targets_match = prepared.measurement_geometries.size() == transaction.migrations.size();
+            for (std::size_t migration = 0; described_targets_match && migration < transaction.migrations.size(); ++migration)
+            {
+                const auto &geometry = prepared.measurement_geometries[migration];
+                const auto &edge = transaction.migrations[migration];
+                const auto source = MoEExpertPlacementTarget::fromPlacement(edge.source);
+                const auto destination = MoEExpertPlacementTarget::fromPlacement(edge.destination);
+                if (!geometry || !source || !destination) { described_targets_match = false; break; }
+                for (const auto &[target, layout] : {std::pair{&*source, &geometry->targets().first},
+                                                    std::pair{&*destination, &geometry->targets().second}})
+                {
+                    if (target->tierIndex() != layout->tier_idx || target->participantCount() != layout->members.size())
+                    { described_targets_match = false; break; }
+                    for (std::size_t member = 0; member < layout->members.size(); ++member)
+                        if (target->participantId(member) != layout->members[member].participant_id)
+                            described_targets_match = false;
+                }
+            }
+        }
+        const bool collect_measurements =
+            config_.measurement_sink &&
+            (config_.measurement_scope ==
+                 MoEOverlayMigrationMeasurementScope::AllWaves ||
+             transaction.purpose ==
+                 MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context;
+        bool context_valid=true;
+        if (prepared.status==MoEOverlayResidencyStageStartStatus::Started &&
+            described_targets_match && prepared.valid(expected_transfer_count) &&
+            !prepared.measurement_geometries.empty() &&
+            prepared.measurement_geometries.size()==transaction.migrations.size())
+        {
+            try {
+                std::vector<MoEOverlayMigrationEvidenceIdentity> identities;
+                identities.reserve(transaction.migrations.size());
+                for(std::size_t i=0;i<transaction.migrations.size();++i) {
+                    const auto &edge=transaction.migrations[i];
+                    identities.push_back({transaction.expected_epoch,transaction.candidate->epoch,
+                        edge.source.owner_participant,edge.destination.owner_participant,edge.layer_idx,
+                        edge.expert_id,prepared.measurement_geometries[i]});
+                }
+                evidence_context=MoEOverlayMigrationEvidenceContext::checked(std::move(identities),transaction.purpose);
+            } catch(const std::exception &exception) {
+                context_valid=false;
+                prepared.error=std::string("Invalid original measurement context: ")+exception.what();
+            }
+        }
+        if (!context_valid || !described_targets_match || !prepared.valid(expected_transfer_count) || (cohort && prepared.measurement_geometries.empty()) ||
+            (!prepared.measurement_geometries.empty() && prepared.measurement_geometries.size() != transaction.migrations.size()))
         {
             stats_->waves_failed_to_prepare.fetch_add(
                 1,
@@ -984,9 +1295,10 @@ namespace llaminar2
             };
         }
 
+        const auto actual_transfer_count = prepared.transfers.size();
         stats_->waves_started.fetch_add(1, std::memory_order_relaxed);
         stats_->transfer_operations_started.fetch_add(
-            expected_transfer_count,
+            actual_transfer_count,
             std::memory_order_relaxed);
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
@@ -995,14 +1307,8 @@ namespace llaminar2
             "maintenance",
             config_.perf_device,
             {{"migrations", std::to_string(transaction.migrations.size())},
-             {"transfer_operations", std::to_string(expected_transfer_count)}});
+             {"transfer_operations", std::to_string(actual_transfer_count)}});
 
-        const bool collect_measurements =
-            config_.measurement_sink &&
-            (config_.measurement_scope ==
-                 MoEOverlayMigrationMeasurementScope::AllWaves ||
-             transaction.purpose ==
-                 MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
         std::vector<MoEOverlayCompletedMigrationMeasurement> measurements;
         if (collect_measurements)
         {
@@ -1019,6 +1325,12 @@ namespace llaminar2
                     .layer = migration.layer_idx,
                     .expert = migration.expert_id,
                 });
+                if (!prepared.measurement_geometries.empty())
+                {
+                    const auto index = measurements.size() - 1;
+                    measurements.back().geometry = prepared.measurement_geometries.at(index);
+                    measurements.back().piece_observations.resize(measurements.back().geometry->pieces().size());
+                }
             }
         }
 
@@ -1039,7 +1351,9 @@ namespace llaminar2
                 std::move(measurements),
                 collect_measurements ? config_.measurement_sink : nullptr,
                 collect_measurements &&
-                    config_.require_complete_local_measurements),
+                    config_.require_complete_local_measurements,
+                std::move(prepared.measurement_operations), evidence_context),
+            .measurement_context = std::move(evidence_context),
         };
     }
 

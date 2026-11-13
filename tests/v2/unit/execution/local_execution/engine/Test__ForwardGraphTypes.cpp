@@ -9,6 +9,11 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/local_execution/orchestrators/MoEMaintenanceObservationContext.h"
+#include "execution/mtp/HostedDeviceGenerationFragment.h"
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "backends/NativeAuxiliaryResourceCatalog.h"
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -20,14 +25,18 @@
 #include <unordered_map>
 
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorBuilder.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "execution/moe/MoEOverlayRetainedParentComposer.h"
+#include "execution/compute_stages/stages/MoEOverlayActivationPacketStages.h"
 #include "memory/BufferArena.h"
+#include "memory/StageBufferContract.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
 #include "tensors/Tensors.h"
@@ -50,7 +59,14 @@ using namespace llaminar2;
 TEST(Test__RetainedParentTicketServiceWorker,
      PrearmsOneInvocationAndReusesThePersistentThread)
 {
-    RetainedParentTicketServiceWorker worker;
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([]{
+    {
+    auto fixture=llaminar2::test::RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)});
+    const PhysicalMemoryResource cpu{0,DeviceId::cpu(),128u<<20,128u<<20};
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(fixture.bom(cpu)),0);
+    auto owner=PreparedRetainedHostService::materialize(fixture.take(memory));
+    auto& worker=owner->worker();
     struct BlockingTask
     {
         std::atomic<bool> entered{false};
@@ -98,6 +114,10 @@ TEST(Test__RetainedParentTicketServiceWorker,
     EXPECT_FALSE(worker.await(second_ticket));
     EXPECT_EQ(second_invocation, 1);
     EXPECT_TRUE(worker.idle());
+    }
+    GPUDeviceProcessLifetime::retireActive();
+    std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
 
 namespace
@@ -163,6 +183,7 @@ namespace
         bool requiresGraphCaptureSegmentBoundaryBefore() const override { return segment_boundary_before_; }
         bool requiresGraphCaptureSegmentBoundaryAfter() const override { return segment_boundary_after_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return collective_authority_;}
         ManualGraphBoundaryScheduling
         manualGraphBoundaryScheduling() const noexcept override
         {
@@ -181,6 +202,7 @@ namespace
         }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
+        CollectiveGraphCaptureAuthority collective_authority_=CollectiveGraphCaptureAuthority::RuntimeBackend;
         int execute_calls_ = 0;
         int abort_publications_ = 0;
 
@@ -461,6 +483,7 @@ namespace
 
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override
         {
+            if (prepare_observer_) prepare_observer_(ctx, stream);
             ++prepare_calls_;
             last_ctx_ = ctx;
             last_stream_ = stream;
@@ -470,8 +493,18 @@ namespace
             return stream != nullptr;
         }
 
+        /** @brief Record exact Controller activity transitions without owning native work. */
+        bool transitionGraphCaptureActivity(IDeviceContext *ctx, void *stream,
+                                            GraphCaptureActivityTransition transition) override
+        {
+            if (capture_activity_observer_) capture_activity_observer_(ctx, stream, transition);
+            return true;
+        }
+
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
+        std::function<void(IDeviceContext*, void*, GraphCaptureActivityTransition)> capture_activity_observer_;
+        std::function<void(IDeviceContext*, void*)> prepare_observer_;
         int prepare_calls_ = 0;
         int execute_calls_ = 0;
         bool executed_after_prepare_ = false;
@@ -702,7 +735,21 @@ namespace
         std::string deviceName() const override { return "FakeReplayGPU"; }
         bool isInitialized() const override { return true; }
 
-        void submitAndWait(std::function<void()> work) override { work(); }
+        /** @return True only within this recorded worker's scoped submission. */
+        bool ownsCurrentThread() const noexcept override { return active_worker_ == this; }
+        /** @brief Model original worker entry, nested inline calls and exception restoration. */
+        void submitAndWait(std::function<void()> work) override
+        {
+            if (ownsCurrentThread()) { work(); return; }
+            ++worker_submissions_;
+            if (broken_dispatch_) { work(); return; }
+            struct Restore {
+                const FakeReplayGPUContext* previous;
+                ~Restore() { active_worker_ = previous; }
+            } restore{active_worker_};
+            active_worker_ = this;
+            work();
+        }
         std::future<void> submitAsync(std::function<void()> work) override
         {
             if (asynchronous_submission_)
@@ -735,7 +782,7 @@ namespace
         }
         void destroyEvent(void *) override { ++events_destroyed_; }
         void recordEvent(void *, void *) override { ++events_recorded_; }
-        void waitEvent(void *, void *) override { ++events_waited_; }
+        void waitEvent(void *event, void *stream) override { ++events_waited_;last_waited_event_=event;last_waited_stream_=stream; }
         bool queryEventChecked(void *event, bool &ready) override
         {
             ++event_query_calls_;
@@ -789,6 +836,8 @@ namespace
             return createFakeGraphCapture(stream);
         }
 
+        int worker_submissions_ = 0;
+        bool broken_dispatch_ = false;
         int synchronize_stream_calls_ = 0;
         int synchronize_stream_checked_calls_ = 0;
         int destroy_stream_calls_ = 0;
@@ -797,6 +846,8 @@ namespace
         int events_destroyed_ = 0;
         int events_recorded_ = 0;
         int events_waited_ = 0;
+        void* last_waited_event_ = nullptr;
+        void* last_waited_stream_ = nullptr;
         int event_query_calls_ = 0;
         int events_synchronized_ = 0;
         int event_elapsed_queries_ = 0;
@@ -818,6 +869,7 @@ namespace
             return capture;
         }
 
+        inline static thread_local const FakeReplayGPUContext* active_worker_ = nullptr;
         int device_ordinal_ = 0;
         bool asynchronous_submission_ = false;
         bool create_graph_only_captures_ = false;
@@ -1010,6 +1062,27 @@ TEST(Test__ForwardGraphSignature, DifferentDecodeNotEqual)
     ForwardGraphSignature a{.seq_len = 1, .batch_size = 1, .decode = true};
     ForwardGraphSignature b{.seq_len = 1, .batch_size = 1, .decode = false};
     EXPECT_NE(a, b);
+}
+
+/** @test Both main-query programs coexist under exact keys; request numeric values are not topology. */
+TEST(Test__ForwardGraphSignature, SparseQueryProgramsRetainIndependentCacheKeys)
+{
+    ForwardGraphSignature complete{.seq_len=1,.batch_size=1,.device=DeviceId::rocm(0),.decode=true};
+    auto short_request=complete;
+    short_request.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    EXPECT_NE(complete,short_request);
+    EXPECT_NE(ForwardGraphSignatureHash{}(complete),ForwardGraphSignatureHash{}(short_request));
+    std::unordered_map<ForwardGraphSignature,int,ForwardGraphSignatureHash> retained;
+    retained.emplace(complete,71);
+    retained.emplace(short_request,93);
+    for(int request=0;request<6;++request){
+        const auto selected=request%2?complete:short_request;
+        EXPECT_EQ(retained.at(selected),request%2?71:93);
+        EXPECT_EQ(retained.size(),2u);
+    }
+    // Copying an identical program/binding is an exact reuse, not another
+    // request-shaped native owner. Budget/prefix remain in admission metadata.
+    EXPECT_EQ(retained.find(ForwardGraphSignature(short_request))->second,93);
 }
 
 TEST(Test__ForwardGraphSignature, SnapshotTopologyHasDedicatedIdentity)
@@ -1237,7 +1310,8 @@ TEST(Test__ForwardGraphSignature, SerialCommitOwnershipExcludesSpeculationAndPre
                                  ForwardExecutionPhase::Decode})
             for (const auto transaction : {ForwardStateTransaction::Ordinary,
                  ForwardStateTransaction::CommittedMTPCondition,
-                 ForwardStateTransaction::RestoredPrefixMTPDecodeBridge})
+                 ForwardStateTransaction::RestoredPrefixMTPDecodeBridge,
+                 ForwardStateTransaction::ForwardOnlyCondition})
             {
                 const bool expected = phase == ForwardExecutionPhase::Decode &&
                     ((role == ForwardExecutionRole::MainInference &&
@@ -1289,6 +1363,39 @@ TEST(Test__ForwardGraphSignature,
     EXPECT_NE(
         ForwardGraphSignatureHash{}(first),
         ForwardGraphSignatureHash{}(rebound));
+}
+
+/** @brief Replayed canonical-logit bindings cannot select a graph with another destination. */
+TEST(Test__ForwardGraphSignature, MTPCanonicalLogitsBindingReplayRejectsStaleIdentity)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ForwardGraphSignature original{
+            .seq_len = 1,
+            .batch_size = 1,
+            .device = device,
+            .execution_role = ForwardExecutionRole::MTPCondition,
+            .decode = true};
+        auto published = original;
+        published.mtp_main_terminal_logits_capture_identity = UINT64_C(0x1234);
+        auto rebound = published;
+        rebound.mtp_main_terminal_logits_capture_identity = UINT64_C(0x5678);
+        std::unordered_map<ForwardGraphSignature, int, ForwardGraphSignatureHash> retained;
+        retained.emplace(original, 0);
+        retained.emplace(published, 1);
+        retained.emplace(rebound, 2);
+        ASSERT_EQ(retained.size(), 3u);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            EXPECT_EQ(retained.at(original), 0);
+            EXPECT_EQ(retained.at(published), 1);
+            EXPECT_EQ(retained.at(rebound), 2);
+        }
+        // Retirement of the old binding cannot evict or authorize the rebound graph.
+        EXPECT_EQ(retained.erase(published), 1u);
+        EXPECT_FALSE(retained.contains(published));
+        EXPECT_EQ(retained.at(rebound), 2);
+    }
 }
 
 /** @brief A different frozen pipeline transport cannot alias an old prefill executable. */
@@ -1396,6 +1503,153 @@ TEST(Test__PipelineForwardEdges, MTPForwardsEncloseEveryRootAndLeaf)
                 }
             }
     }
+}
+
+/**
+ * @test Request-admitted scalar forwards own exact native activation edges.
+ *
+ * Restored-prefix continuation enters the same complete scalar forward as
+ * history decode. Its input token and local KV position stay participant-owned;
+ * no condition/verifier metadata broadcast or generation-parent edge is added.
+ */
+TEST(Test__PipelineForwardEdges, NativeHistoryScalarEnclosesExactActivationEdges)
+{
+    for (const bool cuda : {false, true})
+    {
+        llaminar2::test::MockLocalTPContext transport;
+        std::vector<GlobalDeviceAddress> devices;
+        for (int index = 0; index < 3; ++index)
+            devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                cuda ? DeviceId::cuda(index) : DeviceId::rocm(index)));
+        transport.setDevices(devices);
+        transport.setBackend(cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        FP32Tensor hidden({16, 32});
+        int32_t rows[3]{}; // Token, local cached count and immutable position snapshot.
+        auto *backend = reinterpret_cast<IBackend *>(rows);
+        for (int participant = 0; participant < 3; ++participant)
+        for (const auto intent : {ForwardGraphSubmissionIntent::Execute,
+                                 ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch})
+        {
+            const auto device = devices[participant].toLocalDeviceId();
+            PipelineForwardGraphEdges edges(transport, participant, hidden, 32);
+            ForwardInput input;
+            input.device=device; input.seq_len=1;
+            input.execution_role=ForwardExecutionRole::MainInference;
+            input.execution_phase=ForwardExecutionPhase::Decode;
+            input.graph_submission_intent=intent;
+            input.token_ids_device=rows;
+            input.position_ids_device=rows+2;
+            input.device_decode_position=DeviceDecodePositionBinding{backend,rows+1,rows+2};
+            input.external_hidden_state=participant ? &hidden : nullptr;
+            ASSERT_TRUE(edges.encloses(input));
+            ComputeGraph graph;
+            for (const auto *name : {"branch_a", "branch_b"})
+                graph.addNode(name,std::make_unique<llaminar2::testing::MockComputeStage>(),device);
+            ASSERT_NO_THROW(edges.append(graph,input));
+            EXPECT_EQ(graph.getNode("pipeline_mtp_rows"),nullptr);
+            if (participant)
+            {
+                const auto *receive=graph.getNode("pipeline_activation_receive");
+                ASSERT_NE(receive,nullptr);
+                EXPECT_EQ(receive->stage->estimatedMemoryBytes(),32u*sizeof(float));
+                // Use the executor's real frontier classifier: cold receive
+                // storage is an output, never stale external model input.
+                const auto receive_contract=receive->stage->bufferContract();
+                ASSERT_EQ(receive_contract.outputs.size(),1u);
+                EXPECT_EQ(receive_contract.outputs.front().id,BufferId::HIDDEN_STATE);
+                ASSERT_EQ(receive_contract.writesRequiringPrepare().size(),1u);
+                GraphArenaDependencyTracker frontier;
+                EXPECT_TRUE(frontier.observeStage(receive_contract).empty());
+                const auto norm_contract=StageBufferContract::build().addInput(BufferId::HIDDEN_STATE);
+                EXPECT_TRUE(frontier.observeStage(norm_contract).empty());
+                GraphArenaDependencyTracker omitted_receive;
+                EXPECT_EQ(omitted_receive.observeStage(norm_contract).size(),1u);
+                EXPECT_EQ(graph.getRootNodes(),std::vector<std::string>{"pipeline_activation_receive"});
+                for (const auto *name : {"branch_a","branch_b"})
+                    EXPECT_EQ(graph.getNode(name)->dependencies,std::vector<std::string>{"pipeline_activation_receive"});
+            }
+            else EXPECT_EQ(graph.getNode("pipeline_activation_receive"),nullptr);
+            if (participant<2)
+            {
+                const auto *send=graph.getNode("pipeline_activation_send");
+                ASSERT_NE(send,nullptr);
+                EXPECT_EQ(send->stage->estimatedMemoryBytes(),32u*sizeof(float));
+                auto dependencies=send->dependencies;
+                std::sort(dependencies.begin(),dependencies.end());
+                EXPECT_EQ(dependencies,(std::vector<std::string>{"branch_a","branch_b"}));
+                EXPECT_EQ(graph.getLeafNodes(),std::vector<std::string>{"pipeline_activation_send"});
+            }
+            else EXPECT_EQ(graph.getNode("pipeline_activation_send"),nullptr);
+        }
+    }
+}
+
+/** @test Only an exact setup-only native resident child can delegate activation edges. */
+TEST(Test__PipelineForwardEdges, NativeParentOwnershipCannotBypassHistoryReceive)
+{
+    for (const bool cuda : {false,true})
+    {
+        llaminar2::test::MockLocalTPContext transport;
+        const auto head=cuda?DeviceId::cuda(0):DeviceId::rocm(0);
+        const auto tail=cuda?DeviceId::cuda(1):DeviceId::rocm(1);
+        transport.setDevices({GlobalDeviceAddress::fromLocalDeviceId(head),GlobalDeviceAddress::fromLocalDeviceId(tail)});
+        transport.setBackend(cuda?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+        FP32Tensor hidden({16,32});int32_t rows[3]{};
+        for (const int participant : {0,1})
+        {
+            PipelineForwardGraphEdges edges(transport,participant,hidden,32);
+            ForwardInput input;
+            input.device=participant?tail:head;input.seq_len=1;
+            input.execution_phase=ForwardExecutionPhase::Decode;
+            input.token_ids_device=rows;input.position_ids_device=rows+2;
+            input.device_decode_position=DeviceDecodePositionBinding{reinterpret_cast<IBackend *>(rows),rows+1,rows+2};
+            input.external_hidden_state=participant?&hidden:nullptr;
+            input.graph_submission_intent=ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            input.pipeline_activation_ownership=ForwardPipelineActivationOwnership::NativeGenerationParent;
+            EXPECT_FALSE(edges.encloses(input));
+            ComputeGraph graph;
+            graph.addNode("model",std::make_unique<llaminar2::testing::MockComputeStage>(),input.device);
+            EXPECT_THROW(edges.append(graph,input),std::invalid_argument);
+            EXPECT_EQ(graph.getRootNodes(),std::vector<std::string>{"model"});
+            EXPECT_EQ(graph.getLeafNodes(),std::vector<std::string>{"model"});
+            const auto reject=[&](auto change) {
+                auto invalid=input;change(invalid);
+                EXPECT_THROW((void)edges.encloses(invalid),std::invalid_argument);
+            };
+            reject([](auto &v){v.graph_submission_intent=ForwardGraphSubmissionIntent::Execute;});
+            reject([](auto &v){v.execution_role=ForwardExecutionRole::MTPCondition;});
+            reject([](auto &v){v.execution_phase=ForwardExecutionPhase::Prefill;});
+            reject([](auto &v){v.state_transaction=ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;});
+            reject([](auto &v){v.seq_len=2;});
+            reject([](auto &v){v.batch_size=2;});
+            reject([](auto &v){v.device_decode_position.reset();});
+            reject([&](auto &v){v.sequence_lengths_device=rows+1;});
+            reject([](auto &v){v.token_ids_device=nullptr;});
+            reject([](auto &v){v.position_ids_device=nullptr;});
+            reject([](auto &v){v.device_decode_position->backend=nullptr;});
+            reject([&](auto &v){v.device_decode_position->position=rows;});
+            reject([&](auto &v){v.token_ids=rows;});
+            reject([](auto &v){v.device_prefill_chunk.emplace();});
+            reject([](auto &v){v.pipeline_activation_ownership=static_cast<ForwardPipelineActivationOwnership>(255);});
+        }
+    }
+}
+
+/** @test Transport ownership and the original frozen edge owner are complete capture identity. */
+TEST(Test__ForwardGraphSignature, PipelineActivationOwnershipIsExactCaptureIdentity)
+{
+    int32_t identities[2]{};
+    ForwardGraphSignature invocation;
+    invocation.device=DeviceId::cuda(0);invocation.seq_len=invocation.batch_size=1;
+    invocation.decode=true;invocation.pipeline_forward_edges=identities;
+    auto parent=invocation;
+    parent.pipeline_activation_ownership=ForwardPipelineActivationOwnership::NativeGenerationParent;
+    EXPECT_NE(invocation,parent);
+    EXPECT_NE(ForwardGraphSignatureHash{}(invocation),ForwardGraphSignatureHash{}(parent));
+    auto foreign=parent;foreign.pipeline_forward_edges=identities+1;
+    EXPECT_NE(parent,foreign);
+    EXPECT_NE(ForwardGraphSignatureHash{}(parent),ForwardGraphSignatureHash{}(foreign));
+    EXPECT_EQ(parent,parent);
 }
 
 /** @test Only followers may own complete local pre-verifier rollback bindings. */
@@ -2082,7 +2336,6 @@ TEST(Test__ForwardGraphCache, DefaultState)
     EXPECT_TRUE(cache.token_ids.empty());
     EXPECT_TRUE(cache.position_ids.empty());
     EXPECT_TRUE(cache.collective_nodes.empty());
-    EXPECT_FALSE(cache.pp_needs_copy);
     EXPECT_FALSE(cache.dynamic_param_stages_cached);
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_FALSE(cache.phase3_active);
@@ -2167,8 +2420,6 @@ TEST(Test__ForwardGraphCache, InvalidateResetsAllFields)
     cache.token_ids = {1, 2, 3};
     cache.position_ids = {0, 1, 2};
     cache.collective_nodes = {"allreduce_0", "allreduce_1"};
-    cache.pp_needs_copy = true;
-    cache.pp_copy_bytes = 1024;
     cache.dynamic_param_stages_cached = true;
     cache.gpu_stream_applied = true;
     cache.phase3_active = true;
@@ -2182,8 +2433,6 @@ TEST(Test__ForwardGraphCache, InvalidateResetsAllFields)
     EXPECT_TRUE(cache.token_ids.empty());
     EXPECT_TRUE(cache.position_ids.empty());
     EXPECT_TRUE(cache.collective_nodes.empty());
-    EXPECT_FALSE(cache.pp_needs_copy);
-    EXPECT_EQ(cache.pp_copy_bytes, 0u);
     EXPECT_FALSE(cache.dynamic_param_stages_cached);
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_FALSE(cache.phase3_active);
@@ -2655,9 +2904,10 @@ TEST(Test__GraphSegmentCache, FirstCaptureInvokesBoundaryAfterEventHandoff)
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "main_decode";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -2730,9 +2980,10 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "diagnostically_unrelated_helper";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -2858,12 +3109,13 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "retained_parent_unit";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "retained_parent_unit";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3028,12 +3280,13 @@ TEST(Test__GraphSegmentCache,
         {
             ++snapshot_callback_calls;
         });
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "retained_parent_setup_materialization_unit";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "retained_parent_setup_materialization_unit";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3178,9 +3431,14 @@ TEST(Test__GraphSegmentCache,
  * synchronizing either stream. The sealed replay plan preserves that service
  * program so steady replay repeats the same lifecycle.
  */
-TEST(Test__GraphSegmentCache,
-     RetainedParentServicesCertifiedManualTicketAfterSingleLaunch)
+/** @brief Explicit recorded controller replay versus installed original-source eligibility. */
+enum class HostTicketFixtureOrigin {Recorded,InstalledOriginal};
+/** @brief Run the unchanged actual retained-parent/manual-ticket consumer with the selected original worker declaration. */
+void runRetainedParentManualTicket(HostTicketFixtureOrigin origin)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(([origin]{
+    {
     ComputeGraph graph;
     addFakeSegmentStage(
         graph, "producer", true, false, ComputeStageType::COPY, false,
@@ -3226,14 +3484,24 @@ TEST(Test__GraphSegmentCache,
         graph.getNode("cpu_service")->stage.get());
     ASSERT_NE(service, nullptr);
 
+    // The executor consumes the same predeclared CPU0 owner as production.
+    auto workerFixture=origin==HostTicketFixtureOrigin::InstalledOriginal
+        ?llaminar2::test::RetainedHostServiceFixture::original(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)})
+        :llaminar2::test::RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)});
+    const PhysicalMemoryResource cpu{0,DeviceId::cpu(),128u<<20,128u<<20};
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(workerFixture.bom(cpu)),0);
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
+    executor.setRetainedParentTicketServiceWorker(
+        PreparedRetainedHostService::materialize(workerFixture.take(memory)),memory);
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3302,7 +3570,20 @@ TEST(Test__GraphSegmentCache,
     EXPECT_EQ(composer_calls, 1u);
     EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    }
+    GPUDeviceProcessLifetime::retireActive();
+    std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
+TEST(Test__GraphSegmentCache, RetainedParentServicesCertifiedManualTicketAfterSingleLaunch){
+    runRetainedParentManualTicket(HostTicketFixtureOrigin::Recorded);
+}
+#ifdef LLAMINAR_HOST_SERVICE_ORIGINAL_CONSUMERS
+TEST(Test__GraphSegmentCache, OriginalInstalledRetainedParentServicesManualTicket){
+    runRetainedParentManualTicket(HostTicketFixtureOrigin::InstalledOriginal);
+}
+#endif
+
 
 /** @brief An ordinary host boundary cannot masquerade as concurrent service. */
 TEST(Test__GraphSegmentCache,
@@ -3406,12 +3687,13 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "segmented_root_setup_materialization_unit";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "segmented_root_setup_materialization_unit";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3553,9 +3835,10 @@ TEST(Test__GraphSegmentCache,
             ++snapshot_callback_calls;
         });
 
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "segmented_manual_snapshot_authority_unit";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3757,9 +4040,10 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "role_asymmetric_decode";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3907,9 +4191,10 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "launch_dependency_lifecycle";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -4073,6 +4358,96 @@ TEST(Test__GraphSegmentCache, CapturePlanEvidenceIsUniquePerMaterialization)
     second = std::move(moved);
     EXPECT_EQ(second.evidence_family, rebuilt);
     EXPECT_EQ(moved.evidence_family, 0u);
+}
+
+/** @test The actual capture-plan family retains its authored maintenance context across repeated use and reset. */
+TEST(Test__GraphSegmentCache, MaintenanceReplayContextKeepsOriginalCaptureFamily)
+{
+    for (const auto *context : {"pipeline_original_stage_maintenance_source", "moe_rebalance_maintenance_atomic"})
+    {
+        ComputeGraph graph;
+        addFakeSegmentStage(graph, "maintenance", true);
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        if (std::string(context) == "pipeline_original_stage_maintenance_source") cache.perf_context = context;
+        dgo_detail::bindMoEMaintenanceReplayContext(cache);
+        EXPECT_EQ(cache.perf_context, context);
+        ASSERT_TRUE(cache.replay_workload.valid());
+        EXPECT_TRUE(cache.replay_workload.decode);
+        EXPECT_EQ(cache.replay_workload.m, 1);
+        DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false);
+        const auto family = cache.evidence_family;
+        ASSERT_NE(family, 0u);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            graph.reset();
+            dgo_detail::bindMoEMaintenanceReplayContext(cache);
+            EXPECT_EQ(cache.perf_context, context);
+            EXPECT_EQ(cache.evidence_family, family);
+            for (const auto &unit : cache.segments) EXPECT_EQ(unit.evidence_family, family);
+        }
+        auto moved = std::move(cache);
+        dgo_detail::bindMoEMaintenanceReplayContext(moved);
+        EXPECT_EQ(moved.perf_context, context);
+        EXPECT_EQ(moved.evidence_family, family);
+        moved.reset();
+        dgo_detail::bindMoEMaintenanceReplayContext(moved);
+        DeviceGraphCaptureController::buildCapturePlan(graph, moved, nullptr, false, false);
+        EXPECT_NE(moved.evidence_family, family);
+        EXPECT_EQ(moved.perf_context, context);
+    }
+}
+
+/** @test Missing or foreign context cannot relabel a sealed maintenance family as an atomic replay. */
+TEST(Test__GraphSegmentCache, MaintenanceReplayContextRejectsMissingOrForeignObservationOwner)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "maintenance", true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "pipeline_original_stage_maintenance_source";
+    dgo_detail::bindMoEMaintenanceReplayContext(cache);
+    DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false);
+    const auto family = cache.evidence_family;
+    cache.perf_context.clear();
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_TRUE(cache.perf_context.empty());
+    EXPECT_EQ(cache.evidence_family, family);
+    cache.perf_context = "foreign_capture_owner";
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_EQ(cache.perf_context, "foreign_capture_owner");
+    EXPECT_EQ(cache.evidence_family, family);
+    DeviceGraphExecutor::GraphSegmentCache initialized;
+    initialized.initialized = true;
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(initialized), std::logic_error);
+    EXPECT_TRUE(initialized.perf_context.empty());
+}
+
+/** @test Maintenance preparation authors transaction geometry before capture and rejects lost sealed identity. */
+TEST(Test__GraphSegmentCache, MaintenanceTransactionObservationPreparedBeforeCapture)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "maintenance", true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    dgo_detail::bindMoEMaintenanceReplayContext(cache);
+    ASSERT_TRUE(cache.replay_workload.valid());
+    EXPECT_TRUE(cache.replay_workload.decode);
+    // Binding observation identity cannot claim a capture or initial submission.
+    EXPECT_EQ(cache.successful_capture_count, 0u);
+    EXPECT_EQ(cache.successful_submission_count, 0u);
+    DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false);
+    const auto family = cache.evidence_family;
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        graph.reset();
+        dgo_detail::bindMoEMaintenanceReplayContext(cache);
+        EXPECT_EQ(cache.evidence_family, family);
+        EXPECT_TRUE(cache.replay_workload.decode);
+    }
+    cache.replay_workload.m = 2;
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_EQ(cache.replay_workload.m, 2);
+    cache.replay_workload = {};
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_EQ(cache.evidence_family, family);
 }
 
 TEST(Test__GraphSegmentCache, CapturePlanIncludesLaunchPreparationDependentStages)
@@ -5115,6 +5490,8 @@ TEST(Test__GraphSegmentCache,
             AllowHeterogeneousBoundarySegmentation);
     EXPECT_TRUE(policy.defer_final_sync);
 
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     DeviceGraphCaptureController::buildCapturePlan(
         graph,
@@ -5159,7 +5536,6 @@ TEST(Test__GraphSegmentCache,
      */
     PerfStatsCollector::reset();
     cache.perf_context = "heterogeneous_ticket_event_terminal_unit";
-    FakeReplayGPUContext gpu_ctx;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx, DeviceId::cuda(0)));
     std::vector<FakeReplayGraphCapture *> captures;
     for (auto &segment : cache.segments)
@@ -5830,12 +6206,13 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "heterogeneous_ticket_launch_dependency";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "heterogeneous_ticket_launch_dependency";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -6509,6 +6886,167 @@ TEST(Test__GraphSegmentCache, ReplaySkipsCaptureOnlyPreparation)
     EXPECT_EQ(prep_stage->prepare_calls_, 0)
         << "Capture-only setup must already be embodied by the executable graph.";
     EXPECT_EQ(prep_stage->execute_calls_, 0);
+}
+
+/** @test One actual cold controller dispatch owns preparation, recording and reset replay. */
+TEST(Test__GraphSegmentCache, ColdCaptureOriginalWorkerLifecycle)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)}) {
+        SCOPED_TRACE(device.toString());
+        FakeReplayGPUContext worker;
+        llaminar2::testing::MockDeviceContext context(device, device.is_cuda()
+            ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        for (int replay = 0; replay < 20; ++replay) {
+            SCOPED_TRACE(replay);
+            ComputeGraph graph;
+            auto* stage = addFakeGraphLaunchPrepStage(graph, "original", device);
+            DeviceGraphExecutor::GraphSegmentCache cache;
+            ASSERT_TRUE(cache.ensureCaptureStream(&worker));
+            cache.segments.emplace_back();
+            cache.segments.back().capturable = true;
+            cache.segments.back().stage_names = {"original"};
+            const auto exact_stream = cache.capture_stream;
+            stage->prepare_observer_ = [&](IDeviceContext* actual, void* stream) {
+                EXPECT_TRUE(worker.ownsCurrentThread());
+                EXPECT_EQ(actual, &context);
+                EXPECT_EQ(stream, exact_stream);
+            };
+            bool fail_prebind = false;
+            DeviceGraphCaptureController::ReplayHooks hooks{
+                .prebind_storage = [&](const auto&) {
+                    EXPECT_TRUE(worker.ownsCurrentThread());
+                    if (fail_prebind) throw std::runtime_error("recorded cold preparation failure");
+                    return true;
+                },
+                .cohere_inputs = [](const auto&) { return true; },
+                .execute_node = [&](ComputeNode& node) {
+                    EXPECT_TRUE(worker.ownsCurrentThread());
+                    EXPECT_EQ(node.stage->gpuStream(), exact_stream);
+                    EXPECT_EQ(stage->prepare_calls_, 1);
+                    return node.stage->execute(&context);
+                },
+                .record_snapshot_copies = [](ComputeNode&, void*) { return true; },
+                .post_launch = [](auto&, void*) {},
+            };
+            const auto invoke = [&] {
+                return DeviceGraphCaptureController::executeCapturePhase(
+                    graph, cache, &context, &worker, false, 2, hooks);
+            };
+            // A broken dispatcher must fail at worker entry, before touching any stage.
+            worker.broken_dispatch_ = true;
+            EXPECT_THROW(invoke(), std::logic_error);
+            EXPECT_EQ(stage->prepare_calls_, 0);
+            EXPECT_EQ(stage->execute_calls_, 0);
+            EXPECT_FALSE(worker.ownsCurrentThread());
+            worker.broken_dispatch_ = false;
+            // The original exception unwinds worker identity; the same cache remains usable.
+            fail_prebind = true;
+            EXPECT_THROW(invoke(), std::runtime_error);
+            EXPECT_FALSE(worker.ownsCurrentThread());
+            EXPECT_EQ(stage->prepare_calls_, 0);
+            EXPECT_EQ(stage->execute_calls_, 0);
+            fail_prebind = false;
+            const int before = worker.worker_submissions_;
+            if (replay % 2 == 0) {
+                EXPECT_TRUE(invoke().success);
+            } else {
+                worker.submitAndWait([&] {
+                    const int entered = worker.worker_submissions_;
+                    EXPECT_TRUE(invoke().success);
+                    EXPECT_EQ(worker.worker_submissions_, entered);
+                    EXPECT_TRUE(worker.ownsCurrentThread());
+                });
+            }
+            EXPECT_EQ(worker.worker_submissions_, before + 1);
+            EXPECT_EQ(stage->prepare_calls_, 1);
+            EXPECT_EQ(stage->execute_calls_, 1);
+            EXPECT_FALSE(worker.ownsCurrentThread());
+            cache.reset();
+            graph.clear();
+            EXPECT_FALSE(worker.ownsCurrentThread());
+        }
+    }
+}
+
+/** @test The actual recording hook diagnoses its original stage and unwinds without replacing the exception. */
+TEST(Test__GraphSegmentCache, CaptureHookExceptionPreservesStageContextAndUnwindsActivity)
+{
+    struct RecordedCaptureFailure final : std::logic_error {
+        explicit RecordedCaptureFailure(int token) : std::logic_error("recorded unjoined external producer"), token(token) {}
+        int token;
+    };
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        FakeReplayGPUContext worker;
+        llaminar2::testing::MockDeviceContext context(device, device.is_cuda()
+            ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        ComputeGraph graph;
+        auto *stage = addFakeGraphLaunchPrepStage(graph, "throwing_external_producer", device);
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        cache.perf_context = "decode_diagnostic";
+        ASSERT_TRUE(cache.ensureCaptureStream(&worker));
+        cache.segments.emplace_back();
+        auto &segment = cache.segments.back();
+        segment.capturable = true;
+        segment.stage_names = {"throwing_external_producer"};
+        segment.capture_wave_ordinal = 7;
+        segment.capture_wave_identity = "recorded_source_wave";
+        std::vector<GraphCaptureActivityTransition> activity;
+        stage->capture_activity_observer_ = [&](IDeviceContext *actual, void *stream, auto transition) {
+            EXPECT_EQ(actual, &context);
+            EXPECT_EQ(stream, cache.capture_stream);
+            EXPECT_TRUE(worker.ownsCurrentThread());
+            activity.push_back(transition);
+        };
+        const auto original = std::make_exception_ptr(RecordedCaptureFailure(617));
+        int hook_calls = 0;
+        DeviceGraphCaptureController::ReplayHooks hooks{
+            .prebind_storage = [](const auto &) { return true; },
+            .cohere_inputs = [](const auto &) { return true; },
+            .execute_node = [&](ComputeNode &node) -> bool {
+                ++hook_calls;
+                EXPECT_EQ(node.stage.get(), stage);
+                EXPECT_TRUE(worker.ownsCurrentThread());
+                EXPECT_TRUE(isGraphCaptureActive());
+                std::rethrow_exception(original);
+            },
+            .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+            .post_launch = [](auto &, void *) {},
+        };
+        std::exception_ptr caught;
+        ::testing::internal::CaptureStderr();
+        try {
+            (void)DeviceGraphCaptureController::executeCapturePhase(
+                graph, cache, &context, &worker, false, 2, hooks);
+        } catch (...) { caught = std::current_exception(); }
+        const std::string diagnostic = ::testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(caught);
+        EXPECT_EQ(caught, original);
+        try { std::rethrow_exception(caught); }
+        catch (const RecordedCaptureFailure &failure) {
+            EXPECT_EQ(failure.token, 617);
+            EXPECT_STREQ(failure.what(), "recorded unjoined external producer");
+        } catch (...) { FAIL() << "Controller replaced the original typed exception"; }
+        EXPECT_EQ(hook_calls, 1);
+        EXPECT_FALSE(worker.ownsCurrentThread());
+        EXPECT_FALSE(isGraphCaptureActive());
+        ASSERT_EQ(activity.size(), 2u);
+        EXPECT_EQ(activity[0], GraphCaptureActivityTransition::Entering);
+        EXPECT_EQ(activity[1], GraphCaptureActivityTransition::Aborted);
+        const auto *capture = dynamic_cast<const FakeReplayGraphCapture *>(segment.capture.get());
+        ASSERT_NE(capture, nullptr);
+        EXPECT_FALSE(capture->capturing_);
+        EXPECT_EQ(capture->begin_capture_calls_, 1);
+        EXPECT_EQ(capture->end_capture_calls_, 1);
+        EXPECT_EQ(capture->instantiate_calls_, 0);
+        EXPECT_EQ(capture->launch_calls_, 0);
+        EXPECT_NE(diagnostic.find("stage=throwing_external_producer"), std::string::npos);
+        EXPECT_NE(diagnostic.find(std::string("type=") + computeStageTypeName(ComputeStageType::COPY)), std::string::npos);
+        EXPECT_NE(diagnostic.find("participant_device=" + device.toString()), std::string::npos);
+        EXPECT_NE(diagnostic.find("segment=0 wave=7 wave_identity=recorded_source_wave context=decode_diagnostic"), std::string::npos);
+        EXPECT_NE(diagnostic.find("exception=recorded unjoined external producer"), std::string::npos);
+    }
 }
 
 TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecording)
@@ -7768,4 +8306,695 @@ TEST(Test__RetainedMultiDeviceExecutionPlan,
     EXPECT_NE(error.find("topology"), std::string::npos) << error;
     EXPECT_EQ(first_ptr->execute_calls_, 0)
         << "Generation rejection must happen before a borrowed node is used.";
+}
+
+/** @test Existing CPU ticket cutpoints remain48 while native endpoint collectives stay in their original captured units. */
+TEST(Test__GraphSegmentCache, NativeTransfersPreserveFortyEightCPUServiceCutpoints){
+ ComputeGraph graph;std::string previous;
+ const auto append=[&](const std::string& name){if(!previous.empty())graph.addDependency(name,previous);previous=name;};
+ for(unsigned i=0;i<48;++i){
+  const auto cut="cpu_cut_"+std::to_string(i),service="cpu_service_"+std::to_string(i),native="native_endpoint_"+std::to_string(i);
+  addFakeSegmentStage(graph,cut,true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));append(cut);
+  graph.setHeterogeneousTicketUnitContract(cut,GraphHeterogeneousTicketUnitContract{.identity=cut});
+  addFakeSegmentStage(graph,service,false,true,ComputeStageType::MOE_LOCAL_EXPERT,false,false,false,nullptr,DeviceId::cpu(),false,
+      ManualGraphBoundaryScheduling::ConcurrentTicketService,ConcurrentManualFailureRole::DeviceIngressPublisher);append(service);
+  addFakeSegmentStage(graph,native,true,false,ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER,false,false,false,nullptr,DeviceId::cuda(0));append(native);
+  dynamic_cast<FakeSegmentStage*>(graph.getNode(native)->stage.get())->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+ }
+ addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));append("terminal");graph.setTerminalNode("terminal");
+ graph.setHeterogeneousTicketUnitContract("terminal",GraphHeterogeneousTicketUnitContract{.identity="terminal",.disposition=GraphHeterogeneousTicketUnitDisposition::TransactionTerminal});
+ graph.setNativeCaptureEnvelope(GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+ const auto collectives=graph.collectiveNodeNames();ASSERT_EQ(collectives.size(),48u);EXPECT_FALSE(graph.requiresCollectiveRuntimeCapture(&collectives));
+ DeviceGraphExecutor::GraphSegmentCache cache;
+ ASSERT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false,DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentWithConcurrentTicketService));
+ unsigned manual=0,native=0;std::vector<std::string> logicalServices;
+ for(const auto& segment:cache.segments){if(!segment.capturable){++manual;logicalServices.insert(logicalServices.end(),segment.stage_names.begin(),segment.stage_names.end());}for(const auto& name:segment.stage_names){const auto* stage=graph.getNode(name)->stage.get();
+  if(stage->isParticipantLocalCapturedTransfer()){EXPECT_TRUE(segment.capturable);EXPECT_TRUE(stage->isCollectiveStage());++native;}
+ }}
+ // The original retained-parent lowering packs the48 authenticated CPU
+ // services into ONE physical worker program, preserving their logical order.
+ std::vector<std::string> expectedServices;for(unsigned i=0;i<48;++i)expectedServices.push_back("cpu_service_"+std::to_string(i));
+ EXPECT_EQ(manual,1u);EXPECT_EQ(logicalServices,expectedServices);EXPECT_EQ(native,48u);
+ EXPECT_EQ(cache.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::NotRequired);
+ DeviceGraphExecutor::GraphSegmentCache moved(std::move(cache));EXPECT_EQ(moved.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::NotRequired);
+ moved.reset();EXPECT_EQ(moved.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::Required);
+}
+/** @test Native transport authority never promotes an unready stage; ordinary runtime collectives keep their backend capability AND. */
+TEST(Test__GraphSegmentCache, NativeTransferAuthorityKeepsReadinessAndRuntimeCollectiveGuards){
+ for(const bool runtimeReady:{false,true}){
+  ComputeGraph graph;addFakeSegmentStage(graph,"runtime",true,false,ComputeStageType::ALLREDUCE,false,false,false,nullptr,DeviceId::cuda(0));const auto collectives=graph.collectiveNodeNames();
+  DeviceGraphExecutor::GraphSegmentCache cache;
+  if(runtimeReady){EXPECT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,true));ASSERT_EQ(cache.segments.size(),1u);EXPECT_TRUE(cache.segments[0].capturable);}
+  else EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false),std::runtime_error);
+  EXPECT_EQ(cache.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::Required);
+ }
+ for(const bool ready:{false,true}){
+  ComputeGraph graph;addFakeSegmentStage(graph,"native",ready,false,ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER,false,false,false,nullptr,DeviceId::cuda(0));
+  auto* stage=dynamic_cast<FakeSegmentStage*>(graph.getNode("native")->stage.get());stage->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+  const auto nativeSignature=DeviceGraphCaptureController::computeCaptureVariantSignature(graph);stage->collective_authority_=CollectiveGraphCaptureAuthority::RuntimeBackend;
+  EXPECT_NE(nativeSignature,DeviceGraphCaptureController::computeCaptureVariantSignature(graph));stage->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+  const auto collectives=graph.collectiveNodeNames();DeviceGraphExecutor::GraphSegmentCache cache;
+  if(ready){EXPECT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false));ASSERT_EQ(cache.segments.size(),1u);EXPECT_TRUE(cache.segments[0].capturable);}
+  else EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false),std::invalid_argument);
+ }
+}
+
+/** @test Actual replay uses frozen native-transport plan metadata and defers its terminal without runtime collective support or a new graph scan. */
+TEST(Test__GraphSegmentCache, NativeTransferReplayRetainsCaptureStreamTerminalAuthority){
+ ComputeGraph graph;addFakeSegmentStage(graph,"native",true,false,ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER,false,false,false,nullptr,DeviceId::cuda(0));
+ dynamic_cast<FakeSegmentStage*>(graph.getNode("native")->stage.get())->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+ // Cache borrows the worker during terminal observation and stream teardown.
+ // The worker must outlive the cache even when an assertion returns early.
+ FakeReplayGPUContext worker;
+ const auto collectives=graph.collectiveNodeNames();DeviceGraphExecutor::GraphSegmentCache cache;
+ DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false);
+ ASSERT_TRUE(cache.ensureCaptureStream(&worker,DeviceId::cuda(0),false));ASSERT_EQ(cache.segments.size(),1u);
+ cache.segments[0].capture=std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+ llaminar2::testing::MockDeviceContext context(DeviceId::cuda(0),ComputeBackendType::GPU_CUDA);
+ DeviceGraphCaptureController::ReplayHooks hooks{.cohere_inputs=nullptr,.execute_node=nullptr,.prepare_snapshot_manifest=[](){return true;},.record_snapshot_copies=[](ComputeNode&,void*){return true;},.post_launch=[](DeviceGraphExecutor::GraphSegment&,void*){}};
+ const auto result=DeviceGraphCaptureController::executeReplayPhase(graph,cache,&context,&worker,true,false,1,hooks,false,true);
+ ASSERT_TRUE(result.success);EXPECT_EQ(worker.synchronize_stream_checked_calls_,0);EXPECT_EQ(worker.synchronize_stream_calls_,0);EXPECT_EQ(worker.events_synchronized_,0);
+ cache.reset(); // Retire the exact deferred terminal while its original worker is still live.
+ EXPECT_EQ(worker.events_created_,worker.events_destroyed_);EXPECT_EQ(worker.destroy_stream_calls_,1);
+}
+
+/**
+ * @brief Real endpoint metadata declares movement without claiming unprepared capture.
+ *
+ * GPU MoE kernel construction enters the native SDK. CPU-invalid instances keep
+ * this negative readiness proof device-free; explicit native suites own actual
+ * GPU endpoint capture/data verification.
+ */
+TEST(Test__GraphSegmentCache, MoEEndpointMetadataKeepsNativeAuthorityAndReadinessSeparate)
+{
+    const auto check = []<typename Stage>()
+    {
+        Stage stage(typename Stage::Params{.device_id = DeviceId::cpu()});
+        EXPECT_TRUE(stage.isCollectiveStage());
+        EXPECT_TRUE(isCollectiveComputeStageType(stage.type()));
+        EXPECT_EQ(stage.collectiveGraphCaptureAuthority(),
+                  CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer);
+        EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::CPU));
+        EXPECT_FALSE(stage.isGraphCapturable());
+        EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+        EXPECT_THROW((void)stage.isParticipantLocalCapturedTransfer(), std::logic_error)
+            << "A native authority tag never makes an invalid CPU endpoint capture-ready";
+    };
+    check.template operator()<MoEOverlayActivationDispatchPackStage>();
+    check.template operator()<MoEOverlayActivationDispatchPackBatchStage>();
+    check.template operator()<MoEOverlayActivationDispatchConsumeStage>();
+    check.template operator()<MoEOverlayActivationReturnPackStage>();
+    check.template operator()<MoEOverlayActivationReturnConsumeStage>();
+    check.template operator()<MoEOverlayActivationReturnConsumeBatchStage>();
+}
+
+/** @brief Retained full replay accepts real native endpoint policy, not runtime CCL. */
+TEST(Test__GraphSegmentCache, RetainedFullNativeEndpointRequiresExactExecutableAndDeferredOwner)
+{
+    using Cache = DeviceGraphExecutor::GraphSegmentCache;
+    using Policy = DeviceGraphExecutor::GraphReplayPlanPolicy;
+    const auto probe = [](bool ready, CollectiveGraphCaptureAuthority authority,
+                          bool runtime_capture, bool deferred, bool null_context,
+                          bool null_stream, bool null_worker, bool expect_success)
+    {
+        ComputeGraph graph;
+        addFakeSegmentStage(graph, "endpoint", ready, false,
+            ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK,
+            false, false, false, nullptr, DeviceId::cuda(0));
+        auto *stage = dynamic_cast<FakeSegmentStage *>(graph.getNode("endpoint")->stage.get());
+        ASSERT_NE(stage, nullptr);
+        stage->collective_authority_ = authority;
+        const auto collectives = graph.collectiveNodeNames();
+        ASSERT_TRUE(collectives.contains("endpoint"));
+        FakeReplayGPUContext worker;
+        FakeReplayGPUContext foreign_worker;
+        BufferArena arena;
+        DeviceGraphExecutor executor;
+        executor.setArena(&arena);
+        executor.setWorkerGPUContextResolver([&](DeviceId) { return &worker; });
+        llaminar2::testing::MockDeviceContext context(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+        Cache cache;
+        cache.steady_replay_host_policy = Cache::SteadyReplayHostPolicy::RetainedFullGraph;
+        ASSERT_TRUE(cache.bindBorrowedCaptureStream(&worker, worker.defaultStream(), DeviceId::cuda(0)));
+        ASSERT_TRUE(cache.prepareCaptureStreamTerminal(&worker));
+        const auto submit = [&](IDeviceContext *ctx, void *stream, IWorkerGPUContext *gpu)
+        {
+            graph.reset();
+            bool result = false;
+            Cache::CaptureStreamTerminalTicket terminal;
+            worker.submitAndWait([&]
+            {
+                result = executor.executeWithCachedGraphReplay(
+                    graph, ctx, cache, stream, gpu, &collectives, runtime_capture,
+                    false, deferred, {}, Policy::RequireFullGraph);
+                if (result)
+                    terminal = cache.publishCaptureStreamTerminal();
+            });
+            if (result)
+                cache.waitForPublishedCaptureStreamTerminal(terminal, Cache::HostFenceWaitPolicy::ActiveProgress);
+            return result;
+        };
+        bool first = false;
+        const auto initial = [&]
+        {
+            first = submit(null_context ? nullptr : &context,
+                           null_stream ? nullptr : worker.defaultStream(),
+                           null_worker ? nullptr : &worker);
+        };
+        if (expect_success)
+            EXPECT_NO_THROW(initial());
+        else
+        {
+            try { initial(); }
+            catch (const std::invalid_argument &) { }
+            catch (const std::runtime_error &) { }
+        }
+        EXPECT_EQ(first, expect_success);
+        if (!expect_success)
+        {
+            EXPECT_TRUE(worker.created_graph_captures_.empty());
+            return;
+        }
+        ASSERT_TRUE(cache.retained_full_graph_replay.valid());
+        ASSERT_EQ(cache.segments.size(), 1u);
+        ASSERT_EQ(worker.created_graph_captures_.size(), 1u);
+        auto *capture = worker.created_graph_captures_.front();
+        ASSERT_NE(capture, nullptr);
+        EXPECT_TRUE(capture->hasExecutable());
+        const int captures = capture->begin_capture_calls_;
+        const int instantiations = capture->instantiate_calls_;
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            ASSERT_TRUE(submit(&context, worker.defaultStream(), &worker));
+        }
+        EXPECT_EQ(capture->begin_capture_calls_, captures);
+        EXPECT_EQ(capture->instantiate_calls_, instantiations);
+        EXPECT_EQ(worker.created_graph_captures_.size(), 1u);
+        EXPECT_FALSE(submit(&context, foreign_worker.defaultStream(), &foreign_worker))
+            << "A sealed native executable cannot adopt another worker";
+        EXPECT_EQ(worker.synchronize_stream_checked_calls_, 0);
+        EXPECT_EQ(worker.synchronize_stream_calls_, 0);
+        EXPECT_EQ(worker.device_synchronize_calls_, 0);
+        cache.reset();
+        EXPECT_EQ(worker.events_created_, worker.events_destroyed_);
+    };
+    const auto native = CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+    const auto runtime = CollectiveGraphCaptureAuthority::RuntimeBackend;
+    probe(true, native, false, true, false, false, false, true);
+    probe(false, native, false, true, false, false, false, false);
+    probe(true, runtime, false, true, false, false, false, false);
+    probe(true, runtime, true, true, false, false, false, false);
+    probe(true, native, true, true, false, false, false, false);
+    probe(true, native, false, false, false, false, false, false);
+    probe(true, native, false, true, true, false, false, false);
+    probe(true, native, false, true, false, true, false, false);
+    probe(true, native, false, true, false, false, true, false);
+}
+
+/**
+ * @test Original predictor wave joins different legal participant ranges while retaining local cache identity.
+ * The native replay backend is doubled; actual builder declaration and Controller
+ * boundary generation, capture, cache reuse and rejection execute unchanged.
+ */
+TEST(Test__GraphSegmentCache, QFNPredictorWaveAuthenticatesOriginalTransactionAcrossLocalTP)
+{
+    const auto source = [](int layer) {
+        const Qwen4ExpPredictorMetadata metadata{static_cast<std::uint32_t>(layer),
+            Qwen4ExpPredictorAttention::Dense,Qwen4ExpPredictorHiddenNorm::PerBranch,
+            Qwen4ExpPredictorSource::SharedGGUF};
+        return LayerGraphSourceIdentity::qwen4ExpSharedPredictor(layer,metadata,layer,0,0);
+    };
+    const auto context = [&](DeviceId device,int rows,int layer) {
+        return Qwen4ExpPredictorContext{FullAttentionLayerIdentity::qwen4ExpSharedPredictor(source(layer)),
+            Qwen4ExpPredictorRows::admit(1,rows,device,nullptr,nullptr),8,2,1e-6f,device,nullptr,"mtp0_"};
+    };
+    const auto replay = [&](int participant,int rows,int layer,Qwen4ExpPredictorInvocation invocation,
+                            const std::string &terminal,const std::vector<std::string> *expected,
+                            GraphNativeCaptureEnvelope envelope=GraphNativeCaptureEnvelope::Ordinary) {
+        const auto device=DeviceId::cuda(participant);
+        ComputeGraph graph;graph.setNativeCaptureEnvelope(envelope);
+        const std::string first=participant==0 ? "mtp0_embedding" : "mtp0_norm_hidden";
+        addFakeSegmentStage(graph,first,true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        addFakeSegmentStage(graph,terminal,true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        graph.addDependency(terminal,first);
+        graph.setTerminalNode(terminal);
+        if(envelope==GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction) {
+            graph.setGraphCaptureWaveContract(first,GraphCaptureWaveContract{.identity="internal_dispatch_packet"});
+            graph.setGraphCaptureWaveContract(terminal,GraphCaptureWaveContract{.identity="internal_return_packet"});
+        }
+        Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,context(device,rows,layer),invocation,terminal);
+        DeviceGraphExecutor executor;
+        BufferArena arena;executor.setArena(&arena);
+        FakeReplayGPUContext worker(participant);
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        cache.perf_context="mtp_decode_sidecar_device_target_token_live_position";
+        executor.setWorkerGPUContextResolver([&](DeviceId){return &worker;});
+        llaminar2::testing::MockDeviceContext ctx(device,ComputeBackendType::GPU_CUDA);
+        std::vector<std::string> boundaries;
+        const bool success=executor.executeWithCachedGraphReplay(graph,&ctx,cache,worker.defaultStream(),&worker,
+            nullptr,false,false,false,[&](const std::string &name,void*) {
+                const auto index=boundaries.size();boundaries.push_back(name);
+                return !expected || (index<expected->size() && (*expected)[index]==name);
+            },DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+        EXPECT_EQ(success,expected==nullptr || *expected==boundaries);
+        if(success) {
+            EXPECT_EQ(cache.segments.size(),1u);
+            EXPECT_EQ(cache.segments.front().stage_names.front(),first);
+            const auto *capture=dynamic_cast<const FakeReplayGraphCapture*>(cache.segments.front().capture.get());
+            EXPECT_NE(capture,nullptr);
+            if(capture)EXPECT_EQ(capture->begin_capture_calls_,1);
+            EXPECT_TRUE(executor.executeWithCachedGraphReplay(graph,&ctx,cache,worker.defaultStream(),&worker,
+                nullptr,false,false,false,{},DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph));
+            if(capture)EXPECT_EQ(capture->begin_capture_calls_,1) << "Unchanged participant cache must replay without recapture";
+        }
+        return boundaries;
+    };
+    for(const auto envelope:{GraphNativeCaptureEnvelope::Ordinary,GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction}) {
+        const auto original=replay(0,1,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",nullptr,envelope);
+        ASSERT_EQ(original.size(),2u);
+        EXPECT_EQ(replay(1,1,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,2,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,1,49,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,1,48,Qwen4ExpPredictorInvocation::ShiftedPrefill,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,1,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head_allgather",&original,envelope),original);
+    }
+    const Qwen4ExpPredictorMetadata metadata{48,Qwen4ExpPredictorAttention::Dense,
+        Qwen4ExpPredictorHiddenNorm::PerBranch,Qwen4ExpPredictorSource::SharedGGUF};
+    EXPECT_THROW((void)LayerGraphSourceIdentity::qwen4ExpSharedPredictor(48,metadata,48,1,0),std::invalid_argument);
+    {
+        ComputeGraph graph;
+        const auto device=DeviceId::cuda(0);
+        auto original_context=context(device,1,48);
+        EXPECT_THROW(Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,original_context,
+            Qwen4ExpPredictorInvocation::Draft,"missing"),std::invalid_argument);
+        addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        graph.setTerminalNode("terminal");
+        EXPECT_THROW(Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,original_context,
+            static_cast<Qwen4ExpPredictorInvocation>(99),"terminal"),std::invalid_argument);
+        graph.setNativeTransactionCaptureContract({.identity="foreign_collective",.terminal_node="terminal"});
+        EXPECT_THROW(Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,original_context,
+            Qwen4ExpPredictorInvocation::Draft,"terminal"),std::invalid_argument);
+        EXPECT_EQ(graph.nativeTransactionCaptureContract()->identity,"foreign_collective");
+    }
+    for(const auto envelope:{GraphNativeCaptureEnvelope::Ordinary,
+            GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction,
+            GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction}) {
+        const auto device=envelope==GraphNativeCaptureEnvelope::Ordinary ? DeviceId::cpu() : DeviceId::cuda(0);
+        ComputeGraph graph;graph.setNativeCaptureEnvelope(envelope);
+        addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,context(device,1,48),Qwen4ExpPredictorInvocation::Draft,"terminal");
+        EXPECT_FALSE(graph.nativeTransactionCaptureContract().has_value());
+        EXPECT_EQ(graph.nativeCaptureEnvelope(),envelope);
+    }
+}
+
+/** @test Whole-parent identity is structural, scoped to its graph and rejects partial or conflicting plans. */
+TEST(Test__GraphSegmentCache, NativeTransactionCaptureContractRetainsScopeAndCacheIdentity)
+{
+    static_assert(!std::is_copy_constructible_v<ComputeGraph>);
+    ComputeGraph graph;
+    addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));
+    graph.setTerminalNode("terminal");
+    const auto before=DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
+    graph.setNativeTransactionCaptureContract({.identity="original_transaction",.terminal_node="terminal"});
+    EXPECT_NE(before,DeviceGraphCaptureController::computeCaptureVariantSignature(graph));
+    EXPECT_THROW(graph.setNativeTransactionCaptureContract({.identity="foreign",.terminal_node="terminal"}),std::invalid_argument);
+    EXPECT_THROW(graph.setNativeCaptureEnvelope(GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction),std::invalid_argument);
+    ComputeGraph moved(std::move(graph));
+    ASSERT_TRUE(moved.nativeTransactionCaptureContract());
+    EXPECT_EQ(moved.nativeTransactionCaptureContract()->identity,"original_transaction");
+    graph.clear();EXPECT_FALSE(graph.nativeTransactionCaptureContract());
+    ComputeGraph enclosing;
+    enclosing.merge(std::move(moved));
+    EXPECT_FALSE(enclosing.nativeTransactionCaptureContract());
+    EXPECT_FALSE(moved.nativeTransactionCaptureContract());
+    enclosing.setTerminalNode("terminal");
+    enclosing.setNativeTransactionCaptureContract({.identity="enclosing_transaction",.terminal_node="terminal"});
+    DeviceGraphExecutor::GraphSegmentCache complete;
+    DeviceGraphCaptureController::buildCapturePlan(enclosing,complete,nullptr,false,false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+    ASSERT_EQ(complete.segments.size(),1u);
+    EXPECT_EQ(complete.segments.front().capture_wave_identity,"enclosing_transaction");
+    addFakeSegmentStage(enclosing,"foreign_terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));
+    enclosing.addDependency("foreign_terminal","terminal");
+    enclosing.setTerminalNode("foreign_terminal");
+    DeviceGraphExecutor::GraphSegmentCache changed_terminal;
+    EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(enclosing,changed_terminal,nullptr,false,false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph),std::logic_error);
+    enclosing.setTerminalNode("terminal");
+    addFakeSegmentStage(enclosing,"manual",false,true,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cpu());
+    enclosing.addDependency("terminal","manual");
+    DeviceGraphExecutor::GraphSegmentCache partial;
+    EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(enclosing,partial,nullptr,false,false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation),std::logic_error);
+    enclosing.clear();EXPECT_FALSE(enclosing.nativeTransactionCaptureContract());
+}
+
+namespace {
+/** @brief Original scheduler metadata for receipt-state replay; grants no native readiness. */
+MoEOverlayInferenceTopologyIdentity recurrentTerminalTopology() {
+    return {.workspace_generation=71,.topology_fingerprint_low=0x1234,
+        .topology_fingerprint_high=0x5678,.source_world_rank=0,.target_world_rank=1};
+}
+/** @brief Construct the actual original protocol; terminal state cannot select capacity. */
+MoEOverlayInferenceTransactionProtocol recurrentTerminalProtocol(int depth) {
+    return MoEOverlayInferenceTransactionProtocol({.topology=recurrentTerminalTopology(),
+        .slot_count=moeOverlayInferenceTransactionSlotCount(depth),.max_request_count=4,
+        .max_rows_per_request=16,.max_mtp_draft_depth=depth});
+}
+}
+/** @test Several original same-family publications retain distinct exact receipts before any observation. */
+TEST(Test__GraphSegmentCache, OriginalSlotTerminalsRetainEveryDeferredInvocationLifecycle) {
+    for(const int depth:{1,3,15}) {
+        auto protocol=recurrentTerminalProtocol(depth);
+        OriginalSlotCaptureTerminalState terminals(protocol.originalSlotDomain());
+        for(std::uint64_t request=1;request<=20;++request) {
+            const MoEOverlayInferenceCommandIdentity command{request,request,41};
+            ASSERT_TRUE(protocol.beginCommand(command));
+            std::vector<MoEOverlayInferenceOriginalSlot> submitted;
+            std::vector<OriginalSlotCaptureTerminalReceipt> receipts;
+            // The same learned family is invoked recurrently; depth belongs to
+            // the immutable ticket, never a newly declared learned executable.
+            for(std::uint64_t ordinal=1;ordinal<=3;++ordinal) {
+                const auto ticket=makeMoEOverlayInferenceExecutionTicket(recurrentTerminalTopology(),command,
+                    ordinal,ordinal,41,MoEOverlayInferenceGraphRole::MTPDraft,1,1,1,
+                    std::min(depth,3),int(ordinal-1)%std::min(depth,3));
+                const auto admission=protocol.accept(ticket);ASSERT_TRUE(admission.accepted());
+                ASSERT_TRUE(protocol.markSubmitted(admission.slot_index,ticket));
+                const auto slot=protocol.originalSubmittedSlot(ticket);
+                ASSERT_NO_THROW(terminals.requirePublication(slot));
+                receipts.push_back(terminals.publish(slot));submitted.push_back(slot);
+                EXPECT_THROW(terminals.publish(slot),std::logic_error);
+            }
+            EXPECT_THROW(terminals.requireObservation(receipts.back()),std::logic_error);
+            for(const auto& receipt:receipts) {
+                ASSERT_TRUE(terminals.nextOutstanding());
+                EXPECT_EQ(terminals.nextOutstanding()->generation(),receipt.generation());
+                ASSERT_NO_THROW(terminals.requireObservation(receipt));
+                terminals.observed(receipt);
+                EXPECT_THROW(terminals.observed(receipt),std::logic_error);
+            }
+            EXPECT_FALSE(terminals.nextOutstanding());
+            for(const auto& slot:submitted) {
+                ASSERT_TRUE(protocol.markReturnReady(slot.index(),slot.ticket()));
+                ASSERT_TRUE(protocol.retire(slot.index(),slot.ticket()));
+                EXPECT_THROW(terminals.requirePublication(slot),std::logic_error);
+            }
+            const auto complete=makeMoEOverlayInferenceTerminalTicket(recurrentTerminalTopology(),command,
+                4,41,MoEOverlayInferenceTransactionAction::Complete);
+            EXPECT_TRUE(protocol.accept(complete).completed());
+        }
+    }
+}
+/** @test Foreign caches, withdrawn original authorities and stale slots cannot authenticate terminal proof. */
+TEST(Test__GraphSegmentCache, OriginalSlotTerminalsRejectForeignAndWithdrawnOwners) {
+    auto protocol=recurrentTerminalProtocol(3),foreign=recurrentTerminalProtocol(3);
+    const MoEOverlayInferenceCommandIdentity command{1,1,41};
+    ASSERT_TRUE(protocol.beginCommand(command));
+    const auto ticket=makeMoEOverlayInferenceExecutionTicket(recurrentTerminalTopology(),command,
+        1,1,41,MoEOverlayInferenceGraphRole::MTPDraft,1,1,1,3,0);
+    const auto admission=protocol.accept(ticket);ASSERT_TRUE(admission.accepted());
+    ASSERT_TRUE(protocol.markSubmitted(admission.slot_index,ticket));
+    const auto slot=protocol.originalSubmittedSlot(ticket);
+    OriginalSlotCaptureTerminalState first(protocol.originalSlotDomain()),second(protocol.originalSlotDomain()),
+        foreignState(foreign.originalSlotDomain());
+    EXPECT_THROW(foreignState.requirePublication(slot),std::logic_error);
+    const auto receipt=first.publish(slot);
+    EXPECT_THROW(second.requireObservation(receipt),std::logic_error);
+    first.observed(receipt);
+    ASSERT_TRUE(protocol.markReturnReady(slot.index(),ticket));
+    ASSERT_TRUE(protocol.retire(slot.index(),ticket));
+    EXPECT_THROW(first.requirePublication(slot),std::logic_error);
+    std::optional<MoEOverlayInferenceOriginalSlot> orphan;
+    std::unique_ptr<OriginalSlotCaptureTerminalState> retained;
+    {
+        auto original=recurrentTerminalProtocol(3);
+        ASSERT_TRUE(original.beginCommand(command));
+        const auto accepted=original.accept(ticket);ASSERT_TRUE(accepted.accepted());
+        ASSERT_TRUE(original.markSubmitted(accepted.slot_index,ticket));
+        orphan=original.originalSubmittedSlot(ticket);
+        retained=std::make_unique<OriginalSlotCaptureTerminalState>(original.originalSlotDomain());
+    }
+    EXPECT_THROW(retained->requirePublication(*orphan),std::logic_error);
+}
+/** @test Additional event commitments scale only with the actual original slot roster on both backends. */
+TEST(Test__GraphSegmentCache, OriginalSlotTerminalBOMUsesCertifiedUnitCount) {
+    for(const int depth:{1,3,15}) {
+        auto protocol=recurrentTerminalProtocol(depth);
+        const auto program=NativeOrderingEventProgram::retainedCaptureTerminals(*protocol.originalSlotDomain());
+        EXPECT_EQ(program.orderingEvents(),protocol.slotCount()-1);
+        for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
+            const auto unit=NativeAuxiliaryResourceCatalog::allowance(backend,
+                NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::lookupSubmissionRetirement()));
+            const auto full=NativeAuxiliaryResourceCatalog::allowance(backend,NativeAuxiliaryResourceProgram::ordering(program));
+            EXPECT_EQ(full.hostBytes,unit.hostBytes*(protocol.slotCount()-1));
+            EXPECT_EQ(full.deviceBytes,unit.deviceBytes*(protocol.slotCount()-1));
+            EXPECT_EQ(full.lifetime,unit.lifetime);
+            EXPECT_EQ(full.evidence,unit.evidence);
+        }
+    }
+}
+
+/** @test Exact predecessor device edge preserves its event and every deferred host terminal proof. */
+TEST(Test__GraphSegmentCache, PublishedTerminalDeviceHandoffDoesNotObserveOrRerecord) {
+    using Cache=DeviceGraphExecutor::GraphSegmentCache;
+    FakeReplayGPUContext worker;
+    int sourceStream=1,consumerStream=2;
+    Cache predecessor,successor;
+    ASSERT_TRUE(predecessor.bindBorrowedCaptureStream(&worker,&sourceStream,DeviceId::cuda(0)));
+    ASSERT_TRUE(successor.bindBorrowedCaptureStream(&worker,&consumerStream,DeviceId::cuda(0)));
+    ASSERT_TRUE(predecessor.prepareCaptureStreamTerminal(&worker));
+    ASSERT_TRUE(successor.prepareCaptureStreamTerminal(&worker));
+    for(int repeat=0;repeat<20;++repeat) {
+        const auto ticket=predecessor.publishCaptureStreamTerminal();
+        const auto records=worker.events_recorded_,queries=worker.event_query_calls_;
+        const auto syncs=worker.events_synchronized_,streamSyncs=worker.synchronize_stream_checked_calls_;
+        worker.submitAndWait([&] {
+            predecessor.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker);
+        });
+        EXPECT_EQ(worker.last_waited_event_,predecessor.terminal_event);
+        EXPECT_EQ(worker.last_waited_stream_,&consumerStream);
+        EXPECT_EQ(worker.events_recorded_,records);
+        EXPECT_EQ(worker.event_query_calls_,queries);
+        EXPECT_EQ(worker.events_synchronized_,syncs);
+        EXPECT_EQ(worker.synchronize_stream_checked_calls_,streamSyncs);
+        EXPECT_LT(predecessor.terminal_fence_observed_generation,ticket.generation);
+        const auto following=successor.publishCaptureStreamTerminal();
+        worker.submitAndWait([&] {
+            EXPECT_THROW(successor.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker),std::logic_error);
+        });
+        predecessor.waitForPublishedCaptureStreamTerminal(ticket,Cache::HostFenceWaitPolicy::ActiveProgress);
+        successor.waitForPublishedCaptureStreamTerminal(following,Cache::HostFenceWaitPolicy::ActiveProgress);
+        worker.submitAndWait([&] {
+            // Host retirement may win the race to the same immutable event.
+            // The exact completed dependency is still safe and does not change
+            // observation or native creator/record/query/synchronization counts.
+            const auto completedRecords=worker.events_recorded_;
+            const auto completedQueries=worker.event_query_calls_;
+            const auto completedSyncs=worker.events_synchronized_;
+            predecessor.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker);
+            EXPECT_EQ(predecessor.terminal_fence_observed_generation,ticket.generation);
+            EXPECT_EQ(worker.events_recorded_,completedRecords);
+            EXPECT_EQ(worker.event_query_calls_,completedQueries);
+            EXPECT_EQ(worker.events_synchronized_,completedSyncs);
+        });
+    }
+    EXPECT_EQ(worker.events_created_,2);
+}
+/** @test Cache move/reset and foreign/missing/relabelled owners reject before any native edge. */
+TEST(Test__GraphSegmentCache, PublishedTerminalDeviceHandoffRejectsChangedOriginalOwners) {
+    using Cache=DeviceGraphExecutor::GraphSegmentCache;
+    FakeReplayGPUContext worker,foreign;
+    int sourceStream=1,consumerStream=2;
+    Cache cache;
+    ASSERT_TRUE(cache.bindBorrowedCaptureStream(&worker,&sourceStream,DeviceId::rocm(0)));
+    ASSERT_TRUE(cache.prepareCaptureStreamTerminal(&worker));
+    auto ticket=cache.publishCaptureStreamTerminal();
+    EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker),std::logic_error);
+    worker.submitAndWait([&] {
+        EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait(ticket,nullptr,&worker),std::logic_error);
+        EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&foreign),std::logic_error);
+        EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait({},&consumerStream,&worker),std::logic_error);
+    });
+    EXPECT_EQ(worker.events_waited_,0);
+    Cache moved(std::move(cache));
+    worker.submitAndWait([&] {moved.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker);});
+    moved.waitForPublishedCaptureStreamTerminal(ticket,Cache::HostFenceWaitPolicy::ActiveProgress);
+    moved.reset(Cache::StreamResetPolicy::Preserve);
+    const auto later=moved.publishCaptureStreamTerminal();
+    EXPECT_GT(later.generation,ticket.generation);
+    ticket.generation=later.generation;
+    const auto waits=worker.events_waited_;
+    worker.submitAndWait([&] {
+        EXPECT_THROW(moved.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker),std::logic_error);
+    });
+    EXPECT_EQ(worker.events_waited_,waits);
+    moved.waitForPublishedCaptureStreamTerminal(later,Cache::HostFenceWaitPolicy::ActiveProgress);
+}
+
+/** @test Both fixed and adaptive branch widths retain the actual complete key. */
+TEST(HostedDeviceGenerationFragment, ExactVerifierIdentityAcrossFixedAndDynamicWidths)
+{
+    std::array<int32_t,16> tokens{},positions{},counts{};
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})for(int width=1;width<=16;++width) {
+        SCOPED_TRACE(width);
+        ForwardGraphSignature signature;
+        signature.device=device;signature.seq_len=width;signature.batch_size=1;signature.decode=true;
+        signature.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        signature.all_position_logits=true;signature.all_position_logit_rows=width;
+        signature.device_token_ids=tokens.data();signature.device_position_ids=positions.data();signature.device_sequence_lengths=counts.data();
+        HostedDeviceGenerationFragment fragment;
+        fragment.kind=HostedDeviceGenerationFragment::Kind::MTPGroupedVerifierReplay;fragment.forward_signature=signature;
+        EXPECT_TRUE(fragment.embedsVerifierForward(signature));
+        auto same=fragment;EXPECT_TRUE(fragment.hasSameExecutionIdentity(same));
+        for(int change=0;change<20;++change) {
+            auto different=signature;
+            switch(change) {
+            case 0:different.seq_len++;break;
+            case 1:different.batch_size++;break;
+            case 2:different.device=DeviceId::cpu();break;
+            case 3:different.execution_role=ForwardExecutionRole::MainInference;break;
+            case 4:different.decode=false;break;
+            case 5:different.device_token_ids=tokens.data()+1;break;
+            case 6:different.device_position_ids=positions.data()+1;break;
+            case 7:different.device_sequence_lengths=counts.data()+1;break;
+            case 8:different.all_position_logits=false;break;
+            case 9:different.all_position_logit_rows++;break;
+            case 10:different.snapshot_configuration_identity++;break;
+            case 11:different.moe_placement_epoch++;break;
+            case 12:different.live_mtp_request_batch_condition=true;break;
+            case 13:different.decode_has_history=true;break;
+            case 14:different.device_request_query_capture_identity++;break;
+            case 15:different.mtp_verifier_outcome_graph_mode=MTPVerifierOutcomeGraphMode::Greedy;break;
+            case 16:different.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;break;
+            case 17:different.state_transaction=ForwardStateTransaction::CommittedMTPCondition;break;
+            case 18:different.position_policy=static_cast<ForwardPositionPolicy>(255);break;
+            case 19:different.pipeline_forward_edges=positions.data();break;
+            }
+            EXPECT_FALSE(fragment.embedsVerifierForward(different))<<change;
+            same.forward_signature=different;EXPECT_FALSE(fragment.hasSameExecutionIdentity(same))<<change;
+        }
+        for(int missing=0;missing<3;++missing) {
+            auto partial=signature;
+            if(missing==0)partial.device_token_ids=nullptr;
+            if(missing==1)partial.device_position_ids=nullptr;
+            if(missing==2)partial.device_sequence_lengths=nullptr;
+            fragment.forward_signature=partial;
+            EXPECT_FALSE(fragment.embedsVerifierForward(partial));
+        }
+        for(int invalid=0;invalid<5;++invalid) {
+            auto incomplete=signature;
+            if(invalid==0)incomplete.execution_role=ForwardExecutionRole::MainInference;
+            if(invalid==1)incomplete.decode=false;
+            if(invalid==2)incomplete.device=DeviceId::cpu();
+            if(invalid==3)incomplete.seq_len=0;
+            if(invalid==4)incomplete.batch_size=0;
+            fragment.forward_signature=incomplete;
+            EXPECT_FALSE(fragment.embedsVerifierForward(incomplete));
+        }
+        fragment.forward_signature=signature;
+        for(const auto kind:{HostedDeviceGenerationFragment::Kind::CapturedLocal,HostedDeviceGenerationFragment::Kind::OrdinaryExpertOverlayReplay,
+            HostedDeviceGenerationFragment::Kind::MTPFullSidecarReplay,HostedDeviceGenerationFragment::Kind::MTPChainedSidecarReplay,
+            HostedDeviceGenerationFragment::Kind::MoEOverlayEpochAcquire,HostedDeviceGenerationFragment::Kind::MoEOverlayEpochRelease}) {
+            fragment.kind=kind;EXPECT_FALSE(fragment.embedsVerifierForward(signature));
+        }
+        fragment.kind=HostedDeviceGenerationFragment::Kind::MTPGroupedVerifierReplay;
+        ComputeGraph foreign_graph;fragment.semantic_graph=&foreign_graph;
+        EXPECT_FALSE(fragment.embedsVerifierForward(signature));
+        fragment.semantic_graph=nullptr;
+        FakeReplayGraphCapture capture(nullptr,false);
+        fragment.capture=&capture;
+        EXPECT_FALSE(fragment.embedsVerifierForward(signature));
+        fragment.capture=nullptr;
+        EXPECT_TRUE(fragment.embedsVerifierForward(signature));
+        auto changed_policy=fragment;
+        changed_policy.execution=DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero;
+        EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
+        changed_policy=fragment;changed_policy.condition_word_device=reinterpret_cast<const std::uint32_t*>(counts.data());
+        EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
+        changed_policy=fragment;changed_policy.minimum_selector=1;
+        EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
+    }
+}
+
+/** @test The ordinary semantic arm requires its original sampler and complete retained key. */
+TEST(HostedDeviceGenerationFragment, OrdinaryForwardRequiresOriginalSamplerAndCompleteKey)
+{
+    std::array<int32_t,2> tokens{},positions{},counts{};
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+    FakeReplayGraphCapture original(nullptr,true),foreign(nullptr,true);
+    ForwardGraphSignature key;key.device=device;key.seq_len=key.batch_size=1;
+    key.decode=true;key.execution_role=ForwardExecutionRole::MainInference;
+    key.device_token_ids=tokens.data();key.device_position_ids=positions.data();
+    HostedDeviceGenerationFragment fragment;
+    fragment.kind=HostedDeviceGenerationFragment::Kind::OrdinaryExpertOverlayReplay;
+    fragment.capture=&original;fragment.forward_signature=key;
+    EXPECT_TRUE(fragment.embedsOrdinaryForward(key,&original));
+    EXPECT_FALSE(fragment.embedsVerifierForward(key));
+    EXPECT_FALSE(fragment.embedsOrdinaryForward(key,nullptr));
+    EXPECT_FALSE(fragment.embedsOrdinaryForward(key,&foreign));
+    auto changed=fragment;changed.capture=&foreign;
+    EXPECT_FALSE(changed.embedsOrdinaryForward(key,&original));
+    ComputeGraph graph;changed=fragment;changed.semantic_graph=&graph;
+    EXPECT_FALSE(changed.embedsOrdinaryForward(key,&original));
+    for(int change=0;change<12;++change) {
+        auto other=key;
+        switch(change) {
+        case 0:other.device_token_ids=tokens.data()+1;break;
+        case 1:other.device_position_ids=positions.data()+1;break;
+        case 2:other.device_sequence_lengths=counts.data();break;
+        case 3:other.seq_len=2;break;
+        case 4:other.batch_size=2;break;
+        case 5:other.decode=false;break;
+        case 6:other.execution_role=ForwardExecutionRole::GroupedMTPVerifier;break;
+        case 7:other.snapshot_configuration_identity++;break;
+        case 8:other.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;break;
+        case 9:other.moe_placement_epoch++;break;
+        case 10:other.device_request_query_capture_identity++;break;
+        case 11:other.live_mtp_request_batch_condition=true;break;
+        }
+        EXPECT_FALSE(fragment.embedsOrdinaryForward(other,&original))<<change;
+    }
+    for(int invalid=0;invalid<7;++invalid) {
+        auto other=key;
+        if(invalid==0)other.device_token_ids=nullptr;
+        if(invalid==1)other.device_position_ids=nullptr;
+        if(invalid==2)other.decode=false;
+        if(invalid==3)other.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        if(invalid==4)other.device=DeviceId::cpu();
+        if(invalid==5)other.seq_len=2;
+        if(invalid==6)other.batch_size=2;
+        changed=fragment;changed.forward_signature=other;
+        EXPECT_FALSE(changed.embedsOrdinaryForward(other,&original));
+    }
+    for(const auto kind:{HostedDeviceGenerationFragment::Kind::CapturedLocal,
+        HostedDeviceGenerationFragment::Kind::MTPGroupedVerifierReplay,HostedDeviceGenerationFragment::Kind::MTPFullSidecarReplay,
+        HostedDeviceGenerationFragment::Kind::MTPChainedSidecarReplay,HostedDeviceGenerationFragment::Kind::MoEOverlayEpochAcquire,
+        HostedDeviceGenerationFragment::Kind::MoEOverlayEpochRelease}) {
+        changed=fragment;changed.kind=kind;
+        EXPECT_FALSE(changed.embedsOrdinaryForward(key,&original));
+    }
+    }
+}
+
+#include "RetainedParticipantAuxiliaryRangeReplay.inc"
+
+/** @test Zero-output condition source identity cannot reuse a one-round serial body. */
+TEST(Test__ForwardGraphSignature, PipelineForwardOnlyHasDistinctZeroRoundSourceAndSharedDiagnosticLane)
+{
+    using namespace llaminar2;
+    ForwardGraphSignature ordinary;
+    ordinary.device = DeviceId::rocm(0); ordinary.decode = true;
+    ordinary.execution_role = ForwardExecutionRole::MainInference;
+    ordinary.state_transaction = ForwardStateTransaction::Ordinary;
+    ordinary.seq_len = ordinary.batch_size = 1;
+    ordinary.snapshot_configuration_identity = 73;
+    auto condition = ordinary;
+    condition.state_transaction = ForwardStateTransaction::ForwardOnlyCondition;
+    EXPECT_NE(condition, ordinary);
+    EXPECT_TRUE(ownsSerialDecodeCommitBoundary(ordinary.execution_role, ForwardExecutionPhase::Decode, ordinary.state_transaction));
+    EXPECT_FALSE(ownsSerialDecodeCommitBoundary(condition.execution_role, ForwardExecutionPhase::Decode, condition.state_transaction));
+    auto prefill = ordinary; prefill.decode = false;
+    EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(condition), graphSnapshotArenaReusePolicyForSignature(prefill));
+    EXPECT_FALSE(graphSnapshotArenaReusePolicyForSignature(ordinary).shared());
 }

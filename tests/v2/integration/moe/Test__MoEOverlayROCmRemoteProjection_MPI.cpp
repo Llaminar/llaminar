@@ -10,6 +10,7 @@
  * lane reuse, and teardown without loading a model.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -97,7 +98,7 @@ namespace llaminar2::test
 
         /** @brief Present the one final CPU allocation as immutable regions. */
         std::array<std::span<const std::uint8_t>, 4> cpuSourceRegions(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &weights)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &weights)
         {
             return {
                 std::span<const std::uint8_t>(
@@ -353,7 +354,7 @@ namespace llaminar2::test
                 q8GpuProjection(1024, 3072, 73u),
                 q8GpuProjection(3072, 1024, 109u),
             };
-        std::array<cpu::native_vnni::CPUNativeVNNIPackedWeights,
+        std::array<cpu::native_quantised::CPUNativeQuantisedPackedWeights,
                    kProjectionCount>
             cpu_weights;
         std::string error;
@@ -424,9 +425,9 @@ namespace llaminar2::test
                                             .allocatePersistentTransferStagingSlices(
                                                 staging_bytes,
                                                 2u * kProjectionCount,
-                                                gpu_device);
-            const auto remote_execution = TransferEngine::instance()
-                                              .allocatePersistentTransferExecutionLanes(
+                                                gpu_device,
+                                                HostTransferAccess::CrossProcessReadable);
+            const auto remote_execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                   2u * kProjectionCount,
                                                   gpu_device,
                                                   "rocm_mpi_remote_projection");
@@ -479,7 +480,7 @@ namespace llaminar2::test
                     descriptor.codebook_id,
                     descriptor.blocks_per_row,
                     gpu_slot_lifetime,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id =
                             expected_gpu[projection].source_codebook_id,
                         .is_superblock =
@@ -504,11 +505,7 @@ namespace llaminar2::test
         {
             MoEOverlayMPIRemoteProjectionTransport transport({
                 .mpi_context = context,
-                .lane_budget = {
-                    .maximum_participants_per_cycle = 2,
-                    .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = kProjectionCount,
-                },
+                .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, kProjectionCount),
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "rocm1_mpi_remote_projection",
             });
@@ -519,7 +516,7 @@ namespace llaminar2::test
             {
                 const std::uint64_t epoch = 1000u + wave_index * 2u;
                 const auto *source_format =
-                    native_vnni_formats::forSourceIdentity(
+                    native_quantised_formats::forSourceIdentity(
                         expected_gpu.front().source_codebook_id,
                         expected_gpu.front().is_superblock);
                 ASSERT_NE(source_format, nullptr);

@@ -18,6 +18,7 @@
 #include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
+#include <map>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -213,6 +214,7 @@ namespace llaminar2
         Disabled = 0,
         DeviceTransferDirectory,
         PhysicalResidencyFabric,
+        NoPeer, ///< Dynamic is retained; singleton geometry owns no movement storage.
     };
 
     /** @return Stable diagnostic name for one migration storage lifecycle. */
@@ -223,6 +225,8 @@ namespace llaminar2
         {
         case MoEOverlayMigrationStorageKind::Disabled:
             return "disabled";
+        case MoEOverlayMigrationStorageKind::NoPeer:
+            return "no_peer";
         case MoEOverlayMigrationStorageKind::DeviceTransferDirectory:
             return "device_transfer_directory";
         case MoEOverlayMigrationStorageKind::PhysicalResidencyFabric:
@@ -296,8 +300,7 @@ namespace llaminar2
         /** @return Whether runtime movement owns any physical storage. */
         [[nodiscard]] constexpr bool migrationEnabled() const noexcept
         {
-            return migration_storage !=
-                   MoEOverlayMigrationStorageKind::Disabled;
+            return usesDeviceTransferDirectory() || usesPhysicalResidencyFabric();
         }
 
         /** @return Whether graph-owned homogeneous GPU directories are selected. */
@@ -393,6 +396,18 @@ namespace llaminar2
         boundParticipants(const MoERoutedExpertPlacementPlan &plan);
 
         /**
+         * @brief Declare the shared original per-GPU movement stream population.
+         * @param plan Original bound tier/participant topology; layers do not multiply pools.
+         * @param world_rank Original physical owner whose local endpoints are selected.
+         * @param maximum_execution_streams Independent streams per actual local participant.
+         * @return GPU-keyed exact pool sizes shared by fixed BOM and native materialization.
+         * @throws std::invalid_argument For invalid rank, zero width or malformed topology.
+         * @throws std::overflow_error For an unrepresentable physical stream count.
+         */
+        [[nodiscard]] static std::map<DeviceId,std::size_t> executionStreamCounts(
+            const MoERoutedExpertPlacementPlan &plan,int world_rank,std::size_t maximum_execution_streams);
+
+        /**
          * @brief Price every persistent staging allocation in the real fabric.
          *
          * Device chunks are charged to their GPU. Pinned chunks and bounded MPI
@@ -402,6 +417,8 @@ namespace llaminar2
          * @param plan Hardware-bound tier/domain topology.
          * @param world_size Exact overlay communicator size.
          * @param policy Migration materialization and chunk policy.
+         * @param original_manifest Complete original source shapes and native formats.
+         * @param original_experts Full original expert axis, never a tier quota.
          * @return Sorted nonzero rank/device staging charges.
          * @throws std::invalid_argument for inconsistent policy/topology.
          * @throws std::overflow_error when the materialized BOM overflows.
@@ -410,7 +427,9 @@ namespace llaminar2
         transferStagingBOM(
             const MoERoutedExpertPlacementPlan &plan,
             int world_size,
-            const MoEOverlayCapacityAdmissionPolicy &policy);
+            const MoEOverlayCapacityAdmissionPolicy &policy,
+            const std::vector<MoEOverlayLayerWeightManifest>& original_manifest,
+            int original_experts);
 
         /**
          * @brief Build the complete pure input consumed by the byte resolver.
@@ -473,6 +492,28 @@ namespace llaminar2
          */
         [[nodiscard]] static std::vector<MoEOverlayResolvedCapacityPlan>
         resolvePipelineCapacity(std::span<const MoEOverlayStageCapacityRequest> stages);
+        /**
+         * @brief Freeze replica/quota decisions without granting materialization.
+         * @param stages Complete authored requests for the higher-priority search.
+         * @return Owned draft, to be admitted once after graph rows and ngram storage are fixed.
+         * @throws MoEOverlayCapacityExhausted For higher-priority capacity pressure only.
+         */
+        static MoEOverlayCapacityDraft resolvePipelineCapacityDraft(
+            std::span<const MoEOverlayStageCapacityRequest> stages);
+        /**
+         * @brief Freeze a standalone overlay's higher-priority quotas and replica grant.
+         * @param plan Exact hardware-bound overlay topology.
+         * @param num_experts Complete model expert count.
+         * @param layer_weight_manifest Original authenticated projection manifest.
+         * @param physical_budgets Complete fixed PMA contributions.
+         * @param policy Exact migration/directory policy.
+         * @return Unadmitted draft, with no table preference participating in quota decisions.
+         */
+        static MoEOverlayCapacityDraft resolveCapacityDraft(
+            const MoERoutedExpertPlacementPlan &plan,int num_experts,
+            const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
+            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
+            const MoEOverlayCapacityAdmissionPolicy &policy = {});
 
         /**
          * @brief Resolve capacity and install its exact quotas into a plan copy.

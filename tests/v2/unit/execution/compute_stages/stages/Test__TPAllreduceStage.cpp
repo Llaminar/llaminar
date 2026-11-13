@@ -985,3 +985,108 @@ TEST_F(Test__TPAllreduceStage, GraphConstructionRecordsBillOfMaterials)
 
     PerfStatsCollector::reset();
 }
+
+/** @test A canonical single request lowers without changing native count or receipt ownership. */
+TEST_F(Test__TPAllreduceStage, CanonicalSingleRequestLowersToExactLiveBank)
+{
+    std::int32_t count = 3;
+    unsigned long long receipt = 0;
+    TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.tensor = test_tensor_.get();
+    params.count = 4 * 128;
+    params.sideband_device_index = 0;
+    params.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+    params.request_rows = NativeAllreduceRequestRows(1, 4, 128, &count).withPayloadReceipt(&receipt);
+    TPAllreduceStage stage(params);
+    const auto &actual = stage.params();
+    EXPECT_FALSE(actual.request_rows.has_value());
+    ASSERT_TRUE(actual.live_rows.has_value());
+    EXPECT_EQ(actual.arithmetic_policy, TPAllreduceArithmeticPolicy::CanonicalRankOrder);
+    EXPECT_EQ(actual.live_rows->rows().countOwner(), &count);
+    EXPECT_EQ(actual.live_rows->rows().capacity(), 4);
+    EXPECT_EQ(actual.live_rows->elementsPerRow(), 128u);
+    EXPECT_EQ(actual.live_rows->bankElements(), params.count);
+    EXPECT_EQ(actual.live_rows->payloadReceipt(), &receipt);
+    EXPECT_TRUE(params.request_rows.has_value()) << "Construction must not mutate the caller's declaration";
+}
+
+/** @test Unsupported banks and malformed row/participant declarations reject before execution. */
+TEST_F(Test__TPAllreduceStage, CanonicalSingleRequestRejectsInvalidDeclarations)
+{
+    std::int32_t counts[2] = {1, 2};
+    TPAllreduceStage::Params valid;
+    valid.device_id = DeviceId::rocm(0);
+    valid.tensor = test_tensor_.get();
+    valid.count = 4 * 128;
+    valid.sideband_device_index = 0;
+    valid.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+    valid.request_rows = NativeAllreduceRequestRows(1, 4, 128, counts);
+    auto invalid = valid;
+    invalid.request_rows = NativeAllreduceRequestRows(2, 2, 128, counts);
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+    invalid = valid;
+    invalid.count = 0;
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+    invalid = valid;
+    invalid.count -= 1;
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+    invalid = valid;
+    invalid.device_id = DeviceId::cpu();
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+    invalid = valid;
+    invalid.sideband_device_index = -1;
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+    invalid = valid;
+    invalid.live_rows = valid.request_rows->requestRows(0);
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+    invalid = valid;
+    invalid.sideband_workspace_bindings.resize(1);
+    EXPECT_THROW({ TPAllreduceStage stage(invalid); }, std::invalid_argument);
+}
+
+/** @test Rebinding shares constructor normalization and commits no partial state on failure. */
+TEST_F(Test__TPAllreduceStage, CanonicalSingleRequestRebindNormalizesAndRejectsTransactionally)
+{
+    std::int32_t counts[2] = {4, 2};
+    unsigned long long receipts[2] = {};
+    TPAllreduceStage::Params initial;
+    initial.device_id = DeviceId::rocm(0);
+    initial.tensor = test_tensor_.get();
+    initial.count = 4 * 128;
+    initial.sideband_device_index = 0;
+    initial.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+    initial.request_rows = NativeAllreduceRequestRows(1, 4, 128, counts).withPayloadReceipt(receipts);
+    TPAllreduceStage stage(initial);
+    auto replacement = initial;
+    replacement.stage_name = "rebound";
+    replacement.count = 3 * 128;
+    replacement.request_rows = NativeAllreduceRequestRows(1, 3, 128, counts + 1).withPayloadReceipt(receipts + 1);
+    stage.setParams(replacement);
+    const auto verify = [&] {
+        const auto &actual = stage.params();
+        EXPECT_FALSE(actual.request_rows.has_value());
+        ASSERT_TRUE(actual.live_rows.has_value());
+        EXPECT_EQ(actual.live_rows->rows().countOwner(), counts + 1);
+        EXPECT_EQ(actual.live_rows->rows().capacity(), 3);
+        EXPECT_EQ(actual.live_rows->elementsPerRow(), 128u);
+        EXPECT_EQ(actual.live_rows->bankElements(), 3u * 128);
+        EXPECT_EQ(actual.live_rows->payloadReceipt(), receipts + 1);
+        EXPECT_EQ(actual.tensor, test_tensor_.get());
+        EXPECT_EQ(actual.count, 3u * 128);
+        EXPECT_EQ(actual.stage_name, "rebound");
+        EXPECT_EQ(actual.arithmetic_policy, TPAllreduceArithmeticPolicy::CanonicalRankOrder);
+    };
+    verify();
+    auto invalid = replacement;
+    invalid.stage_name = "must_not_commit";
+    invalid.request_rows = NativeAllreduceRequestRows(2, 3, 64, counts);
+    EXPECT_THROW(stage.setParams(invalid), std::invalid_argument);
+    verify();
+    invalid = replacement;
+    invalid.stage_name = "bad_count_must_not_commit";
+    --invalid.count;
+    EXPECT_THROW(stage.setParams(invalid), std::invalid_argument);
+    verify();
+    EXPECT_TRUE(replacement.request_rows.has_value());
+}

@@ -455,11 +455,7 @@ namespace llaminar2::test
                         continue;
                     for (std::uint32_t layer = 0u; layer < kLayers; ++layer)
                     {
-                        migration->costs.push_back({
-                            .source_participant = static_cast<int>(source),
-                            .destination_participant =
-                                static_cast<int>(destination),
-                            .layer = static_cast<int>(layer),
+                        migration->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(static_cast<int>(source)), .destination_target = MoEOverlayRouteTarget::whole(static_cast<int>(destination)), .layer = static_cast<int>(layer)},
                             .transfer_and_repack_ns = 1u,
                             .inference_interference_ns = 0u,
                         });

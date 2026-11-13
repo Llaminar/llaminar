@@ -176,8 +176,22 @@ namespace llaminar2
                 if (const auto *scatter = std::get_if<TPColumnReduceScatterStage>(&operation_))
                     scatter->validateEnqueue(execution);
                 void *const main_stream = execution.nativeStream();
+                // The same ready event acquires every explicit read-only operand.
+                ITensor *companion = nullptr;
+                ITensor *observation = nullptr;
+                if (const auto *gather = std::get_if<Gather>(&operation_)) {
+                    const auto buffers=(*gather)->exchangeBuffers();
+                    companion=buffers.companion_input;observation=buffers.observation_inout;
+                }
+                if(observation && !companion)
+                    throw std::logic_error("Observed native exchange requires its explicit count companion");
+                const auto sources = observation
+                    ? DeviceTransferForkSources::withCompanionAndObservation(*input(),*companion,*observation)
+                    : companion
+                    ? DeviceTransferForkSources::withCompanion(*input(), *companion)
+                    : DeviceTransferForkSources::single(*input());
                 const auto fork = TransferEngine::instance().recordDeviceInputFork(
-                    input(), device(), main_stream, events_->ready);
+                    sources, device(), main_stream, events_->ready);
                 const auto acquired = TransferEngine::instance().acquireDeviceInputFork(
                     fork, events_->stream);
                 if (!input()->gpu_data_ptr() || (output() && !output()->gpu_data_ptr()))
@@ -217,6 +231,8 @@ namespace llaminar2
                          .waitEventChecked(events_->complete, execution.nativeStream()))
                     throw std::runtime_error("LocalTP reduce overlap completion wait failed");
                 if (output()) execution.publish(output());
+                if(const auto *gather=std::get_if<Gather>(&operation_))
+                    if(auto *observation=(*gather)->exchangeBuffers().observation_inout)execution.publish(observation);
                 if (const auto *scatter = std::get_if<TPColumnReduceScatterStage>(&operation_))
                     execution.publish(scatter->params().packing);
                 phase_ = Phase::Joined;
@@ -265,6 +281,9 @@ namespace llaminar2
             /** @return Diagnostic role, independent of model-specific node names. */
             std::string name() const override
             { return transaction_->stageName() + (edge_ == ReduceEdge::Submit ? "_submit" : ""); }
+            /** @return The retained operation's complete immutable capture identity. */
+            std::uint64_t graphCaptureVariantSignature() const override
+            { return transaction_->operation().graphCaptureVariantSignature(); }
             /** @return Both edges belong to the native collective transaction. */
             bool requiresAllreduce() const override { return true; }
             /** @return Native backend support inherited from the reduction contract. */
@@ -298,7 +317,17 @@ namespace llaminar2
             StageBufferContract bufferContract() const override
             {
                 if (edge_ == ReduceEdge::Join) return transaction_->operation().bufferContract();
-                return StageBufferContract::build().addInput(transaction_->inputId());
+                auto contract = transaction_->operation().bufferContract();
+                // Preserve graph-produced counts through the fork-to-join lifetime.
+                // The auxiliary writer reads the prior receipt total. Keep its
+                // original owner live/readable at submit; only the join declares
+                // and publishes the mutation after the exact completion event.
+                for(const auto &binding:contract.inouts)contract.addInput(binding.id,binding.dtype);
+                contract.outputs.clear(); contract.inouts.clear();
+                if (std::none_of(contract.inputs.begin(), contract.inputs.end(), [&](const auto &binding) {
+                        return binding.id == transaction_->inputId(); }))
+                    contract.addInput(transaction_->inputId());
+                return contract;
             }
             /** @return Original tensor geometry, including the canonical fold's exact row bank. */
             StageBufferRequirements getBufferRequirements() const override
@@ -454,7 +483,11 @@ namespace llaminar2
         const auto contract = compute->stage->bufferContract();
         const auto aliases = [&](const auto &bindings) {
             return std::any_of(bindings.begin(), bindings.end(), [&](const auto &binding) {
-                return binding.id == buffers.input_id || binding.id == buffers.output_id;
+                if (binding.id == buffers.input_id || binding.id == buffers.output_id) return true;
+                const auto operation_contract=operation->bufferContract();
+                const auto aliases=[&](const auto &accesses) {return std::any_of(accesses.begin(),accesses.end(),
+                    [&](const auto &access){return binding.id==access.id;});};
+                return aliases(operation_contract.inputs) || aliases(operation_contract.inouts);
             });
         };
         std::unordered_set<std::string> visited;

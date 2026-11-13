@@ -1,491 +1,253 @@
 /**
  * @file Test__WeightManagerCpuHostRelease.cpp
- * @brief Unit tests for CPU binding-driven host data release after VNNI packing
+ * @brief Actual bounded source retirement and final CPU consumer lifetime contracts.
  *
- * Tests verify the fix in prepareWeightsForDevice(frozen_weights, cpu_device):
- * After binding-driven CPU GEMM preparation completes, quantized TensorSlice
- * weights (IINT8Unpackable) have their raw data released, while FP32 tensors,
- * embeddings, norms, biases, non-2D tensors, and non-prepared bindings are
- * retained.
- *
- * This locks in the fix that saves ~7.5 GB per MPI rank by releasing the
- * original Q4_K/Q5_K/Q6_K TensorSlice heap data after VNNI packing.
+ * The original source is a genuine tensor-backed reader. Every final consumer
+ * is declared before admission and committed through WeightManager/Store. Native
+ * GEMMs retain only their packed root; floating GEMMs, embeddings, norms and
+ * biases retain their actual final readable root. No placeholder prepared
+ * reference or synthetic full-parent pointer authorizes source retirement.
  */
-
 #include <gtest/gtest.h>
-#include <memory>
-
+#include <cstring>
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
-#include "tensors/Tensors.h"
-#include "tensors/TensorSlice.h"
 #include "mocks/MockModelLoader.h"
-
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 using namespace llaminar2;
 using namespace llaminar2::test;
 
-// ============================================================================
-// Helper: Build a WeightBinding for a given tensor
-// ============================================================================
-
-namespace
-{
-    /// @brief Create a WeightBinding for test purposes with specified role and prepared state.
-    WeightBinding makeBinding(
-        uint64_t id,
-        TensorBase *tensor,
-        const std::string &name,
-        WeightRole role,
-        int layer,
-        DeviceId device,
-        bool mark_prepared)
-    {
-        WeightBinding binding;
-        binding.binding_id = id;
-        binding.tensor = tensor;
-        binding.identity.canonical_name = name;
-        binding.identity.role = role;
-        binding.identity.layer = layer;
-        binding.residency.home_device = device;
-        if (mark_prepared)
-        {
-            PreparedWeightRef ref;
-            ref.binding_id = id;
-            ref.kind = PreparedWeightKind::CpuPackedGemm;
-            ref.device = device;
-            binding.prepared = ref;
-        }
-        return binding;
-    }
-
-    /// @brief Wrap a tensor in a TensorSlice with column-parallel metadata.
-    std::shared_ptr<TensorSlice> wrapInSlice(
-        std::shared_ptr<TensorBase> inner,
-        size_t original_rows, size_t original_cols)
-    {
-        auto meta = SliceMetadata::forColumnParallel(
-            original_rows, original_cols, /*rank=*/0, /*world_size=*/2, /*inner_is_presliced=*/true);
-        return std::make_shared<TensorSlice>(std::move(inner), meta);
-    }
-} // namespace
-
-// ============================================================================
-// TestableWeightManager — opens lifecycle gates and pre-registers prepared state
-// ============================================================================
-
-class TestableCpuReleaseWeightManager : public WeightManager
-{
-public:
-    TestableCpuReleaseWeightManager(IModelLoader &loader)
-        : WeightManager(loader, nullptr, nullptr,
-                        WeightDistributionStrategy::REPLICATED,
-                        WeightPrecision::NATIVE)
-    {
-        markMaterializationComplete();
-    }
-
-    /// Pre-register a binding in the PreparedWeightStore so that
-    /// prepareWeightsForDevice skips actual GEMM packing but still
-    /// runs the release loop.
-    void preRegisterPrepared(const WeightBinding &binding, DeviceId device)
-    {
-        auto store = preparedWeightStore();
-        store->registerPreparedForTest(binding, PreparedWeightKind::CpuPackedGemm, device);
-    }
-};
-
-// ============================================================================
-// Test Fixture
-// ============================================================================
-
-class Test__WeightManagerCpuHostRelease : public ::testing::Test
-{
+/** @brief Original source and immutable admission used by each complete CPU population. */
+class Test__WeightManagerCpuHostRelease : public ::testing::Test {
 protected:
-    void SetUp() override
-    {
-        mock_loader_ = MockModelLoader::createMinimal();
+    /** @brief Initialize only the CPU backend used by actual final consumers. */
+    void SetUp() override {if(!hasCPUBackend())initCPUBackend(-1);}
+    std::shared_ptr<MockModelLoader> loader=MockModelLoader::createMinimal();
+    /**
+     * @brief Declare an original source rectangle without loading its parent.
+     * @param name Canonical original weight name.
+     * @param role Intended final CPU consumer.
+     * @param rows Selected source rows, or zero for the complete original tensor.
+     * @return Requirement retaining the original source geometry and consumer.
+     */
+    WeightRequirement request(std::string name,WeightRole role,size_t rows=0) {
+        WeightRequirement value;value.canonical_name=std::move(name);value.role=role;
+        value.layer=inferWeightLayer(value.canonical_name);value.target_device=DeviceId::cpu();
+        if(rows) {value.derivation=WeightDerivationKind::RowSlice;value.slice.row_count=rows;
+            value.slice.inner_is_presliced=true;}
+        if(role==WeightRole::Other)value.expected_prepared_kind=PreparedWeightKind::CPUResidentTensor;
+        return value;
     }
-
-    std::shared_ptr<MockModelLoader> mock_loader_;
+    /**
+     * @brief Commit declared final owners under their actual memory authority.
+     * @param manager Production loader and Store receiving the original plan.
+     * @param requests Complete consumer requirements to admit before population.
+     * @return Frozen original bindings to the committed final CPU owners.
+     */
+    FrozenModelWeightSet populate(WeightManager& manager,std::vector<WeightRequirement> requests) {
+        InferenceStrategy original;original.model_id={98504};original.devices={DeviceId::cpu()};
+        WeightPlan plan(original);for(auto& value:requests)plan.add(std::move(value));
+        if(!manager.preparedWeightStore()->bindModelIdIfUnset(original.model_id))
+            throw std::logic_error("CPU lifetime fixture changed model authority");
+        admitCPUWeightPlansForTest(manager,*loader,{&plan});
+        return manager.materialize(plan);
+    }
+    /**
+     * @brief Verify real execution after original source payload retirement.
+     * @param manager Production Store retaining the prepared consumer.
+     * @param binding Original committed CPU binding being exercised.
+     * @param source_name Original input payload to release before repeat execution.
+     */
+    void proveEngineLifetime(WeightManager& manager,const WeightBinding& binding,const std::string& source_name) {
+        ASSERT_TRUE(binding.prepared);
+        auto engine=manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared);
+        ASSERT_TRUE(engine);ASSERT_TRUE(engine->weights_converted());
+        const int n=int(binding.tensor->shape()[0]),k=int(binding.tensor->shape()[1]);
+        CPUProjectionTestWorkspace workspace(1,k,cpuProjectionTestRequirements(1,{engine.get()}));
+        FP32Tensor input({1,size_t(k)}),before({1,size_t(n)}),after({1,size_t(n)});
+        std::fill_n(input.mutable_data(),k,0.25f);
+        ASSERT_TRUE(engine->multiply_tensor(&input,&before,1,n,k,true,1.f,0.f,nullptr,nullptr,-1,workspace.get()));
+        auto original=loader->loadTensor(source_name);ASSERT_TRUE(original);
+        original->release_host_weight_data();ASSERT_TRUE(original->is_raw_data_released());
+        const auto reads=loader->nativeSourceReadCallCount();
+        manager.clearCache();
+        ASSERT_TRUE(engine->multiply_tensor(&input,&after,1,n,k,true,1.f,0.f,nullptr,nullptr,-1,workspace.get()));
+        EXPECT_EQ(std::memcmp(before.data(),after.data(),size_t(n)*sizeof(float)),0);
+        EXPECT_EQ(loader->nativeSourceReadCallCount(),reads);
+    }
 };
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-TEST_F(Test__WeightManagerCpuHostRelease, ReleasesQuantizedTensorSliceAfterCpuPreparation)
-{
-    // A Q4_0 TensorSlice that is IINT8Unpackable should have its raw data
-    // released after CPU binding-driven preparation.
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    // Create a Q4_0 tensor wrapped in TensorSlice (mimics TP=2 sharding)
-    mock_loader_->addQ4_0RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    ASSERT_NE(inner, nullptr);
-    auto sliced = wrapInSlice(inner, 256, 64);
-
-    // Verify it IS IINT8Unpackable (prerequisite for the fix)
-    ASSERT_NE(dynamic_cast<IINT8Unpackable *>(sliced.get()), nullptr);
-    ASSERT_FALSE(sliced->is_raw_data_released());
-
-    // Build a FrozenModelWeightSet with this binding marked as prepared
-    auto binding = makeBinding(1, sliced.get(), "blk.0.attn_q.weight",
-                               WeightRole::AttentionQ, 0, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    strategy.mode = WeightInferenceMode::Unknown;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    // Act: this should release the raw data after "preparation"
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // Assert: raw data was released
-    EXPECT_TRUE(sliced->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, ReleasesQuantizedTensorSliceAfterCpuPreparation) {
+    loader->addQ4_0RandomTensor("blk.0.attn_q.weight",{256,64});
+    WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.weight",WeightRole::AttentionQ,128)});
+    ASSERT_EQ(frozen.bindings().size(),1u);const auto& binding=frozen.bindings().front();
+    ASSERT_TRUE(binding.native_source);EXPECT_EQ(binding.native_source->original.original_shape,(std::vector<size_t>{64,256}));
+    EXPECT_EQ(binding.native_source->range.rows,128u);
+    EXPECT_EQ(binding.tensor->shape(),(std::vector<size_t>{128,64}));
+    EXPECT_TRUE(binding.tensor->is_raw_data_released());EXPECT_EQ(binding.tensor->raw_data(),nullptr);
+    const auto reads=loader->nativeSourceReadCallCount();
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),reads);
+    proveEngineLifetime(manager,binding,"blk.0.attn_q.weight");
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, RetainsFP32TensorAfterCpuPreparation)
-{
-    // FP32 tensors do NOT implement IINT8Unpackable → should be retained
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addFP32RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto fp32_tensor = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    ASSERT_NE(fp32_tensor, nullptr);
-
-    // FP32Tensor is NOT IINT8Unpackable
-    ASSERT_EQ(dynamic_cast<IINT8Unpackable *>(fp32_tensor.get()), nullptr);
-
-    auto binding = makeBinding(1, fp32_tensor.get(), "blk.0.attn_q.weight",
-                               WeightRole::AttentionQ, 0, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // FP32 should NOT be released (dynamic_cast<IINT8Unpackable*> fails)
-    EXPECT_FALSE(fp32_tensor->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, RetainsFP32TensorAfterCpuPreparation) {
+    loader->addFP32RandomTensor("blk.0.attn_output.weight",{64,128});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_output.weight",WeightRole::AttentionWO)});
+    const auto& binding=frozen.bindings().front();ASSERT_TRUE(binding.tensor->raw_data());
+    const auto* root=binding.tensor->raw_data();ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    EXPECT_FALSE(binding.tensor->is_raw_data_released());EXPECT_EQ(binding.tensor->raw_data(),root);
+    proveEngineLifetime(manager,binding,"blk.0.attn_output.weight");
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, RetainsFP32TensorSliceAfterCpuPreparation)
-{
-    // TensorSlice forwards IINT8Unpackable, so FP32 slices must be identified
-    // by missing VNNI format metadata rather than by dynamic_cast alone.
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addFP32RandomTensor("blk.0.gdn_alpha_proj.weight", {24, 64});
-    auto fp32_inner = mock_loader_->loadTensor("blk.0.gdn_alpha_proj.weight");
-    ASSERT_NE(fp32_inner, nullptr);
-    auto fp32_sliced = wrapInSlice(fp32_inner, 48, 64);
-
-    auto *unpackable = dynamic_cast<IINT8Unpackable *>(fp32_sliced.get());
-    ASSERT_NE(unpackable, nullptr);
-    ASSERT_EQ(unpackable->vnniFormatInfo(), nullptr);
-
-    auto binding = makeBinding(1, fp32_sliced.get(), "blk.0.gdn_alpha_proj.weight",
-                               WeightRole::Other, 0, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    EXPECT_FALSE(fp32_sliced->is_raw_data_released());
-    EXPECT_NE(fp32_sliced->data(), nullptr);
+TEST_F(Test__WeightManagerCpuHostRelease, RetainsFP32TensorSliceAfterCpuPreparation) {
+    loader->addFP32RandomTensor("blk.0.attn_q.weight",{48,64});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.weight",WeightRole::AttentionQ,24)});
+    const auto& binding=frozen.bindings().front();EXPECT_EQ(binding.tensor->shape(),(std::vector<size_t>{24,64}));
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    EXPECT_FALSE(binding.tensor->is_raw_data_released());ASSERT_TRUE(binding.tensor->raw_data());
+    proveEngineLifetime(manager,binding,"blk.0.attn_q.weight");
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, RetainsEmbeddingWeightAfterCpuPreparation)
-{
-    // Embedding role weights should be skipped regardless of tensor type
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addQ4_0RandomTensor("token_embd.weight", {128, 64});
-    auto inner = mock_loader_->loadTensor("token_embd.weight");
-    auto sliced = wrapInSlice(inner, 256, 64);
-
-    // It IS IINT8Unpackable, but the Embedding role should protect it
-    ASSERT_NE(dynamic_cast<IINT8Unpackable *>(sliced.get()), nullptr);
-
-    auto binding = makeBinding(1, sliced.get(), "token_embd.weight",
-                               WeightRole::Embedding, -1, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // Embedding should NOT be released
-    EXPECT_FALSE(sliced->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, RetainsEmbeddingWeightAfterCpuPreparation) {
+    loader->addQ4_0RandomTensor("token_embd.weight",{256,64});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("token_embd.weight",WeightRole::Embedding,128)});
+    const auto& binding=frozen.bindings().front();const auto* root=binding.tensor->raw_data();ASSERT_TRUE(root);
+    const auto ref=manager.preparedWeightStore()->prepareEmbedding(binding,64);
+    ASSERT_TRUE(manager.preparedWeightStore()->embeddingHandle(ref));
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    EXPECT_EQ(binding.tensor->raw_data(),root);EXPECT_FALSE(binding.tensor->is_raw_data_released());
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, RetainsNormWeightAfterCpuPreparation)
-{
-    // Norm role weights should be skipped
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addFP32RandomTensor("blk.0.attn_norm.weight", {128});
-    auto norm = mock_loader_->loadTensor("blk.0.attn_norm.weight");
-    ASSERT_NE(norm, nullptr);
-
-    // 1D tensor — the shape().size() != 2 check should also skip it
-    auto binding = makeBinding(1, norm.get(), "blk.0.attn_norm.weight",
-                               WeightRole::Norm, 0, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    EXPECT_FALSE(norm->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, RetainsNormWeightAfterCpuPreparation) {
+    loader->addFP32RandomTensor("blk.0.attn_norm.weight",{128});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_norm.weight",WeightRole::Norm)});
+    const auto& binding=frozen.bindings().front();const auto* root=binding.tensor->raw_data();ASSERT_TRUE(root);
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    EXPECT_EQ(binding.tensor->raw_data(),root);EXPECT_FALSE(binding.tensor->is_raw_data_released());
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, SkipsBindingsWithoutPreparedField)
-{
-    // Bindings without prepared field should not trigger release
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addQ4_0RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    auto sliced = wrapInSlice(inner, 256, 64);
-
-    // No prepared field (mark_prepared=false)
-    auto binding = makeBinding(1, sliced.get(), "blk.0.attn_q.weight",
-                               WeightRole::AttentionQ, 0, cpu, /*mark_prepared=*/false);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // Should NOT be released — binding has no prepared state
-    EXPECT_FALSE(sliced->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, SkipsBindingsWithoutPreparedField) {
+    loader->addQ4_0RandomTensor("blk.0.attn_q.weight",{256,64});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.weight",WeightRole::AttentionQ,128)});
+    const auto original=frozen.bindings().front();auto missing=original;missing.prepared.reset();
+    FrozenModelWeightSet descriptor(frozen.strategy(),{missing});
+    // Removing a descriptor's ref does not revoke its actual committed Store owner or reload its source.
+    const auto reads=loader->nativeSourceReadCallCount();
+    ASSERT_TRUE(manager.prepareWeightsForDevice(descriptor,DeviceId::cpu()));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),reads);
+    EXPECT_EQ(manager.preparedWeightStore()->gemmKernelLifetime(*original.prepared).get(),
+        manager.preparedWeightStore()->gemmKernelLifetime(*frozen.bindings().front().prepared).get());
+    EXPECT_TRUE(original.tensor->is_raw_data_released());
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, SkipsBindingsPreparedForDifferentDevice)
-{
-    // Bindings prepared for a different device (e.g., cuda:0) should not be
-    // released when preparing for CPU
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-    DeviceId cuda0 = DeviceId::cuda(0);
-
-    mock_loader_->addQ4_0RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    auto sliced = wrapInSlice(inner, 256, 64);
-
-    // Prepared for cuda:0, not cpu
-    auto binding = makeBinding(1, sliced.get(), "blk.0.attn_q.weight",
-                               WeightRole::AttentionQ, 0, cuda0, /*mark_prepared=*/true);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // Should NOT be released — binding is for cuda:0, we prepared for cpu
-    EXPECT_FALSE(sliced->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, SkipsBindingsPreparedForDifferentDevice) {
+    loader->addQ4_0RandomTensor("blk.0.attn_q.weight",{128,64});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.weight",WeightRole::AttentionQ)});
+    const auto& binding=frozen.bindings().front();const auto ref=*binding.prepared;
+    const auto reads=loader->nativeSourceReadCallCount();
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId(DeviceType::CPU,1)));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),reads);
+    EXPECT_TRUE(manager.preparedWeightStore()->gemmKernelLifetime(ref));
+    EXPECT_FALSE(manager.preparedWeightStore()->preparedRefForBinding(binding.binding_id,DeviceId(DeviceType::CPU,1),PreparedWeightKind::CpuPackedGemm));
 }
-
-TEST_F(Test__WeightManagerCpuHostRelease, MixedBindingsReleasesOnlyQuantized)
-{
-    // Multiple bindings: quantized Q4_0 (released), FP32 (retained),
-    // embedding (retained), norm 1D (retained)
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    // Quantized 2D GEMM weight → should be released
-    mock_loader_->addQ4_0RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto q4_inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    auto q4_sliced = wrapInSlice(q4_inner, 256, 64);
-
-    // Another quantized 2D GEMM weight → should be released
-    mock_loader_->addQ4_0RandomTensor("blk.0.ffn_gate.weight", {256, 64});
-    auto gate_inner = mock_loader_->loadTensor("blk.0.ffn_gate.weight");
-    auto gate_sliced = wrapInSlice(gate_inner, 512, 64);
-
-    // FP32 2D GEMM weight → should be retained
-    mock_loader_->addFP32RandomTensor("blk.0.attn_output.weight", {64, 128});
-    auto fp32_tensor = mock_loader_->loadTensor("blk.0.attn_output.weight");
-
-    // Quantized embedding → should be retained (Embedding role)
-    mock_loader_->addQ4_0RandomTensor("token_embd.weight", {128, 64});
-    auto embd_inner = mock_loader_->loadTensor("token_embd.weight");
-    auto embd_sliced = wrapInSlice(embd_inner, 256, 64);
-
-    std::vector<WeightBinding> bindings;
-    bindings.push_back(makeBinding(1, q4_sliced.get(), "blk.0.attn_q.weight",
-                                   WeightRole::AttentionQ, 0, cpu, true));
-    bindings.push_back(makeBinding(2, gate_sliced.get(), "blk.0.ffn_gate.weight",
-                                   WeightRole::FFNGate, 0, cpu, true));
-    bindings.push_back(makeBinding(3, fp32_tensor.get(), "blk.0.attn_output.weight",
-                                   WeightRole::AttentionWO, 0, cpu, true));
-    bindings.push_back(makeBinding(4, embd_sliced.get(), "token_embd.weight",
-                                   WeightRole::Embedding, -1, cpu, true));
-
-    // Pre-register all as prepared so actual packing is skipped
-    for (const auto &b : bindings)
-        wm.preRegisterPrepared(b, cpu);
-
-    InferenceStrategy strategy;
-    FrozenModelWeightSet frozen(strategy, bindings);
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // Quantized GEMM weights: released
-    EXPECT_TRUE(q4_sliced->is_raw_data_released());
-    EXPECT_TRUE(gate_sliced->is_raw_data_released());
-
-    // FP32 GEMM weight: retained (not IINT8Unpackable)
-    EXPECT_FALSE(fp32_tensor->is_raw_data_released());
-
-    // Quantized Embedding: retained (Embedding role)
-    EXPECT_FALSE(embd_sliced->is_raw_data_released());
-}
-
-TEST_F(Test__WeightManagerCpuHostRelease, RetainsBiasWeightAfterCpuPreparation)
-{
-    // Bias role weights should be skipped
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addFP32RandomTensor("blk.0.attn_q.bias", {128, 64});
-    auto bias = mock_loader_->loadTensor("blk.0.attn_q.bias");
-    ASSERT_NE(bias, nullptr);
-
-    auto binding = makeBinding(1, bias.get(), "blk.0.attn_q.bias",
-                               WeightRole::Bias, 0, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    EXPECT_FALSE(bias->is_raw_data_released());
-}
-
-TEST_F(Test__WeightManagerCpuHostRelease, Skips1DTensorAfterCpuPreparation)
-{
-    // 1D tensors (shape().size() != 2) should be skipped
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addFP32RandomTensor("blk.0.some_1d.weight", {128});
-    auto tensor_1d = mock_loader_->loadTensor("blk.0.some_1d.weight");
-    ASSERT_NE(tensor_1d, nullptr);
-    ASSERT_EQ(tensor_1d->shape().size(), 1u);
-
-    auto binding = makeBinding(1, tensor_1d.get(), "blk.0.some_1d.weight",
-                               WeightRole::Other, 0, cpu, /*mark_prepared=*/true);
-    wm.preRegisterPrepared(binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    EXPECT_FALSE(tensor_1d->is_raw_data_released());
-}
-
-TEST_F(Test__WeightManagerCpuHostRelease, ReleasesMultipleLayersQuantizedWeights)
-{
-    // Multiple layers with quantized weights should all be released
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    std::vector<std::shared_ptr<TensorSlice>> slices;
-    std::vector<WeightBinding> bindings;
-
-    for (int layer = 0; layer < 4; ++layer)
-    {
-        std::string name = "blk." + std::to_string(layer) + ".attn_q.weight";
-        mock_loader_->addQ4_0RandomTensor(name, {128, 64});
-        auto inner = mock_loader_->loadTensor(name);
-        auto sliced = wrapInSlice(inner, 256, 64);
-        slices.push_back(sliced);
-
-        auto binding = makeBinding(
-            static_cast<uint64_t>(layer + 1), sliced.get(), name,
-            WeightRole::AttentionQ, layer, cpu, true);
-        bindings.push_back(binding);
-    }
-
-    for (const auto &b : bindings)
-        wm.preRegisterPrepared(b, cpu);
-
-    InferenceStrategy strategy;
-    FrozenModelWeightSet frozen(strategy, bindings);
-
-    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
-    ASSERT_TRUE(ok);
-
-    // All 4 layers should have raw data released
-    for (int i = 0; i < 4; ++i)
-    {
-        EXPECT_TRUE(slices[i]->is_raw_data_released())
-            << "Layer " << i << " quantized weight should be released";
+TEST_F(Test__WeightManagerCpuHostRelease, MixedBindingsReleasesOnlyQuantized) {
+    loader->addQ4_0RandomTensor("blk.0.attn_q.weight",{256,64});
+    loader->addQ4_0RandomTensor("blk.0.ffn_gate.weight",{512,64});
+    loader->addFP32RandomTensor("blk.0.attn_output.weight",{64,128});
+    loader->addQ4_0RandomTensor("token_embd.weight",{256,64});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.weight",WeightRole::AttentionQ,128),
+        request("blk.0.ffn_gate.weight",WeightRole::FFNGate,256),request("blk.0.attn_output.weight",WeightRole::AttentionWO),
+        request("token_embd.weight",WeightRole::Embedding,128)});
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    for(const auto& binding:frozen.bindings()) {
+        const bool packed=binding.identity.role==WeightRole::AttentionQ || binding.identity.role==WeightRole::FFNGate;
+        EXPECT_EQ(binding.tensor->is_raw_data_released(),packed);
+        EXPECT_EQ(binding.tensor->raw_data()==nullptr,packed);
+        if(packed)proveEngineLifetime(manager,binding,binding.identity.canonical_name);
     }
 }
+TEST_F(Test__WeightManagerCpuHostRelease, RetainsBiasWeightAfterCpuPreparation) {
+    loader->addFP32RandomTensor("blk.0.attn_q.bias",{128});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.bias",WeightRole::Bias)});
+    const auto& binding=frozen.bindings().front();ASSERT_TRUE(binding.tensor->raw_data());
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));EXPECT_FALSE(binding.tensor->is_raw_data_released());
+}
+TEST_F(Test__WeightManagerCpuHostRelease, Skips1DTensorAfterCpuPreparation) {
+    loader->addFP32RandomTensor("blk.0.some_1d.weight",{128});WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.some_1d.weight",WeightRole::Other)});
+    const auto& binding=frozen.bindings().front();ASSERT_TRUE(binding.prepared);
+    EXPECT_EQ(binding.prepared->kind,PreparedWeightKind::CPUResidentTensor);
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));EXPECT_FALSE(binding.tensor->is_raw_data_released());
+    EXPECT_EQ(manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared),nullptr);
+}
+TEST_F(Test__WeightManagerCpuHostRelease, ReleasesMultipleLayersQuantizedWeights) {
+    std::vector<WeightRequirement> requests;
+    for(int layer=0;layer<4;++layer) {const auto name="blk."+std::to_string(layer)+".attn_q.weight";
+        loader->addQ4_0RandomTensor(name,{256,64});requests.push_back(request(name,WeightRole::AttentionQ,128));}
+    WeightManager manager(*loader);auto frozen=populate(manager,std::move(requests));
+    ASSERT_EQ(frozen.bindings().size(),4u);ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu()));
+    for(const auto& binding:frozen.bindings()) {EXPECT_TRUE(binding.tensor->is_raw_data_released());
+        proveEngineLifetime(manager,binding,binding.identity.canonical_name);}
+}
+TEST_F(Test__WeightManagerCpuHostRelease, IncludeExpertJobsFalseSkipsRoutedExpertBindings) {
+    loader->addQ4_0RandomTensor("blk.0.attn_q.weight",{128,64});
+    const size_t expert_bytes=2*128*64/Q4_0Block::BLOCK_SIZE*sizeof(Q4_0Block);
+    loader->addTensor("blk.0.ffn_gate_exps.weight",std::make_shared<Q4_0Tensor>(
+        std::vector<size_t>{128,64,2},std::vector<uint8_t>(expert_bytes,0)));
+    WeightManager manager(*loader);
+    auto frozen=populate(manager,{request("blk.0.attn_q.weight",WeightRole::AttentionQ),
+        request("blk.0.ffn_gate_exps.weight",WeightRole::MoEExpertGate)});
+    std::vector<std::shared_ptr<ITensorGemm>> retained;
+    for(const auto& binding:frozen.bindings()) {ASSERT_TRUE(binding.prepared);
+        retained.push_back(manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared));ASSERT_TRUE(retained.back());}
+    const auto reads=loader->nativeSourceReadCallCount();
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,DeviceId::cpu(),false));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),reads);
+    for(size_t index=0;index<frozen.bindings().size();++index) {
+        EXPECT_EQ(manager.preparedWeightStore()->gemmKernelLifetime(*frozen.bindings()[index].prepared),retained[index]);
+        EXPECT_TRUE(frozen.bindings()[index].tensor->is_raw_data_released());}
+}
 
-TEST_F(Test__WeightManagerCpuHostRelease, IncludeExpertJobsFalseSkipsRoutedExpertBindings)
-{
-    TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cpu = DeviceId::cpu();
-
-    mock_loader_->addQ4_0RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto dense_inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    auto dense_sliced = wrapInSlice(dense_inner, 256, 64);
-
-    mock_loader_->addQ4_0RandomTensor("blk.0.ffn_gate_exps.weight", {128, 64});
-    auto expert_inner = mock_loader_->loadTensor("blk.0.ffn_gate_exps.weight");
-    auto expert_sliced = wrapInSlice(expert_inner, 256, 64);
-
-    auto dense_binding = makeBinding(1, dense_sliced.get(), "blk.0.attn_q.weight",
-                                     WeightRole::AttentionQ, 0, cpu, /*mark_prepared=*/true);
-    auto expert_binding = makeBinding(2, expert_sliced.get(), "blk.0.ffn_gate_exps.weight",
-                                      WeightRole::MoEExpertGate, 0, cpu, /*mark_prepared=*/true);
-    expert_binding.identity.residency_category = WeightResidencyCategory::AcceleratorRoutedExpert;
-
-    wm.preRegisterPrepared(dense_binding, cpu);
-    wm.preRegisterPrepared(expert_binding, cpu);
-
-    InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {dense_binding, expert_binding};
-    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
-
-    ASSERT_TRUE(wm.prepareWeightsForDevice(frozen, cpu, /*include_expert_jobs=*/false));
-
-    EXPECT_TRUE(dense_sliced->is_raw_data_released());
-    EXPECT_FALSE(expert_sliced->is_raw_data_released());
+TEST_F(Test__WeightManagerCpuHostRelease, FinalFloatingRootSurvivesBothHostReleaseSweeps) {
+    loader->addFP32RandomTensor("blk.0.attn_q.weight",{16,64});WeightManager manager(*loader);
+    auto declared=request("blk.0.attn_q.weight",WeightRole::AttentionQ);
+    declared.host_policy=WeightHostPolicy::ReleasableAfterPreparation;
+    auto frozen=populate(manager,{declared});const auto& binding=frozen.bindings().front();
+    EXPECT_EQ(binding.residency.host_policy,WeightHostPolicy::RequiredForCPUExecution);
+    const auto retained=manager.getWeightForDevice("blk.0.attn_q.weight",DeviceId::cpu());
+    ASSERT_EQ(retained,binding.tensor_owner);ASSERT_TRUE(retained->hasPreparedDeviceState());
+    const auto* root=retained->raw_data();ASSERT_TRUE(root);retained->setHostResident();
+    manager.markMaterializationComplete();manager.markDevicePreparationComplete();manager.markGraphMaterializationComplete();
+    EXPECT_EQ(manager.releaseAllHostWeightData(),0u);
+    EXPECT_EQ(manager.releaseHostResidentWeightData(),0u);
+    EXPECT_EQ(retained->raw_data(),root);EXPECT_FALSE(retained->is_raw_data_released());
+    // The original failing policy discards the root. Do not dereference freed
+    // bytes in the negative control; the failed ownership assertions suffice.
+    if(!retained->raw_data())return;
+    proveEngineLifetime(manager,binding,"blk.0.attn_q.weight");
+}
+TEST_F(Test__WeightManagerCpuHostRelease, TiedAliasPreservesRequiredFinalSourceLifetime) {
+    loader->addFP32RandomTensor("token_embd.weight",{32,64});WeightManager manager(*loader);
+    auto original=request("token_embd.weight",WeightRole::Embedding);
+    auto alias=request("output.weight",WeightRole::LMHead);
+    alias.source_name="token_embd.weight";alias.derivation=WeightDerivationKind::TiedAlias;
+    alias.host_policy=WeightHostPolicy::ReleasableAfterPreparation;
+    auto frozen=populate(manager,{original,alias});
+    const auto& source=frozen.global("token_embd.weight");const auto& head=frozen.global("output.weight");
+    ASSERT_EQ(source.tensor_owner,head.tensor_owner);ASSERT_TRUE(head.prepared);
+    EXPECT_EQ(source.residency.host_policy,WeightHostPolicy::RequiredForCPUExecution);
+    EXPECT_EQ(head.residency.host_policy,source.residency.host_policy);
+    const auto retained=manager.getWeightForDevice("token_embd.weight",DeviceId::cpu());
+    ASSERT_EQ(retained,source.tensor_owner);ASSERT_TRUE(retained->hasPreparedDeviceState());
+    retained->setHostResident();const auto* root=retained->raw_data();ASSERT_TRUE(root);
+    manager.markMaterializationComplete();manager.markDevicePreparationComplete();manager.markGraphMaterializationComplete();
+    EXPECT_EQ(manager.releaseAllHostWeightData(),0u);EXPECT_EQ(manager.releaseHostResidentWeightData(),0u);
+    EXPECT_EQ(retained->raw_data(),root);EXPECT_FALSE(retained->is_raw_data_released());
+    if(!retained->raw_data())return;
+    proveEngineLifetime(manager,head,"token_embd.weight");
+    const auto reads=loader->nativeSourceReadCallCount();
+    // Reuse cannot weaken the already committed final owner's required policy.
+    InferenceStrategy strategy;strategy.model_id={98504};strategy.devices={DeviceId::cpu()};
+    WeightPlan repeated(strategy);repeated.add(original);repeated.add(alias);
+    const auto reused=manager.materialize(repeated);
+    EXPECT_EQ(reused.global("output.weight").tensor_owner,head.tensor_owner);
+    EXPECT_EQ(reused.global("output.weight").residency.host_policy,WeightHostPolicy::RequiredForCPUExecution);
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),reads);
 }

@@ -1,6 +1,6 @@
 /**
  * @file ROCmWeightPacker.cpp
- * @brief Weight packing utilities: native-VNNI and INT8 conversion for ROCm GEMM
+ * @brief Weight packing utilities: native-quantised and INT8 conversion for ROCm GEMM
  *
  * ## Architecture
  *
@@ -8,7 +8,7 @@
  *   1. vnniFormatInfo()       → per-format metadata (payload bytes, codebook, etc.)
  *   2. packVnniBlock()        → per-format block extraction (payload, scale, min)
  *   3. requantizeRowToInt8()  → per-format INT8 requantization (no FP32 round-trip)
- *   4. packNativeVNNI()       → generic loop calling the polymorphic methods
+ *   4. packNativeQuantised()       → generic loop calling the polymorphic methods
  *
  * Host packing is device-free and may run before any ROCm runtime exists.
  * IQ lookup-table publication belongs to the destination's device preparation
@@ -28,7 +28,7 @@
 #include "tensors/TensorClasses.h"   // IINT8Unpackable (for packVnniBlock, requantizeRowToInt8)
 #include "tensors/VnniPackContext.h" // VnniPackContext, vnniLinearIdx, etc.
 #include "tensors/IQQuantTables.h"   // iq3s_grid, ksigns_iq2xs, etc. (for IQ grid init)
-#include "tensors/TensorType.h"      // isNativeVnniFormat, isInt8VnniFormat
+#include "tensors/TensorType.h"      // isNativeQuantisedFormat, isInt8VnniFormat
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "utils/Logger.h"
@@ -45,14 +45,14 @@
 #include <hip/hip_runtime.h>
 #endif
 
-// IQ grid table initialization (implemented in ROCmGemvKernel_native_VNNI.hip)
+// IQ grid table initialization (implemented in ROCmGemvKernel_native_quantised.hip)
 extern "C" bool rocmInitIQGridTables(
     int device_id,
     const void *h_iq3s_grid, const void *h_iq3xxs_grid,
     const void *h_iq2s_grid, const void *h_iq2xs_grid,
     const void *h_iq2xxs_grid, const void *h_iq1s_grid);
 
-// IQ grid publication initializes every physical NativeVNNI GEMM shard.
+// IQ grid publication initializes every physical NativeQuantised GEMM shard.
 extern "C" bool rocmInitIQGridTables_gemm(
     int device_id,
     const void *h_iq3s_grid, const void *h_iq3xxs_grid,
@@ -175,10 +175,10 @@ namespace llaminar2
         }
 
         // =================================================================
-        // packNativeVNNI: polymorphic metadata + polymorphic block packing
+        // packNativeQuantised: polymorphic metadata + polymorphic block packing
         // =================================================================
 
-        bool packNativeVNNI(const TensorBase *tensor, ROCmPackedWeights &out)
+        bool packNativeQuantised(const TensorBase *tensor, ROCmPackedWeights &out)
         {
             if (!tensor)
                 return false;
@@ -207,14 +207,14 @@ namespace llaminar2
             const bool has_secondary = physical.is_asymmetric;
 
             // Allocate output buffers
-            out.native_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
-            out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
+            out.native_quantised_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
+            out.native_quantised_scales.resize(static_cast<size_t>(blocks_per_row) * N);
             if (has_secondary)
-                out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
+                out.native_quantised_mins.resize(static_cast<size_t>(blocks_per_row) * N);
             if (info->has_emins)
-                out.native_vnni_emins.resize(static_cast<size_t>(blocks_per_row) * N);
-            out.native_vnni_codebook_id = physical.codebook_id;
-            out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+                out.native_quantised_emins.resize(static_cast<size_t>(blocks_per_row) * N);
+            out.native_quantised_codebook_id = physical.codebook_id;
+            out.native_quantised_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
             out.native_source_identity = {
                 .codebook_id = info->codebook_id,
                 .is_superblock = info->is_superblock,
@@ -253,10 +253,10 @@ namespace llaminar2
             ctx.K = K;
             ctx.blocks_per_row = blocks_per_row;
             ctx.payload_bytes = payload_bytes;
-            ctx.payload_array = out.native_vnni_payload.data();
-            ctx.scales_array = out.native_vnni_scales.data();
-            ctx.mins_array = has_secondary ? out.native_vnni_mins.data() : nullptr;
-            ctx.emins_array = info->has_emins ? out.native_vnni_emins.data() : nullptr;
+            ctx.payload_array = out.native_quantised_payload.data();
+            ctx.scales_array = out.native_quantised_scales.data();
+            ctx.mins_array = has_secondary ? out.native_quantised_mins.data() : nullptr;
+            ctx.emins_array = info->has_emins ? out.native_quantised_emins.data() : nullptr;
 
             // Main packing loop — dispatches to per-format virtual method
 #pragma omp parallel for schedule(static)
@@ -268,11 +268,11 @@ namespace llaminar2
                 }
             }
 
-            LOG_DEBUG("[packNativeVNNI] Built native-VNNI container for " << N << "x" << K
-                                                                          << " (codebook=" << static_cast<int>(out.native_vnni_codebook_id) << ")"
-                                                                          << " payload=" << (out.native_vnni_payload.size() / 1024) << " KB"
-                                                                          << " scales=" << (out.native_vnni_scales.size() * 2 / 1024) << " KB"
-                                                                          << (has_secondary ? (" secondary=" + std::to_string(out.native_vnni_mins.size() * 2 / 1024) + " KB") : ""));
+            LOG_DEBUG("[packNativeQuantised] Built native-quantised container for " << N << "x" << K
+                                                                          << " (codebook=" << static_cast<int>(out.native_quantised_codebook_id) << ")"
+                                                                          << " payload=" << (out.native_quantised_payload.size() / 1024) << " KB"
+                                                                          << " scales=" << (out.native_quantised_scales.size() * 2 / 1024) << " KB"
+                                                                          << (has_secondary ? (" secondary=" + std::to_string(out.native_quantised_mins.size() * 2 / 1024) + " KB") : ""));
             return true;
         }
 
@@ -296,11 +296,11 @@ namespace llaminar2
 
             const TensorType wt = tensor->native_type();
             const auto *source = dynamic_cast<const IINT8Unpackable *>(tensor);
-            const NativeVnniFormatInfo *source_format =
+            const NativeQuantisedFormatInfo *source_format =
                 source ? source->vnniFormatInfo() : nullptr;
             if (!source_format)
             {
-                LOG_ERROR("[packWeightsToROCm] Tensor has no NativeVNNI source identity: "
+                LOG_ERROR("[packWeightsToROCm] Tensor has no NativeQuantised source identity: "
                           << tensorTypeName(wt));
                 return false;
             }
@@ -310,17 +310,17 @@ namespace llaminar2
                 .present = true,
             };
 
-            // ---- Native-VNNI path (≤6-bit formats) ----
-            if (isNativeVnniFormat(wt))
+            // ---- NativeQuantised path (≤6-bit formats) ----
+            if (isNativeQuantisedFormat(wt))
             {
-                if (!packNativeVNNI(tensor, out))
+                if (!packNativeQuantised(tensor, out))
                 {
-                    LOG_ERROR("[packWeightsToROCm] Native-VNNI packing failed for "
+                    LOG_ERROR("[packWeightsToROCm] NativeQuantised packing failed for "
                               << tensorTypeName(wt) << " " << N << "x" << K);
                     return false;
                 }
                 LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " "
-                                                        << tensorTypeName(wt) << " to native-VNNI only");
+                                                        << tensorTypeName(wt) << " to native-quantised only");
                 return true;
             }
 
@@ -420,8 +420,8 @@ namespace llaminar2
 #ifdef HAVE_ROCM
         for (auto &[device_id, upload] : device_uploads)
         {
-            if (upload.d_native_vnni)
-                rocmQuantGemm_freeDevice(upload.d_native_vnni, device_id);
+            if (upload.d_native_quantised)
+                rocmQuantGemm_freeDevice(upload.d_native_quantised, device_id);
             if (upload.d_native_scales)
                 rocmQuantGemm_freeDevice(upload.d_native_scales, device_id);
             if (upload.d_native_mins)
@@ -483,8 +483,8 @@ namespace llaminar2
 
         void *d_vnni = nullptr, *d_scales = nullptr, *d_mins = nullptr, *d_emins = nullptr;
 
-        if (!uploadBuffer(all_native_vnni.data(),
-                          all_native_vnni.size() * sizeof(uint8_t), &d_vnni) ||
+        if (!uploadBuffer(all_native_quantised.data(),
+                          all_native_quantised.size() * sizeof(uint8_t), &d_vnni) ||
             !uploadBuffer(all_native_scales.data(),
                           all_native_scales.size() * sizeof(uint16_t), &d_scales) ||
             !uploadBuffer(all_native_mins.empty() ? nullptr : all_native_mins.data(),
@@ -499,7 +499,7 @@ namespace llaminar2
             return false;
         }
 
-        upload.d_native_vnni = reinterpret_cast<uint8_t *>(d_vnni);
+        upload.d_native_quantised = reinterpret_cast<uint8_t *>(d_vnni);
         upload.d_native_scales = d_scales;
         upload.d_native_mins = d_mins;
         upload.d_native_emins = d_emins;
@@ -520,8 +520,8 @@ namespace llaminar2
 
         const auto &base = it->second;
         DeviceUpload expert;
-        expert.d_native_vnni = base.d_native_vnni
-                                   ? base.d_native_vnni + expert_id * vnni_bytes_per_expert
+        expert.d_native_quantised = base.d_native_quantised
+                                   ? base.d_native_quantised + expert_id * vnni_bytes_per_expert
                                    : nullptr;
         expert.d_native_scales = base.d_native_scales
                                      ? reinterpret_cast<uint16_t *>(base.d_native_scales) + expert_id * scales_per_expert
@@ -537,12 +537,12 @@ namespace llaminar2
 
     void MoEBatchPackedWeightsROCm::freeHostBuffers()
     {
-        const size_t freed = all_native_vnni.capacity() +
+        const size_t freed = all_native_quantised.capacity() +
                              all_native_scales.capacity() * sizeof(uint16_t) +
                              all_native_mins.capacity() * sizeof(uint16_t) +
                              all_native_emins.capacity() * sizeof(uint32_t);
-        all_native_vnni.clear();
-        all_native_vnni.shrink_to_fit();
+        all_native_quantised.clear();
+        all_native_quantised.shrink_to_fit();
         all_native_scales.clear();
         all_native_scales.shrink_to_fit();
         all_native_mins.clear();
@@ -601,7 +601,7 @@ namespace llaminar2
         batch->mins_per_expert = physical.is_asymmetric ? batch->scales_per_expert : 0;
         batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
 
-        batch->all_native_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
+        batch->all_native_quantised.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
         batch->all_native_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
         if (physical.is_asymmetric)
             batch->all_native_mins.assign(static_cast<size_t>(num_experts) * batch->mins_per_expert, uint16_t{0});
@@ -623,7 +623,7 @@ namespace llaminar2
             ctx.K = K;
             ctx.blocks_per_row = blocks_per_row;
             ctx.payload_bytes = info->payload_bytes;
-            ctx.payload_array = batch->all_native_vnni.data() + e * batch->vnni_bytes_per_expert;
+            ctx.payload_array = batch->all_native_quantised.data() + e * batch->vnni_bytes_per_expert;
             ctx.scales_array = batch->all_native_scales.data() + e * batch->scales_per_expert;
             ctx.mins_array = physical.is_asymmetric
                                  ? batch->all_native_mins.data() + e * batch->mins_per_expert
@@ -644,7 +644,7 @@ namespace llaminar2
 
         LOG_DEBUG("[packMoEExpertsROCm] Packed " << num_experts << " experts ("
                  << rows_per_expert << "x" << K << " each), total slab "
-                 << (batch->all_native_vnni.size() / (1024 * 1024)) << " MB vnni + "
+                 << (batch->all_native_quantised.size() / (1024 * 1024)) << " MB vnni + "
                  << (batch->all_native_scales.size() * 2 / (1024 * 1024)) << " MB scales");
 
         return batch;

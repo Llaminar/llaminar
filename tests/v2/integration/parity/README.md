@@ -45,6 +45,41 @@ preflight gate.
 
 ## Building shared fixtures
 
+### Source admission without numerical references
+
+Setup-only admission uses plain parameterized fixtures, separate from numerical
+`SetUp`. `FullSourceAdmission` requires successful original-model initialization;
+`CandidateSourceAdmission` carries the same positive obligation for an explicitly
+unqualified configuration. `RejectUnsupportedSourceAdmission` retains an exact
+unsupported request and requires its precise production rejection.
+`RejectCapacitySourceAdmission` retains an explicitly capped request and requires
+its precise production capacity rejection; it is distinct from structural
+unsupported admission. Candidates are enabled tests, not expected failures or
+substituted execution modes.
+
+Canonical discovery labels these `Admission;RealModel;FullModel`, adds
+`UnqualifiedCandidate` or `NegativeAdmission` where appropriate, plus
+`CapacityAdmission` for capacity-rejection probes, and binds the
+actual participant backends, MPI world, source files and integration lock. They
+must not inherit PyTorch/golden-reference dependencies or enter the model-free
+production-preflight inventory. Device-free declaration, discovery and focused
+production-defect regressions belong in preflight independently.
+
+For QFN, build `v2_integration_parity_qwen4exp_production_matrix`, inspect CTest
+JSON, then run exact discovered admission registrations through CTest. Set
+`LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT` to a fresh absolute directory. The
+fixture authenticates source metadata and actual native owners without payload
+hashes or diagnostic snapshots, retires the final model owner, and removes only
+its disposable prefix child. Require both the CTest outcome and applicable
+`admission.csv`, `rejection.csv` or `capacity-rejection.csv` for its declared
+contract, PMA attestation and `retirement.csv`. A capacity probe also retains its
+canonical `capacity-diagnostic.txt`; a rejection must not carry a positive
+admission receipt. Preserve a passive driver diagnostic window for native GPU
+batches. Admission alone proves
+neither inference accuracy, request-time movement, captured replay nor speed.
+
+### Shared numerical fixtures
+
 Keep model registration separate from proof implementation. The Qwen3.5 node
 ExpertOverlay matrices link the same `v2_parity_qwen35moe_node_overlay` object
 library; the 35B and 122B registration sources select their own typed cases and
@@ -69,7 +104,14 @@ canonical cell, not only E2E tags. `scripts/ci/model_parity_inventory.py` owns
 the shared CTest/GoogleTest discovery join. Its default `all` scope includes
 untagged cells; `--scope e2e` projects only the tagged subset. Saved manifests
 declare that scope, and an E2E-only manifest cannot certify full-matrix
-coverage. Listing/exporting metadata does not load weights or run inference:
+coverage. Definitions explicitly marked with
+`ModelParityInventoryRole::NumericalDiagnostic` remain registered for numerical
+campaigns but do not enter generation-control, HTTP or benchmark inventories.
+Discovery still verifies their complete raw CTest/GoogleTest membership before
+applying that role. Unknown roles and conflicting canonical control identities
+are errors; filtering must never select an arbitrary duplicate. Ordinary
+canonical exports retain their existing configuration and corpus identities.
+Listing/exporting metadata does not load weights or run inference:
 
 ```bash
 python3 scripts/ci/model_parity_inventory.py \
@@ -85,6 +127,12 @@ not device ordinals, MPI ownership, domains, expert tiers or layer boundaries.
 The profile owns its HTTP workload/context budgets and a `planning` contract;
 it does not define a second topology. Rebuild the matrix executables after
 changing the typed export and regenerate manifests rather than editing JSON.
+
+When a definition has several ngram storage profiles, its E2E selection uses
+`ngram_table_policy` to match the complete production request: tier mode, mmap
+windows, adaptive capacity ceilings and replacement policy. Omitting this field
+retains exact-one selection; it cannot choose among RAM, mmap or adaptive cells.
+Missing, ambiguous and overlapping tags fail expansion before any model loads.
 
 Rank-local PP cells also project the canonical topology's domain sizes/backends
 and the model's main-layer count into that observation contract. Startup
@@ -147,6 +195,16 @@ expansion. The generation observer requires the declared state at full and
 partial hits; MTP independently adds shifted sidecar and full-hit hidden-state
 obligations. This contract is part of serial-control identity, not inferred
 from model filenames, response flags or optional profiling.
+
+Explicit local diagnostics may pass `--local-unbounded-generation` to the
+native HTTP harness with `--generation-configuration`. Docker and cross-host
+workloads are rejected. Generation requests and successful administrative
+persistence then wait without a deadline; startup stays bounded and failed
+shutdown uses 30s exceptional retirement. The client defaults to one 600s sequence,
+and the outer canonical CI cell watchdog is unchanged. A local caller must own
+process/signal cleanup and use an unbounded ordinary wait; the option alone does
+not disable an enclosing watchdog. All token, prefix, movement, graph and native
+retirement checks remain mandatory. This diagnostic does not certify an image.
 
 The routine generation runner reuses the mature HTTP harness's local or
 Docker server lifecycle. Its default `regression` mode selects only MTP-off
@@ -238,7 +296,13 @@ counting for both; wrong-authority or impossible-axis journals fail. Static
 still requires empty journals even when its topology could support movement.
 
 These passive checks do not estimate placement or drive runtime decisions.
-The completed movement journal uses wire schema 2. Each economy record names
+The completed movement journal uses wire schema 4 (schema 5 for pipeline stage envelopes).
+Every edge retains typed `source` and `destination` endpoints. Whole endpoints
+preserve participant/device/known-rank identity; CPU cohorts retain every original
+ordered rank/NUMA member and all gate/up/down source cuts and codebooks. Scalar
+projections reject cohorts. Cohort transport proof joins each committed edge to
+actual completed native-format pieces and every original endpoint observer; it
+never treats staged work or an allocation capacity as completed movement. Each economy record names
 its admitting `policy`: `time_ns` retains the existing exact service/transfer/
 interference equation, while `native_load_spread` retains the homogeneous GPU
 policy's routed-work conservation, accepted swap gain, payload-slot floor and
@@ -366,7 +430,7 @@ passed flag alone is insufficient. Runtime startup evidence joins selected
 participants to canonical physical-node and GPU UUID/CPU NUMA identity, then
 checks the declared strategy and counts. Repeated visibility of one GPU on two
 MPI ranks cannot satisfy a two-GPU obligation. There is no model-size skip for
-a tagged cell. Each HTTP
+a tagged cell. Each canonical CI HTTP
 cell has one profile-owned `cell_timeout_seconds` watchdog (default fifteen
 minutes), including startup and shutdown. The profile exports budgets for both
 ISAs; the runner selects the tested image's OCI ISA label or the local Release
@@ -552,6 +616,134 @@ Missing models, hardware, decode references, graph evidence, or snapshot
 publication are failures in a production campaign. Focused developer tests may
 still skip when their optional prerequisite is absent.
 
+### Frozen QFN histories and full-stage diagnosis
+
+The QFN accuracy panel uses immutable prompt IDs and a frozen continuation.
+For a history with `D` decode observations, its `D+1` teacher IDs describe
+the pending-token lifecycle: the first `D` are consumed; the final ID remains
+pending. A detailed replay must use these exact inputs, including when they
+differ from a new greedy continuation.
+
+The local fixed-history canary can collect observations without numerical
+acceptance, or evaluate an explicitly supplied policy. Initial acceptance uses
+`run_model_kld_canaries.py --absolute-pilot POLICY` with an explicit schema2
+corpus catalog and exactly one declared topology. This option is mutually
+exclusive with baseline, baseline-approval and calibration arguments. The
+`llaminar.model-kld-absolute-pilot.v1` document binds the exact corpus digest
+and assigns every backend/topology/context/phase group either a `required`
+or `diagnostic` role. Required groups supply every absolute mean, offset,
+row, tail, total-variation and agreement limit; diagnostic groups carry no
+limits. Missing or foreign groups fail before native admission.
+
+A reviewed required-group policy may explicitly add `bounded_row_outliers`
+with `maximum_rows` and `maximum_kl_nats`. Only that many rows may exceed the
+ordinary `maximum.row_kl_nats`, and none may exceed the additional ceiling.
+Every row still contributes to prompt-balanced means, per-offset means, tails,
+total variation, agreement and paired-delta checks. The report retains the
+outlier count and row identities; absent this object, the ordinary ceiling
+applies to every row. This option never changes a reference or drops a row.
+
+An initial pilot reports `REQUIRED_GROUPS_GREEN` or `REQUIRED_GROUPS_RED`.
+Its diagnostic groups remain unavailable, paired deltas remain null, and
+the result does not qualify the complete corpus, model, topology or image.
+Subsequent same-policy comparisons use the approved baseline and calibration
+route. Unscored collection remains `UNCALIBRATED`; command success alone is
+not numerical acceptance. The original short GTest's numerical failures and
+all structural, source, reset and MTP byte-equivalence requirements are retained.
+
+To bind this panel to existing canonical cases, configure the Integration build
+with `-DV2_QFN_LOCAL_PAIRED_BINDINGS=/absolute/path/bindings.json`. The option is
+empty by default and changes no ordinary case or production arithmetic policy.
+Its `llaminar.qfn-local-paired-profiles.v1` document contains the original corpus
+`source` and explicit `bindings`: each names an existing exact `ProductionParity`
+cell, its coverage role, all six arithmetic selectors, and path/SHA256 references
+to the catalog, workload, absolute pilot and benchmark documents. Unknown,
+duplicate and unused case IDs fail registration. Original GGUF identities use
+reference-issued file metadata; model payloads are not hashed.
+
+The configure helper freezes these small inputs into the existing QFN matrix
+binary and declares the inactive predictor dependency for selected cases.
+Build that matrix, the canary and both prerequisite targets, then obtain a
+fresh complete prerequisite receipt. Run
+`run_model_kld_canaries.py --binary BUILD/llaminar_model_kld_canary --paired-cell EXACT_CELL --corpus-root CORPUS --prerequisites-report RECEIPT --report NEW_OUTPUT/report.json`.
+The existing runner authenticates the declared documents and compares the
+canonical and observer configurations through the same public parser before
+model admission. It owns native execution, driver checks and retirement.
+These local source identities do not establish portable image/CI eligibility;
+the benchmark obligation remains `DECLARED_NOT_EXECUTED` until measured.
+
+When the user explicitly requests focused validation, the paired panel has a
+separate diagnostic prerequisite route. First build the selected test owners,
+matrix and canary normally. Run
+`run_production_prerequisites.py --build-dir BUILD --diagnostic-focused-panel --focused-test EXACT_DEVICEFREE_CTEST --output NEW_RECEIPT_DIRECTORY`,
+repeating `--focused-test` for each intended check. Only exact registered,
+bounded, model-free `DeviceFree` Unit/preflight checks are eligible. The producer
+retains their actual CTest output, rejects skips and binds the source, build,
+registrations and executed artifacts. It never runs the complete prerequisite
+gates. These checks provide no native GPU backend regression coverage; retain
+separate actual native evidence when that scope is required.
+
+Then use the same paired invocation with
+`--diagnostic-focused-prerequisites-report NEW_RECEIPT_DIRECTORY/focused-prerequisites.json`
+instead of `--prerequisites-report`. One unchanged source/build may reuse that
+receipt across its bound panels; each execution revalidates it without rerunning
+the checks. This explicit route also admits `NumericalDiagnostic` canonical case
+metadata through a local diagnostic inventory and a source-bound workload
+metadata file outside the corpus root. Every reference payload remains under
+the original corpus root. Histories, tokens, configuration, source identity,
+arithmetic, accuracy policies, driver checks and process retirement use the same
+validators and execution owner as the complete route.
+
+The focused receipt uses `llaminar.focused-panel-prerequisites.v1`. Panel status
+and verdict begin with `DIAGNOSTIC_`, `passed` is null, and reports declare
+`full_preflight=false` and `certification_eligible=false`; actual accuracy rows
+and their separate accuracy verdict remain visible. Complete prerequisite,
+published-image and canonical runtime inventory consumers reject this diagnostic
+evidence. A diagnostic panel never establishes complete prerequisite, model,
+image or release qualification. The default complete route remains unchanged.
+
+Complete-prerequisite observed-pipeline diagnostics may bind a catalog-pinned
+external manifest while keeping the original corpus root. This adaptation may
+change only the explicit topology inventory: original sources, every prompt and
+Pending teacher, reset control and reference declarations must remain identical
+to the original root manifest. The source-frozen binding, original observed
+owner/configuration, exact arithmetic, all policy groups and full prerequisite
+checks remain required. Ordinary canonical/image routes retain their root
+manifest requirement; no reference rows or acceptance limits are inferred.
+
+Generate a full-stage reference for one existing history with
+`generate_qwen4exp_pipeline_snapshots.py --frozen-history MANIFEST --history-id ID`,
+the original `--model`, any declared inactive `--shared-predictor`, pinned
+`--tokenizer`, matching `--decode-steps`, and a fresh `--output` directory.
+The generator validates the frozen source and work before admission, captures
+all original layers/stages, rechecks identity after capture, and publishes
+metadata only after model retirement. Do not use the final-logit-only
+`--accuracy-panel` capture for layer-by-layer diagnosis.
+
+Compare the completed pack's final prefill LM-head row and every decode
+LM-head row against the existing frozen corpus before native replay. Keep both
+packs; a mismatch needs investigation rather than replacement of the oracle.
+Use the canonical campaign driver's `--history-replay` descriptor with the
+exact registered cell and fresh complete Unit/preflight prerequisites.
+The descriptor binds original sources, configuration, arithmetic, teacher
+IDs, reference metadata and physical prefill geometry. Nine logical rows in
+a serving M64 bucket differ from an exact-M9 diagnostic; keep the logical
+PyTorch prompt unchanged and record the native bucket and worker affinity.
+Retain every layer/stage and the six canonical numerical CSVs.
+
+Explicit replay also binds the positive `n_threads` request in the original
+configuration. The single-rank driver preserves the registered MPI launcher,
+transport arguments, binary and filter while exporting the requested workers
+with an unbound physical-core policy. It rejects extra affinity controls or an
+insufficient physical-core budget before admission. The fixture checks actual
+OpenMP settings and affinity, and records production CPU worker counters when
+the topology declares CPU compute. The driver verifies this evidence alongside
+the prefill geometry. GPU-only cells have no CPU router obligation.
+
+This projection applies only to an explicit history replay; ordinary campaigns
+retain their registered resource policy. Record the current CPU mask without
+claiming historical CPU-ID identity when an older observer did not publish it.
+
 ## Model-free prerequisite gates
 
 Git pre-commit runs only the complete Unit and ProductionTestPreflight
@@ -719,6 +911,24 @@ with `ctest -R ...ProductionCampaign...` intentionally fails before model
 mapping because it has no identity-bound tmpfs publication or cache lock. Use
 the driver command above (with `--campaign` for a narrow child selection), or
 run a non-campaign focused GTest diagnostic explicitly.
+
+A frozen-history diagnostic may declare `observation_shard` with `schema: 1`,
+`scope: "noncertifying"`, and duplicate-free `full_keys` / `selected_keys`
+semantic inventories. The full inventory must match the actual authenticated
+reference directory and every original phase; canonical required gold remains
+mandatory. Selection must be a proper subset containing `EMBEDDING` and
+`LM_HEAD`. The same immutable keys control captured nodes, snapshot memory
+admission and comparisons; complete original source, teachers, arithmetic and
+serving capture geometry are retained. Campaign-marked execution rejects this
+scope. It cannot certify complete checkpoint coverage even if GTest passes.
+
+Each shard publishes `history_replay_observation_scope.json` with full,
+selected and missing coverage, plus descriptor/source/reference identities.
+The existing snapshot export retains selected values and every actual terminal
+LM row without truncation. Join observations only when those identities and
+terminal rows agree; an absent row, incompatible shard or incomplete coverage
+must remain explicit. Ordinary histories without this field keep full capture
+and comparison behavior.
 
 Every child validates the typed model mapping and inexpensive reference-pack
 descriptor, then lets full checkpoint parity prove the weight contents. No
@@ -1097,6 +1307,29 @@ cell substitutes another movement policy for it.
 
 ## Local verification
 
+### Final-logit acceptance and agreement metrics
+
+`BackendThresholds::final_logit_mean_kl` is an explicit model-owned policy.
+When selected, each requested main-model decode step must independently meet
+its KL limit, and prefill has its own limit. The trajectory must contain every
+declared step exactly once. Models that omit the policy retain their existing
+acceptance rules. Recursive MTP thresholds, serial/verifier byte equivalence,
+prefix restoration and production-path proofs remain independent.
+
+KL means `KL(reference || native)`, summed across vocabulary and averaged over
+the positions observed at that step. The current final-logit checkpoints
+compare the final prompt position and one position per teacher-forced decode
+step. Top-1 is the fraction of positions with matching argmax tokens. Top-5 is
+the mean intersection size of the two top-five sets divided by five; it is
+distinct from reference-top-token-in-top-K recall. The summary reports each
+original step and its verdict before the existing aggregate diagnostics.
+
+Final-logit acceptance retains every raw layer/stage comparison and its
+numerical verdict. Complete declared snapshot coverage, finite operands,
+matching extents, valid routing representations and exact integer identities
+are mandatory even when the final KL is small. Missing observations cannot
+be converted into an acceptable numerical difference.
+
 ### Route-conditioned MoE MTP equations
 
 A validated near-cutoff expert substitution has an explicit independent proof:
@@ -1156,6 +1389,38 @@ cmake --build build_v2_integration --parallel \
   --target v2_integration_parity_qwen2_single_device_matrix
 ```
 
+## Additional diagnostic capture keys
+
+`LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS` adds a comma-separated list of exact
+semantic keys to the existing setup capture inventory. Set it before starting
+the parity process, for example:
+
+```bash
+export LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS='layer0_HC_ATTN_WRITE_LOGITS,layer0_HC_FFN_BRANCH_NORM'
+export LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS='layer0_HC_ATTN_WRITE_LOGITS,layer0_HC_FFN_BRANCH_NORM'
+export LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS='0'
+```
+
+Capture requests are frozen before runner initialization, including an absent
+or empty request. Later environment changes cannot add nodes to retained graphs.
+Keys use identifier syntax (`[A-Za-z_][A-Za-z0-9_]*`); surrounding spaces are
+trimmed, duplicates are removed, and empty list members, paths and wildcard
+patterns are rejected. An explicit request with disabled diagnostic snapshots
+is an error. Builds must support pipeline snapshots as usual.
+
+The capture list adds actual published outputs to the existing typed snapshot
+policy and physical-memory admission path. It does not create references,
+require numerical comparison for those keys, select every publication, or
+change model execution. The existing snapshot arena capacity remains enforced;
+a request does not authorize unaccounted storage or invent a producer for an
+unknown key. Use the exact keys published by the selected model.
+
+`LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS` independently filters already captured
+values for file export (using its existing substring matching). It cannot add
+missing capture nodes. `LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS` limits decode
+export steps, and `LLAMINAR_PARITY_EXPORT_SNAPSHOT_MAX_ELEMENTS` optionally limits
+payload size. Exports are diagnostics, not numerical or performance certification.
+
 ## Troubleshooting
 
 - “reference pack is stale or unauthenticated” names the exact failed identity
@@ -1177,3 +1442,61 @@ cmake --build build_v2_integration --parallel \
 Parity tests require Python with PyTorch/Transformers/NumPy, `cnpy`, ZLIB, the
 configured MPI runtime, and the relevant backend libraries. Integration builds
 must have pipeline snapshots enabled.
+
+Flash Next reference snapshots use the pinned Qwen4Exp implementation in
+`python/reference/qwen4exp.py`. `PLE_HASH_INDICES` is an exact INT64 checkpoint:
+its native `[M,32]` INT32 arena backing publishes `[M,16]` INT64 identities without
+conversion. The canonical NumPy v1 adapter authenticates scalar kind, endianness,
+shape, row order and complete payload extent before loading. Integer stages
+report `scalar_type=INT64` and `integer_mismatch_count` in stage CSV files; their
+floating metrics are empty and any identity or shape mismatch fails parity.
+Legacy float snapshot access rejects these integer publications. Optional raw
+snapshot export writes `.i64` payloads and records their dtype in the manifest.
+
+The PLE fusion boundaries are explicit: `PLE_GATE` contains the four gated
+shared-value branches (`[M,4H]`), and `PLE_CONVOLUTION` contains the updated trunk
+`trunk + gated + SiLU(depthwise_convolution)` (`[M,4H]`).
+
+
+### Adaptive GPU cache source backing
+
+The existing GPU-adaptive policy declares `--ngram-source-backing ssd|ram`.
+SSD preserves the original bounded mmap source and optional bounded RAM cache.
+RAM retains one complete original native table under the same CPU provider/PMA,
+shared across every actual channel; both source-cache ceilings must be zero.
+It does not change compute/storage membership, GPU cache capacity, arithmetic,
+MTP/expert policy or qualify an otherwise unsupported topology. Source admission
+must prove the mandatory full-table bytes once, then actual native lookup,
+accuracy and Release workload measurements remain required. No source capacity
+is communicated: requests/responses retain original live IDs and exact native
+row byte counts. Full-RAM terminal source observations use the distinct
+`gpu_subordinate_full_ram` mode, no RAM-cache admission/eviction, and zero mmap
+window traffic. C0 GPU grants remain valid admission evidence, not positive
+cache-performance evidence.
+
+The lossless configuration and ngram setup formats carry this explicit choice.
+Older/missing-field documents reject; refresh reviewed binding metadata through
+the canonical exporter/parser while preserving histories/source/policy limits.
+Prior numerical observations retain their original source/config identity and
+must not be relabeled as execution of a new backing policy.
+
+
+### CPU expert tensor-shard full-stage history diagnosis
+
+`Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity`
+uses the original QFN numerical framework with one MPI rank per physical socket.
+Its declared Static RAM MTP-Off/capacity-zero case has the GPU continuation and
+NUMA0 expert fragment on rank0, NUMA1 fragment on rank1, and unchanged GPU64/CPU448
+expert identities. This diagnostic requires an explicit `--history-replay`
+descriptor bound to its exact cell and original full-stage reference. It is not a
+frozen-panel or source-admission certificate.
+
+All original required checkpoints and six CSV comparisons remain intact. Only
+the continuation compares complete snapshots and issues public inference;
+followers execute the original production worker loop. The original MPI context
+and its published physical socket inventory are retained by the Runner factory.
+Distributed history launches retain their registered socket binding and requested
+workers per rank, and reject oversubscription/overlap controls. Completed per-rank
+CPU resource records prove distinct original sockets, live CPU work and retirement.
+Single-rank frozen-history launch behavior is unchanged. No active-MTP, dynamic
+expert migration or absent physical socket qualification is added here.

@@ -8,7 +8,11 @@
  * the Unit gate. A selector cannot fabricate a GPU because it is not an input.
  */
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstring>
+#include <limits>
 #include "planning/ClusterInventoryGatherer.h"
+#include "planning/RankHardwareOwnership.h"
 #include "utils/MPITopology.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <array>
@@ -40,6 +44,11 @@ namespace
         second.available_memory_bytes = 1700;
         hardware.cpu_sockets = {first, second};
         hardware.cpu_last_level_cache_bytes = {{0, 32u << 20}, {1, 96u << 20}};
+        hardware.cpu_numa_devices = {
+            {3, {.type=ComputeBackendType::CPU,.numa_node=3,.name="fixture CPU",.total_memory_bytes=1000,
+                 .free_memory_bytes=600,.compute_units=4,.supports_bf16=true,.supports_int8=true,.last_level_cache_bytes=32u<<20}},
+            {7, {.type=ComputeBackendType::CPU,.numa_node=7,.name="fixture CPU",.total_memory_bytes=2000,
+                 .free_memory_bytes=1700,.compute_units=6,.supports_bf16=true,.supports_int8=true,.last_level_cache_bytes=96u<<20}}};
         return hardware;
     }
 
@@ -65,6 +74,8 @@ namespace
         device.pcie.max_speed_gts = 16.0;
         device.pcie.degraded = true;
         device.pcie.bottleneck_bdf = "0000:81:00.0";
+        device.pcie.upstream_bdfs = {"0000:81:00.0", "0000:80:00.0"};
+        device.native_isa = backend == ComputeBackendType::GPU_ROCM ? "gfx906:sramecc+:xnack-" : "";
         return device;
     }
 
@@ -180,6 +191,8 @@ TEST_P(InventoryGPUProjection, PreservesSparseOrdinalCapacityAndPCIe)
         EXPECT_EQ(gpu.pcie_max_speed_gts, 16.0);
         EXPECT_TRUE(gpu.pcie_degraded);
         EXPECT_EQ(gpu.pcie_bottleneck_bdf, "0000:81:00.0");
+        EXPECT_EQ(gpu.pcie_upstream_bdfs, (std::vector<std::string>{"0000:81:00.0", "0000:80:00.0"}));
+        EXPECT_EQ(gpu.native_isa, visible[0].native_isa);
         EXPECT_EQ(gpu.pci_bus_address, "0001:42:1f.7");
         EXPECT_EQ(gpu.tflops_fp16, 0.0) << "Missing throughput is not a fabricated estimate";
     }
@@ -237,6 +250,8 @@ TEST(Test__ClusterInventoryGatherer, P2PReordersAndFiltersBothBackendsWithoutLos
         EXPECT_EQ(decoded.p2p_rocm, rank.p2p_rocm);
         EXPECT_EQ(decoded.gpus[0].free_memory_bytes, rank.gpus[0].free_memory_bytes);
         EXPECT_EQ(decoded.gpus[0].pcie_bottleneck_bdf, rank.gpus[0].pcie_bottleneck_bdf);
+        EXPECT_EQ(decoded.gpus[0].pcie_upstream_bdfs, rank.gpus[0].pcie_upstream_bdfs);
+        EXPECT_EQ(decoded.gpus[0].native_isa, rank.gpus[0].native_isa);
         EXPECT_EQ(decoded.gpus[0].pci_bus_address, rank.gpus[0].pci_bus_address);
         EXPECT_EQ(decoded.gpus[0].last_level_cache_bytes, rank.gpus[0].last_level_cache_bytes);
     }
@@ -347,4 +362,54 @@ TEST(Test__ClusterInventoryGatherer, NodeAggregation_MultiNode)
 
     // Cluster total: 1024 GB
     EXPECT_EQ(inventory.total_cpu_memory, 2 * expected_per_node);
+}
+
+/** @test One rank's supplied exact locality authorizes only its local visible cards. */
+TEST(Test__ClusterInventoryGatherer, SingleRankObservedNUMAAdmitsOnlyLocalGPUOwnership)
+{
+    auto hardware = hardwareFixture();
+    hardware.cuda_devices = {gpuFixture(ComputeBackendType::GPU_CUDA, 9)};
+    hardware.rocm_devices = {gpuFixture(ComputeBackendType::GPU_ROCM, 2)};
+    for (const int node : {3, 7})
+    {
+        const auto rank = makeRankInventory(hardware, {.rank=0, .cpu_numa_node=node});
+        ASSERT_EQ(rank.gpus.size(), 2u);
+        EXPECT_EQ(rank.cpu.numa_node, node);
+        EXPECT_EQ(rank.cpu.memory_bytes, hardware.cpuDevice(node).total_memory_bytes);
+        for (const auto &gpu : rank.gpus)
+            EXPECT_EQ(rankOwnsGPUDevice(rank, gpu), node == 7);
+        const auto wire = MPITopology::serializeRankInventory(rank);
+        const auto roundtrip = MPITopology::deserializeRankInventory(wire.data(), wire.size());
+        EXPECT_EQ(roundtrip.cpu.numa_node, node);
+        EXPECT_EQ(roundtrip.gpus.size(), 2u);
+    }
+    const auto whole = makeRankInventory(hardware, {});
+    EXPECT_EQ(whole.cpu.numa_node, -1);
+    EXPECT_EQ(whole.cpu.memory_bytes, 3000u);
+    for (const auto &gpu : whole.gpus) EXPECT_FALSE(rankOwnsGPUDevice(whole, gpu));
+}
+
+/** @test Original path/ISA facts survive wire publication; stale and malformed records fail closed. */
+TEST(Test__ClusterInventoryGatherer, PeerGroupingFactsRoundTripRejectOldVersionAndMalformedAncestry)
+{
+    const std::array visible{gpuFixture(ComputeBackendType::GPU_ROCM,9)};
+    auto rank=makeRankInventory(hardwareFixture(),visible,{});
+    rank.gpus[0].pcie_upstream_bdfs={"0000:ab:01.0","0000:ab:00.0"};
+    const auto wire=MPITopology::serializeRankInventory(rank);
+    const auto restored=MPITopology::deserializeRankInventory(wire.data(),wire.size());
+    EXPECT_EQ(restored.gpus[0].native_isa,"gfx906:sramecc+:xnack-");
+    EXPECT_EQ(restored.gpus[0].pcie_upstream_bdfs,rank.gpus[0].pcie_upstream_bdfs);
+    auto old=wire;const uint32_t oldVersion=4;
+    ASSERT_GE(old.size(),2*sizeof(uint32_t));
+    std::memcpy(old.data()+sizeof(uint32_t),&oldVersion,sizeof(oldVersion));
+    EXPECT_THROW(MPITopology::deserializeRankInventory(old.data(),old.size()),std::runtime_error);
+    const std::string first=rank.gpus[0].pcie_upstream_bdfs.front();
+    const auto marker=std::search(wire.begin(),wire.end(),first.begin(),first.end());
+    ASSERT_NE(marker,wire.end());
+    const auto offset=std::size_t(marker-wire.begin());
+    ASSERT_GE(offset,2*sizeof(uint32_t));
+    auto malformed=wire;const auto impossible=std::numeric_limits<uint32_t>::max();
+    // Immediately before the first string's length is the original path count.
+    std::memcpy(malformed.data()+offset-2*sizeof(uint32_t),&impossible,sizeof(impossible));
+    EXPECT_THROW(MPITopology::deserializeRankInventory(malformed.data(),malformed.size()),std::runtime_error);
 }

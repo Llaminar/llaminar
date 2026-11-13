@@ -40,6 +40,9 @@ endif()
 # The build type flags are picked up by the compiler setup during project()
 project(llaminar2 LANGUAGES C CXX)
 
+# Compile the same small semantic source identity into capture and offline replay.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/MTPDepthReplayIdentity.cmake")
+
 # =============================================================================
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
@@ -106,6 +109,18 @@ option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
 
+# Source-bound model policy: Automatic selects only the measured native owner
+# operation. Explicit Serial/Four remain first-class; no serving/env override.
+set(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS "automatic" CACHE STRING
+    "Physical-M1 owner gate/up policy: automatic|serial|four_worker_planes")
+set_property(CACHE LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS PROPERTY STRINGS automatic serial four_worker_planes)
+if(NOT LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS MATCHES "^(automatic|serial|four_worker_planes)$")
+    message(FATAL_ERROR "Invalid LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS; use automatic, serial or four_worker_planes")
+endif()
+if(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "four_worker_planes" AND NOT HAVE_ROCM)
+    message(FATAL_ERROR "Explicit owner partition planes require the ROCm backend")
+endif()
+
 set(LLAMINAR_SHARED_CORE_DEFAULT OFF)
 if(HAVE_CUDA OR HAVE_ROCM)
     set(LLAMINAR_SHARED_CORE_DEFAULT ON)
@@ -138,6 +153,11 @@ option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging
 # Required Platform Dependencies
 # =============================================================================
 find_package(MPI REQUIRED COMPONENTS CXX)
+# OpenMPI CPU-set arguments name hwloc logical cores, not Linux OS CPU IDs.
+# Canonical cold CPU discovery publishes that conversion once; this explicit
+# dependency does not enable the older optional HAVE_HWLOC NUMA detector.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LLAMINAR_CPU_PLACEMENT_HWLOC REQUIRED IMPORTED_TARGET hwloc>=2.1)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/OpenMPRuntimeBinding.cmake")
 llaminar_openmp_runtime_soname(LLAMINAR_OPENMP_RUNTIME_SONAME)
@@ -235,7 +255,7 @@ if(HAVE_CUDA)
         endif()
     endif()
     
-    # CUDA compile flags. NativeVNNI prefill uses Ampere+ ldmatrix/mma.sync
+    # CUDA compile flags. NativeQuantised prefill uses Ampere+ ldmatrix/mma.sync
     # instructions guarded by __CUDA_ARCH__ >= 800, so a CUDA build must include
     # at least one SM80+ target. A stale pre-Ampere-only cache compiles the kernel
     # body to no-ops and returns all-zero GEMM outputs.
@@ -258,7 +278,7 @@ if(HAVE_CUDA)
     endforeach()
     if(NOT LLAMINAR_HAS_AMPERE_CUDA_ARCH)
         message(FATAL_ERROR
-            "V2: CUDA NativeVNNI requires compiling at least one SM80+ architecture. "
+            "V2: CUDA NativeQuantised requires compiling at least one SM80+ architecture. "
             "Current CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'. "
             "Reconfigure with a local SM80+ value such as "
             "-DCMAKE_CUDA_ARCHITECTURES=86.")
@@ -310,7 +330,8 @@ if(HAVE_ROCM)
         endif()
     endif()
     
-    # Enable HIP language for ROCm compilation
+    # Resolve targets before HIP compiler discovery; never overwrite caller intent.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ROCmArchitectures.cmake")
     enable_language(HIP)
     # Compiler relocation discovers device bitcode relative to its executable,
     # but its implicit HIP header search may still name the legacy /opt/rocm.
@@ -340,11 +361,6 @@ if(HAVE_ROCM)
     message(STATUS "V2: HIP Version: ${hip_VERSION}")
     message(STATUS "V2: hipcc: ${HIP_HIPCC_EXECUTABLE}")
     
-    # ROCm compile flags - only architectures supporting DL (Deep Learning) instructions
-    # CK requires specific arch macros: gfx906, gfx908, gfx90a (MI50/MI100/MI200)
-    # NOT supported: gfx900 (no DL), gfx940 (CK expects gfx942), gfx1030/gfx1100 (RDNA)
-    # Currently targeting only gfx906 (MI50) for faster compilation
-    set(CMAKE_HIP_ARCHITECTURES "gfx906")
     # Note: hipcc's -parallel-jobs conflicts with CMake's --parallel, so we rely
     # on CMake's build parallelism instead (multiple hipcc processes in parallel)
 endif()
@@ -375,21 +391,21 @@ if(HAVE_CUDA)
     set(CUDA_KERNEL_SOURCES
         kernels/cuda/gemm/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
         kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
-        kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
-        # NativeVNNI decode/grouped GEMV is physically sharded by codebook pair.
+        kernels/cuda/gemm/CUDANativeQuantisedIQTables.cu    # shared IQ lookup table symbol definitions for native-quantised decode
+        # NativeQuantised decode/grouped GEMV is physically sharded by codebook pair.
         # Eight independent objects expose real Ninja parallelism; the dispatch
         # TU preserves the single public ABI and contains no device templates.
-        kernels/cuda/gemm/CUDANativeVNNIGemvDispatch.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard0.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard1.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard2.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard3.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard4.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard5.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard6.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard7.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvDispatch.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard0.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard1.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard2.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard3.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard4.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard5.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
-        kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu  # custom native-quantised prefill GEMM family (Q4_0 first)
         kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
         kernels/cuda/moe/CUDAMoEGroupedIntermediateExchange.cu # lossless SwiGLU/scales exchange boundary
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
@@ -406,17 +422,28 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
+        kernels/cuda/attention/CUDAQwenSparseAttention.cu # Flash Next selected-index attention
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
         kernels/cuda/kvcache/CUDAAttentionKeyQ8Kernels.cu # Quadratic-companded attention-key cache codec
         kernels/cuda/kvcache/CUDATurboQuantKernels.cu  # TurboQuant quantize/dequant/RoPE GPU kernels
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        kernels/cuda/gemm/CUDAQ8ResidualCorrection.cu # Explicit two-term native Q8 activation projection
+        kernels/cuda/qwen4exp/CUDAQwen4ExpKernels.cu # Flash Next residual and PLE primitives
+        kernels/cuda/qwen4exp/CUDADiagnosticSnapshotCopy.cu
+        kernels/cuda/qwen4exp/CUDAImmutableLookupKernels.cu
+        kernels/cuda/qwen4exp/CUDAImmutableFixedHeadLookupKernels.cu
+        kernels/cuda/attention/CUDAQwenSparseReplay.cu
+        kernels/cuda/attention/CUDAQwen4ExpStateIO.cu
+        kernels/cuda/attention/CUDAQwen4ExpPLERetained.cu
+        kernels/cuda/attention/CUDAQwen4ExpBranchConcat.cu
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
         kernels/cuda/moe/CUDARouterQ8Prefill.cu       # Exact block32 INT8 tensor-core router prefill
         kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
         kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
+        backends/cuda/PlanningGPUClockMarker.cu # Bounded startup fixed-clock timing
         kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
         # GPU repack kernels (GGUF → VNNI layout on device)
         kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
@@ -432,7 +459,7 @@ if(HAVE_CUDA)
     # oversubscribe eight already independent Ninja jobs.
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
         set_source_files_properties(
-            kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
+            kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu
             PROPERTIES COMPILE_OPTIONS "--split-compile=8"
         )
         # Attention owns one arithmetic body specialized across native formats,
@@ -465,10 +492,12 @@ if(HAVE_CUDA)
     add_library(cuda_backend STATIC 
         backends/cuda/CUDADriverApi.cpp
         backends/cuda/CUDABackend.cu
+        backends/cuda/CUDAHardwareMetadata.cu
         backends/cuda/CUDATensorValidation.cu
         backends/cuda/NvidiaDeviceContext.cu
         backends/cuda/NvidiaContextFactory.cu
         backends/cuda/CUDAWorkerImpl.cu
+        backends/cuda/CUDAGraphObjectGeometry.cpp
         backends/cuda/CUDAGraphCapture.cu
         backends/CUDAEnumeration.cu
         collective/backends/NCCLBackendCUDA.cu
@@ -621,6 +650,19 @@ if(HAVE_CUDA)
     if(LLAMINAR_NCCL_LIBRARY)
         set(NCCL_LIBRARY "${LLAMINAR_NCCL_LIBRARY}")
         set(HAVE_NCCL ON CACHE BOOL "NCCL library found")
+        # Resolve the configured DSO before locating its own build/install header;
+        # a relocated lib-only symlink must not select an unrelated system ABI.
+        get_filename_component(_nccl_abi_dso "${NCCL_LIBRARY}" REALPATH)
+        get_filename_component(_nccl_abi_libdir "${_nccl_abi_dso}" DIRECTORY)
+        find_file(_nccl_abi_header NAMES llaminar-nccl/nccl.h nccl.h
+            HINTS "${_nccl_abi_libdir}/../include" "${_nccl_abi_libdir}/include"
+            NO_DEFAULT_PATH NO_CACHE)
+        if(NOT _nccl_abi_header)
+            message(FATAL_ERROR "Configured NCCL dependency has no associated nccl.h: ${_nccl_abi_dso}")
+        endif()
+        target_sources(cuda_backend PRIVATE collective/backends/NCCLHeaderABIContract.cpp)
+        set_property(SOURCE collective/backends/NCCLHeaderABIContract.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS "LLAMINAR_NCCL_ABI_HEADER=\"${_nccl_abi_header}\"")
         add_compile_definitions(HAVE_NCCL)
         message(STATUS "V2: NCCL found")
         message(STATUS "V2:   Library: ${NCCL_LIBRARY}")
@@ -628,9 +670,14 @@ if(HAVE_CUDA)
         # CRITICAL: NCCL is now loaded dynamically via dlopen() in NCCLDynamicLoader.cpp
         # to avoid symbol conflicts with RCCL, which exports identical symbol names.
         # NCCLDynamicLoader owns the isolated ABI declarations and loads NCCL
-        # with RTLD_LOCAL. No consumer includes nccl.h; exporting the vendor's
+        # with RTLD_LOCAL. Only the isolated ABI contract TU includes nccl.h;
+        # exporting the vendor's
         # include directory would leak its conflicting global names to RCCL.
         target_compile_definitions(cuda_backend PUBLIC HAVE_NCCL)
+        # The runtime must consume the exact library authenticated by dependency
+        # admission; a second SONAME search could select an older installation.
+        set_property(SOURCE collective/backends/NCCLDynamicLoader.cpp APPEND
+            PROPERTY COMPILE_DEFINITIONS "LLAMINAR_NCCL_LIBRARY_PATH=\"${NCCL_LIBRARY}\"")
         # Link dl for dlopen/dlsym
         target_link_libraries(cuda_backend PUBLIC ${CMAKE_DL_LIBS})
         message(STATUS "V2: NCCL will be loaded dynamically (dlopen) from cuda_backend for symbol isolation")
@@ -659,22 +706,23 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
-        kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
-        # NativeVNNI prefill is physically sharded by codebook pair so LLVM can
+        kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip  # NativeQuantised 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
+        # NativeQuantised prefill is physically sharded by codebook pair so LLVM can
         # optimize all format families concurrently instead of serializing one
         # multi-minute translation unit.
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard0.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard1.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard2.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard3.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard4.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard5.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard6.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard7.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard0.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard1.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard2.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard3.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard4.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard5.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard6.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard7.hip
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
+        kernels/rocm/attention/ROCmQwenSparseAttention.hip # Flash Next selected-index attention
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/kvcache/ROCmAttentionKeyQ8Kernels.hip    # Quadratic-companded attention-key cache codec
         kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
@@ -692,11 +740,21 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmTPKVStateKernels.hip             # TP-local K/V state deinterleave for phase-split decode caches
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        kernels/rocm/gemm/ROCmQ8ResidualCorrection.hip # Explicit two-term native Q8 activation projection
+        kernels/rocm/qwen4exp/ROCmQwen4ExpKernels.hip # Flash Next residual and PLE primitives
+        kernels/rocm/qwen4exp/ROCmDiagnosticSnapshotCopy.hip
+        kernels/rocm/qwen4exp/ROCmImmutableLookupKernels.hip
+        kernels/rocm/qwen4exp/ROCmImmutableFixedHeadLookupKernels.hip
+        kernels/rocm/attention/ROCmQwenSparseReplay.hip
+        kernels/rocm/attention/ROCmQwen4ExpStateIO.hip
+        kernels/rocm/attention/ROCmQwen4ExpPLERetained.hip
+        kernels/rocm/attention/ROCmQwen4ExpBranchConcat.hip
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
+        backends/rocm/PlanningGPUClockMarker.hip # Bounded startup fixed-clock timing
         kernels/rocm/moe/ROCmMoEOverlayEpochKernels.hip       # Captured ExpertOverlay placement-epoch RCU
         # GPU weight loading pipeline repack kernels
         kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
@@ -719,12 +777,14 @@ if(HAVE_ROCM)
     # Note: ROCmWorkerImpl.cpp provides rocm_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(rocm_backend STATIC 
         backends/rocm/ROCmRuntimeStartup.cpp
+        backends/rocm/ROCmHardwareMetadata.cpp
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/rocm/AMDDeviceContext.cpp
         backends/rocm/AMDContextFactory.cpp
         backends/rocm/ROCmWorkerImpl.cpp
         backends/rocm/HipDeviceGuard.cpp
+        backends/rocm/HIPGraphObjectGeometry.cpp
         backends/rocm/HIPGraphCapture.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
@@ -732,7 +792,7 @@ if(HAVE_ROCM)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
-        kernels/rocm/gemm/ROCmNativeVNNIGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeVNNI GEMM
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeQuantised GEMM
         kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp # Typed common-generated exact prefill policy
         ${ROCM_KERNEL_SOURCES}
     )
@@ -757,6 +817,13 @@ if(HAVE_ROCM)
         ${ROCM_PATH}/lib/libhipblaslt.so         # hipBLASLt for fused GEMM+bias
     )
     
+    # HSA interop shares the selected HIP SDK's physical runtime. Resolve once
+    # during configuration, not through ldconfig/LD_LIBRARY_PATH at execution.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ROCmHSARuntime.cmake")
+    llaminar_find_rocm_hsa_runtime(ROCM_HSA_RUNTIME_LIBRARY)
+    set_property(SOURCE backends/rocm/ROCmBackend.cpp APPEND
+        PROPERTY COMPILE_DEFINITIONS "LLAMINAR_HSA_RUNTIME_LIBRARY_PATH=\"${ROCM_HSA_RUNTIME_LIBRARY}\"")
+
     # RCCLBackend.cpp needs MPI for MPIContext
     target_link_libraries(rocm_backend PUBLIC MPI::MPI_CXX)
     
@@ -857,6 +924,14 @@ if(HAVE_ROCM)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
 
+    # Shared proof authority is published by the dependency owner, before any
+    # test module/Release selection. Preserve explicit nonempty source builds.
+    if(NOT DEFINED RCCL_PROTOCOL_BUILD_DIR OR RCCL_PROTOCOL_BUILD_DIR STREQUAL "")
+        set(RCCL_PROTOCOL_BUILD_DIR "${RCCL_BUILD_DIR}" CACHE PATH
+            "Completed canonical RCCL source build for source/DSO-bound proofs" FORCE)
+    endif()
+    # End shared RCCL proof authority.
+
     if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
         find_package(Git REQUIRED)
     
@@ -871,25 +946,6 @@ if(HAVE_ROCM)
         "C++ compiler used for the nested RCCL source build")
     set(RCCL_ONLY_FUNCS "" CACHE STRING
         "Optional RCCL ONLY_FUNCS generator pattern for nested source builds")
-    
-    # Auto-detect GPU architecture for RCCL build
-    # Default to gfx906 (MI50/MI60) which is known to be broken in packaged RCCL
-    if(NOT DEFINED RCCL_GPU_TARGETS)
-        # Try to detect from rocminfo
-        execute_process(
-            COMMAND bash -c "rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-z]+' | head -1"
-            OUTPUT_VARIABLE DETECTED_GPU_TARGET
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(DETECTED_GPU_TARGET)
-            set(RCCL_GPU_TARGETS "${DETECTED_GPU_TARGET}")
-            message(STATUS "V2: Auto-detected GPU target for RCCL: ${RCCL_GPU_TARGETS}")
-        else()
-            set(RCCL_GPU_TARGETS "gfx906")
-            message(STATUS "V2: Using default GPU target for RCCL: ${RCCL_GPU_TARGETS}")
-        endif()
-    endif()
     
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY "${REPO_ROOT}/external")
@@ -960,9 +1016,48 @@ if(HAVE_ROCM)
     file(SHA256 "${RCCL_CAPTURE_PATCH_FILE}" RCCL_CAPTURE_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-live-rows.patch" RCCL_ROWS_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-native-host-storage.patch" RCCL_HOST_STORAGE_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-partial-file-cleanup.patch" RCCL_SHM_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-created-thread-lifetime.patch" RCCL_THREAD_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-communicator-protocol-defaults.patch" RCCL_PROTOCOL_PATCH_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}")
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-collective-selector-taxonomy.patch" RCCL_SELECTOR_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-small-allgather-ll-policy.patch" RCCL_SMALL_ALLGATHER_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-completed-broadcast.patch" RCCL_COMPLETED_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-sdk-legacy-smi.patch" RCCL_SMI_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-user-p2p-override.patch" RCCL_USER_P2P_PATCH_HASH)
+    # This is a nested dependency/compiler contract, not an inference admission
+    # policy. The fixed builder-owned linker preserves full parallel LTO and
+    # emits final physical allocation records for every native partition.
+    set(RCCL_LTO_ARTIFACT_SCRIPT "${REPO_ROOT}/scripts/docker/llvm-lto-linker/artifact.py")
+    set(RCCL_LTO_CACHE "${RCCL_BUILD_DIR}/llaminar-final-link.cmake")
+    set(RCCL_LTO_LINKER_PREFIX "" CACHE PATH
+        "Explicit proved linker prefix; empty selects the canonical ROCm pin")
+    set(RCCL_LTO_PREFIX_ARGS)
+    if(RCCL_LTO_LINKER_PREFIX)
+        list(APPEND RCCL_LTO_PREFIX_ARGS --linker-prefix "${RCCL_LTO_LINKER_PREFIX}")
+    endif()
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${RCCL_LTO_ARTIFACT_SCRIPT}" configure
+            --sdk "${ROCM_PATH}" --pins "${REPO_ROOT}/scripts/docker/rocm-release.env"
+            --spill-guard "${REPO_ROOT}/scripts/build/gpu_spill_guard.py"
+            --library "${RCCL_BUILD_DIR}/librccl.so.1.0"
+            --architectures "${RCCL_GPU_TARGETS}" --write-cache "${RCCL_LTO_CACHE}"
+            ${RCCL_LTO_PREFIX_ARGS}
+        RESULT_VARIABLE RCCL_LTO_CONFIG_RESULT ERROR_VARIABLE RCCL_LTO_CONFIG_ERROR)
+    if(NOT RCCL_LTO_CONFIG_RESULT EQUAL 0)
+        message(FATAL_ERROR "RCCL final-link compiler contract failed: ${RCCL_LTO_CONFIG_ERROR}")
+    endif()
+    file(READ "${RCCL_BUILD_DIR}/llaminar-final-allocation/configuration.json" RCCL_LTO_CONFIGURATION)
+    string(JSON RCCL_LTO_RECEIPT_HASH GET "${RCCL_LTO_CONFIGURATION}" linker_receipt_sha256)
+    file(SHA256 "${RCCL_LTO_ARTIFACT_SCRIPT}" RCCL_LTO_PRODUCER_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-smi-${RCCL_SMI_PATCH_HASH}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
     
+    # A changed requested target set requires new actual device binaries even
+    # when the pinned patched source is unchanged.
+    string(SHA256 RCCL_TARGET_POLICY_HASH "${RCCL_GPU_TARGETS}")
+    # Compiler metadata precedes the strict thread/protocol/smallAG repair suffix.
+    string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}-llvm-lto-${RCCL_LTO_RECEIPT_HASH}-producer-${RCCL_LTO_PRODUCER_HASH}-")
+    string(PREPEND RCCL_BUILD_ID "p2p-${RCCL_USER_P2P_PATCH_HASH}-")
+
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
     
@@ -990,10 +1085,14 @@ if(HAVE_ROCM)
         endif()
         message(STATUS "V2: NOTE: This may take 30-60+ minutes on first build")
 
+        # Preserve the entire target list as one subprocess argument. HIP's
+        # derived GPU_BUILD_TARGETS cache must change with GPU_TARGETS on reuse.
+        string(REPLACE ";" "\\;" RCCL_GPU_TARGETS_ARGUMENT "${RCCL_GPU_TARGETS}")
         set(RCCL_CONFIG_ARGS
             -B "${RCCL_BUILD_DIR}"
             -S "${RCCL_EXTERNAL_DIR}"
             -G Ninja
+            -C "${RCCL_LTO_CACHE}"
             -DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
             -DCMAKE_BUILD_TYPE=Release
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -1001,7 +1100,8 @@ if(HAVE_ROCM)
             -DCMAKE_CXX_COMPILER=${RCCL_CXX_COMPILER}
             -DCMAKE_PREFIX_PATH=${ROCM_PATH}
             -DROCM_PATH=${ROCM_PATH}
-            -DGPU_TARGETS=${RCCL_GPU_TARGETS}
+            "-DGPU_TARGETS=${RCCL_GPU_TARGETS_ARGUMENT}"
+            "-DGPU_BUILD_TARGETS=${RCCL_GPU_TARGETS_ARGUMENT}"
             -DBUILD_TESTS=OFF
         )
         if(RCCL_ONLY_FUNCS)
@@ -1033,11 +1133,32 @@ if(HAVE_ROCM)
         endif()
         
         # Write version file for cache validation
-        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_BUILD_ID}\n")
+        # The final receipt denotes a fully audited artifact, not merely a
+        # completed native linker process. Preserve any prior receipt on failure.
+        file(WRITE "${RCCL_VERSION_FILE}.pending" "${RCCL_BUILD_ID}\n")
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} "${RCCL_LTO_ARTIFACT_SCRIPT}" compile
+                --sdk "${ROCM_PATH}" --spec "${RCCL_BUILD_DIR}/llaminar-final-allocation/configuration.json"
+                --report "${RCCL_BUILD_DIR}/llaminar-final-allocation.json" --receipt "${RCCL_VERSION_FILE}.pending"
+            RESULT_VARIABLE RCCL_LTO_AUDIT_RESULT ERROR_VARIABLE RCCL_LTO_AUDIT_ERROR)
+        if(NOT RCCL_LTO_AUDIT_RESULT EQUAL 0)
+            message(FATAL_ERROR "RCCL final physical resource evidence failed: ${RCCL_LTO_AUDIT_ERROR}")
+        endif()
+        file(RENAME "${RCCL_VERSION_FILE}.pending" "${RCCL_VERSION_FILE}")
         
         message(STATUS "V2: RCCL built successfully in ${RCCL_BUILD_DIR}")
     else()
         message(STATUS "V2: RCCL already built in ${RCCL_BUILD_DIR}")
+    endif()
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${RCCL_LTO_ARTIFACT_SCRIPT}" verify
+            --report "${RCCL_BUILD_DIR}/llaminar-final-allocation.json"
+            --library "${RCCL_BUILD_DIR}/librccl.so.1.0" --receipt "${RCCL_VERSION_FILE}"
+            --spill-guard "${REPO_ROOT}/scripts/build/gpu_spill_guard.py"
+            --architectures "${RCCL_GPU_TARGETS}"
+        RESULT_VARIABLE RCCL_LTO_VERIFY_RESULT ERROR_VARIABLE RCCL_LTO_VERIFY_ERROR)
+    if(NOT RCCL_LTO_VERIFY_RESULT EQUAL 0)
+        message(FATAL_ERROR "RCCL build artifact has no current complete resource evidence: ${RCCL_LTO_VERIFY_ERROR}")
     endif()
     endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE
     
@@ -1075,6 +1196,15 @@ if(HAVE_ROCM)
     
     if(RCCL_INCLUDE_DIR AND RCCL_LIBRARY)
         set(HAVE_RCCL ON CACHE BOOL "RCCL library found")
+        # This is the actual configured RCCL compilation header, not a runtime search.
+        find_file(_rccl_abi_header NAMES rccl/rccl.h rccl.h
+            HINTS "${RCCL_INCLUDE_DIR}" NO_DEFAULT_PATH NO_CACHE)
+        if(NOT _rccl_abi_header)
+            message(FATAL_ERROR "Configured RCCL dependency has no selected rccl.h: ${RCCL_INCLUDE_DIR}")
+        endif()
+        target_sources(rocm_backend PRIVATE collective/backends/RCCLHeaderABIContract.cpp)
+        set_property(SOURCE collective/backends/RCCLHeaderABIContract.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS "LLAMINAR_RCCL_ABI_HEADER=\"${_rccl_abi_header}\"" "__HIP_PLATFORM_AMD__=1")
         add_compile_definitions(HAVE_RCCL)
 
         # Dynamic loading isolates RCCL's NCCL-named symbols, but must not
@@ -1205,7 +1335,7 @@ if(USE_ONEDNN)
 
     # Keep one installed oneDNN tree per compiled ISA. AVX512 binaries are
     # intentionally also exercised with AVX2 runtime dispatch by the CPU
-    # NativeVNNI trainer, while AVX2-only release artifacts remain separately
+    # NativeQuantised trainer, while AVX2-only release artifacts remain separately
     # runnable. A shared `build/` directory made configuring either tree erase
     # and relink the other, invalidating both evidence provenance and Docker's
     # dual-runtime image build.
@@ -1453,6 +1583,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/CPUBackend.cpp
     # GPUDeviceContextPool is backend-agnostic (uses factory functions registered by cuda_backend/rocm_backend)
     backends/GPUDeviceContextPool.cpp
+    backends/PreparedGPUWorkerThread.cpp
+    backends/NativeContextOpaqueContract.cpp
+    backends/NativeContextPreparation.cpp
+    backends/NativeContextRetirement.cpp
+    backends/GPUDeviceProcessLifetime.cpp
     # GPUDeviceWorker is backend-agnostic (uses forward-declared cuda_worker/rocm_worker namespaces)
     backends/GPUDeviceWorker.cpp
     # Execution framework (hierarchical work distribution)
@@ -1462,6 +1597,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/ComputeStageBase.cpp
     execution/compute_stages/ComputeStageFactory.cpp
     # Individual stages in compute_stages/stages/
+    execution/compute_stages/ProjectionRowWorkBinding.cpp
     execution/compute_stages/stages/GEMMStage.cpp
     execution/compute_stages/stages/FusedQKVGEMMStage.cpp
     execution/compute_stages/stages/FusedGateUpGEMMStage.cpp
@@ -1477,6 +1613,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoECPUExpertShardRouteStage.cpp
     execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
     execution/compute_stages/stages/MoEOverlayTicketPublishStage.cpp
@@ -1547,6 +1684,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayLocalCapacityPlanner.cpp
     execution/moe/MoEOverlayHostDemandMemoryPlan.cpp
     execution/moe/MoEExpertOverlayAuthorityPlan.cpp
+    execution/moe/MoEOptimizationMovementEndpoint.cpp
     execution/moe/MoEOptimizationMovementTopology.cpp
     execution/moe/MoEOptimizationPipeline.cpp
     execution/moe/MoEExpertOwnerMap.cpp
@@ -1563,6 +1701,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.cpp
     execution/moe/MoEOverlayDeviceControllerGraphService.cpp
     execution/moe/MoEOverlayResidencyAuthority.cpp
+    execution/moe/MoEOverlayCPUHostMaintenance.cpp
     execution/moe/MoEOverlayResidencySetup.cpp
     execution/moe/MoEPipelinePreparedPlan.cpp
     execution/runner/PreparedWeightAuthorityIdentity.cpp
@@ -1592,14 +1731,17 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEOverlayParticipantGraphRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
+    execution/moe/CPUExpertShardSourceSelection.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
     execution/moe/MoEOverlayInferenceTransaction.cpp
     execution/moe/MoEOverlayInferenceTransactionService.cpp
     execution/moe/MoEOverlayActivationEpochProtocol.cpp
+    execution/moe/CPUExpertShardRouteCompletion.cpp
     execution/moe/MoEOverlayRetainedActivationTransaction.cpp
     execution/moe/MoEOverlayRetainedParentComposer.cpp
     execution/moe/MoEOverlayRankBatchTransport.cpp
+    execution/moe/MoEOverlayRankBatchPreparation.cpp
     execution/moe/MoEOverlayNodeLocalRankBatchTransport.cpp
     execution/moe/MoEOverlayNodeLocalRouteExchange.cpp
     execution/moe/MoEOverlaySparseCollective.cpp
@@ -1662,6 +1804,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/graph/DeviceGraphExecutor.cpp
     execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp
     execution/local_execution/graph/RetainedParentTicketServiceWorker.cpp
+    execution/local_execution/graph/RetainedHostServiceProgram.cpp
+    execution/local_execution/graph/RetainedHostServiceDeclarations.cpp
+    execution/moe/MoEOverlayHostServiceContract.cpp
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
@@ -1670,13 +1815,19 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorPLE.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorServingGraphFamily.cpp
+    execution/local_execution/orchestrators/MTPGraphPolicyScopes.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp
     execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp
     execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp
     execution/local_execution/orchestrators/PipelineForwardGraphEdges.cpp
     execution/local_execution/orchestrators/PipelineActivationExchange.cpp
+    execution/local_execution/orchestrators/PipelineNativeByteChannel.cpp
+    execution/local_execution/orchestrators/Qwen4ExpFixedHeadPipelinePort.cpp
+    execution/local_execution/orchestrators/PipelineMaintenanceAdmission.cpp
     execution/local_execution/orchestrators/PipelineMetadataExchange.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
@@ -1689,9 +1840,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/config/HybridPrecisionConfig.cpp
     execution/config/InferenceMode.cpp
     execution/local_execution/device/DeviceWorkspaceManager.cpp
+    execution/local_execution/device/WorkspaceDescriptor.cpp
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
+    transfer/PreparedDevicePeerCopy.cpp
+    transfer/ImmutableNativeDeviceStorage.cpp
     transfer/CapturedTransferChannel.cpp
     transfer/MappedTransferProgressEpoch.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
@@ -1738,23 +1892,40 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Memory planning (pre-flight VRAM/RAM budget estimation)
     planning/ClusterInventoryGatherer.cpp
     planning/ModelMemoryProfile.cpp
+    planning/PreparedWeightPhysicalUses.cpp
     planning/WeightMemoryEstimator.cpp
     planning/WeightShardGeometry.cpp
     planning/PlanningForwardWeightWork.cpp
+    planning/PlanningImmutableLookupWork.cpp
     planning/PlanningForwardStateWork.cpp
     planning/KVCacheMemoryEstimator.cpp
     planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
+    backends/NativeAuxiliaryResourceCatalog.cpp
+    backends/NativeOrderingEventBudgetProjection.cpp
+    backends/NativeOrderingEventGroup.cpp
+    backends/ReadAheadNativeResourceFamily.cpp
+    backends/ReadAheadNativeParentTerminal.cpp
+    backends/PooledRemoteGraphProgram.cpp
+    backends/GPUFlatGraphStructure.cpp
+    backends/RetainedParticipantGraphExecutable.cpp
     planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
+    planning/ImmutableRowTablePlacementPlanner.cpp
+    planning/ImmutableRowTableAdmissionWire.cpp
     planning/PipelineTransferMemory.cpp
     planning/RankMemoryPlanInputs.cpp
     planning/MoEOverlayPlanningInputs.cpp
     planning/MoEOverlayMemoryPlanInputs.cpp
     planning/MoEPipelineMemoryAdmission.cpp
+    planning/OriginalRankCapacityExchange.cpp
     planning/PlanningModelMetadata.cpp
+    planning/PlanningAdmissionPreparation.cpp
+    planning/PlanningMemoryQuoteReuse.cpp
     planning/PlanningPublication.cpp
+    planning/PlanningHostServiceEvidence.cpp
+    planning/PlanningNativeContextEvidence.cpp
     planning/ResolvedRankOrchestration.cpp
     planning/AutomaticOrchestrationCandidates.cpp
     planning/OrchestrationCandidateAdmission.cpp
@@ -1762,9 +1933,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/AutomaticPlanningStartup.cpp
     planning/OrchestrationPerformanceEvidence.cpp
     planning/PlanningExecutionMeasurement.cpp
+    planning/PlanningGPUClockBuffer.cpp
     planning/PlanningMemoryBandwidthMeasurement.cpp
     planning/PlanningProjectionMeasurement.cpp
     planning/PlanningLocalTPMeasurement.cpp
+    planning/PlanningInterconnectCostMatrix.cpp
+    planning/PlanningPCIeCommunicationCost.cpp
     planning/PlanningCPUExpertMeasurement.cpp
     planning/PlanningGPUExpertMeasurement.cpp
     planning/PlanningModelSample.cpp
@@ -1777,6 +1951,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PlanningWeightServiceModel.cpp
     planning/PlanningRequestCostModel.cpp
     kernels/cpu/gemm/CPUWeightPreparationMemory.cpp
+    kernels/cpu/gemm/CPUWeightPreparationGeometry.cpp
+    kernels/cpu/gemm/CPUPreparedWeightWriter.cpp
     planning/PlanningMPITransferMeasurement.cpp
     planning/ExecutionRankMembership.cpp
     utils/MPIContext.cpp
@@ -1796,6 +1972,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
     app/MPIShutdown.cpp
+    collective/NativeCPUCollectiveProgram.cpp
     app/MPIProcessSession.cpp
     app/RuntimeInitPhase.cpp
     # Subcommands
@@ -1817,6 +1994,14 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/modes/HttpPrefixCacheStats.cpp
     app/modes/CompletionMode.cpp
     loaders/ModelLoader.cpp
+    loaders/ImmutableRowTable.cpp
+    loaders/CpuAdaptiveImmutableRowCache.cpp
+    loaders/HostImmutableRowProvider.cpp
+    loaders/ImmutableRowTablePolicy.cpp
+    loaders/ImmutableRowTableExtent.cpp
+    loaders/ImmutableRowTableLayoutGeometry.cpp
+    loaders/ResolvedImmutableRowTablePlacement.cpp
+    loaders/ResidentImmutableRowTable.cpp
     loaders/ModelContext.cpp
     models/ModelGenerationPolicy.cpp
     loaders/ModelContextConfig.cpp
@@ -1827,6 +2012,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/DeviceOrchestrator.cpp
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
+    loaders/PreparedWeightIdentityContract.cpp
     loaders/PreparedWeightStore.cpp
     loaders/WeightLoadProgressAggregator.cpp
     loaders/WeightLifecycleTrace.cpp
@@ -1846,6 +2032,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Qwen2 model and graph configuration
     models/ModelRegistrations.cpp
     models/qwen/QwenGraphBase.cpp
+    models/qwen/QwenGraphBaseResidual.cpp
     models/qwen/QwenStandardGraph.cpp
     models/qwen/QwenStandardGraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp
@@ -1855,8 +2042,51 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
     models/qwen35moe/Qwen35MoEGraph.cpp
     models/qwen35moe/Qwen35MoEGraphConfigBuilder.cpp
+    # Qwen3.8 Flash Next: authenticated geometry and native residual/PLE primitives.
+    models/qwen4exp/Qwen4ExpConfig.cpp
+    models/qwen4exp/Qwen4ExpSidecarManifest.cpp
+    models/qwen4exp/Qwen4ExpGraph.cpp
+    models/qwen4exp/Qwen4ExpFixedHeadShards.cpp
+    models/qwen4exp/Qwen4ExpReplicatedPLECohort.cpp
+    models/qwen4exp/Qwen4ExpReplicatedPLEPrefixOrigin.cpp
+    models/qwen4exp/Qwen4ExpPredictorGraph.cpp
+    models/qwen4exp/Qwen4ExpGraphConfigBuilder.cpp
+    models/qwen4exp/Qwen4ExpBufferLayout.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpFixedHeadLookupStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPLERetainedStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpBranchConcatStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorResidualBinding.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorProjectionLayout.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorGlobalBindings.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorBuilder.cpp
+    execution/compute_stages/stages/qwen4exp/QwenSparseAttentionStage.cpp
+    execution/compute_stages/stages/qwen4exp/ImmutableLookupStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.cpp
+    execution/qwen4exp/ImmutableLookupProtocol.cpp
+    execution/qwen4exp/ImmutableLookupService.cpp
+    execution/qwen4exp/ImmutableLookupExecutionBoundary.cpp
+    execution/qwen4exp/Qwen4ExpAuxiliaryState.cpp
+    execution/qwen4exp/ImmutableVerifierPrior.cpp
+    execution/prefix_cache/PrefixAuxiliaryStateIO.cpp
+    kernels/qwen4exp/QwenSparseReplay.cpp
+    kernels/qwen4exp/Qwen4ExpStateIO.cpp
+    kernels/qwen4exp/Qwen4ExpPLERetained.cpp
+    kernels/qwen4exp/Qwen4ExpBranchConcat.cpp
+    kernels/qwen4exp/Qwen4ExpPLERetainedDispatch.cpp
+    kernels/qwen4exp/Qwen4ExpKernels.cpp
+    kernels/common/DiagnosticSnapshotCopy.cpp
+    kernels/cpu/qwen4exp/CPUQwen4ExpKernels.cpp
+    kernels/cpu/qwen4exp/CPUImmutableLookupKernels.cpp
+    kernels/qwen4exp/ImmutableFixedHeadLookupKernels.cpp
+    kernels/qwen4exp/QwenSparseAttention.cpp
+    kernels/cpu/attention/CPUQwenSparseAttention.cpp
+    tensors/PreparedCPUWeightTensor.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
+    tensors/FP32ArenaReshape.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
     tensors/INT32Tensor.cpp
@@ -1917,6 +2147,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
     kernels/IMoEKernel.cpp
     kernels/cpu/moe/CPUCanonicalRouteReducer.cpp
+    kernels/cpu/moe/CPUCanonicalShardRouteRecords.cpp
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
@@ -1942,6 +2173,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/ToolCallParser.cpp
     utils/PerfStatsCollector.cpp
     utils/BenchmarkRunner.cpp
+    utils/BenchmarkCampaign.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
     collective/BackendRouter.cpp
@@ -1960,6 +2192,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     memory/NUMAAllocator.cpp
     # Buffer harmonization (Phase 1: BufferArena + CoherenceTracker)
     memory/BufferArena.cpp
+    memory/CPUTensorStorageDeclaration.cpp
+    memory/CPUGroupedMoEStorageBacking.cpp
+    memory/GraphArenaStorageLayout.cpp
     memory/CoherenceTracker.cpp
     # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
     collective/LocalTPContext.cpp
@@ -2092,6 +2327,7 @@ target_include_directories(llaminar2_core PRIVATE
 # - Debug builds: Always enabled (development/debugging)
 # - Integration builds: Always enabled (Release + debug symbols + snapshots)
 # - Release builds: Disabled by default (performance), enable with -DENABLE_SNAPSHOTS=ON
+# GPU opaque allowances use typed runtime/geometry classes, not application source fingerprints.
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Debug build)")
@@ -2141,7 +2377,7 @@ endif()
 
 # Required dependencies
 target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
-target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer)
+target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer PkgConfig::LLAMINAR_CPU_PLACEMENT_HWLOC)
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
@@ -2203,7 +2439,7 @@ if(HAVE_ROCM)
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
     target_sources(llaminar2_core PRIVATE
-        kernels/rocm/gemm/ROCmWeightPacker.cpp               # Weight packing utilities (native-VNNI + INT8 conversion)
+        kernels/rocm/gemm/ROCmWeightPacker.cpp               # Weight packing utilities (native-quantised + INT8 conversion)
         kernels/rocm/gemm/ROCmFloatingPointGemmKernel.cpp
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
         kernels/rocm/gemm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)
@@ -2218,6 +2454,19 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
         kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (routing, gather, scatter, gate, swiglu)
     )
+    # Only this bridge consumes the compiled choice. Other stages call its
+    # immutable function; flipping modes must not rebuild unrelated core TUs.
+    if(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "four_worker_planes")
+        set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=1)
+    elseif(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "serial")
+        set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=0)
+    else()
+        set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=2)
+    endif()
+    message(STATUS "V2: Compiled ROCm M1 owner partition policy: ${LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS}")
 
     if(LLAMINAR_SHARED_CORE)
         target_include_directories(llaminar2_core PUBLIC
@@ -2297,9 +2546,74 @@ if(USE_ONEDNN AND ONEDNN_FOUND)
     message(STATUS "V2: Linked OneDNN for INT8/BF16 GEMM acceleration")
 endif()
 
+# MPI launch ownership is deliberately independent of model and device startup.
+# The same small implementation owns production launcher and CTest lifetimes;
+# its standalone frontend must never link the accelerator-bearing core.
+find_package(Threads REQUIRED)
+# The module extends the selected native MPI launch hook. Resolve both native
+# libraries from that MPI closure, never an unrelated SDK or generic PATH.
+set(LLAMINAR_NATIVE_MPI_LIBRARY_DIRS "")
+foreach(LLAMINAR_MPI_LIBRARY IN LISTS MPI_CXX_LIBRARIES)
+    if(IS_ABSOLUTE "${LLAMINAR_MPI_LIBRARY}")
+        get_filename_component(LLAMINAR_MPI_LIBRARY_DIR "${LLAMINAR_MPI_LIBRARY}" DIRECTORY)
+        get_filename_component(LLAMINAR_MPI_REAL_LIBRARY "${LLAMINAR_MPI_LIBRARY}" REALPATH)
+        get_filename_component(LLAMINAR_MPI_REAL_LIBRARY_DIR "${LLAMINAR_MPI_REAL_LIBRARY}" DIRECTORY)
+        list(APPEND LLAMINAR_NATIVE_MPI_LIBRARY_DIRS
+            "${LLAMINAR_MPI_LIBRARY_DIR}" "${LLAMINAR_MPI_REAL_LIBRARY_DIR}")
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES LLAMINAR_NATIVE_MPI_LIBRARY_DIRS)
+find_library(LLAMINAR_MPI_ORTE_LIBRARY NAMES open-rte
+    PATHS ${LLAMINAR_NATIVE_MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+find_library(LLAMINAR_MPI_OPAL_LIBRARY NAMES open-pal
+    PATHS ${LLAMINAR_NATIVE_MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+add_library(llaminar_mpi_schizo MODULE utils/NativeMPISessionSchizo.cpp)
+target_compile_features(llaminar_mpi_schizo PRIVATE cxx_std_17)
+target_include_directories(llaminar_mpi_schizo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${MPI_CXX_INCLUDE_DIRS})
+target_link_libraries(llaminar_mpi_schizo PRIVATE
+    "${LLAMINAR_MPI_ORTE_LIBRARY}" "${LLAMINAR_MPI_OPAL_LIBRARY}")
+set_target_properties(llaminar_mpi_schizo PROPERTIES
+    PREFIX "" OUTPUT_NAME mca_schizo_llaminar
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/llaminar_mpi_components")
+add_library(llaminar_mpi_session_owner STATIC utils/MPISessionOwner.cpp)
+target_compile_features(llaminar_mpi_session_owner PRIVATE cxx_std_20)
+set_target_properties(llaminar_mpi_session_owner PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(llaminar_mpi_session_owner PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Process children inherit the configured OpenMP partition even when libgomp
+# binds the frontend before main(). Keep the same runtime ABI as the core.
+target_link_libraries(llaminar_mpi_session_owner PUBLIC
+    Threads::Threads OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+target_link_libraries(llaminar2_core PRIVATE llaminar_mpi_session_owner)
+add_executable(llaminar_mpi_session tools/MPISessionLauncher.cpp)
+target_link_libraries(llaminar_mpi_session PRIVATE llaminar_mpi_session_owner)
+add_dependencies(llaminar_mpi_session llaminar_mpi_schizo)
+add_dependencies(llaminar2_core llaminar_mpi_session)
+if(LLAMINAR_BUILD_TESTS)
+    # Standalone test frontends enter the same owner before MPI initialization.
+    # Keep the exact built helper beside those executables too; no PATH lookup
+    # or copied implementation may select a different ownership policy.
+    add_custom_command(TARGET llaminar_mpi_session POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/tests/v2"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:llaminar_mpi_session>"
+            "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_session"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_session"
+        VERBATIM)
+    add_custom_command(TARGET llaminar_mpi_schizo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_components"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:llaminar_mpi_schizo>"
+            "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_components/$<TARGET_FILE_NAME:llaminar_mpi_schizo>"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_components/mca_schizo_llaminar.so"
+        VERBATIM)
+endif()
+
 # Main executable
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
+add_dependencies(llaminar2 llaminar_mpi_session)
 
 # Metadata-only decoding belongs to the same runtime image as the server under
 # test. It authenticates OpenCode output without model execution or another
@@ -2344,7 +2658,8 @@ endif()
 # TODO: Intel MKL backend - not yet implemented
 
 # Install targets
-install(TARGETS llaminar2 llaminar2_core llaminar_native_tool_evidence_decoder llaminar_model_kld_canary
+install(TARGETS llaminar_mpi_schizo LIBRARY DESTINATION bin/llaminar_mpi_components)
+install(TARGETS llaminar2 llaminar2_core llaminar_mpi_session llaminar_native_tool_evidence_decoder llaminar_model_kld_canary
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
@@ -2383,3 +2698,82 @@ if(HAVE_CUDA AND USE_ONNX_HEURISTIC)
         message(WARNING "CUDA GEMM Pipeline file not found: ${PIPELINE_FILE}")
     endif()
 endif()
+
+# Source-owned pooled physical protocol only; no runtime mode or transport capability.
+target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutablePhysicalOwnerGeometry.cpp)
+
+# One source-owned shared policy/coalescing protocol; no serving selector or native transport.
+target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutableCoordinatorGeometry.cpp)
+target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutableLocalHotGeometry.cpp)
+
+# Original-source local hot roots and checked stateless native phase adapters.
+target_sources(llaminar2_core PRIVATE
+    kernels/qwen4exp/PooledImmutableLocalHotNativePlan.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotOperands.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotKernels.cpp)
+if(TARGET cuda_backend)
+    target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableLocalHotKernels.cu)
+endif()
+if(TARGET rocm_backend)
+    set_source_files_properties(kernels/rocm/qwen4exp/ROCmPooledImmutableLocalHotKernels.hip PROPERTIES LANGUAGE HIP)
+    target_sources(rocm_backend PRIVATE kernels/rocm/qwen4exp/ROCmPooledImmutableLocalHotKernels.hip)
+endif()
+
+
+# Native pooled phases remain participant-local prerequisites; this adds no serving mode.
+target_sources(llaminar2_core PRIVATE
+    kernels/qwen4exp/PooledImmutableNativePlan.cpp
+    kernels/qwen4exp/PooledImmutableNativeStorage.cpp
+    kernels/qwen4exp/PooledImmutableNativeOperands.cpp
+    kernels/qwen4exp/PooledImmutableNativeKernels.cpp
+    execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.cpp)
+target_sources(llaminar2_core PRIVATE
+    execution/compute_stages/stages/qwen4exp/PooledImmutableLocalHotPhaseStage.cpp)
+if(HAVE_CUDA)
+    target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableNativeKernels.cu)
+endif()
+if(HAVE_ROCM)
+    set_source_files_properties(kernels/rocm/qwen4exp/ROCmPooledImmutableNativeKernels.hip PROPERTIES LANGUAGE HIP)
+    target_sources(rocm_backend PRIVATE kernels/rocm/qwen4exp/ROCmPooledImmutableNativeKernels.hip)
+endif()
+
+# Real pooled source storage stays in the existing retained service/boundary ownership.
+target_sources(llaminar2_core PRIVATE
+    kernels/qwen4exp/PooledImmutableSourceGeometry.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.cpp
+    kernels/qwen4exp/PooledImmutableSourcePreparedStorage.cpp
+    kernels/qwen4exp/PooledImmutableSourceKernels.cpp
+    execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.cpp
+    execution/qwen4exp/PooledImmutableLocalLookupGraph.cpp
+    execution/qwen4exp/PooledImmutableLocalHotGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantPinGraph.cpp
+    execution/qwen4exp/PooledImmutableDirectedTransport.cpp
+    execution/qwen4exp/PooledImmutableNativeTransfer.cpp
+    execution/qwen4exp/PooledImmutableTransferBinding.cpp
+    execution/qwen4exp/PooledImmutableParticipantFreeGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantVictimGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantLocalGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantSourceGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantPublicationGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantReadGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantRetirementGraph.cpp)
+if(HAVE_CUDA)
+    target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableSourceKernels.cu)
+endif()
+if(HAVE_ROCM)
+    set_source_files_properties(kernels/rocm/qwen4exp/ROCmPooledImmutableSourceKernels.hip PROPERTIES LANGUAGE HIP)
+    target_sources(rocm_backend PRIVATE kernels/rocm/qwen4exp/ROCmPooledImmutableSourceKernels.hip)
+endif()
+
+# Startup-only original shared-file publication; the process owner library stays MPI-free.
+target_sources(llaminar2_core PRIVATE
+    utils/MPISessionSharedDirectory.cpp
+    execution/moe/MoEOverlaySharedBackingStartup.cpp)
+
+# Closed source-authored remote plans and the actual participant-local builder.
+target_sources(llaminar2_core PRIVATE
+    execution/qwen4exp/PooledImmutableDirectedOwnerProgram.cpp
+    execution/qwen4exp/PooledImmutableDirectedLookupGraph.cpp
+    execution/qwen4exp/PooledImmutableReplicatedReaderGraph.cpp
+    execution/qwen4exp/PooledImmutableRetainedParticipants.cpp)

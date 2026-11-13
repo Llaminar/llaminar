@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# @file check_no_default_stream_in_gpu_code.sh
+# @brief Preserve all explicit-stream checks while batching lexical candidate discovery.
 # ===========================================================================
 # Hygiene check: no usage of the default (nullptr/0) CUDA/HIP stream in
 # production GPU kernels and stages.
@@ -303,6 +305,28 @@ EOF
     trap - RETURN
 }
 
+# @brief Collect exact original pattern candidates once for a complete directory.
+# @param $1 Existing associative membership array, receiving only matching original paths.
+# @param $2 Unchanged original grep pattern or conservative literal candidate expression.
+# @param $@ Complete original source file inventory after the first two arguments.
+# @return Zero for a matching or proved-empty set; original grep errors fail closed.
+# A nameref keeps NUL-safe file membership; no candidate parser or diagnostic changes.
+collect_pattern_candidates()
+{
+    local -n output="$1"
+    local pattern="$2"
+    shift 2
+    local candidate_pid candidate_status file
+    local -a found=()
+    mapfile -d '' found < <(grep -lZE "$pattern" -- "$@")
+    candidate_pid=$!
+    if wait "$candidate_pid"; then :; else
+        candidate_status=$?
+        if (( candidate_status != 1 )); then return "$candidate_status"; fi
+    fi
+    for file in "${found[@]}"; do output["$file"]=1; done
+}
+
 # ==========================================================================
 # Scan
 # ==========================================================================
@@ -317,8 +341,22 @@ for dir in "${scan_dirs[@]}"; do
         continue
     fi
 
-    # Find GPU source files (.cu, .hip, .cpp, .h in GPU dirs)
-    while IFS= read -r -d '' file; do
+    # Enumerate exactly the original inventory, including allowlist bookkeeping.
+    # One directory-wide lexical candidate pass avoids spawning all seven
+    # parsers for files that cannot contain any original pattern. Candidate
+    # files still execute the unchanged parsers and diagnostics below.
+    mapfile -d '' source_files < <(find "$abs_dir" -type f \( -name '*.cu' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' \) -print0)
+    (( ${#source_files[@]} )) || continue
+    declare -A candidates=() cuda_candidates=() hip_candidates=()
+    declare -A async_candidates=() default_candidates=() null_candidates=() override_candidates=()
+    collect_pattern_candidates candidates '<<<|hipLaunchKernelGGL|hipMemcpy|cudaMemcpy|hipMemset|cudaMemset|hipStream_t|cudaStream_t|setGPUStream' "${source_files[@]}"
+    collect_pattern_candidates cuda_candidates '<<<' "${source_files[@]}"
+    collect_pattern_candidates hip_candidates 'hipLaunchKernelGGL' "${source_files[@]}"
+    collect_pattern_candidates async_candidates "$pattern_async_nullptr" "${source_files[@]}"
+    collect_pattern_candidates default_candidates "$pattern_default_param" "${source_files[@]}"
+    collect_pattern_candidates null_candidates "$pattern_null_kernel_stream_binding" "${source_files[@]}"
+    collect_pattern_candidates override_candidates "$pattern_raw_kernel_stream_override" "${source_files[@]}"
+    for file in "${source_files[@]}"; do
         rel_path="${file#"${repo_root}/"}"
 
         if is_allowed_file "${rel_path}"; then
@@ -331,10 +369,12 @@ for dir in "${scan_dirs[@]}"; do
             continue
         fi
 
+        [[ -n "${candidates[$file]:-}" ]] || continue
+
         file_violations=""
 
         # Check Pattern 1: CUDA 3-arg launch (only for .cu files)
-        if [[ "$file" == *.cu ]]; then
+        if [[ "$file" == *.cu && -n "${cuda_candidates[$file]:-}" ]]; then
             p1_hits=$(check_cuda_launch_no_stream "$file" || true)
             if [[ -n "$p1_hits" ]]; then
                 file_violations+="$p1_hits"$'\n'
@@ -342,7 +382,7 @@ for dir in "${scan_dirs[@]}"; do
         fi
 
         # Check Pattern 2: hipLaunchKernelGGL with 0/nullptr stream
-        if [[ "$file" == *.hip || "$file" == *.cpp ]]; then
+        if [[ ( "$file" == *.hip || "$file" == *.cpp ) && -n "${hip_candidates[$file]:-}" ]]; then
             p2_hits=$(check_hip_launch_default_stream "$file" || true)
             if [[ -n "$p2_hits" ]]; then
                 file_violations+="$p2_hits"$'\n'
@@ -350,13 +390,19 @@ for dir in "${scan_dirs[@]}"; do
         fi
 
         # Check Pattern 3: Async API with nullptr/0
-        p3_hits=$(grep -n -E "$pattern_async_nullptr" "$file" 2>/dev/null || true)
+        p3_hits=""
+        if [[ -n "${async_candidates[$file]:-}" ]]; then
+            p3_hits=$(grep -n -E "$pattern_async_nullptr" "$file" 2>/dev/null || true)
+        fi
         if [[ -n "$p3_hits" ]]; then
             file_violations+="$p3_hits"$'\n'
         fi
 
         # Check Pattern 4: Default stream parameter in function signatures
-        p4_hits=$(grep -n -E "$pattern_default_param" "$file" 2>/dev/null || true)
+        p4_hits=""
+        if [[ -n "${default_candidates[$file]:-}" ]]; then
+            p4_hits=$(grep -n -E "$pattern_default_param" "$file" 2>/dev/null || true)
+        fi
         if [[ -n "$p4_hits" ]]; then
             while IFS= read -r hit; do
                 if is_default_param_violation "$hit"; then
@@ -366,13 +412,19 @@ for dir in "${scan_dirs[@]}"; do
         fi
 
         # Check Pattern 6: setGPUStream(nullptr) used as teardown.
-        p6_hits=$(grep -n -E "$pattern_null_kernel_stream_binding" "$file" 2>/dev/null || true)
+        p6_hits=""
+        if [[ -n "${null_candidates[$file]:-}" ]]; then
+            p6_hits=$(grep -n -E "$pattern_null_kernel_stream_binding" "$file" 2>/dev/null || true)
+        fi
         if [[ -n "$p6_hits" ]]; then
             file_violations+="$p6_hits"$'\n'
         fi
 
         # Check Pattern 7: a kernel bypasses the validated binding callback.
-        p7_hits=$(grep -n -E "$pattern_raw_kernel_stream_override" "$file" 2>/dev/null || true)
+        p7_hits=""
+        if [[ -n "${override_candidates[$file]:-}" ]]; then
+            p7_hits=$(grep -n -E "$pattern_raw_kernel_stream_override" "$file" 2>/dev/null || true)
+        fi
         if [[ -n "$p7_hits" ]]; then
             file_violations+="$p7_hits"$'\n'
         fi
@@ -383,7 +435,7 @@ for dir in "${scan_dirs[@]}"; do
                 violations+=("${rel_path}:${v}")
             done <<< "$file_violations"
         fi
-    done < <(find "$abs_dir" -type f \( -name '*.cu' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' \) -print0)
+    done
 done
 
 # Public API contracts must not let callers omit a GPU stream.

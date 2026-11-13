@@ -13,11 +13,18 @@
  * compilation; replay never walks or edits the retained dependency graph.
  * Setup-only kernel inspection distinguishes registered host stubs from
  * admitted module handles and retains each representation's typed resource APIs.
+ * Expected registry misses belong only to their inspection query: inspection
+ * rejects pre-existing HIP errors and consumes its own precise module probe miss
+ * before resolving resources, leaving genuine query/launch failures observable.
+ * A context-owned projection lease encloses native begin/end, including abort,
+ * so another parent cannot reuse forked streams before HIP releases membership.
  */
 
 #ifdef HAVE_ROCM
 
+#include "backends/detail/GPUFlatGraphInspection.h"
 #include "HIPGraphCapture.h"
+#include "AMDDeviceContext.h"
 #include "../NativeParallelGraphBranch.h"
 #include "../NativeGraphDependencyReduction.h"
 #include "HIPGraphTimelineKernels.h"
@@ -576,6 +583,10 @@ namespace llaminar2
          * handle specifically on hipErrorInvalidSymbol from its host registry.
          * Mirror that distinction for an already admitted node. Other errors
          * never authorize casting a failed host lookup to a module function.
+         * The caller first proves the thread's incoming HIP error is clean.
+         * Consume only this query's exact expected registry miss immediately;
+         * successful module queries do not clear HIP's sticky last-error slot.
+         * All unexpected failures remain fatal and retain their error state.
          */
         bool resolveHIPGraphKernel(
             const void *raw, const std::string &path,
@@ -591,6 +602,22 @@ namespace llaminar2
             if (status != hipErrorInvalidSymbol)
             {
                 error = "hipFuncGetAttributes failed at " + path + ": " + hipGetErrorString(status);
+                return false;
+            }
+            const hipError_t probe_error = hipPeekAtLastError();
+            if (probe_error != hipErrorInvalidSymbol)
+            {
+                error = "HIP graph module probe error ownership changed at " + path +
+                    ": " + hipGetErrorString(probe_error);
+                return false;
+            }
+            // The thread-local error belongs to this immediately preceding
+            // failed host-registry query, not to any kernel submission.
+            const hipError_t consumed_probe_error = hipGetLastError();
+            if (consumed_probe_error != hipErrorInvalidSymbol)
+            {
+                error = "HIP graph module probe consumption changed at " + path +
+                    ": " + hipGetErrorString(consumed_probe_error);
                 return false;
             }
             const auto module = reinterpret_cast<hipFunction_t>(const_cast<void *>(raw));
@@ -696,6 +723,13 @@ namespace llaminar2
                     hipFuncAttributes attributes{};
                     if (!resolveHIPGraphKernel(params.func, node_path, function, attributes, error))
                         return false;
+                    // Empty HIP kernels can use zero VGPRs. Preserve that
+                    // observation while rejecting malformed signed metadata.
+                    if (attributes.numRegs < 0)
+                    {
+                        error = "HIP kernel node has a negative register count at " + node_path;
+                        return false;
+                    }
                     const auto *module = std::get_if<HIPModuleKernel>(&function);
                     const char *runtime_name = module != nullptr
                         ? hipKernelNameRef(module->function)
@@ -747,7 +781,7 @@ namespace llaminar2
                         .static_shared_memory_bytes = attributes.sharedSizeBytes,
                         .local_memory_bytes_per_thread = attributes.localSizeBytes,
                         .registers_per_thread = static_cast<uint32_t>(
-                            std::max(0, attributes.numRegs)),
+                            attributes.numRegs),
                         .max_threads_per_block = static_cast<uint32_t>(
                             std::max(0, attributes.maxThreadsPerBlock)),
                         .max_active_blocks_per_sm = static_cast<uint32_t>(
@@ -819,9 +853,22 @@ namespace llaminar2
 
     HIPGraphCapture::~HIPGraphCapture() { reset(); }
 
+    HIPGraphCapture::HIPGraphCapture(hipStream_t stream, int device_ordinal, AMDDeviceContext &owner)
+        : HIPGraphCapture(stream, device_ordinal)
+    {
+        if (owner.deviceOrdinal() != device_ordinal)
+            throw std::invalid_argument("HIP capture requires its exact worker device owner");
+        projection_context_lifetime_ = owner.retainProjectionContextOwner();
+        projection_owner_ = &owner;
+    }
+
     HIPGraphCapture::HIPGraphCapture(HIPGraphCapture &&other) noexcept
         : stream_(other.stream_), device_ordinal_(other.device_ordinal_),
           graph_(other.graph_), exec_(other.exec_),
+          projection_owner_(std::exchange(other.projection_owner_, nullptr)),
+          projection_context_lifetime_(std::move(other.projection_context_lifetime_)),
+          projection_submission_(std::move(other.projection_submission_)),
+          native_capture_active_(std::exchange(other.native_capture_active_, false)),
           node_count_(other.node_count_),
           resident_memory_bytes_(other.resident_memory_bytes_),
           ordered_timeline_timing_events_(
@@ -831,11 +878,14 @@ namespace llaminar2
     {
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
+        definition_scope_=std::move(other.definition_scope_);
+        fragment_frontiers_=std::move(other.fragment_frontiers_);
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
         other.resident_memory_bytes_ = 0u;
         other.ordered_timeline_timing_pending_ = false;
+        other.projection_submission_.reset();
     }
 
     HIPGraphCapture &HIPGraphCapture::operator=(HIPGraphCapture &&other) noexcept
@@ -847,6 +897,12 @@ namespace llaminar2
             device_ordinal_ = other.device_ordinal_;
             graph_ = other.graph_;
             exec_ = other.exec_;
+            projection_owner_ = std::exchange(other.projection_owner_, nullptr);
+            projection_context_lifetime_ = std::move(other.projection_context_lifetime_);
+            if (other.projection_submission_)
+                projection_submission_.emplace(std::move(*other.projection_submission_));
+            other.projection_submission_.reset();
+            native_capture_active_ = std::exchange(other.native_capture_active_, false);
             node_count_ = other.node_count_;
             resident_memory_bytes_ = other.resident_memory_bytes_;
             ordered_timeline_timing_events_ =
@@ -855,6 +911,8 @@ namespace llaminar2
                 other.ordered_timeline_timing_pending_;
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
+            definition_scope_=std::move(other.definition_scope_);
+            fragment_frontiers_=std::move(other.fragment_frontiers_);
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
@@ -889,6 +947,10 @@ namespace llaminar2
 
     bool HIPGraphCapture::beginCapture()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
+        if (native_capture_active_)
+            throw std::logic_error("HIP graph capture already owns a live native recording interval");
         if (!activateOwner("beginCapture"))
             return false;
         // Destroy any previous graph (but keep exec_ for tryUpdate)
@@ -907,10 +969,68 @@ namespace llaminar2
             destroyOrderedTimelineTimingEvents();
         }
 
+        if (projection_owner_)
+            projection_submission_.emplace(projection_owner_->acquireProjectionSubmission(
+                static_cast<void *>(stream_), GPUProjectionSubmissionKind::Capture));
         hipError_t err = hipStreamBeginCapture(stream_, hipStreamCaptureModeRelaxed);
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipStreamBeginCapture failed: " << hipGetErrorString(err));
+            projection_submission_.reset();
+            return false;
+        }
+        native_capture_active_ = true;
+        return true;
+    }
+
+    hipError_t HIPGraphCapture::endNativeCapture(hipGraph_t *captured_graph)
+    {
+        const auto error = hipStreamEndCapture(stream_, captured_graph);
+        if (error != hipSuccess)
+        {
+            hipStreamCaptureStatus status{};
+            if (hipStreamIsCapturing(stream_, &status) != hipSuccess || status != hipStreamCaptureStatusNone)
+            {
+                LOG_ERROR("[HIPGraphCapture] Native capture termination is unproved; refusing to release projection resources");
+                std::terminate();
+            }
+        }
+        native_capture_active_ = false;
+        projection_submission_.reset();
+        return error;
+    }
+
+    bool HIPGraphCapture::appendActiveCaptureChild(const IGPUGraphCapture &child)
+    {
+        const auto *recorded = dynamic_cast<const HIPGraphCapture *>(&child);
+        if (!native_capture_active_ || !recorded || recorded == this ||
+            recorded->device_ordinal_ != device_ordinal_ || recorded->projection_owner_ != projection_owner_ ||
+            recorded->native_capture_active_ || !recorded->graph_ || !recorded->node_count_ ||
+            recorded->exec_ || !activateOwner("appendActiveCaptureChild"))
+            return false;
+
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        unsigned long long capture_id = 0;
+        hipGraph_t destination = nullptr;
+        const hipGraphNode_t *dependencies = nullptr;
+        std::size_t count = 0;
+        const auto query = hipStreamGetCaptureInfo_v2(stream_, &status, &capture_id,
+            &destination, &dependencies, &count);
+        if (query != hipSuccess || status != hipStreamCaptureStatusActive || !capture_id ||
+            !destination || destination == recorded->graph_ || (graph_ && destination != graph_) ||
+            (count && !dependencies))
+        {
+            LOG_ERROR("[HIPGraphCapture] Shared child could not resolve its active stream frontier: "
+                      << hipGetErrorString(query));
+            return false;
+        }
+        hipGraphNode_t node = nullptr;
+        auto result = hipGraphAddChildGraphNode(&node, destination, dependencies, count, recorded->graph_);
+        if (result == hipSuccess && node)
+            result = hipStreamUpdateCaptureDependencies(stream_, &node, 1u, hipStreamSetCaptureDependencies);
+        if (result != hipSuccess || !node)
+        {
+            LOG_ERROR("[HIPGraphCapture] Shared child frontier import failed: " << hipGetErrorString(result));
             return false;
         }
         return true;
@@ -918,16 +1038,20 @@ namespace llaminar2
 
     bool HIPGraphCapture::endCapture()
     {
+        if (!native_capture_active_)
+            return false;
         if (!activateOwner("endCapture"))
             return false;
         const auto end_capture_begin = std::chrono::steady_clock::now();
-        hipError_t err = hipStreamEndCapture(stream_, &graph_);
+        hipError_t err = endNativeCapture(&graph_);
         const auto end_capture_elapsed =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - end_capture_begin);
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipStreamEndCapture failed: " << hipGetErrorString(err));
+            if (graph_ && hipGraphDestroy(graph_) != hipSuccess)
+                std::terminate();
             graph_ = nullptr;
             return false;
         }
@@ -1261,6 +1385,8 @@ namespace llaminar2
                     reset();
                     return false;
                 }
+                fragment_frontiers_.remember(fragments[index],fragments[index]->definitionScope(),
+                    fragments[index]->graph(),fragments[index]->nodeCount(),imported.leaves);
                 frontier = std::move(imported.leaves);
                 expected_node_count += imported.node_count;
             }
@@ -1352,6 +1478,80 @@ namespace llaminar2
         };
     }
 
+    bool HIPGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        const IGPUGraphCapture& producer, const IGPUGraphCapture& body)
+    {
+        const std::array<const IGPUGraphCapture*, 1> producers{&producer};
+        return appendFiniteBodyAfterCapturedFragment(producers, body);
+    }
+
+    bool HIPGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body)
+    {
+        if (!activateOwner("appendFiniteBodyAfterCapturedFragment") || !graph_ || exec_ ||
+            !node_count_ || native_capture_active_ || producers.empty()) return false;
+        const auto* auxiliary = dynamic_cast<const HIPGraphCapture*>(&body);
+        if (!auxiliary || auxiliary == this || auxiliary->deviceOrdinal() != device_ordinal_ ||
+            auxiliary->projection_owner_ != projection_owner_ || !auxiliary->graph() ||
+            auxiliary->graph() == graph_ || !auxiliary->nodeCount() || auxiliary->hasExecutable() ||
+            auxiliary->native_capture_active_ ||
+            fragment_frontiers_.alreadyAttached(auxiliary, auxiliary->definitionScope(), auxiliary->graph())) return false;
+
+        using Definition = typename decltype(fragment_frontiers_)::Definition;
+        std::vector<Definition> original_definitions;
+        for (const auto* producer : producers)
+        {
+            const auto* original = dynamic_cast<const HIPGraphCapture*>(producer);
+            if (!original || original == this || original == auxiliary ||
+                original->deviceOrdinal() != device_ordinal_ || original->projection_owner_ != projection_owner_ ||
+                !original->graph() || !original->nodeCount() || original->hasExecutable() ||
+                original->native_capture_active_) return false;
+            original_definitions.push_back({original, original->definition_scope_, original->graph(), original->nodeCount()});
+        }
+        const auto frontier = fragment_frontiers_.requireJoined(original_definitions);
+        if (frontier.empty()) return false;
+        // Only these exact original exits gate the new body. Existing later
+        // main units remain independent; normal parent completion joins every
+        // finite child. Retaining the actual child exit permits the next body
+        // to join prior local Retire with genuine accepted-history publication.
+        const auto result = detail::appendNativeFiniteBodyAfterFrontier<HIPParallelGraphAPI>(graph_, auxiliary->graph(), frontier);
+        if (result.error != hipSuccess)
+        {
+            LOG_ERROR("[HIPGraphCapture] Finite producer attachment failed operation=" << result.operation
+                      << " error=" << hipGetErrorString(result.error));
+            return false;
+        }
+        definition_scope_.reset();
+        fragment_frontiers_.attached(auxiliary, auxiliary->definitionScope(), auxiliary->graph(),
+            auxiliary->nodeCount(), result.appended_exit);
+        std::size_t count = 0;
+        if (hipGraphGetNodes(graph_, nullptr, &count) != hipSuccess) return false;
+        node_count_ = count;
+        return true;
+    }
+
+    bool HIPGraphCapture::appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> originals)
+    {
+        if(!activateOwner("appendFiniteBodySiblings") || !graph_ || exec_ || !node_count_ || native_capture_active_ || originals.empty())return false;
+        hipStreamCaptureStatus status{};
+        if(hipStreamIsCapturing(stream_,&status)!=hipSuccess || status!=hipStreamCaptureStatusNone)return false;
+        std::vector<hipGraph_t> siblings;siblings.reserve(originals.size());
+        for(const auto* original:originals){
+            const auto* sibling=dynamic_cast<const HIPGraphCapture*>(original);
+            if(!sibling || sibling==this || sibling->deviceOrdinal()!=device_ordinal_ ||
+               !sibling->graph() || sibling->graph()==graph_ || !sibling->nodeCount() || sibling->hasExecutable() || sibling->native_capture_active_ ||
+               std::find(siblings.begin(),siblings.end(),sibling->graph())!=siblings.end())return false;
+            siblings.push_back(sibling->graph());
+        }
+        const auto result=detail::appendNativeFiniteBodySiblings<HIPParallelGraphAPI>(graph_,siblings);
+        if(result.error!=hipSuccess){
+            LOG_ERROR("[HIPGraphCapture] Finite sibling assembly failed operation="<<result.operation<<" error="<<hipGetErrorString(result.error));
+            return false;
+        }
+        std::size_t count=0;if(hipGraphGetNodes(graph_,nullptr,&count)!=hipSuccess)return false;
+        node_count_=count;return true;
+    }
+
     bool HIPGraphCapture::appendParallelBranch(
         const GPUCapturedParallelBranch &branch)
     {
@@ -1382,7 +1582,25 @@ namespace llaminar2
             }
             fragments[i] = source->graph();
         }
-        const auto result = detail::appendNativeParallelBranch<HIPParallelGraphAPI>(graph_, fragments);
+        // Every finite sibling is a cold original definition. Reject aliases
+        // of Open/progress/Close: a progress-as-body alias would make Close
+        // wait for the very worker whose device loop waits for Close.
+        std::vector<hipGraph_t> siblings;
+        siblings.reserve(branch.body_siblings.size());
+        for (const auto* original : branch.body_siblings)
+        {
+            const auto* sibling = dynamic_cast<const HIPGraphCapture*>(original);
+            if (!sibling || sibling == this || sibling->deviceOrdinal() != device_ordinal_ ||
+                !sibling->graph() || sibling->graph() == graph_ || !sibling->nodeCount() || sibling->hasExecutable() ||
+                std::find(fragments.begin(), fragments.end(), sibling->graph()) != fragments.end() ||
+                std::find(siblings.begin(), siblings.end(), sibling->graph()) != siblings.end())
+            {
+                LOG_ERROR("[HIPGraphCapture] Finite body sibling has incompatible original graph ownership");
+                return false;
+            }
+            siblings.push_back(sibling->graph());
+        }
+        const auto result = detail::appendNativeParallelBranch<HIPParallelGraphAPI>(graph_, fragments, siblings);
         if (result.error != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] Parallel graph assembly failed operation=" <<
@@ -1487,6 +1705,36 @@ namespace llaminar2
         return node_count_;
     }
 
+    bool HIPGraphCapture::inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,
+        std::span<std::byte> scratch,GPUFlatGraphStructure& observed,std::string* error)const
+    {
+        observed={};if(error)error->clear();
+        if(!activateOwner("inspectFlatGraphStructure") || !graph_){
+            if(error)*error="Flat graph inspection lost its original backend owner/definition";
+            return false;
+        }
+        struct API {
+            using Node=hipGraphNode_t;
+            hipGraph_t graph;
+            bool nodes(Node* values,std::size_t* count){return hipGraphGetNodes(graph,values,count)==hipSuccess;}
+            bool edges(Node* from,Node* to,std::size_t* count){return hipGraphGetEdges(graph,from,to,count)==hipSuccess;}
+            bool kind(Node node,GPUFlatGraphNodeKind& value){
+                hipGraphNodeType native;
+                if(hipGraphNodeGetType(node,&native)!=hipSuccess)return false;
+                switch(native){
+                case hipGraphNodeTypeKernel:value=GPUFlatGraphNodeKind::Kernel;return true;
+                case hipGraphNodeTypeMemcpy:value=GPUFlatGraphNodeKind::Copy;return true;
+                case hipGraphNodeTypeMemset:value=GPUFlatGraphNodeKind::Set;return true;
+                case hipGraphNodeTypeEmpty:value=GPUFlatGraphNodeKind::Empty;return true;
+                case hipGraphNodeTypeWaitEvent:value=GPUFlatGraphNodeKind::EventWait;return true;
+                case hipGraphNodeTypeEventRecord:value=GPUFlatGraphNodeKind::EventRecord;return true;
+                default:return false;
+                }
+            }
+        } api{graph_};
+        return detail::inspectFlatGraph(api,limits,scratch,observed,error);
+    }
+
     bool HIPGraphCapture::validateFlatHelperNodeKinds(std::string *error) const
     {
         const auto fail = [&](const std::string &detail)
@@ -1528,11 +1776,21 @@ namespace llaminar2
         std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
         std::string *error) const
     {
-        if (!activateOwner("inspectKernelNodes"))
-            return false;
         kernel_nodes.clear();
         if (error)
             error->clear();
+        // A successful metadata probe must never consume an earlier launch or
+        // API error. Peek before any inspection API can replace its ownership.
+        const hipError_t incoming_error = hipPeekAtLastError();
+        if (incoming_error != hipSuccess)
+        {
+            if (error)
+                *error = std::string("HIP graph inspection rejected pre-existing error: ") +
+                    hipGetErrorString(incoming_error);
+            return false;
+        }
+        if (!activateOwner("inspectKernelNodes"))
+            return false;
         if (graph_ == nullptr)
         {
             if (error)
@@ -1557,8 +1815,23 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Destroy original native handles before clearing ownership/accounting state.
+     * @note Failed activation or native teardown is fatal: returning would let an
+     * enclosing PMA retirement owner falsely publish successful handle destruction.
+     */
     void HIPGraphCapture::reset()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
+        if (native_capture_active_)
+        {
+            if (!activateOwner("abortCapture")) std::terminate();
+            hipGraph_t abandoned = nullptr;
+            (void)endNativeCapture(&abandoned);
+            if (abandoned && hipGraphDestroy(abandoned) != hipSuccess)
+                std::terminate();
+        }
         if ((exec_ || graph_) && !activateOwner("reset"))
         {
             LOG_ERROR("[HIPGraphCapture] Cannot release graph resources without their immutable ROCm owner");
@@ -1578,13 +1851,19 @@ namespace llaminar2
         }
         if (exec_)
         {
-            HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
+            if(hipGraphExecDestroy(exec_)!=hipSuccess) {
+                LOG_ERROR("[HIPGraphCapture] Native executable teardown failed before handle/accounting release");
+                std::terminate();
+            }
             exec_ = nullptr;
         }
         resident_memory_bytes_ = 0u;
         if (graph_)
         {
-            HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
+            if(hipGraphDestroy(graph_)!=hipSuccess) {
+                LOG_ERROR("[HIPGraphCapture] Native graph teardown failed before handle/accounting release");
+                std::terminate();
+            }
             graph_ = nullptr;
         }
         destroyOrderedTimelineTimingEvents();

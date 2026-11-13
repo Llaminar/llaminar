@@ -15,6 +15,8 @@
  * optimized path; there is no alternate deterministic prefill implementation.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
@@ -22,6 +24,8 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "backends/ComputeBackend.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/IGPUGraphCapture.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -36,12 +40,13 @@
 #include "utils/MPIContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
-#include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedPrefillDiagnostics.h"
 #include <cuda_runtime.h>
 #endif
 
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/OriginalOutputSliceNativeFixture.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -65,13 +70,13 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
-    void cudaNativeVNNIPrefill_setBK256Mode(int mode);
-    int cudaNativeVNNIPrefill_getBK256Mode();
-    void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
-    void cudaNativeVNNIPrefill_setExactOverlayEnabled(bool enabled);
-    bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
-    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+    void cudaNativeQuantisedPrefill_setBK256Mode(int mode);
+    int cudaNativeQuantisedPrefill_getBK256Mode();
+    void cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(bool enabled);
+    bool cudaNativeQuantisedPrefill_getCanonicalKPartitionMode();
+    void cudaNativeQuantisedPrefill_setExactOverlayEnabled(bool enabled);
+    bool cudaNativeQuantisedPrefill_getExactOverlayEnabled();
+    bool cudaNativeQuantisedPrefill_getWorkspacePlan(
         uint8_t codebook_id,
         int M,
         int N,
@@ -79,7 +84,7 @@ extern "C"
         int cuda_device_id,
         size_t *canonical_kpart_partials_bytes,
         int *planned_k_partitions);
-    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+    bool cudaNativeQuantisedPrefill_getWorkspaceEnvelope(
         uint8_t codebook_id,
         int max_M,
         int N,
@@ -88,15 +93,15 @@ extern "C"
         size_t *canonical_kpart_partials_bytes,
         int *planned_k_partitions,
         int *planned_rows);
-    void cudaNativeVNNIPrefill_setForceTile(int tile_id);
-    void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
-    void cudaNativeVNNIPrefill_getLastLaunchSelection(
+    void cudaNativeQuantisedPrefill_setForceTile(int tile_id);
+    void cudaNativeQuantisedPrefill_getForceTile(int *tile_id);
+    void cudaNativeQuantisedPrefill_getLastLaunchSelection(
         int *tile_id,
         int *k_partitions,
         int *used_bk256,
         int *used_canonical_kpart);
-    int cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay();
-    bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+    int cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay();
+    bool cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
         uint8_t codebook_id,
         int n,
         int k,
@@ -116,22 +121,22 @@ namespace
     {
     public:
         ScopedCudaPrefillModes()
-            : bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+            : bk256_(cudaNativeQuantisedPrefill_getBK256Mode()),
               canonical_kpart_(
-                  cudaNativeVNNIPrefill_getCanonicalKPartitionMode()),
+                  cudaNativeQuantisedPrefill_getCanonicalKPartitionMode()),
               exact_overlay_enabled_(
-                  cudaNativeVNNIPrefill_getExactOverlayEnabled())
+                  cudaNativeQuantisedPrefill_getExactOverlayEnabled())
         {
-            cudaNativeVNNIPrefill_getForceTile(&force_tile_);
+            cudaNativeQuantisedPrefill_getForceTile(&force_tile_);
         }
 
         ~ScopedCudaPrefillModes()
         {
-            cudaNativeVNNIPrefill_setForceTile(force_tile_);
-            cudaNativeVNNIPrefill_setBK256Mode(bk256_);
-            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
+            cudaNativeQuantisedPrefill_setForceTile(force_tile_);
+            cudaNativeQuantisedPrefill_setBK256Mode(bk256_);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(
                 canonical_kpart_);
-            cudaNativeVNNIPrefill_setExactOverlayEnabled(
+            cudaNativeQuantisedPrefill_setExactOverlayEnabled(
                 exact_overlay_enabled_);
         }
 
@@ -834,17 +839,17 @@ TEST_F(Test__CUDAGemmBatchInvariance, SingleKernel_SelfConsistency)
     }
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_SelfConsistency)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_SelfConsistency)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
-    // NativeVNNI is now the sole CUDA GEMM path. Verify it produces
+    // NativeQuantised is now the sole CUDA GEMM path. Verify it produces
     // bitwise-identical results across repeated invocations.
     ScopedCudaPrefillModes mode_guard;
 
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     const int M = 9;
     const int N = 896;
@@ -906,24 +911,24 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_SelfConsistency)
         }
     }
 
-    std::cout << "NativeVNNI self-consistency: min_cos=" << std::fixed << std::setprecision(6) << min_cos
+    std::cout << "NativeQuantised self-consistency: min_cos=" << std::fixed << std::setprecision(6) << min_cos
               << " max_diffs=" << max_diffs
               << " max_abs=" << std::scientific << max_abs << "\n";
 
-    EXPECT_EQ(max_diffs, 0u) << "NativeVNNI path changed bitwise across repeats";
-    EXPECT_FLOAT_EQ(max_abs, 0.0f) << "NativeVNNI path drift should be zero";
-    EXPECT_GE(min_cos, 0.999999) << "NativeVNNI path should be deterministic";
+    EXPECT_EQ(max_diffs, 0u) << "NativeQuantised path changed bitwise across repeats";
+    EXPECT_FLOAT_EQ(max_abs, 0.0f) << "NativeQuantised path drift should be zero";
+    EXPECT_GE(min_cos, 0.999999) << "NativeQuantised path should be deterministic";
 
     int selected_tile = -1;
     int selected_k_partitions = 0;
     int used_bk256 = 0;
     int used_canonical_kpart = 0;
-    cudaNativeVNNIPrefill_getLastLaunchSelection(
+    cudaNativeQuantisedPrefill_getLastLaunchSelection(
         &selected_tile,
         &selected_k_partitions,
         &used_bk256,
         &used_canonical_kpart);
-    std::cout << "NativeVNNI final auto selection: tile=" << selected_tile
+    std::cout << "NativeQuantised final auto selection: tile=" << selected_tile
               << " k_partitions=" << selected_k_partitions
               << " bk256=" << used_bk256
               << " canonical_kpart=" << used_canonical_kpart << "\n";
@@ -932,15 +937,15 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_SelfConsistency)
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_GroupedSmallMProductionScheduleIsStable)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_GroupedSmallMProductionScheduleIsStable)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
 
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     const int M = 72;
     const int N = 4864;
@@ -996,12 +1001,12 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_GroupedSmallMProductionSchedule
     int selected_k_partitions = 0;
     int used_bk256 = 0;
     int used_canonical_kpart = 0;
-    cudaNativeVNNIPrefill_getLastLaunchSelection(
+    cudaNativeQuantisedPrefill_getLastLaunchSelection(
         &selected_tile,
         &selected_k_partitions,
         &used_bk256,
         &used_canonical_kpart);
-    std::cout << "NativeVNNI grouped-small-M production selection: tile=" << selected_tile
+    std::cout << "NativeQuantised grouped-small-M production selection: tile=" << selected_tile
               << " k_partitions=" << selected_k_partitions
               << " bk256=" << used_bk256
               << " canonical_kpart=" << used_canonical_kpart << "\n";
@@ -1014,7 +1019,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_GroupedSmallMProductionSchedule
 }
 
 /**
- * @test Prove ordinary CUDA NativeVNNI prefill remains total below overlays.
+ * @test Prove ordinary CUDA NativeQuantised prefill remains total below overlays.
  *
  * Exact cells are additive and must never substitute for a total generic
  * format/geometry policy. This test explicitly bypasses installed cells, then
@@ -1023,7 +1028,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_GroupedSmallMProductionSchedule
  * publishes the generic selection. An unseen shape must therefore neither fail
  * dispatch nor silently suppress route telemetry.
  */
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_Qwen36DensePromptPrefillUsesTotalHeuristic)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1033,9 +1038,9 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
     PerfStatsCollector::reset();
     ASSERT_TRUE(PerfStatsCollector::isEnabled());
 
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
 
     struct Shape
     {
@@ -1118,7 +1123,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
         int selected_k_partitions = 0;
         int used_bk256 = 0;
         int used_canonical_kpart = 0;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &selected_tile,
             &selected_k_partitions,
             &used_bk256,
@@ -1134,7 +1139,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
         bool found = false;
         for (const auto &record : records)
         {
-            if (record.name != "cuda_native_vnni_prefill_calls")
+            if (record.name != "cuda_native_quantised_prefill_calls")
                 continue;
 
             auto tag = [&](const char *name) -> std::string
@@ -1157,7 +1162,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
                 EXPECT_EQ(tag("bk256"), "0");
                 EXPECT_EQ(tag("canonical_kpart"), "0");
                 EXPECT_EQ(tag("sums_a"), "1")
-                    << "Qwen3.6 dense asymmetric NativeVNNI prefill must consume the "
+                    << "Qwen3.6 dense asymmetric NativeQuantised prefill must consume the "
                        "workspace-owned activation block sums instead of recomputing them "
                        "inside every output tile.";
                 EXPECT_EQ(record.device, "cuda:" + std::to_string(gpu_device_.ordinal));
@@ -1165,7 +1170,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
                 break;
             }
         }
-        EXPECT_TRUE(found) << "NativeVNNI heuristic prefill dispatch must emit structured route counters for "
+        EXPECT_TRUE(found) << "NativeQuantised heuristic prefill dispatch must emit structured route counters for "
                            << shape.name << "\n"
                            << PerfStatsCollector::summaryString({"kernel"}, 0);
 
@@ -1178,13 +1183,13 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistentWorkspaceScratch)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantisedCanonicalKpartDeclaresPersistentWorkspaceScratch)
 {
 #ifdef HAVE_CUDA
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w2x2=*/1);
-    cudaNativeVNNIPrefill_setBK256Mode(-1);
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
+    cudaNativeQuantisedPrefill_setForceTile(/*T64x128_w2x2=*/1);
+    cudaNativeQuantisedPrefill_setBK256Mode(-1);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
 
     constexpr int M = 32;
     constexpr int N = 512;
@@ -1201,7 +1206,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistent
         cudaSuccess);
     int uses_ordered_reducer = 0;
     int canonical_k_partitions = 0;
-    ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+    ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
         /*Q4_0=*/0,
         N,
         K,
@@ -1232,7 +1237,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistent
     for (const auto &buf : reqs.buffers)
     {
         if (buf.name ==
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS)
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS)
         {
             found_canonical_kpart = true;
             EXPECT_GE(buf.size_bytes, expected_canonical_bytes);
@@ -1275,7 +1280,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistent
     int selected_k_partitions = 0;
     int used_bk256 = 0;
     int used_canonical_kpart = 0;
-    cudaNativeVNNIPrefill_getLastLaunchSelection(
+    cudaNativeQuantisedPrefill_getLastLaunchSelection(
         &selected_tile,
         &selected_k_partitions,
         &used_bk256,
@@ -1332,12 +1337,12 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
             << " k=" << k << " installed_auto=" << installed_auto);
         constexpr int max_rows = 65;
         int ordered = 0, partitions = 0;
-        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+        ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
             format.device_execution_codebook_id, n, k, sm_count, &ordered, &partitions));
-        cudaNativeVNNIPrefill_setForceTile(-1);
-        cudaNativeVNNIPrefill_setBK256Mode(installed_auto ? 0 : -1);
-        cudaNativeVNNIPrefill_setExactOverlayEnabled(installed_auto);
-        cudaNativeVNNIPrefill_setCanonicalKPartitionMode(!installed_auto && ordered && partitions > 1);
+        cudaNativeQuantisedPrefill_setForceTile(-1);
+        cudaNativeQuantisedPrefill_setBK256Mode(installed_auto ? 0 : -1);
+        cudaNativeQuantisedPrefill_setExactOverlayEnabled(installed_auto);
+        cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(!installed_auto && ordered && partitions > 1);
         auto weight = format.create({size_t(n), size_t(k)}, 92721);
         auto prepared = makeGpuPreparedGemm(weight.get(), gpu_device_,
             std::string("test.overwrite.") + format.label + "." + std::to_string(k));
@@ -1401,7 +1406,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
             ASSERT_TRUE(launched);
             ASSERT_EQ(ended, cudaSuccess);
             int tile = -1, count = 0, bk256 = 0, canonical = 0;
-            cudaNativeVNNIPrefill_getLastLaunchSelection(&tile, &count, &bk256, &canonical);
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &count, &bk256, &canonical);
             exercised_partition_writer |= canonical != 0;
             captured_partition_counts[index] = count;
             size_t node_count = 0;
@@ -1428,7 +1433,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
                 const int diagnostic_count = count - 1;
                 captured_partition_counts[index] = diagnostic_count;
                 CUDADensePrefillKernelResources producer_resources{}, reducer_resources{};
-                ASSERT_TRUE(cudaNativeVNNIPrefill_queryLastLaunchResources(
+                ASSERT_TRUE(cudaNativeQuantisedPrefill_queryLastLaunchResources(
                     format.device_execution_codebook_id, n, k, gpu_device_.ordinal,
                     &producer_resources, &reducer_resources));
                 bool changed_producer = false, changed_reducer = false;
@@ -1490,7 +1495,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
             GemmWorkspaceBuffers::QUANT_A, GemmWorkspaceBuffers::SCALES_A,
             GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
             GemmWorkspaceBuffers::ACC_INT32, GemmWorkspaceBuffers::TEMP_C_FP32,
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS};
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS};
         std::vector<uint32_t> actual(output.numel());
         for (int replay = 0; replay < 20; ++replay)
         {
@@ -1511,7 +1516,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
                 const auto plane_elements = size_t(row_counts[index]) * n;
                 empty_planes.resize(size_t(captured_partition_counts[index] - empty_partition_begin[index]) * plane_elements);
                 const auto *partials = static_cast<const float *>(workspace.getBuffer(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS));
+                    GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS));
                 ASSERT_EQ(cudaMemcpyAsync(empty_planes.data(),
                     partials + size_t(empty_partition_begin[index]) * plane_elements,
                     empty_planes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), cudaSuccess);
@@ -1533,16 +1538,16 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWorkspacePlan)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_Qwen36Q6ExactOverlayMatchesWorkspacePlan)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
-    cudaNativeVNNIPrefill_setExactOverlayEnabled(true);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+    cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
 
     struct OverlayCase
     {
@@ -1601,7 +1606,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWork
                 test_case.m, test_case.n, test_case.k);
         const auto *canonical_partials = requirements.find(
             GemmWorkspaceBuffers::
-                CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+                CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS);
         if (test_case.expected_canonical_kpart)
         {
             ASSERT_NE(canonical_partials, nullptr)
@@ -1655,13 +1660,13 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWork
         int selected_k_partitions = 0;
         int used_bk256 = 0;
         int used_canonical_kpart = 0;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &selected_tile,
             &selected_k_partitions,
             &used_bk256,
             &used_canonical_kpart);
 
-        EXPECT_EQ(cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay(), 1);
+        EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay(), 1);
         EXPECT_EQ(selected_tile, test_case.expected_tile);
         EXPECT_EQ(used_bk256, 0);
         EXPECT_EQ(
@@ -1677,7 +1682,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWork
          * all other production controls unchanged so provenance alone proves
          * that the explicit profiler scope owns selection.
          */
-        cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
+        cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
         ASSERT_TRUE(kernel->multiply_tensor(
             &input,
             &output,
@@ -1692,9 +1697,9 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWork
             gpu_device_.ordinal,
             workspace_.get()));
         ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-        EXPECT_EQ(cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay(), 0)
+        EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay(), 0)
             << "Profiler bypass must expose the generic AUTO policy";
-        cudaNativeVNNIPrefill_setExactOverlayEnabled(true);
+        cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
 
         workspace_consumer->unbindWorkspace();
         workspace_.reset();
@@ -1719,7 +1724,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWork
  * cached request rather than returning stale policy state.
  */
 TEST_F(Test__CUDAGemmBatchInvariance,
-       NativeVNNIPrefillWorkspaceEnvelopeCoversAllCodebooksAndBuckets)
+       NativeQuantisedPrefillWorkspaceEnvelopeCoversAllCodebooksAndBuckets)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1727,10 +1732,10 @@ TEST_F(Test__CUDAGemmBatchInvariance,
     ScopedCudaPrefillModes mode_guard;
     ScopedDebugEnvOverride concurrent_env(
         "LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
-    cudaNativeVNNIPrefill_setExactOverlayEnabled(true);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+    cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
 
     constexpr std::array<uint8_t, 16> codebooks = {
         0, 4, 5, 6, 7, 8, 9, 10,
@@ -1751,7 +1756,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
                 break;
             size_t bucket_bytes = 0;
             int bucket_partitions = 1;
-            ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspacePlan(
+            ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspacePlan(
                 codebook,
                 bucket,
                 kN,
@@ -1765,7 +1770,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         size_t envelope_bytes = 0;
         int envelope_partitions = 1;
         int envelope_rows = 0;
-        ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+        ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspaceEnvelope(
             codebook,
             kMaxM,
             kN,
@@ -1782,7 +1787,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
     size_t q8_envelope_bytes = 0;
     int q8_partitions = 1;
     int q8_rows = 0;
-    ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+    ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspaceEnvelope(
         /*Q8_0=*/19,
         kMaxM,
         kN,
@@ -1810,24 +1815,24 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         workspace_consumer->getWorkspaceRequirements(kMaxM, kN, kK);
     const auto *exact_partials = exact_requirements.find(
         GemmWorkspaceBuffers::
-            CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+            CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS);
     ASSERT_NE(exact_partials, nullptr);
     EXPECT_EQ(exact_partials->size_bytes, q8_envelope_bytes * 4u)
         << "Concurrent QKV-style replay owns four disjoint reducer slots";
 
-    cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
+    cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
     const WorkspaceRequirements generic_requirements =
         workspace_consumer->getWorkspaceRequirements(kMaxM, kN, kK);
     EXPECT_EQ(
         generic_requirements.find(
             GemmWorkspaceBuffers::
-                CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+                CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr)
         << "The workspace cache key must include exact-overlay policy state";
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesCanonicalKpartScratchSlots)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_Qwen36QKVConcurrentPrefillUsesCanonicalKpartScratchSlots)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1835,9 +1840,9 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesC
     ScopedCudaPrefillModes mode_guard;
     ScopedDebugEnvOverride concurrent_env(
         "LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
 
     constexpr int M = 600;
     constexpr int N = 1024;
@@ -1853,7 +1858,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesC
         cudaSuccess);
     int uses_ordered_reducer = 0;
     int canonical_k_partitions = 0;
-    ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+    ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
         /*Q4_K=*/5,
         N,
         K,
@@ -1893,7 +1898,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesC
     reqs.merge(v_ws->getWorkspaceRequirements(M, N, K));
 
     const auto *canonical_kpart = reqs.find(
-        GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+        GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS);
     ASSERT_NE(canonical_kpart, nullptr);
     EXPECT_GE(
         canonical_kpart->size_bytes,
@@ -1944,7 +1949,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesC
     int selected_k_partitions = 0;
     int used_bk256 = 0;
     int used_canonical_kpart = 0;
-    cudaNativeVNNIPrefill_getLastLaunchSelection(
+    cudaNativeQuantisedPrefill_getLastLaunchSelection(
         &selected_tile,
         &selected_k_partitions,
         &used_bk256,
@@ -1961,14 +1966,14 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesC
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36IQ3SQKVConcurrentPrefillLaunches)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_Qwen36IQ3SQKVConcurrentPrefillLaunches)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     constexpr int M = 600;
     constexpr int N = 1024;
@@ -2049,14 +2054,14 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36IQ3SQKVConcurrentPrefillL
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecodeBindsGemvWorkspace)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantised_Qwen36MoEMixedQKVConcurrentDecodeBindsGemvWorkspace)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     constexpr int M = 1;
     constexpr int N_Q = 8192;
@@ -2189,7 +2194,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36MoEMixedQKVConcurrentDeco
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentPrefillRepeatsBitwise)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantisedConcurrentPrefillRepeatsBitwise)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -2201,8 +2206,8 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentPrefillRepeatsBitwise)
     ASSERT_TRUE(debugEnv().gemm.deterministic);
     EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_prefill);
 
-    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w4x2=*/4);
-    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeQuantisedPrefill_setForceTile(/*T64x128_w4x2=*/4);
+    cudaNativeQuantisedPrefill_setBK256Mode(-1);
 
     constexpr int M = 72;
     constexpr int N = 1024;
@@ -2250,7 +2255,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentPrefillRepeatsBitwise)
         int selected_k_partitions = 0;
         int used_bk256 = 0;
         int used_canonical_kpart = 0;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &selected_tile,
             &selected_k_partitions,
             &used_bk256,
@@ -2424,11 +2429,12 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         {std::move(stage_plan)},
         "CUDA concurrent QKV bias regression");
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
-        cudaSuccess);
+    // The exact worker generation owns shared projection side streams for
+    // the whole native capture, not only each multiply_fused_tensor call.
+    auto capture_owner = GPUDeviceContextPool::instance().retainNvidiaContext(gpu_device_.ordinal);
+    auto graph = capture_owner->createGraphCapture(root_stream);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_TRUE(graph->beginCapture());
     bool capture_body_ok = false;
     std::string capture_error;
     try
@@ -2444,16 +2450,13 @@ TEST_F(Test__CUDAGemmBatchInvariance,
     {
         capture_error = error.what();
     }
-    const cudaError_t capture_end = cudaStreamEndCapture(stream, &graph);
+    const bool capture_end = graph->endCapture();
     ASSERT_TRUE(capture_error.empty()) << capture_error;
     ASSERT_TRUE(capture_body_ok);
-    ASSERT_EQ(capture_end, cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(
-        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
-        cudaSuccess);
-    ASSERT_NE(graph_exec, nullptr);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_TRUE(capture_end);
+    ASSERT_TRUE(graph->instantiate());
+    ASSERT_TRUE(graph->hasExecutable());
+    ASSERT_TRUE(graph->launchOnStream(root_stream));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     std::vector<float> actual_q(expected_q.size());
@@ -2477,8 +2480,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
     expectBitwiseEqual(actual_k, expected_k, "captured concurrent K bias");
     expectBitwiseEqual(actual_v, expected_v, "captured concurrent V bias");
 
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    graph.reset(); // Retire captured workspace pointers before unbinding their owner.
     cleanupSharedWorkspace({q_kernel, k_kernel, v_kernel});
     llaminar::v2::kernels::KernelFactory::clearCacheFor(wq.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(wk.get());
@@ -2486,7 +2488,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
 #endif
 }
 
-TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentDecodeRepeatsBitwise)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeQuantisedConcurrentDecodeRepeatsBitwise)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -2498,8 +2500,8 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentDecodeRepeatsBitwise)
     ASSERT_FALSE(debugEnv().gemm.deterministic);
     EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
 
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     constexpr int M = 1;
     constexpr int N_Q = 512;
@@ -2713,9 +2715,12 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         };
         GraphCaptureDependencyLedger ledger(
             gpu_device_, stream, {std::move(stage_plan)}, "merged workspace regression");
-        cudaGraph_t graph = nullptr;
-        cudaGraphExec_t executable = nullptr;
-        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+        // Retain the actual context from lookup through native capture and
+        // every dirty replay; standalone capture cannot own its shared streams.
+        auto capture_owner = GPUDeviceContextPool::instance().retainNvidiaContext(gpu_device_.ordinal);
+        auto graph = capture_owner->createGraphCapture(stream);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_TRUE(graph->beginCapture());
         bool recorded = false;
         std::string error;
         try
@@ -2730,17 +2735,18 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         {
             error = failure.what();
         }
-        const auto capture_end = cudaStreamEndCapture(stream, &graph);
+        const bool capture_end = graph->endCapture();
         ASSERT_TRUE(error.empty()) << error;
         ASSERT_TRUE(recorded);
-        ASSERT_EQ(capture_end, cudaSuccess);
-        ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+        ASSERT_TRUE(capture_end);
+        ASSERT_TRUE(graph->instantiate());
+        ASSERT_TRUE(graph->hasExecutable());
         for (int replay = 0; replay < 20; ++replay)
         {
             for (size_t i = 0; i < outputs.size(); ++i)
                 ASSERT_EQ(cudaMemsetAsync(outputs[i]->gpu_data_ptr(), 0xff,
                     columns[i] * sizeof(float), stream), cudaSuccess);
-            ASSERT_EQ(cudaGraphLaunch(executable, stream), cudaSuccess);
+            ASSERT_TRUE(graph->launchOnStream(stream));
             for (size_t i = 0; i < outputs.size(); ++i)
             {
                 std::vector<float> actual(columns[i]);
@@ -2750,8 +2756,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
                 expectBitwiseEqual(actual, expected[i], format.label);
             }
         }
-        ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+        graph.reset(); // Captured pointers retire before shared workspace/cache cleanup.
         cleanupSharedWorkspace(kernels);
         for (auto &weight : weights)
             llaminar::v2::kernels::KernelFactory::clearCacheFor(weight.get());
@@ -2787,10 +2792,23 @@ TEST_F(Test__CUDAGemmBatchInvariance,
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }
+
+#ifdef HAVE_CUDA
+/** @test All original native sources preserve Q and exact source-slice bytes in captured ordinary/grouped QKV. */
+TEST_F(Test__CUDAGemmBatchInvariance, CapturedOriginalOutputSliceAllNativeFormats)
+{
+    ASSERT_NO_THROW(original_output_slice_native::prove(gpu_device_));
+}
+#endif

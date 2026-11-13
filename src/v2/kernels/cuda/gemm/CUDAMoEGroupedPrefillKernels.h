@@ -16,10 +16,13 @@
 
 #pragma once
 
-#include "tensors/NativeVnniFormatInfo.h"
+#include "../../common/MoEGroupedDirectory.h"
 
-#include "../../common/DeviceNativeVNNIMatrixDesc.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
+
+#include "../../common/DeviceNativeQuantisedMatrixDesc.h"
 #include "../../common/MoEGroupedSourceRows.h"
+#include "../../common/MoEPrefillProjectionExecution.h"
 
 #include <algorithm>
 #include <array>
@@ -33,7 +36,8 @@ namespace llaminar2::cuda::moe
     inline constexpr int kGroupedImmaTileRows = 16;
 
     /** Maximum descriptor-table width encoded by one directory entry. */
-    inline constexpr int kGroupedImmaMaximumExperts = 512;
+    inline constexpr int kGroupedImmaMaximumExperts =
+        moe_grouped_directory::kMaximumExperts;
 
     /**
      * @brief Compiled output-column ownership for one grouped IMMA CTA.
@@ -77,17 +81,17 @@ namespace llaminar2::cuda::moe
         bool exact_overlay = false;
     };
 
-    /** NativeVNNI execution codebook used by IQ4_XS routed projections. */
+    /** NativeQuantised execution codebook used by IQ4_XS routed projections. */
     inline constexpr int kQwenIQ4ExecutionCodebook =
-        kNativeVnniIQ4XSSourceScaleCodebook;
+        kNativeQuantisedIQ4XSSourceScaleCodebook;
 
-    /** NativeVNNI execution codebook used by Q6_K routed projections. */
+    /** NativeQuantised execution codebook used by Q6_K routed projections. */
     inline constexpr int kQwenQ6KExecutionCodebook = 8;
 
-    /** NativeVNNI execution codebook used by IQ3_S routed projections. */
+    /** NativeQuantised execution codebook used by IQ3_S routed projections. */
     inline constexpr int kQwenIQ3SExecutionCodebook = 11;
 
-    /** NativeVNNI execution codebook used by IQ2_S routed projections. */
+    /** NativeQuantised execution codebook used by IQ2_S routed projections. */
     inline constexpr int kQwenIQ2SExecutionCodebook = 13;
 
     /**
@@ -149,6 +153,8 @@ namespace llaminar2::cuda::moe
      * captured bucket. Positive unseen M values remain total by extending the
      * adjacent measured regime rather than requiring an exact bucket lookup.
      *
+     * @param operation Actual phase/publication/grouping qualification; only
+     *        complete full-width token-row all-route measurements are installed.
      * @param gateup_codebook Sole gate/up execution codebook, or a negative
      *        value when a mixed descriptor table has no single codebook.
      * @param down_codebook Sole down execution codebook, or a negative value
@@ -163,6 +169,7 @@ namespace llaminar2::cuda::moe
      */
     [[nodiscard]] inline constexpr GroupedImmaLaunchPolicy
     selectGroupedImmaLaunchPolicy(
+        MoEPrefillMeasuredOperation operation,
         int gateup_codebook,
         int down_codebook,
         int seq_len,
@@ -175,7 +182,8 @@ namespace llaminar2::cuda::moe
         const bool qwen_35b_geometry =
             hidden_size == 2048 && expert_width == 512 &&
             expert_count == 256 && top_k == 8;
-        if (!qwen_35b_geometry)
+        if (operation != MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes ||
+            !qwen_35b_geometry)
             return policy;
 
         for (const auto &regime : kQwen35BGroupedImmaCodebookRegimes)
@@ -317,7 +325,7 @@ extern "C"
     bool cudaMoEGroupedImma_project(
         const int8_t *d_A_int8,
         const float *d_scales_A,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
         const uint32_t *d_directory,
@@ -373,8 +381,8 @@ extern "C"
         const int8_t *d_A_int8,
         const float *d_scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
         const uint32_t *d_directory,
@@ -398,7 +406,7 @@ extern "C"
      * This setup-only API supplies the all-format spill and occupancy gate.
      * It performs no allocation, transfer, launch, or synchronization.
      *
-     * @param codebook_id NativeVNNI execution codebook specialization.
+     * @param codebook_id NativeQuantised execution codebook specialization.
      * @param columns Exact compiled down-projection geometry to inspect.
      * @param registers_per_thread Receives compiler-assigned registers/thread.
      * @param local_memory_bytes_per_thread Receives compiler local-memory use.
@@ -422,7 +430,7 @@ extern "C"
      * The setup-only resource query lets the all-format performance suite reject
      * spills or an uneconomical occupancy change before model-level timing.
      *
-     * @param codebook_id NativeVNNI execution codebook specialization.
+     * @param codebook_id NativeQuantised execution codebook specialization.
      * @param columns Exact compiled gate/up geometry to inspect.
      * @param schedule Exact compiled projection-to-warp schedule to inspect.
      * @param registers_per_thread Receives compiler-assigned registers/thread.

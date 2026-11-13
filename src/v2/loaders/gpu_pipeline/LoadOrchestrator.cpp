@@ -305,6 +305,8 @@ namespace llaminar2
             };
             const auto geometry = resolveGPUWeightLoadMemoryGeometry(
                 admitted_source_bytes, exact_policy);
+            ctx.released_staging_identity.reset();
+            ctx.resolved_staging_slot_bytes = geometry.staging_slot_bytes;
             const size_t persistent_bytes =
                 alignGPUWeightLoadAllocation(planned_weight_bytes);
             const DeviceId device(
@@ -448,6 +450,7 @@ namespace llaminar2
 
     void LoadOrchestrator::addWeightJob(int device_id, const WeightJob &job)
     {
+        job.validateSource();
         auto *ctx = findDevice(device_id);
         if (!ctx)
         {
@@ -463,7 +466,7 @@ namespace llaminar2
         }
 
         /*
-         * Both mapped-file pread and heap-backed memcpy write the exact payload
+         * Mapped-file pread, heap memcpy and bounded conversion write the exact payload
          * into the persistent pinned slot. There is no alignment padding and no
          * second staging allocation, so the complete configured slot remains
          * available for row-bounded chunks.
@@ -493,13 +496,6 @@ namespace llaminar2
                 "' cannot be row-chunked because raw bytes are not divisible by N");
         }
 
-        if (!job.host_raw_data)
-        {
-            throw std::runtime_error(
-                "LoadOrchestrator: oversized weight '" + job.name +
-                "' has a null host source");
-        }
-
         const auto *source = static_cast<const uint8_t *>(job.host_raw_data);
         const size_t bytes_per_row = job.raw_bytes / static_cast<size_t>(job.N);
         const size_t rows_per_chunk = usable_slot_bytes / bytes_per_row;
@@ -516,7 +512,11 @@ namespace llaminar2
             const int chunk_rows = static_cast<int>(std::min(
                 rows_per_chunk, static_cast<size_t>(job.N - row)));
             WeightJob chunk = job;
-            chunk.host_raw_data = source + static_cast<size_t>(row) * bytes_per_row;
+            const size_t source_offset = static_cast<size_t>(row) * bytes_per_row;
+            if (job.bounded_source)
+                chunk.source_offset_bytes = job.source_offset_bytes + source_offset;
+            else
+                chunk.host_raw_data = source + source_offset;
             chunk.raw_bytes = static_cast<size_t>(chunk_rows) * bytes_per_row;
             chunk.row_offset = job.row_offset + row;
             chunk.full_N = job.full_N > 0 ? job.full_N : job.N;
@@ -596,7 +596,15 @@ namespace llaminar2
 
         ScopedWeightLoadDetailTimer total_timer("gpu_pipeline.total");
 
-        const auto kernels = createRepackKernels();
+        // Explicit floating passthrough has no repack operation. Resolve native
+        // kernels only when some declared job actually requires one; this is
+        // the same raw-copy transaction on production and device-free backends.
+        const bool needs_repack = std::any_of(devices_.begin(), devices_.end(), [](const auto &device)
+        {
+            return std::any_of(device.pending_jobs.begin(), device.pending_jobs.end(),
+                [](const WeightJob &job) { return job.format != RepackFormat::RAW_FP; });
+        });
+        const RepackKernels kernels = needs_repack ? createRepackKernels() : RepackKernels{};
 
         for (auto &ctx : devices_)
         {
@@ -668,7 +676,22 @@ namespace llaminar2
                 ctx.pinned_ring->release();
             ctx.host_staging_lease.reset();
             ctx.device_staging_lease.reset();
+            if (memory_authority_ && ctx.resolved_staging_slot_bytes &&
+                !ctx.released_staging_identity)
+                ctx.released_staging_identity = std::make_shared<const unsigned char>(0);
         }
+    }
+
+    ReleasedWeightLoadStaging LoadOrchestrator::releasedWeightLoadStaging(int device_id) const
+    {
+        const auto *ctx = findDevice(device_id);
+        if (!memory_authority_ || !ctx || !ctx->resolved_staging_slot_bytes ||
+            !ctx->released_staging_identity || ctx->host_staging_lease ||
+            ctx->device_staging_lease || (ctx->pinned_ring && ctx->pinned_ring->isAllocated()) ||
+            !ctx->pool || ctx->pool->stagingSlotCount() != 0)
+            throw std::logic_error("Weight-loader staging receipt requires fully finalized production storage");
+        return ReleasedWeightLoadStaging(memory_authority_, managedDevice(device_id),
+            DeviceId::cpu(), ctx->resolved_staging_slot_bytes, ctx->released_staging_identity);
     }
 
     void LoadOrchestrator::release()
@@ -681,6 +704,7 @@ namespace llaminar2
     {
         for (auto &ctx : devices_)
         {
+            ctx.released_staging_identity.reset();
             if (ctx.pinned_ring)
                 ctx.pinned_ring->release();
             if (ctx.pool)

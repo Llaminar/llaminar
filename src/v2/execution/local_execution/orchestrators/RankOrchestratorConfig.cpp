@@ -7,10 +7,17 @@
  * expert authority before any weight, collective or graph is materialized.
  * Keeping setup policy separate from native runner execution permits focused
  * ownership tests without loading a model or initializing a device backend.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * CPU root declarations remain stage-owned across child projection and reuse.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "RankOrchestrator.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/moe/MoEOverlayPipelineStageBinding.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "utils/Logger.h"
 #include <algorithm>
 #include <cmath>
@@ -227,12 +234,19 @@ namespace llaminar2
         // Runtime fields from pre-parsed RuntimeConfig
         config.max_seq_len = runtime.max_seq_len;
         config.resident_graph_rows = runtime.resident_graph_rows;
+        config.attention_participants = runtime.attention_participants;
+        config.cpu_serial_expert_storage = runtime.cpu_serial_expert_storage;
+        config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
         config.batch_size = runtime.batch_size;
         config.activation_precision = runtime.activation_precision;
         config.kv_cache_precision = runtime.kv_cache_precision;
         config.tp_allreduce_precision_override =
             runtime.tp_allreduce_precision_override;
         config.prefix_cache = runtime.prefix_cache;
+        config.ngram_table_policy = runtime.ngram_table_policy;
+        config.ngram_lookup_schedule = runtime.ngram_lookup_schedule;
+        config.ngram_table_placement = runtime.ngram_table_placement;
+        config.retained_host_services = runtime.retained_host_services;
         config.mtp = runtime.mtp;
         config.routed_expert_compute_policy = runtime.routed_expert_compute_policy;
         config.routed_expert_owner_order =
@@ -253,7 +267,7 @@ namespace llaminar2
         const auto &stage = pp_stages.at(stage_index);
         if (!stage.validate() || effectiveMode() == ParallelismMode::TP || nested_pp_stage_config)
             throw std::invalid_argument("Pipeline child requires one valid stage in a PP parent");
-        if (moe_routed_expert_plan || moe_expert_overlay_residency_authority ||
+        if (!cpu_serial_expert_storage.empty() || moe_routed_expert_plan || moe_expert_overlay_residency_authority ||
             moe_expert_overlay_participant_residency || moe_expert_overlay_decode_histogram ||
             moe_expert_overlay_mpi_ctx || moe_rank_batch_transport_registry ||
             moe_device_controller_fabric || moe_node_local_route_exchange ||
@@ -271,35 +285,49 @@ namespace llaminar2
         child.devices = stage.stage_devices;
         child.weights = stage.tp_weights;
         child.backend = stage.tp_backend;
+        DeviceGenerationDomainDeclaration generation_domain;
+        for (const auto &participant_stage : pp_stages)
+            for (const auto &member : participant_stage.stage_devices)
+                generation_domain.observe(member.device_type);
         child.nested_pp_stage_config = FactoryPPStageConfig{
             .first_layer = stage.first_layer, .last_layer = stage.last_layer,
-            .has_embedding = stage.has_embedding, .has_lm_head = stage.has_lm_head};
+            .has_embedding = stage.has_embedding, .has_lm_head = stage.has_lm_head,
+            .generation_domain = generation_domain.domain()};
         if (stage.moe_runtime)
         {
-            stage.moe_runtime->requireDestination(*child.nested_pp_stage_config,
-                child.devices, child.weights, child.backend, moe_rebalance.mode);
-            // The authority's immutable initial snapshot supplies the plan.
-            // Legacy graph configuration takes a mutable shared_ptr, so lend
-            // a private metadata copy rather than exposing the live snapshot.
-            child.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(
-                *stage.moe_runtime->plan());
-            const auto &owners = stage.moe_runtime->owners();
-            child.moe_expert_overlay_residency_authority = owners.authority;
-            child.moe_expert_overlay_participant_residency = owners.residency;
-            child.moe_expert_overlay_decode_histogram = owners.histogram;
-            child.moe_expert_overlay_mpi_ctx = owners.mpi;
-            child.moe_rank_batch_transport_registry = owners.rank_transport;
-            child.moe_device_controller_fabric = owners.device_fabric;
-            const auto &domains = child.moe_routed_expert_plan->domains;
-            const auto continuation = std::find_if(domains.begin(), domains.end(),
-                [&](const auto &domain) {
-                    return domain.name == child.moe_routed_expert_plan->effectiveBaseModelDomain();
-                });
-            child.routed_expert_compute_policy = continuation->routed_compute_policy;
+            child.installPipelineStageRuntime(*stage.moe_runtime);
         }
         return child;
     }
 
+    void RankOrchestrator::Config::installPipelineStageRuntime(const MoEOverlayPipelineStageBinding &binding)
+    {
+        if (!nested_pp_stage_config || !cpu_serial_expert_storage.empty() || moe_routed_expert_plan ||
+            moe_expert_overlay_residency_authority || moe_expert_overlay_participant_residency ||
+            moe_expert_overlay_decode_histogram || moe_expert_overlay_mpi_ctx || moe_rank_batch_transport_registry ||
+            moe_device_controller_fabric || moe_expert_overlay_cpu_joint_context ||
+            moe_node_local_route_exchange || !moe_node_local_route_transport_policy.unresolved())
+            throw std::invalid_argument("Pipeline child cannot replace an existing expert runtime");
+        InferenceRunnerConfig projection;
+        projection.pp_stage_config = nested_pp_stage_config;
+        projection.moe_rebalance = moe_rebalance;
+        binding.installRuntime(projection, devices, weights, backend);
+        moe_routed_expert_plan = std::move(projection.moe_routed_expert_plan);
+        cpu_serial_expert_storage = std::move(projection.cpu_serial_expert_storage);
+        moe_expert_overlay_residency_authority = std::move(projection.moe_expert_overlay_residency_authority);
+        moe_expert_overlay_participant_residency = std::move(projection.moe_expert_overlay_participant_residency);
+        moe_expert_overlay_decode_histogram = std::move(projection.moe_expert_overlay_decode_histogram);
+        moe_expert_overlay_mpi_ctx = std::move(projection.moe_expert_overlay_mpi_ctx);
+        moe_rank_batch_transport_registry = std::move(projection.moe_rank_batch_transport_registry);
+        moe_device_controller_fabric = std::move(projection.moe_device_controller_fabric);
+        routed_expert_compute_policy = projection.routed_expert_compute_policy;
+    }
+
+    /**
+     * @brief Preserve one resolved plan's exact local TP and PP stage declarations.
+     * @param plan Authored participants, workshare, collective backend and runtime policy.
+     * @return Configuration whose child stages authenticate the same admitted declarations.
+     */
     RankOrchestrator::Config
     RankOrchestrator::Config::fromPlan(const RankExecutionPlan &plan)
     {
@@ -322,8 +350,10 @@ namespace llaminar2
                 stage_cfg.has_embedding = (i == 0);
                 stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
 
-                // Use per-stage TP info if available (TP-in-PP composition)
-                if (i < stage_tp_info.size() && stage_tp_info[i].devices.size() > 1)
+                // A singleton continuation still has an authored collective
+                // and workshare declaration. Preserve it exactly so the child
+                // can authenticate the same stage runtime that admission sealed.
+                if (i < stage_tp_info.size() && !stage_tp_info[i].devices.empty())
                 {
                     stage_cfg.stage_devices = stage_tp_info[i].devices;
                     stage_cfg.tp_weights = stage_tp_info[i].tp_weights;

@@ -18,13 +18,24 @@
 #include "utils/Logger.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace llaminar2
 {
+namespace {
+/** @brief Project only this stage's already-retained cadence controller fields. */
+MTPSpeculativeStatePublicationStage::DynamicMoECommitBoundaryBinding originalCommitBoundary(
+    DeviceMoERebalanceGraphControllerState &controller)
+{
+    return {&controller.decode_rounds_committed, &controller.decode_rounds_until_maintenance,
+        &controller.maintenance_due, &controller.decode_boundary_advanced};
+}
+}
     bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(
         const DeviceSpeculativePublicationRequest &request,
         const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
         ComputeGraph &verifier_graph,
+        const ForwardGraphSignature &verifier_signature,
         int verifier_rows_per_request,
         std::string *error)
     {
@@ -91,7 +102,9 @@ namespace llaminar2
         params.base_cached_tokens_device =
             publication_metadata.base_cached_tokens;
         params.accepted_restore_rows_device =
-            publication_metadata.accepted_state_slot_indices;
+            mtp_spec_decode_metadata_binding_.acceptedStateSlotIndicesView();
+        if (params.accepted_restore_rows_device.data() != publication_metadata.accepted_state_slot_indices)
+            return fail("MTP accepted-row publication metadata does not belong to its bound workspace");
         params.target_cached_tokens_device =
             publication_metadata.target_cached_tokens;
         params.accepted_state_counts_device =
@@ -122,6 +135,7 @@ namespace llaminar2
             device_generation_storage_.control_device;
         params.generation_control_stride =
             device_generation_storage_.control_stride;
+        params.depth_transaction_trace_device = mtp_depth_transaction_trace_dev_;
         params.verifier_input_tokens_device =
             static_cast<const int32_t *>(
                 mtp_verifier_input_tokens_dev_);
@@ -187,6 +201,13 @@ namespace llaminar2
                     };
         }
 
+        if (pipeline_forward_edges_ && pipeline_forward_edges_->carriesMoECommitEvidence()) {
+            if (params.outcome_meta_device != stochastic_batch_output_meta_dev_ ||
+                params.outcome_meta_stride != sampling_math::kSpeculativeBatchMetaCount)
+                return fail("Pipeline committed-round evidence lost its original tail compact outcome bank");
+            params.pipeline_moe_commit_evidence = MTPSpeculativeStatePublicationStage::PipelineMoECommitEvidence{
+                static_cast<int32_t *>(stochastic_batch_output_meta_dev_), sampling_math::kSpeculativeBatchMetaCount};
+        }
         params.request_count = request.requestCount();
         params.verifier_rows_per_request = verifier_rows_per_request;
         // The compact-outcome path embeds its host clipping limit in the
@@ -230,12 +251,18 @@ namespace llaminar2
         params.require_captured_verifier_state =
             mtpSpecStatePublicationRequiresCapturedStage();
 
-        return installMTPStatePublicationGraph(std::move(params), verifier_graph, error);
+        if (!installMTPStatePublicationGraph(std::move(params), verifier_graph, verifier_signature, error))
+            return false;
+        // Only the real externally admitted publication can author this borrow.
+        // Cold sibling preparation never replaces the policy/outcome authority.
+        mtp_publication_admission_authority_ = verifier_signature;
+        return true;
     }
 
     bool DeviceGraphOrchestrator::installMTPStatePublicationGraph(
         MTPSpeculativeStatePublicationStage::Params params,
-        ComputeGraph &verifier_graph, std::string *error)
+        const ComputeGraph &verifier_graph, const ForwardGraphSignature &verifier_signature,
+        std::string *error)
     {
         const auto fail = [&](const std::string &reason) {
             if (error) *error = reason;
@@ -245,6 +272,9 @@ namespace llaminar2
         const auto generation = workspaceGeneration(state_.device_id);
         const int request_count = params.request_count;
         const int verifier_rows_per_request = params.verifier_rows_per_request;
+        if (verifier_signature.batch_size != request_count ||
+            verifier_signature.seq_len != verifier_rows_per_request)
+            return fail("Publication geometry must equal its original immutable verifier signature");
         if (!state_.device_id.is_gpu() || generation == 0 || params.device_id != state_.device_id ||
             request_count <= 0 || verifier_rows_per_request <= 0 || !state_.kv_cache ||
             !params.main_kv_bindings.empty() ||
@@ -285,7 +315,7 @@ namespace llaminar2
         for (const std::string &node_name :
              verifier_graph.getExecutionOrder())
         {
-            ComputeNode *node = verifier_graph.getNode(node_name);
+            const ComputeNode *node = verifier_graph.getNode(node_name);
             if (!node || !node->stage)
             {
                 return fail(
@@ -355,15 +385,14 @@ namespace llaminar2
         params.moe_histogram_publication_stream =
             histogram_boundary_resolution.publication_stream;
 
-        auto &cache = mtp_speculative_state_publication_graph_;
-        if (cache.valid && cache.graph && cache.stage &&
-            cache.workspace_generation == generation &&
-            cache.pipeline_edges == pipeline_forward_edges_ &&
-            cache.stage->hasSameCaptureIdentity(params))
+        auto &cache = mtpStatePublicationCache(verifier_signature);
+        if (cache.matches(verifier_signature, generation, pipeline_forward_edges_, params))
         {
             return true;
         }
 
+        if (sparseQueryParentLaunched())
+            return fail("Cannot replace a publication child while any query parent is in flight");
         auto graph = std::make_unique<ComputeGraph>();
         MTPSpeculativeStatePublicationStage *publication_stage = nullptr;
         try
@@ -386,7 +415,9 @@ namespace llaminar2
             return fail("MTP publication graph rejected ownership: " + std::string(exception.what()));
         }
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        // An empty sibling owns no borrowed executable. Initial cold materialization
+        // must not discard the already-prepared other program's complete parent.
+        if (cache.valid || cache.graph) retireMTPPublicationParent(verifier_signature);
         /* All publication identities are sequential and share one exact MoE
          * histogram producer.  Retain its certified stream across geometry or
          * pointer-identity replacement; only final topology teardown destroys
@@ -396,6 +427,7 @@ namespace llaminar2
         cache.stage = publication_stage;
         cache.workspace_generation = generation;
         cache.pipeline_edges = pipeline_forward_edges_;
+        cache.verifier_signature = verifier_signature;
         cache.valid = true;
 
         PerfStatsCollector::addCounter(
@@ -404,7 +436,9 @@ namespace llaminar2
             1.0,
             "graph_setup",
             state_.device_id.toString(),
-            {{"requests", std::to_string(request_count)},
+            {{"sparse_query_program", verifier_signature.sparse_query_execution_program ==
+                  SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
+             {"requests", std::to_string(request_count)},
              {"verifier_rows",
               std::to_string(verifier_rows_per_request)},
              {"workspace_generation", std::to_string(generation)}});
@@ -412,7 +446,8 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::materializePipelineFollowerMTPPublicationGraph(
-        ComputeGraph &verifier_graph, int verifier_rows_per_request, std::string *error)
+        ComputeGraph &verifier_graph, const ForwardGraphSignature &verifier_signature,
+        int verifier_rows_per_request, std::string *error)
     {
         const auto fail = [&](const char *reason) {
             if (error) *error = reason;
@@ -434,12 +469,65 @@ namespace llaminar2
         params.authority = MTPSpeculativeStatePublicationStage::Authority::PipelineFollower;
         params.request_count = 1;
         params.verifier_rows_per_request = verifier_rows_per_request;
-        params.accepted_restore_rows_device = metadata.accepted_state_slot_indices;
+        params.accepted_restore_rows_device = mtp_spec_decode_metadata_binding_.acceptedStateSlotIndicesView();
         params.target_cached_tokens_device = metadata.target_cached_tokens;
         params.accepted_state_counts_device = metadata.accepted_state_counts;
         params.publication_ok_flags_device = metadata.publication_ok_flags;
         params.require_captured_verifier_state = mtpSpecStatePublicationRequiresCapturedStage();
-        return installMTPStatePublicationGraph(std::move(params), verifier_graph, error);
+        if (pipeline_forward_edges_->carriesMoECommitEvidence()) {
+            if (!stochastic_batch_output_meta_dev_)
+                return fail("Pipeline follower has no original compact-field receive bank");
+            params.pipeline_moe_commit_evidence = MTPSpeculativeStatePublicationStage::PipelineMoECommitEvidence{
+                static_cast<int32_t *>(stochastic_batch_output_meta_dev_), sampling_math::kSpeculativeBatchMetaCount};
+            if (usesParticipantLocalDeviceMoERebalanceController()) {
+                auto *controller = deviceMoERebalanceControllerStateDevice(error);
+                if (!controller) return false;
+                params.dynamic_moe_commit_boundary = originalCommitBoundary(*controller);
+            }
+        }
+        if (!installMTPStatePublicationGraph(std::move(params), verifier_graph, verifier_signature, error))
+            return false;
+        // Only the real externally admitted publication can author this borrow.
+        // Cold sibling preparation never replaces the policy/outcome authority.
+        mtp_publication_admission_authority_ = verifier_signature;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::prepareMTPStatePublicationForVerifier(
+        const ForwardGraphSignature &signature, void *producer_stream, std::string *error)
+    {
+        const auto fail = [&](const std::string &why) { if (error) *error = why; return false; };
+        if (!forward_engine_ || reinterpret_cast<std::uintptr_t>(producer_stream) <= 2)
+            return fail("Publication child requires its existing retained verifier and exact preparation stream");
+        const auto retained = forward_engine_->retainedDecodeGraph(signature, error);
+        if (!retained || !retained->graph_owner || retained->device != state_.device_id)
+            return fail("Publication child has no exact replay-ready verifier owner");
+        if (sparseQueryParentLaunched())
+            return fail("Publication child preparation requires every shared-stream parent to be idle");
+        (void)mtpStatePublicationCache(signature); // Validate the exact active target before any mutation.
+        MTPSpeculativeStatePublicationStage::Params params;
+        try
+        {
+            // The original successful admission owns every outcome/policy
+            // binding. Hosted siblings must be original setup-produced exact
+            // keys; projection changes only their physical stride and rebuilds
+            // all target-local verifier state hooks below.
+            params = mtpStatePublicationAuthority(signature, workspaceGeneration(state_.device_id));
+        }
+        catch (const std::exception &exception)
+        {
+            return fail(exception.what());
+        }
+        // Reconstruct only target-local borrows from the exact retained graph;
+        // no first-valid sibling or compile-selected cache supplies authority.
+        params.main_kv_bindings.clear();
+        params.verifier_state_stages.clear();
+        params.moe_histogram_publishers.clear();
+        params.moe_histogram_publication_stream = nullptr;
+        if (!installMTPStatePublicationGraph(std::move(params), *retained->graph_owner, signature, error))
+            return false;
+        return executeMTPStatePublicationGraph(producer_stream, error,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch);
     }
 
     bool DeviceGraphOrchestrator::executeMTPStatePublicationGraph(
@@ -455,7 +543,7 @@ namespace llaminar2
             return false;
         };
 
-        auto &cache = mtp_speculative_state_publication_graph_;
+        auto &cache = mtpStatePublicationCache();
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!state_.device_id.is_gpu() || !producer_stream ||
             !cache.valid || !cache.graph || !cache.stage ||
@@ -489,17 +577,18 @@ namespace llaminar2
             GPUDeviceContextPool::instance().getContext(state_.device_id);
         void *const histogram_publication_stream =
             cache.stage->getParams().moe_histogram_publication_stream;
-        const bool capture_stream_ready =
-            histogram_publication_stream
-                ? cache.segment_cache.bindBorrowedCaptureStream(
-                      &gpu_ctx,
-                      histogram_publication_stream,
-                      state_.device_id,
-                      /*context_from_process_pool=*/true)
-                : cache.segment_cache.ensureCaptureStream(
-                      &gpu_ctx,
-                      state_.device_id,
-                      /*context_from_process_pool=*/true);
+        // Slot zero retains the original single stream owner even when the
+        // first request selects NoRanking. Other graph children only borrow it.
+        // Histogram-backed owners borrow the already-certified table stream;
+        // no second producer or event authority is created per program.
+        auto &producer = mtp_speculative_state_publication_graphs_.front().segment_cache;
+        const bool producer_ready = histogram_publication_stream
+            ? producer.bindBorrowedCaptureStream(&gpu_ctx, histogram_publication_stream,
+                  state_.device_id, /*context_from_process_pool=*/true)
+            : producer.ensureCaptureStream(&gpu_ctx, state_.device_id, /*context_from_process_pool=*/true);
+        const bool capture_stream_ready = producer_ready &&
+            (&producer == &cache.segment_cache || cache.segment_cache.bindBorrowedCaptureStream(
+                &gpu_ctx, producer.capture_stream, state_.device_id, /*context_from_process_pool=*/true));
         if (!capture_stream_ready ||
             !cache.segment_cache.orderCaptureStreamAfter(
                 &gpu_ctx,
@@ -537,12 +626,12 @@ namespace llaminar2
         {
             capture_policy.graph_replay_plan_policy =
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentComposition;
-            capture_policy.retained_parent_composer = [edges = cache.pipeline_edges, stage = cache.stage](
-                IGPUGraphCapture &destination, const ComputeGraph &,
-                std::span<const DeviceGraphExecutor::GraphSegmentCache::RetainedCaptureUnitTemplateView> units) {
-                if (units.size() != 1 || !units.front().capture) return false;
-                return edges->composePublication(destination, *units.front().capture, stage->getParams());
-            };
+            if (!cache.publication_composer)
+                cache.publication_composer = cache.pipeline_edges->publicationComposer(
+                    *cache.graph, cache.stage,
+                    arena_ ? arena_->getSharedTensor(BufferId::STOCHASTIC_BATCH_OUTPUT_META) : nullptr,
+                    physical_memory_authority_, generation, gpu_ctx, cache.segment_cache.capture_stream);
+            capture_policy.retained_parent_composer = cache.publication_composer;
         }
 
         cache.graph->reset();

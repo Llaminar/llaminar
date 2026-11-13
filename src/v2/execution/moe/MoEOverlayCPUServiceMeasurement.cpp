@@ -1,21 +1,40 @@
 /**
  * @file MoEOverlayCPUServiceMeasurement.cpp
- * @brief Measures complete CPU expert FFNs without changing serving state.
+ * @brief Measures prepared CPU/GPU movable expert work without changing serving state.
  *
- * Preparation owns a small bounded input and the normal grouped-CPU workspace.
+ * Preparation owns bounded inputs and the production backend workspace.
  * Every physical payload is claimed before construction and released after
  * the last stage has retired. Different phases/classes reuse that capacity
  * serially. Only the measured service rows survive setup; no graph, weight
  * copy, inference counter, or alternate placement lifecycle is retained.
+ * Original producer errors are diagnosed before fatal native abort wakes peers;
+ * failure cleanup never substitutes a different domain or source. GateUp
+ * endpoints measure only movable projections; fixed columns remain invariant
+ * and their original bank is borrowed solely for exact arithmetic-policy metadata.
  */
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "planning/PlanningGPUExpertMeasurement.h"
+#include "planning/WorkspaceMemoryEstimator.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
+#include <map>
+#include "backends/RetainedParticipantGraphExecutable.h"
 
 #include "MoEOverlayPreparedWeightSource.h"
+#include "MoEOverlayFixedDownProjectionBank.h"
+#include "MoEExpertOverlayPreparationPlan.h"
+#include "CPUExpertShardSourceSelection.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "utils/Logger.h"
+#include "collective/GlobalTPContext.h"
+#include "memory/CPUJointExpertRouteStorageLayout.h"
+#include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
+#include "kernels/cpu/moe/CPUCanonicalRouteReducer.h"
+#include <array>
+#include <exception>
+#include <cmath>
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +46,29 @@ namespace llaminar2
     namespace
     {
         using llaminar::v2::kernels::KernelFactory;
+        /**
+         * @brief Borrow original fixed-column policy descriptors for a movable service.
+         * @param registry Original source-bound participant registry.
+         * @param source Actual live source lease, retained by the caller through replay.
+         * @param participant Original endpoint ID, not a device ordinal alias.
+         * @param layer Original model layer.
+         * @return Fixed bank only for GateUp endpoints; complete experts need no extra metadata.
+         */
+        std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixedDownServiceMetadata(
+            const MoEOverlayParticipantResidencyRegistry& registry,
+            const MoEOverlayParticipantResidencyRegistry::PreparedSourceUse& source,
+            int participant, int layer)
+        {
+            const auto endpoint = registry.endpoint(participant);
+            if (!endpoint) throw std::invalid_argument("Prepared service endpoint is missing");
+            if (endpoint->movableProjections() == DeviceMoEProjectionSet::CompleteExpert) return {};
+            const auto* physical = registry.initialOwnerMap().participantForId(participant);
+            if (!physical || !source.preparation())
+                throw std::invalid_argument("Gate/up service lost original projection preparation");
+            const auto ownership = source.preparation()->requireProjectionOwnershipForParticipant(*physical, layer);
+            return MoEOverlayFixedDownProjectionBank::resolve(source.registry(), *physical, layer, ownership);
+        }
+
         // Small real-kernel observations, not full-model synthetic inference.
         constexpr int kPrefillRows = MoEOverlayCPUServiceMeasurement::kMaximumRows;
         constexpr int kVerifierRows = 4;
@@ -45,24 +87,132 @@ namespace llaminar2
 
         /** @return The exact CPU workspace constructor geometry used by a probe. */
         CPUGroupedMoESerialWorkspace::Config workspaceConfig(
-            MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows)
+            MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows,
+            DeviceId device, std::shared_ptr<PhysicalMemoryAuthority> memory = {})
         {
             return {.row_capacity = static_cast<size_t>(rows),
                     .d_model = geometry.d_model, .expert_intermediate = geometry.intermediate,
                     .num_experts = 1, .routing_top_k = 1,
-                    .debug_name = "overlay_prepared_service"};
+                    .debug_name = "overlay_prepared_service", .device_id = device,
+                    .physical_memory_authority = std::move(memory)};
         }
 
-        /** @return Exact input/output/route tensor and grouped-workspace payload bytes. */
+        /** @brief The calibration's final tensor roots, separately owned from grouped scratch. */
+        struct ServiceStorageLayout
+        {
+            CPUStorageRoot<float> input, indices, weights, output;
+            CPUGroupedMoESerialWorkspace::StorageLayout grouped;
+            /** @return Checked complete physical calibration bank. */
+            size_t physicalBytes() const
+            {
+                size_t total = grouped.physicalBytes();
+                for (size_t bytes : {input.physicalBytes(), indices.physicalBytes(), weights.physicalBytes(), output.physicalBytes()})
+                {
+                    if (bytes > std::numeric_limits<size_t>::max() - total)
+                        throw std::overflow_error("CPU prepared-service root extent overflows");
+                    total += bytes;
+                }
+                return total;
+            }
+        };
+
+        /** @return One allocation-free declaration used by admission and real calibration roots. */
+        ServiceStorageLayout serviceStorageLayout(
+            MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows, DeviceId device)
+        {
+            const auto root = [&](size_t count) { return CPUStorageRoot<float>(
+                count, PhysicalMemoryOwner::ExecutionWorkspace, device); };
+            const auto grouped = CPUGroupedMoESerialWorkspace::storageLayout(workspaceConfig(geometry, rows, device));
+            return {root(grouped.batch.capacity()), root(static_cast<size_t>(rows)),
+                root(static_cast<size_t>(rows)), root(grouped.batch.capacity()), grouped};
+        }
+
+        /** @brief Reuse canonical route extent/placement under the probe's existing PMA owner.
+         * @tparam T Native root element.
+         * @param source Existing graph-independent route declaration.
+         * @return Same physical geometry with setup execution ownership, never a second ledger.
+         */
+        template<class T> CPUStorageRoot<T> setupRoot(const CPUStorageRoot<T>& source)
+        {
+            return {source.capacity(), PhysicalMemoryOwner::ExecutionWorkspace,
+                source.allocator(), source.placement(), source.initialization()};
+        }
+
+        /** @brief One original immutable calibration selection, exchanged outside the timed body. */
+        struct JointServiceJob { uint64_t epoch; int layer,expert,phase,tier,rows,h,f,e; };
+
+        /** @brief Exact serial probe roots; the same declaration feeds pricing and construction. */
+        struct JointServiceStorageLayout
+        {
+            CPUJointExpertRouteStorageLayout route;
+            CPUGroupedMoESerialWorkspace::Config grouped_config;
+            ServiceStorageLayout service;
+            CPUStorageRoot<float> packed, combined, release;
+            CPUStorageRoot<RootedFloatRecordRange> ranges;
+            CPUStorageRoot<int32_t> maps;
+            CPUStorageRoot<float> required;
+            CPUStorageRoot<JointServiceJob> jobs; ///< Exact original cohort, never a fixed stack cardinality.
+            /** @return Complete physical roots without invocation workspace, checked for overflow. */
+            size_t physicalBytes() const
+            {
+                size_t total=service.physicalBytes();
+                for(auto bytes:{packed.physicalBytes(),combined.physicalBytes(),release.physicalBytes(),
+                    ranges.physicalBytes(),maps.physicalBytes(),required.physicalBytes(),jobs.physicalBytes()}) {
+                    if(bytes>SIZE_MAX-total)throw std::overflow_error("CPU joint prepared-compute roots overflow");
+                    total+=bytes;
+                }
+                return total;
+            }
+        };
+
+        /** @brief Declare one original member's exact input-ready/output-ready probe.
+         * @param cohort Same original cuts/member/native source declaration.
+         * @param member Original domain ordinal.
+         * @param phase Existing representative phase family.
+         * @return Same roots for admission and setup; no graph or payload is constructed.
+         */
+        JointServiceStorageLayout jointServiceStorageLayout(
+            const std::shared_ptr<const MoEExpertShardCohort>& cohort,size_t member,
+            ExpertHistogramSource phase)
+        {
+            const auto rows=phaseGeometry(phase).second;
+            CPUJointExpertRouteStorageLayout route(cohort,member,rows,1);
+            const auto& geometry=cohort->ownership(member).geometry();
+            auto config=workspaceConfig({geometry.model_columns,route.intermediate()},rows,
+                cohort->participants()[member].address.toLocalDeviceId());
+            config.num_experts=geometry.experts;
+            const auto base=serviceStorageLayout({geometry.model_columns,route.intermediate()},rows,config.device_id);
+            ServiceStorageLayout service{base.input,base.indices,base.weights,base.output,
+                CPUGroupedMoESerialWorkspace::storageLayout(config)};
+            const auto placement=route.packed().placement();
+            const auto floatRoot=[&](size_t count){return CPUStorageRoot<float>(count,
+                PhysicalMemoryOwner::ExecutionWorkspace,route.packed().allocator(),placement);};
+            const auto rangeRoot=route.ranges()?setupRoot(*route.ranges()):
+                CPUStorageRoot<RootedFloatRecordRange>(0,PhysicalMemoryOwner::ExecutionWorkspace,
+                    route.packed().allocator(),placement);
+            const auto mapRoot=route.maps()?setupRoot(*route.maps()):CPUStorageRoot<int32_t>(
+                0,PhysicalMemoryOwner::ExecutionWorkspace,route.packed().allocator(),placement);
+            return {route,config,std::move(service),setupRoot(route.packed()),
+                floatRoot(route.isRoot()?static_cast<size_t>(rows)*geometry.model_columns:0),
+                floatRoot(1),rangeRoot,mapRoot,route.required()?setupRoot(*route.required()):floatRoot(0),
+                CPUStorageRoot<JointServiceJob>(cohort->participants().size(),PhysicalMemoryOwner::ExecutionWorkspace,
+                    route.packed().allocator(),placement)};
+        }
+
+        /** @brief Compare immutable original shared owners, rejecting no-op aliases.
+         * @tparam T Original source/preparation type.
+         * @param a First retained owner.
+         * @param b Second retained owner.
+         * @return Exact object and control-block identity.
+         */
+        template<class T> bool sameSourceOwner(const std::shared_ptr<const T>& a,
+            const std::shared_ptr<const T>& b)
+        {return a && a.get()==b.get() && !a.owner_before(b) && !b.owner_before(a);}
+
+        /** @return Exact physical calibration geometry; CPU ordinal does not change rounding. */
         size_t payloadBytes(MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows)
         {
-            const size_t workspace = CPUGroupedMoESerialWorkspace::plannedAllocationBytes(
-                workspaceConfig(geometry, rows));
-            const size_t tensor_elements = static_cast<size_t>(rows) *
-                (2u * static_cast<size_t>(geometry.d_model) + 2u);
-            if (tensor_elements > (std::numeric_limits<size_t>::max() - workspace) / sizeof(float))
-                throw std::overflow_error("CPU prepared-service tensor payload overflow");
-            return workspace + tensor_elements * sizeof(float);
+            return serviceStorageLayout(geometry, rows, DeviceId::cpu()).physicalBytes();
         }
 
         /**
@@ -102,13 +252,11 @@ namespace llaminar2
             requireProjection(source.gate(), device, geometry.intermediate, geometry.d_model);
             requireProjection(source.up(), device, geometry.intermediate, geometry.d_model);
             requireProjection(source.down(), device, geometry.d_model, geometry.intermediate);
-            // Declaration order retires stages/engines/tensors before the claim.
-            auto claim = memory->claimNewAllocation(device, PhysicalMemoryOwner::ExecutionWorkspace,
-                                                    payloadBytes(geometry, rows));
-            FP32Tensor input({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)});
-            FP32Tensor indices({static_cast<size_t>(rows), 1});
-            FP32Tensor weights({static_cast<size_t>(rows), 1});
-            FP32Tensor output({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)});
+            const auto layout = serviceStorageLayout(geometry, rows, device);
+            FP32Tensor input({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)}, layout.input.allocate(memory), device);
+            FP32Tensor indices({static_cast<size_t>(rows), 1}, layout.indices.allocate(memory), device);
+            FP32Tensor weights({static_cast<size_t>(rows), 1}, layout.weights.allocate(memory), device);
+            FP32Tensor output({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)}, layout.output.allocate(memory), device);
             for (int row = 0; row < rows; ++row)
             {
                 indices.mutable_typed_data()[row] = 0.0f;
@@ -121,7 +269,7 @@ namespace llaminar2
                 KernelFactory::createExpertServiceExecutionView(source.gate(), device),
                 KernelFactory::createExpertServiceExecutionView(source.up(), device),
                 KernelFactory::createExpertServiceExecutionView(source.down(), device)};
-            auto workspace = std::make_shared<CPUGroupedMoESerialWorkspace>(workspaceConfig(geometry, rows));
+            auto workspace = std::make_shared<CPUGroupedMoESerialWorkspace>(workspaceConfig(geometry, rows, device, memory));
             MoEExpertComputeStage::Params p;
             p.device_id = device;
             p.input = &input;
@@ -173,6 +321,53 @@ namespace llaminar2
         }
     }
 
+    size_t MoEOverlayCPUServiceMeasurement::GPUStorageLayout::hostBytes() const
+    {
+        size_t result = 0;
+        for (const auto *root : {&input, &indices, &weights, &output})
+        {
+            if (root->physicalBytes() > std::numeric_limits<size_t>::max() - result)
+                throw std::overflow_error("Prepared GPU service host roots overflow");
+            result += root->physicalBytes();
+        }
+        return result;
+    }
+
+    size_t MoEOverlayCPUServiceMeasurement::GPUStorageLayout::deviceBytes() const
+    {
+        size_t result = 0;
+        for (const auto *root : {&input, &indices, &weights, &output})
+        {
+            if (root->capacity() > (std::numeric_limits<size_t>::max() - result) / sizeof(float))
+                throw std::overflow_error("Prepared GPU service tensor copies overflow");
+            result += root->capacity() * sizeof(float);
+        }
+        return result;
+    }
+
+    MoEOverlayCPUServiceMeasurement::GPUStorageLayout
+    MoEOverlayCPUServiceMeasurement::gpuStorageLayout(Geometry geometry, int rows)
+    {
+        if (geometry.d_model <= 0 || geometry.intermediate <= 0 || rows <= 0 || rows > kMaximumRows ||
+            size_t(geometry.d_model) > std::numeric_limits<size_t>::max() / size_t(rows))
+            throw std::invalid_argument("Prepared GPU service requires valid original phase geometry");
+        const auto root = [](size_t count) {
+            return CPUStorageRoot<float>(count, PhysicalMemoryOwner::ExecutionWorkspace, DeviceId::cpu());
+        };
+        const auto payload = size_t(rows) * size_t(geometry.d_model);
+        return {root(payload), root(size_t(rows)), root(size_t(rows)), root(payload)};
+    }
+
+    MoEOverlayCPUServiceMeasurement::GPUAllocation
+    MoEOverlayCPUServiceMeasurement::gpuAllocationBytes(Geometry geometry, size_t invocation)
+    {
+        const auto layout = gpuStorageLayout(geometry, kMaximumRows);
+        const auto payload = layout.deviceBytes();
+        if (invocation > std::numeric_limits<size_t>::max() - payload)
+            throw std::overflow_error("Prepared GPU service workspace overflows");
+        return {layout.hostBytes(), payload + invocation};
+    }
+
     size_t MoEOverlayCPUServiceMeasurement::allocationBytes(Geometry geometry, size_t invocation_workspace_bytes)
     {
         const int rows = std::max(kPrefillRows, kVerifierRows);
@@ -199,13 +394,308 @@ namespace llaminar2
         return measureExpert(source, device, layer, phase, geometry, memory);
     }
 
+    size_t MoEOverlayCPUServiceMeasurement::cpuJointAllocationBytes(
+        const std::shared_ptr<const MoEExpertShardCohort>& cohort,size_t member,
+        ExpertHistogramSource phase,size_t invocation_workspace_bytes)
+    {
+        const auto bytes=jointServiceStorageLayout(cohort,member,phase).physicalBytes();
+        if(invocation_workspace_bytes>SIZE_MAX-bytes)
+            throw std::overflow_error("CPU joint prepared-compute invocation extent overflows");
+        return bytes+invocation_workspace_bytes;
+    }
+
+    std::optional<MoEOverlayCPUServiceMeasurement::PreparedComputeObservation>
+    MoEOverlayCPUServiceMeasurement::measurePreparedCPUJoint(
+        const MoEOverlayParticipantResidencyRegistry& registry,uint64_t epoch,
+        int participant,int layer,int expert,ExpertHistogramSource source_phase,
+        const std::shared_ptr<IGlobalTPContext>& domain,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,std::span<float> diagnostic_output)
+    {
+        // This producer borrows authentic source/bank/native owners. The generic
+        // FFN stage below is only a mathematical consumer of their known private
+        // service views; it never mints a whole-expert payload or serving permit.
+        auto* native=dynamic_cast<GlobalTPContext*>(domain.get());
+        if(!native || !native->authenticatesOriginalCPUExpertBorrow(domain))
+            throw std::invalid_argument("CPU joint prepared-compute requires original admitted native domain owner");
+        // After authenticating the original native owner, every rank-local
+        // rejection must wake its original peers instead of leaving them in a
+        // later collective. No borrowed wrong domain is ever entered.
+        try {
+        if(!memory || epoch!=registry.initialEpoch() || expert<0)
+            throw std::invalid_argument("CPU joint prepared-compute requires original admitted initial source");
+        std::string error;
+        auto source_use=registry.acquireOriginalPreparedSource(&error);
+        if(!source_use)throw std::invalid_argument("CPU joint prepared-compute original source: "+error);
+        const auto cold=registry.initialCPUJointLayer(participant,layer);
+        const auto frame=cold?cold->acquireEpoch(epoch):std::nullopt;
+        if(!frame || !frame->bankLease() || !frame->sourceSelection())
+            throw std::invalid_argument("CPU joint prepared-compute initial source/bank is absent");
+        const auto& source=*frame->sourceSelection();
+        const auto& cohort=source.cohort();
+        const auto member=source.participantIndex();
+        const auto* placement=registry.initialOwnerMap().placementFor(layer,expert);
+        const auto& bank=frame->bankLease()->layerForModelLayer(layer);
+        if(!placement || !sameSourceOwner(placement->shard_cohort,cohort) ||
+            !source.contains(expert) || member!=static_cast<size_t>(domain->myIndex()) ||
+            expert>=static_cast<int>(bank.cpu_fragments.size()) ||
+            expert>=static_cast<int>(bank.resident_mask.size()) || !bank.resident_mask[expert])
+            throw std::invalid_argument("CPU joint prepared-compute changed original target/member/expert");
+        const auto& payload=bank.cpu_fragments[expert];
+        if(!payload.valid() || payload.model()!=registry.originalModel() ||
+            payload.expertId()!=expert || payload.participantIndex()!=member ||
+            !sameSourceOwner(payload.cohort(),cohort) ||
+            !sameSourceOwner(payload.preparation(),source_use->preparation()))
+            throw std::invalid_argument("CPU joint prepared-compute has foreign prepared fragment provenance");
+        const auto [phase,rows]=phaseGeometry(source_phase);
+        const auto layout=jointServiceStorageLayout(cohort,member,source_phase);
+        const auto& geometry=cohort->ownership(member).geometry();
+        const auto device=source.participant().device;
+        const int h=geometry.model_columns,fi=layout.route.intermediate(),e=geometry.experts;
+        if(!diagnostic_output.empty() && (!layout.route.isRoot() ||
+            diagnostic_output.size()!=static_cast<size_t>(rows)*h))
+            throw std::invalid_argument("CPU joint prepared-compute diagnostic output requires exact root extent");
+        requireProjection(payload.gate(),device,fi,h);
+        requireProjection(payload.up(),device,fi,h);
+        requireProjection(payload.down(),device,h,fi);
+
+        FP32Tensor input({static_cast<size_t>(rows),static_cast<size_t>(h)},layout.service.input.allocate(memory),device);
+        FP32Tensor indices({static_cast<size_t>(rows),1},layout.service.indices.allocate(memory),device);
+        FP32Tensor weights({static_cast<size_t>(rows),1},layout.service.weights.allocate(memory),device);
+        FP32Tensor output({static_cast<size_t>(rows),static_cast<size_t>(h)},layout.service.output.allocate(memory),device);
+        FP32Tensor packed({layout.packed.capacity()},layout.packed.allocate(memory),device);
+        FP32Tensor combined({layout.combined.capacity()},layout.combined.allocate(memory),device);
+        FP32Tensor release({1},layout.release.allocate(memory),device);
+        auto ranges=layout.ranges.allocate(memory);
+        auto maps=layout.maps.allocate(memory);
+        auto required=layout.required.allocate(memory);
+        auto jobs=layout.jobs.allocate(memory);
+        for(int row=0;row<rows;++row) {
+            indices.mutable_typed_data()[row]=static_cast<float>(expert);
+            weights.mutable_typed_data()[row]=1.0f;
+            for(int col=0;col<h;++col)input.mutable_typed_data()[static_cast<size_t>(row)*h+col]=
+                0.0001f*static_cast<float>((col%31*13+row*7)%31-15);
+        }
+        std::array<std::shared_ptr<ITensorGemm>,3> engines{
+            KernelFactory::createExpertServiceExecutionView(payload.gate(),device),
+            KernelFactory::createExpertServiceExecutionView(payload.up(),device),
+            KernelFactory::createExpertServiceExecutionView(payload.down(),device)};
+        auto config=layout.grouped_config;
+        config.physical_memory_authority=memory;
+        auto workspace=std::make_shared<CPUGroupedMoESerialWorkspace>(std::move(config));
+        MoEExpertComputeStage::Params p;
+        p.device_id=device;p.input=&input;p.output=&output;p.output_registered_in_arena=false;
+        p.routing_indices=&indices;p.routing_weights=&weights;p.seq_len=rows;p.d_model=h;
+        p.expert_intermediate=fi;p.num_experts=e;p.top_k=1;p.layer_idx=layer;
+        p.expert_mask.assign(e,false);p.expert_mask[expert]=true;
+        p.prepared_gate_gemm.assign(e,nullptr);p.prepared_up_gemm.assign(e,nullptr);p.prepared_down_gemm.assign(e,nullptr);
+        p.prepared_gate_gemm[expert]=engines[0].get();p.prepared_up_gemm[expert]=engines[1].get();p.prepared_down_gemm[expert]=engines[2].get();
+        p.expert_weight_resolution_policy=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+        p.cpu_router_q8_input_publication=CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
+        p.cpu_grouped_serial_workspace=std::move(workspace);p.service_phase=phase;
+        p.force_decode_equivalent_verifier_prefill=phase==MoEOverlayServicePhaseHint::GroupedVerifier;
+        p.canonical_route_contributions=&packed;
+        p.canonical_route_arithmetic=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA;
+        p.canonical_route_layout=MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows;
+        MoEExpertComputeStage compute(std::move(p));
+        const auto requirements=compute.getWorkspaceRequirements(rows);
+        DeviceWorkspaceManager invocation(device,requirements.total_bytes_with_alignment(),memory);
+        if(!invocation.allocate(requirements))throw std::runtime_error("CPU joint prepared-compute invocation admission failed");
+        compute.bindWorkspace(&invocation);
+        MoECPUExpertShardRouteStage gather({.original_source=frame->sourceSelection(),.tp=domain.get(),
+            .packed_records=&packed,.route_indices=&indices,.route_weights=&weights,
+            .combined_routes=layout.route.isRoot()?&combined:nullptr,
+            .source_ranges=std::span<RootedFloatRecordRange>(ranges.data(),ranges.size()),
+            .participant_route_maps=std::span<int32_t>(maps.data(),maps.size()),
+            .required_route_weights=std::span<float>(required.data(),required.size()),
+            .rows=rows,.top_k=1,.columns=h,.root_participant=0,
+            .stage_name="overlay_prepared_cpu_target_compute",.original_tp_owner=domain,
+            .standalone_execution_phase=source_phase});
+        auto context=IDeviceContext::create(device);
+        // Metadata-only job agreement is outside the timed boundary. A caller
+        // cannot accidentally combine different experts/phases with matching row
+        // shapes. The original cohort-sized root is admitted/materialized once
+        // before timing; collect exactly one live record per actual member.
+        const JointServiceJob job{epoch,layer,expert,static_cast<int>(source_phase),placement->tier_idx,
+            rows,h,geometry.intermediate_columns,e};
+        if(domain->degree()<2 || static_cast<size_t>(domain->degree())!=jobs.size() ||
+            !domain->allgatherBytes(&job,jobs.data(),sizeof(job)))
+            throw std::runtime_error("CPU joint prepared-compute job agreement failed");
+        for(int i=0;i<domain->degree();++i) {
+            const auto& j=jobs[i];
+            if(j.epoch!=job.epoch || j.layer!=job.layer || j.expert!=job.expert || j.phase!=job.phase ||
+                j.tier!=job.tier || j.rows!=job.rows || j.h!=job.h || j.f!=job.f || j.e!=job.e)
+                throw std::invalid_argument("CPU joint prepared-compute members selected different jobs");
+        }
+        const auto execute=[&] {
+            if(!compute.execute(context.get()) || !gather.execute(context.get()))
+                throw std::runtime_error("CPU joint prepared-compute FFN/gather failed");
+            if(layout.route.isRoot() && !cpu::moe::reduceCanonicalRouteRowsOrderedFMA({
+                .route_rows=combined.typed_data(),.route_weights=weights.typed_data(),
+                .output=output.mutable_typed_data(),.rows=rows,.top_k=1,.columns=h}))
+                throw std::runtime_error("CPU joint prepared-compute canonical fold failed");
+        };
+        execute(); // Actual FFN/collective/fold warmup, outside all measured intervals.
+        uint64_t total=0;
+        for(int sample=0;sample<kMeasuredSamples;++sample) {
+            domain->barrier(); // Input-ready rendezvous is explicitly OUTSIDE root wall.
+            release.mutable_typed_data()[0]=layout.route.isRoot()?static_cast<float>(sample+1):0.0f;
+            const auto start=layout.route.isRoot()?std::chrono::steady_clock::now():
+                std::chrono::steady_clock::time_point{};
+            if(!domain->broadcastFloatElements(&release,1,0,"overlay_prepared_cpu_target_start") ||
+                release.typed_data()[0]!=static_cast<float>(sample+1))
+                throw std::runtime_error("CPU joint prepared-compute start release failed");
+            execute();
+            if(layout.route.isRoot()) {
+                const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+                if(ns<=0 || static_cast<uint64_t>(ns)>UINT64_MAX-total)
+                    throw std::runtime_error("CPU joint prepared-compute root timing overflows");
+                total+=static_cast<uint64_t>(ns);
+            }
+        }
+        if(!layout.route.isRoot())return std::nullopt;
+        for(size_t i=0;i<output.numel();++i)
+            if(!std::isfinite(output.typed_data()[i]))
+                throw std::runtime_error("CPU joint prepared-compute canonical output is nonfinite");
+        if(!diagnostic_output.empty())
+            std::copy_n(output.typed_data(),output.numel(),diagnostic_output.data());
+        return PreparedComputeObservation{.target=MoEOverlayRouteTarget::cpuCohort(placement->tier_idx),
+            .layer=layer,.expert=expert,.phase=source_phase,.logical_rows_per_invocation=static_cast<uint64_t>(rows),
+            .measured_invocations=kMeasuredSamples,.total_root_wall_nanoseconds=total};
+        } catch(const std::exception& failure) {
+            // Scratch/stages have already unwound, while the authenticated
+            // original domain argument still owns the native peer-wake right.
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original CPU joint job failed"
+                << " participant=" << participant << " layer=" << layer << " expert=" << expert
+                << " phase=" << static_cast<int>(source_phase) << ": " << failure.what());
+            domain->requestAbort();
+            throw;
+        } catch(...) {
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original CPU joint job failed"
+                << " participant=" << participant << " layer=" << layer << " expert=" << expert
+                << " phase=" << static_cast<int>(source_phase) << ": unknown exception");
+            domain->requestAbort();
+            throw;
+        }
+    }
+
+    std::vector<MoEOverlayPreparedTargetServiceTotals>
+    MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
+        const MoEOverlayParticipantResidencyRegistry& registry,
+        const MoEOverlayPreparedTargetServicePlan& plan,Geometry geometry,
+        const std::shared_ptr<IGlobalTPContext>& domain,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+        const ModelMemoryProfile* profile,const RankInventory* inventory,
+        const ILocalTPContext* owner_domain,int owner_top_k)
+    {
+        auto* native=domain?dynamic_cast<GlobalTPContext*>(domain.get()):nullptr;
+        if(domain && (!native || !native->authenticatesOriginalCPUExpertBorrow(domain)))
+            throw std::invalid_argument("Prepared target sequence requires its original native domain shared owner");
+        // A member can fail a whole job while a peer has already advanced to a
+        // later cohort job. Keep the SAME original abort owner over the entire
+        // deterministic sequence, not just each nested fragment measurement.
+        try {
+        if(!memory || plan.snapshot()->epoch!=registry.initialEpoch())
+            throw std::invalid_argument("Prepared target jobs require original initial banks and PMA");
+        std::string error;auto source=registry.acquireOriginalPreparedSource(&error);
+        if(!source)throw std::invalid_argument("Prepared target jobs lost original source: "+error);
+        const auto preparation=plan.snapshot()->originalProjectionPreparation();
+        if(preparation && !sameSourceOwner(preparation,source->preparation()))
+            throw std::invalid_argument("Prepared target jobs have foreign source preparation");
+        const auto& original=plan.snapshot()->placementOwnerMap();
+        const auto& source_map=registry.initialOwnerMap();
+        if(original.participants()!=source_map.participants() || original.owners()!=source_map.owners())
+            throw std::invalid_argument("Prepared target jobs changed the original source placement");
+        std::map<MoEOverlayTargetServiceCoordinate,MoEOverlayPreparedTargetServiceTotals> samples;
+        std::map<DeviceId,std::shared_ptr<RetainedParticipantGraphExecutable>> gpu_calibrations;
+        for(const auto& entry:plan.entries())for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+            if(entry.sample_layers[phase]!=entry.coordinate.layer)continue;
+            const auto source_phase=phase==0?ExpertHistogramSource::DecodeToken:
+                phase==1?ExpertHistogramSource::PrefillChunk:ExpertHistogramSource::GroupedVerifier;
+            const auto cohort=plan.cohort(entry);
+            int participant=-1;
+            if(cohort)for(const auto& member:cohort->participants())
+                if(member.world_rank==memory->worldRank())participant=member.participant_id;
+            if(!cohort && entry.root_world_rank==memory->worldRank())participant=entry.coordinate.target.word();
+            if(participant<0)continue; // No unrelated rank, member alias or synthetic row.
+            const int expert=plan.sampleExpert(entry,phase);
+            uint64_t duration=0;
+            if(cohort) {
+                const auto observation=measurePreparedCPUJoint(registry,registry.initialEpoch(),participant,
+                    entry.coordinate.layer,expert,source_phase,domain,memory);
+                if(!observation)continue;
+                if(observation->target.word()!=entry.coordinate.target.word() ||
+                    observation->logical_rows_per_invocation!=entry.sample_rows[phase] ||
+                    observation->measured_invocations!=entry.measured_invocations)
+                    throw std::logic_error("Prepared CPU target returned another declared job");
+                duration=observation->total_root_wall_nanoseconds;
+            }else {
+                const auto endpoint=registry.endpoint(participant);
+                const auto bank=endpoint?endpoint->acquire(registry.initialEpoch()):MoEOverlayParticipantBankLease{};
+                if(!bank)throw std::invalid_argument("Prepared whole target initial bank is missing");
+                const auto& payload=bank->layerForModelLayer(entry.coordinate.layer).experts.at(expert);
+                if (!payload.readyFor(endpoint->movableProjections()) ||
+                    payload.projections() != endpoint->movableProjections())
+                    throw std::invalid_argument("Prepared target source differs from its immutable movable service family");
+                const auto device=bank->device;
+                if(device.is_cpu())duration=measurePrepared(payload,device,entry.coordinate.layer,source_phase,geometry,memory);
+                else {
+                    if(!profile || !inventory || inventory->rank!=memory->worldRank())
+                        throw std::invalid_argument("Prepared GPU target requires original source/rank workspace metadata");
+                    const auto physical=std::find_if(inventory->gpus.begin(),inventory->gpus.end(),[&](const auto& gpu){
+                        return gpu.type==device.type && gpu.local_device_id==device.ordinal;
+                    });
+                    if(physical==inventory->gpus.end() || physical->compute_units<=0)
+                        throw std::invalid_argument("Prepared GPU target lost actual compute geometry");
+                    const auto invocation=WorkspaceMemoryEstimator::estimatePreparedExpertService(*profile,
+                        {.device=device,.device_compute_units=physical->compute_units,.resident_graph_rows=kMaximumRows,
+                         .first_layer=plan.catalog()->firstModelLayer(),
+                         .last_layer=plan.catalog()->firstModelLayer()+int(plan.catalog()->layerCount())-1,
+                         .apportioned_routed_experts=true});
+                    auto& calibration=gpu_calibrations[device];
+                    if(!calibration)calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(device,memory);
+                    duration=PlanningGPUExpertMeasurement::measurePrepared(payload,device,entry.coordinate.layer,source_phase,
+                        geometry.d_model,geometry.intermediate,memory,invocation,calibration,
+                        fixedDownServiceMetadata(registry,*source,participant,entry.coordinate.layer),
+                        payload.complete() ? -1 : expert,
+                        {.domain=owner_domain,.top_k=owner_top_k,.resident_sources=bank->layerForModelLayer(entry.coordinate.layer).experts});
+                }
+            }
+            auto [found,inserted]=samples.try_emplace(entry.coordinate);
+            auto& row=found->second;row.coordinate=entry.coordinate;
+            if(row.sample_count[phase])throw std::logic_error("Prepared target job produced duplicate phase evidence");
+            row.total_nanoseconds[phase]=duration;
+            row.sample_count[phase]=entry.measured_invocations;
+            row.activation_count[phase]=entry.sample_rows[phase]*entry.measured_invocations;
+            row.expert_ids[phase]=expert;
+        }
+        std::vector<MoEOverlayPreparedTargetServiceTotals> result;result.reserve(samples.size());
+        for(auto& [key,row]:samples)result.push_back(std::move(row));
+        plan.requireLocalSamples(result,memory->worldRank());
+        return result;
+        } catch(const std::exception& failure) {
+            // A peer may already await a later cohort job. Diagnose the original
+            // rejection before requestAbort fatally terminates the MPI job.
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original prepared target sequence failed"
+                << " rank=" << (memory?memory->worldRank():-1) << ": " << failure.what());
+            if(domain)domain->requestAbort();
+            throw;
+        } catch(...) {
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original prepared target sequence failed"
+                << " rank=" << (memory?memory->worldRank():-1) << ": unknown exception");
+            if(domain)domain->requestAbort();
+            throw;
+        }
+    }
+
     std::vector<MoEOverlayParticipantLayerServiceTotals> MoEOverlayCPUServiceMeasurement::measure(
         const MoEOverlayParticipantResidencyRegistry &registry, uint64_t epoch,
         const MoEOverlayEconomyCalibrationLayerCatalog &catalog,
         const ExpertHistogramProductionTopology &topology, Geometry geometry,
-        const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory,
+        const ModelMemoryProfile *model_profile, const RankInventory *rank_inventory,
+        const ILocalTPContext* owner_domain,int owner_top_k)
     {
-        if (!memory) throw std::invalid_argument("CPU prepared-service measurement requires physical admission");
+        if (!memory) throw std::invalid_argument("Prepared-service measurement requires physical admission");
         if (epoch != registry.initialEpoch())
             throw std::logic_error("CPU prepared-service measurement may only lease the published initial epoch");
         (void)payloadBytes(geometry, kMaximumRows); // Validate before indexing the immutable banks.
@@ -226,11 +716,11 @@ namespace llaminar2
             for (size_t layer = 0; layer < catalog.layerCount(); ++layer)
                 result.push_back({.participant_id = id, .layer = catalog.firstModelLayer() + static_cast<int>(layer)});
         }
+        std::map<DeviceId,std::shared_ptr<RetainedParticipantGraphExecutable>> gpu_calibrations;
         size_t observations = 0;
         for (const auto &gap : catalog.serviceEvidenceGaps(live, ids, topology))
         {
             const auto endpoint = registry.endpoint(gap.participant_id);
-            if (!endpoint->device().is_cpu()) continue; // GPU prices remain device-produced.
             const auto bank = endpoint->acquire(epoch);
             if (!bank) throw std::logic_error("CPU prepared-service lost its published bank lease");
             int selected_layer = -1;
@@ -239,7 +729,9 @@ namespace llaminar2
             {
                 const auto &entries = bank->layerForModelLayer(layer);
                 for (size_t expert = 0; expert < entries.experts.size(); ++expert)
-                    if (entries.resident_mask.at(expert) && entries.experts[expert].complete())
+                    if (entries.resident_mask.at(expert) &&
+                        entries.experts[expert].readyFor(endpoint->movableProjections()) &&
+                        entries.experts[expert].projections() == endpoint->movableProjections())
                     {
                         selected_layer = layer;
                         selected_expert = static_cast<int>(expert);
@@ -248,9 +740,50 @@ namespace llaminar2
                 if (selected_expert >= 0) break;
             }
             if (selected_expert < 0)
-                throw std::logic_error("CPU prepared-service class has no exact resident source");
-            const auto duration = measurePrepared(bank->layerForModelLayer(selected_layer).experts[selected_expert],
-                bank->device, selected_layer, gap.source, geometry, memory);
+                throw std::logic_error("Prepared service unsupported: priced class has no matching movable resident source; participant=" +
+                    std::to_string(gap.participant_id) + " device=" + endpoint->device().toString() +
+                    " representative_layer=" + std::to_string(gap.representative_layer) +
+                    " phase=" + std::to_string(expertHistogramProductionSourceIndex(gap.source)));
+            uint64_t duration = 0;
+            if (bank->device.is_cpu())
+                duration = measurePrepared(bank->layerForModelLayer(selected_layer).experts[selected_expert],
+                    bank->device, selected_layer, gap.source, geometry, memory);
+            else
+            {
+                if (!model_profile || !rank_inventory || !bank->device.is_gpu() || rank_inventory->rank != memory->worldRank())
+                    throw std::invalid_argument("Prepared GPU service requires original rank/model workspace metadata");
+                const auto physical=std::find_if(rank_inventory->gpus.begin(),rank_inventory->gpus.end(),[&](const auto& gpu){
+                    return gpu.type==bank->device.type && gpu.local_device_id==bank->device.ordinal;
+                });
+                if(physical==rank_inventory->gpus.end() || physical->compute_units<=0)
+                    throw std::invalid_argument("Prepared GPU service lost its original compute geometry");
+                const auto invocation = WorkspaceMemoryEstimator::estimatePreparedExpertService(*model_profile,
+                    {.device = bank->device, .device_compute_units = physical->compute_units,
+                     .resident_graph_rows = kMaximumRows, .first_layer = catalog.firstModelLayer(),
+                     .last_layer = catalog.firstModelLayer() + int(catalog.layerCount()) - 1,
+                     .apportioned_routed_experts = true});
+                auto& calibration=gpu_calibrations[bank->device];
+                if(!calibration)calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(bank->device,memory);
+                const auto& payload = bank->layerForModelLayer(selected_layer).experts[selected_expert];
+                // CompleteExpert already borrows its authentic resident engines.
+                // Only GateUp needs the additional model-bound fixed-column
+                // authority; keep that source lease alive through native replay.
+                std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse> source;
+                std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixed_down;
+                if (!payload.complete())
+                {
+                    std::string source_error;
+                    source = registry.acquireOriginalPreparedSource(&source_error);
+                    if (!source) throw std::invalid_argument("Prepared GPU service lost original source: " + source_error);
+                    fixed_down = fixedDownServiceMetadata(registry,*source,gap.participant_id,selected_layer);
+                }
+                duration = PlanningGPUExpertMeasurement::measurePrepared(
+                    payload, bank->device,
+                    selected_layer, gap.source, geometry.d_model, geometry.intermediate, memory, invocation, calibration,
+                    std::move(fixed_down),
+                    payload.complete() ? -1 : selected_expert,
+                    {.domain=owner_domain,.top_k=owner_top_k,.resident_sources=bank->layerForModelLayer(selected_layer).experts});
+            }
             const auto participant_index = static_cast<size_t>(std::lower_bound(ids.begin(), ids.end(), gap.participant_id) - ids.begin());
             auto &row = result.at(participant_index * catalog.layerCount() +
                 static_cast<std::size_t>(selected_layer - catalog.firstModelLayer()));
@@ -259,14 +792,14 @@ namespace llaminar2
             row.activation_count[phase] = static_cast<uint64_t>(phaseGeometry(gap.source).second) * kMeasuredSamples;
             row.sample_count[phase] = kMeasuredSamples;
             ++observations;
-            LOG_DEBUG("[ExpertOverlay] prepared CPU service participant=" << gap.participant_id
+            LOG_DEBUG("[ExpertOverlay] prepared service participant=" << gap.participant_id
                 << " layer=" << selected_layer << " expert=" << selected_expert
                 << " phase=" << phase << " rows=" << phaseGeometry(gap.source).second
                 << " samples=" << kMeasuredSamples << " nanoseconds=" << duration);
         }
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count();
-        LOG_INFO("[ExpertOverlay] prepared CPU service observations=" << observations
+        LOG_INFO("[ExpertOverlay] prepared service observations=" << observations
             << " elapsed_ms=" << elapsed_ms);
         return result;
     }

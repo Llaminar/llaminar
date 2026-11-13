@@ -12,9 +12,14 @@
 #include "MoEOverlayNodeLocalRouteExchange.h"
 
 #include "transfer/TransferEngine.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/NativeContextPreparation.h"
+#include "planning/RankHardwareOwnership.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -96,9 +101,19 @@ namespace llaminar2
 
     MoEOverlayNodeLocalRouteExchange::MoEOverlayNodeLocalRouteExchange(
         Config config)
-        : config_(std::move(config))
+        : MoEOverlayNodeLocalRouteExchange(std::move(config), StorageOwnership::IsolatedTestReplay)
+    {}
+
+    MoEOverlayNodeLocalRouteExchange::MoEOverlayNodeLocalRouteExchange(Config config, StorageOwnership ownership)
+        : config_(std::move(config)), ownership_(ownership)
     {
-        if (config_.devices.size() < 2u || !config_.root_device.is_gpu())
+        validateConfig(config_);
+        if (config_.identity.empty()) config_.identity = "node_local_continuation_routes";
+    }
+
+    void MoEOverlayNodeLocalRouteExchange::validateConfig(const Config& config)
+    {
+        if (config.devices.size() < 2u || !config.root_device.is_gpu())
         {
             throw std::invalid_argument(
                 "node-local route exchange requires at least two GPUs and an exact GPU root");
@@ -106,7 +121,7 @@ namespace llaminar2
 
         std::unordered_set<std::string> seen;
         bool root_seen = false;
-        for (const DeviceId device : config_.devices)
+        for (const DeviceId device : config.devices)
         {
             if (!device.is_gpu())
             {
@@ -120,15 +135,85 @@ namespace llaminar2
                     "node-local route exchange contains duplicate endpoint " +
                     device.toString());
             }
-            root_seen = root_seen || device == config_.root_device;
+            root_seen = root_seen || device == config.root_device;
         }
         if (!root_seen)
         {
             throw std::invalid_argument(
                 "node-local route exchange root is absent from its device set");
         }
-        if (config_.identity.empty())
-            config_.identity = "node_local_continuation_routes";
+    }
+
+    namespace {
+        /** @return Same named root slab and allocator alignment used by its BOM. */
+        WorkspaceRequirements routeRootWorkspace(std::size_t bytes) {
+            WorkspaceRequirements result;
+            result.buffers.emplace_back("node_local_route_root", bytes, 256, true,
+                WorkspaceExecutionRegime::Any, WorkspaceContentLifetime::SerialGraphFamily);
+            return result;
+        }
+    }
+    MoEOverlayNodeLocalRouteExchange::MoEOverlayNodeLocalRouteExchange(Config config,
+        StorageDeclaration declaration, std::shared_ptr<PhysicalMemoryAuthority> memory,
+        std::shared_ptr<const ClusterInventory> inventory)
+        : MoEOverlayNodeLocalRouteExchange(std::move(config), StorageOwnership::OriginalAdmitted)
+    {
+        if (!memory || !inventory || inventory->world_size <= 0 || inventory->ranks.size() != std::size_t(inventory->world_size) ||
+            inventory->world_size <= memory->worldRank() || memory->worldRank() < 0 ||
+            declaration.devices_ != config_.devices || declaration.root_ != config_.root_device ||
+            declaration.identity_ != config_.identity)
+            throw std::invalid_argument("Node-local route storage requires its exact original declaration and source authority");
+        const auto& original = inventory->getRank(memory->worldRank());
+        if (original.rank != memory->worldRank())
+            throw std::invalid_argument("Node-local route storage changed original rank identity");
+        std::unordered_set<std::string> uuids;
+        for (const auto device : config_.devices) {
+            requireRankLocalGPUOwnership(original, device, "Node-local route storage");
+            const auto found = std::find_if(original.gpus.begin(), original.gpus.end(), [&](const auto& gpu) {
+                return gpu.type == device.type && gpu.local_device_id == device.ordinal;
+            });
+            if (std::count_if(original.gpus.begin(), original.gpus.end(), [&](const auto& gpu) {
+                    return gpu.type == device.type && gpu.local_device_id == device.ordinal;
+                }) != 1 || found->uuid.empty() || !uuids.insert(found->uuid).second)
+                throw std::invalid_argument("Node-local route storage requires unique original physical GPU identities");
+        }
+        memory_ = std::move(memory); inventory_ = std::move(inventory);
+        declaration_ = std::make_unique<StorageDeclaration>(std::move(declaration));
+    }
+
+    MoEOverlayNodeLocalRouteExchange::StorageDeclaration
+    MoEOverlayNodeLocalRouteExchange::declareStorage(const Config& config, std::uint32_t rows,
+        std::uint32_t top_k, std::uint32_t width)
+    {
+        validateConfig(config);
+        const auto layout = storageLayout(config.devices.size(), rows, top_k, width);
+        return {config.devices, config.root_device, config.identity.empty() ? "node_local_continuation_routes" : config.identity,
+            rows, top_k, width, layout.mapping_bytes, layout.root_bytes};
+    }
+    void MoEOverlayNodeLocalRouteExchange::requireOriginalAdmission(const StorageDeclaration& declaration,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+        const std::shared_ptr<const ClusterInventory>& inventory) const
+    {
+        if (ownership_ != StorageOwnership::OriginalAdmitted || !declaration_ || !memory || !inventory ||
+            memory != memory_ || memory.owner_before(memory_) || memory_.owner_before(memory) ||
+            inventory != inventory_ || inventory.owner_before(inventory_) || inventory_.owner_before(inventory) ||
+            declaration.devices_ != declaration_->devices_ || declaration.root_ != declaration_->root_ ||
+            declaration.identity_ != declaration_->identity_ || declaration.rows_ != declaration_->rows_ ||
+            declaration.top_k_ != declaration_->top_k_ || declaration.width_ != declaration_->width_)
+            throw std::logic_error("Node-local route reuse changed its original admission or capture identity");
+    }
+
+    PhysicalMemoryPlan MoEOverlayNodeLocalRouteExchange::StorageDeclaration::bom(
+        PhysicalMemoryResource host, PhysicalMemoryResource root_gpu) const
+    {
+        if (host.world_rank != root_gpu.world_rank || !host.device.is_cpu() || root_gpu.device != root_)
+            throw std::invalid_argument("Node-local route storage BOM changed original host/root resource");
+        const std::array requests{MappedHostTransferArena::AllocationRequest{mapping_bytes_, kPageBytes}};
+        PhysicalMemoryPlanBuilder result;
+        result.add(host, PhysicalMemoryOwner::ActivationTransportStaging, MappedHostTransferArena::backingBytes(requests));
+        result.add(root_gpu, PhysicalMemoryOwner::ActivationTransportStaging,
+            routeRootWorkspace(root_bytes_).total_bytes_with_alignment());
+        return result.build();
     }
 
     MoEOverlayNodeLocalRouteExchange::~MoEOverlayNodeLocalRouteExchange()
@@ -136,11 +221,99 @@ namespace llaminar2
         abortForShutdown();
         // The owning orchestrator drains retained graphs before destruction;
         // release graph-private root VRAM before unregistering shared pages.
+        root_lease_.reset();
+        root_workspace_.reset();
         root_staging_.reset();
         // MappedHostTransferRegion owns the backend mapping lifetime.  Reset it
         // only after retained graph owners and root DMA scratch have gone away;
         // this keeps every captured alias valid until the graph teardown edge.
         mapped_region_.reset();
+    }
+
+    MoEOverlayNodeLocalRouteExchange::StorageLayout
+    MoEOverlayNodeLocalRouteExchange::storageLayout(std::size_t participants, std::uint32_t max_rows,
+        std::uint32_t top_k, std::uint32_t d_model)
+    {
+        if (participants < 2 || participants - 1 > std::numeric_limits<std::uint32_t>::max() ||
+            !max_rows || !top_k || !d_model)
+            throw std::invalid_argument("Node-local route storage requires positive physical geometry");
+        const auto wide_capacity = std::uint64_t(max_rows) * top_k;
+        if (wide_capacity > std::numeric_limits<std::uint32_t>::max())
+            throw std::overflow_error("Node-local route slot geometry exceeds the native ABI");
+        const auto route_capacity = static_cast<std::uint32_t>(wide_capacity);
+        std::vector<LaneLayout> layouts;
+        layouts.reserve(participants - 1u);
+        std::size_t cursor = 0u;
+        const std::size_t slot_epoch_bytes = checkedMultiply(
+            static_cast<std::size_t>(route_capacity),
+            sizeof(std::uint64_t),
+            "slot-epoch bytes");
+        const std::size_t route_elements = checkedMultiply(
+            static_cast<std::size_t>(route_capacity),
+            static_cast<std::size_t>(d_model),
+            "payload elements");
+        const std::size_t payload_bytes = checkedMultiply(
+            route_elements, sizeof(float), "payload bytes");
+
+        for (std::size_t lane_index = 0; lane_index + 1 < participants; ++lane_index)
+        {
+            cursor = checkedAlignUp(cursor, kPageBytes);
+            LaneLayout layout;
+            layout.control_offset = cursor;
+            cursor = checkedAdd(
+                cursor, sizeof(MoENodeLocalRouteLaneControl),
+                "control layout");
+            cursor = checkedAlignUp(cursor, kCacheLineBytes);
+            layout.slot_epochs_offset = cursor;
+            cursor = checkedAdd(
+                cursor, slot_epoch_bytes, "slot-epoch layout");
+            cursor = checkedAlignUp(cursor, kPageBytes);
+            layout.payload_offset = cursor;
+            cursor = checkedAdd(cursor, payload_bytes, "payload layout");
+            layout.root_staging_offset = checkedMultiply(
+                layouts.size(), payload_bytes, "root staging offset");
+            layouts.push_back(layout);
+        }
+
+        /*
+         * Route publication is many producers to one root; continuation
+         * publication is the inverse. Keep a single dense payload bank and one
+         * cache-line acknowledgement per non-root endpoint so the root performs
+         * exactly one D2H transfer regardless of LocalTP degree. The root may
+         * overwrite that bank only after every peer has acknowledged the prior
+         * epoch on device.
+         */
+        cursor = checkedAlignUp(cursor, kPageBytes);
+        const std::size_t dense_control_offset = cursor;
+        cursor = checkedAdd(
+            cursor,
+            sizeof(MoENodeLocalDensePublicationControl),
+            "dense publication control");
+        cursor = checkedAlignUp(cursor, kCacheLineBytes);
+        const std::size_t dense_peers_offset = cursor;
+        const std::size_t dense_peers_bytes = checkedMultiply(
+            layouts.size(),
+            sizeof(MoENodeLocalDensePublicationPeer),
+            "dense publication peer acknowledgements");
+        cursor = checkedAdd(
+            cursor, dense_peers_bytes, "dense publication peer layout");
+        cursor = checkedAlignUp(cursor, kPageBytes);
+        const std::size_t dense_payload_offset = cursor;
+        const std::size_t dense_element_capacity = checkedMultiply(
+            static_cast<std::size_t>(max_rows),
+            static_cast<std::size_t>(d_model),
+            "dense publication elements");
+        const std::size_t dense_payload_bytes = checkedMultiply(
+            dense_element_capacity,
+            sizeof(float),
+            "dense publication payload bytes");
+        cursor = checkedAdd(
+            cursor, dense_payload_bytes, "dense publication payload layout");
+        const std::size_t mapping_bytes = checkedAlignUp(cursor, kPageBytes);
+
+        const auto root_bytes = checkedMultiply(payload_bytes, layouts.size(), "root staging bytes");
+        return {std::move(layouts), route_capacity, mapping_bytes, root_bytes, dense_control_offset,
+            dense_peers_offset, dense_payload_offset, dense_element_capacity, dense_payload_bytes};
     }
 
     void MoEOverlayNodeLocalRouteExchange::materialize(
@@ -226,81 +399,24 @@ namespace llaminar2
             return;
         }
 
-        std::vector<LaneLayout> layouts;
-        layouts.reserve(endpoints.size() - 1u);
-        std::size_t cursor = 0u;
-        const std::size_t slot_epoch_bytes = checkedMultiply(
-            static_cast<std::size_t>(route_capacity),
-            sizeof(std::uint64_t),
-            "slot-epoch bytes");
-        const std::size_t route_elements = checkedMultiply(
-            static_cast<std::size_t>(route_capacity),
-            static_cast<std::size_t>(d_model),
-            "payload elements");
-        const std::size_t payload_bytes = checkedMultiply(
-            route_elements, sizeof(float), "payload bytes");
-
-        for (const auto &endpoint : endpoints)
-        {
-            if (endpoint.participant_id == root_participant)
-                continue;
-
-            cursor = checkedAlignUp(cursor, kPageBytes);
-            LaneLayout layout;
-            layout.producer_device = endpoint.device;
-            layout.producer_participant = endpoint.participant_id;
-            layout.control_offset = cursor;
-            cursor = checkedAdd(
-                cursor, sizeof(MoENodeLocalRouteLaneControl),
-                "control layout");
-            cursor = checkedAlignUp(cursor, kCacheLineBytes);
-            layout.slot_epochs_offset = cursor;
-            cursor = checkedAdd(
-                cursor, slot_epoch_bytes, "slot-epoch layout");
-            cursor = checkedAlignUp(cursor, kPageBytes);
-            layout.payload_offset = cursor;
-            cursor = checkedAdd(cursor, payload_bytes, "payload layout");
-            layout.root_staging_offset = checkedMultiply(
-                layouts.size(), payload_bytes, "root staging offset");
-            layouts.push_back(layout);
+        const auto geometry = storageLayout(endpoints.size(), max_rows, top_k, d_model);
+        auto layouts = geometry.lanes;
+        std::size_t lane_index = 0;
+        for (const auto& endpoint : endpoints) if (endpoint.participant_id != root_participant) {
+            layouts[lane_index].producer_device = endpoint.device;
+            layouts[lane_index++].producer_participant = endpoint.participant_id;
         }
-
-        /*
-         * Route publication is many producers to one root; continuation
-         * publication is the inverse. Keep a single dense payload bank and one
-         * cache-line acknowledgement per non-root endpoint so the root performs
-         * exactly one D2H transfer regardless of LocalTP degree. The root may
-         * overwrite that bank only after every peer has acknowledged the prior
-         * epoch on device.
-         */
-        cursor = checkedAlignUp(cursor, kPageBytes);
-        const std::size_t dense_control_offset = cursor;
-        cursor = checkedAdd(
-            cursor,
-            sizeof(MoENodeLocalDensePublicationControl),
-            "dense publication control");
-        cursor = checkedAlignUp(cursor, kCacheLineBytes);
-        const std::size_t dense_peers_offset = cursor;
-        const std::size_t dense_peers_bytes = checkedMultiply(
-            layouts.size(),
-            sizeof(MoENodeLocalDensePublicationPeer),
-            "dense publication peer acknowledgements");
-        cursor = checkedAdd(
-            cursor, dense_peers_bytes, "dense publication peer layout");
-        cursor = checkedAlignUp(cursor, kPageBytes);
-        const std::size_t dense_payload_offset = cursor;
-        const std::size_t dense_element_capacity = checkedMultiply(
-            static_cast<std::size_t>(max_rows),
-            static_cast<std::size_t>(d_model),
-            "dense publication elements");
-        const std::size_t dense_payload_bytes = checkedMultiply(
-            dense_element_capacity,
-            sizeof(float),
-            "dense publication payload bytes");
-        cursor = checkedAdd(
-            cursor, dense_payload_bytes, "dense publication payload layout");
-        const std::size_t mapping_bytes = checkedAlignUp(cursor, kPageBytes);
-
+        const auto mapping_bytes = geometry.mapping_bytes;
+        const auto dense_control_offset = geometry.dense_control;
+        const auto dense_peers_offset = geometry.dense_peers;
+        const auto dense_payload_offset = geometry.dense_payload;
+        const auto dense_element_capacity = geometry.dense_elements;
+        const auto dense_payload_bytes = geometry.dense_payload_bytes;
+        if (ownership_ == StorageOwnership::OriginalAdmitted && !declaration_)
+            throw std::logic_error("Admitted route storage lost its immutable declaration");
+        if (declaration_ && (declaration_->rows_ != max_rows || declaration_->top_k_ != top_k ||
+            declaration_->width_ != d_model || declaration_->mapping_bytes_ != mapping_bytes))
+            throw std::logic_error("Node-local route materialization changed its admitted graph geometry");
         /*
          * TransferEngine is the sole mapped-memory authority.  In a
          * same-family node-local topology it allocates one backend-owned
@@ -310,23 +426,33 @@ namespace llaminar2
          * this owner must not recreate either policy with a private mmap.
          */
         TransferEngine transfer_engine;
-        auto region = transfer_engine.allocateMappedHostRegion(
-            mapping_bytes,
-            config_.devices);
-        if (!region || !region->isBound())
-        {
-            throw std::runtime_error(
-                "node-local route exchange could not bind every device alias");
+        std::shared_ptr<MappedHostTransferRegion> region;
+        std::shared_ptr<DeviceTransferBuffer> root_staging;
+        const auto root_staging_bytes = geometry.root_bytes;
+        std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::shared_ptr<const WorkspaceBufferLease> lease;
+        if (ownership_ == StorageOwnership::OriginalAdmitted) {
+            // Source workers are authenticated before either native allocation.
+            std::vector<PreparedGPUContextUsePermit> originals;
+            for (const auto device : config_.devices)
+                originals.push_back(GPUDeviceContextPool::instance().retainExistingPreparedContext(device, memory_));
+            const std::array requests{MappedHostTransferArena::AllocationRequest{mapping_bytes, kPageBytes}};
+            auto arena = transfer_engine.createMappedHostArena(config_.devices, memory_, requests);
+            region = arena->allocate(mapping_bytes, kPageBytes);
+            arena->requireDeclarationConsumed();
+            const auto schema = routeRootWorkspace(root_staging_bytes);
+            workspace = std::make_unique<DeviceWorkspaceManager>(config_.root_device,
+                schema.total_bytes_with_alignment(), memory_, PhysicalMemoryOwner::ActivationTransportStaging);
+            if (!workspace->allocate(schema))
+                throw std::runtime_error("Node-local route could not materialize its admitted original root workspace");
+            lease = workspace->retainBuffer("node_local_route_root", 0, root_staging_bytes);
+        } else {
+            // This private constructor is reachable only from the explicit test friend.
+            region = transfer_engine.allocateMappedHostRegion(mapping_bytes, config_.devices);
+            root_staging = transfer_engine.allocateDeviceTransferBuffer(root_staging_bytes, config_.root_device);
         }
-        const std::size_t root_staging_bytes = checkedMultiply(
-            payload_bytes, layouts.size(), "root staging bytes");
-        auto root_staging = transfer_engine.allocateDeviceTransferBuffer(
-            root_staging_bytes, config_.root_device);
-        if (!root_staging || !root_staging->isBound())
-        {
-            throw std::runtime_error(
-                "node-local route exchange could not allocate stable root DMA scratch");
-        }
+        if (!region || !region->isBound() || (!lease && (!root_staging || !root_staging->isBound())))
+            throw std::runtime_error("Node-local route exchange failed to bind its declared storage");
 
         for (const auto &layout : layouts)
         {
@@ -376,6 +502,8 @@ namespace llaminar2
         dense_publication_element_capacity_ = dense_element_capacity;
         mapped_region_ = std::move(region);
         root_staging_ = std::move(root_staging);
+        root_workspace_ = std::move(workspace);
+        root_lease_ = std::move(lease);
         materialized_ = true;
 
         PerfStatsCollector::addCounter(
@@ -442,14 +570,14 @@ namespace llaminar2
         float *route_payload = nullptr;
         if (alias_device == config_.root_device)
         {
-            if (!root_staging_ || !root_staging_->isBound())
+            if (!root_lease_ && (!root_staging_ || !root_staging_->isBound()))
             {
                 throw std::logic_error(
                     "node-local route exchange root scratch is unavailable");
             }
             route_payload = static_cast<float *>(
-                root_staging_->mutableDeviceData(
-                    lane.root_staging_offset));
+                root_lease_ ? root_lease_->data(lane.root_staging_offset) :
+                    root_staging_->mutableDeviceData(lane.root_staging_offset));
         }
         else
         {
@@ -641,7 +769,7 @@ namespace llaminar2
             << " d_model=" << d_model_
             << " mapping_bytes=" << mapping_bytes_
             << " root_staging_bytes="
-            << (root_staging_ ? root_staging_->sizeBytes() : 0u)
+            << (root_lease_ ? root_lease_->sizeBytes() : (root_staging_ ? root_staging_->sizeBytes() : 0u))
             << " dense_publication_elements="
             << dense_publication_element_capacity_
             << " endpoints=[";

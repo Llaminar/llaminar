@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 
@@ -80,6 +81,48 @@ def verify_report(report, language, compiler, architectures):
         verify_observation(language, observation)
 
 
+def failed_hip_inspection(args, build, variant):
+    """Expose native bundle inspection after an unexpected HIP proof failure.
+
+    Replay only the private fixture's exact Ninja compile command through the
+    production guard. The guard still owns acceptance and retires failed objects;
+    this diagnostic cannot produce a successful proof or replace the first result.
+    SDK/toolchain cache inputs remain untouched while cloud-only inspection
+    failures retain the actual target IDs and extracted bundle header.
+    """
+    commands = subprocess.check_output(
+        [args.ninja, "-C", str(build), "-t", "commands", f"probe_{variant}"], text=True)
+    guard_path = str(ROOT / "scripts/build/gpu_spill_guard.py")
+    compiles = [shlex.split(line) for line in commands.splitlines()
+                if guard_path in shlex.split(line)]
+    if len(compiles) != 1 or compiles[0][1:2] != [guard_path]:
+        raise RuntimeError("HIP diagnostic requires one direct production-guard compile command")
+    trace = f"""
+import importlib.util
+from pathlib import Path
+import sys
+spec = importlib.util.spec_from_file_location("gpu_spill_guard", {guard_path!r})
+guard = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = guard
+spec.loader.exec_module(guard)
+native_tool = guard.run_tool
+def inspect(command):
+    result = native_tool(command)
+    if Path(command[0]).name == "clang-offload-bundler" and "--list" in command:
+        source = Path(next(value.partition("=")[2] for value in command if value.startswith("--input=")))
+        with source.open("rb") as stream:
+            prefix = stream.read(64)
+        print("HIP bundle inspection: bytes=" + str(source.stat().st_size)
+              + " prefix=" + repr(prefix) + " targets=" + repr(result), file=sys.stderr, flush=True)
+    return result
+guard.run_tool = inspect
+sys.exit(guard.main())
+"""
+    result = subprocess.run([compiles[0][0], "-c", trace, *compiles[0][2:]],
+                            cwd=build, text=True, capture_output=True, timeout=30)
+    return f"HIP inspection replay exit={result.returncode}:\n{result.stdout}{result.stderr}"
+
+
 def compile_report(args):
     """Run the real production guard, retaining both first-build and rebuild evidence."""
     # A failed rebuild cannot leave an older successful proof for CTest to use.
@@ -107,7 +150,15 @@ def compile_report(args):
             observation = {"config": config, "variant": variant, "attempt": attempt,
                            "returncode": result.returncode, "diagnostic": result.stdout + result.stderr,
                            "objects_present": bool(list((build / f"CMakeFiles/probe_{variant}.dir").glob("*.o")))}
-            verify_observation(args.language, observation)
+            try:
+                verify_observation(args.language, observation)
+            except RuntimeError:
+                if args.language == "HIP":
+                    try:
+                        print(failed_hip_inspection(args, build, variant), flush=True)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as diagnostic_error:
+                        print(f"HIP inspection diagnostic failed: {diagnostic_error}", flush=True)
+                raise
             report["observations"].append(observation)
             print(f"{args.language} {config} {variant} {attempt}: expected outcome verified", flush=True)
     verify_report(report, args.language, args.compiler, args.architectures)

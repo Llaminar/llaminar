@@ -8,8 +8,8 @@ Use one ordered completion barrier when there is no packet to carry the signal;
 segments with no consumer still submit no unnecessary packet. Packet capture,
 parallel queues and the native signal-pool lifecycle remain unchanged.
 
-Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
-             (therock-10.0, ROCm Core SDK 10.0.0)
+Pinned base: ROCm/rocm-systems 7da43026e4f2ef7600433c38c820732f7a205d22
+             (therock-10.1, ROCm Core SDK 10.1.0)
 
 diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp
 --- a/hipamd/src/hip_graph_internal.cpp

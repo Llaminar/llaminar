@@ -6,7 +6,9 @@ Uses the Qwen35ReferenceModel (registry-based) which handles heterogeneous
 GDN + full attention layers via HuggingFace forward hooks.
 
 Captures all intermediate activations as individual .npy files, compatible
-with the C++ parity test infrastructure (cnpy::npy_load).
+with the C++ parity test infrastructure (cnpy::npy_load). Optional explicit
+stage selection and checked final-row LM-head publication reuse the very same
+cached forward helper; existing callers retain all-stage capture by default.
 
 Usage:
     python3 generate_qwen35_pipeline_snapshots.py \
@@ -174,18 +176,68 @@ def run_prefill_and_decode(
     save_prefill_snapshots: bool = True,
     save_decode_snapshots: bool = True,
     snapshot_decode_steps: Optional[Set[int]] = None,
+    capture_stages=None,
+    snapshot_final_row_only: bool = False,
+    expected_token_ids=None,
+    forced_decode_tokens=None,
 ):
     """
     Run prefill + optional decode steps with snapshot capture.
 
     Returns (total_snapshot_count, token_ids, decode_tokens).
+
+    capture_stages is an explicit optional PipelineStage selection; None retains
+    the original all-stage default for existing callers. snapshot_final_row_only
+    is valid only with exactly LM_HEAD selected and publishes its original final
+    vocabulary row as [1,1,V]. expected_token_ids authenticates a frozen authored
+    tokenization before any model forward. Neither option changes model/cache
+    arithmetic, greedy teacher IDs, or the number of incremental decode calls.
+    forced_decode_tokens is a separate explicit frozen D+1 Pending history:
+    the first D tokens are actual decode inputs and the last remains unconsumed.
+    None preserves the original greedy path byte-for-byte. The frozen sequence
+    is validated before prefill; it never changes logits, cache math or capture.
     """
+    if type(snapshot_final_row_only) is not bool:
+        raise ValueError('Final-row snapshot choice must be boolean')
+    if capture_stages is not None:
+        if (not isinstance(capture_stages, (list, tuple)) or
+                any(not isinstance(stage, PipelineStage) for stage in capture_stages) or
+                len(set(capture_stages)) != len(capture_stages)):
+            raise ValueError('Explicit unique PipelineStage capture selection required')
+    if snapshot_final_row_only and list(capture_stages or []) != [PipelineStage.LM_HEAD]:
+        raise ValueError('Final-row publication requires explicit LM_HEAD-only capture')
+
+    def selected_snapshots():
+        """Project only the owned original final LM-head row, never layer state."""
+        snapshots = model.get_snapshots()
+        if not snapshot_final_row_only:
+            return snapshots
+        if set(snapshots) != {(PipelineStage.LM_HEAD, -1)}:
+            raise ValueError('LM_HEAD-only capture is missing or has extra stages')
+        value = snapshots[(PipelineStage.LM_HEAD, -1)]
+        if (not isinstance(value, np.ndarray) or value.dtype != np.float32 or
+                value.ndim != 3 or value.shape[0] != 1 or value.shape[1] < 1 or
+                value.shape[2] < 1 or not np.isfinite(value).all()):
+            raise ValueError('LM_HEAD requires a complete finite original FP32 plane')
+        return {(PipelineStage.LM_HEAD, -1): value[:, -1:, :]}
+
+    if forced_decode_tokens is not None:
+        vocabulary = model.hf_model.config.vocab_size
+        if (type(decode_steps) is not int or not 1 <= decode_steps <= 256 or
+                type(forced_decode_tokens) is not list or len(forced_decode_tokens) != decode_steps+1 or
+                type(vocabulary) is not int or vocabulary < 1 or
+                any(type(token) is not int or not 0 <= token < vocabulary for token in forced_decode_tokens)):
+            raise ValueError('Frozen decode requires exact valid D+1 Pending teacher IDs')
+        forced_decode_tokens = list(forced_decode_tokens)
+
     # Tokenize
     tokenizer = model.tokenizer
     if tokenizer is None:
         raise RuntimeError("Tokenizer not loaded. model.load_model() should initialize it.")
     encoding = tokenizer(prompt, return_tensors="pt")
     token_ids = encoding["input_ids"][0].tolist()
+    if expected_token_ids is not None and token_ids != expected_token_ids:
+        raise ValueError('Authored prompt tokenization differs from frozen original IDs')
     print(f"  Token IDs ({len(token_ids)}): {token_ids[:20]}{'...' if len(token_ids) > 20 else ''}")
 
     # ---- Prefill ----
@@ -195,7 +247,7 @@ def run_prefill_and_decode(
     # state). Without this, each decode step re-runs the full prompt + all
     # prior decoded tokens — O(S²) attention work that produces snapshots
     # we then throw away (the C++ parity test only compares the LAST row).
-    capture_prefill_stages = None if save_snapshots and save_prefill_snapshots else []
+    capture_prefill_stages = capture_stages if save_snapshots and save_prefill_snapshots else []
     result = model.forward(
         token_ids,
         clear_snapshots=True,
@@ -204,7 +256,7 @@ def run_prefill_and_decode(
     )
     total = 0
     if save_snapshots and save_prefill_snapshots:
-        prefill_snaps = model.get_snapshots()
+        prefill_snaps = selected_snapshots()
         total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
         print(f"  Captured {total} prefill snapshots")
     else:
@@ -213,8 +265,10 @@ def run_prefill_and_decode(
 
     # Get next token (greedy)
     logits = result["logits"]
-    next_token = int(np.argmax(logits[0, -1, :]))
-    print(f"  Next token (greedy): {next_token}")
+    next_token = (forced_decode_tokens[0] if forced_decode_tokens is not None
+                  else int(np.argmax(logits[0, -1, :])))
+    policy = 'frozen' if forced_decode_tokens is not None else 'greedy'
+    print(f"  Next token ({policy}): {next_token}")
 
     decode_tokens = []
     if decode_steps <= 0:
@@ -240,13 +294,13 @@ def run_prefill_and_decode(
             clear_snapshots=True,
             past_key_values=cache,
             use_cache=True,
-            capture_stages=None
+            capture_stages=capture_stages
             if save_snapshots and save_decode_snapshots and capture_this_decode_step
             else [],
         )
         cache = result.get("past_key_values")
         if save_snapshots and save_decode_snapshots and capture_this_decode_step:
-            step_snaps = model.get_snapshots()
+            step_snaps = selected_snapshots()
             n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
             total += n
             print(f"  Captured {n} decode snapshots for step {step}")
@@ -255,9 +309,10 @@ def run_prefill_and_decode(
 
         # Pick next token
         logits = result["logits"]
-        next_token = int(np.argmax(logits[0, -1, :]))
+        next_token = (forced_decode_tokens[step+1] if forced_decode_tokens is not None
+                      else int(np.argmax(logits[0, -1, :])))
         decode_tokens.append(next_token)
-        print(f"  Next token (greedy): {next_token}")
+        print(f"  Next token ({policy}): {next_token}")
 
     return total, token_ids, decode_tokens
 

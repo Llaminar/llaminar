@@ -84,7 +84,7 @@ inline void runGpu(DeviceId device)
             GpuOwners o{backend,stream,device};
             o.weights=sources(role);
             o.prepared.reserve(3);
-            std::array<DeviceNativeVNNIMatrixDesc,3> desc{};
+            std::array<DeviceNativeQuantisedMatrixDesc,3> desc{};
             const std::array<TensorBase*,3> raw{o.weights.gate.get(),o.weights.up.get(),o.weights.down.get()};
             std::array<std::vector<uint8_t>,3> original_bytes;
             for(int p=0;p<3;++p)
@@ -97,7 +97,7 @@ inline void runGpu(DeviceId device)
                 ASSERT_NE(o.prepared.back().kernel,nullptr);
                 if(auto *tensor_kernel=dynamic_cast<ITensorKernel*>(o.prepared.back().kernel))
                     tensor_kernel->setGPUStream(stream);
-                ASSERT_TRUE(o.prepared.back().kernel->exportNativeVNNIMatrixDesc(desc[p]));
+                ASSERT_TRUE(o.prepared.back().kernel->exportNativeQuantisedMatrixDesc(desc[p]));
                 ASSERT_EQ(desc[p].n,width); ASSERT_EQ(desc[p].k,width);
             }
             ASSERT_EQ(desc[0].codebook_id,desc[1].codebook_id);

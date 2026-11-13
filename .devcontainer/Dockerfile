@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the shared installers and run the same ones the release image uses,
 # so the dev environment tracks production 1:1.
 COPY scripts/docker /tmp/install-scripts
+COPY scripts/build/gpu_spill_guard.py /tmp/build/gpu_spill_guard.py
 RUN chmod +x /tmp/install-scripts/*.sh
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
@@ -94,7 +95,7 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
         echo "Skipping CUDA installation"; \
     fi
 
-# The shared ROCm installer builds matching gfx906 BLAS and the repaired HIP
+# The shared ROCm installer builds matching shipping-target BLAS and the repaired HIP
 # runtime from the pinned release sources, exactly like the shipping builder.
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
         MODE=full /tmp/install-scripts/install-rocm.sh; \

@@ -4,8 +4,12 @@
  * @author David Sanftenberg
  *
  * Tests verify that scalar, AVX2, and AVX512 implementations produce identical results.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include <random>
@@ -486,6 +490,8 @@ TEST(Q4_KTensor_INT8, BlockConversion)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -13,6 +13,11 @@
 
 #include "utils/PerfStatsCollector.h"
 #include <stdexcept>
+#include <algorithm>
+#include <cstdint>
+#include <array>
+#include <numeric>
+#include <span>
 
 namespace llaminar2::test::parity
 {
@@ -22,6 +27,149 @@ namespace llaminar2::test::parity
         FreshRunner,
         RetainedRunner,
     };
+
+    /** Cell-lifetime physical movement contract; requests may share one original runner. */
+    enum class ParityMoEMovementExpectation : std::uint8_t
+    {
+        NotApplicable,
+        NoMovement,
+        PhysicalMovement,
+    };
+
+    /** Explicit evidence boundary; an intermediate request cannot certify a cohort. */
+    enum class ParityMoEMovementEvidenceBoundary : std::uint8_t
+    {
+        Intermediate,
+        Final,
+    };
+
+    /** Passive test evidence result, distinct from graph or runtime certification. */
+    enum class ParityMoEMovementEvidenceStatus : std::uint8_t
+    {
+        NotApplicable,
+        Intermediate,
+        Complete,
+        MissingPhysicalFacts,
+        UnexpectedMovement,
+    };
+
+    /**
+     * @brief Evaluate unchanged movement facts at an explicitly declared cell boundary.
+     * @param expectation Original typed cell obligation, never changed by calibration state.
+     * @param facts Latest cumulative snapshot of accepted/copied/bytes/applied facts.
+     * @param boundary Final by default; Intermediate postpones only positive Dynamic proof.
+     * @return Intermediate is expressly incomplete; Final still needs every physical fact.
+     * @throws std::invalid_argument For an unknown boundary or expectation.
+     * @note Static requires zero movement at every boundary. Snapshots are never added.
+     */
+    inline ParityMoEMovementEvidenceStatus parityMoEMovementEvidenceAtBoundary(
+        ParityMoEMovementExpectation expectation,
+        const std::array<float, 4> &facts,
+        ParityMoEMovementEvidenceBoundary boundary = ParityMoEMovementEvidenceBoundary::Final)
+    {
+        if (boundary != ParityMoEMovementEvidenceBoundary::Intermediate &&
+            boundary != ParityMoEMovementEvidenceBoundary::Final)
+            throw std::invalid_argument("Unknown parity movement evidence boundary");
+        switch (expectation)
+        {
+        case ParityMoEMovementExpectation::NotApplicable:
+            return ParityMoEMovementEvidenceStatus::NotApplicable;
+        case ParityMoEMovementExpectation::NoMovement:
+            return std::all_of(facts.begin(), facts.end(), [](float value) { return value == 0.0f; })
+                ? ParityMoEMovementEvidenceStatus::Complete
+                : ParityMoEMovementEvidenceStatus::UnexpectedMovement;
+        case ParityMoEMovementExpectation::PhysicalMovement:
+            if (boundary == ParityMoEMovementEvidenceBoundary::Intermediate)
+                return ParityMoEMovementEvidenceStatus::Intermediate;
+            return std::all_of(facts.begin(), facts.end(), [](float value) { return value > 0.0f; })
+                ? ParityMoEMovementEvidenceStatus::Complete
+                : ParityMoEMovementEvidenceStatus::MissingPhysicalFacts;
+        }
+        throw std::invalid_argument("Unknown parity movement expectation");
+    }
+
+    /**
+     * @brief Project the four required terminal movement facts for one parity cell.
+     * @param records Current-cell collector snapshot, after original native work completed.
+     * @return Accepted placement, copied payload, physical bytes and applied placement totals.
+     *
+     * Native controller families originate only in the authenticated completed
+     * physical-publication producer. Proposals and source arrivals do not
+     * certify completion. CPU/mapped families retain their existing meanings.
+     * Cell evidence reset erases these counters; setup evidence cannot supply
+     * movement credit to a later cell. These are observations, never capacity.
+     */
+    inline std::array<float, 4> parityMoEMovementFacts(
+        std::span<const PerfStatRecord> records)
+    {
+        const auto counter = [&](const char *domain, const char *name)
+        {
+            return std::accumulate(
+                records.begin(), records.end(), 0.0,
+                [&](double total, const PerfStatRecord &record)
+                {
+                    return total +
+                           (record.kind == PerfStatRecord::Kind::Counter &&
+                                    record.domain == domain &&
+                                    record.name == name
+                                ? record.value
+                                : 0.0);
+                });
+        };
+
+        /*
+         * Host-authoritative multi-tier movement and device-authoritative
+         * GPU movement publish different counters, but both must
+         * prove the same four facts. Keep the mapping here at the common
+         * parity boundary rather than teaching each model fixture backend
+         * implementation details.
+         */
+        return {
+            static_cast<float>(
+                counter("moe_overlay_residency", "committed_expert_migrations") +
+                counter("moe_overlay_controller", "dynamic_movement_transactions") +
+                counter("moe_rebalance", "device_rebalance_dynamic_ownership_swap_accepts") +
+                counter("moe_rebalance", "device_rebalance_selected_replicas")),
+            static_cast<float>(
+                counter("moe_overlay_residency", "cpu_native_copy_bytes") +
+                counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
+                counter("moe_overlay_residency", "placement_transfer_operations_completed") +
+                counter("moe_overlay_residency", "device_physical_destinations_staged") +
+                counter("moe_overlay_controller", "dynamic_movement_commands") +
+                counter("moe_rebalance", "cpu_llep_weight_transfers") +
+                counter("moe_rebalance", "weight_transfer_outgoing_entries") +
+                counter("moe_rebalance", "weight_transfer_incoming_entries") +
+                counter("moe_rebalance", "mask_apply_received_entries") +
+                counter("moe_rebalance", "device_rebalance_copy_copied_arrivals") +
+                counter("moe_rebalance", "device_rebalance_transfer_current_copied_arrivals") +
+                counter("moe_rebalance", "device_rebalance_wave_copied_arrivals_total") +
+                counter("moe_rebalance", "device_rebalance_request_copied_payload_lower_bound")),
+            static_cast<float>(
+                counter("moe_overlay_residency", "cpu_native_copy_bytes") +
+                counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
+                counter("moe_overlay_residency", "placement_transfer_payload_bytes_completed") +
+                counter("moe_overlay_controller", "dynamic_physical_bytes") +
+                counter("moe_rebalance", "cpu_llep_weight_transfer_incoming_bytes") +
+                counter("moe_rebalance", "cpu_llep_weight_transfer_outgoing_bytes") +
+                counter("moe_rebalance", "weight_transfer_incoming_bytes") +
+                counter("moe_rebalance", "weight_transfer_outgoing_bytes") +
+                counter("moe_rebalance", "mask_apply_received_bytes") +
+                counter("moe_rebalance", "device_rebalance_transfer_useful_payload_bytes") +
+                counter("moe_rebalance", "device_rebalance_request_useful_payload_bytes_lower_bound")),
+            static_cast<float>(
+                counter("moe_overlay_residency", "expert_migration_edges") +
+                counter("moe_overlay_residency", "device_physical_epoch_published") +
+                counter("moe_overlay_controller", "dynamic_migration_edges") +
+                counter("moe_rebalance", "cpu_llep_weight_transfers") +
+                counter("moe_rebalance", "ownership_change_entries") +
+                counter("moe_rebalance", "replica_arrivals") +
+                counter("moe_rebalance", "mask_apply_received_entries") +
+                counter("moe_rebalance", "device_rebalance_apply_applied_arrivals") +
+                counter("moe_rebalance", "device_rebalance_transfer_current_applied_arrivals") +
+                counter("moe_rebalance", "device_rebalance_wave_applied_arrivals_total") +
+                counter("moe_rebalance", "device_rebalance_request_applied_payload_lower_bound")),
+        };
+    }
 
     /**
      * @brief Start one cell's measurement window without inventing setup work.

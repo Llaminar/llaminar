@@ -11,9 +11,10 @@ the gate appropriate to the task; a focused pass is not a full model or image
 certificate. Reuse the existing drivers and typed matrix instead of maintaining
 another model/topology list.
 
-For mathematical model parity, prove the live inference path against an
-independent reference pack generated from the declared real GGUF. Preserve every
-stage comparison and canonical CSV while amortizing immutable model setup;
+For mathematical model parity, use the production PyTorch parity framework in
+`tests/v2/integration/parity/` to prove the live inference path against an
+independent CPU/FP32 reference pack generated from the same real GGUF. Preserve
+every stage comparison and canonical CSV while amortizing immutable model setup;
 numerical checkpoints, not an extra whole-model hash pass, prove weight equivalence.
 
 ## Routine regression versus mathematical diagnosis
@@ -78,7 +79,8 @@ through `run_production_prerequisites.py`. Production hardware has its own queue
 The `develop` → `master` PR gate is separate: its required pull-request E2E
 check waits for the exact develop-head image pair, runs complete Unit and
 production preflight in source/ISA-bound full-matrix test companions on both
-ISAs, then proves both runtimes on the full HTTP matrix, then its dependent benchmark check consumes that same image-bound
+ISAs, runs separate QFN source admission on both exact-source test companions,
+then proves both runtimes on the full HTTP matrix, then its dependent benchmark check consumes that same image-bound
 E2E receipt. The benchmark check runs both ISAs even when the first has a
 complete red ratchet report, comments the per-cell red/amber/green numbers on
 the PR, and fails if any measured phase exceeds the high-water tolerance.
@@ -116,13 +118,18 @@ workspace and model tmpfs mounts are explicit same-path roots declared through
 the runner deployment.
 Do not run fixed-depth MTP cells or mathematical HF parity by default.
 
-Token drift or a suspected accuracy bug calls for the **specific matching
-diagnostic mathematical HF parity cell**: retain its failing HTTP request and
-tokens, select the same model/topology/precision/movement/MTP configuration,
-and use checkpoint CSVs to locate the first divergent stage. Do not respond
-by regenerating expected tokens or routinely launching the entire expensive
-mathematical matrix. Fixed-depth mathematical coverage remains available for
-focused diagnosis; the full mathematical suite is explicit opt-in only.
+For detailed debugging of a numerical inference failure (including token drift,
+high KL divergence, NaN/Inf, or unexpected MoE routing), use the **production
+PyTorch parity framework**. Preserve the failing request and token IDs, then
+run the matching mathematical parity cell through
+`scripts/ci/run_production_parity_campaigns.py --exact-cell` with the
+same model, topology, precision, movement, and MTP configuration. Its CPU/FP32
+PyTorch reference uses weights from the exact production GGUF. Compare the
+prefill and decode checkpoint CSVs to find the first divergent phase, step,
+layer, and stage before changing arithmetic or tolerances. Do not regenerate
+expected tokens or routinely launch the entire expensive mathematical matrix.
+Fixed-depth mathematical coverage remains available for focused diagnosis;
+the full mathematical suite is explicit opt-in only.
 For an image pipeline, `--diagnostic-mathematical-parity` is that explicit
 opt-in; `--through parity` alone is rejected. The normal piecewise boundaries
 are `--through prerequisites` and `--through generation` before HTTP E2E.
@@ -160,6 +167,11 @@ substitute for the production path.
 
 ## Choose the workflow
 
+- For isolated kernel correctness and economy, use the canonical
+  [production kernel replay procedure](references/kernel-replay.md): fixed
+  production inputs/routes, retained capture, dirty-buffer byte checks,
+  unprofiled timing and separate profiler evidence. Extend existing fixtures;
+  component results still require the applicable model qualification.
 - For the full model-free Unit and production-preflight gate, use
   `scripts/ci/run_production_prerequisites.py --build-dir BUILD --output NEW_DIR`
   or the direct CMake/CTest commands below. Refresh once after a build or test
@@ -709,3 +721,22 @@ python3 scripts/ci/run_production_parity_campaigns.py \
 Keep `.githooks/pre-commit`, `.github/workflows/ci.yml`, this skill,
 `tests/v2/integration/parity/README.md`, and the short parity references in
 `AGENTS.md` synchronized when the canonical command or gate changes.
+
+
+## Explicit native tests against a Release owner
+
+Release keeps performance-only test selection by default. To qualify an existing
+native test against the exact serving core, reconfigure that same Release tree
+with `-DLLAMINAR_RELEASE_NATIVE_TEST_TARGETS='targetA;targetB'`, naming the
+original CMake test executable owners or source/DSO proof custom targets marked
+`V2_RELEASE_NATIVE_PROOF_OWNER`. Preserve the original compiler, SDK,
+architecture and snapshot settings. Unknown, imported and unmarked non-test
+or custom targets fail configuration. Only aliases referencing a selected owner are admitted; script
+drivers retain the same explicit target dependency rules.
+
+Build selected owners explicitly with
+`cmake --build <build> --parallel --target <owner>` and use their existing
+registered CTest aliases. Selected native owners remain excluded from the
+default `all` build. This option neither enables
+snapshots nor changes core/test compile definitions or substitutes an Integration
+binary for the production Release owner.

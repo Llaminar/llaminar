@@ -9,6 +9,8 @@
  * no timing assertions or synthetic performance policy.
  * Exact zero-dot witnesses independently prove subnormal products and sums;
  * neither optimized implementation supplies the other's expected bit words.
+ * A separate versioned frozen projection trace compares the actual full/column
+ * gate across all visible ROCm devices, exposing mixed-ISA sum-tree drift.
  */
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
@@ -192,6 +194,202 @@ void run(DeviceId device)
             }
     });
 }
+
+#ifdef HAVE_ROCM
+/**
+ * @brief Versioned native observation of the original mixed-device projection gate trace.
+ *
+ * Each word is one complete row's sigmoid gate, exposed by shared=1/routed=0.
+ * The production full-row API and column API must agree locally and across
+ * physical devices; a receiver-local-only oracle cannot detect the former
+ * gfx906 XOR versus gfx1100 DOWN reduction tree. No expert math is substituted.
+ */
+struct SharedGateTraceWord
+{
+    int rows, width, degree, replay, live, row;
+    std::uint32_t word;
+};
+
+/**
+ * @brief Replay one frozen trace geometry through retained production captures.
+ * @param device Exact physical owner, bound before allocating/capturing.
+ * @param gpu Strongly retained worker owning the non-null stream and graph.
+ * @param stream Exact worker stream for setup, graph launch and terminal reads.
+ * @param rows Physical row capacity; one uses serial fused shared gate.
+ * @param width Original full model width, never replaced by slice width.
+ * @param degree Output-column partition count; only output addressing narrows.
+ * @param observations Compact full-row words retained solely by this test oracle.
+ *
+ * Version1 reproduces projection replay0's exact h/g construction. Replays
+ * dirty every destination and cycle full/empty/partial/full input admission.
+ * Changing a replay's live count resets data while the same graph/pointers and
+ * arithmetic policy remain captured. Captures retire before workspace/tensors;
+ * the terminal join guard also protects assertion/exception unwinding.
+ */
+void observeCrossDeviceSharedGateTrace(DeviceId device, IWorkerGPUContext &gpu, void *stream,
+    int rows, int width, int degree, std::vector<SharedGateTraceWord> &observations)
+{
+    constexpr std::uint32_t trace_version = 1;
+    constexpr float poison = -1234.5f;
+    SCOPED_TRACE("shared_gate_trace_v" + std::to_string(trace_version) + "/" + device.toString());
+    const int columns = width / degree;
+    auto *backend = getBackendFor(device);
+    require(backend && stream && width % degree == 0, "cross-device shared-gate owner/geometry");
+    const auto tensor = [&](std::size_t count) {
+        auto value = TestTensorFactory::createFP32({count + 16});
+        std::fill_n(value->mutable_data(), value->numel(), 0.f);
+        require(value->ensureOnDevice(device, stream), "cross-device gate storage admission");
+        return value;
+    };
+    const std::size_t full = std::size_t(rows) * width, local = std::size_t(rows) * columns;
+    auto input = tensor(full), gate = tensor(width), shared = tensor(local), routed = tensor(local);
+    auto output = tensor(local), full_shared = tensor(full);
+    auto active = TestTensorFactory::createINT32({1});
+    require(active->ensureOnDevice(device, stream), "cross-device gate live-row admission");
+    WorkspaceRequirements requirements;
+    MoEWorkspaceBuffers::add(requirements, MoEWorkspaceBuffers::ROCM_SHARED_GATE, rows * sizeof(float));
+    DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+    require(workspace.allocate(requirements), "cross-device gate full oracle workspace");
+    auto oracle = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+    oracle->setGPUStream(stream);
+    dynamic_cast<IWorkspaceConsumer *>(oracle.get())->bindWorkspace(&workspace);
+    SharedExpertColumnGate binding{.input = static_cast<const float *>(input->gpu_data_ptr()),
+        .gate = static_cast<const float *>(gate->gpu_data_ptr()),
+        .shared = static_cast<float *>(shared->gpu_data_ptr()),
+        .routed = static_cast<const float *>(routed->gpu_data_ptr()),
+        .combined = static_cast<float *>(output->gpu_data_ptr()),
+        .rows = rows, .model_columns = width, .local_columns = columns,
+        .active_rows = static_cast<const int *>(active->gpu_data_ptr())};
+    for (auto *value : {input.get(), gate.get(), full_shared.get()})
+        TransferEngine::requireDeviceInput(value, device, stream);
+    std::vector<float> x(input->numel(), 0.f), g(gate->numel(), 0.f);
+    // Frozen projection trace v1: preserve the original literal/RN boundaries.
+    for (std::size_t i = 0; i < full; ++i) x[i] = .0071f * (int(i * 19 % 101) - 50);
+    for (int i = 0; i < width; ++i) g[i] = .125f * (int(i * 17 % 23) - 11);
+    const auto upload = [&](ITensor *value, const std::vector<float> &words) {
+        require(backend->hostToDeviceOnStream(value->gpu_data_ptr(), words.data(), words.size() * sizeof(float),
+            device.ordinal, stream), "cross-device gate input upload");
+    };
+    std::vector<float> shared_words(shared->numel()), zero_routes(routed->numel(), 0.f);
+    std::vector<float> full_words(full_shared->numel()), actual(output->numel()), gated(shared->numel());
+    int live = 0; // Persistent upload source must outlive the failure-path terminal join.
+    auto capture = gpu.createGraphCapture(stream);
+    Retire retire{gpu, stream};
+    {
+        ScopedBackendGraphCapture recording(gpu, *capture, "shared_gate_cross_device_trace_v1");
+        require(recording.begin(), "cross-device gate capture begin");
+        require(gateSharedExpertColumnsFP32(device, binding, stream), "cross-device column gate capture");
+        require(oracle->sharedExpertGateFromTensorsEffectiveSeqLen(input.get(), gate.get(), full_shared.get(),
+            rows, width, binding.active_rows), "cross-device full gate capture");
+        recording.finish();
+    }
+    require(capture->instantiate(), "cross-device gate instantiate");
+    upload(input.get(), x); upload(gate.get(), g);
+    upload(routed.get(), zero_routes);
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        live = replay % 4 == 0 ? rows : replay % 4 == 1 ? 0
+            : replay % 4 == 2 ? (rows + 1) / 2 : rows;
+        SCOPED_TRACE("rows=" + std::to_string(rows) + "/width=" + std::to_string(width) +
+            "/degree=" + std::to_string(degree) + "/replay=" + std::to_string(replay));
+        std::fill(shared_words.begin(), shared_words.end(), poison);
+        std::fill(full_words.begin(), full_words.end(), poison);
+        std::fill(actual.begin(), actual.end(), poison);
+        for (int row = 0; row < rows; ++row)
+        {
+            std::fill_n(shared_words.begin() + std::size_t(row) * columns, columns, 1.f);
+            // Serial M1's full API has no masked publication. Zero its explicit
+            // shared input when inactive; the column API must mask its own ones.
+            std::fill_n(full_words.begin() + std::size_t(row) * width, width, row < live ? 1.f : 0.f);
+        }
+        upload(shared.get(), shared_words); upload(full_shared.get(), full_words); upload(output.get(), actual);
+        require(backend->hostToDeviceOnStream(active->gpu_data_ptr(), &live, sizeof(live), device.ordinal, stream)
+            && capture->launch(), "cross-device gate retained replay");
+        require(backend->deviceToHostOnStream(actual.data(), output->gpu_data_ptr(), actual.size() * sizeof(float),
+                device.ordinal, stream) &&
+            backend->deviceToHostOnStream(gated.data(), shared->gpu_data_ptr(), gated.size() * sizeof(float),
+                device.ordinal, stream) &&
+            backend->deviceToHostOnStream(full_words.data(), full_shared->gpu_data_ptr(), full_words.size() * sizeof(float),
+                device.ordinal, stream) && gpu.synchronizeStreamChecked(stream), "cross-device gate terminal observation");
+        for (int row = 0; row < rows; ++row)
+        {
+            const auto expected = std::bit_cast<std::uint32_t>(full_words[std::size_t(row) * width]);
+            if (row < live)
+            {
+                ASSERT_TRUE(std::isfinite(full_words[std::size_t(row) * width]));
+                ASSERT_GE(full_words[std::size_t(row) * width], 0.f);
+                ASSERT_LE(full_words[std::size_t(row) * width], 1.f);
+            }
+            else ASSERT_EQ(expected, 0u);
+            for (int column = 0; column < width; ++column)
+                ASSERT_EQ(std::bit_cast<std::uint32_t>(full_words[std::size_t(row) * width + column]), expected);
+            for (int column = 0; column < columns; ++column)
+            {
+                const auto index = std::size_t(row) * columns + column;
+                ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[index]), expected);
+                ASSERT_EQ(std::bit_cast<std::uint32_t>(gated[index]), expected);
+            }
+            observations.push_back({rows, width, degree, replay, live, row, expected});
+        }
+        for (std::size_t i = local; i < actual.size(); ++i)
+        {
+            ASSERT_EQ(actual[i], poison);
+            ASSERT_EQ(gated[i], poison);
+        }
+        for (std::size_t i = full; i < full_words.size(); ++i) ASSERT_EQ(full_words[i], poison);
+    }
+    retire.completed();
+}
+
+/**
+ * @brief Compare the frozen actual full/column program across every visible ROCm device.
+ *
+ * The first visible card supplies a retained native full-row trace, never a CPU
+ * exp approximation. Every subsequent card must publish exactly those bytes.
+ * Typed process lifetime is supplied by the canonical executable main; each
+ * per-device strong context borrow outlives all captured readers and storage.
+ * No context reset, ISA spoof or lazy launch initialization is used.
+ */
+void runCrossDeviceSharedGateTrace()
+{
+    auto *backend = getBackendFor(DeviceId::rocm(0));
+    require(backend && backend->deviceCount() >= 2, "shared-gate cross-device replay requires two visible ROCm devices");
+    const int count = backend->deviceCount();
+    std::vector<SharedGateTraceWord> baseline;
+    for (int ordinal = 0; ordinal < count; ++ordinal)
+    {
+        const auto device = DeviceId::rocm(ordinal);
+        auto context = GPUDeviceContextPool::instance().retainContext(device);
+        require(bool(context), "cross-device shared-gate retained context");
+        std::vector<SharedGateTraceWord> observed;
+        context->submitAndWait([&] {
+            auto *stream = context->getOrCreateAuxiliaryStream("shared_gate_cross_device_trace_v1");
+            for (int width : {256, 512})
+                for (int rows : {1, 16, 129})
+                    for (int degree : {2, 4})
+                    {
+                        observeCrossDeviceSharedGateTrace(device, *context, stream, rows, width, degree, observed);
+                        if (::testing::Test::HasFailure()) return;
+                    }
+        });
+        ASSERT_FALSE(::testing::Test::HasFailure()) << device.toString();
+        if (ordinal == 0) baseline = std::move(observed);
+        else
+        {
+            ASSERT_EQ(observed.size(), baseline.size());
+            for (std::size_t i = 0; i < observed.size(); ++i)
+            {
+                const auto &value = observed[i];
+                const auto &expected = baseline[i];
+                ASSERT_EQ(value.word, expected.word) << "trace_v1 device=" << device.toString()
+                    << " reference=ROCm:0 rows=" << value.rows << " width=" << value.width
+                    << " degree=" << value.degree << " replay=" << value.replay
+                    << " live=" << value.live << " row=" << value.row << " index=" << i;
+            }
+        }
+    }
+}
+#endif
 
 /**
  * @brief Exact binary32 witnesses for sigmoid(0) * shared followed by addition.
@@ -475,6 +673,8 @@ TEST(SharedExpertColumnGate, SubnormalPublicationCUDA) { runHalfGate(DeviceId::c
 #endif
 #ifdef HAVE_ROCM
 TEST(SharedExpertColumnGate, ROCm) { run(DeviceId::rocm(0)); }
+/** @test Frozen projection gate bytes survive native captured replay across physical cards. */
+TEST(SharedExpertColumnGate, ROCmCrossDeviceCapturedTraceV1) { runCrossDeviceSharedGateTrace(); }
 TEST(SharedExpertColumnGate, SubnormalPublicationROCm) { runHalfGate(DeviceId::rocm(0)); }
 #endif
 }

@@ -4,6 +4,7 @@
  */
 
 #include "MoEOverlayMPIEconomyEvidenceExchange.h"
+#include "MoEOverlayEconomyEvidenceCodec.h"
 
 #include "MoEOverlayMPIFatal.h"
 
@@ -40,43 +41,18 @@ namespace llaminar2
         constexpr std::uint32_t kServiceMagic = 0x45435356u; // "ECSV"
         constexpr std::uint16_t kWireVersion = 3;
 
-        /** @brief Fixed-layout optional projection observation. */
-        struct ProjectionWire
-        {
-            std::uint32_t present = 0;
-            std::uint32_t reserved = 0;
-            std::uint64_t sequence = 0;
-            std::uint64_t bytes = 0;
-            std::uint64_t wall_nanoseconds = 0;
-            std::uint64_t device_nanoseconds = 0;
-            std::uint64_t host_nanoseconds = 0;
-            std::uint64_t transport_nanoseconds = 0;
-        };
-
-        /** @brief Fixed-layout partial timing row for one migration direction. */
-        struct MigrationWire
-        {
-            std::uint64_t expected_epoch = 0;
-            std::uint64_t candidate_epoch = 0;
-            std::int32_t source_participant = -1;
-            std::int32_t destination_participant = -1;
-            std::int32_t layer = -1;
-            std::int32_t expert = -1;
-            std::uint64_t wave_wall_nanoseconds = 0;
-            std::array<ProjectionWire, 3> projections{};
-        };
-
         /** @brief One rank's complete versioned calibration attempt packet. */
-        struct AttemptWire
+        struct EvidenceCountHeader
         {
             std::uint32_t magic = kAttemptMagic;
-            std::uint16_t version = kWireVersion;
+            std::uint16_t version = 5;
             std::uint16_t reserved = 0;
             std::int32_t world_rank = -1;
             std::int32_t world_size = 0;
             std::uint64_t calibration_sequence = 0;
-            std::int32_t first_participant = -1;
-            std::int32_t second_participant = -1;
+            /** Complete typed target words, never representative cohort members. */
+            std::int32_t first_target_word = -1;
+            std::int32_t second_target_word = -1;
             std::int32_t layer = -1;
             std::uint32_t source = 0;
             std::int32_t real_rows = 0;
@@ -88,7 +64,16 @@ namespace llaminar2
             std::uint64_t concurrent_nanoseconds = 0;
             std::uint32_t exact_overlap = 0;
             std::uint32_t reserved_result = 0;
-            std::array<MigrationWire, 2> migrations{};
+            /** Count/identity metadata only; samples use exact-live payloads. */
+            std::uint64_t payload_bytes = 0;
+            std::uint64_t payload_hash = 0;
+            std::uint64_t expected_epoch = 0;
+            std::uint64_t candidate_epoch = 0;
+            std::uint64_t wave_wall_nanoseconds = 0;
+            std::array<std::int32_t,2> experts{{-1,-1}};
+            std::uint32_t evidence_kind = 0;
+            std::uint32_t migration_count = 0;
+            std::uint64_t transaction_purpose = 0;
             std::uint64_t packet_hash = 0;
         };
 
@@ -148,18 +133,18 @@ namespace llaminar2
                 overflowed{};
         };
 
-        static_assert(std::is_trivially_copyable_v<AttemptWire>);
+        static_assert(std::is_trivially_copyable_v<EvidenceCountHeader>);
         static_assert(
             std::is_trivially_copyable_v<CalibrationReadinessWire>);
         static_assert(std::is_trivially_copyable_v<ServiceHeaderWire>);
         static_assert(std::is_trivially_copyable_v<ServiceCellWire>);
 
         /** @brief Hash one zero-initialized fixed attempt packet. */
-        std::uint64_t attemptHash(const AttemptWire &wire) noexcept
+        std::uint64_t evidenceHeaderHash(const EvidenceCountHeader &wire) noexcept
         {
             return fnv1a64(
                 &wire,
-                offsetof(AttemptWire, packet_hash));
+                offsetof(EvidenceCountHeader, packet_hash));
         }
 
         /** @brief Hash one fixed readiness packet excluding its hash field. */
@@ -221,101 +206,6 @@ namespace llaminar2
             return hash;
         }
 
-        /** @brief Copy a public projection into its pointer-free wire form. */
-        ProjectionWire encodeProjection(
-            const std::optional<ExpertTierProjectionTransferMeasurement> &
-                projection)
-        {
-            if (!projection)
-                return {};
-            return {
-                .present = 1,
-                .sequence = projection->sequence,
-                .bytes = projection->bytes,
-                .wall_nanoseconds = projection->wall_nanoseconds,
-                .device_nanoseconds = projection->device_nanoseconds,
-                .host_nanoseconds = projection->host_nanoseconds,
-                .transport_nanoseconds =
-                    projection->transport_nanoseconds,
-            };
-        }
-
-        /** @brief Rebuild one validated optional projection from the wire. */
-        std::optional<ExpertTierProjectionTransferMeasurement>
-        decodeProjection(const ProjectionWire &wire)
-        {
-            if (wire.present == 0)
-                return std::nullopt;
-            if (wire.present != 1 || wire.reserved != 0)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay economy packet has an invalid projection presence marker");
-            }
-            ExpertTierProjectionTransferMeasurement result{
-                .sequence = wire.sequence,
-                .bytes = wire.bytes,
-                .wall_nanoseconds = wire.wall_nanoseconds,
-                .device_nanoseconds = wire.device_nanoseconds,
-                .host_nanoseconds = wire.host_nanoseconds,
-                .transport_nanoseconds = wire.transport_nanoseconds,
-            };
-            if (!result.valid())
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay economy packet contains an invalid projection observation");
-            }
-            return result;
-        }
-
-        /** @brief Encode one locally complete or partial migration row. */
-        MigrationWire encodeMigration(
-            const MoEOverlayCompletedMigrationMeasurement &measurement)
-        {
-            MigrationWire wire{
-                .expected_epoch = measurement.expected_epoch,
-                .candidate_epoch = measurement.candidate_epoch,
-                .source_participant = measurement.source_participant,
-                .destination_participant =
-                    measurement.destination_participant,
-                .layer = measurement.layer,
-                .expert = measurement.expert,
-                .wave_wall_nanoseconds =
-                    measurement.wave_wall_nanoseconds,
-            };
-            for (std::size_t projection = 0; projection < 3; ++projection)
-            {
-                wire.projections[projection] = encodeProjection(
-                    measurement.projections[projection]);
-            }
-            return wire;
-        }
-
-        /** @brief Decode and validate one migration row. */
-        MoEOverlayCompletedMigrationMeasurement decodeMigration(
-            const MigrationWire &wire)
-        {
-            MoEOverlayCompletedMigrationMeasurement result{
-                .expected_epoch = wire.expected_epoch,
-                .candidate_epoch = wire.candidate_epoch,
-                .source_participant = wire.source_participant,
-                .destination_participant = wire.destination_participant,
-                .layer = wire.layer,
-                .expert = wire.expert,
-                .wave_wall_nanoseconds = wire.wave_wall_nanoseconds,
-            };
-            for (std::size_t projection = 0; projection < 3; ++projection)
-            {
-                result.projections[projection] = decodeProjection(
-                    wire.projections[projection]);
-            }
-            if (!result.valid())
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay economy packet contains an invalid migration row");
-            }
-            return result;
-        }
-
         /** @brief Render one stable MPI error diagnostic. */
         std::string mpiError(const char *operation, int mpi_error)
         {
@@ -349,14 +239,20 @@ namespace llaminar2
             CalibrationReadiness,
             ServiceReadiness,
             Service,
+            PreparedService,
         };
 
         Config config;
         MPI_Comm communicator = MPI_COMM_NULL;
         MPI_Request request = MPI_REQUEST_NULL;
         Active active = Active::Idle;
-        AttemptWire local_attempt;
-        std::vector<AttemptWire> gathered_attempts;
+        EvidenceCountHeader local_attempt;
+        std::vector<EvidenceCountHeader> gathered_attempts;
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context;
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> prepared_service_plan;
+        std::vector<std::byte> local_payload, gathered_payload;
+        std::vector<int> payload_counts, payload_offsets;
+        bool payload_active = false;
         CalibrationReadinessWire local_calibration_readiness;
         std::vector<CalibrationReadinessWire>
             gathered_calibration_readiness;
@@ -486,7 +382,8 @@ namespace llaminar2
                     const char *operation =
                         expected == Active::ServiceReadiness
                             ? "MPI_Iallreduce"
-                            : "MPI_Iallgather";
+                            : payload_active && (expected==Active::Attempt || expected==Active::MigrationProfile || expected==Active::PreparedService)
+                                ? "MPI_Iallgatherv" : "MPI_Iallgather";
                     diagnostic
                         << operation
                         << " exceeded the canonical 30-second collective timeout"
@@ -503,7 +400,7 @@ namespace llaminar2
                                                 Active::CalibrationReadiness
                                             ? sizeof(
                                                   CalibrationReadinessWire)
-                                            : sizeof(AttemptWire));
+                                            : (payload_active ? local_payload.size() : sizeof(EvidenceCountHeader)));
                     assignError(error, diagnostic.str());
                     abortMoEOverlayMPI(
                         communicator,
@@ -517,6 +414,120 @@ namespace llaminar2
             if (error)
                 error->clear();
             return MoEOverlayResidencyWaveProgress::Ready;
+        }
+
+        /** @brief Validate every header before posting any observation payload.
+         * @param wire Rank header. @param rank Actual collective source. */
+        void validateEvidenceHeader(const EvidenceCountHeader &wire,int rank) const
+        {
+            const auto &local=local_attempt;
+            if(wire.magic!=kAttemptMagic || wire.version!=5 || wire.reserved || wire.reserved_result ||
+               wire.world_rank!=rank || wire.world_size!=config.mpi_context->world_size() ||
+               wire.packet_hash!=evidenceHeaderHash(wire) || !wire.packet_hash || wire.exact_overlap>1 ||
+               wire.calibration_sequence!=local.calibration_sequence || wire.first_target_word!=local.first_target_word ||
+               wire.second_target_word!=local.second_target_word || wire.layer!=local.layer ||
+               wire.source!=local.source || wire.real_rows!=local.real_rows || wire.execution_rows!=local.execution_rows ||
+               wire.transaction_count!=local.transaction_count || wire.speculative_depth!=local.speculative_depth ||
+               wire.schedule_fingerprint!=local.schedule_fingerprint || wire.evidence_kind!=local.evidence_kind ||
+               wire.expected_epoch!=local.expected_epoch || wire.candidate_epoch!=local.candidate_epoch ||
+               wire.migration_count!=local.migration_count || wire.experts!=local.experts ||
+               wire.transaction_purpose!=local.transaction_purpose ||
+               !wire.wave_wall_nanoseconds || wire.payload_bytes>static_cast<std::uint64_t>(INT_MAX) ||
+               wire.payload_bytes!=MoEOverlayEconomyEvidenceCodec::maximumEncodedBytes(*evidence_context,rank))
+                throw std::invalid_argument("Economy evidence count header differs from original local wave identity");
+            if(wire.evidence_kind==1 && (wire.baseline_nanoseconds || wire.concurrent_nanoseconds || wire.exact_overlap))
+                throw std::invalid_argument("Migration profile contains attempt-only metadata");
+        }
+
+        /** @brief Gather exact live counts then payloads using the same request and deadline.
+         * @param expected Existing exchange kind. @param error Failure diagnostic.
+         * @return Pending, complete payload, or failed state. */
+        MoEOverlayResidencyWaveProgress pollEvidence(Active expected,std::string *error)
+        {
+            const auto progress=pollRaw(expected,error);
+            if(progress!=MoEOverlayResidencyWaveProgress::Ready)return progress;
+            if(payload_active)return MoEOverlayResidencyWaveProgress::Ready;
+            try {
+                std::size_t total=0;
+                for(std::size_t rank=0;rank<gathered_attempts.size();++rank){
+                    const auto &wire=gathered_attempts[rank];validateEvidenceHeader(wire,static_cast<int>(rank));
+                    if(wire.payload_bytes>static_cast<std::size_t>(INT_MAX)-total)
+                        throw std::invalid_argument("Economy evidence live receive prefix exceeds MPI byte ABI");
+                    payload_counts[rank]=static_cast<int>(wire.payload_bytes);payload_offsets[rank]=static_cast<int>(total);
+                    total+=wire.payload_bytes;
+                }
+                gathered_payload.resize(total);
+                // Zero counts are real empty observers, never capacity-sized transmissions.
+                const int status=MPI_Iallgatherv(local_payload.data(),static_cast<int>(local_payload.size()),MPI_BYTE,
+                    gathered_payload.data(),payload_counts.data(),payload_offsets.data(),MPI_BYTE,communicator,&request);
+                if(status!=MPI_SUCCESS || request==MPI_REQUEST_NULL){
+                    ++stats.mpi_failures;
+                    abortMoEOverlayMPI(communicator,config.mpi_context->rank(),"economy_evidence",mpiError("MPI_Iallgatherv",status));
+                }
+                stats.evidence_payload_bytes_sent+=local_payload.size();
+                stats.evidence_payload_bytes_received+=total;
+                ++stats.evidence_payload_collectives_started;
+                record("mpi_economy_evidence_payload_bytes_sent",static_cast<double>(local_payload.size()));
+                record("mpi_economy_evidence_payload_bytes_received",static_cast<double>(total));
+                payload_active=true;active=expected;
+                // started_at belongs to both collectives; never restart the timeout here.
+                return MoEOverlayResidencyWaveProgress::Pending;
+            } catch(const std::exception &exception) {
+                ++stats.rejected_packets;assignError(error,exception.what());
+                // A rank may not abandon the collective sequence while peers enter payload exchange.
+                abortMoEOverlayMPI(communicator,config.mpi_context->rank(),"economy_evidence",exception.what());
+            }
+        }
+
+        /** @brief Bind local original geometry and encode exact observation bytes before posting.
+         * @param wire Common profile/attempt header. @param context Original prepared-wave metadata.
+         * @param rows Local independent quotes and observations. @param kind Existing exchange kind.
+         * @param error Failure diagnostic. @return Whether the count request was posted. */
+        bool beginEvidence(EvidenceCountHeader wire,std::shared_ptr<const MoEOverlayMigrationEvidenceContext> context,
+            const std::vector<MoEOverlayCompletedMigrationMeasurement> &rows,Active kind,std::string *error)
+        {
+            if(active!=Active::Idle || request!=MPI_REQUEST_NULL){
+                ++stats.concurrent_start_rejections;assignError(error,"Economy evidence lane already owns an exchange");return false;
+            }
+            try {
+                if(!context || rows.size()!=2 || !context->matches(rows))
+                    throw std::invalid_argument("Economy evidence requires the original checked prepared-wave context");
+                const auto &ids=context->identities();
+                for(const auto &id:ids)for(const auto *target:{&id.geometry->targets().first,&id.geometry->targets().second})
+                    for(const auto &member:target->members) {
+                        const auto *original=config.owner_map.participantForId(member.participant_id);
+                        if(!original || !original->world_rank_known || original->world_rank!=member.world_rank ||
+                           original->device!=member.device || original->address!=member.address)
+                            throw std::invalid_argument("Economy evidence context differs from original participant inventory");
+                    }
+                // Bound receive counts by original piece incidence before accepting sender lengths.
+                local_payload=MoEOverlayEconomyEvidenceCodec::encode(*context,rows,config.mpi_context->rank());
+                if(local_payload.size()>static_cast<std::size_t>(INT_MAX))throw std::invalid_argument("Economy evidence live payload exceeds MPI byte ABI");
+                wire.expected_epoch=ids.front().expected_epoch;wire.candidate_epoch=ids.front().candidate_epoch;
+                wire.migration_count=static_cast<std::uint32_t>(ids.size());
+                wire.transaction_purpose=static_cast<std::uint64_t>(context->purpose());
+                wire.experts={ids[0].expert,ids[1].expert};wire.wave_wall_nanoseconds=rows.front().wave_wall_nanoseconds;
+                for(const auto &row:rows)if(row.wave_wall_nanoseconds!=wire.wave_wall_nanoseconds)
+                    throw std::invalid_argument("Economy evidence rows disagree on original wave duration");
+                wire.payload_bytes=local_payload.size();wire.payload_hash=fnv1a64(local_payload.data(),local_payload.size());
+                wire.packet_hash=evidenceHeaderHash(wire);local_attempt=wire;evidence_context=std::move(context);payload_active=false;
+                std::fill(gathered_attempts.begin(),gathered_attempts.end(),EvidenceCountHeader{});
+                const bool posted=beginRaw(&local_attempt,gathered_attempts.data(),sizeof(EvidenceCountHeader),kind,error);
+                if(posted){stats.evidence_count_bytes_sent+=sizeof(EvidenceCountHeader);
+                    record("mpi_economy_evidence_count_bytes_sent",sizeof(EvidenceCountHeader));}
+                return posted;
+            }catch(const std::exception &exception){++stats.rejected_packets;assignError(error,exception.what());return false;}
+        }
+
+        /** @brief Decode one rank against this wave's original metadata only.
+         * @param rank Actual collective source. @return Context-shaped partial observations. */
+        std::vector<MoEOverlayCompletedMigrationMeasurement> decodeEvidence(std::size_t rank) const
+        {
+            const auto &wire=gathered_attempts.at(rank);
+            const auto bytes=std::span<const std::byte>(gathered_payload).subspan(payload_offsets.at(rank),payload_counts.at(rank));
+            if(fnv1a64(bytes.data(),bytes.size())!=wire.payload_hash)
+                throw std::invalid_argument("Economy observation payload failed packet integrity");
+            return MoEOverlayEconomyEvidenceCodec::decode(*evidence_context,bytes,static_cast<int>(rank),wire.wave_wall_nanoseconds);
         }
     };
 
@@ -595,6 +606,8 @@ namespace llaminar2
         }
         impl_->gathered_attempts.resize(
             static_cast<std::size_t>(owned.mpi_context->world_size()));
+        impl_->payload_counts.resize(impl_->gathered_attempts.size());
+        impl_->payload_offsets.resize(impl_->gathered_attempts.size());
         impl_->gathered_calibration_readiness.resize(
             static_cast<std::size_t>(owned.mpi_context->world_size()));
         impl_->local_service.resize(impl_->service_packet_words);
@@ -645,266 +658,75 @@ namespace llaminar2
     }
 
     bool MoEOverlayMPIEconomyEvidenceExchange::beginMigrationProfile(
-        const MoEOverlayMigrationProfileEvidence &local,
-        std::string *error)
+        const MoEOverlayMigrationProfileEvidence &local,std::string *error)
     {
-        if (!local.valid())
-        {
-            ++impl_->stats.rejected_packets;
-            assignError(
-                error,
-                "ExpertOverlay MPI economy exchange received invalid migration-profile evidence");
-            return false;
-        }
-        AttemptWire wire{};
-        wire.world_rank = impl_->config.mpi_context->rank();
-        wire.world_size = impl_->config.mpi_context->world_size();
-        wire.calibration_sequence = local.profile_sequence;
-        wire.first_participant = local.coordinate.source_participant;
-        wire.second_participant = local.coordinate.destination_participant;
-        wire.layer = local.coordinate.layer;
-        for (std::size_t migration = 0; migration < 2; ++migration)
-        {
-            wire.migrations[migration] = encodeMigration(
-                local.local_measurements[migration]);
-        }
-        wire.packet_hash = attemptHash(wire);
-        impl_->local_attempt = wire;
-        std::fill(
-            impl_->gathered_attempts.begin(),
-            impl_->gathered_attempts.end(),
-            AttemptWire{});
-        if (!impl_->beginRaw(
-                &impl_->local_attempt,
-                impl_->gathered_attempts.data(),
-                sizeof(AttemptWire),
-                Impl::Active::MigrationProfile,
-                error))
-        {
-            return false;
-        }
-        ++impl_->stats.migration_profile_exchanges_started;
-        impl_->record("mpi_economy_migration_profile_exchanges_started");
-        return true;
+        if(!local.valid()){++impl_->stats.rejected_packets;assignError(error,"Invalid original-context migration-profile evidence");return false;}
+        EvidenceCountHeader wire{};wire.world_rank=impl_->config.mpi_context->rank();wire.world_size=worldSize();wire.evidence_kind=1;
+        wire.calibration_sequence=local.profile_sequence;wire.first_target_word=local.coordinate.source_target.word();
+        wire.second_target_word=local.coordinate.destination_target.word();wire.layer=local.coordinate.layer;
+        if(!impl_->beginEvidence(wire,local.context,local.local_measurements,Impl::Active::MigrationProfile,error))return false;
+        ++impl_->stats.migration_profile_exchanges_started;impl_->record("mpi_economy_migration_profile_exchanges_started");return true;
     }
 
-    MoEOverlayResidencyWaveProgress
-    MoEOverlayMPIEconomyEvidenceExchange::pollMigrationProfile(
-        MoEOverlayMigrationProfileResult *result,
-        std::string *error)
+    MoEOverlayResidencyWaveProgress MoEOverlayMPIEconomyEvidenceExchange::pollMigrationProfile(
+        MoEOverlayMigrationProfileResult *result,std::string *error)
     {
-        if (!result)
-        {
-            assignError(
-                error,
-                "ExpertOverlay MPI migration-profile exchange requires an output owner");
-            return MoEOverlayResidencyWaveProgress::Failed;
-        }
-        const auto progress = impl_->pollRaw(
-            Impl::Active::MigrationProfile, error);
-        if (progress != MoEOverlayResidencyWaveProgress::Ready)
-            return progress;
-        try
-        {
-            std::vector<MoEOverlayMigrationProfileEvidence> rank_evidence;
-            rank_evidence.reserve(impl_->gathered_attempts.size());
-            for (std::size_t rank = 0;
-                 rank < impl_->gathered_attempts.size();
-                 ++rank)
-            {
-                const auto &wire = impl_->gathered_attempts[rank];
-                if (wire.magic != kAttemptMagic ||
-                    wire.version != kWireVersion || wire.reserved != 0 ||
-                    wire.reserved_result != 0 ||
-                    wire.world_rank != static_cast<int>(rank) ||
-                    wire.world_size != worldSize() ||
-                    wire.source != 0 || wire.real_rows != 0 ||
-                    wire.execution_rows != 0 ||
-                    wire.transaction_count != 0 ||
-                    wire.speculative_depth != 0 ||
-                    wire.schedule_fingerprint != 0 ||
-                    wire.baseline_nanoseconds != 0 ||
-                    wire.concurrent_nanoseconds != 0 ||
-                    wire.exact_overlap != 0 || wire.packet_hash == 0 ||
-                    wire.packet_hash != attemptHash(wire))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay MPI migration-profile packet failed version, rank, or hash authentication");
-                }
-                MoEOverlayMigrationProfileEvidence decoded{
-                    .profile_sequence = wire.calibration_sequence,
-                    .coordinate = {
-                        .source_participant = wire.first_participant,
-                        .destination_participant = wire.second_participant,
-                        .layer = wire.layer,
-                    },
-                };
-                decoded.local_measurements.reserve(2);
-                for (const auto &migration : wire.migrations)
-                {
-                    decoded.local_measurements.push_back(
-                        decodeMigration(migration));
-                }
-                if (!decoded.valid())
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay MPI migration-profile packet decoded to invalid evidence");
-                }
-                rank_evidence.push_back(std::move(decoded));
+        if(!result){assignError(error,"Migration-profile exchange requires output owner");return MoEOverlayResidencyWaveProgress::Failed;}
+        const auto progress=impl_->pollEvidence(Impl::Active::MigrationProfile,error);
+        if(progress!=MoEOverlayResidencyWaveProgress::Ready)return progress;
+        try {
+            std::vector<MoEOverlayMigrationProfileEvidence> ranks;ranks.reserve(impl_->gathered_attempts.size());
+            for(std::size_t rank=0;rank<impl_->gathered_attempts.size();++rank){const auto &wire=impl_->gathered_attempts[rank];
+                ranks.push_back({.profile_sequence=wire.calibration_sequence,
+                    .coordinate={MoEOverlayRouteTarget::fromWord(wire.first_target_word),
+                        MoEOverlayRouteTarget::fromWord(wire.second_target_word),wire.layer},
+                    .local_measurements=impl_->decodeEvidence(rank),.context=impl_->evidence_context});
             }
-            *result =
-                MoEOverlayEconomyEvidenceMerger::mergeMigrationProfile(
-                    rank_evidence);
-        }
-        catch (const std::exception &exception)
-        {
-            ++impl_->stats.rejected_packets;
-            assignError(error, exception.what());
-            return MoEOverlayResidencyWaveProgress::Failed;
-        }
-        ++impl_->stats.migration_profile_exchanges_completed;
-        impl_->record("mpi_economy_migration_profile_exchanges_completed");
-        if (error)
-            error->clear();
-        return MoEOverlayResidencyWaveProgress::Ready;
+            *result=MoEOverlayEconomyEvidenceMerger::mergeMigrationProfile(ranks);
+        }catch(const std::exception &exception){++impl_->stats.rejected_packets;assignError(error,exception.what());return MoEOverlayResidencyWaveProgress::Failed;}
+        ++impl_->stats.migration_profile_exchanges_completed;impl_->record("mpi_economy_migration_profile_exchanges_completed");
+        if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
     }
 
     bool MoEOverlayMPIEconomyEvidenceExchange::beginAttempt(
-        const MoEOverlayCalibrationAttemptEvidence &local,
-        std::string *error)
+        const MoEOverlayCalibrationAttemptEvidence &local,std::string *error)
     {
-        if (!local.valid())
-        {
-            ++impl_->stats.rejected_packets;
-            assignError(
-                error,
-                "ExpertOverlay MPI economy exchange received invalid local attempt evidence");
-            return false;
-        }
-        AttemptWire wire{};
-        wire.world_rank = impl_->config.mpi_context->rank();
-        wire.world_size = impl_->config.mpi_context->world_size();
-        wire.calibration_sequence = local.calibration_sequence;
-        wire.first_participant = local.coordinate.source_participant;
-        wire.second_participant = local.coordinate.destination_participant;
-        wire.layer = local.coordinate.layer;
-        wire.source = static_cast<std::uint32_t>(local.source);
-        wire.real_rows = local.workload.real_rows;
-        wire.execution_rows = local.workload.execution_rows;
-        wire.transaction_count = local.workload.transaction_count;
-        wire.speculative_depth = local.workload.speculative_depth;
-        wire.schedule_fingerprint = local.workload.schedule_fingerprint;
-        wire.baseline_nanoseconds = local.baseline_nanoseconds;
-        wire.concurrent_nanoseconds = local.concurrent_nanoseconds;
-        wire.exact_overlap = local.exact_overlap ? 1u : 0u;
-        for (std::size_t migration = 0; migration < 2; ++migration)
-        {
-            wire.migrations[migration] = encodeMigration(
-                local.local_measurements[migration]);
-        }
-        wire.packet_hash = attemptHash(wire);
-        impl_->local_attempt = wire;
-        std::fill(
-            impl_->gathered_attempts.begin(),
-            impl_->gathered_attempts.end(),
-            AttemptWire{});
-        if (!impl_->beginRaw(
-                &impl_->local_attempt,
-                impl_->gathered_attempts.data(),
-                sizeof(AttemptWire),
-                Impl::Active::Attempt,
-                error))
-        {
-            return false;
-        }
-        ++impl_->stats.attempt_exchanges_started;
-        impl_->record("mpi_economy_attempt_exchanges_started");
-        return true;
+        if(!local.valid()){++impl_->stats.rejected_packets;assignError(error,"Invalid original-context attempt evidence");return false;}
+        EvidenceCountHeader wire{};wire.world_rank=impl_->config.mpi_context->rank();wire.world_size=worldSize();wire.evidence_kind=2;
+        wire.calibration_sequence=local.calibration_sequence;wire.first_target_word=local.coordinate.source_target.word();
+        wire.second_target_word=local.coordinate.destination_target.word();wire.layer=local.coordinate.layer;
+        wire.source=static_cast<std::uint32_t>(local.source);wire.real_rows=local.workload.real_rows;
+        wire.execution_rows=local.workload.execution_rows;wire.transaction_count=local.workload.transaction_count;
+        wire.speculative_depth=local.workload.speculative_depth;wire.schedule_fingerprint=local.workload.schedule_fingerprint;
+        wire.baseline_nanoseconds=local.baseline_nanoseconds;wire.concurrent_nanoseconds=local.concurrent_nanoseconds;
+        wire.exact_overlap=local.exact_overlap?1u:0u;
+        if(!impl_->beginEvidence(wire,local.context,local.local_measurements,Impl::Active::Attempt,error))return false;
+        ++impl_->stats.attempt_exchanges_started;impl_->record("mpi_economy_attempt_exchanges_started");return true;
     }
 
-    MoEOverlayResidencyWaveProgress
-    MoEOverlayMPIEconomyEvidenceExchange::pollAttempt(
-        MoEOverlayCalibrationAttemptResult *result,
-        std::string *error)
+    MoEOverlayResidencyWaveProgress MoEOverlayMPIEconomyEvidenceExchange::pollAttempt(
+        MoEOverlayCalibrationAttemptResult *result,std::string *error)
     {
-        if (!result)
-        {
-            assignError(
-                error,
-                "ExpertOverlay MPI attempt exchange requires an output owner");
-            return MoEOverlayResidencyWaveProgress::Failed;
-        }
-        const auto progress = impl_->pollRaw(Impl::Active::Attempt, error);
-        if (progress != MoEOverlayResidencyWaveProgress::Ready)
-            return progress;
-        try
-        {
-            std::vector<MoEOverlayCalibrationAttemptEvidence> rank_evidence;
-            rank_evidence.reserve(impl_->gathered_attempts.size());
-            for (std::size_t rank = 0;
-                 rank < impl_->gathered_attempts.size();
-                 ++rank)
-            {
-                const auto &wire = impl_->gathered_attempts[rank];
-                if (wire.magic != kAttemptMagic ||
-                    wire.version != kWireVersion || wire.reserved != 0 ||
-                    wire.reserved_result != 0 ||
-                    wire.world_rank != static_cast<int>(rank) ||
-                    wire.world_size != worldSize() ||
-                    wire.exact_overlap > 1 ||
-                    wire.packet_hash == 0 ||
-                    wire.packet_hash != attemptHash(wire))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay MPI attempt packet failed version, rank, or hash authentication");
-                }
-                MoEOverlayCalibrationAttemptEvidence decoded{
-                    .calibration_sequence = wire.calibration_sequence,
-                    .coordinate = {
-                        .source_participant = wire.first_participant,
-                        .destination_participant = wire.second_participant,
-                        .layer = wire.layer,
-                    },
-                    .source = static_cast<ExpertHistogramSource>(wire.source),
-                    .workload = {
-                        .source = static_cast<ExpertHistogramSource>(wire.source),
-                        .real_rows = wire.real_rows,
-                        .execution_rows = wire.execution_rows,
-                        .transaction_count = wire.transaction_count,
-                        .speculative_depth = wire.speculative_depth,
-                        .schedule_fingerprint = wire.schedule_fingerprint,
-                    },
-                    .baseline_nanoseconds = wire.baseline_nanoseconds,
-                    .concurrent_nanoseconds = wire.concurrent_nanoseconds,
-                    .exact_overlap = wire.exact_overlap != 0,
-                };
-                decoded.local_measurements.reserve(2);
-                for (const auto &migration : wire.migrations)
-                {
-                    decoded.local_measurements.push_back(
-                        decodeMigration(migration));
-                }
-                if (!decoded.valid())
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay MPI attempt packet decoded to invalid evidence");
-                }
-                rank_evidence.push_back(std::move(decoded));
+        if(!result){assignError(error,"Attempt exchange requires output owner");return MoEOverlayResidencyWaveProgress::Failed;}
+        const auto progress=impl_->pollEvidence(Impl::Active::Attempt,error);
+        if(progress!=MoEOverlayResidencyWaveProgress::Ready)return progress;
+        try {
+            std::vector<MoEOverlayCalibrationAttemptEvidence> ranks;ranks.reserve(impl_->gathered_attempts.size());
+            for(std::size_t rank=0;rank<impl_->gathered_attempts.size();++rank){const auto &wire=impl_->gathered_attempts[rank];
+                ranks.push_back({.calibration_sequence=wire.calibration_sequence,
+                    .coordinate={MoEOverlayRouteTarget::fromWord(wire.first_target_word),
+                        MoEOverlayRouteTarget::fromWord(wire.second_target_word),wire.layer},
+                    .source=static_cast<ExpertHistogramSource>(wire.source),
+                    .workload={.source=static_cast<ExpertHistogramSource>(wire.source),.real_rows=wire.real_rows,
+                        .execution_rows=wire.execution_rows,.transaction_count=wire.transaction_count,
+                        .speculative_depth=wire.speculative_depth,.schedule_fingerprint=wire.schedule_fingerprint},
+                    .baseline_nanoseconds=wire.baseline_nanoseconds,.concurrent_nanoseconds=wire.concurrent_nanoseconds,
+                    .exact_overlap=wire.exact_overlap!=0,.local_measurements=impl_->decodeEvidence(rank),.context=impl_->evidence_context});
             }
-            *result =
-                MoEOverlayEconomyEvidenceMerger::mergeAttempt(rank_evidence);
-        }
-        catch (const std::exception &exception)
-        {
-            ++impl_->stats.rejected_packets;
-            assignError(error, exception.what());
-            return MoEOverlayResidencyWaveProgress::Failed;
-        }
-        ++impl_->stats.attempt_exchanges_completed;
-        impl_->record("mpi_economy_attempt_exchanges_completed");
-        if (error)
-            error->clear();
-        return MoEOverlayResidencyWaveProgress::Ready;
+            *result=MoEOverlayEconomyEvidenceMerger::mergeAttempt(ranks);
+        }catch(const std::exception &exception){++impl_->stats.rejected_packets;assignError(error,exception.what());return MoEOverlayResidencyWaveProgress::Failed;}
+        ++impl_->stats.attempt_exchanges_completed;impl_->record("mpi_economy_attempt_exchanges_completed");
+        if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
     }
 
     bool MoEOverlayMPIEconomyEvidenceExchange::beginCalibrationReadiness(
@@ -1481,4 +1303,95 @@ namespace llaminar2
     {
         return impl_->stats;
     }
+    bool MoEOverlayMPIEconomyEvidenceExchange::beginPreparedService(
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+        const std::vector<MoEOverlayPreparedTargetServiceTotals>& local,std::string* error)
+    {
+        if(impl_->active!=Impl::Active::Idle || impl_->request!=MPI_REQUEST_NULL) {
+            ++impl_->stats.concurrent_start_rejections;assignError(error,"Prepared service evidence lane is already owned");return false;
+        }
+        try {
+            if(!plan || !plan->authenticates(plan) || plan->snapshot()->placementOwnerMap().participants()!=impl_->config.owner_map.participants() ||
+                plan->topology()!=impl_->config.production_topology)
+                throw std::invalid_argument("Prepared service exchange requires original target/inventory/phase declarations");
+            for(const auto& entry:plan->entries())if(entry.root_world_rank<0 || entry.root_world_rank>=worldSize())
+                throw std::invalid_argument("Prepared service original root is outside this MPI authority");
+            impl_->local_payload=MoEOverlayEconomyEvidenceCodec::encodePreparedService(*plan,local,worldRank());
+            if(impl_->local_payload.size()>size_t(INT_MAX))throw std::invalid_argument("Prepared service live payload exceeds MPI ABI");
+            EvidenceCountHeader wire{};wire.evidence_kind=3;wire.world_rank=worldRank();wire.world_size=worldSize();
+            wire.expected_epoch=plan->snapshot()->epoch;wire.candidate_epoch=wire.expected_epoch;
+            wire.schedule_fingerprint=fnv1a64(plan->identity().data(),plan->identity().size());
+            wire.payload_bytes=impl_->local_payload.size();wire.payload_hash=fnv1a64(impl_->local_payload.data(),impl_->local_payload.size());
+            wire.packet_hash=evidenceHeaderHash(wire);impl_->local_attempt=wire;
+            impl_->prepared_service_plan=std::move(plan);impl_->evidence_context.reset();impl_->payload_active=false;
+            std::fill(impl_->gathered_attempts.begin(),impl_->gathered_attempts.end(),EvidenceCountHeader{});
+            if(!impl_->beginRaw(&impl_->local_attempt,impl_->gathered_attempts.data(),sizeof(wire),Impl::Active::PreparedService,error))return false;
+            impl_->stats.evidence_count_bytes_sent+=sizeof(wire);++impl_->stats.service_exchanges_started;
+            impl_->record("mpi_economy_prepared_service_count_bytes_sent",sizeof(wire));return true;
+        }catch(const std::exception& exception) {
+            ++impl_->stats.rejected_packets;assignError(error,exception.what());
+            // Local rejection may race a peer's posted count request. Keep the
+            // existing MPI fatal authority, never leave that peer awaiting data.
+            abortMoEOverlayMPI(impl_->communicator,worldRank(),"prepared_service_evidence",exception.what());
+        }
+    }
+
+    MoEOverlayResidencyWaveProgress MoEOverlayMPIEconomyEvidenceExchange::pollPreparedService(
+        std::vector<MoEOverlayPreparedTargetServiceTotals>* result,std::string* error)
+    {
+        if(!result){assignError(error,"Prepared service exchange requires its output owner");return MoEOverlayResidencyWaveProgress::Failed;}
+        const auto progress=impl_->pollRaw(Impl::Active::PreparedService,error);
+        if(progress!=MoEOverlayResidencyWaveProgress::Ready)return progress;
+        try {
+            const auto& plan=*impl_->prepared_service_plan;
+            if(!impl_->payload_active) {
+                size_t total=0;
+                for(size_t rank=0;rank<impl_->gathered_attempts.size();++rank) {
+                    const auto& wire=impl_->gathered_attempts[rank];const auto& own=impl_->local_attempt;
+                    if(wire.magic!=kAttemptMagic || wire.version!=5 || wire.reserved || wire.reserved_result || wire.evidence_kind!=3 ||
+                        wire.world_rank!=int(rank) || wire.world_size!=worldSize() ||
+                        wire.expected_epoch!=own.expected_epoch || wire.candidate_epoch!=own.candidate_epoch ||
+                        wire.schedule_fingerprint!=own.schedule_fingerprint || wire.calibration_sequence ||
+                        wire.first_target_word!=-1 || wire.second_target_word!=-1 || wire.layer!=-1 || wire.source ||
+                        wire.real_rows || wire.execution_rows || wire.transaction_count || wire.speculative_depth ||
+                        wire.baseline_nanoseconds || wire.concurrent_nanoseconds || wire.exact_overlap || wire.wave_wall_nanoseconds ||
+                        wire.migration_count || wire.transaction_purpose || wire.experts!=std::array<int32_t,2>{-1,-1} ||
+                        wire.packet_hash!=evidenceHeaderHash(wire) ||
+                        wire.payload_bytes!=MoEOverlayEconomyEvidenceCodec::preparedServiceBytes(plan,int(rank)) ||
+                        wire.payload_bytes>size_t(INT_MAX)-total)
+                        throw std::invalid_argument("Prepared service count header differs from original live declarations");
+                    impl_->payload_counts[rank]=int(wire.payload_bytes);impl_->payload_offsets[rank]=int(total);total+=wire.payload_bytes;
+                }
+                impl_->gathered_payload.resize(total);
+                const int status=MPI_Iallgatherv(impl_->local_payload.data(),int(impl_->local_payload.size()),MPI_BYTE,
+                    impl_->gathered_payload.data(),impl_->payload_counts.data(),impl_->payload_offsets.data(),MPI_BYTE,
+                    impl_->communicator,&impl_->request);
+                if(status!=MPI_SUCCESS || impl_->request==MPI_REQUEST_NULL)
+                    abortMoEOverlayMPI(impl_->communicator,worldRank(),"prepared_service_evidence",mpiError("MPI_Iallgatherv",status));
+                impl_->payload_active=true;impl_->active=Impl::Active::PreparedService;
+                impl_->stats.evidence_payload_bytes_sent+=impl_->local_payload.size();
+                impl_->stats.evidence_payload_bytes_received+=total;++impl_->stats.evidence_payload_collectives_started;
+                impl_->record("mpi_economy_prepared_service_payload_bytes_sent",impl_->local_payload.size());
+                impl_->record("mpi_economy_prepared_service_payload_bytes_received",total);
+                // The original count-start deadline covers both requests.
+                return MoEOverlayResidencyWaveProgress::Pending;
+            }
+            std::vector<MoEOverlayPreparedTargetServiceTotals> complete;
+            for(size_t rank=0;rank<impl_->gathered_attempts.size();++rank) {
+                const auto bytes=std::span<const std::byte>(impl_->gathered_payload).subspan(impl_->payload_offsets[rank],impl_->payload_counts[rank]);
+                if(fnv1a64(bytes.data(),bytes.size())!=impl_->gathered_attempts[rank].payload_hash)
+                    throw std::invalid_argument("Prepared service live payload failed protocol integrity");
+                auto local=MoEOverlayEconomyEvidenceCodec::decodePreparedService(plan,bytes,int(rank));
+                complete.insert(complete.end(),std::make_move_iterator(local.begin()),std::make_move_iterator(local.end()));
+            }
+            std::sort(complete.begin(),complete.end(),[](const auto& a,const auto& b){return a.coordinate<b.coordinate;});
+            *result=std::move(complete);impl_->prepared_service_plan.reset();impl_->payload_active=false;
+            ++impl_->stats.service_exchanges_completed;
+            if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
+        }catch(const std::exception& exception) {
+            ++impl_->stats.rejected_packets;assignError(error,exception.what());
+            abortMoEOverlayMPI(impl_->communicator,worldRank(),"prepared_service_evidence",exception.what());
+        }
+    }
+
 } // namespace llaminar2

@@ -2,8 +2,12 @@
  * @file Test__IQ4_NLTensor.cpp
  * @brief Unit tests for IQ4_NLTensor class (GEMM operations)
  * @author David Sanftenberg
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
@@ -534,6 +538,8 @@ TEST_F(Test__IQ4_NLTensor, SIMD_EdgeCase_RandomNibbles)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -117,6 +117,7 @@ namespace llaminar2::test::parity
             throw std::runtime_error("route-conditioned HF normalization has invalid geometry/dtype");
         const float *parameters = norm.data<float>();
         return {.experts = {data, data + array.num_vals},
-            .normalization = {.scale = {parameters, parameters + hidden}, .epsilon = parameters[hidden]}};
+            .suffix = MoEOrdinaryRMSReconstruction{
+                .normalization = {.scale = {parameters, parameters + hidden}, .epsilon = parameters[hidden]}}};
     }
 }

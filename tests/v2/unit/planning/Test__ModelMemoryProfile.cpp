@@ -1,10 +1,3 @@
-#include <gtest/gtest.h>
-#include "planning/ModelMemoryProfile.h"
-#include "loaders/ModelLoader.h"
-#include <cstring>
-#include <string>
-#include <vector>
-
 /**
  * @file Test__ModelMemoryProfile.cpp
  * @brief Unit coverage for GGUF-to-planning model memory profiles.
@@ -15,6 +8,15 @@
  * Malformed length/count/trailer cases must fail before allocating an invented
  * tensor directory; metadata publication consumes one exact versioned payload.
  */
+#include <gtest/gtest.h>
+#include "planning/ModelMemoryProfile.h"
+#include "loaders/ModelLoader.h"
+#include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
+#include <cstring>
+#include <array>
+#include <limits>
+#include <string>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -596,4 +598,121 @@ TEST(Test__ModelMemoryProfile, Deserialize_RejectsImpossibleCountBeforeAllocatio
     // offset or duplicated schema inventory is needed to corrupt this field.
     std::memcpy(bytes.data() + bytes.size() - sizeof(uint32_t), &impossible_count, sizeof(uint32_t));
     EXPECT_THROW(ModelMemoryProfile::deserialize(bytes.data(), bytes.size()), std::runtime_error);
+}
+
+/** @test Native metadata survives MPI publication without collapsing trunk into compute width. */
+TEST(Test__ModelMemoryProfile, FlashNextGeometryAndNativeRowTableRoundTrip)
+{
+    auto model = llaminar2::test::qwen4MetadataFixture();
+    model.findTensor("token_embd.weight")->size_bytes = 248320ULL * 2560 * 2;
+    const auto profile = ModelMemoryProfile::fromGGUF(model);
+    ASSERT_TRUE(profile.flash_next.has_value());
+    EXPECT_EQ(profile.n_layers, 48);
+    EXPECT_EQ(profile.mtp_layer_count, 1);
+    EXPECT_EQ(profile.d_model, 2560);
+    EXPECT_EQ(profile.flash_next->residual_width, 10240u);
+    EXPECT_EQ(profile.flash_next->terminal_head_width, 2560u);
+    EXPECT_EQ(profile.flash_next->maximum_selected_tokens, 2051u);
+    EXPECT_EQ(profile.flash_next->ple_convolution_history, 9u);
+    EXPECT_EQ(profile.flash_next->ple_table_row_bytes, 90u);
+    EXPECT_EQ(profile.flash_next->ple_table_native_bytes, 28800138240ULL);
+    EXPECT_EQ(profile.flash_next->sparse_decoder_layers.size(), 13u);
+    EXPECT_EQ(profile.flash_next->sparse_decoder_layers.back(), 48u);
+    // The PLE tensor appears before ordinary embeddings in the fixture. Name
+    // substrings must not charge the 26.8GiB row store as token embeddings.
+    EXPECT_EQ(profile.embeddingBytes(), 248320ULL * 2560 * 2);
+    const auto wire = profile.serialize();
+    const auto restored = ModelMemoryProfile::deserialize(wire.data(), wire.size());
+    EXPECT_EQ(restored.flash_next, profile.flash_next);
+    EXPECT_EQ(restored.d_model, profile.d_model);
+    EXPECT_EQ(restored.n_layers, profile.n_layers);
+    EXPECT_EQ(restored.tensors.front().quant_type, "F16");
+}
+
+/** @test Corrupt or foreign Flash Next geometry fails before it can influence admission. */
+TEST(Test__ModelMemoryProfile, FlashNextGeometryRejectsStaleAndCorruptAllocationInputs)
+{
+    auto profile = ModelMemoryProfile::fromGGUF(llaminar2::test::qwen4MetadataFixture());
+    profile.flash_next->residual_width = 2560;
+    EXPECT_THROW(profile.serialize(), std::runtime_error);
+    profile = ModelMemoryProfile::fromGGUF(llaminar2::test::qwen4MetadataFixture());
+    profile.flash_next->ple_table_row_bytes = 89;
+    EXPECT_THROW(profile.serialize(), std::runtime_error);
+    profile = ModelMemoryProfile::fromGGUF(llaminar2::test::qwen4MetadataFixture());
+    profile.architecture = "qwen35moe";
+    EXPECT_THROW(profile.serialize(), std::runtime_error);
+    profile.architecture = "qwen4exp";
+    auto wire = profile.serialize();
+    const uint32_t previous_version = 2;
+    std::memcpy(wire.data() + sizeof(uint32_t), &previous_version, sizeof(previous_version));
+    EXPECT_THROW(ModelMemoryProfile::deserialize(wire.data(), wire.size()), std::runtime_error);
+}
+
+/** @test Physical BF16 projection facts retain their true native format name. */
+TEST(Test__ModelMemoryProfile, BF16InventoryKeepsExactNativeFormat)
+{
+    auto model = createTestModel();
+    model.tensors.front().type = GGUFTensorType::BF16;
+    EXPECT_EQ(ModelMemoryProfile::fromGGUF(model).tensors.front().quant_type, "BF16");
+}
+
+/** @test Relationship-consistent foreign geometries and omitted sparse layers cannot pass wire admission. */
+TEST(Test__ModelMemoryProfile, FlashNextWireAuthenticatesPublishedGeometry)
+{
+    const auto source = ModelMemoryProfile::fromGGUF(llaminar2::test::qwen4MetadataFixture());
+    auto changed = source;
+    changed.flash_next->sparse_decoder_layers.erase(changed.flash_next->sparse_decoder_layers.begin());
+    EXPECT_THROW(changed.serialize(), std::runtime_error);
+    changed = source;
+    changed.flash_next->selected_token_budget = 1024;
+    changed.flash_next->maximum_selected_tokens = 1027;
+    EXPECT_THROW(changed.serialize(), std::runtime_error);
+    changed = source;
+    changed.flash_next->residual_branches = 2;
+    changed.flash_next->residual_width = 5120;
+    EXPECT_THROW(changed.serialize(), std::runtime_error);
+    changed = source;
+    changed.flash_next->ple_convolution_dilation = 2;
+    changed.flash_next->ple_convolution_history = 6;
+    EXPECT_THROW(changed.serialize(), std::runtime_error);
+}
+
+/** @test Mixed globals and layer groups remain exact across optimized reduction boundaries. */
+TEST(Test__ModelMemoryProfile, SelectedNativeByteTotalsPreserveEveryInventoryLane)
+{
+    for (size_t count = 0; count <= 129; ++count)
+    {
+        ModelMemoryProfile profile;
+        std::array<size_t, 6> partition_bytes{};
+        for (size_t index = 0; index < count; ++index)
+        {
+            const size_t partition = index % partition_bytes.size();
+            const size_t bytes = (size_t{1} << 34) + index * 97 + 1;
+            partition_bytes[partition] += bytes;
+            profile.tensors.push_back({.name = "native_extent", .native_bytes = bytes,
+                .layer_index = static_cast<int>(partition) - 1});
+        }
+        for (size_t partition = 0; partition < partition_bytes.size(); ++partition)
+        {
+            SCOPED_TRACE(std::to_string(count) + ":" + std::to_string(partition));
+            const int layer = static_cast<int>(partition) - 1;
+            EXPECT_EQ(profile.weightBytesForLayers(layer, layer), partition_bytes[partition]);
+            EXPECT_EQ(profile.layerWeightBytes(layer), partition_bytes[partition]);
+        }
+        EXPECT_EQ(profile.weightBytesForLayers(0, 3),
+            partition_bytes[1] + partition_bytes[2] + partition_bytes[3] + partition_bytes[4]);
+    }
+}
+
+/** @test Exact native-byte queries reject an unrepresentable BOM instead of wrapping. */
+TEST(Test__ModelMemoryProfile, NativeByteQueriesRejectSelectedOverflow)
+{
+    ModelMemoryProfile profile;
+    profile.tensors = {{.name = "output_norm.weight", .native_bytes = std::numeric_limits<size_t>::max(), .layer_index = -1},
+        {.name = "output_norm.extra", .native_bytes = 1, .layer_index = -1}};
+    EXPECT_THROW((void)profile.normBytes(), std::overflow_error);
+    EXPECT_THROW((void)profile.weightBytesForLayers(-1, -1), std::overflow_error);
+    EXPECT_THROW((void)profile.layerWeightBytes(-1), std::overflow_error);
+    EXPECT_EQ(profile.weightBytesForLayers(0, 48), 0u);
+    EXPECT_EQ(profile.layerWeightBytes(48), 0u);
 }

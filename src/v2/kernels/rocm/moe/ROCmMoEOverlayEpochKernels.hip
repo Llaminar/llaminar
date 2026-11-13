@@ -282,7 +282,8 @@ namespace
     __device__ __forceinline__ bool resolveRequiredEpoch(
         const std::uint64_t *external_admission_epoch,
         DeviceMoEOverlayEpochAdmissionBarrierBinding barrier,
-        std::uint64_t *required_epoch)
+        std::uint64_t *required_epoch,
+        std::uint64_t finite_epoch = 0u)
     {
         if (!required_epoch)
             return false;
@@ -290,9 +291,8 @@ namespace
         {
             if (barrier.participant_id != 0xffffffffu)
                 return false;
-            *required_epoch = external_admission_epoch
-                                  ? systemAcquire64(external_admission_epoch)
-                                  : 0u;
+            *required_epoch = finite_epoch ? finite_epoch : external_admission_epoch
+                                  ? systemAcquire64(external_admission_epoch) : 0u;
             return true;
         }
 
@@ -351,7 +351,7 @@ namespace
                 }
                 return false;
             }
-            const std::uint64_t frozen =
+            const std::uint64_t frozen = finite_epoch ? finite_epoch :
                 systemAcquire64(external_admission_epoch);
             systemRelease64(&record->epoch, frozen);
             systemRelease64(&record->publication_sequence, sequence);
@@ -410,11 +410,27 @@ namespace
         {
             const std::uint64_t ready =
                 systemAcquire64(&control->admission.ready_signal);
+            // Admission Abort is terminal for every issued invocation. An
+            // older packet may still publish its ordinary bank timeline while
+            // draining, so a reusable bank signal cannot be the sole abort
+            // authority for a queued successor whose source will never run.
+            if (ready == llaminar2::kMoEOverlayActivationAbortTimeline)
+            {
+                return false;
+            }
             const std::uint64_t generation =
                 systemAcquire64(&control->identity.epoch_generation);
             if (ready < llaminar2::kMoEOverlayActivationAdmissionTimeline ||
                 generation <= previous_generation)
             {
+                // Cancellation is absorbing without a successor admission.
+                // Keep the normal post-generation signal acquire below: an old
+                // positive signal must never authorize a new descriptor.
+                if (systemAcquire64(signal) ==
+                    llaminar2::kMoEOverlayActivationAbortTimeline)
+                {
+                    return false;
+                }
                 __builtin_amdgcn_s_sleep(1u);
                 continue;
             }
@@ -457,6 +473,89 @@ namespace
         }
     }
 
+    /** @brief Captured finite-parent ownership; invalid ownership is a fatal production error. */
+    __global__ __launch_bounds__(1) void finiteParentActionKernel(
+        DeviceMoEOverlayEpochControl *control,DeviceMoEOverlayEpochStatus *status,
+        llaminar2::DeviceMoEOverlayEpochParentAction action)
+    {
+        if(blockIdx.x!=0u || threadIdx.x!=0u)return;
+        using ParentState=llaminar2::DeviceMoEOverlayEpochParentState;
+        using Action=llaminar2::DeviceMoEOverlayEpochParentAction;
+        auto *const parent=control->finite_parent;
+        const auto operation=action==Action::Arm?DeviceMoEOverlayEpochOperation::ArmFiniteParent:
+            DeviceMoEOverlayEpochOperation::CloseFiniteParent;
+        beginStatus(status,operation);
+        auto code=DeviceMoEOverlayEpochStatusCode::InvalidControl;
+        bool success=false;
+        const auto idle=static_cast<std::uint32_t>(ParentState::Idle);
+        const auto armed=static_cast<std::uint32_t>(ParentState::Armed);
+        const auto active=static_cast<std::uint32_t>(ParentState::Active);
+        std::uint64_t epoch=0u,selector=0u;
+        if(parent && parent->control==control && parent->version==llaminar2::kDeviceMoEOverlayEpochParentVersion) {
+            auto *const guard=reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight);
+            if(action==Action::Arm && atomicCAS(&parent->state,idle,static_cast<std::uint32_t>(ParentState::Arming))==idle) {
+                const auto generation=atomicLoad64(&parent->generation);
+                const bool pristine=parent->ticket.epoch==0u && parent->ticket.selector==0u &&
+                    parent->ticket.parent_generation==0u && parent->ticket.parent_sequence==0u &&
+                    atomicLoad64(&parent->children)==0u && generation!=UINT64_MAX &&
+                    atomicLoad64(&parent->progress)!=UINT64_MAX && atomicLoad64(&parent->child_sequence)!=UINT64_MAX;
+                if(pristine) {
+                    const auto prior=atomicAdd(guard,1ull);
+                    // The original guard precedes every publication snapshot.
+                    // Arm pins no chosen epoch, so an in-progress selector flip
+                    // may legitimately expose its still-protected Retiring bank.
+                    const auto published=atomicLoad64(&control->published_selector);
+                    const auto bank=selectorBank(published);
+                    const auto selected_state=bank<kBankCount?atomicLoad32(&control->bank_states[bank]):0u;
+                    bool ready=prior==0ull && selectorGeneration(published)!=0u && bank<kBankCount &&
+                        atomicLoad64(&control->bank_epochs[bank])!=0u &&
+                        (selected_state==rawState(DeviceMoEOverlayEpochBankState::Published) ||
+                         selected_state==rawState(DeviceMoEOverlayEpochBankState::Retiring));
+                    for(std::uint32_t member=0u;member<kBankCount;++member)
+                        ready=ready && atomicLoad64(&control->bank_readers[member])==0u;
+                    if(ready) {
+                        atomicStore64(&parent->generation,generation+1u);
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&parent->progress),1ull);__threadfence();
+                        atomicStore32(&parent->state,armed);success=true;
+                    } else {atomicAdd(guard,~0ull);code=DeviceMoEOverlayEpochStatusCode::Busy;}
+                } else code=DeviceMoEOverlayEpochStatusCode::InvalidTicket;
+                if(!success)atomicStore32(&parent->state,idle);
+            } else if(action==Action::Close) {
+                const auto prior=atomicLoad32(&parent->state);
+                if((prior==armed || prior==active) &&
+                   atomicCAS(&parent->state,prior,static_cast<std::uint32_t>(ParentState::Closing))==prior) {
+                    const bool empty=atomicLoad64(&parent->progress)!=UINT64_MAX && atomicLoad64(&parent->children)==0u && atomicLoad64(&control->acquisitions_in_flight)==(prior==armed?1u:0u);
+                    if(empty && prior==armed && parent->ticket.epoch==0u && parent->ticket.selector==0u && parent->ticket.parent_generation==0u && parent->ticket.parent_sequence==0u) {
+                        atomicAdd(guard,~0ull);success=true;
+                    } else if(empty && prior==active) {
+                        epoch=parent->ticket.epoch;selector=parent->ticket.selector;
+                        const auto bank=selectorBank(selector);
+                        if(epoch && parent->ticket.parent_generation==0u && parent->ticket.parent_sequence==0u && selectorGeneration(selector) && bank<kBankCount &&
+                           atomicLoad64(&control->bank_epochs[bank])==epoch) {
+                            auto *const readers=reinterpret_cast<unsigned long long*>(&control->bank_readers[bank]);
+                            auto observed=atomicAdd(readers,0ull);
+                            while(observed) {
+                                const auto old=atomicCAS(readers,observed,observed-1ull);
+                                if(old==observed){success=true;break;}observed=old;
+                            }
+                        }
+                        if(!success)code=DeviceMoEOverlayEpochStatusCode::ReaderUnderflow;
+                    } else code=DeviceMoEOverlayEpochStatusCode::Busy;
+                    if(success){parent->ticket={};atomicAdd(reinterpret_cast<unsigned long long*>(&parent->progress),1ull);__threadfence();atomicStore32(&parent->state,idle);}
+                    else atomicStore32(&parent->state,prior);
+                }
+            }
+        }
+        finishStatus(status,operation,success?DeviceMoEOverlayEpochStatusCode::Success:code,
+            epoch,selector,selector?selectorBank(selector):kInvalidBank,0u);
+        if(!success) {
+            printf("overlay_finite_parent_failure action=%u code=%u state=%u children=%llu\n",
+                static_cast<unsigned>(action),static_cast<unsigned>(code),parent?atomicLoad32(&parent->state):UINT32_MAX,
+                static_cast<unsigned long long>(parent?atomicLoad64(&parent->children):0u));
+            __builtin_trap();
+        }
+    }
+
     /**
      * @brief Install a request reader in the exact selector it observes.
      *
@@ -479,7 +578,7 @@ namespace
         beginStatus(status, DeviceMoEOverlayEpochOperation::Acquire);
 
         /* A live ticket here means the preceding request failed to release. */
-        if (ticket->epoch != 0u || ticket->selector != 0u)
+        if (ticket->epoch != 0u || ticket->selector != 0u || ticket->parent_generation != 0u || ticket->parent_sequence != 0u)
         {
             reportBoundaryFailure(
                 "acquire_live_ticket", control, ticket);
@@ -521,6 +620,27 @@ namespace
             return;
         }
 
+        using ParentState=llaminar2::DeviceMoEOverlayEpochParentState;
+        auto *const parent=control->finite_parent;
+        const auto idle=static_cast<std::uint32_t>(ParentState::Idle);
+        const auto armed=static_cast<std::uint32_t>(ParentState::Armed);
+        const auto active=static_cast<std::uint32_t>(ParentState::Active);
+        const auto parent_state=parent?atomicLoad32(&parent->state):idle;
+        const bool finite=parent_state!=idle;
+        if(parent && (parent->control!=control || parent->version!=llaminar2::kDeviceMoEOverlayEpochParentVersion ||
+            (finite && parent_state!=armed && parent_state!=active))) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+            finishStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                0u,selector,kInvalidBank,0u);return;
+        }
+        const auto finite_epoch=parent_state==active?parent->ticket.epoch:0u;
+        if(parent_state==active && (!finite_epoch || !selectorGeneration(parent->ticket.selector) ||
+            parent->ticket.parent_generation!=0u || parent->ticket.parent_sequence!=0u || atomicLoad64(&parent->generation)==0u)) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+            finishStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidTicket,
+                finite_epoch,selector,kInvalidBank,0u);return;
+        }
+
         std::uint64_t required_epoch = 0u;
         bool resolved = true;
         const bool exact_prepared_peer = peer_placement_epoch.valid();
@@ -537,7 +657,7 @@ namespace
             resolved = resolveRequiredEpoch(
                 external_admission_epoch,
                 admission_barrier,
-                &required_epoch);
+                &required_epoch,finite_epoch);
         }
         else if (admission_barrier.participant_id != 0xffffffffu)
         {
@@ -545,13 +665,14 @@ namespace
         }
         else
         {
-            required_epoch = external_admission_epoch
+            required_epoch = finite_epoch ? finite_epoch : external_admission_epoch
                                  ? systemAcquire64(external_admission_epoch)
                                  : atomicLoad64(
                                        &control->bank_epochs[published_bank]);
         }
         const std::uint32_t bank = findEpochBank(control, required_epoch);
-        if (!resolved || required_epoch == 0u || bank >= kBankCount)
+        if (!resolved || required_epoch == 0u || bank >= kBankCount ||
+            (finite_epoch && (required_epoch!=finite_epoch || bank!=selectorBank(parent->ticket.selector))))
         {
             atomicAdd(
                 reinterpret_cast<unsigned long long *>(
@@ -641,12 +762,42 @@ namespace
             return;
         }
 
+        if(finite) {
+            if(parent_state==armed) {
+                if(atomicCAS(&parent->state,armed,static_cast<std::uint32_t>(ParentState::Activating))!=armed) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+                    finishStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                        epoch,selector,bank,state);return;
+                }
+                // This SAME original reader protects the bank before the
+                // pending first-admission guard can be released, even at zero work.
+                atomicAdd(reinterpret_cast<unsigned long long*>(&control->bank_readers[bank]),1ull);
+                parent->ticket={epoch,makeSelector(ticket_generation,bank),0u};
+                __threadfence();atomicStore32(&parent->state,active);
+                atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+            }
+            // One finite comparison child owns the original bank at a time.
+            // Its monotonic stamp rejects a retired child's delayed release.
+            if(atomicCAS(reinterpret_cast<unsigned long long*>(&parent->children),0ull,1ull)!=0ull) {
+                atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+                finishStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::Busy,
+                    epoch,selector,bank,state);return;
+            }
+            if(atomicLoad64(&parent->child_sequence)==UINT64_MAX) {
+                atomicStore64(&parent->children,0u);
+                atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+                finishStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::GenerationOverflow,
+                    epoch,selector,bank,state);return;
+            }
+        }
         atomicAdd(
             reinterpret_cast<unsigned long long *>(
                 &control->bank_readers[bank]),
             1ull);
         ticket->epoch = epoch;
         ticket->selector = makeSelector(ticket_generation, bank);
+        ticket->parent_generation = finite?atomicLoad64(&parent->generation):0u;
+        ticket->parent_sequence = finite?atomicAdd(reinterpret_cast<unsigned long long*>(&parent->child_sequence),1ull)+1ull:0u;
         __threadfence();
         atomicAdd(
             reinterpret_cast<unsigned long long *>(
@@ -672,6 +823,29 @@ namespace
             return;
         beginStatus(status, DeviceMoEOverlayEpochOperation::Release);
 
+        auto *const parent=control->finite_parent;
+        const bool finite=ticket->parent_generation!=0u;
+        if(finite != (ticket->parent_sequence!=0u)) {
+            finishStatus(status,DeviceMoEOverlayEpochOperation::Release,
+                DeviceMoEOverlayEpochStatusCode::InvalidTicket,ticket->epoch,ticket->selector,kInvalidBank,0u);return;
+        }
+        if(finite) {
+            auto *const guard=reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight);
+            atomicAdd(guard,1ull);
+            if(!parent || parent->control!=control || parent->version!=llaminar2::kDeviceMoEOverlayEpochParentVersion ||
+                atomicLoad32(&parent->state)!=static_cast<std::uint32_t>(llaminar2::DeviceMoEOverlayEpochParentState::Active) ||
+                atomicLoad64(&parent->generation)!=ticket->parent_generation ||
+                ticket->parent_sequence==0u || atomicLoad64(&parent->child_sequence)!=ticket->parent_sequence ||
+                atomicLoad64(&parent->progress)==UINT64_MAX || parent->ticket.epoch!=ticket->epoch ||
+                selectorBank(parent->ticket.selector)!=selectorBank(ticket->selector)) {
+                atomicAdd(guard,~0ull);finishStatus(status,DeviceMoEOverlayEpochOperation::Release,
+                    DeviceMoEOverlayEpochStatusCode::InvalidTicket,ticket->epoch,ticket->selector,kInvalidBank,0u);return;
+            }
+            auto *const count=reinterpret_cast<unsigned long long*>(&parent->children);
+            const auto observed=atomicCAS(count,1ull,0ull);
+            if(observed!=1ull) {atomicAdd(guard,~0ull);finishStatus(status,DeviceMoEOverlayEpochOperation::Release,
+                DeviceMoEOverlayEpochStatusCode::ReaderUnderflow,ticket->epoch,ticket->selector,kInvalidBank,0u);return;}
+        }
         const std::uint64_t epoch = ticket->epoch;
         const std::uint64_t selector = ticket->selector;
         const std::uint32_t bank = selectorBank(selector);
@@ -679,6 +853,10 @@ namespace
             bank >= kBankCount ||
             atomicLoad64(&control->bank_epochs[bank]) != epoch)
         {
+            if(finite) {
+                atomicAdd(reinterpret_cast<unsigned long long*>(&parent->children),1ull);
+                atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+            }
             reportBoundaryFailure(
                 "release_invalid_ticket", control, ticket, epoch);
             finishStatus(
@@ -705,7 +883,11 @@ namespace
             {
                 ticket->epoch = 0u;
                 ticket->selector = 0u;
+                ticket->parent_generation = 0u;
+                ticket->parent_sequence = 0u;
+                if(finite)atomicAdd(reinterpret_cast<unsigned long long*>(&parent->progress),1ull);
                 __threadfence();
+                if(finite)atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
                 finishStatus(
                     status,
                     DeviceMoEOverlayEpochOperation::Release,
@@ -719,6 +901,12 @@ namespace
             observed = previous;
         }
 
+        if(finite) {
+            // Missing physical release remains an outstanding child. End may
+            // not reinterpret this failure as a successful reader retirement.
+            atomicAdd(reinterpret_cast<unsigned long long*>(&parent->children),1ull);
+            atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
+        }
         finishStatus(
             status,
             DeviceMoEOverlayEpochOperation::Release,
@@ -1175,6 +1363,17 @@ namespace
 
 extern "C"
 {
+    bool hipMoEOverlayEpochParentAction(
+        DeviceMoEOverlayEpochControl *control,DeviceMoEOverlayEpochStatus *status,
+        llaminar2::DeviceMoEOverlayEpochParentAction action,int device_ordinal,void *stream)
+    {
+        if(!control || !status ||
+            (action!=llaminar2::DeviceMoEOverlayEpochParentAction::Arm && action!=llaminar2::DeviceMoEOverlayEpochParentAction::Close) ||
+            !prepareLaunch(device_ordinal,stream,"hipMoEOverlayEpochParentAction"))return false;
+        hipLaunchKernelGGL(finiteParentActionKernel,dim3(1),dim3(1),0,static_cast<hipStream_t>(stream),control,status,action);
+        return finishLaunch("hipMoEOverlayEpochParentAction");
+    }
+
     bool hipMoEOverlayEpochAcquire(
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,

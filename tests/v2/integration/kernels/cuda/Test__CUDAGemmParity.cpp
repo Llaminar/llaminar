@@ -17,6 +17,10 @@
  * serial CUDA decode, independently of numerical CPU reference tolerances.
  * Q6_K source-scale regressions additionally inspect actual packed words and
  * captured source-equation results, including the explicit ROWPAR engines.
+ * Scratchless CPU references create no empty physical-memory resource. Native
+ * quantizer observations use one explicit stream, and retained tensor captures
+ * publish their software capture owner before any producer-event validation.
+ * Exact tile checks authenticate the installed common-generated policy.
  * Explicit floating GDN operand fixtures exercise real half-A/half-B GemmEx
  * with FP32 C/accumulation, pedantic full-FP32 controls, immutable fused-mode
  * rejection and exact complete-M extents on retained changing-input graphs.
@@ -30,6 +34,7 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/IQQuantTables.h"
 #include "transfer/TransferEngine.h"
@@ -56,6 +61,7 @@
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "config/TensorParallelConfig.h"
+#include "config/GDNHeadAssignment.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "loaders/ModelContextConfig.h"
@@ -80,7 +86,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/CPUProjectionTestWorkspace.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
-#include "../../../utils/NativeVNNIEquivalenceInventory.h"
+#include "../../../utils/NativeQuantisedEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 
@@ -94,6 +100,7 @@
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <random>
 #include <numeric>
 #include <filesystem>
@@ -113,40 +120,44 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
-    void cudaNativeVNNIGemvSweep_setConfig(
+    void cudaNativeQuantisedGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt, int target_waves,
         int mkg, int max_kb, int exact_kb, int force_two_phase);
     /**
      * @brief Select the existing grouped-row geometry for diagnostic capture.
      * @param rows_per_tile Live grouped-row tile policy; cleared with the sweep.
      */
-    void cudaNativeVNNIGemvSweep_setGroupedRows(int rows_per_tile);
-    void cudaNativeVNNIGemvSweep_clearConfig();
-    bool cudaNativeVNNIGemvSweep_isActive();
-    void cudaNativeVNNIPrefill_setBK256Mode(int mode);
-    int cudaNativeVNNIPrefill_getBK256Mode();
-    void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
-    void cudaNativeVNNIPrefill_setForceTile(int tile_id);
-    void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
-    void cudaNativeVNNIPrefill_getLastLaunchSelection(
+    void cudaNativeQuantisedGemvSweep_setGroupedRows(int rows_per_tile);
+    void cudaNativeQuantisedGemvSweep_clearConfig();
+    bool cudaNativeQuantisedGemvSweep_isActive();
+    void cudaNativeQuantisedPrefill_setBK256Mode(int mode);
+    int cudaNativeQuantisedPrefill_getBK256Mode();
+    void cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(bool enabled);
+    bool cudaNativeQuantisedPrefill_getCanonicalKPartitionMode();
+    void cudaNativeQuantisedPrefill_setForceTile(int tile_id);
+    void cudaNativeQuantisedPrefill_getForceTile(int *tile_id);
+    /** @return Whether the exact common-generated production overlay policy is enabled. */
+    bool cudaNativeQuantisedPrefill_getExactOverlayEnabled();
+    /** @return Whether the last actual launch consumed its certified exact overlay. */
+    int cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay();
+    void cudaNativeQuantisedPrefill_getLastLaunchSelection(
         int *tile_id,
         int *k_partitions,
         int *used_bk256,
         int *used_canonical_kpart);
-	    bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+	    bool cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
 	        uint8_t codebook_id,
 	        int n,
 	        int k,
 	        int sm_count,
 	        int *uses_ordered_reducer,
 	        int *k_partitions);
-	    bool cudaNativeVNNIInitIQGridTables_tuned();
-	    void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
-	    int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
-	    void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n);
-	    int cudaNativeVNNIGemvTuned_getSerialPartitionN();
-	    bool cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+	    bool cudaNativeQuantisedInitIQGridTables_tuned();
+	    void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int enabled);
+	    int cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
+	    void cudaNativeQuantisedGemvTuned_setSerialPartitionN(int n);
+	    int cudaNativeQuantisedGemvTuned_getSerialPartitionN();
+	    bool cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
 	        uint8_t codebook_id,
 	        int graph_captured,
 	        int m,
@@ -163,7 +174,7 @@ extern "C"
         int M, int K,
         int cuda_device_id,
         void *stream);
-    bool cudaNativeVNNIGemvTuned_fp32(
+    bool cudaNativeQuantisedGemvTuned_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
         const uint16_t *d_scales,
@@ -180,7 +191,7 @@ extern "C"
         void *stream,
         CUDAGemvContext *gemv_ctx,
         CUDARowMajorWeights **rm_slot);
-    bool cudaNativeVNNIGemvTuned_small_m_fp32(
+    bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
         const uint16_t *d_scales,
@@ -208,14 +219,14 @@ namespace
     {
     public:
         explicit ScopedCudaSerialPartitionPolicy(int n)
-            : previous_(cudaNativeVNNIGemvTuned_getSerialPartitionN())
+            : previous_(cudaNativeQuantisedGemvTuned_getSerialPartitionN())
         {
-            cudaNativeVNNIGemvTuned_setSerialPartitionN(n);
+            cudaNativeQuantisedGemvTuned_setSerialPartitionN(n);
         }
 
         ~ScopedCudaSerialPartitionPolicy()
         {
-            cudaNativeVNNIGemvTuned_setSerialPartitionN(previous_);
+            cudaNativeQuantisedGemvTuned_setSerialPartitionN(previous_);
         }
 
         ScopedCudaSerialPartitionPolicy(
@@ -268,18 +279,18 @@ namespace
     public:
         ScopedCudaPrefillModes()
             : force_tile_(-1),
-              bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+              bk256_(cudaNativeQuantisedPrefill_getBK256Mode()),
               canonical_kpart_(
-                  cudaNativeVNNIPrefill_getCanonicalKPartitionMode())
+                  cudaNativeQuantisedPrefill_getCanonicalKPartitionMode())
         {
-            cudaNativeVNNIPrefill_getForceTile(&force_tile_);
+            cudaNativeQuantisedPrefill_getForceTile(&force_tile_);
         }
 
         ~ScopedCudaPrefillModes()
         {
-            cudaNativeVNNIPrefill_setForceTile(force_tile_);
-            cudaNativeVNNIPrefill_setBK256Mode(bk256_);
-            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
+            cudaNativeQuantisedPrefill_setForceTile(force_tile_);
+            cudaNativeQuantisedPrefill_setBK256Mode(bk256_);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(
                 canonical_kpart_);
         }
 
@@ -563,7 +574,7 @@ namespace
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
     {
-        // GPU INT8-packed (quantized native-VNNI) weights cannot go through
+        // GPU INT8-packed (quantized native-quantised) weights cannot go through
         // KernelFactory::prepareGemmHandleLocal() — that path is guarded and throws
         // because such kernels must be built from VRAM-resident, repacked payloads
         // owned by a WeightVRAMPool. Route those through the shared production-pipeline
@@ -732,7 +743,7 @@ namespace
     }
 
     /**
-     * @brief Scope direct CUDA native-VNNI calls into production verifier mode.
+     * @brief Scope direct CUDA native-quantised calls into production verifier mode.
      *
      * The production graph reaches this policy through
      * `ITensorGemm::beginVerifierDecodeEquivalentScope()`.  The all-format test
@@ -740,24 +751,24 @@ namespace
      * same thread-local switch here to prove the publishable MTP verifier path
      * rather than a faster small-M tuning policy.
      */
-    class ScopedCudaNativeVNNIDecodeEquivalentM1Policy
+    class ScopedCudaNativeQuantisedDecodeEquivalentM1Policy
     {
     public:
-        ScopedCudaNativeVNNIDecodeEquivalentM1Policy()
-            : previous_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+        ScopedCudaNativeQuantisedDecodeEquivalentM1Policy()
+            : previous_(cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config())
         {
-            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+            cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
         }
 
-        ~ScopedCudaNativeVNNIDecodeEquivalentM1Policy()
+        ~ScopedCudaNativeQuantisedDecodeEquivalentM1Policy()
         {
-            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_);
+            cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(previous_);
         }
 
-        ScopedCudaNativeVNNIDecodeEquivalentM1Policy(
-            const ScopedCudaNativeVNNIDecodeEquivalentM1Policy &) = delete;
-        ScopedCudaNativeVNNIDecodeEquivalentM1Policy &operator=(
-            const ScopedCudaNativeVNNIDecodeEquivalentM1Policy &) = delete;
+        ScopedCudaNativeQuantisedDecodeEquivalentM1Policy(
+            const ScopedCudaNativeQuantisedDecodeEquivalentM1Policy &) = delete;
+        ScopedCudaNativeQuantisedDecodeEquivalentM1Policy &operator=(
+            const ScopedCudaNativeQuantisedDecodeEquivalentM1Policy &) = delete;
 
     private:
         int previous_ = 0;
@@ -854,7 +865,7 @@ namespace
     /**
      * @brief Select the public-M1 dispatch identity for a low-level test call.
      *
-     * All CUDA NativeVNNI K-parallel routes use persistent partials and ordered
+     * All CUDA NativeQuantised K-parallel routes use persistent partials and ordered
      * publication. This scope makes a direct low-level verifier test resolve
      * the same generated M=1 family, tile, and exact K partition used by the
      * production graph; it does not enable alternate arithmetic.
@@ -863,14 +874,14 @@ namespace
     {
     public:
         ScopedCudaDecodeEquivalentM1Gemv()
-            : previous_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+            : previous_(cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config())
         {
-            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+            cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
         }
 
         ~ScopedCudaDecodeEquivalentM1Gemv()
         {
-            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_);
+            cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(previous_);
         }
 
         ScopedCudaDecodeEquivalentM1Gemv(const ScopedCudaDecodeEquivalentM1Gemv &) = delete;
@@ -902,9 +913,13 @@ namespace
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
         if (beta != 0.0f)
             std::memcpy(C_tensor->mutable_data(), C_data, (size_t)M * N * sizeof(float));
-        CPUProjectionTestWorkspace workspace(cpuProjectionTestRequirements(M, {kernel}));
+        const auto requirements=cpuProjectionTestRequirements(M,{kernel});
+        std::optional<CPUProjectionTestWorkspace> workspace;
+        // An empty declaration owns no physical bytes. Construct the admitted
+        // arena only for actual scratch; a zero-byte resource is not a BOM.
+        if(requirements.total_bytes_with_alignment()!=0)workspace.emplace(requirements);
         bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K,
-            transpose_B, alpha, beta, nullptr, nullptr, -1, workspace.get());
+            transpose_B, alpha, beta, nullptr, nullptr, -1, workspace?workspace->get():nullptr);
         if (ok)
             std::memcpy(C_data, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -1464,8 +1479,8 @@ namespace
      * @brief Configure a loaded Qwen3.6 MoE context for two-way LocalTP slicing.
      *
      * The sharder needs both the schema's weight-sharding annotations and GDN
-     * dimensions.  Fused GDN QKV is asymmetric: Q and K are replicated, while V
-     * is sharded.  Missing any one of these hints changes the physical weight
+     * dimensions. Fused GDN QKV packs each participant's owned key-head
+     * interval with its modulo-linked value heads. Missing any hint changes the physical weight
      * presented to `GDNProjectionStage`, so this helper mirrors the production
      * LocalTP setup before a regression requests per-device weights.
      */
@@ -1513,8 +1528,8 @@ namespace
     /**
      * @brief Configure the dense Qwen3.6 production two-way LocalTP sharder.
      *
-     * Qwen3.6 GDN QKV is not a uniform column slice: Q/K channels are mirrored
-     * while V channels are apportioned.  A synthetic tensor with the resulting
+     * Qwen3.6 GDN QKV packs each participant's key-head interval and all
+     * modulo-linked value heads. A synthetic tensor with the resulting
      * dimensions cannot prove the production slice wrapper, native GGUF block
      * boundaries, or GPU repack.  This helper installs the real dense schema and
      * model dimensions before a regression asks WeightManager for each device's
@@ -1560,6 +1575,19 @@ namespace
         return tp_config;
     }
 
+    /**
+     * @brief Execute the CPU fused reference using its declared participant arena.
+     * @param kernel Prepared CPU down-projection engine.
+     * @param gate_host Original gate matrix with M rows and K columns.
+     * @param up_host Original up matrix with the same row/column layout.
+     * @param C_host Terminal output, also the initial beta addend when requested.
+     * @param M Live reference rows.
+     * @param N Down-projection output columns.
+     * @param K Fused activation input columns.
+     * @param alpha Product multiplier.
+     * @param beta Existing output multiplier.
+     * @return Whether the original fused reference invocation succeeded.
+     */
     bool cpuFusedSwiGLUDownToVector(ITensorGemm *kernel,
                                     const float *gate_host,
                                     const float *up_host,
@@ -1575,9 +1603,16 @@ namespace
         if (beta != 0.0f)
             std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
 
+        auto requirements = cpuProjectionTestRequirements(M, {kernel});
+        // The fused input is owned by this invocation's arena; a prepared
+        // weight engine owns no mutable activation scratch between calls.
+        requirements.merge(cpuSwiGLUWorkspaceRequirements(M, K));
+        if (beta != 0.0f)
+            dynamic_cast<IWorkspaceConsumer &>(*kernel).appendOutputAccumulationWorkspaceRequirements(requirements, M, N);
+        CPUProjectionTestWorkspace workspace(requirements);
         bool ok = kernel->multiply_tensor_with_fused_swiglu(
             gate_tensor.get(), up_tensor.get(), C_tensor.get(),
-            M, N, K, alpha, beta);
+            M, N, K, alpha, beta, workspace.get());
         if (ok)
             std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -1644,7 +1679,7 @@ TEST(Test__CUDAGemmParityPolicy,
     for (const int graph_captured : {0, 1})
     {
         std::array<int, 4> serial{};
-        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+        ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
             IQ3_S_CODEBOOK,
             graph_captured,
             1,
@@ -1659,7 +1694,7 @@ TEST(Test__CUDAGemmParityPolicy,
         {
             ScopedCudaSerialPartitionPolicy serial_partition_scope(
                 SERIAL_PARTITION_N);
-            ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+            ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
                 IQ3_S_CODEBOOK,
                 graph_captured,
                 1,
@@ -1674,7 +1709,7 @@ TEST(Test__CUDAGemmParityPolicy,
         EXPECT_EQ(mirrored, serial)
             << "graph_captured=" << graph_captured;
     }
-    EXPECT_EQ(cudaNativeVNNIGemvTuned_getSerialPartitionN(), 0);
+    EXPECT_EQ(cudaNativeQuantisedGemvTuned_getSerialPartitionN(), 0);
 }
 #endif
 
@@ -2151,7 +2186,8 @@ protected:
             {
                 SCOPED_TRACE("half=" + std::to_string(half) + " K=" + std::to_string(K) + " M=" + std::to_string(M));
                 TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
-                CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+                auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
                 /** @brief Replay must join before its retained graph is destroyed. */
                 struct ReplayRetire
                 {
@@ -2329,6 +2365,9 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
+    // Direct tests must admit the same declared cuBLAS/fixed-order arena
+    // that a production stage binds before submitting this prepared engine.
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel,M,N,K));
 
     // Execute CUDA GEMM via tensor coherence
     std::vector<float> C_cuda(M * N, 0.0f);
@@ -2344,6 +2383,7 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     EXPECT_LE(result.relative_l2_error, 0.01)
         << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
 
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -2370,11 +2410,15 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
+    // Direct tests must admit the same declared cuBLAS/fixed-order arena
+    // that a production stage binds before submitting this prepared engine.
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel,M,N,K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
     ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -2401,11 +2445,15 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
+    // Direct tests must admit the same declared cuBLAS/fixed-order arena
+    // that a production stage binds before submitting this prepared engine.
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel,M,N,K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
     ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -2419,11 +2467,15 @@ TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBloc
     int8_t *d_A_int8 = nullptr;
     float *d_scales = nullptr;
 
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream=static_cast<cudaStream_t>(stream_owner.get());
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_A, A_data.size() * sizeof(float)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_A_int8, A_data.size() * sizeof(int8_t)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_scales, static_cast<size_t>(M) * (K / 32) * sizeof(float)), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(d_A, A_data.data(), A_data.size() * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_A,A_data.data(),A_data.size()*sizeof(float),cudaMemcpyHostToDevice,stream),cudaSuccess);
+    // The public producer rejects a missing stream before any native enqueue.
+    EXPECT_THROW(cudaQuantGemm_quantizeActivationsBlockwise(d_A,d_A_int8,d_scales,M,K,gpu_device_.ordinal,nullptr),std::invalid_argument);
 
     ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(
         d_A,
@@ -2432,13 +2484,14 @@ TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBloc
         M,
         K,
         gpu_device_.ordinal,
-        nullptr));
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        stream_owner.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     std::vector<int8_t> quantized(A_data.size(), 0);
     std::vector<float> scales(static_cast<size_t>(M) * (K / 32), 0.0f);
-    ASSERT_EQ(cudaMemcpy(quantized.data(), d_A_int8, quantized.size() * sizeof(int8_t), cudaMemcpyDeviceToHost), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(scales.data(), d_scales, scales.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(quantized.data(),d_A_int8,quantized.size()*sizeof(int8_t),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(scales.data(),d_scales,scales.size()*sizeof(float),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
 
     for (int row = 0; row < M; ++row)
     {
@@ -2468,6 +2521,27 @@ TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBloc
             EXPECT_TRUE(saw_nonzero) << "row=" << row << " block=" << block;
         }
     }
+
+    // Independent fixed-word witness, deliberately distinct from ROCm's
+    // half-rounded scale contract. FP32(2.125/127) is 0x3c891224, so -2 maps
+    // to -120. Rounding that scale to half 0x2449 would incorrectly yield -119.
+    // The zero block also pins scale 1 and all-zero quantized bytes.
+    std::vector<float> witness(A_data.size(),0.0f);
+    witness[0]=2.125f;witness[1]=-2.0f;
+    witness[K]=-2.125f;witness[K+1]=2.0f;
+    std::fill_n(witness.begin()+K+32,32,2.125f);
+    std::vector<std::int8_t> expected(quantized.size(),0);
+    expected[0]=127;expected[1]=-120;expected[K]=-127;expected[K+1]=120;
+    std::fill_n(expected.begin()+K+32,32,std::int8_t{127});
+    ASSERT_EQ(cudaMemcpyAsync(d_A,witness.data(),witness.size()*sizeof(float),cudaMemcpyHostToDevice,stream),cudaSuccess);
+    ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(d_A,d_A_int8,d_scales,M,K,gpu_device_.ordinal,stream_owner.get()));
+    ASSERT_EQ(cudaMemcpyAsync(quantized.data(),d_A_int8,quantized.size()*sizeof(std::int8_t),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(scales.data(),d_scales,scales.size()*sizeof(float),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
+    EXPECT_EQ(quantized,expected);
+    constexpr std::array<std::uint32_t,4> expected_scale_words{0x3c891224u,0x3f800000u,0x3c891224u,0x3c891224u};
+    for(std::size_t i=0;i<expected_scale_words.size();++i)
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(scales[i]),expected_scale_words[i])<<"known block="<<i;
 
     cudaFree(d_scales);
     cudaFree(d_A_int8);
@@ -2601,7 +2675,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
  * threshold. This catches both a missing generated-prefill include dependency
  * and codebook aliases that fail to reach the total heuristic.
  */
-TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
+TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillHeuristicAllFormatsMatchesCPU)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -2610,8 +2684,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
     constexpr int N = 384;
     constexpr int K = 512;
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     for (const auto &format : cudaSmallMNativeFormats())
     {
@@ -2660,7 +2734,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
 }
 
 /**
- * @test Prove CUDA NativeVNNI active rows are byte-invariant for the complete
+ * @test Prove CUDA NativeQuantised active rows are byte-invariant for the complete
  * finite M-totality witness inventory and every quantized format.
  *
  * The production graph may capture a larger M than the request's semantic
@@ -2677,7 +2751,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
  * Captured replays overwrite poisoned outputs before the final comparison;
  * the new ragged-K witnesses exercise odd and short final partition spans.
  */
-TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
+TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -2692,7 +2766,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
     const auto read_launch_selection = []
     {
         LaunchSelection selection;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &selection.tile_id,
             &selection.k_partitions,
             &selection.used_bk256,
@@ -2701,8 +2775,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
     };
 
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(-1);
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     std::array<bool, 6> tensor_core_tile_seen{};
     bool bk256_narrow_seen = false;
@@ -2710,7 +2784,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
     bool profiled_narrow_large_k_crossover_seen = false;
 
     for (const auto &geometry :
-         nativeVNNIPrefillAllFormatGeometryEquivalenceCases())
+         nativeQuantisedPrefillAllFormatGeometryEquivalenceCases())
     {
         SCOPED_TRACE(geometry.label);
         ASSERT_FALSE(geometry.row_cases.empty());
@@ -2754,7 +2828,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
             int uses_ordered_reducer = 0;
             int canonical_k_partitions = 0;
             ASSERT_TRUE(
-                cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
                     quantizedVerifierFormat(format.name)
                         .device_execution_codebook_id,
                     N,
@@ -2764,14 +2838,14 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                     &canonical_k_partitions));
             const bool has_canonical_kpart_candidate =
                 uses_ordered_reducer != 0 && canonical_k_partitions > 1;
-            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(
                 has_canonical_kpart_candidate);
             ASSERT_TRUE(setupWorkspaceIfNeeded(
                 cuda_kernel,
                 maximum_bucket_rows,
                 N,
                 K));
-            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
 
             auto input = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{
@@ -2890,7 +2964,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
 
                 if (has_canonical_kpart_candidate)
                 {
-                    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
+                    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
                     ASSERT_TRUE(cuda_kernel->multiply_tensor(
                         input.get(),
                         canonical_kpart_output.get(),
@@ -2907,7 +2981,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                         canonical_selection.k_partitions,
                         canonical_k_partitions);
                     EXPECT_EQ(canonical_selection.used_bk256, 0);
-                    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+                    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
                 }
 
                 /*
@@ -3091,7 +3165,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
  * @test Lock the profiled Qwen3.6 GDN projection tile overlays to the
  * production automatic dispatcher without relaxing byte equality.
  *
- * Q4_1, Q5_1, and IQ1_S use asymmetric NativeVNNI prefill arithmetic. Their
+ * Q4_1, Q5_1, and IQ1_S use asymmetric NativeQuantised prefill arithmetic. Their
  * Qwen3.6 GDN QKV geometry is common enough to justify an exact dispatch
  * overlay, but a faster tile is admissible only when it preserves every FP32
  * output bit. This regression therefore computes a conservative
@@ -3116,13 +3190,16 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
         int expected_tile;
     };
     constexpr std::array<OverlayCase, 3> cases = {{
-        {"Q4_1", 3},  // T64x128_w2x4
-        {"Q5_1", 3},  // T64x128_w2x4
-        {"IQ1_S", 2}, // T64x128_w4x2
+        // The immutable common-generated exact overlay supersedes the older
+        // generic-policy witness and selects these certified shape-specific tiles.
+        {"Q4_1", 2},  // Certified T64x128_w4x2.
+        {"Q5_1", 2},  // Certified T64x128_w4x2.
+        {"IQ1_S", 5}, // Certified T128x128_w4x4.
     }};
 
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
+    ASSERT_TRUE(cudaNativeQuantisedPrefill_getExactOverlayEnabled());
 
     const std::vector<float> input =
         randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
@@ -3154,7 +3231,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
         std::vector<float> conservative_output(
             static_cast<size_t>(M) * static_cast<size_t>(N),
             0.0f);
-        cudaNativeVNNIPrefill_setForceTile(conservative_tile);
+        cudaNativeQuantisedPrefill_setForceTile(conservative_tile);
         ASSERT_TRUE(cudaMultiplyViaTensor(
             cuda_kernel,
             input.data(),
@@ -3168,12 +3245,13 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
         int k_partitions = -1;
         int used_bk256 = -1;
         int used_canonical_kpart = -1;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &tile_id,
             &k_partitions,
             &used_bk256,
             &used_canonical_kpart);
         ASSERT_EQ(tile_id, conservative_tile);
+        ASSERT_EQ(cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay(),0);
         ASSERT_EQ(k_partitions, 1);
         ASSERT_EQ(used_bk256, 0);
         ASSERT_EQ(used_canonical_kpart, 0);
@@ -3181,7 +3259,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
         std::vector<float> production_output(
             static_cast<size_t>(M) * static_cast<size_t>(N),
             0.0f);
-        cudaNativeVNNIPrefill_setForceTile(-1);
+        cudaNativeQuantisedPrefill_setForceTile(-1);
         ASSERT_TRUE(cudaMultiplyViaTensor(
             cuda_kernel,
             input.data(),
@@ -3191,11 +3269,13 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
             K,
             gpu_device_));
 
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &tile_id,
             &k_partitions,
             &used_bk256,
             &used_canonical_kpart);
+        EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay(),1)
+            << "Production must consume its certified exact overlay, not a matching generic tile";
         EXPECT_EQ(tile_id, overlay.expected_tile)
             << overlay.format_name << " did not use its profiled production tile";
         EXPECT_EQ(k_partitions, 1);
@@ -3221,7 +3301,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
  * for every format and every grouped-verifier row count.
  *
  * The production policy changes only asymmetric and dual-scale formats, but
- * the regression intentionally sweeps every loader-supported NativeVNNI
+ * the regression intentionally sweeps every loader-supported NativeQuantised
  * format. For each M=2..16 plus the M=31 depth sentinel, it compares production
  * AUTO dispatch against the measured `T64x64_w2x2` candidate in
  * native FP32 bytes. Affected formats must select that candidate without a
@@ -3265,7 +3345,7 @@ TEST_F(Test__CUDAGemmParity,
     };
 
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeQuantisedPrefill_setBK256Mode(0);
 
     size_t profiled_formats_seen = 0;
     for (const auto &format : cudaSmallMNativeFormats())
@@ -3296,7 +3376,7 @@ TEST_F(Test__CUDAGemmParity,
             std::vector<float> profiled_output(
                 static_cast<size_t>(M) * N,
                 0.0f);
-            cudaNativeVNNIPrefill_setForceTile(profiled_tile);
+            cudaNativeQuantisedPrefill_setForceTile(profiled_tile);
             ASSERT_TRUE(cudaMultiplyViaTensor(
                 cuda_kernel,
                 input.data(),
@@ -3310,7 +3390,7 @@ TEST_F(Test__CUDAGemmParity,
             int k_partitions = -1;
             int used_bk256 = -1;
             int used_canonical_kpart = -1;
-            cudaNativeVNNIPrefill_getLastLaunchSelection(
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(
                 &tile_id,
                 &k_partitions,
                 &used_bk256,
@@ -3323,7 +3403,7 @@ TEST_F(Test__CUDAGemmParity,
             std::vector<float> production_output(
                 static_cast<size_t>(M) * N,
                 0.0f);
-            cudaNativeVNNIPrefill_setForceTile(-1);
+            cudaNativeQuantisedPrefill_setForceTile(-1);
             ASSERT_TRUE(cudaMultiplyViaTensor(
                 cuda_kernel,
                 input.data(),
@@ -3333,7 +3413,7 @@ TEST_F(Test__CUDAGemmParity,
                 K,
                 gpu_device_));
 
-            cudaNativeVNNIPrefill_getLastLaunchSelection(
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(
                 &tile_id,
                 &k_partitions,
                 &used_bk256,
@@ -3427,7 +3507,7 @@ TEST_F(Test__CUDAGemmParity,
 /**
  * @brief Helper macro for decode-size (M=1) quantized GEMV parity tests
  *
- * Exercises the NativeVNNI GEMV path (M=1 decode) for each codebook.
+ * Exercises the NativeQuantised GEMV path (M=1 decode) for each codebook.
  * K-quant formats use 256-element blocks, so K must be multiple of 256.
  */
 #define DEFINE_QUANTIZED_DECODE_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed)  \
@@ -3481,7 +3561,7 @@ DEFINE_QUANTIZED_PARITY_TEST(Q8_0_SmallMatrix, Q8_0Tensor, createQ8_0Random, 32,
 TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896PreservesOrderedKReduction)
 {
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(-1);
+    cudaNativeQuantisedPrefill_setForceTile(-1);
 
     const int M = 35;
     const int N = 896;
@@ -3512,7 +3592,7 @@ TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896PreservesOrderedKReduction)
         int k_partitions = -1;
         int used_bk256 = 0;
         int used_canonical_kpart = 0;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(
             &tile_id,
             &k_partitions,
             &used_bk256,
@@ -3571,7 +3651,7 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
             return buffer.name == GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
         });
     ASSERT_NE(kpar_req, reqs.buffers.end())
-        << "CUDA decode native-VNNI KPAR route must declare its partials workspace";
+        << "CUDA decode native-quantised KPAR route must declare its partials workspace";
     EXPECT_TRUE(kpar_req->required);
     EXPECT_GE(kpar_req->size_bytes,
               static_cast<size_t>((K + 31) / 32) * static_cast<size_t>(N) * sizeof(float));
@@ -3670,8 +3750,8 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     const int K = 2048;
 
     ScopedCudaPrefillModes prefill_modes;
-    cudaNativeVNNIPrefill_setBK256Mode(-1);
-    cudaNativeVNNIPrefill_setForceTile(1); // T64x128_w2x2.
+    cudaNativeQuantisedPrefill_setBK256Mode(-1);
+    cudaNativeQuantisedPrefill_setForceTile(1); // T64x128_w2x2.
 
     int sm_count = 0;
     ASSERT_EQ(
@@ -3682,7 +3762,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
         cudaSuccess);
     int uses_ordered_reducer = 0;
     int canonical_k_partitions = 0;
-    ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+    ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
         quantizedVerifierFormat("Q4_0").device_execution_codebook_id,
         N,
         K,
@@ -3694,7 +3774,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
 
     // Workspace identity must include the public-M=1 partition schedule before
     // graph capture. Captured replay then owns the same persistent partials.
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
 
     auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)}, 232);
     auto A_data = randomFP32(static_cast<size_t>(M) * K);
@@ -3716,8 +3796,8 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     FP32Tensor C_tensor({static_cast<size_t>(M), static_cast<size_t>(N)});
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
-    cudaStream_t stream = nullptr;
-    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream=static_cast<cudaStream_t>(stream_owner.get());
 
     ASSERT_TRUE(A_tensor.ensureOnDevice(gpu_device_, stream));
     ASSERT_TRUE(C_tensor.ensureOnDevice(gpu_device_, stream));
@@ -3728,7 +3808,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     // The direct output owner and the explicit K-partition owner are separate
     // economical schedules for exactly the same public-M=1 arithmetic tree.
     // Capture must preserve byte equality, not merely numerical proximity.
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
     ASSERT_TRUE(cuda_kernel->multiply_tensor(
         &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
         gpu_device_.ordinal, workspace_.get()));
@@ -3744,7 +3824,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
+    cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
     ASSERT_TRUE(cuda_kernel->multiply_tensor(
         &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
         gpu_device_.ordinal, workspace_.get()));
@@ -3754,7 +3834,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     int k_partitions = 0;
     int used_bk256 = 0;
     int used_canonical_kpart = 0;
-    cudaNativeVNNIPrefill_getLastLaunchSelection(
+    cudaNativeQuantisedPrefill_getLastLaunchSelection(
         &tile_id,
         &k_partitions,
         &used_bk256,
@@ -3764,26 +3844,38 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
         << "Regression must exercise persistent canonical K-partition scratch";
     ASSERT_EQ(k_partitions, canonical_k_partitions);
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-
-    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), cudaSuccess);
-    ASSERT_TRUE(cuda_kernel->multiply_tensor(
-        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
-        gpu_device_.ordinal, workspace_.get()));
-    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_NE(graph_exec, nullptr);
-
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    // Join the exact external producer before recording. A software capture
+    // owner prevents importing that uncaptured event from inside native capture.
+    TransferEngine::requireDeviceInput(&A_tensor,gpu_device_,stream);
+    TransferEngine::requireDeviceOutput(&C_tensor,gpu_device_,stream);
+    {
+    auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
+    {
+        ScopedBackendGraphCapture recording(graph,"canonical K-partition reset fixture");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(cuda_kernel->multiply_tensor(
+            &A_tensor,&C_tensor,M,N,K,true,1.0f,0.0f,nullptr,nullptr,
+            gpu_device_.ordinal,workspace_.get()));
+        recording.finish();
+    }
+    // Captured execution must retain the same explicit arithmetic schedule.
+    cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile_id,&k_partitions,&used_bk256,&used_canonical_kpart);
+    EXPECT_EQ(tile_id,1);EXPECT_EQ(used_bk256,0);EXPECT_EQ(used_canonical_kpart,1);
+    EXPECT_EQ(k_partitions,canonical_k_partitions);
+    EXPECT_FALSE(isGraphCaptureActive());
+    cudaStreamCaptureStatus status=cudaStreamCaptureStatusActive;
+    ASSERT_EQ(cudaStreamIsCapturing(stream,&status),cudaSuccess);
+    EXPECT_EQ(status,cudaStreamCaptureStatusNone);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
 
     cuda_kernel->resetDynamicState();
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
         << "resetDynamicState should clear request-scoped stream binding";
 
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess)
+    ASSERT_TRUE(graph.launch())
         << "Captured graph must survive request reset without dangling context scratch";
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
@@ -3809,11 +3901,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "Cosine similarity too low after graph replay: " << result.cosine_similarity;
 
-    if (graph_exec)
-        cudaGraphExecDestroy(graph_exec);
-    if (graph)
-        cudaGraphDestroy(graph);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    } // Retire executable before workspace and original tensor/stream owners.
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
@@ -4025,7 +4113,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_2x512x768)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
-TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
+TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeQuantisedRoute)
 {
     const int M = 2;
     const int N = 896;
@@ -4053,7 +4141,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
         workspace_.get()));
 
     const auto records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_calls"});
     uint64_t specialized_records = 0;
     for (const auto &record : records)
     {
@@ -4066,7 +4154,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
         {
             continue;
         }
-        if (record.name == "cuda_native_vnni_small_m_calls" &&
+        if (record.name == "cuda_native_quantised_small_m_calls" &&
             record.tags.at("m") == std::to_string(M) &&
             record.tags.at("route") == "specialized")
         {
@@ -4075,7 +4163,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
     }
 
     EXPECT_EQ(specialized_records, 1u)
-        << "Q4_K M=2 verifier GEMM must use the specialized native-VNNI small-M route";
+        << "Q4_K M=2 verifier GEMM must use the specialized native-quantised small-M route";
 
     PerfStatsCollector::reset();
     cleanupWorkspaceIfNeeded(cuda_kernel);
@@ -4226,13 +4314,13 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
         weights.get(), gpu_device_, "test.q6_source_scale", ModelContextId{19943});
     auto *kernel = prepared.kernel;
     ASSERT_NE(kernel, nullptr);
-    ASSERT_FALSE(cudaNativeVNNIGemvSweep_isActive());
+    ASSERT_FALSE(cudaNativeQuantisedGemvSweep_isActive());
     kernel->setGPUStream(stream);
     ASSERT_TRUE(setupSharedWorkspaceForExecutionRows(
         {kernel}, {1, 8, maximum_m}, {N}, K));
 
-    DeviceNativeVNNIMatrixDesc desc{};
-    ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc));
+    DeviceNativeQuantisedMatrixDesc desc{};
+    ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc));
     ASSERT_EQ(desc.codebook_id, 8);
     ASSERT_NE(desc.mins, nullptr);
     ASSERT_EQ(desc.blocks_per_row, K / 32);
@@ -4316,12 +4404,12 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
          */
         explicit RowparSelection(bool select) : enabled(select)
         {
-            if (enabled) cudaNativeVNNIGemvSweep_setConfig(3, 2, 1, 1, 1, 1, 0, 0);
+            if (enabled) cudaNativeQuantisedGemvSweep_setConfig(3, 2, 1, 1, 1, 1, 0, 0);
         }
         /** @brief Restore normal generated dispatch even after a fatal assertion. */
         ~RowparSelection()
         {
-            if (enabled) cudaNativeVNNIGemvSweep_clearConfig();
+            if (enabled) cudaNativeQuantisedGemvSweep_clearConfig();
         }
     };
     /**
@@ -4337,7 +4425,8 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
         // consumer stream before capture; an upload or prior replay may have
         // published a new completion-event generation since the last arm.
         TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
-        CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         /** @brief Join replay/DMA before the retained graph is destroyed. */
         struct ReplayRetirement
         {
@@ -4356,13 +4445,13 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
         {
             auto *rowmajor_pointer = rowmajor.get();
             const bool launched = M == 1
-                ? cudaNativeVNNIGemvTuned_fp32(
+                ? cudaNativeQuantisedGemvTuned_fp32(
                     quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
                     static_cast<float *>(output->gpu_data_ptr()), scales, N, K,
                     1.0f, 0.0f, nullptr, nullptr, 8, gpu_device_.ordinal, stream,
                     gemv.get(), &rowmajor_pointer)
-                : cudaNativeVNNIGemvTuned_small_m_fp32(
+                : cudaNativeQuantisedGemvTuned_small_m_fp32(
                     quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
                     static_cast<float *>(output->gpu_data_ptr()), scales, M, N, K,
@@ -4539,7 +4628,7 @@ TEST_F(Test__CUDAGemmParity, LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatc
  * @brief Prove CUDA LocalTP Wo grouped verifier rows for floating weights.
  *
  * Floating-point Wo weights use CUDA's FP GEMM implementation rather than the
- * native-VNNI quantized path.  Keeping FP32, FP16, and BF16 in the same LocalTP
+ * native-quantised quantized path.  Keeping FP32, FP16, and BF16 in the same LocalTP
  * reconstruction matrix prevents a future model or loader setting from escaping
  * the strict grouped-verifier serial-row contract.
  */
@@ -4931,9 +5020,9 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
 /**
  * @brief Guard the asymmetric Qwen3.6 dense LocalTP GDN QKV shard at M=2.
  *
- * Two-way LocalTP replicates the GDN Q/K channels and shards the wider V
- * channels.  The resulting rank-local fused QKV tensor has 7168 output rows,
- * a geometry absent from the earlier full-weight `N=10240` regressions.  The
+ * This synthetic regression retains the historical replicated-Q/K 7168-row
+ * geometry as additional numerical coverage. The real-weight regression below
+ * authenticates current linked-head LocalTP ownership instead.  The
  * device-resident request-batch condition graph uses exactly M=2, and its first
  * observed byte drift occurred at this projection.  Exercise the public
  * grouped projection API and independently quantized ordinary M=1 API so the
@@ -5026,6 +5115,15 @@ TEST_F(Test__CUDAGemmParity, RealQwen36DenseLocalTPGDNQKVShardM2MatchesSerialDec
     ASSERT_TRUE(tp_config->validate()) << tp_config->validationError();
 
     constexpr int M = 2;
+    const auto& loader=model_ctx->concreteLoader();
+    const int key_heads=loader.getInt("ssm.group_count",0);
+    const int value_heads=loader.getInt("ssm.time_step_rank",0);
+    const int state_width=loader.getInt("ssm.state_size",0);
+    ASSERT_GT(key_heads,0);ASSERT_GT(value_heads,0);ASSERT_GT(state_width,0);
+    const auto source_shape=loader.getTensorShape("blk.0.attn_qkv.weight");
+    ASSERT_TRUE(source_shape.has_value());ASSERT_EQ(source_shape->size(),2u);
+    ASSERT_EQ((*source_shape)[0],std::size_t(2*key_heads+value_heads)*state_width);
+    ASSERT_EQ((*source_shape)[1],5120u);
     const ModelContextId model_id{36364};
     for (int rank = 0; rank < 2; ++rank)
     {
@@ -5038,8 +5136,19 @@ TEST_F(Test__CUDAGemmParity, RealQwen36DenseLocalTPGDNQKVShardM2MatchesSerialDec
 
         const int N = static_cast<int>(weight->rows());
         const int K = static_cast<int>(weight->cols());
-        ASSERT_EQ(N, 7168) << "rank=" << rank;
-        ASSERT_EQ(K, 5120) << "rank=" << rank;
+        // Use the production geometry authority, not the retired layout
+        // that replicated every Q/K row on each participant. Linked V heads
+        // are packed with their owned Q/K heads before native GPU repacking.
+        const auto& participant=tp_config->forDevice(logical_tp_devices[std::size_t(rank)]);
+        const auto assignment=GDNHeadAssignment::fromPartition(key_heads,value_heads,
+            participant.head_start,participant.head_count,tp_config->totalHeads());
+        ASSERT_EQ(std::size_t(N),assignment.localFusedRows(state_width))<<"rank="<<rank;
+        ASSERT_EQ(K,5120)<<"rank="<<rank;
+        const auto* slice=dynamic_cast<const TensorSlice*>(weight.get());
+        ASSERT_NE(slice,nullptr);EXPECT_TRUE(slice->metadata().inner_is_presliced);
+        EXPECT_EQ(slice->metadata().rank,rank);EXPECT_EQ(slice->metadata().world_size,2);
+        EXPECT_EQ(slice->original_rows(),(*source_shape)[0]);
+        EXPECT_EQ(slice->metadata().original_cols,(*source_shape)[1]);
 
         auto prepared = llaminar2::test::makeGpuPreparedGemm(
             gpuPreparationTensor(weight.get()),
@@ -5285,6 +5394,22 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
     stage.setGPUStream(static_cast<void *>(stream));
     CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+    /** @brief Retire submitted work and borrowed stage/kernel streams on every exit. */
+    struct GdnInvocationRetirement
+    {
+        cudaStream_t stream; ///< Original nonblocking execution/capture stream.
+        GDNProjectionStage &stage; ///< Stage outlives its workspace/stream borrow.
+        std::array<ITensorGemm *, 4> kernels; ///< Prepared engines outlive this guard.
+        /** @brief Drain before prepared sources, staging and tensor operands can destruct. */
+        ~GdnInvocationRetirement()
+        {
+            (void)cudaStreamSynchronize(stream);
+            stage.unbindWorkspace();
+            for (auto *kernel : kernels)
+                kernel->resetDynamicState();
+            (void)cudaStreamDestroy(stream);
+        }
+    } retirement{stream, stage, {kernel_qkv, kernel_z, kernel_alpha, kernel_beta}};
 
     const bool ok = with_gpu_coherence(
         gpu_device_,
@@ -5316,31 +5441,71 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
-    ASSERT_TRUE(stage.execute(&ctx))
-        << "CUDA GDN projection stage should be graph-capturable with fused qkv+z and alpha+beta subgroups";
-    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    // Join original external publications before native recording. The
+    // software capture owner validates these exact event/stream generations
+    // rather than importing uncaptured upload events from a capture body.
+    // Prepared floating engines consume immutable RAW_FP pool payloads, not
+    // the original host-only source tensors. Their load pipeline has drained
+    // repack/H2D before returning; authenticate the actual retained resource
+    // without manufacturing a tensor publication or uploading another copy.
+    for (const auto *prepared : {&alpha_prepared, &beta_prepared})
+    {
+        ASSERT_NE(prepared->orchestrator, nullptr);
+        ASSERT_NE(prepared->store, nullptr);
+        ASSERT_EQ(prepared->store->gemmKernel(prepared->ref), prepared->kernel);
+        ASSERT_TRUE(prepared->binding.immutable);
+        ASSERT_NE(prepared->binding.tensor, nullptr);
+        const auto *pool = prepared->orchestrator->getPool(gpu_device_.ordinal);
+        ASSERT_NE(pool, nullptr);
+        ASSERT_TRUE(pool->isAllocated());
+        ASSERT_EQ(pool->deviceId(), gpu_device_.ordinal);
+        const auto slot = pool->getSlot(prepared->binding.identity.canonical_name);
+        ASSERT_TRUE(slot.has_value());
+        ContiguousFloatingPointWeightDescriptor actual;
+        ASSERT_TRUE(prepared->kernel->exportContiguousFloatingPointWeights(actual));
+        ASSERT_TRUE(actual.valid());
+        ASSERT_EQ(actual.data, static_cast<const void *>(slot->d_native_quantised_payload));
+        ASSERT_LE(actual.bytes, slot->payload_bytes);
+        ASSERT_EQ(actual.type, prepared->binding.tensor->native_type());
+        ASSERT_EQ(actual.n, static_cast<int>(prepared->binding.tensor->rows()));
+        ASSERT_EQ(actual.k, static_cast<int>(prepared->binding.tensor->cols()));
+    }
+    TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+    for (auto *output : {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()})
+        TransferEngine::requireDeviceOutput(output, gpu_device_, stream);
+    // Route counters below must be authored by this capture, not its warmup.
+    PerfStatsCollector::reset();
+    auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
+    /** @brief Join submitted replay before the retained graph object retires. */
+    struct GdnReplayRetirement
+    {
+        cudaStream_t stream; ///< Exact retained graph submission stream.
+        /** @brief Also retire replay/DMA when a terminal assertion fails. */
+        ~GdnReplayRetirement() { (void)cudaStreamSynchronize(stream); }
+    } replay_retirement{stream};
+    {
+        ScopedBackendGraphCapture recording(graph, "CUDA GDN quantized verifier fused projections");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(stage.execute(&ctx))
+            << "CUDA GDN projections must remain graph-native with their original fused subgroups";
+        recording.finish();
+    }
+    ASSERT_GT(graph.nodeCount(), 0u);
+    ASSERT_FALSE(isGraphCaptureActive());
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusActive;
+    ASSERT_EQ(cudaStreamIsCapturing(stream, &status), cudaSuccess);
+    ASSERT_EQ(status, cudaStreamCaptureStatusNone);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
     TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
     TransferEngine::publishCurrentDeviceWrite(output_z, stream);
     TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
     TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
-
-    stage.unbindWorkspace();
-    workspace_.reset();
-    kernel_qkv->resetDynamicState();
-    kernel_z->resetDynamicState();
-    kernel_alpha->resetDynamicState();
-    kernel_beta->resetDynamicState();
+    // Scoped replay/graph/invocation owners retire in that order, before
+    // prepared weights; the fixture retains its original workspace until then.
 
     const auto route_records = PerfStatsCollector::snapshot({"kernel.gdn_projection_route"});
     const auto qkv_z_route = std::find_if(
@@ -5378,14 +5543,14 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         << "CUDA GDN verifier projection must use the grouped decode-equivalent FP32 alpha+beta subgroup";
 
     const auto fused_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_fused_projection_calls"});
     const auto fused_kernel_record = std::find_if(
         fused_records.begin(),
         fused_records.end(),
         [&](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+                   record.name == "cuda_native_quantised_small_m_fused_projection_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.at("m") == std::to_string(M) &&
                    record.tags.at("k") == std::to_string(K) &&
@@ -5525,6 +5690,22 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
     stage.setGPUStream(static_cast<void *>(stream));
     CUDADeviceContext context(gpu_device_, gpu_device_.ordinal);
+    /** @brief Retire submitted work and borrowed stage/kernel streams on every exit. */
+    struct GdnInvocationRetirement
+    {
+        cudaStream_t stream; ///< Original nonblocking execution/capture stream.
+        GDNProjectionStage &stage; ///< Stage outlives its workspace/stream borrow.
+        std::array<ITensorGemm *, 4> kernels; ///< Prepared engines outlive this guard.
+        /** @brief Drain before prepared sources, staging and tensor operands can destruct. */
+        ~GdnInvocationRetirement()
+        {
+            (void)cudaStreamSynchronize(stream);
+            stage.unbindWorkspace();
+            for (auto *kernel : kernels)
+                kernel->resetDynamicState();
+            (void)cudaStreamDestroy(stream);
+        }
+    } retirement{stream, stage, {prepared_qkv.kernel, prepared_z.kernel, prepared_alpha.kernel, prepared_beta.kernel}};
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
@@ -5534,14 +5715,63 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
         [&] { return stage.execute(&context); }));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
-    ASSERT_TRUE(stage.execute(&context));
-    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    // Join original external publications before native recording. The
+    // software capture owner validates these exact event/stream generations
+    // rather than importing uncaptured upload events from a capture body.
+    // Prepared floating engines consume immutable RAW_FP pool payloads, not
+    // the original host-only source tensors. Their load pipeline has drained
+    // repack/H2D before returning; authenticate the actual retained resource
+    // without manufacturing a tensor publication or uploading another copy.
+    for (const auto *prepared : {&prepared_qkv, &prepared_z, &prepared_alpha, &prepared_beta})
+    {
+        ASSERT_NE(prepared->orchestrator, nullptr);
+        ASSERT_NE(prepared->store, nullptr);
+        ASSERT_EQ(prepared->store->gemmKernel(prepared->ref), prepared->kernel);
+        ASSERT_TRUE(prepared->binding.immutable);
+        ASSERT_NE(prepared->binding.tensor, nullptr);
+        const auto *pool = prepared->orchestrator->getPool(gpu_device_.ordinal);
+        ASSERT_NE(pool, nullptr);
+        ASSERT_TRUE(pool->isAllocated());
+        ASSERT_EQ(pool->deviceId(), gpu_device_.ordinal);
+        const auto slot = pool->getSlot(prepared->binding.identity.canonical_name);
+        ASSERT_TRUE(slot.has_value());
+        ContiguousFloatingPointWeightDescriptor actual;
+        ASSERT_TRUE(prepared->kernel->exportContiguousFloatingPointWeights(actual));
+        ASSERT_TRUE(actual.valid());
+        ASSERT_EQ(actual.data, static_cast<const void *>(slot->d_native_quantised_payload));
+        ASSERT_LE(actual.bytes, slot->payload_bytes);
+        ASSERT_EQ(actual.type, prepared->binding.tensor->native_type());
+        ASSERT_EQ(actual.n, static_cast<int>(prepared->binding.tensor->rows()));
+        ASSERT_EQ(actual.k, static_cast<int>(prepared->binding.tensor->cols()));
+    }
+    TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+    for (auto *output : {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()})
+        TransferEngine::requireDeviceOutput(output, gpu_device_, stream);
+    // Route counters below must be authored by this capture, not its warmup.
+    PerfStatsCollector::reset();
+    auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
+    /** @brief Join submitted replay before the retained graph object retires. */
+    struct GdnReplayRetirement
+    {
+        cudaStream_t stream; ///< Exact retained graph submission stream.
+        /** @brief Also retire replay/DMA when a terminal assertion fails. */
+        ~GdnReplayRetirement() { (void)cudaStreamSynchronize(stream); }
+    } replay_retirement{stream};
+    {
+        ScopedBackendGraphCapture recording(graph, "CUDA GDN mixed BF16/FP32 physical subgroups");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(stage.execute(&context))
+            << "CUDA GDN projections must remain graph-native with their original fused subgroups";
+        recording.finish();
+    }
+    ASSERT_GT(graph.nodeCount(), 0u);
+    ASSERT_FALSE(isGraphCaptureActive());
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusActive;
+    ASSERT_EQ(cudaStreamIsCapturing(stream, &status), cudaSuccess);
+    ASSERT_EQ(status, cudaStreamCaptureStatusNone);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
@@ -5594,11 +5824,8 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
     EXPECT_TRUE(has_pair("qkv+z"));
     EXPECT_TRUE(has_pair("alpha+beta"));
 
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
-    stage.unbindWorkspace();
-    workspace_.reset();
+    // Scoped replay/graph/invocation owners retire in that order, before
+    // prepared weights; the fixture retains its original workspace until then.
     PerfStatsCollector::reset();
 }
 
@@ -5941,11 +6168,10 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSeri
 /**
  * @brief Prove the sharded LocalTP Qwen3.6 MoE GDN projection verifier shape.
  *
- * The LocalTP graph keeps Q/K replicated but shards the GDN value heads, so the
- * production projection dimensions differ from the full single-device MoE
- * shape: QKV is `[6144, 2048]`, Z is `[2048, 2048]`, and alpha/beta are
- * `[16, 2048]`. This regression prevents the grouped verifier implementation
- * from being correct only for the unsharded GDN tensor geometry.
+ * This synthetic historical replicated-Q/K layout retains QKV `[6144,2048]`,
+ * Z `[2048,2048]` and alpha/beta `[16,2048]` as extra numerical coverage.
+ * The real-weight test below derives current linked-head ownership from the
+ * original model metadata and canonical participant assignment.
  */
 TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_RuntimeMMatchesSerialStageRows)
 {
@@ -6130,8 +6356,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_Runtime
  * Qwen3.6 MoE layer-0 GDN projection weights through the LocalTP two-device
  * sharding path:
  *
- * - `attn_qkv.weight`: fused asymmetric Q/K/V, with Q and K replicated and V
- *   sharded.
+ * - `attn_qkv.weight`: owned Q/K heads packed with modulo-linked V heads.
  * - `attn_gate.weight`: Q6_K column-parallel gate/Z projection.
  * - `ssm_alpha.weight` and `ssm_beta.weight`: FP32 column-parallel per-value
  *   head projections.
@@ -6161,10 +6386,18 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
     ASSERT_TRUE(tp_config->validate()) << tp_config->validationError();
 
     constexpr int kK = 2048;
-    constexpr int kNQKV = 6144;
     constexpr int kNZ = 2048;
     constexpr int kNAlpha = 16;
     constexpr int kNBeta = 16;
+    const auto& loader=model_ctx->concreteLoader();
+    const int key_heads=loader.getInt("ssm.group_count",0);
+    const int value_heads=loader.getInt("ssm.time_step_rank",0);
+    const int state_width=loader.getInt("ssm.state_size",0);
+    ASSERT_GT(key_heads,0);ASSERT_GT(value_heads,0);ASSERT_GT(state_width,0);
+    const auto source_shape=loader.getTensorShape("blk.0.attn_qkv.weight");
+    ASSERT_TRUE(source_shape.has_value());ASSERT_EQ(source_shape->size(),2u);
+    ASSERT_EQ((*source_shape)[0],std::size_t(2*key_heads+value_heads)*state_width);
+    ASSERT_EQ((*source_shape)[1],std::size_t(kK));
     const ModelContextId model_id{36363};
 
     struct StageOutputs
@@ -6175,11 +6408,11 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
         std::unique_ptr<FP32Tensor> beta;
     };
 
-    auto make_outputs = [](int rows) -> StageOutputs
+    auto make_outputs = [](int rows,int qkv_width) -> StageOutputs
     {
         return {
             std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNQKV)}),
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(qkv_width)}),
             std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNZ)}),
             std::make_unique<FP32Tensor>(
@@ -6210,6 +6443,14 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
     for (int rank = 0; rank < 2; ++rank)
     {
         const DeviceId shard_device = logical_tp_devices[static_cast<size_t>(rank)];
+        const auto& participant=tp_config->forDevice(shard_device);
+        const auto assignment=GDNHeadAssignment::fromPartition(key_heads,value_heads,
+            participant.head_start,participant.head_count,tp_config->totalHeads());
+        const int kNQKV=static_cast<int>(assignment.localFusedRows(state_width));
+        ASSERT_GT(kNQKV,0);
+        ASSERT_EQ(std::size_t(kNZ),std::size_t(assignment.localValueHeads())*state_width);
+        ASSERT_EQ(kNAlpha,assignment.localValueHeads());
+        ASSERT_EQ(kNBeta,assignment.localValueHeads());
 
         auto weights_qkv = model_ctx->getWeightForDevice("blk.0.attn_qkv.weight", shard_device);
         auto weights_z = model_ctx->getWeightForDevice("blk.0.attn_gate.weight", shard_device);
@@ -6226,6 +6467,11 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
         ASSERT_EQ(weights_beta->native_type(), TensorType::FP32);
         ASSERT_EQ(weights_qkv->rows(), static_cast<size_t>(kNQKV));
         ASSERT_EQ(weights_qkv->cols(), static_cast<size_t>(kK));
+        const auto* qkv_slice=dynamic_cast<const TensorSlice*>(weights_qkv.get());
+        ASSERT_NE(qkv_slice,nullptr);EXPECT_TRUE(qkv_slice->metadata().inner_is_presliced);
+        EXPECT_EQ(qkv_slice->metadata().rank,rank);EXPECT_EQ(qkv_slice->metadata().world_size,2);
+        EXPECT_EQ(qkv_slice->original_rows(),(*source_shape)[0]);
+        EXPECT_EQ(qkv_slice->metadata().original_cols,(*source_shape)[1]);
         ASSERT_EQ(weights_z->rows(), static_cast<size_t>(kNZ));
         ASSERT_EQ(weights_z->cols(), static_cast<size_t>(kK));
         ASSERT_EQ(weights_alpha->rows(), static_cast<size_t>(kNAlpha));
@@ -6319,12 +6565,12 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
         for (const int M : kGroupedVerifierBoundaryRows)
         {
             const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(kK));
-            StageOutputs grouped = make_outputs(M);
+            StageOutputs grouped = make_outputs(M,kNQKV);
             run_stage(M, input_data.data(), &grouped);
 
             for (int row = 0; row < M; ++row)
             {
-                StageOutputs serial = make_outputs(1);
+                StageOutputs serial = make_outputs(1,kNQKV);
                 run_stage(
                     1,
                     input_data.data() + static_cast<size_t>(row) * static_cast<size_t>(kK),
@@ -6782,13 +7028,13 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
     }
 
     const auto records = PerfStatsCollector::snapshot(
-        {"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+        {"kernel.cuda_native_quantised_small_m_fused_projection_calls"});
     uint64_t total_count = 0;
     uint64_t concurrent_count = 0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+            record.name == "cuda_native_quantised_small_m_fused_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter)
         {
             total_count += record.count;
@@ -6799,7 +7045,7 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
             EXPECT_GE(std::stoi(m_tag), 2);
             EXPECT_LE(std::stoi(m_tag), kGroupedVerifierRuntimeRows.back());
             EXPECT_EQ(route_tag, "specialized")
-                << "CUDA verifier projections must use the grouped small-M native-VNNI route";
+                << "CUDA verifier projections must use the grouped small-M native-quantised route";
             const std::string &schedule =
                 record.tags.at("projection_schedule");
             EXPECT_TRUE(schedule == "concurrent" || schedule == "ordered")
@@ -7542,8 +7788,8 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
     const int K = 256;
     const int N = 192;
 
-    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
-        << "CUDA native-VNNI IQ grid tables must be initialized before M=1 repeat checks";
+    ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned())
+        << "CUDA native-quantised IQ grid tables must be initialized before M=1 repeat checks";
 
     auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
     ASSERT_NE(weights, nullptr);
@@ -7552,9 +7798,9 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
     ASSERT_NE(kernel, nullptr);
     ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K));
 
-    DeviceNativeVNNIMatrixDesc desc;
-    ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc))
-        << "Q4_0 CUDA kernel must export a native-VNNI descriptor";
+    DeviceNativeQuantisedMatrixDesc desc;
+    ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc))
+        << "Q4_0 CUDA kernel must export a native-quantised descriptor";
 
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
@@ -7606,7 +7852,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
              * and hot calls must be bitwise identical.
              */
             ScopedCudaDecodeEquivalentM1Gemv decode_equivalent_scope;
-            if (!cudaNativeVNNIGemvTuned_fp32(
+            if (!cudaNativeQuantisedGemvTuned_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
                     static_cast<const uint16_t *>(desc.scales),
@@ -7626,7 +7872,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
                     gemv_ctx,
                     nullptr))
                 return false;
-            if (!cudaNativeVNNIGemvTuned_fp32(
+            if (!cudaNativeQuantisedGemvTuned_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
                     static_cast<const uint16_t *>(desc.scales),
@@ -7670,8 +7916,8 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
     const int K = 256;
     const int N = 192;
 
-    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
-        << "CUDA native-VNNI IQ grid tables must be initialized before low-level repeat checks";
+    ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned())
+        << "CUDA native-quantised IQ grid tables must be initialized before low-level repeat checks";
 
     auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
     ASSERT_NE(weights, nullptr);
@@ -7680,9 +7926,9 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
     ASSERT_NE(kernel, nullptr);
     ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K));
 
-    DeviceNativeVNNIMatrixDesc desc;
-    ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc))
-        << "Q4_0 CUDA kernel must export a native-VNNI descriptor";
+    DeviceNativeQuantisedMatrixDesc desc;
+    ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc))
+        << "Q4_0 CUDA kernel must export a native-quantised descriptor";
 
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
@@ -7741,9 +7987,9 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
              * ROWPAR.  The two checked launches below then consume identical
              * quantized activations and identical prepared weights.
              */
-            ScopedCudaNativeVNNIDecodeEquivalentM1Policy verifier_scope;
+            ScopedCudaNativeQuantisedDecodeEquivalentM1Policy verifier_scope;
 
-            if (!cudaNativeVNNIGemvTuned_small_m_fp32(
+            if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
                     static_cast<const uint16_t *>(desc.scales),
@@ -7764,7 +8010,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
                     gemv_ctx,
                     &rowmajor))
                 return false;
-            if (!cudaNativeVNNIGemvTuned_small_m_fp32(
+            if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
                     static_cast<const uint16_t *>(desc.scales),
@@ -7785,7 +8031,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
                     gemv_ctx,
                     &rowmajor))
                 return false;
-            if (!cudaNativeVNNIGemvTuned_small_m_fp32(
+            if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
                     static_cast<const uint16_t *>(desc.scales),
@@ -7910,14 +8156,14 @@ TEST_F(Test__CUDAGemmParity, MTP_BlockwiseActivationQuantizeM1RepeatIsBitwiseSta
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
-TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs)
+TEST_F(Test__CUDAGemmParity, NativeQuantisedSpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs)
 {
     const int K = 512;
     const int N = 384;
-    ScopedCudaNativeVNNIDecodeEquivalentM1Policy verifier_policy_scope;
+    ScopedCudaNativeQuantisedDecodeEquivalentM1Policy verifier_policy_scope;
 
-    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
-        << "CUDA native-VNNI IQ grid tables must be initialized for direct low-level GEMV tests";
+    ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned())
+        << "CUDA native-quantised IQ grid tables must be initialized for direct low-level GEMV tests";
 
     for (const auto &fmt : cudaSmallMNativeFormats())
     {
@@ -7938,9 +8184,9 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
             << fmt.name << " explicit CUDA stream";
         base_kernel->setGPUStream(stream);
 
-        DeviceNativeVNNIMatrixDesc desc;
-        ASSERT_TRUE(base_kernel->exportNativeVNNIMatrixDesc(desc))
-            << fmt.name << " must export native-VNNI packed descriptor";
+        DeviceNativeQuantisedMatrixDesc desc;
+        ASSERT_TRUE(base_kernel->exportNativeQuantisedMatrixDesc(desc))
+            << fmt.name << " must export native-quantised packed descriptor";
 
         CUDAGemvContext *gemv_ctx = cudaGemvContext_create(gpu_device_.ordinal);
         ASSERT_NE(gemv_ctx, nullptr) << fmt.name << " GEMV context";
@@ -8003,7 +8249,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                         return false;
                     }
 
-                    if (!cudaNativeVNNIGemvTuned_small_m_fp32(
+                    if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                             d_A_int8,
                             static_cast<const uint8_t *>(desc.payload),
                             static_cast<const uint16_t *>(desc.scales),
@@ -8041,7 +8287,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                     cudaGraphExec_t graph_exec = nullptr;
                     if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess)
                         return false;
-                    const bool captured_launch = cudaNativeVNNIGemvTuned_small_m_fp32(
+                    const bool captured_launch = cudaNativeQuantisedGemvTuned_small_m_fp32(
                         d_A_int8,
                         static_cast<const uint8_t *>(desc.payload),
                         static_cast<const uint16_t *>(desc.scales),
@@ -8080,7 +8326,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                             d_scales_A + static_cast<size_t>(row) * static_cast<size_t>(K / 32);
                         float *row_C = d_C_serial_captured +
                             static_cast<size_t>(row) * static_cast<size_t>(N);
-                        captured_serial_launch = cudaNativeVNNIGemvTuned_fp32(
+                        captured_serial_launch = cudaNativeQuantisedGemvTuned_fp32(
                             row_A,
                             static_cast<const uint8_t *>(desc.payload),
                             static_cast<const uint16_t *>(desc.scales),
@@ -8132,7 +8378,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                             d_scales_A + static_cast<size_t>(row) * static_cast<size_t>(K / 32);
                         float *row_C =
                             d_C_serial + static_cast<size_t>(row) * static_cast<size_t>(N);
-                        if (!cudaNativeVNNIGemvTuned_fp32(
+                        if (!cudaNativeQuantisedGemvTuned_fp32(
                                 row_A,
                                 static_cast<const uint8_t *>(desc.payload),
                                 static_cast<const uint16_t *>(desc.scales),
@@ -8158,12 +8404,12 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
 
                     return cudaStreamSynchronize(stream) == cudaSuccess;
                 }))
-                << fmt.name << " specialized-vs-serial CUDA native-VNNI GEMV failed at M=" << M;
+                << fmt.name << " specialized-vs-serial CUDA native-quantised GEMV failed at M=" << M;
 
             for (int row = 0; row < M; ++row)
             {
                 const std::string label =
-                    std::string(fmt.name) + " CUDA native-VNNI grouped verifier row M=" +
+                    std::string(fmt.name) + " CUDA native-quantised grouped verifier row M=" +
                     std::to_string(M) + " row=" + std::to_string(row);
                 expectBitwiseEqualFloatRow(
                     label.c_str(),
@@ -8240,7 +8486,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
  * close approximation.
  */
 TEST_F(Test__CUDAGemmParity,
-       NativeVNNILMHeadM16_AllNativeFormatsMatchSerialGEMVs)
+       NativeQuantisedLMHeadM16_AllNativeFormatsMatchSerialGEMVs)
 {
     constexpr int M = 16;
     constexpr int N = 248320;
@@ -8266,13 +8512,13 @@ TEST_F(Test__CUDAGemmParity,
         ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K))
             << format.name << " LM-head verifier workspace";
 
-        DeviceNativeVNNIMatrixDesc desc;
-        ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc))
-            << format.name << " must export a native-VNNI descriptor";
+        DeviceNativeQuantisedMatrixDesc desc;
+        ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc))
+            << format.name << " must export a native-quantised descriptor";
 
         int uses_ordered_reducer = 0;
         int canonical_k_partitions = 0;
-        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+        ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
             desc.codebook_id, N, K, sm_count,
             &uses_ordered_reducer, &canonical_k_partitions))
             << format.name << " generated serial-M1 LM-head policy";
@@ -8296,10 +8542,10 @@ TEST_F(Test__CUDAGemmParity,
 
         bool observed_grouped_route = false;
         for (const auto &record :
-             PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_gemv_dispatch"}))
+             PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_gemv_dispatch"}))
         {
             if (record.domain != "kernel" ||
-                record.name != "cuda_native_vnni_gemv_dispatch")
+                record.name != "cuda_native_quantised_gemv_dispatch")
             {
                 continue;
             }
@@ -8357,7 +8603,7 @@ TEST_F(Test__CUDAGemmParity,
             << format.name
             << " did not publish grouped LM-head production dispatch evidence\n"
             << PerfStatsCollector::summaryString(
-                   {"kernel.cuda_native_vnni_gemv_dispatch"}, 20);
+                   {"kernel.cuda_native_quantised_gemv_dispatch"}, 20);
 
         for (int row = 0; row < M; ++row)
         {
@@ -8569,7 +8815,7 @@ TEST_F(Test__CUDAGemmParity,
  *
  * MTP does not feed every verifier projection directly from hidden state. FFN
  * down projections first materialize `silu(gate) * up`, quantize that derived
- * activation, and then enter NativeVNNI. This sweep covers the complete fused
+ * activation, and then enter NativeQuantised. This sweep covers the complete fused
  * production entry point for every certified row count so a row-independent
  * GEMV cannot hide a batch-dependent activation or quantization implementation.
  */
@@ -8641,7 +8887,7 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchS
     }
 }
 
-TEST_F(Test__CUDAGemmParity, MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI)
+TEST_F(Test__CUDAGemmParity, MTP_SmallM_MoEProjectionNamesUseSpecializedNativeQuantised)
 {
     const int K = 256;
     const int N0 = 192;
@@ -8730,19 +8976,19 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVN
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
 
     const auto records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_fused_projection_calls"});
     uint64_t total_count = 0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+            record.name == "cuda_native_quantised_small_m_fused_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter)
         {
             total_count += record.count;
             EXPECT_EQ(record.tags.at("k"), std::to_string(K));
             EXPECT_EQ(record.tags.at("projections"), "2");
             EXPECT_EQ(record.tags.at("route"), "specialized")
-                << "MoE projection groups must use the same specialized small-M native-VNNI route";
+                << "MoE projection groups must use the same specialized small-M native-quantised route";
         }
     }
     EXPECT_EQ(total_count, verifier_rows.size());
@@ -9216,12 +9462,12 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M4FusedProjectionMatchesFo
         }
 
         const auto route_records =
-            PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+            PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_calls"});
         uint64_t codebook7_m4_specialized = 0;
         for (const auto &record : route_records)
         {
             if (record.domain == "kernel" &&
-                record.name == "cuda_native_vnni_small_m_calls" &&
+                record.name == "cuda_native_quantised_small_m_calls" &&
                 record.kind == PerfStatRecord::Kind::Counter &&
                 record.tags.at("m") == std::to_string(M) &&
                 record.tags.at("codebook") == "7" &&
@@ -9373,12 +9619,12 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTw
         }
 
         const auto route_records =
-            PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+            PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_calls"});
         uint64_t specialized = 0;
         for (const auto &record : route_records)
         {
             if (record.domain == "kernel" &&
-                record.name == "cuda_native_vnni_small_m_calls" &&
+                record.name == "cuda_native_quantised_small_m_calls" &&
                 record.kind == PerfStatRecord::Kind::Counter &&
                 record.tags.at("m") == std::to_string(M) &&
                 record.tags.at("n") == std::to_string(N) &&
@@ -9390,7 +9636,7 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTw
         }
         EXPECT_EQ(specialized, 2u)
             << fmt.name << " M=2 gate/up must route through specialized "
-            << "small-M native-VNNI projections";
+            << "small-M native-quantised projections";
 
         cleanupSharedWorkspace({cuda_gate, cuda_up});
         EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
@@ -9408,6 +9654,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
     const int K = 5120;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv concurrent_decode("LLAMINAR_CUDA_CONCURRENT_DECODE","1");
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
     PerfStatsCollector::reset();
 
     auto weights_gate = TestTensorFactory::createQ4_KRandom(
@@ -9503,12 +9751,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
     }
 
     const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_calls"});
     uint64_t q4k_specialized = 0;
     for (const auto &record : route_records)
     {
         if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_small_m_calls" &&
+            record.name == "cuda_native_quantised_small_m_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.at("m") == std::to_string(M) &&
             record.tags.at("codebook") == "5" &&
@@ -9520,7 +9768,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
         }
     }
     EXPECT_EQ(q4k_specialized, 2u)
-        << "Q4_K M=2 gate/up must route through specialized small-M native-VNNI projections";
+        << "Q4_K M=2 gate/up must route through specialized small-M native-quantised projections";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
@@ -9612,23 +9860,22 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecod
         up_m1->data(),
         static_cast<size_t>(N));
 
-    const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
-    uint64_t canonical_m1 = 0;
-    for (const auto &record : route_records)
-    {
-        if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_m1_canonical_decode_calls" &&
-            record.kind == PerfStatRecord::Kind::Counter &&
-            record.tags.at("codebook") == "5" &&
-            record.tags.at("n") == std::to_string(N) &&
-            record.tags.at("k") == std::to_string(K))
+    // Production M1 uses the persistent side-stream transaction. Its raw
+    // native M1 launcher keeps canonical math, but bypasses the sequential
+    // adapter's per-projection counter. Authenticate the actual production
+    // route, while the byte checks above prove its arithmetic matches grouped.
+    const auto route_records=PerfStatsCollector::snapshot({"kernel.cuda_fused_projection_stream_pool_calls"});
+    std::uint64_t concurrent_m1=0;
+    for(const auto& record:route_records)
+        if(record.domain=="kernel" && record.name=="cuda_fused_projection_stream_pool_calls" &&
+            record.kind==PerfStatRecord::Kind::Counter && record.device=="cuda:"+std::to_string(gpu_device_.ordinal))
         {
-            canonical_m1 += record.count;
+            EXPECT_EQ(record.tags.at("mode"),"decode");EXPECT_EQ(record.tags.at("m"),"1");
+            EXPECT_EQ(record.tags.at("k"),std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"),"2");EXPECT_EQ(record.tags.at("streams"),"2");
+            concurrent_m1+=record.count;
         }
-    }
-    EXPECT_EQ(canonical_m1, 2u)
-        << "Production M=1 gate/up must route through canonical decode GEMV";
+    EXPECT_EQ(concurrent_m1,1u)<<"Production M1 must execute exactly one two-stream native transaction";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     cuda_gate->clearGPUStreamBinding();
@@ -9647,6 +9894,8 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecod
     const int K = 5120;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv concurrent_decode("LLAMINAR_CUDA_CONCURRENT_DECODE","1");
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
     PerfStatsCollector::reset();
 
     auto weights_gate = TestTensorFactory::createQ5_KRandom(
@@ -9723,23 +9972,22 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecod
         up_m1->data(),
         static_cast<size_t>(N));
 
-    const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
-    uint64_t canonical_m1 = 0;
-    for (const auto &record : route_records)
-    {
-        if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_m1_canonical_decode_calls" &&
-            record.kind == PerfStatRecord::Kind::Counter &&
-            record.tags.at("codebook") == "7" &&
-            record.tags.at("n") == std::to_string(N) &&
-            record.tags.at("k") == std::to_string(K))
+    // Production M1 uses the persistent side-stream transaction. Its raw
+    // native M1 launcher keeps canonical math, but bypasses the sequential
+    // adapter's per-projection counter. Authenticate the actual production
+    // route, while the byte checks above prove its arithmetic matches grouped.
+    const auto route_records=PerfStatsCollector::snapshot({"kernel.cuda_fused_projection_stream_pool_calls"});
+    std::uint64_t concurrent_m1=0;
+    for(const auto& record:route_records)
+        if(record.domain=="kernel" && record.name=="cuda_fused_projection_stream_pool_calls" &&
+            record.kind==PerfStatRecord::Kind::Counter && record.device=="cuda:"+std::to_string(gpu_device_.ordinal))
         {
-            canonical_m1 += record.count;
+            EXPECT_EQ(record.tags.at("mode"),"decode");EXPECT_EQ(record.tags.at("m"),"1");
+            EXPECT_EQ(record.tags.at("k"),std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"),"2");EXPECT_EQ(record.tags.at("streams"),"2");
+            concurrent_m1+=record.count;
         }
-    }
-    EXPECT_EQ(canonical_m1, 2u)
-        << "Production M=1 Q5_K gate/up must route through canonical decode GEMV";
+    EXPECT_EQ(concurrent_m1,1u)<<"Production M1 must execute exactly one two-stream native transaction";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     cuda_gate->clearGPUStreamBinding();
@@ -9805,12 +10053,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRo
     }
 
     const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_calls"});
     uint64_t q4k_m4_specialized = 0;
     for (const auto &record : route_records)
     {
         if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_small_m_calls" &&
+            record.name == "cuda_native_quantised_small_m_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.at("m") == std::to_string(M) &&
             record.tags.at("codebook") == "5" &&
@@ -9823,7 +10071,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRo
     }
     EXPECT_EQ(q4k_m4_specialized, 1u)
         << "Qwen3.6 verifier-sized fused-SwiGLU down must use the "
-        << "decode-equivalent small-M GEMV route, not generic NativeVNNI prefill";
+        << "decode-equivalent small-M GEMV route, not generic NativeQuantised prefill";
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
@@ -9832,7 +10080,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRo
     PerfStatsCollector::reset();
 }
 
-TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI)
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeQuantised)
 {
     const int M = 2;
     const int N = 5120;
@@ -9885,7 +10133,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNati
     }
 
     const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_small_m_calls"});
     uint64_t specialized_records = 0;
     for (const auto &record : route_records)
     {
@@ -9903,7 +10151,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNati
             continue;
         }
 
-        if (record.name == "cuda_native_vnni_small_m_calls" &&
+        if (record.name == "cuda_native_quantised_small_m_calls" &&
             record.tags.at("m") == std::to_string(M) &&
             record.tags.at("codebook") == "5" &&
             record.tags.at("route") == "specialized")
@@ -9912,7 +10160,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNati
         }
     }
     EXPECT_EQ(specialized_records, 1u)
-        << "Qwen3.6 fused-SwiGLU down M=2 must use specialized native-VNNI small-M GEMV";
+        << "Qwen3.6 fused-SwiGLU down M=2 must use specialized native-quantised small-M GEMV";
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
@@ -9982,11 +10230,11 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M1FusedSwiGLUSerialDecodeIsBitwi
 
     uint64_t canonical_m1 = 0;
     const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_m1_canonical_decode_calls"});
     for (const auto &record : route_records)
     {
         if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_m1_canonical_decode_calls" &&
+            record.name == "cuda_native_quantised_m1_canonical_decode_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.at("codebook") == "5" &&
             record.tags.at("n") == std::to_string(N) &&
@@ -10414,61 +10662,48 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
  * Tests vocabulary projection (LM head) which is the final layer.
  * Shape: [vocab_size, hidden_dim] = [151936, 896] for Qwen2.5
  */
-TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
+/**
+ * @test Compare the model's actual native LM-head format on CPU and CUDA.
+ * @details A model's headline quantization does not constrain output.weight.
+ * Preserve its stored format and compare the original full vocabulary output;
+ * a different native format is coverage, never a reason to skip this test.
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_NativeLMHead)
 {
-    if (!std::filesystem::exists(REAL_MODEL_PATH))
-    {
-        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
-    }
-
+    ASSERT_TRUE(std::filesystem::exists(REAL_MODEL_PATH))
+        << "The model fixture must provide " << REAL_MODEL_PATH;
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
-
-    if (!loader.loadModel(REAL_MODEL_PATH))
-    {
-        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
-    }
-
+    ASSERT_TRUE(loader.loadModel(REAL_MODEL_PATH));
     auto weights = loader.loadTensor("output.weight", DeviceId::cpu());
-    ASSERT_NE(weights, nullptr) << "Failed to load output.weight (LM head)";
-
-    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
-    if (!q4_tensor)
-    {
-        // LM head might be in a different format (e.g., FP32/FP16)
-        std::cout << "LM head is not Q4_0, tensor type: "
-                  << static_cast<int>(weights->native_type()) << "\n";
-        GTEST_SKIP() << "LM head is not Q4_0 format";
-    }
-
-    const int M = 2;                                       // Smaller batch for large vocab
-    const int N = static_cast<int>(q4_tensor->shape()[0]); // vocab_size
-    const int K = static_cast<int>(q4_tensor->shape()[1]); // hidden_dim
-
-    std::cout << "Real model LM head weight: " << N << "x" << K << " (Q4_0)\n";
-
-    auto A_data = randomFP32(M * K);
-
-    // CPU
-    std::vector<float> C_cpu(M * N, 0.0f);
+    ASSERT_NE(weights, nullptr);
+    ASSERT_EQ(weights->shape().size(), 2u);
+    const auto original_type = weights->native_type();
+    const int M = 2;
+    const int N = static_cast<int>(weights->shape()[0]);
+    const int K = static_cast<int>(weights->shape()[1]);
+    ASSERT_EQ(static_cast<size_t>(N), loader.vocabSize());
+    ASSERT_EQ(static_cast<size_t>(K), loader.embeddingLength());
+    const auto input = randomFP32(static_cast<size_t>(M) * K);
+    std::vector<float> cpu_output(static_cast<size_t>(M) * N, 0.0f);
+    std::vector<float> cuda_output(cpu_output.size(), 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CPU);
-    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
-
-    // CUDA
-    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto *cuda_kernel = getPreparedKernel(
-        q4_tensor, gpu_device_);
-
-    // Set up workspace for quantized kernel
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), input.data(), cpu_output.data(), M, N, K));
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
-
-    float *d_A, *d_C;
-    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
-
-    // Clean up cache entry while tensor is still alive
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, input.data(), cuda_output.data(), M, N, K, gpu_device_));
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive());
+    EXPECT_EQ(weights->native_type(), original_type);
+    const auto parity = checkParity(cuda_output.data(), cpu_output.data(), cpu_output.size(), 0.99, 0.15);
+    parity.print("Real model native LM head");
+    EXPECT_FALSE(parity.has_nan_inf);
+    EXPECT_GE(parity.cosine_similarity, 0.99);
+    EXPECT_LE(parity.relative_l2_error, 0.15);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -10523,9 +10758,10 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr);
+    CPUProjectionTestWorkspace cpu_workspace(cpuProjectionTestRequirements(M, {cpu_kernel.get()}));
     ASSERT_TRUE(cpu_kernel->multiply_tensor(
         input_tensor.get(), output_cpu.get(),
-        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1));
+        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1, cpu_workspace.get()));
 
     // ===== CUDA: multiply_tensor() =====
     // First ensure weights are on GPU
@@ -11699,13 +11935,13 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
         weights.get(), gpu_device_, "test.iq2s_source_scale", ModelContextId{19944});
     auto *kernel = prepared.kernel;
     ASSERT_NE(kernel, nullptr);
-    ASSERT_FALSE(cudaNativeVNNIGemvSweep_isActive());
+    ASSERT_FALSE(cudaNativeQuantisedGemvSweep_isActive());
     kernel->setGPUStream(stream);
     ASSERT_TRUE(setupSharedWorkspaceForExecutionRows(
         {kernel}, {1, 3, 8, maximum_m}, {N}, K));
 
-    DeviceNativeVNNIMatrixDesc desc{};
-    ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc));
+    DeviceNativeQuantisedMatrixDesc desc{};
+    ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc));
     ASSERT_EQ(desc.codebook_id, 13);
     ASSERT_NE(desc.mins, nullptr);
     ASSERT_EQ(desc.blocks_per_row, K / 32);
@@ -11790,14 +12026,14 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
          */
         explicit DiagnosticSelection(int family)
             : enabled(family >= 0),
-              previous(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+              previous(cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config())
         {
             if (enabled)
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
-                cudaNativeVNNIGemvSweep_setConfig(
+                cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
+                cudaNativeQuantisedGemvSweep_setConfig(
                     family, family == 3 ? 2 : 64, 1, 1, 1, 1, 0, 0);
-                cudaNativeVNNIGemvSweep_setGroupedRows(8);
+                cudaNativeQuantisedGemvSweep_setGroupedRows(8);
             }
         }
         /** @brief Restore generated dispatch even on a failed assertion. */
@@ -11805,8 +12041,8 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
         {
             if (enabled)
             {
-                cudaNativeVNNIGemvSweep_clearConfig();
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous);
+                cudaNativeQuantisedGemvSweep_clearConfig();
+                cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(previous);
             }
         }
     };
@@ -11823,7 +12059,8 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
         // consumer stream before capture; an upload or prior replay may have
         // published a new completion-event generation since the last arm.
         TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
-        CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         /** @brief Join replay/DMA before the retained graph is destroyed. */
         struct ReplayRetirement
         {
@@ -11842,13 +12079,13 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
         {
             auto *rowmajor_pointer = rowmajor.get();
             const bool launched = M == 1
-                ? cudaNativeVNNIGemvTuned_fp32(
+                ? cudaNativeQuantisedGemvTuned_fp32(
                     quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
                     static_cast<float *>(output->gpu_data_ptr()), scales, N, K,
                     1.0f, 0.0f, nullptr, nullptr, 13, gpu_device_.ordinal, stream,
                     gemv.get(), &rowmajor_pointer)
-                : cudaNativeVNNIGemvTuned_small_m_fp32(
+                : cudaNativeQuantisedGemvTuned_small_m_fp32(
                     quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
                     static_cast<float *>(output->gpu_data_ptr()), scales, M, N, K,
@@ -11935,6 +12172,8 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include "../../common/MoEOverlayActivationPacketDevice.inl"
+#include "../../common/MoEOverlayNativeInvocationDevice.inl"
 #include "../../common/MoEOverlayNodeLocalRouteExchangeDevice.inl"
 
 #include <algorithm>
@@ -95,6 +96,9 @@ extern "C" bool cudaMoEOverlayActivationPackDispatch(
         llaminar2::moe_activation_packet_device::packDispatchHiddenKernel
             <<<blocksFor(hidden_elements), kThreads, 0u, cuda_stream>>>(*launch);
     }
+    if (launch->shared_row_writer)
+        llaminar2::moe_activation_packet_device::packSharedDispatchUnionKernel
+            <<<launch->physical_rows,kThreads,0u,cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -467,5 +471,74 @@ extern "C" bool cudaMoEOverlayFinishNodeLocalDensePublicationConsume(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_node_local_route_device::finishDensePublicationConsumeKernel
         <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
+
+/** @brief Submit the original-slot begin without a host state observation. */
+extern "C" bool cudaMoEOverlayOriginalNativeBegin(
+    const llaminar2::MoEOverlayOriginalNativeBeginLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    llaminar2::moe_activation_packet_device::beginOriginalNativeInvocationKernel
+        <<<1u, 64u, 0u, reinterpret_cast<cudaStream_t>(stream)>>>(*launch);
+    return launchAccepted();
+}
+
+/** @brief Submit the original-slot retire without a host state observation. */
+extern "C" bool cudaMoEOverlayOriginalNativeRetire(
+    const llaminar2::MoEOverlayOriginalNativeRetireLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    llaminar2::moe_activation_packet_device::retireOriginalNativeInvocationKernel
+        <<<1u, 1u, 0u, reinterpret_cast<cudaStream_t>(stream)>>>(*launch);
+    return launchAccepted();
+}
+
+/** @brief Submit the original-slot retiresinglerowbatch without a host state observation. */
+extern "C" bool cudaMoEOverlayOriginalNativeRetireSingleRowBatch(
+    const llaminar2::MoEOverlayActivationSingleRowReturnBatchLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    llaminar2::moe_activation_packet_device::retireOriginalNativeInvocationBatchKernel<llaminar2::MoEOverlayActivationSingleRowReturnBatchLaunch>
+        <<<launch->lane_count, 1u, 0u, reinterpret_cast<cudaStream_t>(stream)>>>(*launch);
+    return launchAccepted();
+}
+
+/** @brief Submit the original-slot retiremultirowbatch without a host state observation. */
+extern "C" bool cudaMoEOverlayOriginalNativeRetireMultiRowBatch(
+    const llaminar2::MoEOverlayActivationMultiRowReturnBatchLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    llaminar2::moe_activation_packet_device::retireOriginalNativeInvocationBatchKernel<llaminar2::MoEOverlayActivationMultiRowReturnBatchLaunch>
+        <<<launch->lane_count, 1u, 0u, reinterpret_cast<cudaStream_t>(stream)>>>(*launch);
     return launchAccepted();
 }

@@ -103,6 +103,15 @@ After merge, the ordinary develop push workflow below builds and publishes
 **both** shipping ISA runtime images without running tests. Master PR certification remains a
 separate, broader gate.
 
+Real-model QFN source admission belongs to the separate master PR gate. It
+uses the full compiled test inventory, typed CTest/GTest membership, exact
+native hardware eligibility and canonical read-only GGUF inputs. Every selected
+cell, including Candidates, must execute without skips; absent hardware remains
+explicitly unqualified. Its source/ISA/image-bound receipts are required before
+HTTP, benchmark and release admission. Ordinary cell failures are gathered
+across both ISAs; driver or infrastructure failure is terminal. PR Unit/host
+receipts do not satisfy this qualification.
+
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
@@ -746,6 +755,25 @@ successful completion, copy its result file, then remove the helper. Attached
 stdout is not a metadata authority: short-lived Docker attach can lose output
 even when the process succeeds. Probe failures are fatal, with no retries or
 permission changes; an empty NVIDIA inventory remains distinct from failure.
+The ROCm compiler builder also installs the pinned parallel-LTO remark repair.
+Its linker stays outside the SDK and serving image. Actual two/eight-partition
+compiler controls prove complete final stack records and unchanged device code;
+the original compiler body is the negative control. RCCL selects that exact
+linker through its dependency-owned configuration, names separate per-ISA
+object-record files, and runs the canonical allocation parser before installation.
+RCCL is a pinned external dependency: this resource evidence reports every physical
+spill without claiming zero-spill, native-runtime or performance qualification.
+Project kernel targets retain their independent absolute zero-spill guard.
+Missing, malformed or incomplete records still reject; dependency protocol,
+correctness and performance remain separate qualification gates.
+The compact final allocation proof includes the compiler observations and binds
+the selected DSO and build receipt. Installed production preflight revalidates
+this proof without compiler tools or accelerator access. Missing partitions,
+foreign outputs and stale receipts fail the build. Physical spills in the
+external dependency remain reported; project-owned kernels retain their fatal
+zero-spill guard. Ordinary host dependency links do not participate in the
+collective's native proof.
+
 The compiler builder and runtime install the same source-built RCCL at the same
 library path. Runtime loading uses CMake's exact `RCCL_LIBRARY` selection; it never
 guesses a checkout location or substitutes another packaged collective library.
@@ -940,6 +968,16 @@ The public MPI bootstrap propagates explicitly requested diagnostic settings
 to remote ranks. Use rank-qualified PerfStats output paths (`{rank}`) available
 on each host; plain output paths remain authority-rank-only. This propagation
 does not export provider credentials or launcher-local device/CPU placement.
+Production entrypoints and canonical process-owned test children share the CPU-only
+`llaminar_mpi_session` process owner. It keeps each run's private temporary and
+shared-memory directories until its actual launcher, ranks and local daemon
+descendants retire. CTest sends TERM on timeout and grants the native owner's
+30-second retirement plus five-second forced-exit drain; the timeout remains a
+failed test. Campaign transitions passively require the declared owned roots to
+be absent, including after cancellation. They never clean another job's files
+or replace a missing retirement witness with a process-group check. The
+installed image contains the matching helper and native component beside each executable. External
+MPI launchers and remote infrastructure retain their own outer ownership.
 Model and image staging uses an atomic SSH/rsync upload to one owned
 CPU peer, then distributes it concurrently to other peers over the leased
 private network. A short-lived, SSH-owned source serves only that artifact to

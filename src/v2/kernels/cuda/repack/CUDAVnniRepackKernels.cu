@@ -24,10 +24,10 @@
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
-#include "tensors/NativeVnniQ6Scale.h"
-#include "tensors/NativeVnniIQ2SScale.h"
-#include "tensors/NativeVnniIQ4XSScale.h"
-#include "tensors/NativeVnniIQ3SScale.h"
+#include "tensors/NativeQuantisedQ6Scale.h"
+#include "tensors/NativeQuantisedIQ2SScale.h"
+#include "tensors/NativeQuantisedIQ4XSScale.h"
+#include "tensors/NativeQuantisedIQ3SScale.h"
 
 namespace llaminar2 {
 
@@ -569,7 +569,7 @@ __global__ void cuda_repack_q6k_to_vnni(
     const int sc_lo_idx = half * 8 + sub_in_half * 2;
     const int sc_hi_idx = sc_lo_idx + 1;
     d_scales[linear] = blk.d;
-    d_mins[linear] = native_vnni_q6_scale::pack(
+    d_mins[linear] = native_quantised_q6_scale::pack(
         signed_scales[sc_lo_idx],
         signed_scales[sc_hi_idx]);
 }
@@ -754,7 +754,7 @@ __global__ void cuda_repack_iq4xs_to_vnni(
                  | (((blk.scales_h >> (2 * sub_idx)) & 3) << 4);
     // Preserve both original source factors; the consumer multiplies in FP32.
     d_scales[linear] = blk.d;
-    d_mins[linear] = llaminar2::native_vnni_iq4xs_scale::encodeSourceCoefficient(
+    d_mins[linear] = llaminar2::native_quantised_iq4xs_scale::encodeSourceCoefficient(
         static_cast<uint8_t>(ls));
 }
 
@@ -789,7 +789,7 @@ __global__ void cuda_repack_iq3s_to_vnni(
     uint8_t sc_byte = blk.scales[sub_idx / 2];
     int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
     d_scales[linear] = blk.d;
-    d_coefficients[linear] = llaminar2::native_vnni_iq3s_scale::encodeSourceCoefficient(
+    d_coefficients[linear] = llaminar2::native_quantised_iq3s_scale::encodeSourceCoefficient(
         static_cast<uint8_t>(nibble));
 }
 
@@ -882,7 +882,7 @@ __global__ void cuda_repack_iq2s_to_vnni(
     memcpy(dst + 5, blk.qs + 32 + sub_idx * 4, 4);
 
     d_scales[linear] = blk.d;
-    d_mins[linear] = native_vnni_iq2s_scale::pack(blk.scales[sub_idx]);
+    d_mins[linear] = native_quantised_iq2s_scale::pack(blk.scales[sub_idx]);
 }
 
 // ============================================================================

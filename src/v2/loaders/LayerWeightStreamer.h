@@ -263,10 +263,10 @@ namespace llaminar2
         std::vector<std::string> getLayerWeightNames(int layer_idx) const;
 
         /**
-         * @brief Estimate memory required for a layer on GPU
+         * @brief Inspect the layer's original native payload extent without loading it.
          *
          * @param layer_idx Zero-based layer index
-         * @return Estimated bytes required
+         * @return Native source bytes used by the streaming cache policy, not a PMA claim.
          */
         size_t estimateLayerMemory(int layer_idx) const;
 

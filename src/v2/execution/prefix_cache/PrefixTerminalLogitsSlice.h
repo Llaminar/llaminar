@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
@@ -20,6 +21,48 @@ namespace llaminar2
     {
         size_t first_token;
         size_t token_count;
+    };
+
+    /**
+     * @brief Immutable selected-row identity authenticated by the owning request.
+     *
+     * This is a copy-plan value, not a second publication ledger. The current
+     * session authority must authenticate it immediately before consuming bytes.
+     */
+    class PrefixLogitsRowSelection
+    {
+    public:
+        /**
+         * @brief Select one live row from an explicitly bounded producer.
+         * @param row Accepted physical row, including any request-row offset.
+         * @param rows Physical rows produced by this exact verifier invocation.
+         * @param session_epoch Request epoch owning the producer and destination.
+         * @throws std::invalid_argument For absent or out-of-range rows.
+         */
+        PrefixLogitsRowSelection(size_t row, size_t rows, uint64_t session_epoch)
+            : row_(row), rows_(rows), session_epoch_(session_epoch)
+        {
+            if (rows == 0 || row >= rows)
+                throw std::invalid_argument("Terminal-logit selection is outside its producer rows");
+        }
+        /** @return Selected physical producer row. */
+        [[nodiscard]] size_t row() const noexcept { return row_; }
+        /** @return Exact physical row extent authenticated at selection. */
+        [[nodiscard]] size_t rows() const noexcept { return rows_; }
+        /**
+         * @brief Reject a selected row retained across request reset or restore.
+         * @param current_epoch Current canonical request/session authority.
+         * @throws std::invalid_argument If the producer belongs to another session.
+         */
+        void requireCurrent(uint64_t current_epoch) const
+        {
+            if (current_epoch != session_epoch_)
+                throw std::invalid_argument("Terminal-logit selection belongs to a stale session");
+        }
+    private:
+        size_t row_;
+        size_t rows_;
+        uint64_t session_epoch_;
     };
 
     /** @brief Immutable FP32 row slice whose logical and physical bounds are proven. */
@@ -55,6 +98,29 @@ namespace llaminar2
 
             // Containment in the physical FP32 row proves these products fit.
             return PrefixTerminalLogitsSlice(offset * sizeof(float), archive.token_count * sizeof(float));
+        }
+
+        /**
+         * @brief Resolve an accepted row and vocabulary interval together.
+         * @param source Vocabulary represented by every physical producer row.
+         * @param archive Exact vocabulary interval to publish to canonical storage.
+         * @param storage_row_bytes Physical row stride, including storage padding.
+         * @param selection Typed accepted row and owning request epoch.
+         * @param current_epoch Current canonical request/session authority.
+         * @return Bounded byte slice from the beginning of the complete tensor.
+         * @throws std::invalid_argument For stale sessions or overflowing storage.
+         */
+        static PrefixTerminalLogitsSlice resolveSelectedRow(
+            PrefixLogitsVocabularyRange source, PrefixLogitsVocabularyRange archive,
+            size_t storage_row_bytes, const PrefixLogitsRowSelection &selection,
+            uint64_t current_epoch)
+        {
+            selection.requireCurrent(current_epoch);
+            const auto row = resolve(source, archive, storage_row_bytes);
+            if (storage_row_bytes > std::numeric_limits<size_t>::max() / selection.rows())
+                throw std::invalid_argument("Terminal-logit producer row extent overflows storage");
+            return PrefixTerminalLogitsSlice(
+                selection.row() * storage_row_bytes + row.byteOffset(), row.byteCount());
         }
 
         /** @return Byte offset from row zero of the published source tensor. */

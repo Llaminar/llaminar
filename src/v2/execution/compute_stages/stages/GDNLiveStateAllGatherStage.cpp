@@ -14,6 +14,8 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../kernels/common/GDNLinkedStateLayout.h"
 #include "../../../tensors/TensorKernels.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "../../../utils/Logger.h"
 
 #include <utility>
@@ -23,6 +25,29 @@ namespace llaminar2
     GDNLiveStateAllGatherStage::GDNLiveStateAllGatherStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    uint64_t GDNLiveStateAllGatherStage::graphCaptureVariantSignature() const
+    {
+        return 0x47444e4700000000ULL | static_cast<uint64_t>(params_.geometry.recurrence_layout);
+    }
+
+    bool GDNLiveStateAllGatherStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        if (!ctx || ctx->deviceId() != params_.device_id || !stream || !params_.tp_ctx ||
+            !params_.recurrence_kernel || isGraphCaptureActive())
+            throw std::invalid_argument(
+                "GDN clique layout preparation requires its exact cold participant");
+        if (!validGDNRecurrenceStateLayout(params_.geometry.recurrence_layout) ||
+            params_.recurrence_kernel->recurrenceStateLayout() !=
+                params_.geometry.recurrence_layout)
+            throw std::invalid_argument("GDN clique layout differs from its recurrence owner");
+        // The existing context aborts on mismatched names; same-size foreign layouts
+        // therefore fail before recording any native collective or state import.
+        const std::string identity = params_.geometry.captureLayoutIdentity(params_.layer_idx);
+        if (!params_.tp_ctx->graphCaptureBoundaryRendezvous(identity, params_.tp_device_idx, 30000))
+            return false;
+        return IComputeStage::prepareGraphLaunch(ctx, stream);
     }
 
     std::string GDNLiveStateAllGatherStage::localConvBufferName() const
@@ -142,6 +167,13 @@ namespace llaminar2
             return false;
         }
 
+        if (params_.recurrence_kernel->recurrenceStateLayout() !=
+            params_.geometry.recurrence_layout)
+        {
+            LOG_ERROR(
+                "[GDNLiveStateAllGatherStage] Recurrence owner differs from immutable clique layout");
+            return false;
+        }
         void *stream = gpuStream();
         if (!stream)
         {
@@ -390,50 +422,8 @@ namespace llaminar2
         if (!params_.tp_ctx)
             return requirements;
 
-        const auto append_state_buffers = [&requirements](
-                                              const std::string &local,
-                                              const std::string &gathered,
-                                              const std::string &full,
-                                              const GDNLinkedLiveStateShape &shape)
-        {
-            requirements.buffers.push_back(
-                {local,
-                 static_cast<size_t>(shape.local_state_floats) * sizeof(float),
-                 256,
-                 true});
-            requirements.buffers.push_back(
-                {gathered,
-                 static_cast<size_t>(shape.full_state_floats) * sizeof(float),
-                 256,
-                 true});
-            requirements.buffers.push_back(
-                {full,
-                 static_cast<size_t>(shape.full_state_floats) * sizeof(float),
-                 256,
-                 true});
-        };
-
-        if (const auto conv = params_.geometry.resolve(
-                GDNLinkedLiveStateKind::ConvHistory,
-                params_.tp_ctx->degree()))
-        {
-            append_state_buffers(
-                localConvBufferName(),
-                gatheredConvBufferName(),
-                fullConvBufferName(),
-                *conv);
-        }
-        if (const auto recurrence = params_.geometry.resolve(
-                GDNLinkedLiveStateKind::Recurrence,
-                params_.tp_ctx->degree()))
-        {
-            append_state_buffers(
-                localRecurrenceBufferName(),
-                gatheredRecurrenceBufferName(),
-                fullRecurrenceBufferName(),
-                *recurrence);
-        }
-        return requirements;
+        return gdn_live_state_workspace::requirements(params_.layer_idx,
+            {.degree = params_.tp_ctx->degree(), .state = params_.geometry});
     }
 
     void GDNLiveStateAllGatherStage::bindWorkspace(

@@ -64,7 +64,7 @@ Kernel route counters explain which backend path ran without forcing legacy
 profiling. They are CPU-side counters around explicit-stream GPU launches, so
 they are safe to export during graph-safe diagnostic runs.
 
-- `kernel.cuda_native_vnni_prefill_calls` records CUDA NativeVNNI prompt-prefill
+- `kernel.cuda_native_quantised_prefill_calls` records CUDA NativeQuantised prompt-prefill
   route selection with `codebook`, `m`, `n`, `k`, `tile_id`, `split_k`, `bk256`,
   and `streamk` tags.
 

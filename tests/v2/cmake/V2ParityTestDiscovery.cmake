@@ -7,40 +7,72 @@
 # Production binaries identify their model/scope and matrix role, never one
 # placement, precision, or MTP cell. Discovery enforces that role before it
 # publishes campaign registrations; focused-only binaries remain independent.
+# The original native MPI owner wraps every focused/campaign process world;
+# bounded metadata hashes keep exact long logical names out of filesystem components.
+# FullSourceAdmission, CandidateSourceAdmission, RejectUnsupportedSourceAdmission
+# and RejectCapacitySourceAdmission
+# are setup-only contracts:
+# each retains exact model
+# dependencies and backend startup isolation without numerical-reference labels
+# or campaign admission. The real fixture still owns materialization/teardown.
 # Console parameter comments are opaque and may contain truncated JSON. Remove
 # them before converting lines to a CMake list: unmatched brackets in comments
 # otherwise absorb later test names. Structured parameters belong exclusively
 # to Google's complete JSON export, not this registration-name parser.
 #
 # Inputs (via -D):
+#   MODEL_FREE_NATIVE - Explicit model-free original singleton codec discovery
+#   NATIVE_BACKENDS  - Configured compiled CUDA/ROCm families (no codec roster)
 #   TEST_EXECUTABLE  - Full path to the GTest binary
 #   CTEST_FILE       - Output .cmake file to generate
+#   MPI_SESSION_HELPER - Exact built original native MPI owner executable
+#   MPI_SESSION_ROOT - Absolute build-owned parent for per-test session bases
 #   TEST_PREFIX      - CTest name prefix (e.g. V2_Integration_Parity_Qwen2_SingleDevice)
 #   LABELS           - Semicolon-separated CTest labels
 #   MPI_PROCS        - Number of MPI processes for test execution
 #   NUM_SOCKETS      - Detected CPU socket count
 #   CORES_PER_SOCKET - Cores per socket
 #   WORKING_DIR      - Working directory for tests
-#   TIMEOUT          - Optional per-test timeout in seconds
+#   TIMEOUT          - Optional ordinary focused-test timeout in seconds
+#   SOURCE_ADMISSION_TIMEOUT - Optional source-only setup deadline; takes precedence
 #   PRODUCTION_PERF_STATS_FILTER - Optional campaign PerfStats domains
 #   PRODUCTION_ISOLATED_TESTS_SERIALIZED - Pipe-separated literal GTest-name
 #                         fragments whose matching cells require a fresh MPI
 #                         application lifetime
 #   MODEL_FILES_SERIALIZED - Pipe-separated GGUF inputs owned by this binary
+#   SOURCE_ADMISSION_MTP_SOURCE_KIND - Embedded or Paired for active source cells
+#   SOURCE_ADMISSION_MTP_MODEL_FILES_SERIALIZED - External Paired predictor inputs only
 #   <BACKEND>_MODEL_FILES_SERIALIZED - Additional inputs for that backend
 # =============================================================================
+
+# A selected preflight-only placeholder must fail, while CTest inventory and
+# unrelated label selections remain usable before this target's first build.
+if(NATIVE_DISCOVERY_REQUIRED)
+    message(FATAL_ERROR "Build ${NATIVE_DISCOVERY_REQUIRED} before required native codec discovery")
+endif()
 
 # The 75-minute economy requirement is a reporting target, never an execution
 # timeout. This separate ceiling exists only to terminate a stuck standalone
 # campaign; the aggregate runner applies the same safety horizon to the matrix.
 set(_production_campaign_completion_timeout_seconds 21600)
 
+# The original owner and builder namespace are mandatory registration inputs.
+# No runtime search or global /tmp directory may substitute for either one.
+if(CMAKE_VERSION VERSION_LESS "3.27")
+    message(FATAL_ERROR "Parity MPI ownership requires CMake/CTest >= 3.27 timeout signal grace")
+endif()
+if(NOT IS_ABSOLUTE "${MPI_SESSION_HELPER}" OR NOT EXISTS "${MPI_SESSION_HELPER}" OR IS_DIRECTORY "${MPI_SESSION_HELPER}")
+    message(FATAL_ERROR "Parity discovery requires its exact built MPI_SESSION_HELPER")
+endif()
+if(NOT IS_ABSOLUTE "${MPI_SESSION_ROOT}")
+    message(FATAL_ERROR "Parity discovery requires its absolute build-owned MPI_SESSION_ROOT")
+endif()
+
 # --- Run the binary to discover tests (no mpirun needed) --------------------
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
         "HWLOC_COMPONENTS=-gl,-opencl"
         "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
-        "OMPI_MCA_btl_vader_single_copy_mechanism=none"
         "${TEST_EXECUTABLE}" --gtest_list_tests
     OUTPUT_VARIABLE _test_list_output
     ERROR_VARIABLE _discovery_error
@@ -75,7 +107,9 @@ foreach(_line IN LISTS _lines)
 
     # Check if this is a suite line (does not start with whitespace)
     string(REGEX MATCH "^[^ ]" _is_suite "${_line}")
-    if(_is_suite)
+    # Regex matches are strings, not booleans: a suite beginning with N
+    # matches "N", which CMake otherwise interprets as false.
+    if(NOT "${_is_suite}" STREQUAL "")
         # Suite line: strip trailing whitespace, keep the trailing dot
         string(STRIP "${_line}" _current_suite)
     else()
@@ -95,15 +129,111 @@ if(_test_count EQUAL 0)
     message(FATAL_ERROR "V2ParityTestDiscovery: No tests discovered from ${TEST_EXECUTABLE}")
 endif()
 
+# Shared startup environment remains identical for parity and native replay.
+include(${CMAKE_CURRENT_LIST_DIR}/V2ParityEnvironment.cmake)
+if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "" OR CORES_PER_SOCKET EQUAL 0)
+    set(CORES_PER_SOCKET 1)
+endif()
+
+set(_env_vars
+    "LLAMINAR_TEST_MPI_SESSION_HELPER=${MPI_SESSION_HELPER}"
+    "LLAMINAR_LOG_LEVEL=DEBUG"
+    "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
+    "HWLOC_COMPONENTS=-gl,-opencl"
+    "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
+    "OMP_PLACES=sockets"
+    "OMP_PROC_BIND=close"
+    "OMP_NESTED=false"
+    "OMP_DYNAMIC=false"
+    "KMP_AFFINITY=granularity=fine,compact,1,0"
+    "KMP_BLOCKTIME=0"
+    "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
+    "MKL_DYNAMIC=false"
+    "OMPI_MCA_mpi_leave_pinned=1"
+    "OMPI_MCA_btl_openib_allow_ib=1"
+)
+
+# Model-free native codecs reuse this parser and original process guardian.
+# The compiled ValuesIn(canonical formats) registration owns the codec roster;
+# CMake selects backend families only and never copies the format table.
+if(MODEL_FREE_NATIVE)
+    if(NOT NATIVE_BACKENDS OR NOT MPI_PROCS EQUAL 1 OR
+       NOT TIMEOUT MATCHES "^[1-9][0-9]*$" OR TIMEOUT GREATER 120)
+        message(FATAL_ERROR "Native codec discovery requires backends, singleton ownership and deadline <=120")
+    endif()
+    v2_parity_escape_literal(_native_working_directory "${WORKING_DIR}")
+    set(_seen_backends "")
+    set(_output "# Compiled model-free native codec registrations; do not edit.\n")
+    foreach(_backend IN LISTS NATIVE_BACKENDS)
+        if(NOT _backend MATCHES "^(CUDA|ROCm)$" OR _backend IN_LIST _seen_backends)
+            message(FATAL_ERROR "Invalid or duplicate native backend: ${_backend}")
+        endif()
+        list(APPEND _seen_backends "${_backend}")
+        string(TOLOWER "${_backend}" _family)
+        set(_selected "")
+        foreach(_full_name IN LISTS _all_tests)
+            if(_full_name MATCHES "^AllNativeCodecs/NativeFixedHeadPipelineFormats\\.${_backend}2/")
+                if(NOT _full_name MATCHES "^AllNativeCodecs/NativeFixedHeadPipelineFormats\\.${_backend}2/([A-Za-z0-9_]+)$")
+                    message(FATAL_ERROR "Malformed native codec selection: ${_full_name}")
+                endif()
+                set(_codec "${CMAKE_MATCH_1}")
+                if(_codec IN_LIST _selected)
+                    message(FATAL_ERROR "Duplicate native codec selection: ${_full_name}")
+                endif()
+                list(APPEND _selected "${_codec}")
+                set(_ctest_name "${TEST_PREFIX}_${_backend}2Formats_${_codec}")
+                string(SHA256 _session_component "${TEST_EXECUTABLE}\n${_ctest_name}")
+                set(_session_base "${MPI_SESSION_ROOT}/${_session_component}")
+                file(MAKE_DIRECTORY "${_session_base}")
+                set(_cmd "${MPI_SESSION_HELPER}" --session-base "${_session_base}" --
+                    "${TEST_EXECUTABLE}" "--pipeline-native-family=${_family}"
+                    --pipeline-native-degree=2 "--gtest_filter=${_full_name}")
+                set(_cmd_str "")
+                foreach(_arg IN LISTS _cmd)
+                    v2_parity_escape_literal(_escaped "${_arg}")
+                    string(APPEND _cmd_str " \"${_escaped}\"")
+                endforeach()
+                string(APPEND _output "add_test(\"${_ctest_name}\"${_cmd_str})\n")
+                set(_native_labels ${LABELS} ${_backend} ProcessOwned)
+                list(REMOVE_DUPLICATES _native_labels)
+                set(_native_environment ${_env_vars})
+                foreach(_property IN ITEMS _native_labels _native_environment)
+                    v2_parity_escape_literal(${_property} "${${_property}}")
+                endforeach()
+                string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n"
+                    " LABELS \"${_native_labels}\"\n ENVIRONMENT \"${_native_environment}\"\n"
+                    " WORKING_DIRECTORY \"${_native_working_directory}\"\n TIMEOUT ${TIMEOUT}\n"
+                    " TIMEOUT_SIGNAL_NAME SIGTERM\n TIMEOUT_SIGNAL_GRACE_PERIOD 36\n"
+                    " PROCESSORS 4\n RESOURCE_LOCK Integration_Serial\n"
+                    " FAIL_REGULAR_EXPRESSION \"0 tests? from 0 test suites?;\\\\[ *SKIPPED *\\\\]\"\n")
+                if(_backend STREQUAL "ROCm")
+                    string(APPEND _output " ENVIRONMENT_MODIFICATION \"HSA_OVERRIDE_GFX_VERSION=unset:\"\n")
+                endif()
+                string(APPEND _output ")\n")
+            endif()
+        endforeach()
+        if(NOT _selected)
+            message(FATAL_ERROR "Missing compiled native codec family: ${_backend}")
+        endif()
+        # Backend symmetry is checked from compiled names, without another roster.
+        list(SORT _selected)
+        if(DEFINED _original_codec_selection AND NOT _selected STREQUAL _original_codec_selection)
+            message(FATAL_ERROR "Native backend codec populations differ")
+        endif()
+        set(_original_codec_selection "${_selected}")
+    endforeach()
+    file(WRITE "${CTEST_FILE}" "${_output}")
+    return()
+endif()
+
 # --- Establish the default MPI world ----------------------------------------
 if(NOT MPI_PROCS)
     set(MPI_PROCS 1)
 endif()
 
-# --- Build environment variables list ----------------------------------------
-if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "" OR CORES_PER_SOCKET EQUAL 0)
-    set(CORES_PER_SOCKET 1)
-endif()
+v2_parity_environment_deserialize(_explicit_environment "${ENVIRONMENT_SERIALIZED}")
+
+# --- Establish parity-only instrumentation policy ---------------------------
 
 if(NOT PRODUCTION_PERF_STATS_FILTER)
     # The standard campaign owns graph, MTP, prefix, and ExpertOverlay path
@@ -112,13 +242,32 @@ if(NOT PRODUCTION_PERF_STATS_FILTER)
     # remains the sole runtime authority, while zero counters are meaningful
     # evidence for Static/no-MTP cells.
     set(PRODUCTION_PERF_STATS_FILTER
-        "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement")
+        "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,immutable_lookup,qsa")
+endif()
+
+# Immutable lookup reuse is a shared production-fixture invariant, including
+# ordinary numerical cells. Its actual source/remote enqueue counters must not
+# disappear when a target supplies an explicit numerical-domain filter.
+if(NOT PRODUCTION_PERF_STATS_FILTER MATCHES "(^|,)ngram_lookup(,|$)")
+    string(APPEND PRODUCTION_PERF_STATS_FILTER ",ngram_lookup")
+endif()
+
+# Source admission and focused native exact replay share this explicit source intent. Embedded MTP
+# needs no external predictor; Paired MTP must name its own source closure.
+# Do not infer this from a model name or impose paired GGUFs on future embedded MTP.
+if(SOURCE_ADMISSION_MTP_SOURCE_KIND AND
+   NOT SOURCE_ADMISSION_MTP_SOURCE_KIND MATCHES "^(Embedded|Paired)$")
+    message(FATAL_ERROR "Invalid SOURCE_ADMISSION_MTP_SOURCE_KIND: ${SOURCE_ADMISSION_MTP_SOURCE_KIND}")
+endif()
+if(SOURCE_ADMISSION_MTP_MODEL_FILES_SERIALIZED AND
+   NOT SOURCE_ADMISSION_MTP_SOURCE_KIND STREQUAL "Paired")
+    message(FATAL_ERROR "External source-admission MTP inputs require Paired source kind")
 endif()
 
 # Normalize the binary-owned model manifest once. Production campaigns expose
 # the same list through REQUIRED_FILES for machine-readable aggregate discovery
 # and through an environment contract for runtime path-remap validation.
-foreach(_model_scope IN ITEMS COMMON CPU CUDA ROCM)
+foreach(_model_scope IN ITEMS COMMON CPU CUDA ROCM SOURCE_ADMISSION_MTP)
     if(_model_scope STREQUAL "COMMON")
         set(_serialized_scope_models "${MODEL_FILES_SERIALIZED}")
     else()
@@ -153,29 +302,6 @@ set(_all_production_model_files
     ${_production_model_files_ROCM})
 list(REMOVE_DUPLICATES _all_production_model_files)
 
-set(_env_vars
-    "LLAMINAR_LOG_LEVEL=DEBUG"
-    "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
-    "HWLOC_COMPONENTS=-gl,-opencl"
-    "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
-    "OMP_PLACES=sockets"
-    "OMP_PROC_BIND=close"
-    "OMP_NESTED=false"
-    "OMP_DYNAMIC=false"
-    "KMP_AFFINITY=granularity=fine,compact,1,0"
-    "KMP_BLOCKTIME=0"
-    "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
-    "MKL_DYNAMIC=false"
-    "OMPI_MCA_mpi_leave_pinned=1"
-    "OMPI_MCA_btl_vader_single_copy_mechanism=none"
-    "OMPI_MCA_btl_openib_allow_ib=1"
-)
-
-# Add ROCm env if labels mention ROCm
-if("${LABELS}" MATCHES "ROCm")
-    list(APPEND _env_vars "HSA_OVERRIDE_GFX_VERSION=9.0.6")
-endif()
-
 # Graph-native parity is only meaningful when the captured production graph
 # path is admitted.  Keep the full KV context capacity independent from the
 # resident activation bucket: runtime planning chooses the largest fitting
@@ -193,6 +319,19 @@ endif()
 set(_output "# Auto-generated by V2ParityTestDiscovery.cmake\n")
 string(APPEND _output "# Source: ${TEST_EXECUTABLE}\n")
 string(APPEND _output "# Tests discovered: ${_test_count}\n\n")
+foreach(_entry IN LISTS _explicit_environment)
+    string(REGEX MATCH "^[^=]+" _name "${_entry}")
+    if(_name MATCHES "^LLAMINAR_(GPU_GRAPHS|PREFILL_GRAPH_BUCKETS|PREFILL_GRAPH_REQUIRED)$")
+        message(FATAL_ERROR "Explicit parity ENVIRONMENT cannot replace canonical setting ${_name}")
+    endif()
+    foreach(_canonical IN LISTS _env_vars _graph_native_capture_env)
+        if("${_canonical}" MATCHES "^${_name}=")
+            message(FATAL_ERROR "Explicit parity ENVIRONMENT cannot replace canonical setting ${_name}")
+        endif()
+    endforeach()
+endforeach()
+list(APPEND _env_vars ${_explicit_environment})
+
 set(_production_campaign_keys "")
 set(_production_isolated_test_patterns "")
 if(PRODUCTION_ISOLATED_TESTS_SERIALIZED)
@@ -201,6 +340,14 @@ if(PRODUCTION_ISOLATED_TESTS_SERIALIZED)
 endif()
 
 foreach(_full_name IN LISTS _all_tests)
+    set(_focused_native_exact FALSE)
+    set(_focused_native_generation FALSE)
+    if("${_full_name}" MATCHES "\\.NativeGeneration/")
+        set(_focused_native_generation TRUE)
+    endif()
+    if("${_full_name}" MATCHES "\\.MTPExactReplay/")
+        set(_focused_native_exact TRUE)
+    endif()
     if("${_full_name}" MATCHES "ProductionParity")
         # One CTest campaign owns every precision cell for a backend signature
         # in this executable.  GTest still reports each parameterized cell, but
@@ -313,11 +460,22 @@ foreach(_full_name IN LISTS _all_tests)
         "--bind-to" "socket"
         "--map-by" "socket"
         "--mca" "mpi_leave_pinned" "1"
-        "--mca" "btl_vader_single_copy_mechanism" "none"
         "--mca" "orte_allowed_exit_without_sync" "1")
     if(NUM_SOCKETS AND _focused_mpi_procs GREATER NUM_SOCKETS)
         list(APPEND _test_mpi_cmd "--oversubscribe")
     endif()
+    if(_focused_native_exact OR _focused_native_generation)
+        foreach(_name IN ITEMS LLAMINAR_PRODUCTION_PARITY
+                LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN LLAMINAR_GPU_GRAPHS
+                LLAMINAR_PREFILL_GRAPH_BUCKETS LLAMINAR_PREFILL_GRAPH_REQUIRED
+                LLAMINAR_PERF_STATS_SUMMARY LLAMINAR_PERF_STATS_FILTER
+                LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS)
+            list(APPEND _test_mpi_cmd "-x" "${_name}")
+        endforeach()
+    endif()
+    foreach(_export IN LISTS _explicit_environment)
+        list(APPEND _test_mpi_cmd "-x" "${_export}")
+    endforeach()
     foreach(_export IN LISTS _graph_native_capture_env)
         # mpirun must explicitly forward graph admission settings to every
         # participant; CTest ENVIRONMENT alone is not reliable for OpenMPI.
@@ -331,13 +489,18 @@ foreach(_full_name IN LISTS _all_tests)
         list(APPEND _test_mpi_cmd "-x" "LLAMINAR_PROFILE_KERNELS=1")
     endif()
 
-    # Build the full command: mpirun ... <binary> --gtest_filter=<full_name>
-    set(_cmd ${_test_mpi_cmd} "${TEST_EXECUTABLE}" "--gtest_filter=${_full_name}")
+    # Keep exact logical identity while bounding the filesystem component.
+    string(SHA256 _session_component "${TEST_EXECUTABLE}\n${_ctest_name}")
+    set(_session_base "${MPI_SESSION_ROOT}/${_session_component}")
+    file(MAKE_DIRECTORY "${_session_base}")
+    set(_cmd "${MPI_SESSION_HELPER}" --session-base "${_session_base}" --
+        ${_test_mpi_cmd} -- "${TEST_EXECUTABLE}" "--gtest_filter=${_full_name}")
 
     # Convert command list to space-separated string for add_test
     # We need to properly quote each argument
     set(_cmd_str "")
     foreach(_arg IN LISTS _cmd)
+        v2_parity_escape_literal(_arg "${_arg}")
         if(_cmd_str)
             string(APPEND _cmd_str " \"${_arg}\"")
         else()
@@ -347,7 +510,67 @@ foreach(_full_name IN LISTS _all_tests)
 
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
-    set(_test_labels ${LABELS})
+    set(_test_labels ${LABELS} ProcessOwned)
+    set(_focused_explicit_inputs FALSE)
+    set(_focused_active_mtp FALSE)
+    set(_focused_model_files "")
+    set(_focused_backend_signature "")
+    if(_focused_native_exact OR _focused_native_generation OR "${_full_name}" MATCHES "\\.(FullSourceAdmission|CandidateSourceAdmission|RejectUnsupportedSourceAdmission|RejectCapacitySourceAdmission)/")
+        set(_focused_explicit_inputs TRUE)
+        # An admission fixture must not inherit every backend (or reference
+        # dependency) named by the binary's numerical matrix. Select only its
+        # actual participant signature, as for a numerical campaign above.
+        list(REMOVE_ITEM _test_labels CPU CUDA ROCm PyTorch GoldenReference Parity)
+        list(APPEND _test_labels RealModel FullModel)
+        if(_focused_native_exact OR _focused_native_generation)
+            if(_focused_native_generation)
+                list(APPEND _test_labels NativeGeneration Functional UnqualifiedCandidate)
+            else()
+                list(APPEND _test_labels NativeExactReplay Functional MTP ByteExact Snapshots)
+            endif()
+        else()
+            list(APPEND _test_labels Admission)
+        endif()
+        if("${_full_name}" MATCHES "\\.RejectCapacitySourceAdmission/")
+            list(APPEND _test_labels NegativeAdmission CapacityAdmission)
+        elseif("${_full_name}" MATCHES "\\.RejectUnsupportedSourceAdmission/")
+            list(APPEND _test_labels NegativeAdmission)
+        elseif("${_full_name}" MATCHES "\\.CandidateSourceAdmission/")
+            list(APPEND _test_labels UnqualifiedCandidate)
+        endif()
+        set(_focused_model_files ${_production_model_files_COMMON})
+        foreach(_backend IN ITEMS CPU CUDA ROCm)
+            if("${_full_name}" MATCHES "${_backend}")
+                list(APPEND _focused_backend_signature "${_backend}")
+                list(APPEND _test_labels "${_backend}")
+                string(TOUPPER "${_backend}" _backend_upper)
+                list(APPEND _focused_model_files ${_production_model_files_${_backend_upper}})
+            endif()
+        endforeach()
+        if(NOT _focused_backend_signature)
+            message(FATAL_ERROR "Source-admission case has no backend identity: ${_full_name}")
+        endif()
+        # These suffixes are the five active typed ModelParityMTP policies.
+        # Off and numerical methods retain their original manifests unchanged.
+        if("${_full_name}" MATCHES "MTP(Depth1|Depth2|Depth3|Depth15|DynamicDepth)$")
+            set(_focused_active_mtp TRUE)
+            if(NOT SOURCE_ADMISSION_MTP_SOURCE_KIND)
+                message(FATAL_ERROR "Active source-admission MTP case requires explicit Embedded or Paired source kind: ${_full_name}")
+            endif()
+            if(SOURCE_ADMISSION_MTP_SOURCE_KIND STREQUAL "Paired")
+                if(NOT _production_model_files_SOURCE_ADMISSION_MTP)
+                    message(FATAL_ERROR "Paired source-admission MTP case has no declared predictor inputs: ${_full_name}")
+                endif()
+                list(APPEND _focused_model_files ${_production_model_files_SOURCE_ADMISSION_MTP})
+            endif()
+        elseif("${_full_name}" MATCHES "_MTP[^/]*$" AND NOT "${_full_name}" MATCHES "_MTPOff$")
+            message(FATAL_ERROR "Unsupported source-admission MTP policy suffix: ${_full_name}")
+        endif()
+        list(REMOVE_DUPLICATES _focused_model_files)
+        if(NOT _focused_model_files)
+            message(FATAL_ERROR "Source-admission case has no declared MODEL_FILES: ${_full_name}")
+        endif()
+    endif()
     if("${_full_name}" MATCHES "Profiler")
         list(FIND _test_labels "Profiler" _profiler_label_index)
         if(_profiler_label_index EQUAL -1)
@@ -358,19 +581,77 @@ foreach(_full_name IN LISTS _all_tests)
     string(JOIN ";" _labels_joined ${_test_labels})
 
     set(_test_env_vars ${_env_vars})
+    if(_focused_explicit_inputs)
+        if(_focused_backend_signature STREQUAL "CPU")
+            list(APPEND _test_env_vars "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+        else()
+            list(APPEND _test_env_vars "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0")
+        endif()
+        foreach(_backend IN ITEMS CUDA ROCm)
+            string(TOUPPER "${_backend}" _backend_upper)
+            list(FIND _focused_backend_signature "${_backend}" _focused_backend_index)
+            if(NOT _focused_backend_index EQUAL -1)
+                list(APPEND _test_env_vars "LLAMINAR_SKIP_${_backend_upper}_STARTUP=0")
+            else()
+                list(APPEND _test_env_vars "LLAMINAR_SKIP_${_backend_upper}_STARTUP=1")
+            endif()
+        endforeach()
+    endif()
+    if(_focused_native_exact OR _focused_native_generation)
+        string(JOIN "|" _focused_model_manifest ${_focused_model_files})
+        list(APPEND _test_env_vars
+            "LLAMINAR_PRODUCTION_PARITY=1"
+            "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=0"
+            "LLAMINAR_GPU_GRAPHS=1"
+            "LLAMINAR_PREFILL_GRAPH_BUCKETS=1"
+            "LLAMINAR_PREFILL_GRAPH_REQUIRED=1"
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=${PRODUCTION_PERF_STATS_FILTER}"
+            "LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS=${_focused_model_manifest}")
+    elseif(_focused_active_mtp)
+        # Serving-plan evidence is observed from the production controller's
+        # forward-graph counters. Off cells keep their original environment.
+        list(FILTER _test_env_vars EXCLUDE REGEX "^LLAMINAR_PERF_STATS_(SUMMARY|FILTER)=")
+        list(APPEND _test_env_vars
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=forward_graph")
+    endif()
     if("${_full_name}" MATCHES "Profiler")
         list(APPEND _test_env_vars "LLAMINAR_PROFILE_KERNELS=1")
     endif()
     string(JOIN ";" _env_joined ${_test_env_vars})
+    v2_parity_escape_literal(_env_joined "${_env_joined}")
 
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
-    string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_NAME SIGTERM\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_GRACE_PERIOD 36\n")
+    # Exact functional replay consumes only its declared originals and never fetches a reference/model suite.
+    if(NOT _focused_native_exact AND NOT _focused_native_generation)
+        string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
+    endif()
+    if(_focused_explicit_inputs)
+        string(JOIN ";" _focused_model_files_joined ${_focused_model_files})
+        string(APPEND _output "    REQUIRED_FILES \"${_focused_model_files_joined}\"\n")
+    endif()
     string(APPEND _output "    LABELS \"${_labels_joined}\"\n")
     string(APPEND _output "    ENVIRONMENT \"${_env_joined}\"\n")
+    if("${_labels_joined}" MATCHES "ROCm")
+        string(APPEND _output "    ENVIRONMENT_MODIFICATION \"HSA_OVERRIDE_GFX_VERSION=unset:\"\n")
+    endif()
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")
-    if(DEFINED TIMEOUT AND NOT "${TIMEOUT}" STREQUAL "")
-        string(APPEND _output "    TIMEOUT \"${TIMEOUT}\"\n")
+    set(_focused_timeout "${TIMEOUT}")
+    if(_focused_explicit_inputs)
+        if(DEFINED SOURCE_ADMISSION_TIMEOUT AND NOT "${SOURCE_ADMISSION_TIMEOUT}" STREQUAL "")
+            set(_focused_timeout "${SOURCE_ADMISSION_TIMEOUT}")
+        endif()
+        if(NOT "${_focused_timeout}" MATCHES "^[0-9]+([.][0-9]+)?$" OR
+           NOT _focused_timeout GREATER 0)
+            message(FATAL_ERROR "Source-admission case requires a positive TIMEOUT or SOURCE_ADMISSION_TIMEOUT: ${_full_name}")
+        endif()
+    endif()
+    if(NOT "${_focused_timeout}" STREQUAL "")
+        string(APPEND _output "    TIMEOUT \"${_focused_timeout}\"\n")
     endif()
     # Serialize with ALL integration tests (same lock as add_v2_mpi_test).
     # Parity tests load large models and consume significant memory/GPU resources.
@@ -498,21 +779,26 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
         "--bind-to" "socket"
         "--map-by" "socket"
         "--mca" "mpi_leave_pinned" "1"
-        "--mca" "btl_vader_single_copy_mechanism" "none"
         "--mca" "orte_allowed_exit_without_sync" "1")
     if(NUM_SOCKETS AND _campaign_mpi_procs GREATER NUM_SOCKETS)
         list(APPEND _campaign_mpi_cmd "--oversubscribe")
     endif()
+    foreach(_export IN LISTS _explicit_environment)
+        list(APPEND _campaign_mpi_cmd "-x" "${_export}")
+    endforeach()
     foreach(_export IN LISTS _campaign_runtime_env)
         list(APPEND _campaign_mpi_cmd "-x" "${_export}")
     endforeach()
-    set(_cmd
-        ${_campaign_mpi_cmd}
-        "${TEST_EXECUTABLE}"
+    string(SHA256 _session_component "${TEST_EXECUTABLE}\n${_ctest_name}")
+    set(_session_base "${MPI_SESSION_ROOT}/${_session_component}")
+    file(MAKE_DIRECTORY "${_session_base}")
+    set(_cmd "${MPI_SESSION_HELPER}" --session-base "${_session_base}" --
+        ${_campaign_mpi_cmd} -- "${TEST_EXECUTABLE}"
         "--gtest_filter=${_gtest_filter}")
 
     set(_cmd_str "")
     foreach(_arg IN LISTS _cmd)
+        v2_parity_escape_literal(_arg "${_arg}")
         if(_cmd_str)
             string(APPEND _cmd_str " \"${_arg}\"")
         else()
@@ -521,7 +807,7 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     endforeach()
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
-    set(_campaign_labels ${LABELS})
+    set(_campaign_labels ${LABELS} ProcessOwned)
     # Target-level labels describe every parameter in a binary. Policy labels
     # must instead describe this exact process campaign.
     list(REMOVE_ITEM _campaign_labels
@@ -569,23 +855,23 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(JOIN ";" _labels_joined ${_campaign_labels})
 
     set(_campaign_env_vars ${_env_vars})
-    # HSA compatibility is similarly scoped to campaigns that actually own a
-    # ROCm participant; it must not leak topology assumptions into CUDA/CPU.
-    if(NOT "${_backend_signature}" MATCHES "ROCm")
-        list(FILTER _campaign_env_vars EXCLUDE REGEX
-            "^HSA_OVERRIDE_GFX_VERSION=")
-    endif()
     # Integration tests default to DEBUG, but a complete real-weight campaign
     # emits canonical CSV/PerfStats evidence and must not benchmark synchronous
     # debug-log traffic.  A focused reproduction can still run at DEBUG.
     list(FILTER _campaign_env_vars EXCLUDE REGEX "^LLAMINAR_LOG_LEVEL=")
     list(APPEND _campaign_env_vars ${_campaign_runtime_env})
     string(JOIN ";" _env_joined ${_campaign_env_vars})
+    v2_parity_escape_literal(_env_joined "${_env_joined}")
 
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_NAME SIGTERM\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_GRACE_PERIOD 36\n")
     string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
     string(APPEND _output "    LABELS \"${_labels_joined}\"\n")
     string(APPEND _output "    ENVIRONMENT \"${_env_joined}\"\n")
+    if("${_labels_joined}" MATCHES "ROCm")
+        string(APPEND _output "    ENVIRONMENT_MODIFICATION \"HSA_OVERRIDE_GFX_VERSION=unset:\"\n")
+    endif()
     string(APPEND _output "    REQUIRED_FILES \"${_campaign_model_files}\"\n")
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")

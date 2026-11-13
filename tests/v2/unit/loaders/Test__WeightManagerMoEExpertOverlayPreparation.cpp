@@ -5,7 +5,8 @@
  * These cases validate that the preparation request is exact in both logical
  * expert identity and MPI ownership before any device packing occurs.  The
  * real-weight integration campaigns rely on this layer to prevent a rank from
- * loading a remote CPU/accelerator participant's expert slice.
+ * loading a remote CPU/accelerator participant's expert slice. Canonical parent
+ * readiness also controls retirement of independent typed-cache expert copies.
  */
 
 #include <gtest/gtest.h>
@@ -15,7 +16,18 @@
 #include "execution/moe/MoEOverlayCpuPreparationGate.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "loaders/WeightManager.h"
+#include "../../fixtures/loaders/ExpertGemmRegistryResidencyTestAccess.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "kernels/PackedWeightsSerialization.h"
+#include "loaders/PreparedWeightStore.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "models/GraphTypes.h"
+#include "execution/moe/MoEExpertOverlayGraphScope.h"
+#include "execution/moe/MoEExpertOwnerMap.h"
 #include "mocks/MockModelLoader.h"
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "utils/CPUExpertStageTestAdmission.h"
+#include "mocks/MockLocalTPContext.h"
 #include "tensors/Tensors.h"
 
 #include <algorithm>
@@ -26,6 +38,7 @@
 #include <memory>
 #include <future>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -35,6 +48,44 @@ namespace llaminar2::test
 namespace
 {
     using Role = ExpertGemmRegistry::WeightRole;
+
+    /** @return Exact original rank-local CPU source declaration, with a real model identity. */
+    WeightPlan routedFixturePlan(IModelLoader& loader,const MoEExpertOverlayRuntimePlan& runtime,
+        ModelContextId model=ModelContextId{606}) {
+        return MoEExpertOverlayPreparationPlan::build(runtime,loader).filteredForDevice(DeviceId::cpu()).sourceWeightPlan(loader,model);
+    }
+    /**
+     * @brief Admit the SAME original source plan through the shared canonical fixture quote.
+     * @param owner_limit Deliberately insufficient typed owner for admission-negative tests only.
+     * @return Original rank-bound authority; no source is loaded by this declaration.
+     */
+    std::shared_ptr<PhysicalMemoryAuthority> admitRoutedFixture(WeightManager& manager,IModelLoader& loader,
+        const MoEExpertOverlayRuntimePlan& runtime,ModelContextId model=ModelContextId{606},int rank=0,
+        std::optional<size_t> owner_limit=std::nullopt) {
+        const auto sources=routedFixturePlan(loader,runtime,model);
+        manager.setPreparedWeightStore(std::make_shared<PreparedWeightStore>(model));
+        if(!owner_limit) {
+            admitCPUWeightPlansForTest(manager,loader,{&sources},rank);return manager.physicalMemoryAuthority();
+        }
+        WeightManager quote(loader);admitCPUWeightPlansForTest(quote,loader,{&sources},rank);
+        const auto declared=quote.physicalMemoryAuthority()->rankAttestation();size_t total=0;
+        for(const auto& line:declared)total+=line.owner==PhysicalMemoryOwner::RoutedExpertWeights?*owner_limit:line.planned_new_bytes;
+        PhysicalMemoryPlanBuilder budget;
+        for(const auto& line:declared)budget.add({rank,line.identity.device,total,total},line.owner,
+            line.owner==PhysicalMemoryOwner::RoutedExpertWeights?*owner_limit:line.planned_new_bytes);
+        auto authority=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(budget.build()),rank);
+        manager.installPhysicalMemoryAuthority(authority);return authority;
+    }
+
+    /** @return Exact live routed bytes observed under the authority's ledger lock. */
+    size_t liveRoutedBytes(const PhysicalMemoryAuthority &authority)
+    {
+        size_t bytes = 0;
+        for (const auto &line : authority.rankAttestation())
+            if (line.owner == PhysicalMemoryOwner::RoutedExpertWeights)
+                bytes += line.materialized_new_bytes;
+        return bytes;
+    }
 
     RoutedExpertDomain domainWith(
         const std::string &name,
@@ -636,9 +687,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     auto rank_zero_loader = MockModelLoader::createMinimal();
     addSingleLayerExpertParents(rank_zero_loader, d_model, intermediate, num_experts);
     WeightManager rank_zero_manager(*rank_zero_loader);
-    ASSERT_NE(rank_zero_manager.getWeightForDevice("blk.0.ffn_gate_exps.weight"), nullptr);
-    ASSERT_NE(rank_zero_manager.getWeightForDevice("blk.0.ffn_up_exps.weight"), nullptr);
-    ASSERT_NE(rank_zero_manager.getWeightForDevice("blk.0.ffn_down_exps.weight"), nullptr);
+    admitRoutedFixture(rank_zero_manager,*rank_zero_loader,*rank_zero_runtime);
     ASSERT_TRUE(rank_zero_manager.prepareMoEExpertOverlayWeights(
         *rank_zero_runtime, DeviceId::cpu()));
 
@@ -667,6 +716,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     auto rank_one_loader = MockModelLoader::createMinimal();
     addSingleLayerExpertParents(rank_one_loader, d_model, intermediate, num_experts);
     WeightManager rank_one_manager(*rank_one_loader);
+    admitRoutedFixture(rank_one_manager,*rank_one_loader,*rank_one_runtime,ModelContextId{606},1);
     ASSERT_TRUE(rank_one_manager.prepareMoEExpertOverlayWeights(
         *rank_one_runtime, DeviceId::cpu()));
 
@@ -712,43 +762,17 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     auto loader = MockModelLoader::createMinimal();
     addSingleLayerExpertParents(loader, kModel, kIntermediate, kExperts);
     WeightManager manager(*loader);
+    admitRoutedFixture(manager,*loader,*runtime_plan,ModelContextId{8123});
 
-    InferenceStrategy strategy;
-    strategy.mode = WeightInferenceMode::SingleDevice;
-    strategy.model_id = ModelContextId{8123};
-    strategy.devices = {DeviceId::cpu()};
-    ModelWeightSetBuilder builder(strategy);
-    for (int participant = 0; participant < 2; ++participant)
-    {
-        for (const auto &[name, role, rows, cols] : {
-                 std::tuple{"blk.0.ffn_gate_exps.weight", WeightRole::MoEExpertGate, kModel, kIntermediate},
-                 std::tuple{"blk.0.ffn_up_exps.weight", WeightRole::MoEExpertUp, kModel, kIntermediate},
-                 std::tuple{"blk.0.ffn_down_exps.weight", WeightRole::MoEExpertDown, kIntermediate, kModel},
-             })
-        {
-            WeightBinding binding;
-            binding.identity.canonical_name = name;
-            binding.identity.role = role;
-            binding.identity.derivation = WeightDerivationKind::ExpertSlice;
-            binding.identity.layer = 0;
-            binding.identity.overlay_domain = "cpu_cold";
-            binding.identity.overlay_participant_index = participant;
-            binding.identity.overlay_participant_world_rank = 0;
-            binding.residency.home_device = DeviceId::cpu();
-            binding.residency.resident_device = DeviceId::cpu();
-            binding.slice.expert_start = static_cast<size_t>(participant) * 2u;
-            binding.slice.expert_count = 2u;
-            binding.slice.expert_ids = {participant * 2, participant * 2 + 1};
-            binding.tensor_owner = createQ4_0WithData(
-                {rows, cols, 2u},
-                static_cast<uint32_t>(101 + participant * 3 +
-                                      (role == WeightRole::MoEExpertUp ? 1 :
-                                       role == WeightRole::MoEExpertDown ? 2 : 0)));
-            binding.tensor = binding.tensor_owner.get();
-            builder.addBinding(std::move(binding));
-        }
+    const auto source_plan=routedFixturePlan(*loader,*runtime_plan,ModelContextId{8123});
+    const auto frozen=manager.materialize(source_plan);
+    ASSERT_EQ(frozen.bindings().size(),kExperts*3);
+    for(const auto& binding:frozen.bindings()) {
+        ASSERT_TRUE(binding.native_source);EXPECT_FALSE(binding.projection_source_owner);
+        EXPECT_EQ(binding.tensor->shape().size(),2u);EXPECT_EQ(binding.slice.expert_count,1u);
+        EXPECT_EQ(binding.identity.overlay_participant_index,binding.identity.expert/2);
+        EXPECT_EQ(binding.native_source->range.original_expert,size_t(binding.identity.expert));
     }
-    FrozenModelWeightSet frozen(strategy, builder.freezeBindings());
 
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu(), &frozen));
@@ -844,6 +868,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     WeightManager manager(*loader);
     const auto plan = singleLayerCpuColdPlan(kExperts);
     const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    admitRoutedFixture(manager,*loader,*runtime_plan);
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));
 
@@ -889,15 +914,22 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
             .down = down0,
         },
     };
+    // Deliberately permute this device-free map through the private validator;
+    // only the physical fabric may supply a production reusable-context seal.
     std::string replacement_error;
-    ASSERT_TRUE(registry.replaceParticipantResidency(
+    ASSERT_TRUE(ExpertGemmRegistryResidencyTestAccess::replace(registry,
         std::span<const ExpertGemmRegistry::ParticipantLayerScope>(&scope, 1u),
         rebound,
         &replacement_error))
         << replacement_error;
 
+    const auto original_reads=loader->nativeSourceReadCallCount();
+    const auto original_live=liveRoutedBytes(*manager.physicalMemoryAuthority());
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),original_reads);
+    EXPECT_EQ(liveRoutedBytes(*manager.physicalMemoryAuthority()),original_live);
+
     EXPECT_EQ(acquire(0, Role::GATE).get(), gate1.get());
     EXPECT_EQ(acquire(0, Role::UP).get(), up1.get());
     EXPECT_EQ(acquire(0, Role::DOWN).get(), down1.get());
@@ -932,6 +964,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     WeightManager manager(*loader);
     const auto plan = singleLayerCpuColdPlan(kExperts);
     const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    admitRoutedFixture(manager,*loader,*runtime_plan);
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));
 
@@ -984,14 +1017,20 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     WeightManager manager(*loader);
     const auto plan = singleLayerCpuColdPlan(kExperts);
     const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    admitRoutedFixture(manager,*loader,*runtime_plan);
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));
 
     auto &registry = manager.expertGemmRegistry();
     ASSERT_TRUE(registry.removeEngineForDomain(
         "cpu_cold", DeviceId::cpu(), 0, 0, Role::GATE));
+    const auto original_reads=loader->nativeSourceReadCallCount();
+    const auto original_live=liveRoutedBytes(*manager.physicalMemoryAuthority());
     EXPECT_FALSE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),original_reads);
+    EXPECT_EQ(liveRoutedBytes(*manager.physicalMemoryAuthority()),original_live);
+
     EXPECT_NE(
         registry.getEngineForParticipant(
             "cpu_cold", DeviceId::cpu(), 0, 0, 0, 0, Role::GATE),
@@ -1002,7 +1041,38 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
         nullptr);
 }
 
-TEST(Test__WeightManagerMoEExpertOverlayPreparation, HydratesCpuFallbackParentsWhenParentsWereNotPreloaded)
+/** @test All included scopes are classified before an empty sibling can read/allocate/publish. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, RejectsTornBankBeforeLoadingEmptySibling) {
+    auto loader=MockModelLoader::createMinimal();addSingleLayerExpertParents(loader,64,32,4);
+    for(const auto& role:std::vector<std::string>{"gate","up"})
+        loader->addTensor("blk.1.ffn_"+role+"_exps.weight",createQ4_0WithData({64,32,4},111));
+    loader->addTensor("blk.1.ffn_down_exps.weight",createQ4_0WithData({32,64,4},112));
+    auto source=singleLayerCpuColdPlan(4);
+    auto second_layer=source->placements.front();second_layer.layer=1;source->placements.push_back(second_layer);source->domains[0].scope=ExecutionDomainScope::RANK_LOCAL;
+    source->domains[0].world_ranks.clear();const auto runtime=resolveMoEExpertOverlayRuntimePlan(source);
+    WeightManager manager(*loader);const auto memory=admitRoutedFixture(manager,*loader,*runtime);
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu()));
+    auto& registry=manager.expertGemmRegistry();
+    // Original layer0 is now empty; layer1 remains physically
+    // retained but torn. Clear original Store records so an accidental load of
+    // the empty first scope must really read/allocate, rather than hit a cache.
+    const ExpertGemmRegistry::ParticipantLayerScope empty_scope{"cpu_cold",DeviceId::cpu(),0,0,0};
+    std::string error;
+    ASSERT_TRUE(ExpertGemmRegistryResidencyTestAccess::replace(registry,{&empty_scope,1},{},&error))<<error;
+    ASSERT_TRUE(registry.removeEngineForDomain("cpu_cold",DeviceId::cpu(),1,0,Role::GATE));
+    manager.preparedWeightStore()->clear();
+    const auto original_reads=loader->nativeSourceReadCallCount();const auto original_live=liveRoutedBytes(*memory);
+    EXPECT_FALSE(manager.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu()));
+    EXPECT_EQ(loader->nativeSourceReadCallCount(),original_reads);EXPECT_EQ(liveRoutedBytes(*memory),original_live);
+    for(int expert:{0,1})for(const auto role:{Role::GATE,Role::UP,Role::DOWN}) {
+        EXPECT_EQ(registry.getEngineForParticipant("cpu_cold",DeviceId::cpu(),0,0,0,expert,role),nullptr);
+        EXPECT_EQ(registry.getEngineForDomain("cpu_cold",DeviceId::cpu(),0,expert,role),nullptr);
+    }
+    EXPECT_NE(registry.getEngineForParticipant("cpu_cold",DeviceId::cpu(),0,0,1,0,Role::GATE),nullptr);
+    EXPECT_EQ(registry.getEngineForDomain("cpu_cold",DeviceId::cpu(),1,0,Role::GATE),nullptr);
+}
+
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparesCpuExpertsFromOriginalSourceWithoutPreloadedParents)
 {
     auto loader = MockModelLoader::createMinimal();
     const size_t d_model = 64;
@@ -1012,8 +1082,10 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, HydratesCpuFallbackParentsW
 
     WeightManager manager(*loader);
 
+
     auto plan = singleLayerCpuColdPlan(num_experts);
     auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    admitRoutedFixture(manager,*loader,*runtime_plan);
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));
 
@@ -1028,6 +1100,703 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, HydratesCpuFallbackParentsW
     EXPECT_EQ(gate[2], nullptr);
     EXPECT_EQ(up[2], nullptr);
     EXPECT_EQ(down[2], nullptr);
+}
+
+/** @test Host cleanup preserves final prepared CPU owners without recreating raw parent copies. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparedCpuBankRetainsFinalOwnersAcrossHostCleanup)
+{
+    constexpr size_t experts=4;auto loader=MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader,64,32,experts);WeightManager manager(*loader);
+    const auto runtime=resolveMoEExpertOverlayRuntimePlan(singleLayerCpuColdPlan(experts));
+    const auto authority=admitRoutedFixture(manager,*loader,*runtime);
+    const auto original=routedFixturePlan(*loader,*runtime);
+    const auto frozen=manager.materialize(original);ASSERT_FALSE(frozen.bindings().empty());
+    std::vector<std::shared_ptr<ITensorGemm>> retained;
+    for(const auto& binding:frozen.bindings()) {
+        ASSERT_TRUE(binding.native_source);ASSERT_TRUE(binding.prepared);EXPECT_FALSE(binding.projection_source_owner);
+        EXPECT_EQ(binding.tensor->raw_data(),nullptr); // Packed metadata owns no source-native parent.
+        retained.push_back(manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared));ASSERT_TRUE(retained.back());
+    }
+    WeightShardingConfig sharding;sharding.default_mode=WeightShardingMode::Replicate;manager.setWeightShardingConfig(sharding);
+    const auto assignments=TensorParallelConfig::equalSplit(2,4,2,64,128,std::vector<DeviceId>{DeviceId::cpu(),DeviceId::cpu()});
+    // The removed raw-parent access cannot create a second cache/root now that
+    // the original model owns a complete prepared bank.
+    EXPECT_THROW(manager.getShardedWeightForAssignment("blk.0.ffn_gate_exps.weight",DeviceId::cpu(),assignments.forRank(0),0),std::logic_error);
+    const auto live=liveRoutedBytes(*authority);ASSERT_GT(live,0u);
+    manager.markMaterializationComplete();manager.markDevicePreparationComplete();manager.markGraphMaterializationComplete();
+    manager.releaseAllHostWeightData();manager.releaseHostResidentWeightData();
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu()));
+    EXPECT_EQ(liveRoutedBytes(*authority),live);
+    for(size_t i=0;i<frozen.bindings().size();++i) {
+        const auto& binding=frozen.bindings()[i];
+        EXPECT_EQ(manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared),retained[i]);
+        EXPECT_TRUE(retained[i]->weights_converted());EXPECT_EQ(binding.tensor->raw_data(),nullptr);
+    }
+    EXPECT_EQ(manager.releaseAllHostWeightData(),0u);
+
+}
+
+/** @test Source and real preparation select the same logical CPU owner despite shared storage/reordering. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, ExactCPUGraphScopeOwnsOnlyItsSourcesAndPreparation)
+{
+    for(const bool reverse:{false,true})
+    {
+        SCOPED_TRACE(reverse);
+        auto source=singleLayerCpuColdPlan(4);
+        source->domains[0].scope=ExecutionDomainScope::RANK_LOCAL;
+        source->domains[0].world_ranks.clear();
+        if(reverse)std::reverse(source->domains[0].participants.begin(),source->domains[0].participants.end());
+        const auto runtime=resolveMoEExpertOverlayRuntimePlan(source);
+        auto loader=MockModelLoader::createMinimal();
+        // MockModelLoader's exact expert-selection API supports FP32. Use
+        // that supported source so real materialization and CPU preparation
+        // operate on compact two-expert tensors, never a full-parent substitute.
+        loader->addFP32RandomTensor("blk.0.ffn_gate_exps.weight", {64, 32, 4}, -1.0f, 1.0f, 101);
+        loader->addFP32RandomTensor("blk.0.ffn_up_exps.weight", {64, 32, 4}, -1.0f, 1.0f, 102);
+        loader->addFP32RandomTensor("blk.0.ffn_down_exps.weight", {32, 64, 4}, -1.0f, 1.0f, 103);
+        const auto all=MoEExpertOverlayPreparationPlan::build(*runtime,*loader);
+
+        // Original device-only production selection retains both NUMA owners.
+        // This concrete control must reproduce the graph-facing ambiguity.
+        WeightManager legacy_manager(*loader);
+        admitRoutedFixture(legacy_manager,*loader,*runtime,ModelContextId{920});
+        const auto legacy_plan=all.filteredForDevice(DeviceId::cpu()).sourceWeightPlan(*loader,ModelContextId{920});
+        ASSERT_EQ(legacy_plan.size(),6u);
+        const auto legacy=legacy_manager.materialize(legacy_plan);
+        const auto legacy_bindings=makeModelWeightBindings(legacy,DeviceId::cpu());
+        const auto legacy_layer=legacy_bindings.get_layer_weights(0);
+        EXPECT_FALSE(legacy_layer.moe_gate_exps);EXPECT_FALSE(legacy_layer.moe_up_exps);EXPECT_FALSE(legacy_layer.moe_down_exps);
+        auto duplicate=legacy.bindings();duplicate.push_back(duplicate.front());
+        const auto canonical=duplicate.front().identity.canonical_name;ASSERT_TRUE(canonical.starts_with("blk.0."));
+        const FrozenModelWeightSet ambiguous(legacy.strategy(),duplicate,legacy.physicalMemoryOwner());
+        EXPECT_THROW(ambiguous.optionalLayerForDevice(0,canonical.substr(6),DeviceId::cpu()),std::runtime_error);
+
+        WeightManager manager(*loader);
+
+        admitRoutedFixture(manager,*loader,*runtime,ModelContextId{921});
+        MockLocalTPContext local;
+        local.setDevices({GlobalDeviceAddress::cpu(1),GlobalDeviceAddress::cpu(0)});
+        std::vector<int> seen(4);
+        // Visit by the TP context's exact address, independently of domain order.
+        for(int graph_index=0;graph_index<2;++graph_index)
+        {
+            const auto &endpoint=local.devices()[graph_index];
+            const auto found=std::find(source->domains[0].participants.begin(),source->domains[0].participants.end(),endpoint);
+            ASSERT_NE(found,source->domains[0].participants.end());
+            const int participant=static_cast<int>(found-source->domains[0].participants.begin());
+            const auto scope=MoEExpertOverlayGraphScope::resolveForTPParticipant(
+                *runtime,DeviceId::cpu(),&local,graph_index);
+            const auto scoped=all.filteredForGraphScope(*runtime,scope);
+            const auto plan=scoped.sourceWeightPlan(*loader,ModelContextId{921});
+            ASSERT_EQ(plan.size(),3u);
+            for(const auto &requirement:plan.requirements())
+            {
+                EXPECT_EQ(requirement.overlay_domain,"cpu_cold");
+                EXPECT_EQ(requirement.overlay_participant_world_rank,0);
+                EXPECT_EQ(requirement.overlay_participant_index,participant);
+                EXPECT_EQ(requirement.slice.expert_ids,(std::vector<int>{participant*2,participant*2+1}));
+            }
+            const auto frozen=manager.materialize(plan);
+            for (const auto &binding : frozen.bindings())
+            {
+                ASSERT_TRUE(binding.tensor);
+                ASSERT_EQ(binding.tensor->shape().size(),2u);ASSERT_TRUE(binding.native_source);
+                EXPECT_FALSE(binding.projection_source_owner);EXPECT_EQ(binding.slice.expert_count,1u);
+                EXPECT_EQ(binding.identity.expert/2,participant);
+                EXPECT_EQ(binding.slice.expert_ids,(std::vector<int>{binding.identity.expert}));
+            }
+            const auto bindings=makeModelWeightBindings(frozen,DeviceId::cpu());
+            // A CPU graph receives the real prepared registry bank; it must
+            // not reconstruct a raw3D parent from final per-expert records.
+            const auto layer=bindings.get_layer_weights(0);
+            EXPECT_FALSE(layer.moe_gate_exps);EXPECT_FALSE(layer.moe_up_exps);EXPECT_FALSE(layer.moe_down_exps);
+            ASSERT_TRUE(manager.prepareMoEExpertOverlayWeightsForGraph(*runtime,scope,&frozen,nullptr,
+                PreparedWeightAdmission::AllocateCompleteSet));
+            for(const auto &request:scoped.requests())
+            {
+                EXPECT_EQ(request.participant_index,participant);
+                EXPECT_NE(manager.expertGemmRegistry().getEngineForParticipant(
+                    request.domain_name,request.device,request.participant_world_rank,request.participant_index,
+                    request.layer,request.expert_id,request.role),nullptr);
+                // No engine may be published under a sibling's ownership tuple.
+                EXPECT_EQ(manager.expertGemmRegistry().getEngineForParticipant(
+                    request.domain_name,request.device,request.participant_world_rank,1-participant,
+                    request.layer,request.expert_id,request.role),nullptr);
+                if(request.role==Role::GATE)++seen[request.expert_id];
+            }
+        }
+        EXPECT_EQ(seen,(std::vector<int>{1,1,1,1}));
+    }
+}
+
+/** @test Exact scopes fail closed on missing, ambiguous, stale and foreign logical identity. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, ExactGraphScopeRejectsAmbiguousAndForeignIdentity)
+{
+    auto source=singleLayerCpuColdPlan(4);
+    source->domains[0].scope=ExecutionDomainScope::RANK_LOCAL;
+    source->domains[0].world_ranks.clear();
+    const auto runtime=resolveMoEExpertOverlayRuntimePlan(source);
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolve(*runtime,DeviceId::cpu()),std::invalid_argument);
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolve(*runtime,DeviceId::cpu(),GlobalDeviceAddress::cpu(7)),std::invalid_argument);
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolve(*runtime,DeviceId::cuda(0),GlobalDeviceAddress::cpu(0)),std::invalid_argument);
+    MockLocalTPContext local;
+    local.setDevices({GlobalDeviceAddress::cpu(1),GlobalDeviceAddress::cpu(0)});
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolveForTPParticipant(*runtime,DeviceId::cpu(),&local,-1),std::invalid_argument);
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolveForTPParticipant(*runtime,DeviceId::cpu(),&local,2),std::invalid_argument);
+    const auto scope=MoEExpertOverlayGraphScope::resolve(*runtime,DeviceId::cpu(),GlobalDeviceAddress::cpu(1));
+    EXPECT_TRUE(scope.contains("cpu_cold",DeviceId::cpu(),0,1));
+    EXPECT_FALSE(scope.contains("wrong_domain",DeviceId::cpu(),0,1));
+    EXPECT_FALSE(scope.contains("cpu_cold",DeviceId::cpu(),1,1));
+    EXPECT_FALSE(scope.contains("cpu_cold",DeviceId::cpu(),0,0));
+    EXPECT_FALSE(scope.contains("cpu_cold",DeviceId::cuda(1),0,1));
+    const auto other_runtime=resolveMoEExpertOverlayRuntimePlan(source);
+    EXPECT_THROW(scope.validate(*other_runtime,DeviceId::cpu()),std::invalid_argument);
+    EXPECT_THROW(scope.validate(*runtime,DeviceId::cuda(0)),std::invalid_argument);
+    const auto prep=MoEExpertOverlayPreparationPlan::build(*runtime,128);
+    EXPECT_THROW(prep.filteredForGraphScope(*other_runtime,scope),std::invalid_argument);
+    // Existing distributed CPU owners remain device-unambiguous in each MPI rank.
+    const auto distributed=resolveMoEExpertOverlayRuntimePlan(singleLayerCpuColdPlan(4));
+    const auto single=MoEExpertOverlayGraphScope::resolve(*distributed,DeviceId::cpu());
+    EXPECT_TRUE(single.contains("cpu_cold",DeviceId::cpu(),0,0));
+}
+
+/** @test Only routed owners and selected endpoints require rank proof at graph selection. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, ExactGraphScopePreservesUnusedDomainsAndRejectsUnboundOwners)
+{
+    auto source=singleLayerCpuColdPlan(4);
+    RoutedExpertDomain unbound;
+    unbound.name="unbound_remote";
+    unbound.scope=ExecutionDomainScope::SINGLE;
+    unbound.backend=CollectiveBackendType::NCCL;
+    unbound.participants={GlobalDeviceAddress::cuda(0,NUMA_NODE_UNKNOWN,"unbound-host")};
+    source->domains.push_back(unbound);
+    // A domain not named by any routed tier is not an expert owner. Existing
+    // runtime metadata may retain it unbound without changing this graph scope.
+    const auto runtime=resolveMoEExpertOverlayRuntimePlan(source);
+    const auto *foreign=runtime->domainForName("unbound_remote");
+    ASSERT_TRUE(foreign);ASSERT_EQ(foreign->participants.size(),1u);
+    ASSERT_FALSE(foreign->participants.front().world_rank_known);
+    ASSERT_EQ(foreign->routed_tier_count,0u);
+    const auto scope=MoEExpertOverlayGraphScope::resolve(*runtime,DeviceId::cpu(),GlobalDeviceAddress::cpu(0));
+    EXPECT_TRUE(scope.contains("cpu_cold",DeviceId::cpu(),0,0));
+    EXPECT_FALSE(scope.contains("unbound_remote",DeviceId::cuda(0),0,0));
+    // Selecting that endpoint itself still requires an authenticated MPI owner.
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolve(*runtime,DeviceId::cuda(0),unbound.participants.front()),
+        std::invalid_argument);
+
+    // Adding a routed tier makes its participants actual owner-map entries,
+    // even before any expert is assigned there. Match the original factory's
+    // fail-fast owner-map boundary, rather than broadening runtime validation.
+    auto routed_source=std::make_shared<MoERoutedExpertPlacementPlan>(*source);
+    routed_source->routed_tiers.front().priority=2;
+    routed_source->routed_tiers.push_back(tier("unbound","unbound_remote",1));
+    const auto owner_runtime=resolveMoEExpertOverlayRuntimePlan(routed_source);
+    ASSERT_EQ(owner_runtime->domainForName("unbound_remote")->routed_tier_count,1u);
+    const auto owners=MoEExpertOwnerMap::build(*routed_source);
+    const auto unbound_owner=std::find_if(owners.participants().begin(),owners.participants().end(),
+        [](const auto &owner){return owner.domain_name=="unbound_remote";});
+    ASSERT_NE(unbound_owner,owners.participants().end());
+    ASSERT_FALSE(unbound_owner->world_rank_known);
+    EXPECT_THROW(MoEExpertOverlayGraphScope::resolve(*owner_runtime,DeviceId::cpu(),GlobalDeviceAddress::cpu(0)),
+        std::invalid_argument);
+}
+
+/** @test Canonical host/NUMA/device identities are copied unchanged for CPU and both GPU backends. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, ExactGraphScopePreservesCanonicalCPUAndGPUAddresses)
+{
+    const std::vector<GlobalDeviceAddress> endpoints{
+        GlobalDeviceAddress::cpu(1,"canonical-node"),
+        GlobalDeviceAddress::cuda(3,1,"canonical-node"),
+        GlobalDeviceAddress::rocm(2,1,"canonical-node")};
+    for(const auto &endpoint:endpoints)
+    {
+        SCOPED_TRACE(endpoint.toString());
+        auto source=singleLayerCpuColdPlan(4);
+        source->domains[0].scope=ExecutionDomainScope::SINGLE;
+        // This fixture projects one endpoint, so its inherited NodeTP dense
+        // continuation and shared-expert policy must also become singleton.
+        source->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::Replicated);
+        source->domains[0].participants={endpoint};
+        source->domains[0].world_ranks={0};
+        source->domains[0].backend=endpoint.isCPU()?CollectiveBackendType::UPI:
+            endpoint.device_type==DeviceType::CUDA?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
+        const auto runtime=resolveMoEExpertOverlayRuntimePlan(source);
+        ASSERT_EQ(runtime->continuationDomain().participants.front().address,endpoint);
+        MockLocalTPContext local;
+        local.setDevices(source->domains[0].participants);
+        const auto scope=MoEExpertOverlayGraphScope::resolveForTPParticipant(
+            *runtime,endpoint.toLocalDeviceId(),&local,0);
+        EXPECT_TRUE(scope.contains("cpu_cold",endpoint.toLocalDeviceId(),0,0));
+        // Host aliases are not reinterpreted at this post-normalization boundary.
+        auto unnormalized=endpoint;unnormalized.hostname="localhost";
+        local.setDevices({unnormalized});
+        EXPECT_THROW(MoEExpertOverlayGraphScope::resolveForTPParticipant(
+            *runtime,endpoint.toLocalDeviceId(),&local,0),std::invalid_argument);
+    }
+}
+
+/**
+ * @test GPU continuation scope owns both colocated CPU groups while its sibling owns only itself.
+ * @details Only production request/source metadata is constructed; no GPU backend is initialized.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, GraphScopeSeparatesGPUContinuationCPUOwnersFromSibling)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(static_cast<int>(backend));
+        const auto gpu_address = [backend](int ordinal)
+        {
+            return backend == DeviceType::CUDA ? GlobalDeviceAddress::cuda(ordinal) :
+                                                 GlobalDeviceAddress::rocm(ordinal);
+        };
+        auto source = std::make_shared<MoERoutedExpertPlacementPlan>();
+        source->enabled = true;
+        source->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        source->continuation_domain = "gpu_main";
+        source->shared_expert_domain = "gpu_main";
+        source->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        source->domains = {
+            domainWith("gpu_main", ExecutionDomainScope::RANK_LOCAL,
+                       {gpu_address(0), gpu_address(1)}, RoutedExpertComputePolicy::Apportioned,
+                       backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL),
+            domainWith("cpu_cold", ExecutionDomainScope::RANK_LOCAL,
+                       {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
+                       RoutedExpertComputePolicy::Apportioned, CollectiveBackendType::UPI),
+        };
+        source->routed_tiers = {tier("hot", "gpu_main", 0), tier("cold", "cpu_cold", 1, true)};
+        source->placements = {
+            RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 0, 0, 0, 1, 1, 1, 1}},
+        };
+        const auto runtime = resolveMoEExpertOverlayRuntimePlan(source);
+        auto loader = MockModelLoader::createMinimal();
+        addSingleLayerExpertParents(loader, 64, 32, 8);
+        const auto all = MoEExpertOverlayPreparationPlan::build(*runtime, *loader);
+        ASSERT_EQ(all.requests().size(), 24u);
+
+        // TP ordering is deliberately independent of the domain declaration.
+        MockLocalTPContext local;
+        local.setDevices({gpu_address(1), gpu_address(0)});
+        const auto root_device = gpu_address(0).toLocalDeviceId();
+        const auto sibling_device = gpu_address(1).toLocalDeviceId();
+        const auto root = MoEExpertOverlayGraphScope::resolveForTPParticipant(
+            *runtime, root_device, &local, 1, MoEOverlayColocatedCPUOwnership::CurrentRank);
+        const auto sibling = MoEExpertOverlayGraphScope::resolveForTPParticipant(
+            *runtime, sibling_device, &local, 0);
+        EXPECT_TRUE(root.contains("gpu_main", root_device, 0, 0));
+        EXPECT_TRUE(root.contains("cpu_cold", DeviceId::cpu(), 0, 0));
+        EXPECT_TRUE(root.contains("cpu_cold", DeviceId::cpu(), 0, 1));
+        EXPECT_FALSE(root.contains("gpu_main", sibling_device, 0, 1));
+        EXPECT_TRUE(sibling.contains("gpu_main", sibling_device, 0, 1));
+        EXPECT_FALSE(sibling.contains("cpu_cold", DeviceId::cpu(), 0, 0));
+        EXPECT_FALSE(sibling.contains("cpu_cold", DeviceId::cpu(), 0, 1));
+        EXPECT_THROW(MoEExpertOverlayGraphScope::resolveForTPParticipant(
+            *runtime, sibling_device, &local, 0, MoEOverlayColocatedCPUOwnership::CurrentRank),
+            std::invalid_argument);
+
+        const auto root_preparation = all.filteredForGraphScope(*runtime, root);
+        const auto sibling_preparation = all.filteredForGraphScope(*runtime, sibling);
+        EXPECT_EQ(root_preparation.requests().size(), 18u);
+        EXPECT_EQ(sibling_preparation.requests().size(), 6u);
+        const auto root_sources = root_preparation.sourceWeightPlan(*loader, ModelContextId{930});
+        const auto sibling_sources = sibling_preparation.sourceWeightPlan(*loader, ModelContextId{930});
+        EXPECT_EQ(root_sources.size(), 9u);
+        EXPECT_EQ(sibling_sources.size(), 3u);
+        std::set<int> root_cpu_participants;
+        for (const auto &requirement : root_sources.requirements())
+        {
+            EXPECT_TRUE(root.contains(requirement.overlay_domain, requirement.target_device,
+                requirement.overlay_participant_world_rank, requirement.overlay_participant_index));
+            EXPECT_EQ(requirement.slice.expert_ids.size(), 2u);
+            if (requirement.target_device.is_cpu())
+                root_cpu_participants.insert(requirement.overlay_participant_index);
+            else
+                EXPECT_EQ(requirement.target_device, root_device);
+        }
+        EXPECT_EQ(root_cpu_participants, (std::set<int>{0, 1}));
+        for (const auto &requirement : sibling_sources.requirements())
+        {
+            EXPECT_EQ(requirement.target_device, sibling_device);
+            EXPECT_EQ(requirement.overlay_domain, "gpu_main");
+            EXPECT_EQ(requirement.overlay_participant_world_rank, 0);
+            EXPECT_EQ(requirement.overlay_participant_index, 1);
+            EXPECT_EQ(requirement.slice.expert_ids, (std::vector<int>{2, 3}));
+        }
+    }
+}
+
+/** @test Distributed rank one retains its exact CPU source tuple and excludes rank zero. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, GraphScopeSelectsDistributedRankOneSources)
+{
+    const auto source = singleLayerCpuColdPlan(4);
+    const auto runtime = resolveMoEExpertOverlayRuntimePlan(source,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 1,
+            .validate_mvp_root_reachability = false,
+        });
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, 4);
+    const auto scope = MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), nullptr, 0);
+    EXPECT_TRUE(scope.contains("cpu_cold", DeviceId::cpu(), 1, 1));
+    EXPECT_FALSE(scope.contains("cpu_cold", DeviceId::cpu(), 0, 0));
+    const auto preparation = MoEExpertOverlayPreparationPlan::build(*runtime, *loader)
+        .filteredForGraphScope(*runtime, scope);
+    ASSERT_EQ(preparation.requests().size(), 6u);
+    for (const auto &request : preparation.requests())
+    {
+        EXPECT_TRUE(request.participant_world_rank_known);
+        EXPECT_EQ(request.participant_world_rank, 1);
+        EXPECT_EQ(request.participant_index, 1);
+        EXPECT_GE(request.expert_id, 2);
+        EXPECT_LT(request.expert_id, 4);
+    }
+    const auto sources = preparation.sourceWeightPlan(*loader, ModelContextId{931});
+    ASSERT_EQ(sources.size(), 3u);
+    for (const auto &requirement : sources.requirements())
+    {
+        EXPECT_EQ(requirement.target_device, DeviceId::cpu());
+        EXPECT_EQ(requirement.overlay_domain, "cpu_cold");
+        EXPECT_EQ(requirement.overlay_participant_world_rank, 1);
+        EXPECT_EQ(requirement.overlay_participant_index, 1);
+        EXPECT_EQ(requirement.slice.expert_ids, (std::vector<int>{2, 3}));
+    }
+}
+
+/** @test NodeTP dense coordinates cannot replace the original rank in sparse source weight requests. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, GraphScopeKeepsSparseOriginalRanksAcrossDenseSubset)
+{
+    /** @brief Metadata-only dense membership, with no live communicator or collective. */
+    struct StageTP final : IGlobalTPContext
+    {
+        std::vector<int> ranks{1, 3, 4};
+        int index = 1;
+        GlobalDeviceAddress address = GlobalDeviceAddress::cpu(9, "original-node");
+        int degree() const override { return static_cast<int>(ranks.size()); }
+        int myIndex() const override { return index; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::UPI; }
+        MPI_Comm communicator() const override { return MPI_COMM_NULL; }
+        int domainId() const override { return 2; }
+        const std::vector<int>& worldRanks() const override { return ranks; }
+        GlobalDeviceAddress localDevice() const override { return address; }
+        void barrier() const override {}
+        bool allreduce(TensorBase*) override { return false; }
+        bool broadcast(TensorBase*, int) override { return false; }
+        bool allgather(const TensorBase*, TensorBase*) override { return false; }
+        bool gatherVariableFloatRecordsToRoot(const float*, size_t, float*, size_t, size_t,
+            int, size_t&, const std::string&) override { return false; }
+        bool broadcastFloatElements(TensorBase*, size_t, int, const std::string&) override { return false; }
+        bool send(const TensorBase*, int) override { return false; }
+        bool recv(TensorBase*, int) override { return false; }
+    };
+    StageTP dense;
+    auto source = singleLayerCpuColdPlan(6);
+    source->domains.front().world_ranks = dense.ranks;
+    source->domains.front().owner_rank = dense.ranks.front();
+    source->domains.front().participants = {GlobalDeviceAddress::cpu(5, "original-node"),
+        dense.address, GlobalDeviceAddress::cpu(17, "original-node")};
+    const auto runtime = resolveMoEExpertOverlayRuntimePlan(source,
+        {.current_world_rank = 3, .validate_mvp_root_reachability = false});
+    const auto scope = MoEExpertOverlayGraphScope::resolveForTPParticipant(*runtime, DeviceId::cpu(), &dense, 1);
+    ASSERT_EQ(scope.participants().size(), 1u);
+    EXPECT_TRUE(scope.contains("cpu_cold", DeviceId::cpu(), 3, 1));
+    EXPECT_FALSE(scope.contains("cpu_cold", DeviceId::cpu(), 1, 1));
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, 6);
+    const auto preparation = MoEExpertOverlayPreparationPlan::build(*runtime, *loader)
+        .filteredForGraphScope(*runtime, scope);
+    const auto weights = preparation.sourceWeightPlan(*loader, ModelContextId{931});
+    ASSERT_EQ(weights.size(), 3u);
+    for (const auto& request : weights.requirements())
+    {
+        EXPECT_EQ(request.overlay_participant_world_rank, 3);
+        EXPECT_EQ(request.overlay_participant_index, 1);
+        EXPECT_EQ(request.slice.expert_ids, (std::vector<int>{2, 3}));
+    }
+
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &dense, 3), std::invalid_argument);
+    auto foreign = dense;
+    foreign.index = 0;
+    foreign.address = source->domains.front().participants.front();
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &foreign, 0), std::invalid_argument);
+    foreign = dense;
+    foreign.ranks = {4, 3, 1}; // Same local rank/index, but foreign ordered membership.
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &foreign, 1), std::invalid_argument);
+    foreign = dense;
+    foreign.address.numa_node = 17;
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &foreign, 1), std::invalid_argument);
+}
+
+/**
+ * @test Initial CPU packs retain one physical claim across aliases and graph reuse.
+ *
+ * Exercise real quantized and floating owning engines with one/two local CPU
+ * participants and reversed ownership order. Registry clearing retires only
+ * aliases; a retained graph consumer keeps its exact allocation lease alive.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     InitialCpuPhysicalClaimsFollowStorageAcrossAliasesAndFamilies)
+{
+    for (const bool floating : {false, true})
+    for (const int participants : {1, 2})
+    for (const bool reverse : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "floating=" << floating
+            << " participants=" << participants << " reverse=" << reverse);
+        auto loader = MockModelLoader::createMinimal();
+        if (floating)
+        {
+            loader->addFP32RandomTensor("blk.0.ffn_gate_exps.weight", {64, 32, 4}, -1.0f, 1.0f, 101);
+            loader->addFP32RandomTensor("blk.0.ffn_up_exps.weight", {64, 32, 4}, -1.0f, 1.0f, 102);
+            loader->addFP32RandomTensor("blk.0.ffn_down_exps.weight", {32, 64, 4}, -1.0f, 1.0f, 103);
+        }
+        else
+            addSingleLayerExpertParents(loader, 64, 32, 4);
+        auto plan = singleLayerCpuColdPlan(4);
+        plan->domains[0].scope = ExecutionDomainScope::RANK_LOCAL;
+        plan->domains[0].world_ranks.clear();
+        plan->domains[0].participants.resize(participants);
+        if (participants == 1)
+            plan->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::Replicated);
+        if (reverse)
+            std::reverse(plan->domains[0].participants.begin(), plan->domains[0].participants.end());
+        const auto runtime = resolveMoEExpertOverlayRuntimePlan(plan);
+        WeightManager manager(*loader);
+        const auto authority = admitRoutedFixture(manager,*loader,*runtime);
+        EXPECT_EQ(liveRoutedBytes(*authority), 0u);
+        ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime, DeviceId::cpu()));
+        const size_t live = liveRoutedBytes(*authority);
+        ASSERT_GT(live, 0u);
+        std::shared_ptr<ITensorGemm> consumer;
+        for (int participant = 0; participant < participants; ++participant)
+        {
+            const int expert = participant * (4 / participants);
+            auto exact = manager.expertGemmRegistry().getEngineLifetimeForParticipant(
+                "cpu_cold", DeviceId::cpu(), 0, participant, 0, expert, Role::GATE);
+            auto alias = manager.expertGemmRegistry().getEngineLifetimeForDomain(
+                "cpu_cold", DeviceId::cpu(), 0, expert, Role::GATE);
+            ASSERT_TRUE(exact);
+            ASSERT_EQ(exact.get(), alias.get());
+            EXPECT_FALSE(exact.owner_before(alias));
+            EXPECT_FALSE(alias.owner_before(exact));
+            consumer = std::move(exact);
+        }
+        // A second graph family reuses the certified canonical engines and
+        // cannot re-charge storage or choose another physical allocation.
+        manager.markMaterializationComplete();
+        manager.markDevicePreparationComplete();
+        manager.markGraphMaterializationComplete();
+        ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+            *runtime, DeviceId::cpu(), nullptr, nullptr,
+            PreparedWeightAdmission::ReuseCertifiedCompleteSet));
+        EXPECT_EQ(liveRoutedBytes(*authority), live);
+        manager.expertGemmRegistry().clear();manager.preparedWeightStore()->clear();manager.clearCache();
+        const auto retained = liveRoutedBytes(*authority);
+        EXPECT_GT(retained, 0u);
+        EXPECT_LT(retained, live);
+        consumer.reset();
+        EXPECT_EQ(liveRoutedBytes(*authority), 0u);
+    }
+}
+
+/** @test Missing admission and insufficient owner capacity never publish partial CPU engines. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     InitialCpuPhysicalClaimsRejectMissingAndInsufficientAdmission)
+{
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, 4);
+    const auto runtime = resolveMoEExpertOverlayRuntimePlan(singleLayerCpuColdPlan(4));
+    WeightManager missing(*loader);missing.setPreparedWeightStore(std::make_shared<PreparedWeightStore>(ModelContextId{606}));
+    EXPECT_THROW(missing.prepareMoEExpertOverlayWeights(*runtime, DeviceId::cpu()), std::logic_error);
+    EXPECT_EQ(missing.expertGemmRegistry().size(), 0u);
+    WeightManager insufficient(*loader);
+    const auto authority = admitRoutedFixture(insufficient,*loader,*runtime,ModelContextId{606},0,1);
+    EXPECT_THROW(insufficient.prepareMoEExpertOverlayWeights(*runtime, DeviceId::cpu()),std::logic_error);
+    EXPECT_EQ(insufficient.expertGemmRegistry().size(), 0u);
+    EXPECT_EQ(liveRoutedBytes(*authority), 0u);
+}
+
+/** @test A full durable owner can export and receive through separately admitted staging. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     FullPersistentBudgetExportsReceivesAndRetiresStagingWithoutRechargingWeights)
+{
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, 4);
+    const auto runtime = resolveMoEExpertOverlayRuntimePlan(singleLayerCpuColdPlan(4));
+    // Record exact physical storage from an actual native pack; this test's
+    // second authority admits precisely that recorded durable geometry.
+    size_t durable_bytes=0,startup_bytes=0,migration_bytes=0;
+    {
+        WeightManager probe(*loader);const auto admitted=admitRoutedFixture(probe,*loader,*runtime);
+        for(const auto& line:admitted->rankAttestation())if(line.owner==PhysicalMemoryOwner::WeightLoadStaging)startup_bytes=line.planned_new_bytes;
+        ASSERT_TRUE(probe.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu()));durable_bytes=liveRoutedBytes(*admitted);
+        const auto engine=probe.expertGemmRegistry().getEngineLifetimeForParticipant("cpu_cold",DeviceId::cpu(),0,0,0,0,Role::GATE);
+        ASSERT_TRUE(engine);const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
+        packed_weights_serialization::PackedWeightsTransferDescriptor description;
+        packed_weights_serialization::PackedWeightsConstSectionViews sections;
+        ASSERT_TRUE(packed_weights_serialization::describeTransfer(*packed,description,sections));
+        size_t backing=0,wire=sizeof(PackedWeightsHeader)+sizeof(PackedWeightsSectionTable);
+        const auto allocation=CPUWeightStoragePlacement::local();
+        for(const auto bytes:sections.sizes) {
+            backing+=allocation.requiredAllocationBytes<uint8_t>(bytes);wire+=bytes;
+        }
+        // The unchanged replay keeps three packed destinations plus two wire
+        // buffers alive simultaneously. Every extent comes from its actual
+        // producer descriptor and allocator rounding, never a reserve.
+        migration_bytes=3*backing+2*allocation.requiredAllocationBytes<uint8_t>(wire);
+    }
+    ASSERT_GT(durable_bytes,0u);ASSERT_GT(migration_bytes,0u);
+    const auto total=durable_bytes+startup_bytes+migration_bytes;
+    PhysicalMemoryPlanBuilder plan;const PhysicalMemoryResource host{0,DeviceId::cpu(),total,total};
+    plan.add(host,PhysicalMemoryOwner::RoutedExpertWeights,durable_bytes);
+    plan.add(host,PhysicalMemoryOwner::WeightLoadStaging,startup_bytes);
+    plan.add(host,PhysicalMemoryOwner::ExpertMigrationStaging,migration_bytes);
+    const auto authority=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+    WeightManager manager(*loader);manager.setPreparedWeightStore(std::make_shared<PreparedWeightStore>(ModelContextId{606}));
+    manager.installPhysicalMemoryAuthority(authority);
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime, DeviceId::cpu()));
+    ASSERT_EQ(liveRoutedBytes(*authority), durable_bytes);
+    auto engine = manager.expertGemmRegistry().getEngineLifetimeForParticipant(
+        "cpu_cold", DeviceId::cpu(), 0, 0, 0, 0, Role::GATE);
+    ASSERT_TRUE(engine);
+    const auto *source = engine->exportCPUNativeQuantisedPackedWeights();
+    ASSERT_NE(source, nullptr);
+    const auto staging = CPUWeightStoragePlacement::accounted(authority, DeviceId::cpu(),
+        PhysicalMemoryOwner::ExpertMigrationStaging, CPUWeightStoragePlacement::local());
+    auto live_staging = [&]()
+    {
+        for (const auto &line : authority->rankAttestation())
+            if (line.owner == PhysicalMemoryOwner::ExpertMigrationStaging)
+                return line.materialized_new_bytes;
+        return size_t{0};
+    };
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        EXPECT_EQ(live_staging(), 0u);
+        {
+            auto clone = engine->cloneWeightsTo(staging);
+            ASSERT_TRUE(clone);
+            ExpertTransferBuffer wire;
+            ASSERT_TRUE(packed_weights_serialization::serializeInto(*source, wire, staging));
+            auto received = packed_weights_serialization::deserialize(wire.data(), wire.size(), staging);
+            ASSERT_TRUE(received);
+            packed_weights_serialization::PackedWeightsTransferDescriptor descriptor;
+            packed_weights_serialization::PackedWeightsConstSectionViews sections;
+            ASSERT_TRUE(packed_weights_serialization::describeTransfer(*received, descriptor, sections));
+            auto direct = packed_weights_serialization::allocateTransferTarget(descriptor, staging);
+            for (size_t section = 0; section < sections.sizes.size(); ++section)
+                if (sections.sizes[section])
+                    std::memcpy(direct.data[section], sections.data[section], sections.sizes[section]);
+            ExpertTransferBuffer replayed;
+            ASSERT_TRUE(packed_weights_serialization::serializeInto(*direct.weights, replayed, staging));
+            ASSERT_EQ(wire.size(), replayed.size());
+            EXPECT_EQ(std::memcmp(wire.data(), replayed.data(), wire.size()), 0);
+            EXPECT_GT(live_staging(), 0u);
+            EXPECT_EQ(liveRoutedBytes(*authority), durable_bytes);
+        }
+        EXPECT_EQ(live_staging(), 0u);
+        EXPECT_EQ(liveRoutedBytes(*authority), durable_bytes);
+    }
+    manager.expertGemmRegistry().clear();manager.preparedWeightStore()->clear();manager.clearCache();
+    engine.reset();
+    EXPECT_EQ(liveRoutedBytes(*authority), 0u);
+}
+
+/** @test Standalone CPU MoE retains the frozen plan's additional-model owner. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     StandaloneCpuOwnerComesFromFrozenBindingsAndRejectsMissingOwner)
+{
+    const FrozenModelWeightSet frozen(InferenceStrategy{}, {}, PhysicalMemoryOwner::AdditionalModelWeights);
+    const auto bindings = makeModelWeightBindings(frozen, DeviceId::cpu());
+    EXPECT_EQ(bindings.physical_memory_owner, PhysicalMemoryOwner::AdditionalModelWeights);
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, 4);
+    const auto gate=loader->loadTensor("blk.0.ffn_gate_exps.weight"),up=loader->loadTensor("blk.0.ffn_up_exps.weight"),
+        down=loader->loadTensor("blk.0.ffn_down_exps.weight");
+    std::shared_ptr<PhysicalMemoryAuthority> authority;
+    {
+        PreparedWeightStore store;
+        MoEExpertComputeStage::Params params;params.device_id=DeviceId::cpu();params.num_experts=4;
+        params.expert_intermediate=32;params.d_model=64;params.layer_idx=0;
+        params.gate_exps=gate.get();params.up_exps=up.get();params.down_exps=down.get();
+        ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));params.prepared_store=&store;
+        const auto admission=admitCPUExpertStageForTest(params,bindings.physical_memory_owner);authority=store.physicalMemoryAuthority();
+        params.persistent_weight_owner=PhysicalMemoryOwner::Count;
+        EXPECT_THROW(MoEExpertComputeStage::prepareExpertGemmEngines(params),std::invalid_argument);
+        params.persistent_weight_owner=bindings.physical_memory_owner;
+        ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+        bool additional_live=false;
+        for(const auto& line:authority->rankAttestation()) {
+            if(line.owner==PhysicalMemoryOwner::PrimaryModelWeights) {
+                EXPECT_EQ(line.materialized_new_bytes,0u);EXPECT_EQ(line.committed_new_bytes,0u);
+            }
+            if(line.owner==PhysicalMemoryOwner::AdditionalModelWeights)additional_live=line.materialized_new_bytes>0;
+        }
+        EXPECT_TRUE(additional_live);
+    }
+    for(const auto& line:authority->rankAttestation())EXPECT_EQ(line.materialized_new_bytes,0u);
+
+}
+
+/** @test Final CPU weights retain their actual primary allocation across source and Store retirement. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     PrimaryCpuFinalWeightsRetainClaimsAcrossSourceAndStoreRetirement)
+{
+    for(const auto device:{DeviceId::cpu(),DeviceId{DeviceType::CPU,1}}) {
+        SCOPED_TRACE(device.toString());auto loader=MockModelLoader::createMinimal();
+        loader->addTensor("blk.0.attn_q.weight",createQ4_0WithData({32,64},777));
+        WeightPlan source_plan(InferenceStrategy{.model_id=ModelContextId{98604}});
+        WeightRequirement requirement;requirement.canonical_name="blk.0.attn_q.weight";
+        requirement.target_device=device;requirement.layer=0;requirement.role=inferWeightRole(requirement.canonical_name);
+        requirement.bypass_tensor_parallel=true;requirement.expected_prepared_kind=PreparedWeightKind::CpuPackedGemm;source_plan.add(requirement);
+        std::shared_ptr<PreparedWeightStore> retained_store;std::shared_ptr<PhysicalMemoryAuthority> authority;size_t packed_bytes=0;
+        const auto live=[&] {size_t bytes=0;for(const auto& line:authority->rankAttestation())bytes+=line.materialized_new_bytes;return bytes;};
+        {
+            WeightManager manager(*loader);admitCPUWeightPlansForTest(manager,*loader,{&source_plan});authority=manager.physicalMemoryAuthority();
+            const auto frozen=manager.materialize(source_plan);ASSERT_EQ(frozen.bindings().size(),1u);
+            const auto& source=frozen.bindings().front();ASSERT_TRUE(source.prepared);ASSERT_TRUE(source.native_source);
+            EXPECT_EQ(source.tensor->raw_data(),nullptr);EXPECT_FALSE(source.projection_source_owner);
+            ASSERT_TRUE(manager.prepareWeightsForDevice(frozen,device,true));
+            auto engine=manager.preparedWeightStore()->gemmKernelLifetime(*source.prepared);ASSERT_TRUE(engine);
+            packed_bytes=live();ASSERT_GT(packed_bytes,0u);retained_store=manager.preparedWeightStore();
+            loader->loadTensor("blk.0.attn_q.weight")->release_host_weight_data();
+            for(int replay=0;replay<3;++replay) {
+                const auto repeated=manager.materialize(source_plan);EXPECT_EQ(repeated.bindings().front().tensor,source.tensor);
+                EXPECT_EQ(manager.preparedWeightStore()->gemmKernelLifetime(*source.prepared),engine);
+                ASSERT_TRUE(manager.prepareWeightsForDevice(repeated,device,true));EXPECT_EQ(live(),packed_bytes);
+            }
+        }
+        EXPECT_EQ(live(),packed_bytes);retained_store.reset();EXPECT_EQ(live(),0u);
+    }
+
+}
+
+/** @test Source population rejects unadmitted physical bytes before source retirement. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     PrimaryCpuFinalWeightsRejectMissingAndInsufficientAdmission)
+{
+    for(const bool admitted:{false,true}) {
+        auto loader=MockModelLoader::createMinimal();loader->addTensor("blk.0.attn_q.weight",createQ4_0WithData({32,64},777));
+        WeightPlan source_plan(InferenceStrategy{.model_id=ModelContextId{98605}});
+        WeightRequirement request;request.canonical_name="blk.0.attn_q.weight";request.target_device=DeviceId::cpu();request.layer=0;
+        request.role=inferWeightRole(request.canonical_name);request.bypass_tensor_parallel=true;
+        request.expected_prepared_kind=PreparedWeightKind::CpuPackedGemm;source_plan.add(request);
+        WeightManager manager(*loader);manager.setPreparedWeightStore(std::make_shared<PreparedWeightStore>(source_plan.strategy().model_id));
+        std::shared_ptr<PhysicalMemoryAuthority> authority;
+        if(admitted) {
+            PhysicalMemoryPlanBuilder budget;budget.add({0,DeviceId::cpu(),1,1},PhysicalMemoryOwner::PrimaryModelWeights,1);
+            authority=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(budget.build()),0);
+            manager.installPhysicalMemoryAuthority(authority);
+        }
+        const auto original=loader->loadTensor("blk.0.attn_q.weight");ASSERT_TRUE(original);ASSERT_NE(original->raw_data(),nullptr);
+        EXPECT_THROW(manager.materialize(source_plan),std::logic_error);EXPECT_FALSE(original->is_raw_data_released());
+        EXPECT_EQ(manager.expertGemmRegistry().size(),0u);
+        if(authority)for(const auto& line:authority->rankAttestation())EXPECT_EQ(line.materialized_new_bytes,0u);
+    }
+
 }
 
 } // namespace llaminar2::test

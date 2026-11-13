@@ -7,10 +7,18 @@
  * event. Ordinary and speculative algorithms share that lifecycle but have
  * different state-commit and depth semantics. Keeping validation here makes
  * those differences explicit and testable without loading a backend or model.
+ * Measured terminal publication authenticates the same typed confirmation and
+ * independent trial/reference ownership used before each device observation.
  */
 #pragma once
 
 #include "kernels/common/SamplingMath.h"
+#include "kernels/common/SparseQueryExecutionProgram.h"
+#include "kernels/qwen4exp/QwenSparseAttention.h"
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 #include "execution/mtp/GenerationRequestSeeds.h"
 #include "utils/Sampler.h"
 #include <algorithm>
@@ -20,6 +28,81 @@
 
 namespace llaminar2
 {
+/**
+ * @brief Completed target-cache counts issued at a successful admission boundary.
+ *
+ * Counts include restored history and newly completed prefill. They are immutable
+ * request metadata, never a shadow of the resident controller's live counters.
+ */
+class DeviceGenerationInitialTargetCounts
+{
+public:
+    /** @brief Own exact completed target counts, one per independent request. */
+    explicit DeviceGenerationInitialTargetCounts(std::vector<int> counts)
+        : counts_(std::move(counts)) {}
+    /** @return Immutable completed-token counts in controller request order. */
+    [[nodiscard]] std::span<const int> values() const noexcept { return counts_; }
+    /** @return Exact admission identity, including every request's origin. */
+    bool operator==(const DeviceGenerationInitialTargetCounts &) const = default;
+private:
+    std::vector<int> counts_;
+};
+
+/**
+ * @brief Resolve one checked conservative visibility envelope from existing policy.
+ * @param counts Immutable initial counts; absence cannot prove omission.
+ * @param requests Existing controller request count.
+ * @param budget Existing response budget, never independently recomputed.
+ * @param policy Existing admitted algorithm and maximum executed depth.
+ * @return Maximum visible-token count, or nullopt for absent/invalid metadata.
+ */
+[[nodiscard]] inline std::optional<int> deviceGenerationMaximumVisibleTokens(
+    const std::optional<DeviceGenerationInitialTargetCounts> &counts,
+    int requests, int budget, const sampling_math::DeviceGenerationPolicy &policy) noexcept
+{
+    if (!counts || requests <= 0 || !policy.valid() || budget < 0 ||
+        counts->values().size() != static_cast<std::size_t>(requests))
+        return std::nullopt;
+    const int64_t extra = policy.isForwardOnly() ? 1 :
+        policy.isOrdinary() ? static_cast<int64_t>(budget) :
+        static_cast<int64_t>(budget) + policy.maximum_depth + 1;
+    int64_t maximum = 0;
+    for (const int initial : counts->values())
+    {
+        if (initial < 0 || static_cast<int64_t>(initial) + extra > std::numeric_limits<int>::max())
+            return std::nullopt;
+        maximum = std::max(maximum, static_cast<int64_t>(initial) + extra);
+    }
+    return static_cast<int>(maximum);
+}
+
+/** @brief Exact depth interval executed by one admitted speculative parent. */
+struct DeviceGenerationSpeculativeDepthRange
+{
+    int minimum = 0; ///< First executable branch depth.
+    int maximum = 0; ///< Last executable branch depth, equal to minimum for a pinned policy.
+    bool operator==(const DeviceGenerationSpeculativeDepthRange &) const = default;
+};
+
+/**
+ * @brief Project immutable policy into its exact retained speculative branch interval.
+ * @param policy Existing complete device-generation policy, never live selector state.
+ * @return Dynamic min/max or the Fixed/Observe initial-depth singleton; nullopt
+ * for invalid, ordinary or sampler-free policies.
+ *
+ * Fixed and Observe execute their pinned initial width even when Observe owns
+ * wider observation bounds. Initial family binding and continued-response
+ * authentication use the same projection, without changing policy or recapture.
+ */
+[[nodiscard]] inline std::optional<DeviceGenerationSpeculativeDepthRange>
+deviceGenerationSpeculativeDepthRange(const sampling_math::DeviceGenerationPolicy &policy) noexcept
+{
+    if (!policy.valid() || policy.isOrdinary() || policy.isForwardOnly()) return std::nullopt;
+    return policy.mode == sampling_math::DeviceGenerationPolicyMode::Dynamic ?
+        DeviceGenerationSpeculativeDepthRange{policy.minimum_depth, policy.maximum_depth} :
+        DeviceGenerationSpeculativeDepthRange{policy.initial_depth, policy.initial_depth};
+}
+
 /**
  * @brief Complete immutable policy installed at one GPU request admission.
  *
@@ -47,10 +130,18 @@ struct DeviceGenerationAdmissionRequest
      */
     std::optional<SamplingParams> ordinary_sampling;
 
+    /** Completed prefill/terminal provenance; missing metadata retains ranking. */
+    std::optional<DeviceGenerationInitialTargetCounts> initial_target_counts;
+
+    /** @return Complete immutable request admission; no device-owned mutable values occur here. */
+    bool operator==(const DeviceGenerationAdmissionRequest &) const = default;
+
     /** @return Whether every immutable admission field is implemented and valid. */
     [[nodiscard]] bool valid() const noexcept
     {
         return request_count > 0 &&
+            (!initial_target_counts || deviceGenerationMaximumVisibleTokens(
+                initial_target_counts, request_count, max_new_tokens, depth_policy).has_value()) &&
             (kind == sampling_math::DeviceGenerationAdmissionKind::NewRequest ||
              (kind == sampling_math::DeviceGenerationAdmissionKind::ContinueResponse &&
               !depth_policy.isForwardOnly())) &&
@@ -70,6 +161,31 @@ struct DeviceGenerationAdmissionRequest
             depth_policy, max_new_tokens, initial_leading_row_disposition);
     }
 };
+
+/**
+ * @brief Select a retained query program from one complete immutable admission.
+ * @param admission Existing budget/depth/leading-row policy and optional prefix proof.
+ * @return RankingPossible when proof is absent, otherwise the certified program.
+ * @throws std::invalid_argument For invalid admission, including malformed supplied counts.
+ *
+ * Speculative publication clipping does not clip physical verifier evaluation.
+ * Its envelope therefore includes maximum_depth+1 beyond the response budget.
+ * An explicitly proven ForwardOnly transaction uses its one-row P+1 envelope.
+ */
+[[nodiscard]] inline SparseQueryExecutionProgram resolveSparseQueryExecutionProgram(
+    const DeviceGenerationAdmissionRequest &admission)
+{
+    if (!admission.valid())
+        throw std::invalid_argument("Invalid generation admission for sparse-query program");
+    if (!admission.initial_target_counts)
+        return SparseQueryExecutionProgram::RankingPossible;
+    const int maximum = *deviceGenerationMaximumVisibleTokens(
+        admission.initial_target_counts, admission.request_count,
+        admission.max_new_tokens, admission.depth_policy);
+    return maximum <= qwen4exp::QwenSparseFirstRankingLogicalRow
+        ? SparseQueryExecutionProgram::ProvenNoRanking
+        : SparseQueryExecutionProgram::RankingPossible;
+}
 
 /** @brief First terminal invariant that failed; never a recoverable replay choice. */
 enum class DeviceGenerationTerminalError
@@ -129,6 +245,37 @@ enum class DeviceGenerationTerminalError
     const auto &policy = admission.depth_policy;
     if (!device_generation_policy_matches(row.data(), policy))
         return Error::ChangedPolicy;
+
+    // State survives ContinueResponse; reporting counters deliberately do not.
+    // Validate each event independently, never sum keeps/returns against probes
+    // from this response: its probe may have begun in a previous response.
+    for (int i = kDeviceGenerationControlDepthUtilityPhase; i <= kDeviceGenerationControlDepthUtilityReturns; ++i)
+        if (row[i] < 0) return Error::InvalidDepthStatistics;
+    for (int i = kDeviceGenerationControlDepthUtilityProbes; i <= kDeviceGenerationControlDepthUtilityReturns; ++i)
+        if (row[i] > transactions) return Error::InvalidDepthStatistics;
+    const bool utility_active = policy.mode == DeviceGenerationPolicyMode::Dynamic &&
+        resolveMTPDepthCostProfile(policy.learned).active();
+    if (!utility_active)
+    {
+        // Ordinary/ForwardOnly/Fixed/Observe and unmeasured domains own no
+        // reversible-probe state. None may expose a stale or fabricated event.
+        for (int i = kDeviceGenerationControlDepthUtilityPhase; i <= kDeviceGenerationControlDepthUtilityReturns; ++i)
+            if (row[i] != 0) return Error::InvalidDepthStatistics;
+    }
+    else
+    {
+        const int runs = row[kDeviceGenerationControlDepthWindowVerifierRuns];
+        const int depth = row[kDeviceGenerationControlCurrentDraftDepth];
+        // One shared authority validates both confirmation words and the
+        // independent trial/Y bank; a deferred target may differ from current.
+        if (!valid_device_generation_measured_confirmation(row.data(),depth,
+                policy.minimum_depth,policy.maximum_depth,
+                policy.promote_consecutive_windows,policy.minimum_samples) ||
+            (row[kDeviceGenerationControlDepthUtilityPhase] ==
+                static_cast<int>(MTPReversibleProposalPhase::ProbePending) &&
+                runs >= policy.minimum_samples))
+            return Error::InvalidDepthStatistics;
+    }
 
     const int learned_matches = row[kDeviceGenerationControlLearnedDepthMatchedWindows];
     if (learned_matches < 0 ||

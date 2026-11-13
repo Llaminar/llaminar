@@ -2,6 +2,9 @@
  * @file BF16Tensor.cpp
  * @brief BF16 tensor implementation (Brain Float 16)
  * @author David Sanftenberg
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 #include "TensorClasses.h"
@@ -68,11 +71,13 @@ namespace llaminar2
 
     BF16Tensor::BF16Tensor(
         const std::vector<size_t> &shape,
-        AlignedVector<uint16_t> bf16_data)
-        : shape_(shape), device_(DeviceId::cpu()), is_view_(false),
+        AlignedVector<uint16_t> bf16_data, DeviceId device)
+        : shape_(shape), device_(device), is_view_(false),
           host_bf16_data_(std::move(bf16_data)), parent_data_ptr_(nullptr),
           view_offset_(0), parent_(nullptr), device_data_(nullptr)
     {
+        if (!device.is_valid() || !device.is_cpu())
+            throw std::invalid_argument("BF16Tensor owned CPU storage requires an exact CPU home device");
         if (shape.empty())
             throw std::invalid_argument("BF16Tensor: shape cannot be empty");
 
@@ -107,6 +112,9 @@ namespace llaminar2
 
     const float *BF16Tensor::data() const
     {
+        // A separately materialized FP32 cache remains owned; raw retirement
+        // forbids refreshing it through a retired parent vector.
+        if (is_raw_data_released()) return dequant_cache_.empty() ? nullptr : dequant_cache_.data();
         assertValid("BF16Tensor::data");
 
         // Lazy dequantization to FP32 cache
@@ -132,6 +140,7 @@ namespace llaminar2
 
     float *BF16Tensor::mutable_data()
     {
+        if (is_raw_data_released()) return nullptr;
         assertValid("BF16Tensor::mutable_data");
         throw std::runtime_error("BF16Tensor::mutable_data: BF16 tensors are immutable (use from_fp32 to update)");
     }
@@ -142,6 +151,7 @@ namespace llaminar2
 
     void *BF16Tensor::raw_host_data_ptr()
     {
+        if (is_raw_data_released()) return nullptr;
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;
@@ -151,6 +161,7 @@ namespace llaminar2
 
     const void *BF16Tensor::raw_host_data_ptr() const
     {
+        if (is_raw_data_released()) return nullptr;
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;

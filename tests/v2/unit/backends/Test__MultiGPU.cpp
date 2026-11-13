@@ -12,6 +12,7 @@
  * @author David Sanftenberg
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "backends/ComputeBackend.h"
 #include "backends/BackendManager.h"
@@ -769,6 +770,8 @@ TEST_F(Test__MultiGPU_HeterogeneousBackends, BackendSpecificDeviceIDs)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -9,13 +9,19 @@
  */
 #include "PipelineTransferMemory.h"
 #include "transfer/CapturedTransferChannel.h"
+#include "transfer/PipelineActivationFanoutProtocol.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 
 namespace llaminar2
 {
-PipelineTransferMemory PipelineTransferMemory::forRows(std::size_t width,
+std::size_t PipelineTransferMemory::fanoutDeviceBytes() noexcept
+{ return sizeof(PipelineActivationFanoutDeviceState); }
+std::size_t PipelineTransferMemory::fanoutHostBytes()
+{ return TransferEngine::mappedHostRegionAllocationBytes(sizeof(PipelineActivationFanoutOperand)); }
+
+PipelineTransferMemory PipelineTransferMemory::nativeForRows(std::size_t width,
     std::size_t prefill_rows, std::size_t verifier_rows)
 {
     if (!width || !prefill_rows || !verifier_rows)
@@ -25,13 +31,22 @@ PipelineTransferMemory PipelineTransferMemory::forRows(std::size_t width,
             throw std::overflow_error("Pipeline transfer capacity overflow");
         return left * right;
     };
-    const auto add = [](size_t left, size_t right) {
-        if (left > std::numeric_limits<size_t>::max() - right)
+    const auto activation_bytes = multiply(multiply(width, std::max(prefill_rows, verifier_rows)), sizeof(float));
+    const auto metadata_bytes = multiply(verifier_rows, sizeof(int32_t));
+    return {activation_bytes, metadata_bytes, 0, 0};
+}
+
+PipelineTransferMemory PipelineTransferMemory::forRows(std::size_t width,
+    std::size_t prefill_rows, std::size_t verifier_rows)
+{
+    const auto native = nativeForRows(width, prefill_rows, verifier_rows);
+    const auto activation_bytes = native.activation_capacity_bytes;
+    const auto metadata_bytes = native.metadata_capacity_bytes;
+    const auto add = [](std::size_t left, std::size_t right) {
+        if (left > std::numeric_limits<std::size_t>::max() - right)
             throw std::overflow_error("Pipeline transfer allocation sum overflow");
         return left + right;
     };
-    const auto activation_bytes = multiply(multiply(width, std::max(prefill_rows, verifier_rows)), sizeof(float));
-    const auto metadata_bytes = multiply(verifier_rows, sizeof(int32_t));
     const auto activation = CapturedTransferChannel::memoryFor(activation_bytes);
     const auto metadata = CapturedTransferChannel::memoryFor(metadata_bytes);
     return {activation_bytes, metadata_bytes,

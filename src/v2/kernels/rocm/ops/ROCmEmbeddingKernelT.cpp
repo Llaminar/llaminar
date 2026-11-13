@@ -109,42 +109,19 @@ namespace llaminar2
 
     void ROCmEmbeddingKernelT::bindGPUStream(ExplicitGPUStream stream)
     {
-        gpu_stream_ = stream.get();
-
-        int current_device = -1;
-        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
-        {
-            std::lock_guard<std::mutex> lock(stream_mutex_);
-            stream_by_device_[current_device] = stream.get();
-        }
+        binding_.bindStream(stream.get(), [](void *native, int *ordinal) {
+            return hipStreamGetDevice(static_cast<hipStream_t>(native), ordinal);
+        });
     }
 
     void ROCmEmbeddingKernelT::clearGPUStreamBinding()
     {
-        gpu_stream_ = nullptr;
-
-        int current_device = -1;
-        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
-        {
-            std::lock_guard<std::mutex> lock(stream_mutex_);
-            stream_by_device_.erase(current_device);
-        }
+        binding_.clearStream();
     }
 
     void *ROCmEmbeddingKernelT::getStream() const
     {
-        int current_device = -1;
-        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
-        {
-            std::lock_guard<std::mutex> lock(stream_mutex_);
-            auto it = stream_by_device_.find(current_device);
-            if (it != stream_by_device_.end())
-            {
-                return it->second;
-            }
-        }
-
-        return requireExplicitGPUStreamBinding(gpu_stream_, "ROCmEmbeddingKernelT");
+        return binding_.stream();
     }
 
     void ROCmEmbeddingKernelT::setDynamicTokenIds(const int *token_ids, int num_tokens)
@@ -182,7 +159,7 @@ namespace llaminar2
 
         std::memcpy(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int));
 
-        int dev = (device_idx_ >= 0) ? device_idx_ : 0;
+        const int dev = binding_.ordinal();
         hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
@@ -190,19 +167,7 @@ namespace llaminar2
             return;
         }
 
-        DeviceWorkspaceManager *workspace = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(workspace_mutex_);
-            auto it = workspace_by_device_.find(dev);
-            if (it != workspace_by_device_.end())
-            {
-                workspace = it->second;
-            }
-            else
-            {
-                workspace = workspace_;
-            }
-        }
+        DeviceWorkspaceManager *workspace = binding_.workspace();
 
         if (!workspace || !workspace->isAllocated())
         {
@@ -252,10 +217,6 @@ namespace llaminar2
         device_token_ids_ = nullptr;
         device_token_count_ = 0;
         preload_stream_ = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(stream_mutex_);
-            stream_by_device_.clear();
-        }
         // h_token_ids_ buffer is preserved — it's reusable for the next session
     }
 
@@ -400,7 +361,7 @@ namespace llaminar2
         int device_idx)
     {
         (void)mpi_ctx;
-        int dev = (device_idx >= 0) ? device_idx : device_idx_;
+        const int dev = binding_.resolveOrdinal(device_idx);
 
         hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
@@ -440,7 +401,7 @@ namespace llaminar2
         int device_idx)
     {
         (void)mpi_ctx;
-        int dev = (device_idx >= 0) ? device_idx : device_idx_;
+        const int dev = binding_.resolveOrdinal(device_idx);
 
         hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
@@ -469,7 +430,7 @@ namespace llaminar2
         int device_idx)
     {
         (void)mpi_ctx;
-        int dev = (device_idx >= 0) ? device_idx : device_idx_;
+        const int dev = binding_.resolveOrdinal(device_idx);
 
         hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
@@ -498,7 +459,7 @@ namespace llaminar2
         int device_idx)
     {
         (void)mpi_ctx;
-        int dev = (device_idx >= 0) ? device_idx : device_idx_;
+        const int dev = binding_.resolveOrdinal(device_idx);
 
         hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
@@ -532,6 +493,7 @@ namespace llaminar2
         const IMPIContext *mpi_ctx,
         int device_idx)
     {
+        const int dev = binding_.resolveOrdinal(device_idx);
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::EMBEDDING_LOOKUP, static_cast<hipStream_t>(getStream()));
         (void)mpi_ctx;
 
@@ -564,7 +526,6 @@ namespace llaminar2
         }
 
         // Set target ROCm device
-        int dev = (device_idx >= 0) ? device_idx : device_idx_;
         hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
@@ -578,19 +539,7 @@ namespace llaminar2
             return false;
         }
 
-        DeviceWorkspaceManager *workspace = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(workspace_mutex_);
-            auto it = workspace_by_device_.find(dev);
-            if (it != workspace_by_device_.end())
-            {
-                workspace = it->second;
-            }
-            else
-            {
-                workspace = workspace_;
-            }
-        }
+        DeviceWorkspaceManager *workspace = binding_.workspace();
 
         // =====================================================================
         // Step 1: Get token_ids buffer from workspace and copy data
@@ -643,7 +592,7 @@ namespace llaminar2
         // after clear_cache(). The kernel is cached in KernelFactory and
         // dynamic_params_active_ persists across graph rebuilds.
         // Also verify stream match: setDynamicTokenIds() may have run on a
-        // different stream than the current gpu_stream_ if the graph capture
+        // different stream than the current explicit binding if the graph capture
         // controller reassigned stage streams after updateDynamicParams().
         const bool token_ids_preloaded =
             dynamic_params_active_ &&
@@ -857,62 +806,18 @@ namespace llaminar2
 
     void ROCmEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        if (!workspace)
-        {
-            std::lock_guard<std::mutex> lock(workspace_mutex_);
-            workspace_ = nullptr;
-            workspace_by_device_.clear();
-            return;
-        }
-
-        int dev_key = device_idx_;
-        const DeviceId ws_device = workspace->device();
-        dev_key = ws_device.toKernelDeviceIndex();
-
-        {
-            std::lock_guard<std::mutex> lock(workspace_mutex_);
-            workspace_ = workspace;
-            workspace_by_device_[dev_key] = workspace;
-        }
+        binding_.bindWorkspace(workspace, workspace ? workspace->device() : DeviceId::invalid());
     }
 
     bool ROCmEmbeddingKernelT::hasWorkspace() const
     {
-        int current_device = -1;
-        DeviceWorkspaceManager *workspace = nullptr;
-
-        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
-        {
-            std::lock_guard<std::mutex> lock(workspace_mutex_);
-            auto it = workspace_by_device_.find(current_device);
-            if (it != workspace_by_device_.end())
-            {
-                workspace = it->second;
-            }
-        }
-
-        if (!workspace)
-        {
-            workspace = workspace_;
-        }
-
-        return workspace != nullptr && workspace->isAllocated();
+        const auto *workspace = binding_.workspace();
+        return workspace && workspace->isAllocated();
     }
 
     DeviceWorkspaceManager *ROCmEmbeddingKernelT::getWorkspace() const
     {
-        int current_device = -1;
-        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
-        {
-            std::lock_guard<std::mutex> lock(workspace_mutex_);
-            auto it = workspace_by_device_.find(current_device);
-            if (it != workspace_by_device_.end())
-            {
-                return it->second;
-            }
-        }
-
-        return workspace_;
+        return binding_.workspace();
     }
 
 } // namespace llaminar2

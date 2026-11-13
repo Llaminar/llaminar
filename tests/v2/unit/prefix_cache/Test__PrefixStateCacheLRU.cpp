@@ -736,6 +736,8 @@ TEST(Test__PrefixStateCacheLRU, SparseCheckpointSurvivesHistoryRewriteAndColdPro
             layout.total_layers = 2;
             layout.includes_hybrid_state = true;
             layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = 256u;
+            layout.hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+            layout.hybrid_host_state_capacity_bytes = layout.hybrid_host_state_bytes;
             layout.includes_mtp_state = mtp;
             layout.mtp_kv_bytes = mtp ? 8u : 0u;
             layout.includes_terminal_hidden = layout.includes_terminal_logits = true;
@@ -1379,6 +1381,13 @@ TEST(Test__PrefixStateCacheLRU, SelectedRestoreOwnsOnlyCoordinatedReadSet)
                         layout.total_layers = layout.fa_layers + layout.gdn_layers;
                         layout.includes_hybrid_state = organization != 0;
                         layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = organization != 0 ? 32u : 0u;
+                        layout.hybrid_host_encoding = organization != 0
+                            ? HybridPrefixHostEncoding::CPUFixedEpochPackedV2 : HybridPrefixHostEncoding::None;
+                        layout.hybrid_host_state_capacity_bytes = layout.hybrid_host_state_bytes;
+                        ASSERT_EQ(layout.hybrid_host_encoding == HybridPrefixHostEncoding::CPUFixedEpochPackedV2,
+                                  layout.gdn_layers > 0);
+                        ASSERT_EQ(layout.hybrid_host_state_capacity_bytes > 0, layout.gdn_layers > 0);
+                        ASSERT_TRUE(layout.compatiblePayloadShape(layout));
                         layout.includes_mtp_state = mtp;
                         layout.mtp_kv_bytes = mtp ? 16u : 0u;
                         layout.includes_terminal_hidden = layout.includes_terminal_logits = true;
@@ -1502,6 +1511,8 @@ TEST(Test__PrefixStateCacheLRU, SelectedRestoreBoundsActualRowsAndEndpointByTier
         layout.gdn_layers = 1;
         layout.total_layers = 2;
         layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = 32;
+        layout.hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+        layout.hybrid_host_state_capacity_bytes = layout.hybrid_host_state_bytes;
         const size_t capacity = layout.totalBytes() + layout.faKVBytes();
         auto ram = RamPrefixStorageBackend::create(DeviceId::cpu(), capacity, prefixAuthority(capacity));
         auto disk = makeDiskBackend(directory, layout.totalBytes() * 4u);

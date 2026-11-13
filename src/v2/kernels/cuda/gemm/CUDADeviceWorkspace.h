@@ -24,7 +24,7 @@ extern "C"
     // Opaque handles — .cu files define the concrete structs.
     // =====================================================================
 
-    /** Per-device GEMV workspace (KPAR partials, SM count cache). */
+    /** Per-device GEMV workspace; physical facts belong to CUDAHardwareMetadata. */
     typedef struct CUDAGemvContext_ CUDAGemvContext;
 
     /** Per-weight row-major transpose (ROWPAR acceleration). */
@@ -68,7 +68,7 @@ extern "C"
         int cuda_device_id,
         void *stream);
     void cudaRowMajorWeights_destroy(CUDARowMajorWeights *rm);
-    bool cudaNativeVNNIGemvTuned_policyRequiresRowMajor(
+    bool cudaNativeQuantisedGemvTuned_policyRequiresRowMajor(
         uint8_t codebook_id,
         int N,
         int K);
@@ -82,7 +82,7 @@ extern "C"
         CUDAPrefillContext *ctx,
         float *canonical_kpart_partials,
         size_t canonical_kpart_partials_bytes);
-    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+    bool cudaNativeQuantisedPrefill_getWorkspacePlan(
         uint8_t codebook_id,
         int M,
         int N,
@@ -98,7 +98,7 @@ extern "C"
      * CPU-tier representation normalization. It controls only the serial-M1
      * arithmetic tree and therefore belongs in workspace identity.
      */
-    bool cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
+    bool cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
         uint8_t codebook_id,
         uint8_t arithmetic_policy_codebook_id,
         int M,
@@ -122,7 +122,7 @@ extern "C"
      * allocates no device memory, and leaves 128-row arena padding to the owning
      * workspace planner.
      *
-     * @param codebook_id Canonical NativeVNNI codebook identifier.
+     * @param codebook_id Canonical NativeQuantised codebook identifier.
      * @param max_M Inclusive maximum row count represented by the graph family.
      * @param N Projection output width.
      * @param K Projection reduction width; must be divisible by 32.
@@ -136,7 +136,7 @@ extern "C"
      *         geometry, unsupported codebook, malformed overlay, or unavailable
      *         canonical schedule.
      */
-    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+    bool cudaNativeQuantisedPrefill_getWorkspaceEnvelope(
         uint8_t codebook_id,
         int max_M,
         int N,
@@ -147,7 +147,7 @@ extern "C"
         int *planned_rows);
 
     /** @brief Compute a graph-family envelope for an explicit source policy. */
-    bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+    bool cudaNativeQuantisedPrefill_getWorkspaceEnvelopeWithPolicy(
         uint8_t codebook_id,
         uint8_t arithmetic_policy_codebook_id,
         int max_M,

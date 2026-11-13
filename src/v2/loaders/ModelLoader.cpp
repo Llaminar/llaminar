@@ -9,12 +9,19 @@
  * and admitted MPI sample reception; adding a format must not create a second
  * name/size catalog in the distributed planner. Native owned/borrowed payload
  * factories preserve bytes rather than dequantizing them for transport.
+ * Original expert projections compact exact K blocks/N rows in the same final
+ * storage owner; they neither reinterpret a full-parent stride nor requantize.
  */
 
+#include "memory/CPUStorageRoot.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
+#include "../utils/PerfStatsCollector.h"
 #include "../utils/OpenMPUtils.h"
 #include "ModelLoader.h"
+#include "WeightIdentity.h"
+#include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
 #include "../utils/MPIContext.h"
@@ -23,6 +30,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 
 namespace llaminar2
 {
@@ -140,6 +148,83 @@ namespace llaminar2
     // =============================================================================
     // GGUF VALUE ACCESSORS
     // =============================================================================
+
+    namespace
+    {
+        /**
+         * @brief Decode fixed-width integers without float conversion or unaligned loads.
+         * @tparam Destination Exact signed or unsigned 64-bit result type.
+         * @tparam Source On-disk integer element type.
+         * @param value Retained metadata payload.
+         * @param count Number of expected elements.
+         * @return Losslessly widened elements.
+         * @throws std::invalid_argument If payload size or integer range is invalid.
+         */
+        template <typename Destination, typename Source>
+        std::vector<Destination> decodeMetadataIntegers(const GGUFValue &value, uint64_t count)
+        {
+            if (count > std::numeric_limits<size_t>::max() / sizeof(Source) ||
+                value.data.size() != static_cast<size_t>(count) * sizeof(Source))
+                throw std::invalid_argument("GGUF integer metadata payload length mismatch");
+            std::vector<Destination> result;
+            result.reserve(static_cast<size_t>(count));
+            for (size_t i = 0; i < static_cast<size_t>(count); ++i)
+            {
+                Source source;
+                std::memcpy(&source, value.data.data() + i * sizeof(Source), sizeof(Source));
+                if constexpr (std::is_signed_v<Source> && !std::is_signed_v<Destination>)
+                {
+                    if (source < 0)
+                        throw std::invalid_argument("Negative GGUF integer cannot become uint64");
+                }
+                if constexpr (!std::is_signed_v<Source> && std::is_signed_v<Destination>)
+                {
+                    if (static_cast<uint64_t>(source) > static_cast<uint64_t>(INT64_MAX))
+                        throw std::invalid_argument("GGUF unsigned integer exceeds int64 range");
+                }
+                result.push_back(static_cast<Destination>(source));
+            }
+            return result;
+        }
+
+        /** @brief Dispatch only true GGUF integer subtypes to the exact decoder. */
+        template <typename Destination>
+        std::vector<Destination> metadataIntegers(
+            const GGUFValue &value, GGUFValueType element_type, uint64_t count)
+        {
+            switch (element_type)
+            {
+            case GGUFValueType::UINT8: return decodeMetadataIntegers<Destination, uint8_t>(value, count);
+            case GGUFValueType::INT8: return decodeMetadataIntegers<Destination, int8_t>(value, count);
+            case GGUFValueType::UINT16: return decodeMetadataIntegers<Destination, uint16_t>(value, count);
+            case GGUFValueType::INT16: return decodeMetadataIntegers<Destination, int16_t>(value, count);
+            case GGUFValueType::UINT32: return decodeMetadataIntegers<Destination, uint32_t>(value, count);
+            case GGUFValueType::INT32: return decodeMetadataIntegers<Destination, int32_t>(value, count);
+            case GGUFValueType::UINT64: return decodeMetadataIntegers<Destination, uint64_t>(value, count);
+            case GGUFValueType::INT64: return decodeMetadataIntegers<Destination, int64_t>(value, count);
+            default: throw std::invalid_argument("GGUF metadata requires an integer subtype");
+            }
+        }
+    }
+
+    uint64_t GGUFValue::asUInt64Checked() const
+    {
+        return metadataIntegers<uint64_t>(*this, type, 1).front();
+    }
+
+    std::vector<uint64_t> GGUFValue::asUInt64Array() const
+    {
+        if (type != GGUFValueType::ARRAY || !array_element_type)
+            throw std::invalid_argument("GGUF integer array requires its retained element subtype");
+        return metadataIntegers<uint64_t>(*this, *array_element_type, array_length);
+    }
+
+    std::vector<int64_t> GGUFValue::asInt64Array() const
+    {
+        if (type != GGUFValueType::ARRAY || !array_element_type)
+            throw std::invalid_argument("GGUF integer array requires its retained element subtype");
+        return metadataIntegers<int64_t>(*this, *array_element_type, array_length);
+    }
 
     uint32_t GGUFValue::asUInt32() const
     {
@@ -482,8 +567,86 @@ namespace llaminar2
         }
     }
 
+    ModelLoader::~ModelLoader() = default;
+
+    void ModelLoader::bindSharedPredictor(const SharedPredictorGGUFSource &source, SharedPredictorMaterialization materialization)
+    {
+        std::lock_guard lock(source_mutex_);
+        if (!loaded_ || predictor_loader_ || tensor_sources_sealed_)
+            throw std::logic_error("Shared predictor binding requires one loaded, unbound, unmaterialized target");
+        if (materialization != SharedPredictorMaterialization::Active && materialization != SharedPredictorMaterialization::Inactive)
+            throw std::invalid_argument("Unknown shared predictor materialization policy");
+        auto candidate = std::make_unique<ModelLoader>(factory_);
+        candidate->setUseMmap(use_mmap_);
+        candidate->setSkipMmapCacheEviction(skip_mmap_cache_eviction_);
+        // Parsing authenticates metadata only; predictor payload is admitted by the existing weight owner.
+        candidate->setPayloadAccessPattern(payload_access_pattern_ == ModelPayloadAccessPattern::DenseCpuResident
+            ? ModelPayloadAccessPattern::SparseSelection : payload_access_pattern_);
+        candidate->loadModel(source.path());
+        auto manifest = std::make_unique<Qwen4ExpSidecarManifest>(model_, candidate->getModel());
+        predictor_materialization_ = materialization;
+        predictor_manifest_ = std::move(manifest);
+        predictor_loader_ = std::move(candidate);
+    }
+
+    void ModelLoader::sealTensorSources()
+    {
+        std::lock_guard lock(source_mutex_);
+        tensor_sources_sealed_ = true;
+    }
+
+    ModelLoader *ModelLoader::sealAndSelectTensorSource(const std::string &name)
+    {
+        std::lock_guard lock(source_mutex_);
+        tensor_sources_sealed_ = true;
+        if (predictor_loader_ && predictor_loader_->hasTensor(name))
+        {
+            if (predictor_materialization_ != SharedPredictorMaterialization::Active)
+                throw std::logic_error("Inactive shared predictor is metadata-only and cannot materialize tensor " + name);
+            return predictor_loader_.get();
+        }
+        return nullptr;
+    }
+
+    void ModelLoader::requireSharedPredictorSource(
+        const std::optional<SharedPredictorGGUFSource>& requested,
+        SharedPredictorMaterialization materialization) const
+    {
+        std::lock_guard lock(source_mutex_);
+        if(bool(predictor_loader_)!=requested.has_value() ||
+           (predictor_loader_ && predictor_loader_->file_path_!=requested->path()))
+            throw std::invalid_argument("Preloaded ModelContext shared predictor source does not match --mtp-model");
+        if(predictor_loader_ && predictor_materialization_!=materialization)
+            throw std::invalid_argument("Preloaded ModelContext shared predictor materialization policy does not match active MTP");
+    }
+
+    const GGUFModel *ModelLoader::ggufPredictorDirectory() const noexcept
+    {
+        return predictor_loader_ ? &predictor_loader_->getModel() : nullptr;
+    }
+
+    const Qwen4ExpSidecarManifest *ModelLoader::predictorManifest() const noexcept
+    {
+        return predictor_manifest_.get();
+    }
+
+    std::vector<std::string> ModelLoader::artifactPaths() const
+    {
+        auto paths = model_.split_paths;
+        if (paths.empty() && !file_path_.empty()) paths.push_back(file_path_);
+        if (predictor_loader_)
+        {
+            const auto predictor_paths = predictor_loader_->artifactPaths();
+            paths.insert(paths.end(), predictor_paths.begin(), predictor_paths.end());
+        }
+        return paths;
+    }
+
     bool ModelLoader::loadModel(const std::string &file_path)
     {
+        std::lock_guard lock(source_mutex_);
+        if (predictor_loader_ || tensor_sources_sealed_)
+            throw std::logic_error("Cannot replace model source after predictor binding or tensor materialization");
         // Close any existing file
         if (file_stream_.is_open())
         {
@@ -569,27 +732,21 @@ namespace llaminar2
             LOG_DEBUG("  Split files: " << model_.split_count);
         }
 
-        // Memory-map the file for zero-syscall tensor loading.
-        // Pass NUMA node so mmap pages are bound to the correct socket,
-        // avoiding cross-NUMA bandwidth penalties during GEMV decode.
-        // Device staging does not retain host payload pages, so binding that
-        // transient mapping to one socket provides no ownership benefit.
-        // Sparse CPU selection does retain its selected output tensors on the
-        // factory's NUMA node, but the source mapping still stays lazy: mbind
-        // applies to pages that are actually read without first-touching the
-        // unrelated remainder of the GGUF.
-        const bool device_staging =
-            payload_access_pattern_ ==
-            ModelPayloadAccessPattern::DeviceStaging;
-        const bool demand_paged =
-            payload_access_pattern_ !=
-            ModelPayloadAccessPattern::DenseCpuResident;
-        const int mmap_numa_node =
-            device_staging ? -1
-                           : (factory_ ? factory_->getNumaNode() : -1);
-        const MmapRegion::PrefaultPolicy mmap_prefault_policy =
-            demand_paged ? MmapRegion::PrefaultPolicy::DemandPaged
-                         : MmapRegion::PrefaultPolicy::Auto;
+        // The merged original directory is available before any source mmap.
+        // A separately owned row table forbids whole-source prefault even when
+        // ordinary CPU weights retain borrowed source pages for inference.
+        for (const auto &tensor : model_.tensors)
+            payload_access_pattern_ = resolveModelPayloadAccessPattern(
+                payload_access_pattern_, inferWeightRole(tensor.name));
+
+        // Source mappings retain only original address/file provenance. Final
+        // CPU population now has an admitted consumer root and bounded reads;
+        // no socket count, dense role or source access hint may prefault the
+        // complete GGUF before that owner exists. SSD row-table final mappings
+        // are a separate explicit storage policy, not these source views.
+        const bool device_staging = payload_access_pattern_ == ModelPayloadAccessPattern::DeviceStaging;
+        const int mmap_numa_node = device_staging ? -1 : (factory_ ? factory_->getNumaNode() : -1);
+        constexpr auto mmap_prefault_policy = MmapRegion::PrefaultPolicy::DemandPaged;
         if (use_mmap_)
         {
             mmap_region_ = MmapRegion::create(
@@ -708,13 +865,20 @@ namespace llaminar2
         LOG_DEBUG("[ModelLoader] Initialized test model (no file loaded)");
     }
 
+    const GGUFTensorInfo *ModelLoader::tensorInfo(const std::string &name) const
+    {
+        if (const auto *info = model_.findTensor(name)) return info;
+        return predictor_loader_ ? predictor_loader_->tensorInfo(name) : nullptr;
+    }
+
     bool ModelLoader::hasTensor(const std::string &tensor_name) const
     {
         if (!loaded_)
         {
             return false;
         }
-        return model_.findTensor(tensor_name) != nullptr;
+        return model_.findTensor(tensor_name) != nullptr ||
+               (predictor_loader_ && predictor_loader_->hasTensor(tensor_name));
     }
 
     std::optional<std::vector<size_t>> ModelLoader::getTensorShape(const std::string &name) const
@@ -724,6 +888,7 @@ namespace llaminar2
             return std::nullopt;
         }
         const GGUFTensorInfo *info = model_.findTensor(name);
+        if (!info && predictor_loader_) return predictor_loader_->getTensorShape(name);
         if (!info)
         {
             return std::nullopt;
@@ -735,6 +900,9 @@ namespace llaminar2
                                                         DeviceId device,
                                                         WeightPrecision weight_precision)
     {
+        if (auto *source = sealAndSelectTensorSource(tensor_name))
+            return source->loadTensor(tensor_name, device, weight_precision);
+
         if (!loaded_)
         {
             LOG_ERROR("[ModelLoader] Model not loaded");
@@ -1200,6 +1368,9 @@ namespace llaminar2
         DeviceId device,
         WeightPrecision weight_precision)
     {
+        if (auto *source = sealAndSelectTensorSource(tensor_name))
+            return source->loadTensorRowSlice(tensor_name, row_start, row_end, device, weight_precision);
+
         if (!loaded_)
         {
             LOG_ERROR("[ModelLoader] Model not loaded");
@@ -1657,6 +1828,9 @@ namespace llaminar2
         DeviceId device,
         WeightPrecision weight_precision)
     {
+        if (auto *source = sealAndSelectTensorSource(tensor_name))
+            return source->loadTensorExpertSlice(tensor_name, expert_start, expert_end, device, weight_precision);
+
         const GGUFTensorInfo *info = loaded_ ? model_.findTensor(tensor_name) : nullptr;
         if (!info || info->dimensions.size() != 3u ||
             expert_start >= expert_end || expert_end > info->dimensions[2])
@@ -1685,13 +1859,156 @@ namespace llaminar2
         DeviceId device,
         WeightPrecision weight_precision)
     {
+        return loadTensorExpertSelectionImpl(tensor_name,expert_ids,nullptr,device,weight_precision);
+    }
+
+    /** @copydoc IModelLoader::loadTensorExpertProjectionSlice */
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertProjectionSlice(
+        const std::string &tensor_name,const WeightSliceSpec &slice,
+        DeviceId device,WeightPrecision weight_precision)
+    {
+        if (weight_precision != WeightPrecision::NATIVE || slice.inner_is_presliced ||
+            !slice.source_rows || !slice.source_cols || !slice.row_count || !slice.col_count ||
+            !slice.expert_count || slice.row_start > slice.source_rows ||
+            slice.row_count > slice.source_rows-slice.row_start || slice.col_start > slice.source_cols ||
+            slice.col_count > slice.source_cols-slice.col_start)
+            throw std::invalid_argument("Original native expert projection requires complete bounded GGUF source coordinates");
+        return loadTensorExpertSelectionImpl(tensor_name,{},&slice,device,weight_precision);
+    }
+
+    /** @copydoc IModelLoader::nativeWeightSourcePlacement */
+    CPUStoragePlacement ModelLoader::nativeWeightSourcePlacement() const
+    {
+        if (!factory_)
+            throw std::logic_error("Native source placement requires its original CPU tensor factory");
+        const int node = factory_->getNumaNode();
+        return node >= 0 ? CPUStoragePlacement::onNode(node) : CPUStoragePlacement::local();
+    }
+
+    /** @copydoc IModelLoader::nativeWeightSourceGeometry */
+    NativeWeightSourceGeometry ModelLoader::nativeWeightSourceGeometry(const std::string &name)
+    {
+        if (auto *source = sealAndSelectTensorSource(name))
+            return source->nativeWeightSourceGeometry(name);
+        const auto *info = loaded_ ? model_.findTensor(name) : nullptr;
+        if (!info || info->dimensions.empty() || !info->getTypeSize())
+            throw std::invalid_argument("Native weight source geometry requires an original tensor: " + name);
+        NativeWeightSourceGeometry result{
+            .original_shape = {},
+            .original_type = ggufToTensorType(info->type),
+            .native_group_elements = std::max(size_t(1), info->getBlockSize()),
+            .native_group_bytes = info->getTypeSize()};
+        for (auto dimension : info->dimensions) {
+            if (!dimension || dimension > std::numeric_limits<size_t>::max())
+                throw std::invalid_argument("Native weight source has an invalid original dimension");
+            result.original_shape.push_back(size_t(dimension));
+        }
+        // The GGUF parser normalizes only rank-two descriptors to runtime
+        // [N,K]. Source windows always retain actual on-disk [K,N] axes.
+        if (result.original_shape.size() == 2)
+            std::swap(result.original_shape[0], result.original_shape[1]);
+        if (result.original_shape.front() % result.native_group_elements)
+            throw std::invalid_argument("Native weight source K extent splits an original encoded group");
+        return result;
+    }
+
+    /** @copydoc IModelLoader::readNativeWeightSourceWindow */
+    void ModelLoader::readNativeWeightSourceWindow(
+        const std::string &name, const NativeWeightSourceWindow &window,
+        std::span<std::byte> destination)
+    {
+        if (auto *source = sealAndSelectTensorSource(name))
+            return source->readNativeWeightSourceWindow(name, window, destination);
+        if (!loaded_)
+            throw std::logic_error("Native source read requires a loaded original directory");
+        const auto *info = model_.findTensor(name);
+        if (!info || info->dimensions.empty())
+            throw std::invalid_argument("Native source read has no original tensor: " + name);
+        const auto multiply = [](size_t a, size_t b) {
+            if (b && a > std::numeric_limits<size_t>::max() / b)
+                throw std::overflow_error("Native source coordinate extent overflows");
+            return a * b;
+        };
+        const size_t columns = info->dimensions.size() == 2 ? info->dimensions[1] : info->dimensions[0];
+        const size_t rows = info->dimensions.size() == 2 ? info->dimensions[0] :
+            info->dimensions.size() > 1 ? info->dimensions[1] : 1;
+        size_t outer = 1;
+        for (size_t axis = 2; axis < info->dimensions.size(); ++axis)
+            outer = multiply(outer, info->dimensions[axis]);
+        const size_t group = std::max(size_t(1), info->getBlockSize());
+        const size_t block_bytes = info->getTypeSize();
+        if (!columns || !rows || !outer || !block_bytes || columns % group ||
+            window.original_expert >= outer || window.first_row > rows ||
+            window.rows > rows - window.first_row || window.first_column > columns ||
+            window.columns > columns - window.first_column ||
+            window.first_column % group || window.columns % group ||
+            window.native_row_bytes != multiply(window.columns / group, block_bytes) ||
+            (!destination.data() || destination.size() != window.nativeBytes()))
+            throw std::invalid_argument("Native source window disagrees with original coordinates/format: " + name);
+        const size_t row_bytes = multiply(columns / group, block_bytes);
+        const size_t outer_bytes = multiply(rows, row_bytes);
+        if (multiply(outer, outer_bytes) != info->size_bytes)
+            throw std::invalid_argument("Native source directory byte extent disagrees with its original format: " + name);
+        const size_t outer_offset = multiply(window.original_expert, outer_bytes);
+        const size_t row_offset = multiply(window.first_row, row_bytes);
+        const size_t column_offset = multiply(window.first_column / group, block_bytes);
+        if (row_offset > std::numeric_limits<size_t>::max() - outer_offset ||
+            column_offset > std::numeric_limits<size_t>::max() - outer_offset - row_offset)
+            throw std::overflow_error("Native source window offset overflows");
+        const size_t source_offset = outer_offset + row_offset + column_offset;
+        // The original filebuf coalesces strided source gaps. Full-K windows are
+        // a single read; narrow K windows never issue a pread/seek for each row.
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        auto *stream = &file_stream_;
+        uint64_t base = model_.data_offset;
+        if (model_.split_count > 1) {
+            if (info->split_idx >= model_.split_count)
+                throw std::invalid_argument("Native source window has a foreign split index");
+            base = model_.split_data_offsets[info->split_idx];
+            if (info->split_idx) stream = &split_streams_[info->split_idx - 1];
+        }
+        if (info->offset > std::numeric_limits<uint64_t>::max() - base ||
+            source_offset > std::numeric_limits<uint64_t>::max() - base - info->offset ||
+            base + info->offset + source_offset > uint64_t(std::numeric_limits<std::streamoff>::max()))
+            throw std::overflow_error("Native source file offset exceeds stream extent");
+        stream->clear();
+        stream->seekg(std::streamoff(base + info->offset + source_offset), std::ios::beg);
+        if (!*stream) throw std::runtime_error("Cannot seek original native weight source: " + name);
+        const auto read = [&](std::byte *out, size_t bytes) {
+            if (bytes > size_t(std::numeric_limits<std::streamsize>::max()) ||
+                !stream->read(reinterpret_cast<char *>(out), std::streamsize(bytes)))
+                throw std::runtime_error("Short/error buffered read of original native weight source: " + name);
+        };
+        const size_t gap = row_bytes - window.native_row_bytes;
+        if (!gap) read(destination.data(), destination.size());
+        else {
+            if (gap > size_t(std::numeric_limits<std::streamsize>::max()))
+                throw std::overflow_error("Native source row gap exceeds stream extent");
+            for (size_t row = 0; row < window.rows; ++row) {
+                read(destination.data() + row * window.native_row_bytes, window.native_row_bytes);
+                if (row + 1 < window.rows) {
+                    stream->ignore(std::streamsize(gap));
+                    if (!*stream || stream->gcount() != std::streamsize(gap))
+                        throw std::runtime_error("Short/error buffered gap in original native weight source: " + name);
+                }
+            }
+        }
+    }
+
+    /** @copydoc ModelLoader::loadTensorExpertSelectionImpl */
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertSelectionImpl(
+        const std::string &tensor_name,const std::vector<size_t> &selection,
+        const WeightSliceSpec *projection,DeviceId device,WeightPrecision weight_precision)
+    {
+        if (auto *source = sealAndSelectTensorSource(tensor_name))
+        {
+            return projection ? source->loadTensorExpertProjectionSlice(tensor_name,*projection,device,weight_precision)
+                              : source->loadTensorExpertSelection(tensor_name,selection,device,weight_precision);
+        }
+
         if (!loaded_)
             throw std::runtime_error(
                 "[ModelLoader] Explicit expert selection requires a loaded model");
-        if (expert_ids.empty())
-            throw std::invalid_argument(
-                "[ModelLoader] Explicit expert selection cannot be empty");
-
         const GGUFTensorInfo *info = model_.findTensor(tensor_name);
         if (!info)
             throw std::invalid_argument(
@@ -1703,6 +2020,35 @@ namespace llaminar2
         const size_t ne0 = info->dimensions[0];
         const size_t ne1 = info->dimensions[1];
         const size_t ne2 = info->dimensions[2];
+        if (!ne0 || !ne1 || !ne2)
+            throw std::invalid_argument("Expert selection requires nonempty original GGUF axes");
+        std::vector<size_t> projected_ids;
+        if (projection)
+        {
+            if (projection->expert_count>ne2)
+                throw std::invalid_argument("Expert projection exceeds original expert inventory");
+            if (!projection->expert_ids.empty())
+            {
+                if (projection->expert_count!=projection->expert_ids.size())
+                    throw std::invalid_argument("Expert projection count disagrees with explicit original IDs");
+                projected_ids.reserve(projection->expert_count);
+                for (int id:projection->expert_ids)
+                {
+                    if (id<0) throw std::invalid_argument("Expert projection has a negative original expert ID");
+                    projected_ids.push_back(static_cast<size_t>(id));
+                }
+            }
+            else
+            {
+                if (projection->expert_start>ne2 || projection->expert_count>ne2-projection->expert_start)
+                    throw std::invalid_argument("Expert projection interval exceeds original expert inventory");
+                projected_ids.reserve(projection->expert_count);
+                for (size_t i=0;i<projection->expert_count;++i) projected_ids.push_back(projection->expert_start+i);
+            }
+        }
+        const auto &expert_ids=projection ? projected_ids : selection;
+        if (expert_ids.empty())
+            throw std::invalid_argument("Explicit expert selection cannot be empty");
         for (size_t index = 0; index < expert_ids.size(); ++index)
         {
             if (expert_ids[index] >= ne2 ||
@@ -1725,19 +2071,34 @@ namespace llaminar2
                 "[ModelLoader] Expert columns are not aligned to the tensor block size for " +
                 tensor_name);
         }
-        const size_t bytes_per_row = block_size > 0u
-                                         ? (ne0 / block_size) * type_size
-                                         : ne0 * type_size;
+        const size_t row_units=block_size ? ne0/block_size : ne0;
+        if (!type_size || row_units>std::numeric_limits<size_t>::max()/type_size)
+            throw std::overflow_error("Expert selection original row-byte geometry overflows size_t");
+        const size_t bytes_per_row=row_units*type_size;
+        if (bytes_per_row==0 || ne1 > std::numeric_limits<size_t>::max()/bytes_per_row ||
+            ne2 > std::numeric_limits<size_t>::max()/(ne1*bytes_per_row))
+            throw std::overflow_error("Expert projection original source extent overflows size_t");
         const size_t bytes_per_expert = ne1 * bytes_per_row;
+        const size_t first_k=projection ? projection->row_start : 0;
+        const size_t local_k=projection ? projection->row_count : ne0;
+        const size_t first_n=projection ? projection->col_start : 0;
+        const size_t local_n=projection ? projection->col_count : ne1;
+        if (projection && (projection->source_rows!=ne0 || projection->source_cols!=ne1 ||
+            (block_size && (first_k%block_size || local_k%block_size))))
+            throw std::invalid_argument("Expert projection differs from original GGUF shape or native block boundaries");
+        const bool complete_projection=first_k==0 && local_k==ne0 && first_n==0 && local_n==ne1;
+        const size_t local_row_bytes=block_size ? local_k/block_size*type_size : local_k*type_size;
+        const size_t first_k_bytes=block_size ? first_k/block_size*type_size : first_k*type_size;
+        const size_t local_expert_bytes=local_n*local_row_bytes;
         if (bytes_per_expert == 0u ||
-            expert_ids.size() > std::numeric_limits<size_t>::max() / bytes_per_expert)
+            expert_ids.size() > std::numeric_limits<size_t>::max() / local_expert_bytes)
         {
             throw std::overflow_error(
                 "[ModelLoader] Explicit expert selection byte size overflow for " + tensor_name);
         }
 
-        const size_t packed_byte_count = expert_ids.size() * bytes_per_expert;
-        const std::vector<size_t> packed_shape = {ne0, ne1, expert_ids.size()};
+        const size_t packed_byte_count = expert_ids.size() * local_expert_bytes;
+        const std::vector<size_t> packed_shape = {local_k, local_n, expert_ids.size()};
         if (mmap_region_)
         {
             // Validate before pointer arithmetic or allocation. The final selected
@@ -1750,7 +2111,7 @@ namespace llaminar2
                     (owner->size() - data_offset - info->offset) / bytes_per_expert)
                 throw std::runtime_error(
                     "[ModelLoader] Expert selection exceeds mapped file: " + tensor_name);
-            if (contiguous && info->isQuantized() &&
+            if (complete_projection && contiguous && info->isQuantized() &&
                 weight_precision == WeightPrecision::NATIVE && factory_)
                 return factory_->createQuantizedZeroCopy(
                     ggufToTensorType(info->type), packed_shape,
@@ -1765,6 +2126,9 @@ namespace llaminar2
         AlignedVector<uint16_t> fp16_storage;
         AlignedVector<uint16_t> bf16_storage;
         uint8_t *packed_destination = nullptr;
+        const auto allocate_native = [&]<typename T>(AlignedVector<T> &storage,size_t count) {
+            storage.resize_uninitialized(count);
+        };
         {
             ScopedWeightLoadDetailTimer timer(
                 "weights.expert_selection.allocate");
@@ -1774,8 +2138,7 @@ namespace llaminar2
                 if (packed_byte_count % sizeof(float) != 0u)
                     throw std::runtime_error(
                         "[ModelLoader] Invalid FP32 expert-selection byte count for " + tensor_name);
-                fp32_storage.resize_uninitialized(
-                    packed_byte_count / sizeof(float));
+                allocate_native(fp32_storage, packed_byte_count / sizeof(float));
                 packed_destination = reinterpret_cast<uint8_t *>(
                     fp32_storage.data());
                 break;
@@ -1783,8 +2146,7 @@ namespace llaminar2
                 if (packed_byte_count % sizeof(uint16_t) != 0u)
                     throw std::runtime_error(
                         "[ModelLoader] Invalid FP16 expert-selection byte count for " + tensor_name);
-                fp16_storage.resize_uninitialized(
-                    packed_byte_count / sizeof(uint16_t));
+                allocate_native(fp16_storage, packed_byte_count / sizeof(uint16_t));
                 packed_destination = reinterpret_cast<uint8_t *>(
                     fp16_storage.data());
                 break;
@@ -1792,8 +2154,7 @@ namespace llaminar2
                 if (packed_byte_count % sizeof(uint16_t) != 0u)
                     throw std::runtime_error(
                         "[ModelLoader] Invalid BF16 expert-selection byte count for " + tensor_name);
-                bf16_storage.resize_uninitialized(
-                    packed_byte_count / sizeof(uint16_t));
+                allocate_native(bf16_storage, packed_byte_count / sizeof(uint16_t));
                 packed_destination = reinterpret_cast<uint8_t *>(
                     bf16_storage.data());
                 break;
@@ -1804,7 +2165,7 @@ namespace llaminar2
                     // The GGUF copy first-touches the exact final tensor pages.
                     // Avoid zeroing tens of gigabytes that are immediately
                     // overwritten, and retain the allocation through packing.
-                    quantized_storage.resize_uninitialized(packed_byte_count);
+                    allocate_native(quantized_storage,packed_byte_count);
                     packed_destination = quantized_storage.data();
                 }
                 else
@@ -1827,7 +2188,7 @@ namespace llaminar2
         copy_runs.reserve(expert_ids.size());
         {
             size_t packed_begin = 0u;
-            while (packed_begin < expert_ids.size())
+            while (complete_projection && packed_begin < expert_ids.size())
             {
                 size_t packed_end = packed_begin + 1u;
                 while (packed_end < expert_ids.size() &&
@@ -1855,7 +2216,59 @@ namespace llaminar2
                     run.byte_count);
         };
 
-        if (mmap_region_)
+        if (!complete_projection)
+        {
+            // Compact each exact original K-block interval into its final row.
+            // There is no full-parent copy, requantization or per-row run vector.
+            const auto copy_expert=[&](size_t packed,const auto &copy_row)
+            {
+                for (size_t row=0;row<local_n;++row)
+                    copy_row(expert_ids[packed]*bytes_per_expert+(first_n+row)*bytes_per_row+first_k_bytes,
+                             packed*local_expert_bytes+row*local_row_bytes,local_row_bytes);
+            };
+            ScopedWeightLoadDetailTimer timer("weights.expert_projection.source_copy");
+            if (mmap_region_)
+            {
+                const uint8_t *base=getMmapPtr(info);
+                if (!base) throw std::runtime_error("Expert projection lost original mapped source");
+                const auto copy=[&](size_t packed) {
+                    copy_expert(packed,[&](size_t source,size_t destination,size_t bytes) {
+                        std::memcpy(packed_destination+destination,base+source,bytes);
+                    });
+                };
+                if (omp_in_parallel() || packed_byte_count<kParallelExpertSelectionCopyBytes)
+                    for (size_t i=0;i<expert_ids.size();++i) copy(i);
+                else
+                {
+                    auto work=[&]() {
+#pragma omp for schedule(static)
+                        for (size_t i=0;i<expert_ids.size();++i) copy(i);
+                    };
+                    OMP_WORKSHARE_REGION(work);
+                }
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(file_mutex_);
+                auto *stream=&file_stream_;
+                uint64_t data_offset=model_.data_offset;
+                if (model_.split_count>1)
+                {
+                    if (info->split_idx>=model_.split_count)
+                        throw std::runtime_error("Expert projection has invalid original shard index");
+                    data_offset=model_.split_data_offsets[info->split_idx];
+                    if (info->split_idx) stream=&split_streams_[info->split_idx-1];
+                }
+                for (size_t i=0;i<expert_ids.size();++i)
+                    copy_expert(i,[&](size_t source,size_t destination,size_t bytes) {
+                        stream->clear();stream->seekg(data_offset+info->offset+source,std::ios::beg);
+                        if (!*stream || !stream->read(reinterpret_cast<char *>(packed_destination+destination),
+                                                     static_cast<std::streamsize>(bytes)))
+                            throw std::runtime_error("Failed reading original native expert projection");
+                    });
+            }
+        }
+        else if (mmap_region_)
         {
             const uint8_t *tensor_base = getMmapPtr(info);
             if (!tensor_base)
@@ -2004,6 +2417,9 @@ namespace llaminar2
         DeviceId device,
         WeightPrecision weight_precision)
     {
+        if (auto *source = sealAndSelectTensorSource(tensor_name))
+            return source->loadTensorColumnSlice(tensor_name, col_start, col_end, device, weight_precision);
+
         if (!loaded_)
         {
             LOG_ERROR("[ModelLoader] Model not loaded");
@@ -2546,6 +2962,7 @@ namespace llaminar2
         // Actually read the array data (don't skip it!)
         value.type = GGUFValueType::ARRAY;
         value.array_length = array_len; // Store array length
+        value.array_element_type = static_cast<GGUFValueType>(elem_type);
 
         // Determine element size
         size_t elem_size = 0;
@@ -3622,7 +4039,29 @@ namespace llaminar2
         {
             names.push_back(t.name);
         }
+        if (predictor_loader_)
+        {
+            auto extra = predictor_loader_->tensorNames();
+            names.insert(names.end(), extra.begin(), extra.end());
+        }
         return names;
+    }
+
+    std::vector<std::string> ModelLoader::materializationNames() const
+    {
+        std::vector<std::string> names;
+        names.reserve(tensorCount());
+        for (const auto &tensor : model_.tensors) names.push_back(tensor.name);
+        if (predictor_manifest_ && predictor_materialization_ == SharedPredictorMaterialization::Active)
+            for (const auto &source : predictor_manifest_->sources())
+                if (source.source == Qwen4ExpTensorSource::Predictor && source.consumed)
+                    names.push_back(source.tensor.name);
+        return names;
+    }
+
+    size_t ModelLoader::tensorCount() const
+    {
+        return model_.tensors.size() + (predictor_loader_ ? predictor_loader_->tensorCount() : 0u);
     }
 
     size_t ModelLoader::totalBytes() const
@@ -3630,9 +4069,14 @@ namespace llaminar2
         size_t total = 0;
         for (const auto &t : model_.tensors)
         {
+            if (t.size_bytes > std::numeric_limits<size_t>::max() - total)
+                throw std::overflow_error("GGUF native tensor byte total overflow");
             total += t.size_bytes;
         }
-        return total;
+        const auto predictor_bytes = predictor_loader_ ? predictor_loader_->totalBytes() : 0u;
+        if (predictor_bytes > std::numeric_limits<size_t>::max() - total)
+            throw std::overflow_error("Shared predictor native tensor byte total overflow");
+        return total + predictor_bytes;
     }
 
     int ModelLoader::getInt(const std::string &key, int default_val) const

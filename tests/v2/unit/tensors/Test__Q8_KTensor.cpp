@@ -3,8 +3,12 @@
  * @brief Scalar/SIMD source-value checks for292-byte FP32-scaled Q8_K blocks.
  * Legacy unit-scale fixtures explicitly initialize d=1. Focused regressions
  * below independently encode raw GGUF bytes and exercise nonunit source d.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "tensors/Tensors.h"
 #include "tensors/SIMDHelpers.h"
 #include <gtest/gtest.h>
@@ -433,6 +437,8 @@ TEST_F(Q8_KSIMDTest, RoundTrip)
 // ===== Main =====
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
@@ -445,7 +451,7 @@ int main(int argc, char **argv)
  * explicit precision limitation, never used as the original-value oracle.
  */
 #include "loaders/ModelLoader.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <array>
 #include <bit>
 #include <limits>

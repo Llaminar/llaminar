@@ -1,9 +1,17 @@
 /**
  * @file Test__WeightPlan.cpp
  * @brief Unit tests for declarative weight planning and frozen materialization.
+ *
+ * Original source declarations drive the production materializer and prepared
+ * Store. These tests preserve native geometry, exact physical owners and final
+ * execution lifetimes across tied aliases, repeated preparation and cleanup.
+ * Device-qualified immutable indexing preserves original candidate ambiguity
+ * and plan-order selection across backend identities and large metadata sets.
  */
 
 #include <gtest/gtest.h>
+#include <string_view>
+#include <initializer_list>
 
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
@@ -18,6 +26,8 @@
 #include "models/GraphTypes.h"
 #include "../../mocks/MockModelLoader.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
+#include "../../utils/CPUWeightPlanTestAdmission.h"
 #include "tensors/Tensors.h"
 
 #include <cstring>
@@ -49,19 +59,7 @@ namespace
         return binding;
     }
 
-    std::optional<DeviceId> firstAvailableGpuDevice()
-    {
-        auto &manager = DeviceManager::instance();
-        manager.initialize(-1, /*log_inventory=*/false);
-        for (const auto &device : manager.devices())
-        {
-            if (device.type == ComputeBackendType::GPU_CUDA)
-                return DeviceId::cuda(device.device_id);
-            if (device.type == ComputeBackendType::GPU_ROCM)
-                return DeviceId::rocm(device.device_id);
-        }
-        return std::nullopt;
-    }
+
 }
 
 TEST(Test__WeightPlan, NormalizesRequirementMetadata)
@@ -202,7 +200,7 @@ TEST(Test__WeightManagerMaterialize, ProducesFrozenBindingsFromPlan)
     WeightRequirement embedding;
     embedding.canonical_name = "token_embd.weight";
     embedding.target_device = DeviceId::cpu();
-    embedding.expected_prepared_kind = PreparedWeightKind::PreparedEmbedding;
+    embedding.expected_prepared_kind = PreparedWeightKind::CPUResidentTensor;
     embedding.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
     plan.add(embedding);
 
@@ -219,6 +217,7 @@ TEST(Test__WeightManagerMaterialize, ProducesFrozenBindingsFromPlan)
     optional_missing.layer = 0;
     plan.add(optional_missing);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
     ASSERT_NO_THROW(frozen.validateForGraph());
     ASSERT_EQ(frozen.bindings().size(), 2u);
@@ -227,9 +226,11 @@ TEST(Test__WeightManagerMaterialize, ProducesFrozenBindingsFromPlan)
     EXPECT_EQ(embed.identity.model_id.value, 99u);
     EXPECT_EQ(embed.identity.role, WeightRole::Embedding);
     ASSERT_TRUE(embed.prepared.has_value());
-    EXPECT_EQ(embed.prepared->kind, PreparedWeightKind::PreparedEmbedding);
+    EXPECT_EQ(embed.prepared->kind, PreparedWeightKind::CPUResidentTensor);
     EXPECT_EQ(embed.prepared->binding_id, embed.binding_id);
-    EXPECT_EQ(embed.residency.host_policy, WeightHostPolicy::ReleasableAfterPreparation);
+    // This embedding is its final readable CPU root, even when the original
+    // source declaration permits temporary input bytes to be reclaimed.
+    EXPECT_EQ(embed.residency.host_policy, WeightHostPolicy::RequiredForCPUExecution);
 
     const auto &down = frozen.layer(0, "ffn_down.weight");
     EXPECT_EQ(down.identity.role, WeightRole::FFNDown);
@@ -308,6 +309,7 @@ TEST(Test__WeightManagerMaterialize,
                 WeightHostPolicy::RequiredUntilGraphMaterialized;
             plan.add(requirement);
         }
+        admitCPUWeightPlansForTest(manager,*loader,{&plan});
         return manager.materialize(plan);
     };
 
@@ -360,6 +362,7 @@ TEST(Test__WeightManagerMaterialize,
         plan.add(requirement);
     }
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
     ASSERT_NO_THROW(frozen.validateForGraph());
 
@@ -442,7 +445,9 @@ TEST(Test__WeightManagerMaterialize,
 
         std::weak_ptr<TensorBase> model_owned_override;
         const TensorBase *first_override = nullptr;
+        size_t source_loads = 0;
         {
+            admitCPUWeightPlansForTest(manager,*loader,{&plan});
             FrozenModelWeightSet first = manager.materialize(plan);
             const auto &binding = first.layer(0, "ffn_gate_inp_shexp.weight");
             ASSERT_TRUE(binding.tensor_owner);
@@ -457,6 +462,7 @@ TEST(Test__WeightManagerMaterialize,
                 << "Initial FP32 conversion changed arithmetic";
             model_owned_override = binding.tensor_owner;
             first_override = binding.tensor;
+            source_loads = loader->loadTensorCallCount();
         }
 
         /* Runner-owned storage would expire at the end of the preceding scope. */
@@ -471,6 +477,8 @@ TEST(Test__WeightManagerMaterialize,
             << "Rematerialization must acquire the same model-owned authority";
         EXPECT_EQ(binding.tensor_owner.get(), first_override);
         EXPECT_EQ(binding.tensor->native_type(), TensorType::FP32);
+        EXPECT_EQ(loader->loadTensorCallCount(), source_loads)
+            << "A retained model override must not reload its retired source";
         EXPECT_EQ(
             std::memcmp(
                 binding.tensor->data(),
@@ -513,6 +521,7 @@ TEST(Test__WeightManagerMaterialize, ProducesTiedAliasBindingFromSourceName)
     lm_head_alias.expected_prepared_kind = PreparedWeightKind::CpuPackedGemm;
     plan.add(lm_head_alias);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
     ASSERT_NO_THROW(frozen.validateForGraph());
 
@@ -588,6 +597,7 @@ TEST(Test__WeightManagerMaterialize, TiedAliasTPSliceHintPreservesMaterializedSl
     lm_head_alias.slice = partial_vocab_hint;
     plan.add(lm_head_alias);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
     const auto &binding = frozen.global("output.weight");
 
@@ -730,7 +740,11 @@ TEST(Test__WeightManagerPrepare, RegistersExactFrozenBindingRefs)
     ffn_down.expected_prepared_kind = PreparedWeightKind::CpuPackedGemm;
     plan.add(ffn_down);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
+    // Fresh bounded loading commits actual final roots before numerical use;
+    // later preparation reuses those bindings under the same original PMA.
+
     ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, DeviceId::cpu()));
 
     const auto &embedding_binding = frozen.global("token_embd.weight");
@@ -741,7 +755,10 @@ TEST(Test__WeightManagerPrepare, RegistersExactFrozenBindingRefs)
     ASSERT_TRUE(down_binding.prepared.has_value());
     EXPECT_TRUE(store->contains(*lm_head_binding.prepared));
     EXPECT_TRUE(store->contains(*down_binding.prepared));
-    EXPECT_FALSE(store->preparedRefForBinding(embedding_binding.binding_id, DeviceId::cpu()).has_value());
+    const auto resident_ref=store->preparedRefForBinding(embedding_binding.binding_id,DeviceId::cpu());
+    ASSERT_TRUE(resident_ref);
+    EXPECT_EQ(resident_ref->kind,PreparedWeightKind::CPUResidentTensor);
+    EXPECT_EQ(store->gemmKernel(*resident_ref),nullptr);
 
     auto resolved_lm_head = store->preparedRefForBinding(lm_head_binding.binding_id, DeviceId::cpu());
     ASSERT_TRUE(resolved_lm_head.has_value());
@@ -781,6 +798,8 @@ TEST(Test__WeightManagerPrepare, StagePreparedStoresRemainIndependentAcrossMater
     auto store_a = std::make_shared<PreparedWeightStore>(ModelContextId{1001});
     manager.setPreparedWeightStore(store_a);
     WeightPlan plan_a = make_plan(ModelContextId{1001}, 0, 0, 10);
+    WeightPlan plan_b = make_plan(ModelContextId{1002}, 1, 1, 20);
+    admitCPUWeightPlansForTest(manager,*loader,{&plan_a,&plan_b});
     FrozenModelWeightSet frozen_a = manager.materialize(plan_a);
     ASSERT_TRUE(manager.prepareWeightsForDevice(frozen_a, DeviceId::cpu()));
 
@@ -792,7 +811,6 @@ TEST(Test__WeightManagerPrepare, StagePreparedStoresRemainIndependentAcrossMater
 
     auto store_b = std::make_shared<PreparedWeightStore>(ModelContextId{1002});
     manager.setPreparedWeightStore(store_b);
-    WeightPlan plan_b = make_plan(ModelContextId{1002}, 1, 1, 20);
     FrozenModelWeightSet frozen_b = manager.materialize(plan_b);
     ASSERT_TRUE(manager.prepareWeightsForDevice(frozen_b, DeviceId::cpu()));
 
@@ -822,6 +840,16 @@ TEST(Test__WeightManagerMaterialize, LookupDeviceCanDifferFromTargetDevice)
 
     WeightManager manager(*loader);
 
+    // The plan's TP identity comes from the same original assignment used to
+    // slice the host source; a target GPU ordinal alone cannot define a shard.
+    WeightShardingConfig sharding;
+    sharding.exact_matches["blk.0.ffn_down.weight"] = WeightShardingMode::InputParallel;
+    sharding.exact_dimension_matches["blk.0.ffn_down.weight"] = WeightDimensionType::FFNHidden;
+    manager.setWeightShardingConfig(sharding);
+    manager.setTensorParallelConfig(std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, 4, 4, 64, 128,
+            std::vector<DeviceId>{DeviceId::cuda(0), DeviceId::cuda(1)})));
+
     InferenceStrategy strategy;
     strategy.mode = WeightInferenceMode::LocalTP;
     strategy.model_id = ModelContextId{456};
@@ -839,6 +867,7 @@ TEST(Test__WeightManagerMaterialize, LookupDeviceCanDifferFromTargetDevice)
     requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
     plan.add(requirement);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
     const auto &binding = frozen.layer(0, "ffn_down.weight");
 
@@ -851,112 +880,13 @@ TEST(Test__WeightManagerMaterialize, LookupDeviceCanDifferFromTargetDevice)
     EXPECT_EQ(binding.prepared->device, DeviceId::cuda(0));
     EXPECT_EQ(binding.prepared->kind, PreparedWeightKind::CudaInt8PackedGemm);
     EXPECT_NE(binding.tensor, nullptr);
+    EXPECT_EQ(binding.tensor->shape(), (std::vector<size_t>{16, 32}));
+    EXPECT_EQ(binding.slice.source_cols, 64u);
+    EXPECT_EQ(binding.slice.col_count, 32u);
+    EXPECT_EQ(loader->nativeSourceReadCallCount(), 0u)
+        << "An explicit GPU preparation source must not create a final CPU consumer";
 }
 
-TEST(Test__WeightManagerPrepare, GpuFrozenBindingWithoutPreparedHintIsPreparedByStructure)
-{
-    const auto gpu = firstAvailableGpuDevice();
-    if (!gpu)
-        GTEST_SKIP() << "No CUDA/ROCm GPU available";
-
-    auto loader = MockModelLoaderBuilder()
-                      .addFP32RandomTensor("blk.0.ffn_down.weight", {16, 64})
-                      .build();
-
-    WeightManager manager(*loader);
-    WeightShardingConfig sharding;
-    manager.setWeightShardingConfig(sharding);
-
-    auto store = std::make_shared<PreparedWeightStore>(ModelContextId{909});
-    manager.setPreparedWeightStore(store);
-
-    InferenceStrategy strategy;
-    strategy.mode = WeightInferenceMode::SingleDevice;
-    strategy.model_id = ModelContextId{909};
-    strategy.devices = {*gpu};
-
-    WeightPlan plan(strategy);
-    WeightRequirement requirement;
-    requirement.canonical_name = "blk.0.ffn_down.weight";
-    requirement.layer = 0;
-    requirement.target_device = *gpu;
-    requirement.lookup_device = DeviceId::cpu();
-    requirement.expected_prepared_kind = PreparedWeightKind::None;
-    requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
-    plan.add(requirement);
-
-    FrozenModelWeightSet frozen = manager.materialize(plan);
-    const auto &binding = frozen.layer(0, "ffn_down.weight");
-    ASSERT_FALSE(binding.prepared.has_value());
-
-    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, *gpu, /*include_expert_jobs=*/false));
-
-    auto prepared = store->preparedRefForBinding(binding.binding_id, *gpu);
-    ASSERT_TRUE(prepared.has_value());
-    EXPECT_EQ(prepared->binding_id, binding.binding_id);
-    EXPECT_EQ(prepared->device, *gpu);
-    EXPECT_EQ(prepared->kind, gpu->is_cuda()
-                                  ? PreparedWeightKind::CudaInt8PackedGemm
-                                  : PreparedWeightKind::RocmInt8PackedGemm);
-}
-
-TEST(Test__WeightManagerPrepare, GpuGdnAlphaBetaProjectionBindingsArePreparedByStructure)
-{
-    const auto gpu = firstAvailableGpuDevice();
-    if (!gpu)
-        GTEST_SKIP() << "No CUDA/ROCm GPU available";
-
-    auto loader = MockModelLoaderBuilder()
-                      .addFP32RandomTensor("blk.0.ssm_alpha.weight", {4, 8})
-                      .addFP32RandomTensor("blk.0.ssm_beta.weight", {4, 8})
-                      .build();
-
-    WeightManager manager(*loader);
-    WeightShardingConfig sharding;
-    sharding.exact_matches["blk.0.ssm_alpha.weight"] = WeightShardingMode::ColumnParallel;
-    sharding.exact_dimension_matches["blk.0.ssm_alpha.weight"] = WeightDimensionType::ProportionalHeads;
-    sharding.exact_matches["blk.0.ssm_beta.weight"] = WeightShardingMode::ColumnParallel;
-    sharding.exact_dimension_matches["blk.0.ssm_beta.weight"] = WeightDimensionType::ProportionalHeads;
-    manager.setWeightShardingConfig(sharding);
-
-    auto store = std::make_shared<PreparedWeightStore>(ModelContextId{910});
-    manager.setPreparedWeightStore(store);
-
-    InferenceStrategy strategy;
-    strategy.mode = WeightInferenceMode::SingleDevice;
-    strategy.model_id = ModelContextId{910};
-    strategy.devices = {*gpu};
-
-    WeightPlan plan(strategy);
-    for (const std::string &name : {"blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"})
-    {
-        WeightRequirement requirement;
-        requirement.canonical_name = name;
-        requirement.layer = 0;
-        requirement.target_device = *gpu;
-        requirement.lookup_device = DeviceId::cpu();
-        requirement.expected_prepared_kind = PreparedWeightKind::None;
-        requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
-        plan.add(requirement);
-    }
-
-    FrozenModelWeightSet frozen = manager.materialize(plan);
-    const auto &alpha_binding = frozen.layer(0, "ssm_alpha.weight");
-    const auto &beta_binding = frozen.layer(0, "ssm_beta.weight");
-    EXPECT_EQ(alpha_binding.identity.role, WeightRole::GDNAlphaBetaProjection);
-    EXPECT_EQ(beta_binding.identity.role, WeightRole::GDNAlphaBetaProjection);
-    ASSERT_FALSE(alpha_binding.prepared.has_value());
-    ASSERT_FALSE(beta_binding.prepared.has_value());
-
-    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, *gpu, /*include_expert_jobs=*/false));
-
-    auto alpha_prepared = store->preparedRefForBinding(alpha_binding.binding_id, *gpu);
-    auto beta_prepared = store->preparedRefForBinding(beta_binding.binding_id, *gpu);
-    ASSERT_TRUE(alpha_prepared.has_value());
-    ASSERT_TRUE(beta_prepared.has_value());
-    EXPECT_EQ(alpha_prepared->binding_id, alpha_binding.binding_id);
-    EXPECT_EQ(beta_prepared->binding_id, beta_binding.binding_id);
-}
 
 /**
  * @brief A prepared FP32 override retains the TP slice identity of its source.
@@ -1002,6 +932,7 @@ TEST(Test__WeightManagerMaterialize,
     requirement.slice.inner_is_presliced = true;
     plan.add(requirement);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet frozen = manager.materialize(plan);
     const auto &binding = frozen.layer(0, "ssm_alpha.weight");
     ASSERT_NE(binding.tensor, nullptr);
@@ -1064,6 +995,7 @@ TEST(Test__WeightManagerMaterialize, FrozenBindingsRetainMaterializedTPSlices)
     requirement.tp_rank_or_device_index = 0;
     plan.add(requirement);
 
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     FrozenModelWeightSet first_frozen = manager.materialize(plan);
     const auto &first_binding = first_frozen.layer(0, "ssm_a");
     ASSERT_NE(first_binding.tensor, nullptr);
@@ -1177,7 +1109,8 @@ TEST(Test__WeightManagerMaterialize, ThrowsForMissingRequiredWeight)
     missing.required = true;
     plan.add(missing);
 
-    EXPECT_THROW(manager.materialize(plan), std::runtime_error);
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
+    EXPECT_THROW(manager.materialize(plan), std::invalid_argument);
 }
 
 TEST(Test__WeightPlan, FrozenSetRetainsItsExactPhysicalMemoryOwner)
@@ -1233,7 +1166,7 @@ TEST(Test__GDNProjectionArithmetic, ExplicitPolicyRejectsUnknownValues)
 TEST(Test__GDNProjectionArithmetic, SourceAwareSelectionPreservesOtherOperators)
 {
     using Contract = PreparedWeightRepresentationContract;
-    for (const auto architecture : {"qwen35", "qwen35moe"})
+    for (const auto architecture : {"qwen35", "qwen35moe", "qwen4exp"})
     {
         for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight",
                                 "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight", "blk.0.ssm_out.weight"})
@@ -1312,6 +1245,7 @@ TEST(Test__GDNProjectionArithmetic, ActualMaterializerPreservesOriginalValuesAnd
         requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         plan.add(requirement);
     }
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     auto frozen = manager.materialize(plan);
     for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"})
     {
@@ -1321,8 +1255,11 @@ TEST(Test__GDNProjectionArithmetic, ActualMaterializerPreservesOriginalValuesAnd
         EXPECT_EQ(std::memcmp(binding.tensor->data(), expected.data(), expected.size() * sizeof(float)), 0);
     }
     EXPECT_EQ(frozen.layer(0, "ffn_up.weight").tensor->native_type(), TensorType::Q6_K);
-    EXPECT_EQ(frozen.layer(0, "ssm_alpha.weight").tensor,
-              loader->loadTensor("blk.0.ssm_alpha.weight").get());
+    const auto alpha_source=loader->loadTensor("blk.0.ssm_alpha.weight");
+    const auto* alpha=frozen.layer(0,"ssm_alpha.weight").tensor;
+    EXPECT_NE(alpha,alpha_source.get());
+    ASSERT_EQ(alpha->size_bytes(),alpha_source->size_bytes());
+    EXPECT_EQ(std::memcmp(alpha->raw_data(),alpha_source->raw_data(),alpha->size_bytes()),0);
     EXPECT_EQ(source->native_type(), TensorType::Q6_K);
     EXPECT_EQ(std::memcmp(source->raw_data(), original.data(), original.size()), 0);
 }
@@ -1331,7 +1268,7 @@ TEST(Test__GDNProjectionArithmetic, ActualMaterializerPreservesOriginalValuesAnd
 TEST(Test__GDNProjectionArithmetic, HalfSourceAndOperandPolicyStayScoped)
 {
     using Contract = PreparedWeightRepresentationContract;
-    for (const auto architecture : {"qwen35", "qwen35moe"})
+    for (const auto architecture : {"qwen35", "qwen35moe", "qwen4exp"})
         for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_alpha.weight",
                                "blk.0.ssm_beta.weight", "blk.0.ssm_out.weight"})
         {
@@ -1439,6 +1376,7 @@ TEST(Test__GDNProjectionArithmetic, HalfMaterializationRejectsOverflowAndAdmitsC
     requirement.target_device = DeviceId::cpu();
     requirement.lookup_device = DeviceId::cpu();
     plan.add(requirement);
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     const auto frozen = manager.materialize(plan);
     const auto &binding = frozen.layer(0, "ssm_alpha.weight");
     EXPECT_EQ(binding.tensor->native_type(), TensorType::FP16);
@@ -1502,6 +1440,7 @@ TEST(Test__MoERouterArithmetic, MaterializationSealsHalfOperandsAndPreservesNati
         requirement.lookup_device = DeviceId::cpu();
         plan.add(requirement);
     }
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     const auto frozen = manager.materialize(plan);
     const auto &router = frozen.layer(0, "ffn_gate_inp.weight");
     ASSERT_TRUE(router.tensor_owner);
@@ -1552,7 +1491,7 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaSelectsOnlyOriginalFloatingCont
 {
     using Contract = PreparedWeightRepresentationContract;
     constexpr auto mode = GDNProjectionArithmetic::FP16AlphaBeta;
-    for (const auto architecture : {"qwen35", "qwen35moe"})
+    for (const auto architecture : {"qwen35", "qwen35moe", "qwen4exp"})
         for (const auto name : {"blk.0.ssm_alpha.weight", "blk.12.ssm_beta.weight"})
         {
             const auto role = inferWeightRole(name);
@@ -1663,13 +1602,27 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaMaterializationLeavesWideQuanti
         requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         plan.add(requirement);
     }
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
     const auto frozen = manager.materialize(plan);
     for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ffn_up.weight"})
     {
         const auto &binding = frozen.layer(0, suffix);
         EXPECT_EQ(binding.tensor->native_type(), TensorType::Q6_K);
         EXPECT_EQ(binding.floating_operand_precision, FloatingActivationOperandPrecision::Native);
-        EXPECT_EQ(std::memcmp(binding.tensor->raw_data(), original.data(), original.size()), 0);
+        // Prepared-only metadata never pretends that final VNNI bytes are a
+        // raw native tensor. Compare the actual final bank against packing the
+        // unchanged original codec, preserving the no-requantization contract.
+        EXPECT_EQ(binding.tensor->raw_data(),nullptr);
+        ASSERT_TRUE(binding.prepared);
+        const auto engine=manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared);
+        ASSERT_TRUE(engine);
+        const auto* actual=engine->exportCPUNativeQuantisedPackedWeights();
+        ASSERT_NE(actual,nullptr);
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_bank;
+        ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(wide.get(),expected_bank));
+        ASSERT_EQ(actual->native_interleaved.size(),expected_bank.native_interleaved.size());
+        EXPECT_EQ(std::memcmp(actual->native_interleaved.data(),expected_bank.native_interleaved.data(),
+            actual->native_interleaved.size()),0);
     }
     for (const auto suffix : {"ssm_alpha.weight", "ssm_beta.weight"})
     {
@@ -1685,4 +1638,294 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaMaterializationLeavesWideQuanti
             EXPECT_EQ(words[i], canonicalPreparedHalfBits(source->data()[i]));
     }
     EXPECT_EQ(std::memcmp(wide->raw_data(), original.data(), original.size()), 0);
+}
+
+/** @test Explicit MoE alpha/beta precision includes the exact Flash Next source family. */
+TEST(Test__GDNProjectionArithmetic, FlashNextMoESelectivePolicyMatchesSourceContract)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNAlphaBetaProjection,
+        "blk.0.ssm_alpha.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
+        GDNProjectionArithmetic::FP16);
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNProjection,
+        "blk.0.attn_gate.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
+        GDNProjectionArithmetic::Native);
+}
+
+/** @brief Only the registered QFN source schema changes its omitted router preparation default. */
+TEST(Test__MoERouterArithmetic, QFNDefaultPlanningAndMaterializationUseOneResolvedPolicy)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    constexpr auto role = WeightRole::MoERouter;
+    constexpr auto name = "blk.0.ffn_gate_inp.weight";
+    constexpr auto gdn = kDefaultGDNProjectionArithmetic;
+    const auto omitted = MoERouterArithmetic::ModelDefault;
+    for (const auto architecture : {"qwen4exp", "qwen35moe", "qwen35", "llama"})
+    {
+        SCOPED_TRACE(architecture);
+        const auto expected = architecture == std::string_view("qwen4exp") ?
+            MoERouterArithmetic::FP16 : MoERouterArithmetic::Native;
+        for (const auto &[type, format] : std::initializer_list<std::pair<TensorType, const char *>>{
+                 {TensorType::FP32, "F32"}, {TensorType::FP16, "F16"},
+                 {TensorType::BF16, "BF16"}, {TensorType::Q8_0, "Q8_0"}})
+        {
+            SCOPED_TRACE(format);
+            EXPECT_EQ(Contract::resolve(role, type, name, architecture, gdn, omitted),
+                      Contract::resolve(role, type, name, architecture, gdn, expected));
+            EXPECT_EQ(Contract::resolve(role, format, name, architecture, gdn, omitted),
+                      Contract::resolve(role, type, name, architecture, gdn, expected));
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, gdn, omitted),
+                      expected == MoERouterArithmetic::FP16 ? FloatingActivationOperandPrecision::FP16RNE :
+                          FloatingActivationOperandPrecision::Native);
+            EXPECT_EQ(Contract::resolve(role, type, name, architecture, gdn, MoERouterArithmetic::Native),
+                      Contract::resolve(role, type));
+        }
+        for (const auto source : {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                  "blk.0.ffn_down_exps.weight", "output.weight"})
+        {
+            const auto other_role = inferWeightRole(source);
+            EXPECT_EQ(Contract::resolve(other_role, TensorType::Q8_0, source, architecture, gdn, omitted),
+                      Contract::resolve(other_role, TensorType::Q8_0));
+            EXPECT_EQ(Contract::operandPrecision(other_role, source, architecture, gdn, omitted),
+                      FloatingActivationOperandPrecision::Native);
+        }
+    }
+    EXPECT_EQ(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn),
+              ModelPreparedWeightRepresentation::FP16);
+    EXPECT_EQ(Contract::operandPrecision(role, name, "qwen4exp", gdn),
+              FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_THROW(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn,
+                                  static_cast<MoERouterArithmetic>(255)), std::invalid_argument);
+}
+
+/**
+ * @test Materialization seals every predictor projection before prepared adoption.
+ * @details Metadata-only existing handles reproduce bulk preparation without
+ * loading a GPU or executing GEMM. The real WeightManager path must publish
+ * identical frozen source48/device identities to both graph and prepared store.
+ */
+TEST(Test__WeightManagerMaterialize, PreparedAdoptionPublishesImmutablePredictorSources)
+{
+    using Factory = llaminar::v2::kernels::KernelFactory;
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const std::string suffix : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+                 "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight", "nextn.hc_head_down.weight",
+                 "nextn.hc_head_up.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                 "nextn.eh_proj.weight", "output.weight"})
+        {
+            const std::string name = suffix == "output.weight" ? suffix : "blk.48." + suffix;
+            SCOPED_TRACE(::testing::Message() << name << " device=" << device.toString());
+            auto loader = MockModelLoaderBuilder().addFP32RandomTensor(name, {8, 8}).build();
+            WeightManager manager(*loader);
+            auto store = std::make_shared<PreparedWeightStore>(ModelContextId{1441});
+            manager.setPreparedWeightStore(store);
+            const auto kind = device.is_cpu() ? PreparedWeightKind::CpuPackedGemm :
+                device.is_cuda() ? PreparedWeightKind::CudaInt8PackedGemm : PreparedWeightKind::RocmInt8PackedGemm;
+            InferenceStrategy strategy;
+            strategy.mode = WeightInferenceMode::SingleDevice;
+            strategy.model_id = ModelContextId{1441};
+            strategy.devices = {device};
+            WeightPlan plan(strategy);
+            WeightRequirement requirement;
+            requirement.canonical_name = name;
+            requirement.layer = inferWeightLayer(name);
+            requirement.target_device = device;
+            requirement.lookup_device = DeviceId::cpu();
+            requirement.expected_prepared_kind = kind;
+            plan.add(requirement);
+            admitCPUWeightPlansForTest(manager,*loader,{&plan});
+            const auto first = manager.materialize(plan);
+            ASSERT_EQ(first.bindings().size(), 1u);
+            auto bulk = first.bindings().front();
+            bulk.binding_id = bulk.binding_id == 1 ? 2 : 1;
+            bulk.identity.instance_id = bulk.binding_id;
+            bulk.prepared.reset();
+            auto handle = std::make_shared<Factory::PreparedGemmHandle>();
+            handle->tensor = bulk.tensor;
+            handle->device_id = device;
+            handle->kind = Factory::GemmPreparationKind::FLOATING_POINT;
+            handle->prepared_weights = std::make_shared<Factory::PreparedGemmWeights>();
+            const auto bulk_ref = store->registerPreparedGemmHandle(bulk, kind, device, handle);
+            const auto frozen = manager.materialize(plan);
+            ASSERT_EQ(frozen.bindings().size(), 1u);
+            const auto &binding = frozen.bindings().front();
+            ASSERT_TRUE(binding.prepared.has_value());
+            ASSERT_NE(binding.binding_id, bulk.binding_id);
+            ASSERT_TRUE(store->contains(*binding.prepared));
+            const auto stored = store->binding(*binding.prepared);
+            ASSERT_TRUE(stored.has_value());
+            EXPECT_TRUE(binding.immutable);
+            EXPECT_TRUE(stored->immutable) << "Prepared adoption must not retain a pre-freeze copy";
+            EXPECT_EQ(stored->binding_id, binding.binding_id);
+            EXPECT_EQ(stored->identity, binding.identity);
+            EXPECT_EQ(stored->identity.layer, inferWeightLayer(name));
+            EXPECT_EQ(stored->tensor, binding.tensor);
+            EXPECT_EQ(stored->residency.home_device, device);
+            EXPECT_EQ(binding.prepared->device, device);
+            EXPECT_TRUE(store->binding(bulk_ref)->immutable);
+        }
+}
+
+/** @test Native CPU lookup borrows genuine final resident storage, never a prepared-kind hint. */
+TEST(CPUWeightPlanAdmissionLifecycle, NativeResidentEmbeddingLookupRetainsExactFinalStorage)
+{
+    for(const auto requested:{PreparedWeightKind::CPUResidentTensor,PreparedWeightKind::PreparedEmbedding}) {
+    auto loader=MockModelLoaderBuilder().addQ8_0RandomTensor("token_embd.weight",{4,64}).build();
+    WeightManager manager(*loader);
+    InferenceStrategy strategy;strategy.model_id=ModelContextId{18740};strategy.devices={DeviceId::cpu()};
+    WeightPlan plan(strategy);
+    WeightRequirement requirement;requirement.canonical_name="token_embd.weight";
+    requirement.target_device=DeviceId::cpu();
+    requirement.expected_prepared_kind=requested;
+    plan.add(requirement);
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
+    const auto frozen=manager.materialize(plan);
+    const auto& binding=frozen.global("token_embd.weight");
+    const auto store=manager.preparedWeightStore();
+    const auto resident=store->preparedRefForBinding(binding.binding_id,DeviceId::cpu(),PreparedWeightKind::CPUResidentTensor);
+    ASSERT_TRUE(resident);
+    EXPECT_EQ(store->gemmKernel(*resident),nullptr);
+    ASSERT_TRUE(binding.prepared);
+    ASSERT_EQ(binding.prepared->kind,requested);
+    // Explicit later preparation belongs only to the resident-declared case;
+    // a declared embedding request must arrive fulfilled by the Manager.
+    const auto lookup=requested==PreparedWeightKind::CPUResidentTensor
+        ?store->prepareEmbedding(binding,64):*binding.prepared;
+    ASSERT_EQ(lookup.kind,PreparedWeightKind::PreparedEmbedding);
+    const auto* handle=store->embeddingHandle(lookup);
+    ASSERT_NE(handle,nullptr);ASSERT_TRUE(handle->weights);
+    EXPECT_EQ(handle->weights->retainedFinalCPUTensor(),binding.tensor_owner);
+    EXPECT_EQ(handle->weights->device_data,binding.tensor->raw_data());
+    const auto original=loader->loadTensor("token_embd.weight");
+    ASSERT_EQ(binding.tensor->size_bytes(),original->size_bytes());
+    EXPECT_EQ(std::memcmp(binding.tensor->raw_data(),original->raw_data(),original->size_bytes()),0);
+    EXPECT_FALSE(store->preparedRefForBinding(binding.binding_id,DeviceId::cpu()));
+    const auto retained=store->preparedRefForBinding(binding.binding_id,DeviceId::cpu(),PreparedWeightKind::CPUResidentTensor);
+    ASSERT_TRUE(retained);
+    EXPECT_EQ(retained->binding_id,resident->binding_id);
+    EXPECT_EQ(retained->kind,resident->kind);
+    }
+}
+
+#include "CPUWeightPrecisionIntentContract.inc"
+
+#include "TiedCPUWeightFinalOwnerLifecycle.inc"
+
+#include "NativeWeightSourceAssemblyContract.inc"
+
+#include "CPUOverlaySourceOwnerContract.inc"
+
+/**
+ * @brief Exercise the production immutable index across original endpoint widths.
+ *
+ * No backend/tensor/worker is created: DeviceId values describe frozen metadata.
+ * Both vendors may use ordinal zero without becoming the same participant.
+ */
+TEST(Test__FrozenModelWeightSet, IndexedDeviceLookupPreservesOriginalCandidatesAndOrder)
+{
+    for (const int width : {1, 2, 4, 8})
+    for (const bool reverse : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "width=" << width << " reverse=" << reverse);
+        InferenceStrategy strategy;
+        strategy.model_id = ModelContextId{7};
+        ModelWeightSetBuilder builder(strategy);
+        std::vector<DeviceId> devices;
+        for (int member=0; member<width; ++member)
+        {
+            const int ordinal=member/2;
+            devices.push_back(member%2 ? DeviceId::rocm(ordinal) : DeviceId::cuda(ordinal));
+        }
+        for (int offset=0; offset<width; ++offset)
+        {
+            const int member=reverse ? width-1-offset : offset;
+            builder.addBinding(makeBinding("blk.7.attn_q.weight",devices[member]));
+        }
+        auto alias=makeBinding("blk.7.alias.weight",DeviceId::cpu());
+        alias.residency.resident_device=DeviceId::cuda(15);
+        builder.addBinding(std::move(alias));
+        builder.addBinding(makeBinding("token_embd.weight",DeviceId::cpu()));
+        // Suffix parsing follows the canonical name, while the index coordinate
+        // follows the original identity. Preserve even this metadata edge.
+        auto foreign_name=makeBinding("blk.12.attn_k.weight",DeviceId::cuda(15));
+        foreign_name.identity.layer=7;
+        builder.addBinding(std::move(foreign_name));
+        FrozenModelWeightSet frozen(strategy,builder.freezeBindings());
+        const auto &original=frozen.bindings();
+        EXPECT_EQ(frozen.optionalLayer(7,"attn_q.weight"),&original[width-1]);
+        for (int member=0; member<width; ++member)
+        {
+            const int index=reverse ? width-1-member : member;
+            // Home==resident is one original binding, never two candidates.
+            EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_q.weight",devices[member]),&original[index]);
+        }
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_q.weight",DeviceId::cuda(15)),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"missing.weight",devices.front()),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(8,"attn_q.weight",devices.front()),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"alias.weight",DeviceId::cpu()),&original[width]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"alias.weight",DeviceId::cuda(15)),&original[width]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"alias.weight",DeviceId::rocm(15)),nullptr);
+        EXPECT_EQ(frozen.optionalLayer(-1,"token_embd.weight"),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(-1,"token_embd.weight",DeviceId::cpu()),&original[width+1]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_k.weight",DeviceId::cuda(15)),&original[width+2]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(12,"attn_k.weight",DeviceId::cuda(15)),nullptr);
+        auto copied=frozen;
+        EXPECT_EQ(copied.optionalLayer(7,"attn_q.weight"),&copied.bindings()[width-1]);
+        auto moved=std::move(copied);
+        EXPECT_EQ(moved.optionalLayer(7,"attn_q.weight"),&moved.bindings()[width-1]);
+        EXPECT_EQ(moved.optionalLayerForDevice(7,"alias.weight",DeviceId::cuda(15)),&moved.bindings()[width]);
+    }
+}
+
+/** @brief Ambiguity remains a queried-device failure, never a freeze-time failure. */
+TEST(Test__FrozenModelWeightSet, IndexedDeviceLookupRejectsOnlyActualAmbiguousDevice)
+{
+    InferenceStrategy strategy;
+    ModelWeightSetBuilder builder(strategy);
+    auto alias=makeBinding("blk.3.ffn_gate.weight",DeviceId::cuda(0));
+    alias.residency.resident_device=DeviceId::rocm(0);
+    builder.addBinding(std::move(alias));
+    builder.addBinding(makeBinding("blk.3.ffn_gate.weight",DeviceId::rocm(0)));
+    builder.addBinding(makeBinding("blk.3.ffn_gate.weight",DeviceId::cuda(1)));
+    builder.addBinding(makeBinding("token_embd.weight",DeviceId::cuda(0)));
+    builder.addBinding(makeBinding("token_embd.weight",DeviceId::rocm(0)));
+    FrozenModelWeightSet frozen(strategy,builder.freezeBindings());
+    EXPECT_EQ(frozen.optionalLayer(3,"ffn_gate.weight"),&frozen.bindings()[2]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::cuda(0)),&frozen.bindings()[0]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::cuda(1)),&frozen.bindings()[2]);
+    EXPECT_THROW(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::rocm(0)),std::runtime_error);
+    EXPECT_EQ(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::rocm(1)),nullptr);
+    EXPECT_EQ(&frozen.global("token_embd.weight"),&frozen.bindings()[4]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(-1,"token_embd.weight",DeviceId::cuda(0)),&frozen.bindings()[3]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(-1,"token_embd.weight",DeviceId::rocm(0)),&frozen.bindings()[4]);
+}
+
+/**
+ * @brief Large unrelated original expert populations cannot alter named lookup.
+ * @details Original-size metadata sets model the measured source359 cold and
+ * retained binding populations. There is no wall-clock assertion or device work.
+ */
+TEST(Test__FrozenModelWeightSet, IndexedDeviceLookupRetainsLargeOriginalSourceIdentity)
+{
+    for (const std::size_t count : {std::size_t{1104},std::size_t{57699}})
+    {
+        SCOPED_TRACE(count);
+        InferenceStrategy strategy;
+        ModelWeightSetBuilder builder(strategy);
+        for (std::size_t index=0; index<count-2; ++index)
+            builder.addBinding(makeBinding("blk."+std::to_string(index%49)+".expert_"+
+                std::to_string(index)+".weight",DeviceId::cuda(0)));
+        builder.addBinding(makeBinding("blk.7.attn_q.weight",DeviceId::cuda(0)));
+        builder.addBinding(makeBinding("blk.7.attn_q.weight",DeviceId::rocm(0)));
+        FrozenModelWeightSet frozen(strategy,builder.freezeBindings());
+        ASSERT_EQ(frozen.bindings().size(),count);
+        const auto bindings=makeModelWeightBindings(frozen,DeviceId::cuda(0));
+        for (int replay=0; replay<20; ++replay)
+        {
+            EXPECT_EQ(bindings.get_layer_weights(7).wq,&frozen.bindings()[count-2]);
+            EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_q.weight",DeviceId::rocm(0)),&frozen.bindings()[count-1]);
+            EXPECT_EQ(frozen.optionalLayer(7,"attn_q.weight"),&frozen.bindings()[count-1]);
+            EXPECT_EQ(frozen.optionalLayerForDevice(7,"missing.weight",DeviceId::cuda(0)),nullptr);
+        }
+    }
 }

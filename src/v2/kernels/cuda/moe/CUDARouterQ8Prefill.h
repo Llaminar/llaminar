@@ -3,7 +3,8 @@
  * @brief Shape- and device-aware captured INT8 router prefill with exact Q8 arithmetic.
  *
  * Tile selection uses output-grid occupancy, matrix tails and reduction depth.
- * Device limits are observed before capture and remain immutable launch metadata.
+ * Device limits are borrowed from the admitted inventory before capture and
+ * retained as immutable per-capture launch metadata.
  * A sparse output grid shares the canonical K tree between cooperating warps;
  * a dense grid groups output tiles. Neither choice changes quantization or the
  * reduction order. The enclosing publisher restores the original expert basis.
@@ -11,6 +12,7 @@
 #pragma once
 #include "kernels/common/DeviceRowPartition.h"
 #include "config/MoERouterArithmeticPolicy.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include <cstdint>
 
 namespace llaminar2::cuda
@@ -30,10 +32,31 @@ namespace llaminar2::cuda
         }
     };
 
+    /**
+     * @brief Bind one exact stream/device observation to admitted physical limits.
+     * @param device Requested CUDA ordinal. @param stream_device Observed owning ordinal.
+     * @param capture_active Whether the exact stream is already recording.
+     * @param hardware Immutable record for the requested ordinal.
+     * @param result Published only after the complete binding validates.
+     * @return False for capture, identity disagreement or incomplete physical limits.
+     */
+    inline bool bindRouterQ8PrefillHardware(int device, int stream_device,
+        bool capture_active, const CUDADeviceHardware &hardware,
+        RouterQ8PrefillHardware &result)
+    {
+        const RouterQ8PrefillHardware observed{device, hardware.sm_count,
+                                              hardware.maximum_blocks_per_sm};
+        if (capture_active || device != stream_device || device != hardware.ordinal ||
+            !observed.valid()) return false;
+        result = observed;
+        return true;
+    }
+
     /** @brief Observe the explicit stream's device before any capture begins.
      * @param device Exact CUDA ordinal. @param stream Non-null producer stream.
      * @param result Receives the complete observation only on success.
-     * @return False for a missing/mismatched stream, capture, or native query error. */
+     * @return False for a missing/mismatched stream, capture, or stream observation error.
+     * @throws Admission errors if physical metadata was not explicitly initialized. */
     bool prepareRouterQ8PrefillHardware(int device, void *stream,
                                        RouterQ8PrefillHardware &result);
 

@@ -19,6 +19,8 @@
  * @date February 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
@@ -250,6 +252,10 @@ INSTANTIATE_TEST_SUITE_P(
  */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Initialize MPI with thread support
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -284,7 +290,7 @@ int main(int argc, char **argv)
     // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
     // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
 
     // Finalize MPI
     MPI_Finalize();

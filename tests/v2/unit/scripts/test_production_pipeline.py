@@ -94,10 +94,18 @@ def full_manifest():
     return {**manifest(), "scope": "all", "cells": [cell(), untagged]}
 
 
+def fixture_preflight_qualification():
+    """Authored no-optional-geometry fixture; original producer validates this same partition."""
+    return {"schema": 1, "registered": ["V2_Unit_A", "V2_Integration_B"],
+            "selected": ["V2_Unit_A", "V2_Integration_B"], "requirements": {},
+            "hardware": None, "unqualified": {}}
+
+
 def parity_report():
     """Complete mock numerical evidence uses the same full fixture membership."""
     return {"correctness_passed": True, "performance_requirements_met": True,
             "artifact_contract_passed": True, "preflight_return_code": 0,
+            "preflight_qualification": fixture_preflight_qualification(),
             "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "preflight_test_count": 2,
             "exact_matrix_cell_count": len(full_manifest()["cells"]),
             "campaigns": [{"campaign": "campaign", "return_code": 0, "outcome": "completed",
@@ -109,6 +117,7 @@ def prerequisite_report():
     """Canonical model-free receipt, separate from mathematical diagnostics."""
     return {"preflight_return_code": 0, "preflight_elapsed_seconds": 1,
             "preflight_build_directory": "/src/build_v2_integration", "preflight_completed_ns": 123,
+            "preflight_qualification": fixture_preflight_qualification(),
             "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "preflight_test_count": 2}
 
 
@@ -379,6 +388,7 @@ class GenerationHTTPTests(unittest.TestCase):
         dynamic = policy is generation_http.MTPPolicy.DYNAMIC
         depth = {generation_http.MTPPolicy.OFF: 1, generation_http.MTPPolicy.DEPTH1: 1,
                  generation_http.MTPPolicy.DEPTH2: 2, generation_http.MTPPolicy.DEPTH3: 3,
+                 generation_http.MTPPolicy.DEPTH5: 5, generation_http.MTPPolicy.DEPTH6: 6,
                  generation_http.MTPPolicy.DEPTH15: 15, generation_http.MTPPolicy.DYNAMIC: 2}[policy]
         return {"object": "chat.completion", "token_ids": {"prompt": prompt,
                 "completion": [variant * 1000 + index for index in range(384)]},
@@ -847,6 +857,31 @@ class GenerationHTTPTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             generation_http.validate_mtp_outcome(record["runtime"]["generation"], changed)
 
+    def test_fixed_five_six_preserve_stochastic_prefix_and_exact_terminal_depth(self):
+        """Named non-power verifier axes retain all four384-token/prefix/serial obligations."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            control = self.collect(root / "serial")
+            for policy, depth in ((generation_http.MTPPolicy.DEPTH5, 5), (generation_http.MTPPolicy.DEPTH6, 6)):
+                self.mtp_policy = policy
+                record = self.record(True)
+                record["runtime"]["generation"]["mtp_policy"] = policy.value
+                with patch.object(generation_http, "post_completion", side_effect=self.response) as post:
+                    observed = generation_http.run_probes(record, "http://unused", root / policy.value, control)
+                self.assertEqual(post.call_count, 4)
+                self.assertTrue(observed["complete"])
+                self.assertTrue(observed["repeatability_passed"])
+                self.assertTrue(observed["serial_comparison_passed"])
+                self.assertFalse(observed["certification_eligible"])
+                for request in observed["requests"]:
+                    self.assertEqual(len(request["response"]["token_ids"]["completion"]), 384)
+                response = observed["requests"][0]["response"]
+                for field in ("min_depth", "current_depth", "max_depth"):
+                    changed = copy.deepcopy(response)
+                    changed["runtime_summary"]["mtp"][field] = 3
+                    with self.subTest(policy=policy, field=field), self.assertRaisesRegex(ValueError, "fixed|admitted bounds"):
+                        generation_http.validate_mtp_outcome(record["runtime"]["generation"], changed)
+
     def test_terminal_mtp_evidence_rejects_bypass_wrong_policy_and_inactive_drafts(self):
         """A requested MTP mode is not proof that its stochastic work happened."""
         record = self.record(True)
@@ -956,7 +991,8 @@ class GenerationAcquisitionAuditTests(unittest.TestCase):
             report = {"schema": 1, "mode": "collect-controls" if name == "serial" else "compare-controls",
                 "source_revision": "revision", "certification_eligible": False, "complete": True,
                 "passed": True, "selected": 1, "preflight_return_code": 0, "preflight_test_count": 2,
-                "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "cells": [{
+                "preflight_qualification": fixture_preflight_qualification(),
+            "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "cells": [{
                     "case": "Suite." + name, "configuration": self.records[name], "return_code": 0,
                     "evidence_error": None, "artifacts": str(self.root / name / "row")}]}
             path = self.root / name / "report.json"
@@ -1230,6 +1266,35 @@ class ApprovedGenerationCorpusTests(unittest.TestCase):
             corpus.expected(self.record())
         self.assertEqual(self.inventory["cells"][0]["configuration"]["model"], "/models/model.gguf")
 
+    def test_explicit_predictor_is_portable_but_a_different_predictor_is_not_a_serial_control(self):
+        """Corpus identity pins both artifact roles even when ordinary policy is off."""
+        inventory = copy.deepcopy(self.inventory)
+        sources = copy.deepcopy(self.sources)
+        sources["/models/predictor.gguf"] = [1, 5, 8192, 100, 200]
+        for row in inventory["cells"]:
+            row["configuration"]["shared_predictor"] = "/models/predictor.gguf"
+            row["configuration"]["runtime"]["server_args"] += ["--mtp-model", "/models/predictor.gguf"]
+            row["model_files"].append("/models/predictor.gguf")
+        expected = generation_corpus.portable_inventory(inventory, sources)
+        self.assertEqual(expected[0]["configuration"]["shared_predictor"],
+                         {"filename": "predictor.gguf", "bytes": 8192})
+        moved = pipeline.remap_manifest({**inventory, "cells": [
+            {**row, "configuration": {**row["configuration"],
+                "model": row["configuration"]["model"].replace("/models/", "/src/models/"),
+                "shared_predictor": "/src/models/predictor.gguf",
+                "runtime": {**row["configuration"]["runtime"], "server_args": ["opaque topology", "--mtp-model", "/src/models/predictor.gguf"]}},
+             "model_files": [path.replace("/models/", "/src/models/") for path in row["model_files"]]}
+            for row in inventory["cells"]]}, Path("/mounted/models"))
+        moved_sources = {path.replace("/models/", "/mounted/models/"): stat for path, stat in sources.items()}
+        self.assertEqual(generation_corpus.portable_inventory(moved, moved_sources), expected)
+        for row in inventory["cells"]:
+            row["model_files"].append("/models/foreign.gguf")
+        sources["/models/foreign.gguf"] = [1, 6, 8192, 100, 200]
+        inventory["cells"][1]["configuration"]["shared_predictor"] = "/models/foreign.gguf"
+        inventory["cells"][1]["configuration"]["runtime"]["server_args"][-1] = "/models/foreign.gguf"
+        with self.assertRaisesRegex(ValueError, "exact canonical serial control"):
+            generation_corpus.portable_inventory(inventory, sources)
+
     def test_same_model_filename_with_changed_shard_size_is_rejected(self):
         for path in self.sources:
             sources = copy.deepcopy(self.sources)
@@ -1454,7 +1519,7 @@ class RoutineGenerationPolicyTests(unittest.TestCase):
         helper = GenerationHTTPTests()
         campaign = parity.CampaignCell("campaign", parity.CampaignGroup("CUDA", "ALL"))
         records = [helper.record()]
-        for policy in ("depth_1", "depth_2", "depth_3", "depth_15", "dynamic"):
+        for policy in ("depth_1", "depth_2", "depth_3", "depth_5", "depth_6", "depth_15", "dynamic"):
             record = helper.record(True)
             record["id"] = policy
             record["runtime"]["generation"]["mtp_policy"] = policy
@@ -1464,7 +1529,95 @@ class RoutineGenerationPolicyTests(unittest.TestCase):
         with patch.object(generation_runner, "discover", return_value=inventory):
             self.assertEqual([cell.configuration["id"] for cell in generation_runner.select_cells(args)],
                              ["serial", "dynamic"])
-            self.assertEqual(len(generation_runner.select_cells(args, generation_corpus.InventoryScope.ALL)), 6)
+            self.assertEqual(len(generation_runner.select_cells(args, generation_corpus.InventoryScope.ALL)), 8)
+
+    def test_full_inventory_excludes_only_declared_numerical_controls(self):
+        """Three real discovery roles preserve both QFN tests and unrelated Qwen36 selection."""
+        import model_parity_inventory as inventory_reader
+        helper = GenerationHTTPTests()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, predictor = root / "model.gguf", root / "predictor.gguf"
+            model.write_bytes(b"metadata-only model identity")
+            predictor.write_bytes(b"metadata-only predictor identity")
+            main = helper.record()
+            main["model"] = str(model)
+            diagnostic = copy.deepcopy(main)
+            diagnostic.update(inventory_role="numerical_diagnostic", shared_predictor=str(predictor))
+            serial, dynamic = copy.deepcopy(main), helper.record(True)
+            serial["id"] = serial["runtime"]["generation"]["serial_control_id"] = "qwen36_serial"
+            dynamic.update(id="qwen36_dynamic", model=str(model))
+            dynamic["runtime"]["generation"].update(serial_control_id="qwen36_serial", mtp_policy="dynamic")
+            definitions = [("Main", "CPU", [main]), ("Candidate", "CPU", [diagnostic]),
+                           ("Qwen36", "CUDA", [serial, dynamic])]
+            campaigns, by_binary = [], {}
+            for suite, backend, records in definitions:
+                binary = str(root / ("v2_integration_parity_" + suite.lower() + "_matrix"))
+                cases = tuple(suite + ".ProductionParity/" + record["id"] for record in records)
+                campaigns.append(parity.CampaignCell(suite, parity.CampaignGroup(backend, "ALL"),
+                    command=(binary,), gtest_cases=cases,
+                    model_files=(str(model), str(predictor)) if suite == "Candidate" else (str(model),),
+                    working_directory=str(root)))
+                by_binary[binary] = (suite, records)
+            listed = []
+            omit_diagnostic = False
+            def list_parameters(command, **kwargs):
+                suite, records = by_binary[command[0]]
+                listed.append(suite)
+                rows = [] if omit_diagnostic and suite == "Candidate" else [
+                    {"name": "ProductionParity/" + record["id"], "value_param": json.dumps(record)} for record in records]
+                Path(command[2].removeprefix("--gtest_output=json:")).write_text(json.dumps(
+                    {"testsuites": [{"name": suite, "testsuite": rows}]}))
+            args = argparse.Namespace(mode=generation_runner.RunMode.REGRESSION, manifest=None,
+                build_dir=root, backend=".*", campaign=".*", cell=".*")
+            with patch.object(parity, "discover_campaigns", return_value=campaigns), \
+                 patch.object(inventory_reader.subprocess, "run", side_effect=list_parameters):
+                selected = generation_runner.select_cells(args)
+                self.assertEqual([item.configuration["id"] for item in selected],
+                                 ["serial", "qwen36_serial", "qwen36_dynamic"])
+                self.assertEqual(listed, ["Main", "Candidate", "Qwen36"])
+                raw = inventory_reader.discover(args, inventory_reader.InventoryScope.ALL)
+                manifest = inventory_reader.export_manifest(raw, "revision", inventory_reader.InventoryScope.ALL)
+                self.assertEqual(len(manifest["cells"]), 3)
+                self.assertFalse(any("inventory_role" in item["configuration"] for item in manifest["cells"]))
+                args.backend, args.campaign = "CUDA", ".*Qwen36.*"
+                self.assertEqual([item.configuration["id"] for item in generation_runner.select_cells(args)],
+                                 ["qwen36_serial", "qwen36_dynamic"])
+                # Numerical role never hides a missing raw CTest/GTest member.
+                omit_diagnostic = True
+                with self.assertRaisesRegex(ValueError, "CTest/GoogleTest inventory mismatch"):
+                    generation_runner.select_cells(args)
+                omit_diagnostic = False
+                # A second actual canonical authority remains fatal even when unrelated to selectors.
+                diagnostic.pop("inventory_role")
+                for backend, campaign in ((".*", ".*"), ("CUDA", ".*Qwen36.*")):
+                    args.backend, args.campaign = backend, campaign
+                    with self.subTest(backend=backend), self.assertRaisesRegex(
+                            ValueError, "ambiguous canonical generation cell identity: serial"):
+                        generation_runner.select_cells(args)
+
+    def test_inventory_roles_are_closed_and_never_runtime_eligibility(self):
+        """Unknown roles cannot silently disappear, and diagnostics cannot own HTTP tags."""
+        record = GenerationHTTPTests().record()
+        for role in (None, "", "other", 0, [], {}):
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, "unknown inventory role"):
+                generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": role})
+        for scope in generation_corpus.InventoryScope:
+            self.assertEqual(scope.accepts({**record, "inventory_role": "numerical_diagnostic"}),
+                             scope == generation_corpus.InventoryScope.LOCAL_DIAGNOSTIC)
+        with self.assertRaisesRegex(ValueError, "runtime certification eligibility"):
+            generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": "numerical_diagnostic", "e2e": {}})
+        self.assertTrue(generation_corpus.InventoryScope.ALL.accepts(record))
+        self.assertTrue(generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": "canonical"}))
+        # A hand-written full manifest cannot smuggle a diagnostic back into
+        # corpus approval or image projection after discovery excluded it.
+        document = full_manifest()
+        document["cells"][0]["configuration"].update(inventory_role="numerical_diagnostic", e2e=None)
+        with self.assertRaisesRegex(ValueError, "outside canonical inventory authority"):
+            pipeline.e2e_projection(document, "revision")
+        sources = {path: [1, 1, 2, 1, 1] for row in document["cells"] for path in row["model_files"]}
+        with self.assertRaisesRegex(ValueError, "outside canonical inventory authority"):
+            generation_corpus.portable_inventory(document, sources)
 
     def test_mathematical_matrix_is_explicit_and_receipts_cannot_change_policy(self):
         self.assertNotIn(pipeline.Phase.PARITY, pipeline.pipeline_phases())
@@ -1519,10 +1672,12 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                     frozenset(("Integration", "ProductionTestPreflight")),
                     None,
                     parity.PreflightExecutionLane.HOST,
+                    ctest_index=2,
                 )
                 with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
                      patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
                      patch.object(prebuilt_test_image, "validate") as validate, \
+                     patch.object(parity, "_validate_preflight_index_selection") as preview, \
                      patch.object(parity, "_run_process", return_value=0) as execute:
                     self.assertEqual(prerequisites_runner.main(argv), 0)
                 commands = [call.args[0] for call in execute.call_args_list]
@@ -1536,7 +1691,8 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                                                   parity.PRODUCTION_TEST_PREFLIGHT_BUILD_TARGET])
                 unit, preflight = commands[-2:]
                 self.assertEqual(unit[unit.index("-R") + 1], "^V2_Unit_")
-                self.assertEqual(preflight[preflight.index("-R") + 1], "^(V2_Integration_B)$")
+                self.assertEqual(preview.call_args.args[2], ("V2_Integration_B",))
+                self.assertFalse(Path(preflight[preflight.index("-I") + 1]).exists())
                 for command in (unit, preflight):
                     self.assertIn("--output-log", command)
                     self.assertIn("--output-junit", command)
@@ -1564,7 +1720,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                 root = Path(folder)
                 output = root / "results"
                 with patch.object(prerequisites_runner, "run_production_test_preflight",
-                                  return_value=(code, 1.0, ())) as execute:
+                                  return_value=parity.PreflightResult(code, 1.0, (), None)) as execute:
                     self.assertEqual(prerequisites_runner.main([
                         "--build-dir", str(root), "--output", str(output)]), code)
                     execute.assert_called_once_with(root, None, installed_build_receipt=None,
@@ -1586,6 +1742,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                 frozenset(("Integration", "ProductionTestPreflight")),
                 None,
                 parity.PreflightExecutionLane.HOST,
+                ctest_index=2,
             )
             with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
                  patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
@@ -1606,6 +1763,905 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
 
 
 class BenchmarkPolicyTests(unittest.TestCase):
+    def test_paired_diagnostic_arguments_project_only_explicit_original_prefix_policy(self):
+        """Original metadata adapter only; no model or native authority is minted."""
+        import model_kld_corpus_execution as adapter
+        record = dict(model='/original/model', diagnostic_benchmark=dict(schema=1,
+            policy='diagnostic_declared',certification_eligible=False,context_length=4096,args=['--no-mtp']))
+        observer = dict(expected_config=dict(configuration=dict(prefix_cache=dict(enabled=False))),
+                        engine_argv=['--no-mtp','--no-prefix-cache','--prefill-max-bucket-size','512'])
+        original = copy.deepcopy(record)
+        untouched,_,_ = adapter.canonical_diagnostic_arguments(record)
+        self.assertNotIn('--no-prefix-cache',untouched)
+        actual,_,_ = adapter.canonical_diagnostic_arguments(record,paired_observer=observer)
+        self.assertEqual(actual.count('--no-prefix-cache'),1)
+        self.assertNotIn('--prefill-max-bucket-size',actual)
+        self.assertEqual(record,original)
+        for change in ('enabled','missing','duplicate','conflict'):
+            bad=copy.deepcopy(observer)
+            if change=='enabled':bad['expected_config']['configuration']['prefix_cache']['enabled']=True
+            if change=='missing':bad['engine_argv'].remove('--no-prefix-cache')
+            if change=='duplicate':bad['engine_argv'].append('--no-prefix-cache')
+            if change=='conflict':bad['engine_argv'].append('--prefix-cache')
+            with self.assertRaisesRegex(ValueError,'explicitly disable prefix'):
+                adapter.canonical_diagnostic_arguments(record,paired_observer=bad)
+        conflicting=copy.deepcopy(record);conflicting['diagnostic_benchmark']['args'].append('--prefix-cache')
+        with self.assertRaisesRegex(ValueError,'conflicts with disabled observer'):
+            adapter.canonical_diagnostic_arguments(conflicting,paired_observer=observer)
+
+    def test_declared_parser_rejects_prefix_drift_before_native_launch(self):
+        """Actual benchmark pre-launch guard, with a mocked public-parser owner."""
+        from types import SimpleNamespace
+        prefix = dict(enabled=False, storage_mode='Tiered', disk_dir='/original/archive')
+        canonical = dict(config=dict(configuration=dict(prefix_cache=copy.deepcopy(prefix))))
+        selection = SimpleNamespace(topology=dict(expected_config=copy.deepcopy(canonical['config'])),
+                                    require_public_projection=Mock(return_value=canonical))
+        self.assertIs(benchmark.declared_config_identity(selection, {}, Path('/parser'), {}), canonical)
+        for field,value in [('enabled',True),('disk_dir','/foreign/archive'),('storage_mode','RAM')]:
+            bad = copy.deepcopy(canonical)
+            bad['config']['configuration']['prefix_cache'][field] = value
+            selection.require_public_projection.return_value = bad
+            with self.assertRaisesRegex(ValueError, 'original source prefix-cache policy'):
+                benchmark.declared_config_identity(selection, {}, Path('/parser'), {})
+
+    @staticmethod
+    def _focused_panel_fixture():
+        """Producer-shaped metadata only; no model/native result is claimed by this fixture."""
+        record = {'diagnostic_benchmark': dict(schema=1,policy='diagnostic_declared',
+            certification_eligible=False,context_length=4096,args=['--no-mtp']),
+            'paired_workload': {'accuracy': {'policy':'initial_absolute_pilot'}}}
+        workload = dict(schema=1,prompt_unit=' test',prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3)
+        cell = dict(complete=True,passed=True,observations_complete=True,native_retired=True,
+            returncode=0,driver_window_clean=True,reset_byte_equal=True)
+        panel = dict(schema=2,mode='local_paired_focused_diagnostic',complete=True,passed=None,
+            diagnostic_passed=True,observations_complete=True,status='DIAGNOSTIC_PANEL_COMPLETE',
+            accuracy_verdict='REQUIRED_GROUPS_GREEN',verdict='DIAGNOSTIC_REQUIRED_GROUPS_GREEN',
+            certification_eligible=False,full_preflight=False,calibrated=False,whole_corpus_accepted=False,
+            scope='selected_topology_required_groups_only',
+            prerequisites=dict(available=True,mode='focused_DeviceFree_diagnostic',full_preflight=False,
+                native_backend_regressions='not_covered_by_DeviceFree_selection'),
+            paired_workload=dict(exact_cell='Exact',source_export=record),cells=[cell])
+        return panel,record,workload
+
+    def _assert_declared_focused_panel_requires_explicit_scope_and_rejects_spoofed_green(self):
+        """Focused green is usable only by the explicit diagnostic bridge, never canonical admission."""
+        panel,record,workload = self._focused_panel_fixture();before=copy.deepcopy(panel)
+        self.assertEqual(benchmark.declared_panel_eligibility(panel,'Exact',record,workload,
+            allow_focused_diagnostic=True),record['diagnostic_benchmark'])
+        self.assertEqual(panel,before);self.assertIsNone(panel['passed'])
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,'Exact',record,workload)
+        for field,value in [('complete',False),('observations_complete',False),('diagnostic_passed',False),
+                ('diagnostic_passed',None),('accuracy_verdict','UNCALIBRATED'),('accuracy_verdict','REQUIRED_GROUPS_RED'),
+                ('verdict','GREEN'),('status','DIAGNOSTIC_PANEL_RUNNING'),('passed',True),
+                ('full_preflight',True),('certification_eligible',True)]:
+            with self.subTest(field=field,value=value):
+                bad=copy.deepcopy(panel);bad[field]=value
+                with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        for field,value in [('available',False),('mode','complete_production_preflight'),('full_preflight',True),
+                ('native_backend_regressions','covered')]:
+            bad=copy.deepcopy(panel);bad['prerequisites'][field]=value
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        for field,value in [('exact_cell','Other'),('source_export',{})]:
+            bad=copy.deepcopy(panel);bad['paired_workload'][field]=value
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        for field in ('complete','passed','observations_complete','native_retired','driver_window_clean','reset_byte_equal'):
+            bad=copy.deepcopy(panel);bad['cells'][0][field]=False
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        bad=copy.deepcopy(panel);bad.update(mode='local_paired_canonical_accuracy',passed=True)
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload)
+        import model_kld_canary
+        with self.assertRaises(ValueError):model_kld_canary.validate_report(panel,source_revision='fixture',image={},
+            cpu_isa='AVX512',corpus_manifest_digest='fixture')
+        spoofed=copy.deepcopy(panel);spoofed.update(schema=1,passed=True,source_revision='fixture',image={},
+            corpus_manifest_digest='fixture',cpu_isa='AVX512',diagnostic_only=False,full_preflight=True)
+        with self.assertRaises(ValueError):model_kld_canary.validate_report(spoofed,source_revision='fixture',image={},
+            cpu_isa='AVX512',corpus_manifest_digest='fixture')
+
+    def _assert_declared_focused_scope_reuses_complete_row_and_original_pilot_evaluator(self):
+        """Actual tiny scored rows exercise original evaluator negatives, not a replacement scorer."""
+        from types import SimpleNamespace
+        from test_model_kld_corpus_v2 import manifest,observation,absolute_pilot
+        import model_kld_corpus_v2 as corpus
+        panel,_,_=self._focused_panel_fixture();m=manifest();metrics=observation(m);pilot=absolute_pilot(m)
+        selection=SimpleNamespace(corpus={'manifest':m},documents={'pilot':pilot})
+        cell=dict(metrics=metrics,native_identity=metrics['native_identity'],
+            numerical_summary=corpus.summarize(m,metrics,absolute_pilot=pilot))
+        original=copy.deepcopy(cell);scope=benchmark.declared_focused_accuracy_scope(panel,selection,cell)
+        self.assertFalse(scope['full_preflight']);self.assertFalse(scope['certification_eligible'])
+        self.assertFalse(scope['calibrated']);self.assertEqual(scope['scope'],'selected_topology_required_groups_only')
+        self.assertEqual(cell,original)
+        for change in ('missing','duplicate','reordered','foreign_source','foreign_math','red','unscored_green','wrong_native'):
+            bad=copy.deepcopy(cell)
+            if change=='missing':bad['metrics']['rows'].pop()
+            elif change=='duplicate':bad['metrics']['rows'][-1]=copy.deepcopy(bad['metrics']['rows'][0])
+            elif change=='reordered':bad['metrics']['rows'].reverse()
+            elif change=='foreign_source':bad['metrics']['source_digest']='foreign'
+            elif change=='foreign_math':bad['metrics']['arithmetic']['hc_up']='two_term_q8'
+            elif change=='red':bad['metrics']=observation(m,replacements={m['histories'][0]['id']+':prefill':[-100.,0.,0.,0.,0.,0.]})
+            elif change=='unscored_green':bad['numerical_summary']['groups']=[]
+            else:bad['native_identity']={'fixture':'another'}
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                benchmark.declared_focused_accuracy_scope(panel,selection,bad)
+        with self.assertRaises(ValueError):benchmark.declared_focused_accuracy_scope(panel,
+            SimpleNamespace(corpus={'manifest':m},documents={}),cell)
+
+    def _assert_declared_focused_generated_inventory_and_list_use_original_typed_document_policy(self):
+        """Real inventory export/discover and adapter paths stop before native execution."""
+        from types import SimpleNamespace
+        from test_model_kld_corpus_execution import paired_fixture
+        from test_model_kld_corpus_v2 import observation
+        import model_parity_inventory as inventory
+        import model_kld_corpus_execution as owner
+        import gpu_driver_diagnostics as driver
+        from model_kld_corpus import metadata_digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);c,t,exact,record=paired_fixture(root)
+            record.update(inventory_role='numerical_diagnostic',e2e=None,cross_host_e2e=[])
+            panel,_,workload=self._focused_panel_fixture()
+            benchmark_path=root/'benchmark.json';benchmark_path.write_text(json.dumps(workload))
+            record['paired_workload']['benchmark']['profile']['sha256']=hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
+            external=root/'source-owned';external.mkdir();source_manifest=external/'manifest.json'
+            (root/'manifest.json').rename(source_manifest)
+            record['paired_workload']['accuracy']['workload']['path']=str(source_manifest)
+            metrics=observation(c['manifest']);metrics['native_identity']['executable_sha256']='fixture-only'
+            summary=owner.corpus_v2.summarize(c['manifest'],metrics,absolute_pilot=json.loads((root/'pilot.json').read_text()))
+            cell={**panel['cells'][0], 'topology_id':t['id'],'metrics':metrics,'numerical_summary':summary,
+                'native_identity':metrics['native_identity'],'actual_owner':{'fixture_only':True}}
+            panel.update(cells=[cell],paired_workload=dict(exact_cell=exact,source_export=record),
+                corpus_manifest_digest=metadata_digest(c['manifest']),absolute_pilot_digest=metadata_digest(json.loads((root/'pilot.json').read_text())),
+                binary={'sha256':'fixture-only'})
+            panel_path=root/'panel.json';panel_path.write_text(json.dumps(panel))
+            cell_path=root/t['id'];cell_path.mkdir()
+            (cell_path/'described-config.json').write_text(json.dumps(dict(schema='llaminar.model-kld-described-config.v1',
+                engine_argv=t['engine_argv'],config=t['expected_config'],runtime_config_digest=t['runtime_config_digest'])))
+            (cell_path/'controller.json').write_text(json.dumps({**cell,'returncode':0}))
+            native={**metrics,'actual_owner':cell['actual_owner']}
+            (cell_path/'native-observation.json').write_text(json.dumps(native))
+            campaign=parity.CampaignCell('fixture-source',parity.CampaignGroup('CPU','ALL'),model_files=(record['model'],))
+            document=inventory.export_manifest([(campaign,exact,record)],'fixture-revision',inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+            path=root/'inventory.json';path.write_text(json.dumps(document))
+            binary=root/'llaminar2';binary.write_text('not-an-executable-fixture')
+            parser=root/'llaminar_model_kld_canary';parser.write_text('not-an-executable-fixture')
+            args=argparse.Namespace(manifest=path,source_revision='fixture-revision',declared_cell=exact,diagnostic=True,
+                diagnostic_binary=binary,image=None,e2e_report=None,panel_report=panel_path,corpus_root=root,parser_binary=parser,
+                report=root/'result.json',workload=benchmark_path,list=True)
+            with patch.object(benchmark.e2e,'release_binary_cpu_isa'), \
+                 patch.object(driver,'validate_evidence'), \
+                 patch.object(owner.corpus_v2,'load_corpus',return_value=c) as load, \
+                 patch.object(benchmark,'run_declared_guardian',side_effect=AssertionError('No native launch')):
+                self.assertEqual(benchmark.run_declared_diagnostic(args),0)
+            self.assertEqual(load.call_args.kwargs['manifest_path'],source_manifest.resolve())
+            self.assertIsNone(json.loads(panel_path.read_text())['passed'])
+            with self.assertRaises(ValueError):benchmark.declared_inventory(args,binary)
+            for bad_document in ({**document,'scope':'e2e'},{**document,'source_revision':'foreign'}):
+                path.write_text(json.dumps(bad_document))
+                with self.assertRaises(ValueError):benchmark.declared_inventory(args,binary,scope=inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+            path.write_text(json.dumps(document));args.declared_cell='Other'
+            with self.assertRaises(ValueError):benchmark.declared_inventory(args,binary,scope=inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+
+    def test_declared_benchmark_requires_exact_green_panel_and_complete_retirement(self):
+        """Declared placement is eligible only after genuine same-policy numerical/terminal proof."""
+        record = {"diagnostic_benchmark": {"schema": 1, "policy": "diagnostic_declared",
+            "certification_eligible": False, "context_length":512, "args": ["--ngram-gpu-cache-placement", "consumer-local"]}}
+        workload = dict(schema=1,prompt_unit=" test",prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3)
+        panel = dict(mode="local_fixed_history_diagnostic",complete=True,passed=True,observations_complete=True,
+            cells=[dict(complete=True,passed=True,observations_complete=True,native_retired=True,
+                returncode=0,driver_window_clean=True,reset_byte_equal=True)])
+        self.assertEqual(benchmark.declared_panel_eligibility(panel,"Exact",record,workload),record['diagnostic_benchmark'])
+        for field in ('complete','passed','observations_complete'):
+            bad=copy.deepcopy(panel);bad[field]=False
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        for field in ('complete','passed','observations_complete','native_retired','driver_window_clean','reset_byte_equal'):
+            bad=copy.deepcopy(panel);bad['cells'][0][field]=False
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        bad=copy.deepcopy(panel);bad['cells'][0]['returncode']=1
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        bad=copy.deepcopy(panel);bad['paired_workload']={'exact_cell':'Other','source_export':record}
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        bad=copy.deepcopy(record);bad['diagnostic_benchmark']['policy']='production_defaults'
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",bad,workload)
+        bad=copy.deepcopy(workload);bad['measurement_iterations']=2
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",record,bad)
+        # This exact selector already owns a dedicated ProductionTestPreflight
+        # registration. Keep both strict and explicit focused modes under it.
+        self._assert_declared_focused_panel_requires_explicit_scope_and_rejects_spoofed_green()
+        self._assert_declared_focused_scope_reuses_complete_row_and_original_pilot_evaluator()
+
+    @staticmethod
+    def _passive_lookup_fixture(backing='RAM', shared=False, positive=True):
+        """Recorded original setup/terminal schemas; no native-success or numerical evidence is minted."""
+        config={'routed_expert_owner_order':'Ordinal','moe_routed_expert_plan':{
+            'continuation_domain':'original','dense_domains':[{'name':'original','owner_rank':0,
+                'participants':[{'device_type':'CUDA','device_ordinal':i} for i in range(2)]}],
+            'first_model_layer':0,'routed_tiers':[{'domain':'original','resolved_live_experts_per_layer':[128]}],
+            'domains':[{'name':'original','participants':[{'device_type':'CUDA','device_ordinal':i} for i in range(2)]}]}}
+        maximum,ceiling=(100,4096) if positive else (0,0)
+        participants=[{'world_rank':0,'backend':'CUDA','ordinal':i} for i in range(2)]
+        placement={'mode':'DeclaredRankLocal','coordinator':participants[1],
+            'owners':[{'participant':p,'maximum_cache_rows':maximum,'cache_physical_byte_limit':ceiling} for p in participants]} if shared else {'mode':'ConsumerLocal','owners':[]}
+        config['ngram_table_policy']={'storage':'AdaptiveVRAMRAMSSD','gpu_adaptive':{
+            'source_backing':backing,'maximum_gpu_cache_rows':maximum,'gpu_cache_physical_byte_limit':ceiling,
+            'placement':placement,'host':{'maximum_cache_rows':0,'cache_physical_byte_limit':0}}}
+        mode='gpu_subordinate_full_ram' if backing=='RAM' else 'host_adaptive_ram_ssd'
+        records=[]
+        def record(domain,name,device,tags,phase,count=3,value=0):
+            row=dict(domain=domain,name=name,device=device,tags=tags,phase=phase,count=count,value=value,
+                kind='counter',total_ns=0,min_ns=0,max_ns=0)
+            records.append(row);return row
+        common={'storage':mode,'source_path':'/original/table.gguf','source_tensor':'per_layer_token_embd.weight',
+            'source_format':'2','source_generation':'17','source_file_offset':'37','source_rows':'1000','source_row_elements':'32','source_row_bytes':'90'}
+        def owner(device,role,slots,payload,metadata,source,staging):
+            tags={**common,'world_rank':'0','role':role,'admitted_slots':str(slots),'payload_bytes':str(payload),
+                'metadata_bytes':str(metadata),'source_storage_bytes':str(source),
+                'table_storage_bytes':str(payload+metadata+source),'lookup_staging_bytes':str(staging)}
+            return record('immutable_lookup_setup','admitted_owner',device,tags,'setup',1,1)
+        sources=['CUDA:1'] if shared else ['CUDA:0','CUDA:1']
+        for i in range(2):
+            owner(f'CUDA:{i}','gpu_cache',2 if positive else 0,192 if positive else 0,64 if positive else 0,0,256)
+        for device in sources:
+            owner(device,'gpu_policy',0,0,128 if positive else 0,0,64)
+            owner(device,'gpu_source_staging',0,0,0,0,512)
+        owner('CPU','shared_host_source',0,0,0,8192,512)
+        device_names=('adaptive_lookup_calls','adaptive_completed_live_ids','adaptive_cache_hit_rows','adaptive_cache_miss_rows',
+            'adaptive_source_rows','adaptive_source_native_bytes','adaptive_promotions','adaptive_evictions','adaptive_failed_frames')
+        host_names=('intervals','requests','ids','id_bytes','native_bytes','metadata_bytes','acknowledgement_bytes','terminal_bytes','failures',
+            'window_hits','window_misses','window_evictions','adaptive_batches','ram_rows','source_rows','duplicate_rows','cache_admissions',
+            'cache_evictions','cache_admission_rejections','all_pinned_responses')
+        for device in sources:
+            for name in device_names:record('immutable_lookup',name,device,{'request':'0','storage':'vram','transport':'pooled_subordinate',
+                'authority':'terminal_device_generation_control'},'generation_terminal')
+            for name in host_names:record('immutable_lookup',name,device,{'storage':mode,'transport':'pooled_subordinate'},
+                'generation_terminal',value=3 if name=='intervals' else 72 if name=='terminal_bytes' else 0)
+            for name in ('reset_terminal_closes','reset_terminal_waits'):
+                record('immutable_lookup',name,device,{},'request_reset',3,3)
+            for name in ('retained_source_native_invocations','retained_remote_native_enqueues'):
+                record('ngram_lookup',name,device,{'policy':'retained_hosted'},'hosted_transaction')
+        for i in range(2):record('moe_placement','routed_expert_weight_selection',f'CUDA:{i}',
+            {'layer':'0','participant':str(i),'owner_order':'ordinal','selection_layout':'contiguous'},'load',3,384)
+        return {'runtime_configuration':{'configuration':config},
+            'perf_stats':{'schema':'llaminar.perf_stats.v1','enabled':True,'records':records}}
+
+    def _combined_passive_fixture(self, zero_positive=False):
+        """Authored metadata replay only; no native allocation or timing is fabricated."""
+        data=self._passive_lookup_fixture(shared=True)
+        config=data['runtime_configuration']['configuration']
+        request=config['ngram_table_policy']['gpu_adaptive']
+        request['local_hot_cache']={'maximum_cache_rows':100,'cache_physical_byte_limit':4096,
+            'consumer_overrides':[]}
+        if zero_positive:
+            request['local_hot_cache']['consumer_overrides']=[{'participant':{'world_rank':0,'backend':'CUDA','ordinal':0},
+                'maximum_cache_rows':0,'cache_physical_byte_limit':0}]
+        records=data['perf_stats']['records']
+        common=next(r['tags'] for r in records if r['domain']=='immutable_lookup_setup')
+        for ordinal in range(2):
+            slots=0 if zero_positive and ordinal==0 else 2
+            for role,device in (('local_gpu_cache',f'CUDA:{ordinal}'),('local_ready','CPU')):
+                tags={**common,'role':role,'admitted_slots':str(slots if role=='local_gpu_cache' else 0),
+                    'payload_bytes':str(slots*90 if role=='local_gpu_cache' else 0),
+                    'metadata_bytes':str(64 if slots and role=='local_gpu_cache' else 0),
+                    'table_storage_bytes':str(slots*90+64 if slots and role=='local_gpu_cache' else 0),
+                    'source_storage_bytes':'0','lookup_staging_bytes':'4096',
+                    'local_consumer':f'CUDA:{ordinal}','local_storage_identity':str(100+ordinal)}
+                records.append(dict(domain='immutable_lookup_setup',name='admitted_owner',device=device,tags=tags,
+                    phase='setup',count=1,value=1,kind='counter',total_ns=0,min_ns=0,max_ns=0))
+            values=[32,16 if slots else 0,0,32,0,0,0,0,1 if slots else 0,0,0,0,0,0,0]
+            if ordinal==1:values[10:]=[8,0,88,96,0]
+            else:values[10:]=[0,90,96,0,40]
+            for window,count in (('since_original_storage_initialization',1),('between_completed_terminals',2)):
+                for index,name in enumerate(benchmark.LOCAL_TERMINAL_NAMES):
+                    records.append(dict(domain='ngram_lookup',name=name,device=f'CUDA:{ordinal}',
+                        phase='generation_terminal',kind='counter',count=count,value=values[index]*count,
+                        total_ns=0,min_ns=0,max_ns=0,sequence_word_count=count,
+                        sequence_minimum_words=[values[index]],sequence_maximum_words=[values[index]],
+                        tags={'authority':'completed_local_hot_terminal','storage_identity':str(100+ordinal),
+                            'unit':'original_l1_ids' if index<4 else 'native_rows' if index<10 else 'bytes',
+                            'wire_attribution':'receive_completed_only','window':window}))
+        return data
+
+    @staticmethod
+    def _initial_bank_fixture():
+        """Exact initial-bank producer forms; no native authority or execution."""
+        data=BenchmarkPolicyTests._passive_lookup_fixture(shared=True)
+        config=data['runtime_configuration']['configuration']
+        config['shared_predictor']='/original/predictor.gguf'
+        plan=config['moe_routed_expert_plan']
+        plan['domains'][0].update(routed_compute_policy='Apportioned',routed_phase_policy='Uniform')
+        plan['domains'].append(dict(name='cpu',participants=[dict(device_type='CPU',device_ordinal=0)],
+                                    routed_compute_policy='Apportioned',routed_phase_policy='Uniform'))
+        plan['routed_tiers'][0]['resolved_live_experts_per_layer']=[128,128]
+        plan['routed_tiers'].append(dict(domain='cpu',resolved_live_experts_per_layer=[256,256]))
+        records=data['perf_stats']['records']
+        records[:]=[x for x in records if x['domain']!='moe_placement']
+        for layer,role in [(0,'main_transformer'),(1,'mtp_predictor')]:
+            for device,participant,tier,size,selected in [('CUDA:0',0,0,2,64),('CUDA:1',1,0,2,64),('CPU',2,1,1,256)]:
+                records.append(dict(domain='moe_placement',name='routed_expert_weight_selection',device=device,
+                    phase='model_setup',kind='counter',count=1,value=selected,total_ns=0,
+                    tags=dict(layer=str(layer),participant=str(participant),tier=str(tier),tier_participant_count=str(size),
+                        owner_order='ordinal',selection_layout='contiguous',publication='initial_epoch_bank',
+                        frozen_owner_map_match='true',layer_role=role)))
+        return data
+
+    def test_declared_passive_initial_bank_matches_exact_registry_publication(self):
+        """Producer-shaped initial banks retain global IDs, tier and role coverage."""
+        data=self._initial_bank_fixture()
+        self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+        for field,value in [('publication','desired_map'),('frozen_owner_map_match','false'),('layer_role','unknown'),
+                            ('tier','2'),('tier_participant_count','3'),('participant','2')]:
+            bad=copy.deepcopy(data);next(x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement')['tags'][field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+        for change in ('partial','population','no_predictor','role_order'):
+            bad=copy.deepcopy(data);banks=[x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement']
+            if change=='partial':bad['perf_stats']['records'].remove(banks[-1])
+            if change=='population':banks[-1]['value']-=1
+            if change=='no_predictor':bad['runtime_configuration']['configuration'].pop('shared_predictor')
+            if change=='role_order':banks[-1]['tags']['layer_role']='main_transformer'
+            with self.subTest(change=change),self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_initial_bank_uses_physical_domain_policy_and_zero_banks(self):
+        """Sharded/replicated physical IDs are repeated; empty admitted banks remain evidence."""
+        for compute,phase,replicated in [('Apportioned','Uniform',False),('TensorSharded','Uniform',True),
+                ('Replicated','Uniform',True),('Apportioned','PrefillApportionedDecodeReplicated',True)]:
+            for population in [0,128]:
+                data=self._initial_bank_fixture()
+                plan=data['runtime_configuration']['configuration']['moe_routed_expert_plan']
+                plan['domains'][0].update(routed_compute_policy=compute,routed_phase_policy=phase)
+                plan['routed_tiers'][0]['resolved_live_experts_per_layer']=[population,population]
+                banks=[x for x in data['perf_stats']['records'] if x['domain']=='moe_placement' and x['tags']['tier']=='0']
+                for bank in banks:bank['value']=population if replicated else population//2
+                with self.subTest(compute=compute,phase=phase,population=population):
+                    self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+                bad=copy.deepcopy(data)
+                next(x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement')['value']+=1
+                with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+        # CPU F-shard members can share the rendered CPU DeviceId; their
+        # original global participant IDs still identify distinct physical banks.
+        data=self._initial_bank_fixture()
+        domain=data['runtime_configuration']['configuration']['moe_routed_expert_plan']['domains'][1]
+        domain['participants']*=2
+        domain.update(routed_compute_policy='TensorSharded',routed_phase_policy='Uniform')
+        cpu=[x for x in data['perf_stats']['records'] if x['domain']=='moe_placement' and x['tags']['tier']=='1']
+        for bank in cpu:
+            bank['tags']['tier_participant_count']='2'
+            other=copy.deepcopy(bank);other['tags']['participant']='3';data['perf_stats']['records'].append(other)
+        self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+        bad=self._initial_bank_fixture()
+        bad['runtime_configuration']['configuration']['moe_routed_expert_plan']['domains'][0]['routed_compute_policy']='Automatic'
+        with self.assertRaisesRegex(ValueError,'unsupported passive initial-bank compute/phase'):
+            benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_socket_ordinals_preserve_global_expert_owners(self):
+        """CPU socket ordinals are not native DeviceId ordinals; global owners distinguish banks."""
+        for sockets in (1,2,4,8):
+            for compute in ('Apportioned','TensorSharded'):
+                with self.subTest(sockets=sockets,compute=compute):
+                    data=self._initial_bank_fixture()
+                    domain=data['runtime_configuration']['configuration']['moe_routed_expert_plan']['domains'][1]
+                    domain.update(participants=[dict(device_type='CPU',device_ordinal=i,numa_node=i)
+                                                for i in range(sockets)],routed_compute_policy=compute)
+                    records=data['perf_stats']['records']
+                    templates=[row for row in records if row['domain']=='moe_placement' and row['tags']['tier']=='1']
+                    records[:]=[row for row in records if row not in templates]
+                    for template in templates:
+                        for socket in range(sockets):
+                            row=copy.deepcopy(template)
+                            row['tags'].update(participant=str(2+socket),tier_participant_count=str(sockets))
+                            row['value']=256 if compute=='TensorSharded' else 256//sockets
+                            records.append(row)
+                    self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+                    for mutation in ('missing','duplicate','foreign','population'):
+                        bad=copy.deepcopy(data);banks=bad['perf_stats']['records']
+                        row=next(x for x in banks if x['domain']=='moe_placement' and x['tags']['tier']=='1')
+                        if mutation=='missing':banks.remove(row)
+                        if mutation=='duplicate':banks.append(copy.deepcopy(row))
+                        if mutation=='foreign':row['tags']['participant']=str(sockets+2)
+                        if mutation=='population':row['value']+=1
+                        with self.subTest(mutation=mutation),self.assertRaises(ValueError):
+                            benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_gateup_initial_banks_preserve_exact_movable_ownership(self):
+        """Gate/up IDs partition once; fixed down columns are not resident duplicates."""
+        for population in (0, 128):
+            data=self._initial_bank_fixture()
+            plan=data['runtime_configuration']['configuration']['moe_routed_expert_plan']
+            plan['domains'][0].update(routed_compute_policy='GateUpOwnedDownColumns',routed_phase_policy='Uniform')
+            plan['routed_tiers'][0]['resolved_live_experts_per_layer']=[population,population]
+            banks=[x for x in data['perf_stats']['records'] if x['domain']=='moe_placement' and x['tags']['tier']=='0']
+            for bank in banks:bank['value']=population//2
+            with self.subTest(population=population):
+                self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+                for mutation in ('partial','duplicate','population','foreign_member','unfrozen','phase','unknown_policy'):
+                    bad=copy.deepcopy(data)
+                    bad_plan=bad['runtime_configuration']['configuration']['moe_routed_expert_plan']
+                    row=next(x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement')
+                    if mutation=='partial':bad['perf_stats']['records'].remove(row)
+                    if mutation=='duplicate':bad['perf_stats']['records'].append(copy.deepcopy(row))
+                    if mutation=='population':row['value']+=1
+                    if mutation=='foreign_member':row['tags']['participant']='99'
+                    if mutation=='unfrozen':row['tags']['frozen_owner_map_match']='false'
+                    if mutation=='phase':bad_plan['domains'][0]['routed_phase_policy']='PrefillApportionedDecodeReplicated'
+                    if mutation=='unknown_policy':bad_plan['domains'][0]['routed_compute_policy']='UnknownGateUp'
+                    with self.subTest(mutation=mutation),self.assertRaises(ValueError):
+                        benchmark.validate_declared_passive_evidence(bad)
+                if population:
+                    bad=copy.deepcopy(data)
+                    for row in bad['perf_stats']['records']:
+                        if row['domain']=='moe_placement' and row['tags']['tier']=='0':row['value']=population
+                    with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_noncoordinator_terminal_is_exact_original_zero_tuple(self):
+        """An original non-source controller can publish no source work, never invented traffic."""
+        data=self._passive_lookup_fixture(shared=True)
+        rows=[copy.deepcopy(x) for x in data['perf_stats']['records'] if x['domain']=='immutable_lookup'
+              and x['tags'].get('authority')=='terminal_device_generation_control']
+        for x in rows:x['device']='CUDA:0'
+        data['perf_stats']['records'].extend(rows)
+        self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+        for change in ('positive','foreign','partial'):
+            bad=copy.deepcopy(data)
+            if change=='positive':bad['perf_stats']['records'][-1]['value']=1
+            if change=='foreign':
+                for x in bad['perf_stats']['records'][-len(rows):]:x['device']='CUDA:7'
+            if change=='partial':bad['perf_stats']['records'].pop()
+            with self.subTest(change=change),self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_combined_passive_binds_actual_local_ready_pairs_and_storage_windows(self):
+        for zero_positive in (False,True):
+            data=self._combined_passive_fixture(zero_positive)
+            result=benchmark.validate_declared_passive_evidence(data)
+            local=result['local_hot']
+            self.assertEqual(len(local['setup']),4)
+            self.assertEqual(len(local['terminal_observations']),4)
+            self.assertEqual(sorted(r['count'] for r in local['terminal_observations']),[1,1,2,2])
+            self.assertIn('physical_budget_pairing_requires_final_original_pma_costs',local['qualification_limits'])
+            self.assertEqual(len(result['setup']),5) # Unchanged original pool/source owners only.
+
+    def test_declared_combined_passive_rejects_foreign_incomplete_or_impossible_native_work(self):
+        original=self._combined_passive_fixture()
+        cases=[]
+        def changed(predicate,mutate):
+            data=copy.deepcopy(original);mutate(next(r for r in data['perf_stats']['records'] if predicate(r)));cases.append(data)
+        is_local=lambda r:r['domain']=='ngram_lookup' and r['name'].startswith('local_')
+        changed(is_local,lambda r:r['tags'].update(storage_identity='999'))
+        changed(is_local,lambda r:r.update(sequence_word_count=0))
+        changed(is_local,lambda r:r.update(sequence_word_count=True))
+        changed(is_local,lambda r:r.update(count=2)) # Initialization is storage-once, never request-once.
+        changed(is_local,lambda r:r.update(sequence_minimum_words=[999]))
+        changed(lambda r:r.get('tags',{}).get('role')=='local_ready',lambda r:r['tags'].update(local_consumer='CUDA:9'))
+        changed(lambda r:r.get('tags',{}).get('role')=='local_ready',lambda r:r['tags'].update(local_storage_identity='999'))
+        changed(lambda r:r.get('tags',{}).get('role')=='local_gpu_cache',lambda r:r['tags'].update(payload_bytes='181'))
+        data=copy.deepcopy(original);data['perf_stats']['records'].pop();cases.append(data)
+        data=copy.deepcopy(original);data['runtime_configuration']['configuration']['ngram_table_policy']['gpu_adaptive']['local_hot_cache']=None;cases.append(data)
+        data=copy.deepcopy(original);overrides=data['runtime_configuration']['configuration']['ngram_table_policy']['gpu_adaptive']['local_hot_cache']['consumer_overrides']
+        overrides.extend([{'participant':{'world_rank':0,'backend':'CUDA','ordinal':0},'maximum_cache_rows':100,'cache_physical_byte_limit':4096}]*2);cases.append(data)
+        # Exact wire byte categories cannot be relabeled as source-self or capacity.
+        for name in ('local_request_key_payload_bytes','local_native_result_payload_bytes','local_lookup_control_header_bytes','local_acknowledgement_bytes','local_request_admission_bytes'):
+            changed(lambda r:is_local(r) and r['name']==name,lambda r:r.update(value=r['value']+1,sequence_minimum_words=[r['value']+1],sequence_maximum_words=[r['value']+1]))
+        data=self._combined_passive_fixture(True)
+        for r in data['perf_stats']['records']:
+            if r['name']=='local_hit_original_ids' and r['device']=='CUDA:0':r.update(value=r['count'],sequence_minimum_words=[1],sequence_maximum_words=[1])
+        cases.append(data)
+        for data in cases:
+            with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(data)
+
+    def test_declared_passive_environment_overrides_caller_profiling_before_startup(self):
+        supplied={'PATH':'/original','HOME':'/home/original','OMP_NUM_THREADS':'56','LD_PRELOAD':'/foreign',
+            'LLAMINAR_PERF_STATS_JSON':'/foreign/all.json','LLAMINAR_PERF_STATS_FILTER':'*',
+            'LLAMINAR_PERF_STATS_CPU_STAGE_TIMING':'1','LLAMINAR_PERF_STATS_GPU_STAGE_TIMING':'1',
+            'LLAMINAR_GPU_STAGE_TIMING':'1','LLAMINAR_PROFILE':'1'}
+        environment=benchmark.declared_environment(supplied,{'measurement_iterations':3,'warmup_iterations':1},{},Path('/owned'))
+        self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
+        self.assertEqual(environment['LLAMINAR_PERF_STATS_JSON'],'/owned/passive-perfstats-rank-{rank}.json')
+        for name in ('LLAMINAR_PERF_STATS_CPU_STAGE_TIMING','LLAMINAR_PERF_STATS_GPU_STAGE_TIMING','LLAMINAR_GPU_STAGE_TIMING'):
+            self.assertEqual(environment[name],'0')
+        self.assertNotIn('LLAMINAR_PROFILE',environment);self.assertNotIn('LD_PRELOAD',environment)
+        self.assertEqual(environment['OMP_NUM_THREADS'],'56')
+
+    def test_declared_passive_adaptive_setup_and_zero_activity_are_complete(self):
+        for backing in ('RAM','SSD'):
+            for shared in (False,True):
+                for positive in (False,True):
+                    data=self._passive_lookup_fixture(backing,shared,positive)
+                    result=benchmark.validate_declared_passive_evidence(data)
+                    self.assertEqual(result['collection_policy'],benchmark.DECLARED_PASSIVE_POLICY)
+                    self.assertEqual(result['backing'],backing)
+                    self.assertEqual(len([r for r in result['setup'] if r['tags']['role']=='shared_host_source']),1)
+                    self.assertIn('aggregate_gpu_hits_do_not_identify_locality',result['qualification_limits'])
+                    self.assertEqual(result['terminal_observations'][0]['counters']['adaptive_lookup_calls'],0)
+
+        # Real nonzero recorded source work uses the original emitted width;
+        # no Python format table or row-size estimate substitutes for it.
+        active=self._passive_lookup_fixture('SSD')
+        values={'adaptive_lookup_calls':1,'adaptive_completed_live_ids':3,'adaptive_cache_hit_rows':1,
+            'adaptive_cache_miss_rows':2,'adaptive_source_rows':2,'adaptive_source_native_bytes':180,
+            'adaptive_promotions':1,'requests':1,'ids':2,'id_bytes':16,'native_bytes':180,'source_rows':2}
+        for record in active['perf_stats']['records']:
+            if record['device']=='CUDA:0' and record['name'] in values:record['value']=values[record['name']]
+        self.assertTrue(benchmark.validate_declared_passive_evidence(active)['adaptive'])
+        for name in ('adaptive_source_native_bytes','native_bytes','id_bytes'):
+            wrong=copy.deepcopy(active)
+            next(record for record in wrong['perf_stats']['records'] if record['device']=='CUDA:0' and record['name']==name)['value']+=1
+            with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(wrong)
+
+    def test_declared_passive_rejects_partial_wrong_grants_and_foreign_setup(self):
+        original=self._passive_lookup_fixture()
+        cases=[]
+        d=copy.deepcopy(original);d['perf_stats']['enabled']=False;cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records'].pop();cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records']=[r for r in d['perf_stats']['records'] if r['domain']!='moe_placement'];cases.append(d)
+        for field,value in [('admitted_slots','0'),('admitted_slots','101'),('table_storage_bytes','4097'),
+                ('storage','host_adaptive_ram_ssd'),('source_generation','18'),('source_row_bytes','91'),('role','foreign'),('world_rank','1')]:
+            d=copy.deepcopy(original);d['perf_stats']['records'][0]['tags'][field]=value;cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records'].append(copy.deepcopy(d['perf_stats']['records'][0]));cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records']=[r for r in d['perf_stats']['records'] if not (r['domain']=='immutable_lookup_setup' and r['tags']['role']=='shared_host_source')];cases.append(d)
+        d=copy.deepcopy(original);d['runtime_configuration']['configuration']['ngram_table_policy']['gpu_adaptive']['placement']['mode']='Unsupported';cases.append(d)
+        for d in cases:
+            with self.subTest(d=d['perf_stats']['records'][0]):
+                with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(d)
+
+    def test_declared_passive_rejects_warmup_partial_failed_and_mapping_claims(self):
+        original=self._passive_lookup_fixture()
+        cases=[]
+        for name,field,value in [('adaptive_lookup_calls','phase','warmup'),('failures','value',1),
+                ('adaptive_failed_frames','value',1),('window_misses','value',1),('cache_admissions','value',1),
+                ('requests','count',4),('adaptive_source_rows','value',1),('ids','value',1),('reset_terminal_waits','value',2)]:
+            d=copy.deepcopy(original);next(r for r in d['perf_stats']['records'] if r['name']==name)[field]=value;cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records']=[r for r in d['perf_stats']['records'] if r['name']!='adaptive_source_native_bytes'];cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records'].append(dict(domain='stage_gpu',name='elapsed',kind='timer',phase='decode',device='CUDA:0',count=1,value=0,total_ns=5,tags={}));cases.append(d)
+        for d in cases:
+            with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(d)
+
+    def test_declared_benchmark_preserves_original_thread_controls_and_strips_loader_environment(self):
+        """The actual declared runner keeps accepted CPU policy while dropping hostile loader/SDK controls."""
+        from types import SimpleNamespace
+        import model_kld_corpus_execution as owner
+        import gpu_driver_diagnostics as driver
+        from model_kld_corpus import metadata_digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / 'llaminar2'
+            parser = root / 'llaminar_model_kld_canary'
+            binary.write_text('original Release binary pin')
+            parser.write_text('original Release parser pin')
+            workload = dict(schema=1, prompt_unit=' test', prompt_repetitions=512,
+                decode_tokens=256, warmup_iterations=1, measurement_iterations=3)
+            workload_path = root / 'workload.json'
+            workload_path.write_text(json.dumps(workload))
+            manifest = {'source': {'original': 'source identity'}}
+            topology = {'id': 'original-tp2', 'arithmetic': {'hc_up': 'two_term_q8'},
+                'runtime_config_digest': 'original-runtime'}
+            native_identity = {'executable_sha256': 'original-panel-binary'}
+            actual_owner = {'actual_config': {'configuration': {'n_threads': -1}}}
+            cell = dict(topology_id=topology['id'], complete=True, passed=True,
+                observations_complete=True, native_retired=True, returncode=0,
+                driver_window_clean=True, reset_byte_equal=True,
+                native_identity=native_identity, actual_owner=actual_owner)
+            panel = dict(mode='local_fixed_history_diagnostic', complete=True, passed=True,
+                observations_complete=True, cells=[cell],
+                corpus_manifest_digest=metadata_digest(manifest), binary={'sha256': 'original-panel-binary'})
+            panel_path = root / 'panel.json'
+            panel_path.write_text(json.dumps(panel))
+            cell_directory = root / topology['id']
+            cell_directory.mkdir()
+            (cell_directory / 'described-config.json').write_text('{}')
+            (cell_directory / 'controller.json').write_text(json.dumps(dict(
+                topology_id=topology['id'], complete=True, native_retired=True, passed=True, returncode=0)))
+            (cell_directory / 'native-observation.json').write_text(json.dumps(dict(
+                complete=True, topology_id=topology['id'],
+                corpus_manifest_digest=metadata_digest(manifest), source_digest=metadata_digest(manifest['source']),
+                runtime_config_digest=topology['runtime_config_digest'], arithmetic=topology['arithmetic'],
+                native_identity=native_identity, actual_owner=actual_owner,
+                proofs={name: True for name in owner.corpus_v2.PROOFS})))
+            selection = SimpleNamespace(topology=topology, corpus={'manifest': manifest},
+                documents={'pilot': None}, paths={'benchmark': workload_path})
+            record = {'model':'original.gguf','diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
+                certification_eligible=False, context_length=4096, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
+            args = argparse.Namespace(diagnostic=True, diagnostic_binary=binary, image=None,
+                e2e_report=None, panel_report=panel_path, corpus_root=root, parser_binary=parser,
+                workload=workload_path, list=False, report=root / 'report.json')
+            supplied = dict(PATH='/original/bin', HOME='/original/home',
+                ROCR_VISIBLE_DEVICES='GPU-original0,GPU-original1', HWLOC_COMPONENTS='-gl,-opencl',
+                OMP_NUM_THREADS='56', OMP_PLACES='cores', OMP_PROC_BIND='false', OPENBLAS_NUM_THREADS='1',
+                LD_LIBRARY_PATH='/foreign/sdk/lib', LD_PRELOAD='/foreign/allocator.so',
+                HSA_OVERRIDE_GFX_VERSION='9.0.6', PYTHONPATH='/foreign/python')
+            with patch.dict(os.environ, supplied, clear=True), \
+                 patch.object(benchmark.e2e, 'release_binary_cpu_isa'), \
+                 patch.object(benchmark, 'declared_inventory', return_value=(('original', 'Exact', record), {})), \
+                 patch.object(owner.PairedCorpusSelection, 'from_export', return_value=selection), \
+                 patch.object(owner, 'validate_described_config'), \
+                 patch.object(driver, 'validate_evidence'), \
+                 patch.object(benchmark, 'declared_source_pins', return_value={}), \
+                 patch.object(benchmark, 'declared_config_identity', side_effect=RuntimeError('actual environment captured')) as capture:
+                with self.assertRaisesRegex(RuntimeError, 'actual environment captured'):
+                    benchmark.run_declared_diagnostic(args)
+            environment = capture.call_args.args[3]
+            for key in ('HOME', 'ROCR_VISIBLE_DEVICES', 'HWLOC_COMPONENTS',
+                        'OMP_NUM_THREADS', 'OMP_PLACES', 'OMP_PROC_BIND', 'OPENBLAS_NUM_THREADS'):
+                self.assertEqual(environment.get(key), supplied[key], key)
+            for key in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'HSA_OVERRIDE_GFX_VERSION', 'PYTHONPATH'):
+                self.assertNotIn(key, environment)
+            self.assertEqual(environment['LLAMINAR_BENCHMARK_ITERATIONS'], '3')
+            self.assertEqual(environment['LLAMINAR_BENCHMARK_WARMUP_ITERATIONS'], '1')
+            self.assertEqual(environment[owner.SELECTORS['hc_up']], 'two_term_q8')
+            self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
+            self.assertEqual(environment['LLAMINAR_PERF_STATS_GPU_STAGE_TIMING'],'0')
+            self.assertIn('passive-perfstats-rank-{rank}.json',environment['LLAMINAR_PERF_STATS_JSON'])
+
+    def test_declared_benchmark_preserves_retirement_after_validation_failure(self):
+        """Successful guardian retirement survives a later measurement or configuration rejection."""
+        from types import SimpleNamespace
+        import model_kld_corpus_execution as owner
+        import gpu_driver_diagnostics as driver
+        from model_kld_corpus import metadata_digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / 'llaminar2'
+            parser = root / 'llaminar_model_kld_canary'
+            binary.write_text('original Release binary pin')
+            parser.write_text('original Release parser pin')
+            workload = dict(schema=1, prompt_unit=' test', prompt_repetitions=512,
+                decode_tokens=256, warmup_iterations=1, measurement_iterations=3)
+            workload_path = root / 'workload.json'
+            workload_path.write_text(json.dumps(workload))
+            manifest = {'source': {'original': 'source identity'}}
+            topology = {'id': 'original-tp2', 'arithmetic': {'hc_up': 'two_term_q8'},
+                'runtime_config_digest': 'original-runtime'}
+            native_identity = {'executable_sha256': 'original-panel-binary'}
+            actual_owner = {'actual_config': {'configuration': {'n_threads': -1}}}
+            cell = dict(topology_id=topology['id'], complete=True, passed=True,
+                observations_complete=True, native_retired=True, returncode=0,
+                driver_window_clean=True, reset_byte_equal=True,
+                native_identity=native_identity, actual_owner=actual_owner)
+            panel = dict(mode='local_fixed_history_diagnostic', complete=True, passed=True,
+                observations_complete=True, cells=[cell],
+                corpus_manifest_digest=metadata_digest(manifest), binary={'sha256': 'original-panel-binary'})
+            panel_path = root / 'panel.json'
+            panel_path.write_text(json.dumps(panel))
+            cell_directory = root / topology['id']
+            cell_directory.mkdir()
+            (cell_directory / 'described-config.json').write_text('{}')
+            (cell_directory / 'controller.json').write_text(json.dumps(dict(
+                topology_id=topology['id'], complete=True, native_retired=True, passed=True, returncode=0)))
+            (cell_directory / 'native-observation.json').write_text(json.dumps(dict(
+                complete=True, topology_id=topology['id'],
+                corpus_manifest_digest=metadata_digest(manifest), source_digest=metadata_digest(manifest['source']),
+                runtime_config_digest=topology['runtime_config_digest'], arithmetic=topology['arithmetic'],
+                native_identity=native_identity, actual_owner=actual_owner,
+                proofs={name: True for name in owner.corpus_v2.PROOFS})))
+            selection = SimpleNamespace(topology=topology, corpus={'manifest': manifest},
+                documents={'pilot': None}, paths={'benchmark': workload_path},
+                canonical_arguments=['--ngram-gpu-cache-placement','consumer-local','--no-prefix-cache',
+                                     '-m','original.gguf','--context-length','4096'])
+            record = {'model': 'original.gguf', 'diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
+                certification_eligible=False, context_length=4096, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
+            args = argparse.Namespace(diagnostic=True, diagnostic_binary=binary, image=None,
+                e2e_report=None, panel_report=panel_path, corpus_root=root, parser_binary=parser,
+                workload=workload_path, list=False, report=root / 'report.json')
+            helper = root / 'llaminar_mpi_session'
+            helper.write_text('original session helper')
+            helper.chmod(0o700)
+            workload.update(seed=42, temperature=0, top_k=1, top_p=1)
+            workload_path.write_text(json.dumps(workload))
+            for failure_stage in ('measurement', 'configuration', 'passive', 'success'):
+                args.report = root / (failure_stage + '.json')
+                def guardian(command, environment, output):
+                    engine=command.index('benchmark')+1
+                    self.assertEqual(command[engine:engine+len(selection.canonical_arguments)],
+                                     selection.canonical_arguments)
+                    self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
+                    self.assertEqual(environment['LLAMINAR_PERF_STATS_GPU_STAGE_TIMING'],'0')
+                    (output / 'benchmark.json').write_text(json.dumps(self._passive_lookup_fixture()) if failure_stage=='success' else '{}')
+                with patch.object(benchmark.e2e, 'release_binary_cpu_isa'), \
+                     patch.object(benchmark, 'declared_inventory', return_value=(('original', 'Exact', record), {})), \
+                     patch.object(owner.PairedCorpusSelection, 'from_export', return_value=selection), \
+                     patch.object(owner, 'validate_described_config'), \
+                     patch.object(driver, 'validate_evidence'), \
+                     patch.object(driver, 'begin'), \
+                     patch.object(driver, 'finish', return_value=True) as finish, \
+                     patch.object(benchmark, 'declared_source_pins', return_value={}), \
+                     patch.object(benchmark, 'declared_config_identity', return_value={}), \
+                     patch.object(benchmark, 'run_declared_guardian', side_effect=guardian) as retired, \
+                     patch.object(benchmark, 'validate_measurement', side_effect=(ValueError('measurement rejected') if failure_stage == 'measurement' else None), return_value={}), \
+                     patch.object(benchmark, 'declared_runtime_configuration', side_effect=(ValueError('configuration rejected') if failure_stage=='configuration' else None)):
+                    if failure_stage=='success':
+                        self.assertEqual(benchmark.run_declared_diagnostic(args),0)
+                    else:
+                        with self.assertRaisesRegex(ValueError, failure_stage if failure_stage=='passive' else failure_stage+' rejected'):
+                            benchmark.run_declared_diagnostic(args)
+                result = json.loads(args.report.read_text())
+                self.assertTrue(result['native_retired'])
+                self.assertEqual(result['passed'],failure_stage=='success')
+                self.assertEqual(result['complete'],failure_stage=='success')
+                self.assertTrue(result['driver_window_clean'])
+                if failure_stage=='success':
+                    self.assertEqual(result['collection_policy'],benchmark.DECLARED_PASSIVE_POLICY)
+                    self.assertTrue(result['passive_evidence']['adaptive'])
+                else:
+                    self.assertIn(failure_stage if failure_stage=='passive' else failure_stage+' rejected', result['error'])
+                retired.assert_called_once()
+                finish.assert_called_once()
+
+    def test_declared_benchmark_preserves_numerical_config_and_measured_tokenizer_count(self):
+        """Exact source/config arithmetic stays bound while prefill tokens come from the real measurement."""
+        from model_kld_corpus import metadata_digest
+        from model_kld_corpus_execution import PairedCorpusSelection
+        with tempfile.TemporaryDirectory() as temporary:
+            model=Path(temporary)/'model.gguf';model.write_bytes(b'original source')
+            other=Path(temporary)/'other.gguf';other.write_bytes(b'foreign source')
+            canonical_config={'configuration':{'model_path':str(model),'prefix_cache':{'enabled':False},
+                'prefill_max_bucket_size':None}}
+            observed_config=copy.deepcopy(canonical_config)
+            observed_config['configuration'].update(prefix_cache={'enabled':False},prefill_max_bucket_size=512)
+            topology={'engine_argv':['--observer'],'expected_config':observed_config,
+                'runtime_config_digest':metadata_digest(observed_config),'arithmetic':{'hc_up':'two_term_q8'}}
+            observed={'schema':'llaminar.model-kld-described-config.v1','engine_argv':['--observer'],
+                'config':observed_config,'runtime_config_digest':metadata_digest(observed_config),
+                'qfn_canonical_intent':{'ngram':'ConsumerLocal','prefill_max_bucket_size':512},
+                'qfn_arithmetic_intent':topology['arithmetic']}
+            canonical={**observed,'engine_argv':['--canonical'],'config':canonical_config,
+                'runtime_config_digest':metadata_digest(canonical_config)}
+            selection=PairedCorpusSelection('Exact',{'model':str(model)}, {},topology,{}, {},{},['--canonical'])
+            with patch.object(benchmark.subprocess,'check_output',return_value=json.dumps(canonical)):
+                self.assertEqual(benchmark.declared_config_identity(selection,observed,Path('/original/parser'),{}),canonical)
+            for field,value in [('config',{'configuration':{'model_path':str(other)}}),
+                    ('qfn_canonical_intent',{'ngram':'replicated'}),('qfn_arithmetic_intent',{'hc_up':'other'})]:
+                bad=copy.deepcopy(canonical);bad[field]=value
+                bad['runtime_config_digest']=metadata_digest(bad['config'])
+                with patch.object(benchmark.subprocess,'check_output',return_value=json.dumps(bad)):
+                    with self.assertRaises(ValueError):benchmark.declared_config_identity(selection,observed,Path('/original/parser'),{})
+        workload=dict(schema=1,prompt_unit=' test',prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3)
+        prompt=benchmark.validate_workload(workload).encode()
+        data=dict(schema='llaminar.benchmark.v1',success=True,prefill_success=True,decode_success=True,
+            prompt={'sha256':hashlib.sha256(prompt).hexdigest(),'bytes':len(prompt)},
+            measurement_iterations=3,warmup_iterations=1,iterations=[dict(tokens={'prefill':513,'decode':256},
+                throughput_tokens_per_sec={'prefill':100,'decode_after_prefill':10}) for _ in range(3)])
+        self.assertEqual(benchmark.validate_measurement(data,workload)['prefill_tokens'],513)
+        data['iterations'][1]['tokens']['decode']=255
+        with self.assertRaises(ValueError):benchmark.validate_measurement(data,workload)
+
+    def test_declared_benchmark_guardian_drains_timeout_and_rejects_partial_retirement(self):
+        """Timeout/error never returns while the original guardian still owns native MPI children."""
+        for outcome in ('success','exit','timeout','cleanup'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                output=Path(temporary);process=Mock()
+                process.poll.return_value=0
+                process.wait.return_value=0 if outcome!='exit' else 1
+                if outcome=='timeout':
+                    process.wait.side_effect=[subprocess.TimeoutExpired('owned',1),0]
+                    process.poll.return_value=None
+                with patch.object(benchmark.subprocess,'Popen',return_value=process) as spawn, \
+                     patch('mpi_session_retirement.require_retired',side_effect=ValueError('unretired session') if outcome=='cleanup' else None) as retired:
+                    command=['original-helper','--session-base',str(output/'mpi-session'),'--','binary']
+                    spawn.side_effect=lambda *args,**kwargs: process if (output/'mpi-session').is_dir() else self.fail('session base absent at spawn')
+                    if outcome=='success':benchmark.run_declared_guardian(command,{'HOME':'/original'},output)
+                    else:
+                        with self.assertRaises((ValueError,subprocess.TimeoutExpired)):
+                            benchmark.run_declared_guardian(command,{'HOME':'/original'},output)
+                    retired.assert_called_once_with([output/'mpi-session'],timeout_seconds=0)
+                    self.assertEqual(spawn.call_args.kwargs['env'],{'HOME':'/original'})
+                    if outcome=='timeout':process.terminate.assert_called_once();self.assertEqual(process.wait.call_args.kwargs['timeout'],36)
+
+    def test_declared_benchmark_compares_accepted_resolved_owner_and_exact_canonical_controls(self):
+        """Real report shape: resolution changes ranks/NUMA/placement while observer controls stay separate."""
+        from model_kld_corpus import metadata_digest
+        canonical={'kind':'llaminar.orchestration-config','schema_version':11,'configuration':{'model_path':'original','prefix_cache':{'enabled':True},'prefill_max_bucket_size':None,
+            'domain_definitions':[{'explicit_ranks':[],'numa_node':-1}],
+            'moe_routed_expert_plan':{'authority_execution':'Unresolved','placements':[]},'n_threads':-1}}
+        accepted=copy.deepcopy(canonical)
+        accepted['configuration'].update(prefix_cache={'enabled':False},prefill_max_bucket_size=512,
+            domain_definitions=[{'explicit_ranks':[0],'numa_node':0}],
+            moe_routed_expert_plan={'authority_execution':'HostResident','placements':[{'layer':0,'tier':0}]})
+        workload=dict(schema=1,prompt_unit=' test',prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3,seed=42,temperature=0,top_k=1,top_p=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            output=Path(temporary)
+            actual=copy.deepcopy(accepted)
+            actual['configuration'].update(prefix_cache={'enabled':True},prefill_max_bucket_size=None,
+                benchmark_mode=True,benchmark_json_output_path=str(output/'benchmark.json'),
+                prompt=benchmark.validate_workload(workload),prompt_was_explicitly_provided=True,
+                n_predict=256,seed=42,temperature=0,top_k=1,top_p=1)
+            def describe(command,**kwargs):
+                self.assertEqual(command[:3],['/original/parser','--describe-config','--'])
+                document=json.loads(Path(command[-1]).read_text())
+                config=document['configuration']
+                intent={key:config[key] for key in ('domain_definitions','moe_routed_expert_plan')}
+                intent.update(prefill_max_bucket_size=config['prefill_max_bucket_size'] or 512,prefill_graph_buckets=[1,512])
+                self.assertEqual(kwargs['env']['LLAMINAR_FORCE_CPU_ONLY_STARTUP'],'1')
+                return json.dumps(dict(schema='llaminar.model-kld-described-config.v1',engine_argv=command[3:],
+                    config=document,runtime_config_digest=metadata_digest(document),qfn_canonical_intent=intent))
+            with patch.object(benchmark.subprocess,'check_output',side_effect=describe):
+                benchmark.declared_runtime_configuration({'runtime_configuration':actual},{'config':canonical},accepted,
+                    workload,output,Path('/original/parser'),{})
+                for mutate in ('placement','prefix','workload','worker'):
+                    wrong=copy.deepcopy(actual)
+                    if mutate=='placement':wrong['configuration']['moe_routed_expert_plan']['placements'][0]['tier']=1
+                    elif mutate=='prefix':wrong['configuration']['prefix_cache']['enabled']=False
+                    elif mutate=='workload':wrong['configuration']['n_predict']=255
+                    else:wrong['configuration']['n_threads']=8
+                    with self.assertRaises(ValueError):benchmark.declared_runtime_configuration({'runtime_configuration':wrong},
+                        {'config':canonical},accepted,workload,output,Path('/original/parser'),{})
+
+    def test_declared_benchmark_pins_all_original_source_stats_before_and_after(self):
+        """Actual original-source identity owner covers four shards and paired predictor without hashing payloads."""
+        from types import SimpleNamespace
+        from model_kld_corpus import identity,unchanged
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);descriptors=[]
+            for index in range(5):
+                path=root/f'source-{index}.gguf';path.write_bytes(b'original')
+                pin=identity(path)
+                descriptors.append(dict(path=str(path),name=path.name,bytes=pin[3],object_identity=json.dumps(
+                    dict(path=pin[0],device=pin[1],inode=pin[2],bytes=pin[3],mtime_ns=pin[4],ctime_ns=pin[5]))))
+            selection=SimpleNamespace(pins={},corpus={'inputs':{},'manifest':{'source':{
+                'shards':descriptors[:4],'shared_predictor':descriptors[4]}}})
+            pins=benchmark.declared_source_pins(selection)
+            self.assertEqual(set(pins),{d['path'] for d in descriptors})
+            unchanged(pins)
+            Path(descriptors[4]['path']).write_bytes(b'changed predictor')
+            with self.assertRaises(ValueError):benchmark.declared_source_pins(selection)
+            with self.assertRaises(ValueError):unchanged(pins)
+
+    def test_declared_benchmark_requires_original_driver_window_evidence(self):
+        """Native exit zero cannot hide driver fault or incomplete canonical observation."""
+        driver=Mock();driver.finish.return_value=True
+        benchmark.finish_declared_driver(driver,Path('/original/output'))
+        driver.finish.assert_called_once();driver.validate_evidence.assert_called_once_with(Path('/original/output'))
+        driver.reset_mock();driver.finish.return_value=False
+        with self.assertRaisesRegex(ValueError,'driver window'):
+            benchmark.finish_declared_driver(driver,Path('/original/output'))
+        driver.finish.assert_called_once();driver.validate_evidence.assert_called_once()
+        driver.reset_mock();driver.finish.return_value=True;driver.validate_evidence.side_effect=ValueError('incomplete driver proof')
+        with self.assertRaisesRegex(ValueError,'incomplete'):
+            benchmark.finish_declared_driver(driver,Path('/original/output'))
+
+    def test_declared_benchmark_uses_pinned_all_manifest_without_release_matrix(self):
+        """Actual canonical discover reads Integration's ALL export; no Release CTest/GTest bootstrap is attempted."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);path=root/'all.json'
+            record={'model_parity_schema':1,'e2e':None,'model':'/original/model.gguf',
+                'shared_predictor':'/original/predictor.gguf','diagnostic_benchmark':{'policy':'diagnostic_declared'}}
+            document={'schema':1,'scope':'all','source_revision':'original-revision','cells':[
+                {'case':'Suite.ProductionParity/Original','campaign':'original-campaign','backends':'CPU_CUDA',
+                 'configuration':record,'model_files':[record['model'],record['shared_predictor']]}]}
+            args=argparse.Namespace(manifest=path,source_revision='original-revision',declared_cell='Suite.ProductionParity/Original')
+            import model_parity_inventory as inventory
+            with patch.object(inventory.parity,'discover_campaigns',side_effect=AssertionError('Release has no matrix')):
+                path.write_text(json.dumps(document))
+                (campaign,exact,actual),pins=benchmark.declared_inventory(args,root/'llaminar2')
+                self.assertEqual(exact,args.declared_cell);self.assertEqual(actual,record)
+                self.assertEqual(set(pins),{str(path.resolve())})
+                # Enter the actual diagnostic owner through discovery, stopping
+                # at original document admission before any native operation.
+                binary=root/'llaminar2';binary.write_text('metadata-only executable pin')
+                parser=root/'llaminar_model_kld_canary';parser.write_text('metadata-only parser pin')
+                args.diagnostic=True;args.diagnostic_binary=binary;args.image=None;args.e2e_report=None
+                args.panel_report=root/'panel.json';args.corpus_root=root;args.parser_binary=parser
+                args.report=root/'report.json';args.list=True
+                args.panel_report.write_text(json.dumps({'mode':'local_fixed_history_diagnostic'}))
+                with patch.object(benchmark.e2e,'release_binary_cpu_isa'), \
+                     patch('model_kld_corpus_execution.PairedCorpusSelection.from_export',side_effect=RuntimeError('actual ALL manifest selected')) as admitted:
+                    with self.assertRaisesRegex(RuntimeError,'actual ALL manifest selected'):
+                        benchmark.run_declared_diagnostic(args)
+                    self.assertEqual(admitted.call_args.args[:2],(args.declared_cell,record))
+                for changed in ({**document,'scope':'e2e'},{**document,'source_revision':'foreign'}):
+                    path.write_text(json.dumps(changed))
+                    with self.assertRaises(ValueError):benchmark.declared_inventory(args,root/'llaminar2')
+                path.write_text(json.dumps(document))
+                with patch('model_kld_corpus.unchanged',side_effect=ValueError('changed manifest')):
+                    with self.assertRaisesRegex(ValueError,'changed manifest'):
+                        benchmark.declared_inventory(args,root/'llaminar2')
+                args.manifest=None
+                with self.assertRaisesRegex(ValueError,'all-cell'):
+                    benchmark.declared_inventory(args,root/'llaminar2')
+                args.manifest=root/'missing.json'
+                with self.assertRaises(FileNotFoundError):benchmark.declared_inventory(args,root/'llaminar2')
+
+        # The existing dedicated inventory preflight also exercises generated
+        # LOCAL_DIAGNOSTIC export/list without weakening its default ALL arm.
+        self._assert_declared_focused_generated_inventory_and_list_use_original_typed_document_policy()
+
     def test_cross_revision_image_is_diagnostic_only(self):
         """Historical implementations can be retimed, never silently certified."""
         with tempfile.TemporaryDirectory() as directory:
@@ -1957,6 +3013,25 @@ class PipelineInventoryTests(unittest.TestCase):
                 with self.subTest(filename=filename, shard=index), self.assertRaises(ValueError):
                     pipeline.remap_manifest(full, Path("/admitted/models"))
                 self.assertEqual(full, before)
+
+    def test_explicit_predictor_mount_and_argv_follow_the_same_declared_source(self):
+        """A second source is mounted and pinned independently of the main artifact."""
+        full = full_manifest()
+        row = full["cells"][1]
+        row["configuration"]["shared_predictor"] = "/src/models/predictor.gguf"
+        row["configuration"]["runtime"] = {"server_args": ["--no-mtp", "--mtp-model", "/src/models/predictor.gguf"]}
+        row["configuration"]["benchmark"]["args"] += ["--mtp-model", "/src/models/predictor.gguf"]
+        row["model_files"].append("/src/models/predictor.gguf")
+        before = copy.deepcopy(full)
+        translated = pipeline.remap_manifest(full, Path("/admitted/models"))
+        config = translated["cells"][1]["configuration"]
+        self.assertEqual(config["shared_predictor"], "/admitted/models/predictor.gguf")
+        self.assertEqual(config["runtime"]["server_args"], ["--no-mtp", "--mtp-model", "/admitted/models/predictor.gguf"])
+        self.assertIn(config["shared_predictor"], translated["cells"][1]["model_files"])
+        self.assertEqual(full, before)
+        translated["cells"][1]["model_files"].remove(config["shared_predictor"])
+        with self.assertRaisesRegex(ValueError, "model-file declaration"):
+            pipeline.e2e_projection(translated, "revision")
 
     def test_container_model_translation_requires_an_absolute_resolved_mount(self):
         """The caller supplies the admitted mount, never a working-directory alias."""
@@ -4008,8 +5083,121 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('-G Ninja', owner)
         self.assertIn('-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}', owner)
         successful_build = owner.index('if(NOT RCCL_BUILD_RESULT EQUAL 0)')
-        authenticated_receipt = owner.index('file(WRITE "${RCCL_VERSION_FILE}"')
-        self.assertLess(successful_build, authenticated_receipt)
+        pending_receipt = owner.index('file(WRITE "${RCCL_VERSION_FILE}.pending"')
+        resource_compile = owner.index('"${RCCL_LTO_ARTIFACT_SCRIPT}" compile')
+        resource_failure = owner.index('if(NOT RCCL_LTO_AUDIT_RESULT EQUAL 0)')
+        authenticated_receipt = owner.index(
+            'file(RENAME "${RCCL_VERSION_FILE}.pending" "${RCCL_VERSION_FILE}")')
+        self.assertLess(successful_build, pending_receipt)
+        self.assertLess(pending_receipt, resource_compile)
+        self.assertLess(resource_compile, resource_failure)
+        self.assertLess(resource_failure, authenticated_receipt)
+        self.assertIn('message(FATAL_ERROR "RCCL final physical resource evidence failed:',
+                      owner[resource_failure:authenticated_receipt])
+        self.assertNotIn('file(WRITE "${RCCL_VERSION_FILE}"', owner)
+
+    def test_rccl_legacy_smi_rejects_foreign_sdk_discovery(self):
+        """Replay the actual patched CMake owner with authored package metadata."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = root / "cmake/rccl_legacy_smi_sdk.cmake"
+            result = subprocess.run(["git", "apply", "--include=cmake/rccl_legacy_smi_sdk.cmake",
+                str(ROOT / "scripts/docker/patches/rccl-sdk-legacy-smi.patch")],
+                cwd=root, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for case in ("selected", "selected_release", "foreign_default", "foreign_warm_cache",
+                         "foreign_preimported", "foreign_library_symlink", "selected_cache_alias"):
+                with self.subTest(case=case):
+                    cell = root / case
+                    selected, foreign = cell / "sdk", cell / "foreign"
+                    for sdk in (selected, foreign):
+                        (sdk / "lib/cmake/rocm_smi").mkdir(parents=True)
+                        (sdk / "include").mkdir()
+                        library = sdk / "lib/librocm_smi64.so.1.0"
+                        library.write_bytes(b"authored SMI metadata fixture, not a native DSO")
+                        configuration = ("set(ROCM_SMI_INCLUDE_DIR \"" + str(sdk / "include") + "\")\n"
+                            "if(NOT TARGET rocm_smi64)\nadd_library(rocm_smi64 SHARED IMPORTED)\n"
+                            "set_target_properties(rocm_smi64 PROPERTIES ")
+                        if case == "selected_release":
+                            configuration += "IMPORTED_CONFIGURATIONS RELEASE IMPORTED_LOCATION_RELEASE "
+                        else:
+                            configuration += "IMPORTED_LOCATION "
+                        configuration += '"' + str(library) + '")\nendif()\n'
+                        (sdk / "lib/cmake/rocm_smi/rocm_smi-config.cmake").write_text(configuration)
+                    prefix = "cmake_minimum_required(VERSION 3.27)\nproject(SMIOwnership NONE)\n"
+                    prefix += 'set(CMAKE_PREFIX_PATH "' + str(foreign) + '")\n'
+                    if case == "foreign_preimported":
+                        prefix += ('add_library(rocm_smi64 SHARED IMPORTED)\n'
+                            'set_target_properties(rocm_smi64 PROPERTIES IMPORTED_LOCATION "'
+                            + str(foreign / "lib/librocm_smi64.so.1.0") + '")\n')
+                    if case == "foreign_default":
+                        (selected / "lib/cmake/rocm_smi/rocm_smi-config.cmake").unlink()
+                    if case == "foreign_library_symlink":
+                        library = selected / "lib/librocm_smi64.so.1.0"
+                        library.unlink()
+                        library.symlink_to(foreign / "lib/librocm_smi64.so.1.0")
+                    source = cell / "source"
+                    source.mkdir()
+                    (source / "CMakeLists.txt").write_text(prefix + 'include("' + str(module) + '")\n')
+                    command = ["cmake", "-S", str(source), "-B", str(cell / "build"), "-G", "Ninja"]
+                    if case == "foreign_warm_cache":
+                        warmed = subprocess.run(command + ["-DROCM_PATH=" + str(foreign)],
+                            capture_output=True, text=True, timeout=20)
+                        self.assertEqual(warmed.returncode, 0, warmed.stdout + warmed.stderr)
+                    command += ["-DROCM_PATH=" + str(selected)]
+                    if case == "selected_cache_alias":
+                        alias = cell / "sdk-alias"
+                        alias.symlink_to(selected, target_is_directory=True)
+                        command += ["-Drocm_smi_DIR=" + str(alias / "lib/cmake/rocm_smi")]
+                    configured = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                    positive = case in ("selected", "selected_release", "selected_cache_alias")
+                    if positive:
+                        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                    else:
+                        self.assertNotEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                    if case in ("foreign_warm_cache", "foreign_preimported", "foreign_library_symlink"):
+                        self.assertIn("another SDK", configured.stdout + configured.stderr)
+
+    def test_legacy_smi_runtime_component_authenticates_before_export(self):
+        """Run the real export boundary with authored files, never a build/runtime."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = root / "sdk"
+            pins = rocm_release_pins()
+            (sdk / ".info").mkdir(parents=True)
+            (sdk / ".info/version").write_text(pins["LLAMINAR_ROCM_VERSION"] + "\n")
+            (sdk / "lib/cmake/rocm_smi").mkdir(parents=True)
+            (sdk / "include/rocm_smi").mkdir(parents=True)
+            (sdk / "share/llaminar").mkdir(parents=True)
+            (sdk / "share/licenses/llaminar-rocm-smi").mkdir(parents=True)
+            library = sdk / "lib/librocm_smi64.so.1.0"
+            library.write_bytes(b"authored SMI export artifact, not a native DSO")
+            (sdk / "lib/librocm_smi64.so.1").symlink_to(library.name)
+            (sdk / "lib/librocm_smi64.so").symlink_to("librocm_smi64.so.1")
+            (sdk / "include/rocm_smi/rocm_smi.h").write_text("authored header metadata")
+            (sdk / "lib/cmake/rocm_smi/rocm_smi-config.cmake").write_text("authored package metadata")
+            (sdk / "share/licenses/llaminar-rocm-smi/LICENSE.md").write_text("authored license metadata")
+            identity = ":".join(pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
+                                                     "LLAMINAR_ROCM_SYSTEMS_REVISION")) + ":legacy-smi-1.0"
+            marker = sdk / "share/llaminar/rocm-smi-compat.txt"
+            marker.write_text(identity + ":" + hashlib.sha256(library.read_bytes()).hexdigest() + "\n")
+            component = root / "component"
+            environment = dict(os.environ, ROCM_PATH=str(sdk), ROCM_SMI_INSTALL_PREFIX=str(sdk),
+                               ROCM_SMI_STAGE_PREFIX=str(component))
+            command = ["bash", str(ROOT / "scripts/docker/install-rocm-smi-compat.sh")]
+            result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            exported = component / "lib" / library.name
+            self.assertEqual(exported.read_bytes(), library.read_bytes())
+            self.assertEqual((component / "lib/librocm_smi64.so.1").resolve(), exported)
+            self.assertFalse((component / "include").exists())
+            library.write_bytes(b"changed dependency artifact")
+            rejected = root / "must-not-be-created"
+            environment["ROCM_SMI_STAGE_PREFIX"] = str(rejected)
+            result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires an authenticated builder component", result.stderr)
+            self.assertFalse(rejected.exists())
 
     def test_hip_runtime_repair_is_shared_by_builder_and_shipping_image(self):
         """A green builder cannot ship the uncorrected distribution HIP DSO.
@@ -4025,12 +5213,20 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("scripts/docker/install-hip-graph-runtime.sh", toolchain)
         self.assertIn("scripts/docker/rocm-release.env", toolchain)
         self.assertIn("patches/rocm-hip-graph-empty-segment-publication.patch", toolchain)
-        self.assertIn("patches/rocm-hip-host-queue-native-stack.patch", toolchain)
-        self.assertIn("patches/rocm-hip-sdma-stream-sharing.patch", toolchain)
+        self.assertNotIn("patches/rocm-hip-host-queue-native-stack.patch", toolchain)
+        self.assertNotIn("patches/rocm-hip-sdma-stream-sharing.patch", toolchain)
         self.assertIn("patches/rocm-hip-sdma-event-publication.patch", toolchain)
         self.assertIn("patches/rocm-hip-graph-progress-safe-collapse.patch", toolchain)
         self.assertIn("patches/rocm-hip-event-producer-lifetime.patch", toolchain)
-        # Those four backports are part of the pinned upstream monorepo now.
+        self.assertIn("patches/rocm-hip-graph-kernarg-metadata.patch", toolchain)
+        self.assertIn("patches/rocm-hip-preferred-queue-unshared.patch", toolchain)
+        self.assertIn("patches/rocm-hip-timed-sdma-marker.patch", toolchain)
+        self.assertIn("patches/rocm-hip-capture-retirement-membership.patch", toolchain)
+        self.assertIn("scripts/docker/hip-end-capture/proof.py", toolchain)
+        self.assertIn("scripts/docker/hip-end-capture/end-capture-contract.cpp.in", toolchain)
+        self.assertIn("scripts/docker/hip-preferred-queue/proof.py", toolchain)
+        self.assertIn("scripts/docker/hip-preferred-queue/selector-contract.cpp.in", toolchain)
+        # These graph backports and the native-stack/SDMA-sharing repairs are upstream.
         # Applying them again would make the upgrade a second orphaned repair.
         for old_patch in ("node-identity", "queue-placement", "packet-publication", "entry-ordering"):
             self.assertNotIn(f"rocm-hip-graph-{old_patch}.patch", toolchain)
@@ -4045,11 +5241,15 @@ class InfrastructureTests(unittest.TestCase):
             self.assertIn(f"{variable}={active_prefix}", development)
         self.assertIn(f":{active_prefix}/bin:{active_prefix}/lib/llvm/bin:", development)
         self.assertIn(f"LD_LIBRARY_PATH=/usr/local/cuda/lib64:{active_prefix}/lib", development)
-        self.assertIn('cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/libamdhip64.so.7', dockerfile)
-        self.assertIn('${ROCM_PATH}/share/licenses/llaminar-hip', dockerfile)
+        self.assertIn('HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh', dockerfile)
+        self.assertNotIn('cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/', dockerfile)
         runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
             "FROM runtime AS test-runner", 1)[0]
         self.assertIn("COPY --from=builder /src/runtime-libs/ /usr/local/lib/", runtime)
+        self.assertIn("COPY --from=builder /src/runtime-hip/ /opt/rocm-sdk/", runtime)
+        self.assertNotIn("runtime-share", dockerfile)
+        self.assertIn('/etc/ld.so.conf.d/llaminar-rocm-sdk.conf', installer)
+        self.assertIn('printf \'%s/lib\\n\' "${LLAMINAR_ROCM_ACTIVE_PREFIX}"', installer)
         self.assertIn("LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm-sdk/lib", runtime)
 
     def test_hip_runtime_reuse_authenticates_every_graph_repair(self):
@@ -4071,7 +5271,9 @@ class InfrastructureTests(unittest.TestCase):
             # SDK rejects stale receipts before any native work or network I/O.
             for name in ("dirname", "sha256sum", "cut"):
                 (commands / name).symlink_to(Path("/usr/bin") / name)
-            for name in ("cmake", "ninja", "ccache", "curl", "git", "python3"):
+            # Proof verification uses Python, never an installed compiler/native SDK.
+            (commands / "python3").symlink_to(Path(sys.executable))
+            for name in ("cmake", "ninja", "ccache", "curl", "git"):
                 tool = commands / name
                 tool.write_text(
                     '#!/bin/sh\necho "unexpected build tool execution" >&2\nexit 97\n',
@@ -4097,26 +5299,33 @@ class InfrastructureTests(unittest.TestCase):
                 alias.symlink_to(target)
             patches = (
                 ROOT / "scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch",
-                ROOT / "scripts/docker/patches/rocm-hip-host-queue-native-stack.patch",
-                ROOT / "scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-sdma-event-publication.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-event-producer-lifetime.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-timed-sdma-marker.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-capture-retirement-membership.patch",
             )
             parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
                      "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]
             base_count = len(parts)
             parts.extend(hashlib.sha256(path.read_bytes()).hexdigest() for path in patches)
+            from test_hip_runtime_binding import HIPRuntimeAuthority, HIPRuntimeBindingTests
+            authority = HIPRuntimeAuthority.from_source(ROOT)
+            proof_parts = authority.proof_contract.split(":")
+            self.assertEqual(authority.identity, ":".join([*parts, *proof_parts]))
+            HIPRuntimeBindingTests().write_queue_proof(output, authority, library)
             library_digest = hashlib.sha256(library.read_bytes()).hexdigest()
             marker = output / "share/llaminar/hip-graph-runtime.txt"
             receipts = [(f"patch-count-{count}",
-                         [*parts[:base_count + count], library_digest], count == len(patches))
+                         [*parts[:base_count + count], *proof_parts, library_digest], count == len(patches))
                         for count in range(len(patches) + 1)]
             # Authenticate every pin and repair body, as well as a DSO replaced
             # without updating its installation receipt.
-            complete_receipt = [*parts, library_digest]
+            complete_receipt = [*parts, *proof_parts, library_digest]
             receipt_names = ["sdk", "package", "source", "hip-version",
-                             *[path.name for path in patches], "installed-DSO"]
+                             *[path.name for path in patches], "proof-producer", "proof-fixture", "installed-DSO"]
             for index, name in enumerate(receipt_names):
                 stale_receipt = complete_receipt.copy()
                 stale_receipt[index] = "0" * 64
@@ -4172,7 +5381,8 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory) / "sdk"
             (sdk / ".info").mkdir(parents=True)
-            for version in (None, "7.2.4", "10.0.1", "10.1.0"):
+            major, minor, patch = map(int, rocm_release_pins()["LLAMINAR_ROCM_VERSION"].split("."))
+            for version in (None, "0.0.0", f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 1}.0"):
                 with self.subTest(version=version):
                     if version is not None:
                         (sdk / ".info/version").write_text(version + "\n")
@@ -4235,10 +5445,14 @@ class InfrastructureTests(unittest.TestCase):
                         self.assertNotIn(llvm_package, packages)
                         self.assertNotIn("libglvnd-dev", packages)
                         self.assertNotIn("libmsgpack-cxx-dev", packages)
+                        for dependency in ("libelf-dev", "libnuma-dev", "pkg-config", "xxd"):
+                            self.assertNotIn(dependency, packages)
                     else:
                         self.assertIn(llvm_package, packages)
                         self.assertIn("libglvnd-dev", packages)
                         self.assertIn("libmsgpack-cxx-dev", packages)
+                        for dependency in ("libelf-dev", "libnuma-dev", "pkg-config", "xxd"):
+                            self.assertIn(dependency, packages)
                     for package in packages:
                         if package.startswith("amdrocm-"):
                             self.assertTrue(package.endswith("=" + pins["LLAMINAR_ROCM_DEB_VERSION"]))
@@ -4269,7 +5483,7 @@ class InfrastructureTests(unittest.TestCase):
                 f'amdrocm-profiler-base{pins["LLAMINAR_ROCM_SERIES"]}={pins["LLAMINAR_ROCM_DEB_VERSION"]}'])
 
     def test_rocm_blas_kernels_are_built_and_shipped_with_the_matching_dso(self):
-        """Both ISA lanes inherit one source-built gfx906 BLAS artifact closure.
+        """Both ISA lanes inherit one source-built shipping-target BLAS artifact closure.
 
         A host-only package or a kernel tree copied without its DSO is not a
         supported MI50 BLAS implementation. The runtime must not download a
@@ -4280,10 +5494,10 @@ class InfrastructureTests(unittest.TestCase):
         runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
             "FROM runtime AS test-runner", 1)[0]
         installer = (ROOT / "scripts/docker/install-rocm.sh").read_text()
-        blas = (ROOT / "scripts/docker/install-rocblas-gfx906.sh").read_text()
-        self.assertIn("scripts/docker/install-rocblas-gfx906.sh", toolchain)
-        self.assertIn('bash "${rocm_script_dir}/install-rocblas-gfx906.sh"', installer)
-        self.assertIn('blas_targets="${ROCBLAS_GPU_TARGETS:-gfx906:xnack-}"', blas)
+        blas = (ROOT / "scripts/docker/install-rocblas.sh").read_text()
+        self.assertIn("scripts/docker/install-rocblas.sh", toolchain)
+        self.assertIn('bash "${rocm_script_dir}/install-rocblas.sh"', installer)
+        self.assertIn('blas_targets="${ROCBLAS_GPU_TARGETS:-${LLAMINAR_ROCM_GPU_TARGETS}}"', blas)
         self.assertIn("ROCm/rocm-libraries/tar.gz/${LLAMINAR_ROCM_LIBRARIES_REVISION}", blas)
         self.assertIn('Tensile_TEST_LOCAL_PATH="${blas_work}/libraries/shared/tensile"', blas)
         self.assertIn('cmake --build "${blas_work}/build" --parallel', blas)
@@ -4292,8 +5506,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5', dockerfile)
         self.assertIn('cp -r "${ROCM_PATH}/lib/rocblas/library" /src/runtime-rocblas/lib/rocblas/', dockerfile)
         self.assertIn("COPY --from=builder /src/runtime-rocblas/ /opt/rocm-sdk/", runtime)
-        self.assertNotIn("install-rocblas-gfx906.sh", runtime)
-        for script in ("install-rocm.sh", "install-rocm-runtime.sh", "install-rocblas-gfx906.sh"):
+        self.assertNotIn("install-rocblas.sh", runtime)
+        for script in ("install-rocm.sh", "install-rocm-runtime.sh", "install-rocblas.sh"):
             self.assertNotIn("archlinux.org", (ROOT / "scripts/docker" / script).read_text())
         pins = rocm_release_pins()
         self.assertIn(f'ROCM_PATH={pins["LLAMINAR_ROCM_ACTIVE_PREFIX"]}', runtime)
@@ -4333,7 +5547,7 @@ class InfrastructureTests(unittest.TestCase):
             def run_installer():
                 """Run the actual isolated receipt verifier, not a Python copy."""
                 return subprocess.run(
-                    ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                    ["bash", str(ROOT / "scripts/docker/install-rocblas.sh")],
                     env={**os.environ, "ROCM_PATH": str(sdk),
                          "ROCBLAS_INSTALL_PREFIX": str(output), "ROCBLAS_GPU_TARGETS": "gfx906:xnack-"},
                     capture_output=True, text=True, timeout=10)
@@ -4356,7 +5570,7 @@ class InfrastructureTests(unittest.TestCase):
             for targets in ("gfx908", "gfx906:xnack-;gfx908"):
                 with self.subTest(targets=targets):
                     result = subprocess.run(
-                        ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                        ["bash", str(ROOT / "scripts/docker/install-rocblas.sh")],
                         env={**os.environ, "ROCM_PATH": str(sdk),
                              "ROCBLAS_INSTALL_PREFIX": str(output), "ROCBLAS_GPU_TARGETS": targets},
                         capture_output=True, text=True, timeout=10)
@@ -4368,13 +5582,14 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory) / "sdk"
             (sdk / ".info").mkdir(parents=True)
-            for version in (None, "7.2.4", "10.0.1"):
+            major, minor, patch = map(int, rocm_release_pins()["LLAMINAR_ROCM_VERSION"].split("."))
+            for version in (None, "0.0.0", f"{major}.{minor}.{patch + 1}"):
                 with self.subTest(version=version):
                     if version is not None:
                         (sdk / ".info/version").write_text(version + "\n")
                     output = Path(directory) / "output"
                     result = subprocess.run(
-                        ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                        ["bash", str(ROOT / "scripts/docker/install-rocblas.sh")],
                         env={**os.environ, "ROCM_PATH": str(sdk), "ROCBLAS_INSTALL_PREFIX": str(output)},
                         capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 1, result.stderr)
@@ -4652,21 +5867,26 @@ class InfrastructureTests(unittest.TestCase):
             frozenset(("Integration", "ProductionTestPreflight")),
             None,
             parity.PreflightExecutionLane.HOST,
+            ctest_index=2,
         )
         with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
              patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
              patch.object(parity.os, "sched_getaffinity", return_value=set(range(8))), \
              patch.object(prebuilt_test_image, "validate") as validate, \
-             patch.object(parity, "_run_process", return_value=0) as execute:
-            status, _, tests = parity.run_production_test_preflight(Path("build"), None, Path("receipt"))
-        self.assertEqual(status, 0)
-        self.assertEqual(len(tests), 2)
+             patch.object(parity, "_validate_preflight_index_selection") as preview, \
+                     patch.object(parity, "_run_process", return_value=0) as execute:
+            result = parity.run_production_test_preflight(Path("build"), None, Path("receipt"))
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(len(result.tests), 2)
+        self.assertEqual(result.qualification["selected"], list(result.tests))
+        self.assertEqual(result.qualification["unqualified"], {})
         validate.assert_called_once()
         self.assertEqual(execute.call_count, 2)
         commands = [call.args[0] for call in execute.call_args_list]
         self.assertTrue(all(cmd[0] == "ctest" and "--no-tests=error" in cmd for cmd in commands))
         self.assertIn("^V2_Unit_", commands[0])
-        self.assertIn("^(V2_Integration_B)$", commands[1])
+        self.assertEqual(preview.call_args.args[2], ("V2_Integration_B",))
+        self.assertFalse(Path(commands[1][commands[1].index("-I") + 1]).exists())
         # The full device-free Unit namespace consumes available CPU capacity;
         # the typed preflight host lane is deliberately serial so it cannot
         # race device/mixed-rank maintenance work.

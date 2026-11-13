@@ -9,6 +9,7 @@
 #include "../../../utils/OpenMPUtils.h"
 
 #include <cmath>
+#include <stdexcept>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -24,7 +25,7 @@ extern "C" bool cudaGDN_gated_rmsnorm(
     const float *input, const float *gate, const float *gamma,
     float *output,
     int seq_len, int d_model, int norm_dim, int gamma_period,
-    float eps, bool subtract_one, bool gate_silu,
+    float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation,
     int device_idx, void *stream);
 #endif
 #ifdef HAVE_ROCM
@@ -32,7 +33,7 @@ extern "C" bool rocmGDN_gated_rmsnorm(
     const float *input, const float *gate, const float *gamma,
     float *output,
     int seq_len, int d_model, int norm_dim, int gamma_period,
-    float eps, bool subtract_one, bool gate_silu,
+    float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation,
     int device_idx, void *stream);
 #endif
 
@@ -47,7 +48,7 @@ namespace llaminar2
     void gated_rmsnorm_group_scalar(const float *input_data, const float *gate_data,
                                     const float *gamma_data, float *output_data,
                                     size_t offset, size_t norm_dim, size_t gamma_period,
-                                    float eps, bool subtract_one, bool gate_silu)
+                                    float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation)
     {
         float sum_sq = 0.0f;
         for (size_t j = 0; j < norm_dim; ++j)
@@ -65,9 +66,9 @@ namespace llaminar2
                                         ? (1.0f + gamma_data[j % gamma_period])
                                         : gamma_data[j % gamma_period];
             const float gate_val = gate_data[offset + j];
-            const float gate_act = gate_silu
-                                       ? gate_val / (1.0f + std::exp(-gate_val))
-                                       : gate_val;
+            const float gate_act = gate_activation == GatedNormActivation::Identity ? gate_val :
+                (gate_activation == GatedNormActivation::SiLU ? gate_val : 1.0f) /
+                    (1.0f + std::exp(-gate_val));
             output_data[offset + j] = normalized * gamma_eff * gate_act;
         }
     }
@@ -76,7 +77,7 @@ namespace llaminar2
     void gated_rmsnorm_group_avx2(const float *input_data, const float *gate_data,
                                   const float *gamma_data, float *output_data,
                                   size_t offset, size_t norm_dim, size_t gamma_period,
-                                  float eps, bool subtract_one, bool gate_silu)
+                                  float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation)
     {
         __m256 vsum_sq = _mm256_setzero_ps();
         const size_t nd_vec = norm_dim & ~static_cast<size_t>(7);
@@ -105,8 +106,10 @@ namespace llaminar2
                 vgamma = _mm256_add_ps(vone, vgamma);
             __m256 vgate = _mm256_loadu_ps(gate_data + offset + j);
             __m256 vgate_act;
-            if (gate_silu)
+            if (gate_activation == GatedNormActivation::SiLU)
                 vgate_act = avx2::fast_silu(vgate);
+            else if (gate_activation == GatedNormActivation::Sigmoid)
+                vgate_act = avx2::fast_sigmoid(vgate);
             else
                 vgate_act = vgate;
             _mm256_storeu_ps(output_data + offset + j, _mm256_mul_ps(_mm256_mul_ps(vnorm, vgamma), vgate_act));
@@ -116,7 +119,9 @@ namespace llaminar2
             const float normalized = input_data[offset + j] * inv_rms;
             const float gamma_eff = subtract_one ? (1.0f + gamma_data[j % gamma_period]) : gamma_data[j % gamma_period];
             const float gate_val = gate_data[offset + j];
-            const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
+            const float gate_act = gate_activation == GatedNormActivation::Identity ? gate_val :
+                (gate_activation == GatedNormActivation::SiLU ? gate_val : 1.0f) /
+                    (1.0f + std::exp(-gate_val));
             output_data[offset + j] = normalized * gamma_eff * gate_act;
         }
     }
@@ -126,7 +131,7 @@ namespace llaminar2
     void gated_rmsnorm_group_avx512(const float *input_data, const float *gate_data,
                                     const float *gamma_data, float *output_data,
                                     size_t offset, size_t norm_dim, size_t gamma_period,
-                                    float eps, bool subtract_one, bool gate_silu)
+                                    float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation)
     {
         __m512 vsum_sq = _mm512_setzero_ps();
         const size_t nd_vec = norm_dim & ~static_cast<size_t>(15);
@@ -156,7 +161,7 @@ namespace llaminar2
                 vgamma = _mm512_add_ps(vone, vgamma);
             __m512 vgate = _mm512_loadu_ps(gate_data + offset + j);
             __m512 vgate_act;
-            if (gate_silu)
+            if (gate_activation != GatedNormActivation::Identity)
             {
                 __m512 neg_g = _mm512_mul_ps(vgate, vneg1);
                 neg_g = _mm512_max_ps(_mm512_set1_ps(-88.0f), _mm512_min_ps(_mm512_set1_ps(88.0f), neg_g));
@@ -174,7 +179,8 @@ namespace llaminar2
                 __m512 v2n = _mm512_castsi512_ps(_mm512_slli_epi32(vi_n, 23));
                 __m512 vexp = _mm512_mul_ps(vp, v2n);
                 __m512 vsig = _mm512_div_ps(vone, _mm512_add_ps(vone, vexp));
-                vgate_act = _mm512_mul_ps(vgate, vsig);
+                vgate_act = gate_activation == GatedNormActivation::SiLU
+                                ? _mm512_mul_ps(vgate, vsig) : vsig;
             }
             else
             {
@@ -187,7 +193,9 @@ namespace llaminar2
             const float normalized = input_data[offset + j] * inv_rms;
             const float gamma_eff = subtract_one ? (1.0f + gamma_data[j % gamma_period]) : gamma_data[j % gamma_period];
             const float gate_val = gate_data[offset + j];
-            const float gate_act = gate_silu ? gate_val / (1.0f + std::exp(-gate_val)) : gate_val;
+            const float gate_act = gate_activation == GatedNormActivation::Identity ? gate_val :
+                (gate_activation == GatedNormActivation::SiLU ? gate_val : 1.0f) /
+                    (1.0f + std::exp(-gate_val));
             output_data[offset + j] = normalized * gamma_eff * gate_act;
         }
     }
@@ -196,23 +204,25 @@ namespace llaminar2
     inline void gated_rmsnorm_group(const float *input_data, const float *gate_data,
                                     const float *gamma_data, float *output_data,
                                     size_t offset, size_t norm_dim, size_t gamma_period,
-                                    float eps, bool subtract_one, bool gate_silu)
+                                    float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation)
     {
 #if defined(__AVX512F__)
         gated_rmsnorm_group_avx512(input_data, gate_data, gamma_data, output_data,
-                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
 #elif defined(__AVX2__)
         gated_rmsnorm_group_avx2(input_data, gate_data, gamma_data, output_data,
-                                 offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+                                 offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
 #else
         gated_rmsnorm_group_scalar(input_data, gate_data, gamma_data, output_data,
-                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
 #endif
     }
 
     GatedRMSNormStage::GatedRMSNormStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (!validGatedNormActivation(params_.gate_activation))
+            throw std::invalid_argument("GatedRMSNormStage requires an explicit supported gate activation");
     }
 
     bool GatedRMSNormStage::execute(IDeviceContext *ctx)
@@ -270,7 +280,7 @@ namespace llaminar2
         }
         const float eps = params_.eps;
         const bool subtract_one = params_.subtract_one;
-        const bool gate_silu = params_.gate_silu;
+        const llaminar2::GatedNormActivation gate_activation = params_.gate_activation;
 
         // Gamma weight may be smaller than norm_dim (e.g., [d_v=128] with full-row
         // norm over value_dim=2048). In this case, gamma cycles every gamma_period elements.
@@ -300,7 +310,7 @@ namespace llaminar2
                     inp_gpu, gate_gpu, gamma_gpu, out_gpu,
                     seq_len, static_cast<int>(d_model),
                     static_cast<int>(norm_dim), static_cast<int>(gamma_period),
-                    eps, subtract_one, gate_silu,
+                    eps, subtract_one, gate_activation,
                     dev_idx, stream);
                 if (!ok)
                 {
@@ -317,7 +327,7 @@ namespace llaminar2
                     inp_gpu, gate_gpu, gamma_gpu, out_gpu,
                     seq_len, static_cast<int>(d_model),
                     static_cast<int>(norm_dim), static_cast<int>(gamma_period),
-                    eps, subtract_one, gate_silu,
+                    eps, subtract_one, gate_activation,
                     dev_idx, stream);
                 if (!ok)
                 {
@@ -355,7 +365,7 @@ namespace llaminar2
                 const size_t g = work_idx % n_groups;
                 const size_t offset = static_cast<size_t>(t) * d_model + g * norm_dim;
                 gated_rmsnorm_group(input_data, gate_data, gamma_data, output_data,
-                                    offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+                                    offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
             }
         }
         else
@@ -369,7 +379,7 @@ namespace llaminar2
                     const size_t g = work_idx % n_groups;
                     const size_t offset = static_cast<size_t>(t) * d_model + g * norm_dim;
                     gated_rmsnorm_group(input_data, gate_data, gamma_data, output_data,
-                                        offset, norm_dim, gamma_period, eps, subtract_one, gate_silu);
+                                        offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
                 }
             };
             OMP_WORKSHARE_REGION(do_work);
@@ -379,7 +389,7 @@ namespace llaminar2
                                                            << " d_model=" << d_model
                                                            << " norm_dim=" << norm_dim
                                                            << " n_groups=" << n_groups
-                                                           << " gate_silu=" << params_.gate_silu
+                                                           << " gate_activation=" << static_cast<int>(params_.gate_activation)
                                                            << " subtract_one=" << params_.subtract_one);
         return true;
     }

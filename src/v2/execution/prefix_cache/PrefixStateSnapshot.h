@@ -11,6 +11,7 @@
 #include "backends/DeviceId.h"
 #include "execution/prefix_cache/PrefixStorageBackend.h"
 #include "execution/prefix_cache/PrefixPlacementEpochSpan.h"
+#include "execution/prefix_cache/HostCacheAuxiliaryCheckpoint.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +23,7 @@
 
 namespace llaminar2
 {
+    class Qwen4ExpReplicatedPLEPrefixOrigin;
     /**
      * @brief One immutable lookup cohort, resolved only after participant coordination.
      *
@@ -154,6 +156,9 @@ namespace llaminar2
         {
             return storage.get();
         }
+
+        /** @return Exact native checkpoint metadata and original ownership/event identities. */
+        bool operator==(const DeviceKVSequenceStateCheckpoint &) const = default;
 
         bool valid() const
         {
@@ -370,9 +375,12 @@ namespace llaminar2
         bool logical_checkpoint = false;
         PrefixStateProvenance provenance = PrefixStateProvenance::Unknown;
         int cached_tokens = 0;
+        MTPShiftedCacheOrigin mtp_shifted_origin=MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Authenticated cache coordinates retained across restore.
         std::vector<int> mtp_cached_tokens;
         std::vector<DeviceKVSequenceStateCheckpoint>
             device_sequence_state_checkpoints;
+        /** Accepted CPU endpoint state; append-only pool banks remain in the canonical cache. */
+        std::vector<HostCacheAuxiliaryCheckpoint> host_auxiliary_checkpoints;
         std::vector<PrefixBlockHandle> blocks;
         std::vector<PrefixBlockHandle> mtp_blocks;
         std::vector<PrefixStateSnapshot> participant_snapshots;
@@ -391,6 +399,17 @@ namespace llaminar2
         DeviceId ready_device = DeviceId::invalid();
         bool ready_event_valid = false;
 
+        /**
+         * Actual process-local Rank rollback origin for fixed-head PLE only.
+         * Durable disk/RAM prefix lookup uses its existing payload-plan authority
+         * and never requires this process-local declaration. The origin retains
+         * only these existing handles, not copies of device or host payloads.
+         */
+        std::shared_ptr<const Qwen4ExpReplicatedPLEPrefixOrigin> fixed_head_rollback_origin;
+
+        /** @return Complete snapshot metadata/handle identity; payload bytes are never compared. */
+        bool operator==(const PrefixStateSnapshot &) const = default;
+
         bool decodeEquivalent() const
         {
             return isDecodeEquivalent(provenance);
@@ -403,9 +422,11 @@ namespace llaminar2
             swap(logical_checkpoint, other.logical_checkpoint);
             swap(provenance, other.provenance);
             swap(cached_tokens, other.cached_tokens);
+            std::swap(mtp_shifted_origin,other.mtp_shifted_origin);
             mtp_cached_tokens.swap(other.mtp_cached_tokens);
             device_sequence_state_checkpoints.swap(
                 other.device_sequence_state_checkpoints);
+            host_auxiliary_checkpoints.swap(other.host_auxiliary_checkpoints);
             blocks.swap(other.blocks);
             mtp_blocks.swap(other.mtp_blocks);
             participant_snapshots.swap(other.participant_snapshots);
@@ -413,6 +434,7 @@ namespace llaminar2
             swap(ready_producer_stream, other.ready_producer_stream);
             swap(ready_device, other.ready_device);
             swap(ready_event_valid, other.ready_event_valid);
+            fixed_head_rollback_origin.swap(other.fixed_head_rollback_origin);
         }
     };
 

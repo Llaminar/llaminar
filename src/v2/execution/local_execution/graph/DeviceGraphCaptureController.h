@@ -171,6 +171,8 @@ namespace llaminar2
              * lifetime and is never used for segmented or retained-parent plans.
              */
             IGraphCaptureAuxiliaryBranch *auxiliary_branch = nullptr;
+            /** @brief Same cold parent attachment, optionally contributing an original finite storage sibling. */
+            std::function<bool(IGPUGraphCapture&)> attach_original_parent;
             /**
              * @brief Build the immutable internal-edge ledger for one capture unit.
              *
@@ -622,6 +624,25 @@ namespace llaminar2
          * stop after instantiation; the cache then exposes one typed
          * MaterializedUnlaunched state whose next ordinary invocation owns the
          * initial launch. No graph-only or partially instantiated state escapes.
+         *
+         * Control-thread callers dispatch the entire cold transaction to the
+         * supplied original GPU worker. Calls already on that worker run inline.
+         * Preparation, native recording and capture-boundary hooks share one
+         * worker scope; no per-leaf host wait or GPU synchronization is added.
+         *
+         * @param graph Participant-local graph with its admitted topology.
+         * @param segment_cache Original cache owning the exact capture stream.
+         * @param ctx Device context for this graph participant.
+         * @param gpu_ctx Original worker retained by this graph's executor.
+         * @param has_collective_nodes Whether declared collective nodes exist.
+         * @param current_step Caller-owned lifecycle sequence for diagnostics.
+         * @param hooks Original preparation, recording and boundary operations.
+         * @param initial_submission Whether to stop after materialization or
+         *        submit the initial captured transaction.
+         * @return Capture result with the existing reset-on-failure obligation.
+         * @throws std::logic_error If worker dispatch fails to enter its owner.
+         * @throws std::exception Original preparation or recording failures,
+         *         propagated to the caller without changing execution policy.
          */
         static CapturePhaseResult executeCapturePhase(
             ComputeGraph &graph,

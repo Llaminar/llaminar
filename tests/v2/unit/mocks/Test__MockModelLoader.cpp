@@ -521,3 +521,76 @@ TEST(Test__MockModelLoader, ImplementsIModelLoaderInterface) {
     auto tensor = loader->loadTensor(names[0]);
     EXPECT_NE(tensor, nullptr);
 }
+
+/** @test In-memory source fixtures implement the same original-coordinate contract with genuine roots. */
+TEST(Test__MockModelLoader, NativeSourceWindowsRetainOriginalTensorBytesAndRejectInvalidPrefix)
+{
+    MockModelLoader loader;
+    auto ordinary=std::make_shared<FP32Tensor>(std::vector<size_t>{3,8});
+    for(size_t i=0;i<24;++i)ordinary->mutable_data()[i]=float(i);
+    loader.addTensor("ordinary",ordinary);
+    EXPECT_EQ(loader.nativeWeightSourcePlacement(),CPUStoragePlacement::local());
+    const auto source=loader.nativeWeightSourceGeometry("ordinary");
+    EXPECT_EQ(source.original_shape,(std::vector<size_t>{8,3}));
+    EXPECT_EQ(source.original_type,TensorType::FP32);
+    EXPECT_EQ(source.native_group_elements,1u);EXPECT_EQ(source.native_group_bytes,sizeof(float));
+    std::array<float,5> result;result.fill(-7.f);
+    NativeWeightSourceWindow window{.first_row=1,.rows=1,.first_column=2,.columns=3,.native_row_bytes=3*sizeof(float)};
+    loader.readNativeWeightSourceWindow("ordinary",window,
+        {reinterpret_cast<std::byte*>(result.data()),window.nativeBytes()});
+    EXPECT_EQ(result,(std::array<float,5>{10.f,11.f,12.f,-7.f,-7.f}));
+    EXPECT_EQ(loader.loadTensorCallCount(),0u);EXPECT_EQ(loader.nativeSourceReadCallCount(),1u);
+    window.first_row=3;
+    EXPECT_THROW(loader.readNativeWeightSourceWindow("ordinary",window,
+        {reinterpret_cast<std::byte*>(result.data()),3*sizeof(float)}),std::invalid_argument);
+    EXPECT_EQ(result,(std::array<float,5>{10.f,11.f,12.f,-7.f,-7.f}));
+    EXPECT_EQ(loader.nativeSourceReadCallCount(),1u);
+    ordinary->release_raw_data();
+    const auto retired=loader.nativeWeightSourceGeometry("ordinary");
+    EXPECT_EQ(retired.original_shape,source.original_shape);
+    EXPECT_EQ(retired.original_type,source.original_type);
+    EXPECT_EQ(retired.native_group_elements,source.native_group_elements);
+    EXPECT_EQ(retired.native_group_bytes,source.native_group_bytes);
+    window.first_row=1;
+    EXPECT_THROW(loader.readNativeWeightSourceWindow("ordinary",window,
+        {reinterpret_cast<std::byte*>(result.data()),window.nativeBytes()}),std::invalid_argument);
+    EXPECT_EQ(result,(std::array<float,5>{10.f,11.f,12.f,-7.f,-7.f}));
+    EXPECT_EQ(loader.nativeSourceReadCallCount(),1u);
+}
+
+/** @test Real native blocks and original expert axes remain unchanged by the in-memory reader. */
+TEST(Test__MockModelLoader, NativeSourceWindowsPreserveQuantizedGroupsAndExpertCoordinates)
+{
+    MockModelLoader loader;loader.addQ4_0RandomTensor("quant",{3,64},-1.f,1.f,19);
+    const auto source=loader.nativeWeightSourceGeometry("quant");
+    ASSERT_EQ(source.original_shape,(std::vector<size_t>{64,3}));
+    ASSERT_EQ(source.native_group_elements,32u);
+    const auto root=loader.loadTensor("quant");ASSERT_TRUE(root);
+    std::vector<std::byte> output(source.native_group_bytes+8,std::byte{0xcd});
+    NativeWeightSourceWindow window{.first_row=1,.rows=1,.first_column=32,.columns=32,.native_row_bytes=source.native_group_bytes};
+    loader.readNativeWeightSourceWindow("quant",window,{output.data(),source.native_group_bytes});
+    EXPECT_EQ(std::memcmp(output.data(),static_cast<const std::byte*>(root->raw_data())+3*source.native_group_bytes,
+        source.native_group_bytes),0);
+    for(size_t i=source.native_group_bytes;i<output.size();++i)EXPECT_EQ(output[i],std::byte{0xcd});
+    const auto populated=output;
+    root->release_host_weight_data();
+    const auto retired=loader.nativeWeightSourceGeometry("quant");
+    EXPECT_EQ(retired.original_shape,source.original_shape);
+    EXPECT_EQ(retired.original_type,source.original_type);
+    EXPECT_EQ(retired.native_group_bytes,source.native_group_bytes);
+    EXPECT_THROW(loader.readNativeWeightSourceWindow("quant",window,
+        {output.data(),source.native_group_bytes}),std::invalid_argument);
+    EXPECT_EQ(output,populated);
+    EXPECT_EQ(loader.nativeSourceReadCallCount(),1u);
+    auto experts=std::make_shared<FP32Tensor>(std::vector<size_t>{8,3,2});
+    for(size_t i=0;i<48;++i)experts->mutable_data()[i]=float(i);
+    loader.addTensor("experts",experts);
+    EXPECT_EQ(loader.nativeWeightSourceGeometry("experts").original_shape,(std::vector<size_t>{8,3,2}));
+    std::array<float,3> values{-7.f,-7.f,-7.f};
+    const NativeWeightSourceWindow selected{.original_expert=1,.selected_expert_ordinal=0,.first_row=2,.rows=1,
+        .first_column=3,.columns=2,.native_row_bytes=2*sizeof(float)};
+    loader.readNativeWeightSourceWindow("experts",selected,
+        {reinterpret_cast<std::byte*>(values.data()),selected.nativeBytes()});
+    EXPECT_EQ(values,(std::array<float,3>{43.f,44.f,-7.f}));
+    loader.resetCounters();EXPECT_EQ(loader.nativeSourceReadCallCount(),0u);
+}

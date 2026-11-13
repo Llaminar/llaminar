@@ -13,6 +13,7 @@
  */
 
 #include "ShortConv1dStage.h"
+#include "kernels/common/CPURequestStateBankView.h"
 #include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -33,6 +35,8 @@ namespace llaminar2
     void ShortConv1dStage::updateDynamicParams(int pos_offset, int seq_len)
     {
         (void)pos_offset;
+        if(std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract)&&seq_len!=1)
+            throw std::invalid_argument("Scalar prepared GDN convolution cannot change captured row geometry");
 
         /*
          * ForwardInput::seq_len is the width of one request.  The short-conv
@@ -69,6 +73,16 @@ namespace llaminar2
           params_(std::move(params)),
           workspace_slice_id_(g_shortconv_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
+        if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+        {
+            const auto layout=p->layout();
+            const auto *bank=dynamic_cast<const TensorBase*>(p->storage);
+            if(!device().is_rocm()||!params_.kernel||params_.seq_len!=1||params_.request_count!=1||
+                (params_.request_seq_len!=0&&params_.request_seq_len!=1)||
+                params_.kernel_size!=4||!bank||bank->native_type()!=TensorType::FP32||bank->size_bytes()<layout.bytes||bank->home_device()!=device()||
+                std::size_t(params_.channels)!=layout.elements+std::size_t(p->value_heads)*p->value_width)
+                throw std::invalid_argument("Scalar prepared GDN convolution has an incomplete producer binding");
+        }
     }
 
     WorkspaceRequirements ShortConv1dStage::getWorkspaceRequirements(int m, int n, int k) const
@@ -478,6 +492,41 @@ namespace llaminar2
         };
     }
 
+    bool ShortConv1dStage::planCPUVerifierStateRestoreRows(const int *rows,int requests,
+        std::vector<CPUVerifierStateRestorePlan> &plans)
+    {
+        if(params_.device_id.is_gpu() || !rows || requests<=0 || requests!=params_.request_count ||
+            !hasVerifierStateCapture() || !ensureVerifierStateCaptureWorkspaceBound())return false;
+        if(requests==1)return IComputeStage::planCPUVerifierStateRestoreRows(rows,requests,plans);
+        auto *owner=dynamic_cast<ICPURequestStateBankView *>(params_.kernel);
+        if(!owner || !params_.conv_state)return false;
+        const auto bank=owner->cpuRequestStateBankView();
+        const auto *capture=cpuVerifierStateCaptureSource();
+        const int stride=params_.request_seq_len;
+        if(!capture || stride<=0 || !bank.contains(requests,bank.stateElements) ||
+            verifier_capture_state_size_bound_<bank.stateElements ||
+            (params_.request_seq_lens_host && params_.request_seq_lens_host->size()!=std::size_t(requests)))return false;
+        // Only address metadata is borrowed from the current owner. No shared
+        // backend workspace is rebound, and every request is checked before
+        // the publisher can write any accepted state or clear capture bindings.
+        for(int request=0;request<requests;++request) {
+            const int row=rows[request];
+            const int live=params_.request_seq_lens_host ? (*params_.request_seq_lens_host)[request] : stride;
+            const auto first=std::int64_t(request)*stride;
+            if(live<0 || live>stride || (row>=0 && (row<first || row>=first+live || row>=verifier_capture_rows_bound_)))return false;
+            if(row<0)continue;
+            const auto bytes=std::size_t(bank.stateElements)*sizeof(float);
+            auto *destination=bank.storage.data()+std::size_t(request)*bank.stateElements;
+            const auto *selected=capture+std::size_t(row)*verifier_capture_state_size_bound_;
+            plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
+                .destination=destination,.source=selected,.bytes=bytes});
+            if(request==0 && params_.conv_state!=destination)
+                plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
+                    .destination=params_.conv_state,.source=selected,.bytes=bytes});
+        }
+        return true;
+    }
+
     bool ShortConv1dStage::restoreVerifierStateCaptureRow(int row, void *stream)
     {
         if (!hasVerifierStateCapture())
@@ -523,9 +572,11 @@ namespace llaminar2
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceIndex(
-        const int *device_row_index,
+        std::span<const int> device_row_index_view,
         void *stream)
     {
+        if (!deviceVerifierStateMetadataCovers(device_row_index_view, 1, 1)) return false;
+        const int *device_row_index = device_row_index_view.data();
         if (!hasVerifierStateCapture() || !device_row_index || !stream)
             return false;
         // Device-indexed publication must also re-establish this stage's
@@ -551,11 +602,13 @@ namespace llaminar2
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowsFromDeviceIndices(
-        const int *device_row_indices,
+        std::span<const int> device_row_indices_view,
         int request_count,
         int row_index_stride,
         void *stream)
     {
+        if (!deviceVerifierStateMetadataCovers(device_row_indices_view, request_count, row_index_stride)) return false;
+        const int *device_row_indices = device_row_indices_view.data();
         if (!hasVerifierStateCapture() ||
             !device_row_indices ||
             request_count <= 0 ||
@@ -743,7 +796,16 @@ namespace llaminar2
             }
 
             bool ok = false;
-            if (request_batched)
+            if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+            {
+                if(params_.seq_len!=1||params_.request_count!=1)
+                    throw std::invalid_argument("Scalar prepared GDN convolution cannot change captured row geometry");
+                auto execution=gpuExecution();execution.requirePreparedOutput(p->storage);
+                auto *bank=dynamic_cast<TensorBase*>(p->storage);
+                ok=params_.kernel->forwardPreparedQK({p->key_heads,p->value_heads,p->key_width,p->value_width,
+                    p->normalize_qk,d_input,d_weight,d_bias,d_output,static_cast<float*>(bank->gpu_data_ptr())});
+            }
+            else if (request_batched)
             {
                 const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
                 if (!params_.request_seq_lens_device)
@@ -968,6 +1030,8 @@ namespace llaminar2
             contract.addInput(*params_.input_buffer_id);
         if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+            contract.addOutput(p->buffer_id);
         // Conv weights are model parameters, not arena-managed
         if (params_.weight)
             contract.addWeight(const_cast<ITensor *>(params_.weight));

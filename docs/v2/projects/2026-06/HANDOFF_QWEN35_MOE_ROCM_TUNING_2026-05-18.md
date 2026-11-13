@@ -227,7 +227,7 @@ Accepted wins:
 Default-off / neutral:
 
 - Shared expert grouped decode was essentially neutral: opt-in around 58.38 tok/s versus default around 58 tok/s.
-- Native-VNNI direct/tuning knobs were added during a pass but did not produce a default win. Keep them guarded unless a future profile proves otherwise.
+- NativeQuantised direct/tuning knobs were added during a pass but did not produce a default win. Keep them guarded unless a future profile proves otherwise.
 
 ### GDN
 
@@ -241,9 +241,9 @@ Observed result:
 
 Next likely target from the last tuning context: `rocm_gdn_recurrent_step_kernel` and GDN recurrence/projection interaction.
 
-### Native-VNNI Decode GEMV
+### NativeQuantised Decode GEMV
 
-Decode-focused rocprof showed native-VNNI decode GEMV is still a major bucket, especially separate `gemv_native_vnni_reduce_kernel_t` cost after codebook-19 GEMVs.
+Decode-focused rocprof showed native-quantised decode GEMV is still a major bucket, especially separate `gemv_native_quantised_reduce_kernel_t` cost after codebook-19 GEMVs.
 
 Ideas that still look worth exploring:
 
@@ -297,8 +297,8 @@ Work in this order unless new profiling contradicts it:
    - Look for scalar memory traffic, redundant per-head state loads, and launch shape under-occupancy.
    - Benchmark with and without `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=1`.
 
-2. **Native-VNNI decode GEMV reduce overhead**
-   - Target `gemv_native_vnni_reduce_kernel_t` and associated codebook-19 GEMV path.
+2. **NativeQuantised decode GEMV reduce overhead**
+   - Target `gemv_native_quantised_reduce_kernel_t` and associated codebook-19 GEMV path.
    - Try single-pass or fused reduce variants for decode shapes.
    - Keep direct-path knobs default-off unless no-env benchmark clearly wins.
 
@@ -309,7 +309,7 @@ Work in this order unless new profiling contradicts it:
 4. **Prefill parity phase**
    - llama.cpp prefill is around 694 tok/s versus Llaminar around 268 tok/s.
    - Treat this as a separate project after decode reaches parity.
-   - Likely targets: native-VNNI prefill kernels, packed layout, and prefill graph/launch overhead.
+   - Likely targets: native-quantised prefill kernels, packed layout, and prefill graph/launch overhead.
 
 ## Subagent Dispatch Template
 

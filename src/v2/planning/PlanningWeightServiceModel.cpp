@@ -5,13 +5,15 @@
  * Selection is bounded by executed format families, not layer count, expert count
  * or candidate count. Timed cache-resident work never supplies DRAM bandwidth.
  * Predictions retain the observed operation family and extrapolate logical
- * shape explicitly; no vendor peak table, inferred topology, synthetic speed
+ * shape explicitly. Host-source CPU streaming remains separate when CPU compute
+ * is excluded; arithmetic and candidate backend eligibility are unchanged.
+ * No vendor peak table, inferred topology, synthetic speed
  * bonus, live placement state or parallel physical-memory ledger is introduced.
  */
 #include "utils/DebugEnv.h"
 #include "PlanningWeightServiceModel.h"
 #include "AutomaticPlanningStartup.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -50,11 +52,11 @@ namespace llaminar2
         double gpuProjectionBytes(const PlanningWeightOperand &operand, WeightShardMatrix matrix)
         {
             const auto format = operand.executionFormat();
-            if (const auto *native = native_vnni_formats::forQuantType(format))
+            if (const auto *native = native_quantised_formats::forQuantType(format))
             {
                 if (matrix.columns % 32 != 0)
                     throw std::invalid_argument("GPU expert work requires complete native execution blocks");
-                return nativeVnniPackedRegionSizes(matrix.rows, matrix.columns, *native).logicalBytes();
+                return nativeQuantisedPackedRegionSizes(matrix.rows, matrix.columns, *native).logicalBytes();
             }
             if (format != "F32" && format != "F16" && format != "BF16")
                 throw std::invalid_argument("GPU expert work has an unsupported executed projection format");
@@ -152,12 +154,31 @@ namespace llaminar2
     {
         std::vector<PlanningWeightServiceSample> selected;
         std::optional<AutomaticOrchestrationRequest> request;
+        bool separate_host_source = false;
         acceptPlanningCostPreparation(context.mpi(), [&] {
             selected = samples(context.metadata());
             request = std::get<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(context.request()));
+            const auto &policy=context.request().ngram_table_policy;
+            const auto &tensors=context.metadata().memoryProfile().tensors;
+            const bool immutable=std::any_of(tensors.begin(),tensors.end(),[](const auto &tensor) {
+                return inferWeightRole(tensor.name)==WeightRole::ImmutableRowTable;
+            });
+            separate_host_source=immutable && !request->allows(DeviceType::CPU) &&
+                !policy.isFixedHeadSharded() && policy.storage!=ImmutableRowStoragePreference::VRAM;
         });
         auto memory = PlanningKernelServiceCatalog::collect(context.mpi(), context.inventory(), *request,
             PlanningStreamingServicePlan{});
+        // Host source ownership is independent of allowed COMPUTE backends.
+        // This source-free CPU stream is a separate first-class measurement;
+        // the original request still owns every projection/expert observer.
+        std::optional<PlanningKernelServiceCatalog> host_source_memory;
+        std::optional<AutomaticOrchestrationRequest> host_request;
+        acceptPlanningCostPreparation(context.mpi(),[&] {
+            if(separate_host_source)host_request.emplace(AutomaticOrchestrationOptions{
+                .only_backends=std::vector<DeviceType>{DeviceType::CPU}});
+        });
+        if(host_request)host_source_memory=PlanningKernelServiceCatalog::collect(
+            context.mpi(),context.inventory(),*host_request,PlanningStreamingServicePlan{});
         std::vector<PlanningKernelServiceCatalog> kernels;
         for (const auto &sample : selected)
         {
@@ -194,14 +215,24 @@ namespace llaminar2
             });
         }
         if (!context.isRoot()) return std::nullopt;
-        return PlanningWeightServiceModel(std::move(*memory), std::move(kernels));
+        return PlanningWeightServiceModel(std::move(*memory), std::move(kernels),std::move(host_source_memory));
     }
 
     PlanningWeightServiceModel::PlanningWeightServiceModel(PlanningKernelServiceCatalog memory,
-        std::vector<PlanningKernelServiceCatalog> kernels) : memory_(std::move(memory)), kernels_(std::move(kernels))
+        std::vector<PlanningKernelServiceCatalog> kernels,std::optional<PlanningKernelServiceCatalog> host_source_memory)
+        : memory_(std::move(memory)), kernels_(std::move(kernels)),host_source_memory_(std::move(host_source_memory))
     {
         if (!std::holds_alternative<PlanningStreamingServicePlan>(memory_.source()) || kernels_.empty())
             throw std::invalid_argument("Weight service needs independent streaming and kernel catalogs");
+        if(host_source_memory_) {
+            if(!std::holds_alternative<PlanningStreamingServicePlan>(host_source_memory_->source()) ||
+                host_source_memory_->records().empty() ||
+                std::any_of(host_source_memory_->records().begin(),host_source_memory_->records().end(),
+                    [](const auto &record){return !record.observer.device().is_cpu();}) ||
+                std::any_of(memory_.records().begin(),memory_.records().end(),
+                    [](const auto &record){return record.observer.device().is_cpu();}))
+                throw std::invalid_argument("Immutable host-source memory needs a separate nonempty CPU-only streaming catalog");
+        }
         std::set<std::pair<std::string, FloatingActivationOperandPrecision>> ordinary;
         std::set<std::array<std::string, 3>> experts;
         for (const auto &kernel : kernels_)
@@ -268,7 +299,8 @@ namespace llaminar2
 
     double PlanningWeightServiceModel::memorySeconds(int rank, DeviceId device, double bytes) const
     {
-        return std::get<PlanningMemoryBandwidthObservation>(memory_.serviceFor(rank, device).observation)
+        const auto &catalog=device.is_cpu() && host_source_memory_ ? *host_source_memory_ : memory_;
+        return std::get<PlanningMemoryBandwidthObservation>(catalog.serviceFor(rank, device).observation)
             .service.secondsFor(PlanningWorkUnit::Bytes, bytes);
     }
 

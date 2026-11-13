@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "GPUFlatGraphStructure.h"
 #include "GPUGraphMemoryContract.h"
 
 #include <cstddef>
@@ -24,6 +25,7 @@ namespace llaminar2
 {
 
     class IGPUGraphCapture;
+    class RetainedParticipantGraphExecutable;
     class PhysicalMemoryAuthority;
 
     /**
@@ -88,7 +90,7 @@ namespace llaminar2
         size_t dynamic_shared_memory_bytes = 0;   ///< Per-block dynamic shared memory.
         size_t static_shared_memory_bytes = 0;    ///< Compiler-owned shared memory per block.
         size_t local_memory_bytes_per_thread = 0; ///< Compiler-owned local memory per thread.
-        uint32_t registers_per_thread = 0;         ///< Compiler-assigned registers per thread.
+        uint32_t registers_per_thread = 0;         ///< Compiler-assigned registers; a native empty kernel can legitimately use zero.
         uint32_t max_threads_per_block = 0;        ///< Backend launch ceiling for this kernel.
         uint32_t max_active_blocks_per_sm = 0;     ///< Occupancy ceiling at captured geometry.
         size_t nesting_depth = 0;                 ///< Number of enclosing child graphs.
@@ -98,14 +100,18 @@ namespace llaminar2
          * @brief Verify that the record describes a launchable kernel node.
          *
          * @return true when function identity and every launch dimension are
-         *         present. A symbolic name is intentionally not required because
-         *         opaque library kernels must still be represented.
+         *         present, with resolved positive launch and occupancy limits.
+         *         Zero registers is a valid compiler result for an empty kernel;
+         *         it must not be confused with absent launch metadata. Native
+         *         inspectors reject failed resource queries before publication.
+         *         A symbolic name is intentionally not required because opaque
+         *         library kernels must still be represented.
          */
         [[nodiscard]] bool valid() const noexcept
         {
             return function_identity != 0 && grid_x > 0 && grid_y > 0 &&
                    grid_z > 0 && block_x > 0 && block_y > 0 && block_z > 0 &&
-                   registers_per_thread > 0 && max_threads_per_block > 0 &&
+                   max_threads_per_block > 0 &&
                    max_active_blocks_per_sm > 0;
         }
     };
@@ -299,6 +305,7 @@ namespace llaminar2
         std::span<const DeviceControlledLoopEntryFragment> entry;
         std::span<const DeviceControlledLoopFragment> initialization;
         std::span<const DeviceControlledLoopFragment> iteration;
+        std::span<const DeviceControlledLoopEntryFragment> terminal; ///< Unconditional once-only release after WHILE exits, including unhealthy/zero-iteration exits.
     };
 
     /**
@@ -516,6 +523,9 @@ namespace llaminar2
         const IGPUGraphCapture &open;
         const IGPUGraphCapture &worker;
         const IGPUGraphCapture &close;
+        /** Finite body work sharing Open; all such terminals precede Close.
+         * These definitions may not depend on Close or parent completion. */
+        std::span<const IGPUGraphCapture* const> body_siblings{};
     };
 
     /// Abstract interface for GPU graph capture and replay.
@@ -734,6 +744,48 @@ namespace llaminar2
             (void)branch;
             return false;
         }
+
+        /**
+         * @brief Add finite native siblings without inventing a progress contribution.
+         * @param siblings Nonempty, unique graph-only definitions on this exact original device.
+         * @return True after all siblings are roots/terminals of this same parent.
+         * @note Original main nodes stay in place, including CUDA conditional handles.
+         * Native completion and outer timeline composition include ALL terminals.
+         * Empty/self/foreign/executable definitions reject before any mutation;
+         * a later native failure invalidates the parent. No operation executes here.
+         */
+        virtual bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)
+        {(void)siblings;return false;}
+
+        /**
+         * @brief Fork a finite body after one exact imported main fragment.
+         * @param producer Original graph-only fragment imported exactly once by this parent's ordered timeline.
+         * @param body Original same-device finite auxiliary definition, not an executable or alias.
+         * @return True after the auxiliary entry depends on that imported exit frontier.
+         * Later main units remain independent of auxiliary completion. The
+         * auxiliary becomes another parent terminal, so final native retirement
+         * joins it. No event, live counter or replay-time host work is added.
+         * Wrong-parent, reset, foreign, ambiguous and duplicate definitions
+         * reject before mutation; native failure after mutation invalidates the parent.
+         */
+        [[nodiscard]] virtual bool appendFiniteBodyAfterCapturedFragment(
+            const IGPUGraphCapture& producer, const IGPUGraphCapture& body)
+        {(void)producer;(void)body;return false;}
+
+        /**
+         * @brief Join exact imported main and previously appended finite-body exits before another body.
+         * @param producers Unique original definitions already belonging to this uninstantiated parent.
+         * @param body Same-device graph-only finite definition, not already present in this parent.
+         * @return True after the body depends on every actual original exit. Its newly appended
+         * child exit can be named by a later call using the SAME original body definition.
+         * Empty, null, stale, foreign, ambiguous and duplicate definitions reject before native mutation.
+         * Instantiated/reset parents reject. No event or live word is introduced; completion
+         * of an appended child means all terminals of its original finite body completed.
+         * Backends without native graph assembly, including CPU, explicitly return false.
+         */
+        [[nodiscard]] virtual bool appendFiniteBodyAfterCapturedFragment(
+            std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body)
+        {(void)producers;(void)body;return false;}
 
         /**
          * @brief Consume completed per-step timings without waiting on the GPU.
@@ -965,6 +1017,20 @@ namespace llaminar2
         virtual const char *backendName() const = 0;
 
     protected:
+        friend class RetainedParticipantGraphExecutable;
+        /**
+         * @brief Import a retained graph-only child at the exact active stream frontier.
+         * @param child Same-device sealed native definition with a parent-held lifetime borrow.
+         * @return True after the native child is the stream's complete new dependency frontier.
+         * @note The retained owner authenticates the borrow before entering capture. Failure
+         * requires discarding this recording after closing the active native interval.
+         */
+        [[nodiscard]] virtual bool appendActiveCaptureChild(const IGPUGraphCapture &child)
+        {
+            (void)child;
+            return false;
+        }
+
         /**
          * @brief Require a flat native kernel/copy/memset-only graph.
          * @param error Receives the first forbidden or unreadable native node.
@@ -979,6 +1045,25 @@ namespace llaminar2
             return false;
         }
 
+    public:
+        /**
+         * @brief Inspect one sealed flat definition in original caller-owned bounded scratch.
+         * @param limits Source-authored geometry/kind envelope declared before admission.
+         * @param scratch Original CPU0/PMA storage; no per-node allocation is permitted.
+         * @param observed Receives a complete default-edge DAG census only on success.
+         * @param error Optional precise first failure, cleared on success.
+         * @return False for unsupported backends, native kinds, edge data or incomplete metadata.
+         * @note Cold setup only: no instantiate, launch, transfer, device-memory query or synchronization.
+         */
+        virtual bool inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,
+            std::span<std::byte> scratch,GPUFlatGraphStructure& observed,std::string* error=nullptr)const
+        {
+            (void)limits;(void)scratch;observed={};
+            if(error)*error="GPU backend has no complete flat structural inspection";
+            return false;
+        }
+
+    protected:
         IGPUGraphCapture() = default;
         // Non-copyable
         IGPUGraphCapture(const IGPUGraphCapture &) = delete;

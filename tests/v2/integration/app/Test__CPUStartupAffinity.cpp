@@ -7,8 +7,13 @@
  * and serialized form, together with the serialized unresolved endpoint used
  * by canonical single-CPU generation cells. Each child verifies the complete
  * physical-core team before any model or accelerator allocation is possible.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "app/MPIBootstrapPhase.h"
 #include "config/OrchestrationConfigParser.h"
 
@@ -47,10 +52,10 @@ namespace
             MPIBootstrapPhase bootstrap;
             (void)bootstrap.execute(config, 3, arguments);
         }
-        catch (const std::runtime_error &error)
+        catch (const std::invalid_argument &error)
         {
-            return std::string(error.what()).find("has no physical CPU set") !=
-                   std::string::npos;
+            return std::string(error.what()) ==
+                   "MPI placement cannot select an unknown/duplicate observed NUMA node";
         }
         return false;
     }
@@ -115,6 +120,7 @@ namespace
                   << " workers=" << omp_get_max_threads()
                   << " expected=" << expected_threads << " affinity=" << details
                   << std::endl;
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         MPI_Finalize();
         return passed ? 0 : 1;
     }
@@ -126,6 +132,10 @@ namespace
  */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         if (argc > 1)

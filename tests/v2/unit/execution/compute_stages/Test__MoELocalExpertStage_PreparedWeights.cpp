@@ -10,9 +10,14 @@
  *   5. Params has only the allowed MoE runtime-table hook, not runner/peer fields.
  *   6. CPU replay and expert replacement retain the setup-owned workspace;
  *      prepared CPU engines receive scratch through invocation, never rebinding.
+ *   7. Model-global PP layer identities select only the exact compact retained bank row.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "utils/CPUSerialArenaTestAdmission.h"
+#include "utils/CPUPerLayerPacketTestAdmission.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -51,7 +56,7 @@ namespace
     class FakePreparedGemm final : public ITensorGemm, public IWorkspaceConsumer
     {
     public:
-        explicit FakePreparedGemm(DeviceNativeVNNIMatrixDesc desc)
+        explicit FakePreparedGemm(DeviceNativeQuantisedMatrixDesc desc)
             : desc_(desc)
         {
         }
@@ -90,7 +95,7 @@ namespace
 
         bool weights_converted() const override { return true; }
 
-        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
         {
             out = desc_;
             return out.valid();
@@ -114,7 +119,7 @@ namespace
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
     private:
-        DeviceNativeVNNIMatrixDesc desc_;
+        DeviceNativeQuantisedMatrixDesc desc_;
         DeviceWorkspaceManager *workspace_ = nullptr;
     };
 
@@ -132,6 +137,10 @@ namespace
             : expert_id_(expert_id), down_projection_(down_projection)
         {
         }
+
+        /** @brief Inject one changed protocol certificate after compute, without a concurrent writer. */
+        void rewritePacketEpochAfterCompute(std::uint64_t* epoch,std::uint64_t replacement=0)noexcept
+        { packet_epoch_=epoch;replacement_epoch_=replacement; }
 
         bool supports_device(int) const override { return true; }
 
@@ -181,6 +190,7 @@ namespace
                         static_cast<float>((expert_id_ + 1) * 16 + col);
                 }
             }
+            if(packet_epoch_)*packet_epoch_=replacement_epoch_;
             return true;
         }
 
@@ -243,6 +253,8 @@ namespace
         }
 
     private:
+        std::uint64_t* packet_epoch_=nullptr; ///< Same-thread adversarial protocol mutation only.
+        std::uint64_t replacement_epoch_=0;
         int expert_id_ = -1;
         bool down_projection_ = false;
         size_t binding_calls_ = 0;
@@ -355,11 +367,11 @@ namespace
         bool down_projection_ = false; ///< Select the fused down role.
     };
 
-    DeviceNativeVNNIMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
+    DeviceNativeQuantisedMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
     {
         const uintptr_t base = 0x10000000u + static_cast<uintptr_t>(expert_id) * 0x10000u +
                                static_cast<uintptr_t>(role) * 0x1000u;
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base + 0x0100u);
         desc.scales = reinterpret_cast<const void *>(base + 0x0200u);
         desc.mins = reinterpret_cast<const void *>(base + 0x0300u);
@@ -502,7 +514,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
      ValidatePreparedWeights_SucceedsWithCompleteEngineVectors)
 {
     auto p = makePreparedVectorParams(4);
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
 
     std::string err;
     EXPECT_TRUE(stage.validatePreparedWeights(&err));
@@ -553,7 +565,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
             .route_slot_capacity = original_slots.size(),
         };
     EXPECT_THROW(
-        (void)MoELocalExpertStage{params},
+        (void)MoELocalExpertStage{test::admitCPUPerLayerPacketForTest(params)},
         std::invalid_argument)
         << "A mapped route destination without its serial raw-route arena is an invalid lifecycle state";
 }
@@ -613,7 +625,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
         kMappedRouteCapacity * kDModel, kUntouched);
 
     auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-        MoELocalExpertSerialBufferArena::Config{
+        test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
             .device_id = DeviceId::cpu(),
             .row_capacity = kRows,
             .row_capacity_buckets = {kRows},
@@ -624,7 +636,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
                     CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
             .logical_participant_id = 3,
             .debug_name = "unit.cpu_canonical_route_return",
-        });
+        }));
 
     std::vector<std::unique_ptr<CanonicalRouteTestGemm>> engines;
     std::vector<ITensorGemm *> gate(kExperts, nullptr);
@@ -667,7 +679,8 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.prepared_up_gemm = up;
     params.prepared_down_gemm = down;
 
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
+    test::CPUStageTestWorkspace stage_workspace(stage);
     llaminar2::testing::MockDeviceContext context(
         DeviceId::cpu(), ComputeBackendType::CPU);
     ASSERT_TRUE(stage.execute(&context));
@@ -772,11 +785,10 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
         MoEOverlayParticipantBankInstallStatus::Installed);
     params.overlay_participant_residency = residency;
 
-    DeviceWorkspaceManager workspace(DeviceId::cpu(), 4096);
-    MoELocalExpertStage stage(params);
-    stage.bindWorkspace(&workspace);
-    auto unbind = [](MoELocalExpertStage *value) { value->unbindWorkspace(); };
-    std::unique_ptr<MoELocalExpertStage, decltype(unbind)> binding(&stage, unbind);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
+    test::CPUStageTestWorkspace stage_workspace(stage);
+    DeviceWorkspaceManager *const admitted_workspace = stage.getWorkspace();
+    ASSERT_NE(admitted_workspace, nullptr);
     std::array<size_t, experts * 3> setup_bindings;
     for (size_t i = 0; i < engines.size(); ++i)
         setup_bindings[i] = engines[i]->bindingCalls();
@@ -799,7 +811,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
             input.residency_epoch = 2;
         }
         ASSERT_TRUE(stage.execute(&context));
-        EXPECT_EQ(stage.getWorkspace(), &workspace);
+        EXPECT_EQ(stage.getWorkspace(), admitted_workspace);
         ASSERT_EQ(output.live_row_count, rows);
         for (int row = 0; row < rows; ++row)
             for (int col = 0; col < width; ++col)
@@ -808,12 +820,12 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
         for (size_t i = 0; i < engines.size(); ++i)
         {
             EXPECT_EQ(engines[i]->bindingCalls(), setup_bindings[i]);
-            EXPECT_EQ(engines[i]->lastInvocationWorkspace(), &workspace);
+            EXPECT_EQ(engines[i]->lastInvocationWorkspace(), admitted_workspace);
         }
         for (const auto &engine : replacement)
         {
             EXPECT_EQ(engine->bindingCalls(), 0u);
-            EXPECT_EQ(engine->lastInvocationWorkspace(), replay >= 10 ? &workspace : nullptr);
+            EXPECT_EQ(engine->lastInvocationWorkspace(), replay >= 10 ? admitted_workspace : nullptr);
         }
     }
 }
@@ -847,11 +859,11 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     }
     std::fill_n(input.hidden_rows_fp32, width, 1.0f);
     auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-        MoELocalExpertSerialBufferArena::Config{
+        test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
             .device_id = DeviceId::cpu(), .row_capacity = 1,
             .d_model = width, .routing_top_k = 4,
             .cpu_canonical_route_storage = MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
-        });
+        }));
     std::vector<std::unique_ptr<CanonicalRouteTestGemm>> owned;
     MoELocalExpertStage::Params params;
     params.device_id = DeviceId::cpu();
@@ -875,7 +887,8 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
         owned.push_back(std::make_unique<CanonicalRouteTestGemm>(expert, true));
         params.prepared_down_gemm.push_back(owned.back().get());
     }
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
+    test::CPUStageTestWorkspace stage_workspace(stage);
     llaminar2::testing::MockDeviceContext context(DeviceId::cpu(), ComputeBackendType::CPU);
     ASSERT_TRUE(stage.execute(&context));
     ASSERT_EQ(output.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
@@ -935,7 +948,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     }
 
     auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-        MoELocalExpertSerialBufferArena::Config{
+        test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
             .device_id = DeviceId::cpu(),
             .row_capacity = kRows,
             .row_capacity_buckets = {1, 2, kRows},
@@ -943,7 +956,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
             .routing_top_k = kTopK,
             .logical_participant_id = 2,
             .debug_name = "unit.cpu_single_pass_compaction",
-        });
+        }));
 
     std::vector<std::unique_ptr<CanonicalRouteTestGemm>> engines;
     std::vector<ITensorGemm *> gate(kExperts, nullptr);
@@ -979,7 +992,8 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.prepared_up_gemm = up;
     params.prepared_down_gemm = down;
 
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
+    test::CPUStageTestWorkspace stage_workspace(stage);
     llaminar2::testing::MockDeviceContext context(
         DeviceId::cpu(), ComputeBackendType::CPU);
     ASSERT_TRUE(stage.execute(&context));
@@ -1092,14 +1106,14 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
         MoEOverlayActivationHiddenPayloadLayout::SharedPhysicalRows;
 
     auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-        MoELocalExpertSerialBufferArena::Config{
+        test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
             .device_id = DeviceId::cpu(),
             .row_capacity = kRows,
             .d_model = kDModel,
             .routing_top_k = kTopK,
             .logical_participant_id = 2,
             .debug_name = "unit.cpu_borrowed_physical_hidden",
-        });
+        }));
     BorrowedHiddenEchoGemm gate(/*down_projection=*/false);
     BorrowedHiddenEchoGemm up(/*down_projection=*/false);
     BorrowedHiddenEchoGemm down(/*down_projection=*/true);
@@ -1121,7 +1135,8 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.prepared_up_gemm = {&up};
     params.prepared_down_gemm = {&down};
 
-    MoELocalExpertStage stage(std::move(params));
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(std::move(params)));
+    test::CPUStageTestWorkspace stage_workspace(stage);
     llaminar2::testing::MockDeviceContext context(
         DeviceId::cpu(), ComputeBackendType::CPU);
     ASSERT_TRUE(stage.execute(&context));
@@ -1183,7 +1198,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.prepared_up_gemm[3] = nullptr;
     p.prepared_down_gemm[3] = nullptr;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_TRUE(stage.validatePreparedWeights(&err));
     EXPECT_TRUE(err.empty());
@@ -1196,7 +1211,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     // Expert 2 is active but its gate engine is null.
     p.prepared_gate_gemm[2] = nullptr;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_FALSE(stage.validatePreparedWeights(&err));
     EXPECT_FALSE(err.empty());
@@ -1232,7 +1247,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.expert_intermediate = 512;
     params.layer_idx = 0;
 
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
     const WorkspaceRequirements requirements =
         stage.getWorkspaceRequirements(/*m=*/9);
     const auto descriptor_bytes = [](const WorkspaceRequirements &candidate,
@@ -1249,7 +1264,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     const size_t expected_bytes =
         static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) *
         static_cast<size_t>(kLogicalExperts) *
-        sizeof(DeviceNativeVNNIMatrixDesc);
+        sizeof(DeviceNativeQuantisedMatrixDesc);
 
     EXPECT_EQ(
         descriptor_bytes(
@@ -1275,7 +1290,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     // Deliberately mismatch prepared_up_gemm size.
     p.prepared_up_gemm.resize(3);
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_FALSE(stage.validatePreparedWeights(&err));
     EXPECT_FALSE(err.empty());
@@ -1310,7 +1325,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.up_slab_ref = up_ref;
     p.down_slab_ref = down_ref;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_TRUE(stage.validatePreparedWeights(&err));
     EXPECT_TRUE(err.empty());
@@ -1347,7 +1362,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.up_slab_ref = up_ref;
     p.down_slab_ref = down_ref;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_FALSE(stage.validatePreparedWeights(&err));
     EXPECT_FALSE(err.empty());
@@ -1383,7 +1398,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.up_slab_ref = up_ref;
     p.down_slab_ref = down_ref;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_FALSE(stage.validatePreparedWeights(&err));
     EXPECT_NE(err.find("expert 2"), std::string::npos);
@@ -1408,7 +1423,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.up_exps = up.get();
     p.down_exps = down.get();
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_TRUE(stage.validatePreparedWeights(&err));
     EXPECT_TRUE(err.empty());
@@ -1425,7 +1440,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.layer_idx = 0;
     // No prepared vectors, no slab refs, no raw tensors.
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     std::string err;
     EXPECT_FALSE(stage.validatePreparedWeights(&err));
     EXPECT_FALSE(err.empty());
@@ -1451,7 +1466,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     std::vector<std::unique_ptr<FakePreparedGemm>> owned;
     attachFakePreparedEngines(p, owned);
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     EXPECT_FALSE(stage.isGraphCapturable());
     EXPECT_TRUE(stage.refreshRuntimePlacement());
 
@@ -1506,7 +1521,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.expert_mask = {false, false, false, false};
     p.moe_runtime_table = &table;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
     ASSERT_TRUE(stage.execute(&ctx));
     EXPECT_EQ(output.live_row_count, 0u);
@@ -1549,7 +1564,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.top_k = kTopK;
     p.expert_intermediate = 64;
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
     EXPECT_FALSE(stage.execute(&ctx));
     EXPECT_EQ(output.live_row_count, 0u);
@@ -1561,7 +1576,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     MoELocalExpertStage::Params p = makePreparedVectorParams(4);
     p.device_id = DeviceId::rocm(1);
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
     EXPECT_FALSE(stage.execute(&ctx));
 }
@@ -1599,7 +1614,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     std::vector<std::unique_ptr<FakePreparedGemm>> owned;
     attachFakePreparedEngines(p, owned);
 
-    MoELocalExpertStage stage(p);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(p));
     const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(kRows, 0, 0);
 
     const auto *group_indices = reqs.find(MoEWorkspaceBuffers::GROUP_INT_INDICES);
@@ -1671,7 +1686,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     std::vector<std::unique_ptr<FakePreparedGemm>> owned;
     attachFakePreparedEngines(params, owned);
 
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
     ASSERT_TRUE(stage.refreshRuntimePlacement());
     ASSERT_EQ(table.hostLayerState(0).active_epoch, 1u);
 
@@ -1713,7 +1728,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.prepared_up_gemm[1] = nullptr;
     params.prepared_down_gemm[1] = nullptr;
 
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
     ASSERT_TRUE(stage.refreshRuntimePlacement());
     ASSERT_EQ(stage.missingPreparedExpertIds({1}), (std::vector<int>{1}));
 
@@ -1785,7 +1800,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.layer_idx = 0;
     params.runtime_participant_index = 3;
     params.overlay_participant_residency = residency;
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
     llaminar2::testing::MockDeviceContext ctx(
         DeviceId::cpu(), ComputeBackendType::CPU);
 
@@ -1800,6 +1815,144 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     input.residency_epoch = 2;
     EXPECT_TRUE(stage.execute(&ctx));
     EXPECT_EQ(output.residency_epoch, 2u);
+}
+
+/** @test Completion rejects a changed packet certificate instead of relabelling its retained bank. */
+TEST(Test__MoELocalExpertStage_PreparedWeights, CompletionRejectsChangedPacketEpochForRetainedBank)
+{
+    constexpr int width=8;
+    auto endpoint=std::make_shared<MoEOverlayParticipantResidency>(MoEOverlayParticipantResidency::Config{
+        .participant_id=3,.device=DeviceId::cpu(),.num_layers=1,.num_experts=1,.retained_epoch_capacity=2});
+    auto gate=std::make_shared<CanonicalRouteTestGemm>(0,false);
+    auto up=std::make_shared<CanonicalRouteTestGemm>(0,false);
+    auto down=std::make_shared<CanonicalRouteTestGemm>(0,true);
+    MoEOverlayParticipantResidencyBank bank;bank.epoch=1;bank.participant_id=3;bank.device=DeviceId::cpu();
+    bank.layers.resize(1);bank.layers[0].resident_mask.assign(1,false);bank.layers[0].experts.resize(1);
+    bank.layers[0].setResidentExpert(0,{gate,up,down});
+    std::string error;ASSERT_EQ(prepareAndInstall(*endpoint,bank,&error),MoEOverlayParticipantBankInstallStatus::Installed)<<error;
+    MoEOverlayCollectiveWorkspace packets;packets.ensureCapacity(1,1,width,1,DeviceId::cpu());
+    auto input=packets.localExpertInput(0,0);auto output=packets.localExpertOutput(0,0);
+    input.residency_epoch=1;input.live_row_count=input.live_entry_count=1;
+    input.row_ids_host[0]=0;input.entry_offsets_host[0]=0;input.entry_offsets_host[1]=1;
+    input.expert_ids_host[0]=0;input.route_weights_host[0]=1;std::fill_n(input.hidden_rows_fp32,width,1.0f);
+    MoELocalExpertStage::Params params;params.device_id=DeviceId::cpu();params.input_rows=&input;params.output_rows=&output;
+    params.graph_row_capacity=1;params.num_experts=1;params.top_k=1;params.d_model=width;params.expert_intermediate=16;
+    params.layer_idx=0;params.runtime_participant_index=3;params.expert_mask={true};params.overlay_participant_residency=endpoint;
+    params.prepared_gate_gemm={gate.get()};params.prepared_up_gemm={up.get()};params.prepared_down_gemm={down.get()};
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));test::CPUStageTestWorkspace workspace(stage);
+    llaminar2::testing::MockDeviceContext context(DeviceId::cpu(),ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&context));EXPECT_EQ(output.residency_epoch,1u);
+    down->rewritePacketEpochAfterCompute(&input.residency_epoch,2);
+    EXPECT_FALSE(stage.execute(&context));EXPECT_EQ(input.residency_epoch,2u);EXPECT_EQ(output.live_row_count,0u);
+    EXPECT_FALSE(stage.hasPendingDeferredOutput());
+    down->rewritePacketEpochAfterCompute(nullptr);input.residency_epoch=1;
+    EXPECT_TRUE(stage.execute(&context));EXPECT_EQ(output.residency_epoch,1u);
+}
+
+/** @test Real CPU packets address model-global layers within compact PP residency banks. */
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUPipelineGlobalLayerExecutesExactRetainedExpertBank)
+{
+    constexpr int width = 8, experts = 2, rows = 2;
+    for (const int first : {0, 1, 2, 24, 40})
+    for (const int layer_count : {1, 2})
+    {
+        SCOPED_TRACE(::testing::Message() << first << '/' << layer_count);
+        auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+            MoEOverlayParticipantResidency::Config{
+                .participant_id = 3, .device = DeviceId::cpu(),
+                .num_layers = layer_count, .num_experts = experts,
+                .first_model_layer = first});
+        MoEOverlayParticipantResidencyBank bank;
+        bank.epoch = 1; bank.participant_id = 3; bank.device = DeviceId::cpu();
+        bank.first_model_layer = first;
+        bank.layers.resize(layer_count);
+        for (int local = 0; local < layer_count; ++local)
+        {
+            bank.layers[local].resident_mask.assign(experts, false);
+            bank.layers[local].experts.resize(experts);
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                const int identity = local * experts + expert;
+                bank.layers[local].setResidentExpert(expert, {
+                    std::make_shared<CanonicalRouteTestGemm>(identity, false),
+                    std::make_shared<CanonicalRouteTestGemm>(identity, false),
+                    std::make_shared<CanonicalRouteTestGemm>(identity, true)});
+            }
+        }
+        std::string error;
+        ASSERT_EQ(prepareAndInstall(*residency, bank, &error),
+            MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        MoEOverlayCollectiveWorkspace packets;
+        packets.ensureCapacity(rows, rows, width, 1, DeviceId::cpu());
+        auto input = packets.localExpertInput(first, 0);
+        auto output = packets.localExpertOutput(first, 0);
+        input.residency_epoch = 1;
+        input.live_row_count = input.live_entry_count = rows;
+        for (int row = 0; row < rows; ++row)
+        {
+            input.row_ids_host[row] = row;
+            input.entry_offsets_host[row] = row;
+            input.expert_ids_host[row] = row;
+            input.route_weights_host[row] = 1.0F;
+            std::fill_n(input.hidden_rows_fp32 + row * width, width, 1.0F);
+        }
+        input.entry_offsets_host[rows] = rows;
+        llaminar2::testing::MockDeviceContext context(DeviceId::cpu(), ComputeBackendType::CPU);
+        for (int local = 0; local < layer_count; ++local)
+        {
+            input.key.layer_idx = first + local;
+            MoELocalExpertStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.input_rows = &input; params.output_rows = &output;
+            params.graph_row_capacity = rows;
+            params.num_experts = experts; params.top_k = 1;
+            params.d_model = width; params.expert_intermediate = 16;
+            params.layer_idx = first + local; params.runtime_participant_index = 3;
+            params.expert_mask.assign(experts, true);
+            params.overlay_participant_residency = residency;
+            for (const auto &source : bank.layers[local].experts)
+            {
+                params.prepared_gate_gemm.push_back(source.gate().get());
+                params.prepared_up_gemm.push_back(source.up().get());
+                params.prepared_down_gemm.push_back(source.down().get());
+            }
+            MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
+            test::CPUStageTestWorkspace stage_workspace(stage);
+            DeviceWorkspaceManager *const admitted_workspace = stage.getWorkspace();
+            ASSERT_NE(admitted_workspace, nullptr);
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                ASSERT_TRUE(stage.execute(&context));
+                ASSERT_EQ(output.live_row_count, rows);
+                EXPECT_EQ(output.residency_epoch, 1u);
+                for (int row = 0; row < rows; ++row)
+                    for (int col = 0; col < width; ++col)
+                        EXPECT_FLOAT_EQ(output.output_rows_fp32[row * width + col],
+                            float((local * experts + row + 1) * 16 + col));
+            }
+            for (const int foreign : {first - 1, first + layer_count})
+            {
+                auto invalid = params;
+                invalid.layer_idx = foreign;
+                input.key.layer_idx = foreign; // Valid packet/stage agreement, foreign residency scope.
+                EXPECT_NO_THROW(([&] {
+                    MoELocalExpertStage rejected(test::admitCPUPerLayerPacketForTest(invalid));
+                    test::CPUStageTestWorkspace rejected_workspace(rejected);
+                    EXPECT_FALSE(rejected.execute(&context));
+                }()));
+                input.key.layer_idx = params.layer_idx;
+            }
+            auto invalid = params;
+            invalid.runtime_participant_index++;
+            MoELocalExpertStage rejected_participant(test::admitCPUPerLayerPacketForTest(invalid));
+            test::CPUStageTestWorkspace rejected_participant_workspace(rejected_participant);
+            EXPECT_FALSE(rejected_participant.execute(&context));
+            input.residency_epoch = 0;
+            EXPECT_FALSE(stage.execute(&context));
+            input.residency_epoch = 1;
+        }
+    }
 }
 
 TEST(Test__MoELocalExpertStage_PreparedWeights,
@@ -1845,7 +1998,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.overlay_participant_residency = residency;
     params.moe_runtime_table = &runtime_table;
 
-    MoELocalExpertStage stage(params);
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));
     llaminar2::testing::MockDeviceContext ctx(
         DeviceId::cpu(), ComputeBackendType::CPU);
     EXPECT_FALSE(stage.execute(&ctx));
@@ -1869,14 +2022,14 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     auto input = workspace.localExpertInput(0, 0);
     auto output = workspace.localExpertOutput(0, 0);
     auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-        MoELocalExpertSerialBufferArena::Config{
+        test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
             .device_id = device,
             .row_capacity = 1,
             .row_capacity_buckets = {1},
             .d_model = kDModel,
             .routing_top_k = kTopK,
             .logical_participant_id = 7,
-            .debug_name = "unit.deferred_local_expert"});
+            .debug_name = "unit.deferred_local_expert"}));
     auto residency = std::make_shared<MoEOverlayParticipantResidency>(
         MoEOverlayParticipantResidency::Config{
             .participant_id = 7,
@@ -1913,7 +2066,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     std::vector<std::unique_ptr<FakePreparedGemm>> owned;
     attachFakePreparedEngines(params, owned);
 
-    MoELocalExpertStage producer(params);
+    MoELocalExpertStage producer(test::admitCPUPerLayerPacketForTest(params));
     EXPECT_TRUE(producer.usesDeferredCompletion());
     EXPECT_FALSE(producer.hasPendingDeferredOutput());
     EXPECT_TRUE(
@@ -1951,7 +2104,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     cpu_params.device_id = DeviceId::cpu();
     cpu_params.serial_compact_buffer_arena.reset();
     EXPECT_THROW(
-        (void)MoELocalExpertStage{cpu_params},
+        (void)MoELocalExpertStage{test::admitCPUPerLayerPacketForTest(cpu_params)},
         std::invalid_argument)
         << "Only GPU endpoints may defer their host-visible completion";
 }
@@ -1968,3 +2121,5 @@ TEST(Test__MoELocalExpertStage_PreparedWeights, ParamsHasOnlyMoERuntimeTableAndN
     EXPECT_FALSE(has_peer_participants<P>::value);
     EXPECT_FALSE(has_prepared_participants<P>::value);
 }
+
+#include "CPUCanonicalPreweightReplay.inc"

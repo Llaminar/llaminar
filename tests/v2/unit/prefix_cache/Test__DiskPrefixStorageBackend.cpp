@@ -15,8 +15,22 @@
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "utils/Sha256.h"
+#include "execution/prefix_cache/BlockHash.h"
+#include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "utils/MPIContext.h"
+#include "utils/OpenMPUtils.h"
+#include <nlohmann/json.hpp>
+#include <cmath>
+#include <bit>
+#include <cstring>
+#include <cstdlib>
+#include <functional>
+#include <memory>
 
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -100,6 +114,41 @@ namespace
         ~MaintenancePayloadReads() { active.store(nullptr); }
     };
     std::atomic<MaintenancePayloadReads *> MaintenancePayloadReads::active{nullptr};
+
+    /** @brief Inject one EIO only for an exact stat-authenticated journal read extent. */
+    struct JournalNativeReadFailure
+    {
+        dev_t device{};
+        ino_t inode{};
+        off_t offset = 0;
+        size_t bytes = 0;
+        std::atomic<bool> injected{false};
+        static std::atomic<JournalNativeReadFailure *> active;
+        /** @brief Arm metadata only; no open descriptor or payload is retained here. */
+        JournalNativeReadFailure(const std::filesystem::path &journal, off_t begin, size_t count)
+            : offset(begin), bytes(count)
+        {
+            struct stat state{};
+            if (::stat(journal.c_str(), &state) != 0 || count == 0)
+                throw std::runtime_error("invalid journal native-read failure extent");
+            device = state.st_dev;
+            inode = state.st_ino;
+            JournalNativeReadFailure *empty = nullptr;
+            if (!active.compare_exchange_strong(empty, this))
+                throw std::runtime_error("overlapping journal read failures");
+        }
+        /** @brief All selected public reads have returned before disarming this owner. */
+        ~JournalNativeReadFailure() { active.store(nullptr); }
+        /** @return Whether this exact real read receives the sole injected EIO. */
+        bool matches(int descriptor, off_t begin, size_t count)
+        {
+            if (begin != offset || count != bytes) return false;
+            struct stat state{};
+            return ::fstat(descriptor, &state) == 0 && state.st_dev == device && state.st_ino == inode &&
+                !injected.exchange(true);
+        }
+    };
+    std::atomic<JournalNativeReadFailure *> JournalNativeReadFailure::active{nullptr};
 
     /** @brief One exact native unlink failure after the new journal frontier commits. */
     struct PayloadRetirementFailure
@@ -204,6 +253,13 @@ extern "C" int unlink(const char *path) noexcept
  */
 extern "C" ssize_t pread(int fd, void *destination, size_t bytes, off_t offset)
 {
+    const int incoming_errno = errno;
+    if (auto *failure = JournalNativeReadFailure::active.load(); failure && failure->matches(fd, offset, bytes))
+    {
+        errno = EIO;
+        return -1;
+    }
+    errno = incoming_errno;
     const auto result = static_cast<ssize_t>(::syscall(SYS_pread64, fd, destination, bytes, offset));
     const int saved_errno = errno;
     if (auto *observer = PayloadReadObservation::active; observer && result > 0 && offset >= 0)
@@ -289,6 +345,76 @@ namespace
             std::move(admission), 0);
     }
 } // namespace
+
+/**
+ * @test Produce a retired archive through the actual current writer for the independent audit.
+ *
+ * With no export option this remains an ordinary small device-free native case.
+ * The explicit preflight qualifier supplies an empty owned directory, runs only
+ * this case, then observes journal metadata and payload inode extents in Python.
+ * No fixture payload is read back or hashed by that audit. The native writer's
+ * real put/touch/capacity-eviction path, including nonempty runtime state, prevents
+ * an authored old-format fixture from silently certifying a changed writer.
+ */
+TEST(Test__DiskPrefixStorageBackend, MetadataAuditCurrentWriterProducesRetiredArchive)
+{
+    const char *const export_directory = std::getenv("LLAMINAR_TEST_PREFIX_METADATA_AUDIT_DIRECTORY");
+    const bool exported = export_directory && export_directory[0] != '\0';
+    const auto directory = exported ? std::filesystem::path(export_directory) : tempDir();
+    if (exported)
+    {
+        ASSERT_TRUE(directory.is_absolute());
+        ASSERT_FALSE(std::filesystem::is_symlink(directory));
+        ASSERT_TRUE(std::filesystem::is_directory(directory));
+        ASSERT_TRUE(std::filesystem::is_empty(directory));
+    }
+    struct Cleanup
+    {
+        std::filesystem::path directory;
+        bool retained;
+        /** @brief Qualifier owns exported evidence; ordinary Unit owns temporary cleanup. */
+        ~Cleanup()
+        {
+            if (!retained) { std::error_code ignored; std::filesystem::remove_all(directory, ignored); }
+        }
+    } cleanup{directory, exported};
+    const auto layout = makeLayout();
+    RamPrefixStorageBackend ram(256u);
+    auto a = ram.allocate(testKey(), layout);
+    auto b = ram.allocate(makePrefixCacheKey(0x12345678, 0, 1, 2, {3, 4}), layout);
+    ASSERT_TRUE(a.valid());
+    ASSERT_TRUE(b.valid());
+    ASSERT_TRUE(ram.attachModelRuntimeState(&a, std::make_shared<std::vector<uint8_t>>(8u, 0x18)));
+    ASSERT_TRUE(ram.attachModelRuntimeState(&b, std::make_shared<std::vector<uint8_t>>(8u, 0x29)));
+    ASSERT_EQ(a.total_bytes, b.total_bytes);
+    for (const auto *handle : {&a, &b})
+    {
+        std::fill_n(static_cast<uint8_t *>(handle->kv_payload), handle->kvBytes(), uint8_t{0x31});
+        std::fill_n(static_cast<uint8_t *>(handle->terminal_logits), handle->terminalLogitsBytes(), uint8_t{0x42});
+    }
+    const auto budget = a.total_bytes;
+    {
+        DiskPrefixStorageBackend disk(archivePath(directory), budget, kModelArtifactIdentity);
+        ASSERT_TRUE(disk.ready()) << disk.initializationError();
+        PrefixBlockHandle stored;
+        std::string error;
+        ASSERT_TRUE(disk.writeBlock(a, &stored, nullptr, &error)) << error;
+        ASSERT_TRUE(disk.writeBlock(a, &stored, nullptr, &error)) << error; // Actual metadata-only touch.
+        ASSERT_TRUE(disk.writeBlock(b, &stored, nullptr, &error)) << error; // Actual capacity retirement of a.
+        ASSERT_TRUE(disk.writeBlock(b, &stored, nullptr, &error)) << error;
+        ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+        const auto usage = disk.telemetry()->snapshot();
+        EXPECT_EQ(usage.entries, 1u);
+        EXPECT_EQ(usage.used_bytes, budget);
+    } // Join native writer/maintenance before the independent auditor may open metadata.
+    std::ofstream metadata(directory / "native-writer-fixture.json");
+    ASSERT_TRUE(metadata);
+    metadata << nlohmann::json{{"schema", "llaminar.test.prefix_archive_native_fixture.v1"},
+        {"budget_bytes", budget}, {"expected_entries", 1u}, {"expected_payload_bytes", budget},
+        {"model_artifact_identity", kModelArtifactIdentity}}.dump() << '\n';
+    metadata.flush();
+    ASSERT_TRUE(metadata);
+}
 
 /** @brief Archive-owned gauges survive restart; counters distinguish writes, touches, selected reads and evictions. */
 TEST(Test__DiskPrefixStorageBackend, TelemetryOccupancyTrafficAndRestart)
@@ -696,7 +822,7 @@ TEST(Test__DiskPrefixStorageBackend, MetadataSelectionRetainsVersionAndRecency)
 /** @test An incompatible archive is rejected intact rather than reinterpreted or erased. */
 TEST(Test__DiskPrefixStorageBackend, MetadataFormatRejectsLegacyArchiveIntact)
 {
-    for (const char version : {1, 2})
+    for (const char version : {1, 2, 3, 4})
     {
         SCOPED_TRACE(static_cast<unsigned>(version));
         const auto directory = tempDir();
@@ -718,7 +844,7 @@ TEST(Test__DiskPrefixStorageBackend, MetadataFormatRejectsLegacyArchiveIntact)
             DiskPrefixStorageBackend reopened(archivePath(directory), 1024u, kModelArtifactIdentity);
             EXPECT_FALSE(reopened.ready());
             EXPECT_NE(reopened.initializationError().find("header"), std::string::npos);
-            EXPECT_NE(reopened.initializationError().find("expected 3; use a fresh cache directory"), std::string::npos);
+            EXPECT_NE(reopened.initializationError().find("expected 5; use a fresh cache directory"), std::string::npos);
         }
         std::ifstream retained(archivePath(directory), std::ios::binary);
         const std::string after((std::istreambuf_iterator<char>(retained)), {});
@@ -910,6 +1036,200 @@ TEST(Test__DiskPrefixStorageBackend, SelectedReadCohortRetainsOneImmutableInode)
         EXPECT_EQ(archive_descriptors(), initial_fds);
     }
     std::filesystem::remove_all(directory);
+}
+
+/** @test A cached metadata index pins its original inode until actual refresh or shutdown.
+ * The observer retains only dev/ino numbers; it never opens the old journal and
+ * cannot mask the production lease defect. Every replacement uses the actual
+ * peer worker and every key is checked through the real archive metadata API. */
+TEST(Test__DiskPrefixStorageBackend, BackgroundCompactionRetainsCachedIndexInodeUntilRefresh)
+{
+    const auto directory = tempDir();
+    const auto layout = makeLayout();
+    struct stat cached{}, current{};
+    const auto descriptors = [](const struct stat &identity) {
+        size_t count = 0;
+        for (const auto &entry : std::filesystem::directory_iterator("/proc/self/fd"))
+        {
+            const int descriptor = std::stoi(entry.path().filename().string());
+            struct stat actual{};
+            if (::fstat(descriptor, &actual) == 0 && actual.st_dev == identity.st_dev && actual.st_ino == identity.st_ino)
+                ++count;
+        }
+        return count;
+    };
+    const auto key = [](int index) {
+        return makePrefixCacheKey(testKey().fingerprint, 0, index, 2 * index,
+            {2 * index + 1, 2 * index + 2});
+    };
+    const auto write = [&](DiskPrefixStorageBackend &backend, int index) {
+        RamPrefixStorageBackend ram(layout.totalBytes());
+        auto source = ram.allocate(key(index), layout);
+        if (!source.valid()) return std::string("could not allocate authored block");
+        std::fill(source.kv_storage->begin(), source.kv_storage->end(), static_cast<uint8_t>(index));
+        std::string error;
+        if (!backend.writeBlock(source, nullptr, nullptr, &error)) return error;
+        return std::string{};
+    };
+    {
+        DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+        ASSERT_EQ(write(disk, 0), "");
+        ASSERT_EQ(::stat(disk.archivePath().c_str(), &cached), 0);
+        EXPECT_EQ(descriptors(cached), 1u) << "The archive itself must pin the generation of its cached offsets";
+        {
+            DiskPrefixStorageBackend peer(archivePath(directory), 0u, kModelArtifactIdentity);
+            struct stat intermediate{};
+            for (int index = 1; index <= 2; ++index)
+            {
+                ASSERT_EQ(write(peer, index), "");
+                std::string error;
+                ASSERT_TRUE(peer.requestCompaction(&error)) << error;
+                ASSERT_TRUE(peer.waitForCompaction(&error)) << error;
+                ASSERT_EQ(::stat(disk.archivePath().c_str(), &current), 0);
+                EXPECT_FALSE(current.st_dev == cached.st_dev && current.st_ino == cached.st_ino)
+                    << "The still-indexed unlinked inode cannot be recycled as either replacement";
+                EXPECT_EQ(descriptors(cached), 1u) << "The idle backend remains stale across BOTH peer compactions";
+                EXPECT_EQ(descriptors(current), 1u) << "Only the peer has refreshed to its latest metadata generation";
+                if (index == 1) intermediate = current;
+                // Deliberately no disk lookup/write/maintenance/refresh here.
+                // Stat and descriptor observation retain no native inode lease.
+            }
+            EXPECT_EQ(descriptors(intermediate), 0u) << "The peer releases its first replacement instead of retaining a history chain";
+            std::string error;
+            const auto entries = disk.compatibleEntries(testKey().fingerprint, layout, &error);
+            ASSERT_EQ(entries.size(), 3u) << error;
+            for (int expected = 0; expected <= 2; ++expected)
+            {
+                EXPECT_TRUE(std::any_of(entries.begin(), entries.end(), [&](const auto &entry) {
+                    return entry.key == key(expected);
+                }));
+            }
+            EXPECT_EQ(descriptors(cached), 0u) << "One actual refresh releases the original pre-two-compactions index lease";
+            EXPECT_EQ(descriptors(current), 2u) << "Exactly one latest-generation lease per backend after refresh";
+        }
+        EXPECT_EQ(descriptors(current), 1u);
+    }
+    EXPECT_EQ(descriptors(current), 0u) << "Archive shutdown releases its final index lease";
+    std::filesystem::remove_all(directory);
+}
+
+namespace
+{
+    /** @brief Exact metadata-only read extent derived from a real committed record. */
+    struct JournalRecordReadRegion { off_t offset; size_t bytes; };
+
+    /** @return Whole tiny authored metadata journal bytes, never a payload file or hash. */
+    std::string authoredJournalBytes(const std::filesystem::path &path)
+    {
+        std::ifstream journal(path, std::ios::binary);
+        if (!journal) throw std::runtime_error("could not read authored metadata journal");
+        return {std::istreambuf_iterator<char>(journal), std::istreambuf_iterator<char>()};
+    }
+
+    /** @return Actual committed framing extents for preamble, metadata and footer. */
+    std::array<JournalRecordReadRegion, 3> authoredJournalRecordRegions(
+        const std::string &journal, size_t record_offset)
+    {
+        constexpr size_t preamble_bytes = 56, footer_bytes = 16;
+        const auto word = [&](size_t position) {
+            if (position > journal.size() || journal.size() - position < sizeof(uint64_t))
+                throw std::runtime_error("short authored journal framing");
+            uint64_t value = 0;
+            for (size_t byte = 0; byte < sizeof(value); ++byte)
+                value |= uint64_t(static_cast<unsigned char>(journal[position + byte])) << (8 * byte);
+            return value;
+        };
+        const auto record_bytes = word(record_offset + 16);
+        const auto metadata_bytes = word(record_offset + 24);
+        if (record_offset > journal.size() || record_bytes > journal.size() - record_offset ||
+            record_bytes < preamble_bytes + footer_bytes || metadata_bytes != record_bytes - preamble_bytes - footer_bytes)
+            throw std::runtime_error("invalid authored metadata-only record extent");
+        return {{{static_cast<off_t>(record_offset), preamble_bytes},
+                 {static_cast<off_t>(record_offset + preamble_bytes), static_cast<size_t>(metadata_bytes)},
+                 {static_cast<off_t>(record_offset + record_bytes - footer_bytes), footer_bytes}}};
+    }
+
+    /** @brief Author tiny actual committed blocks, then exercise the public native read boundary. */
+    void proveJournalNativeReadFailurePreservesCommittedBytes(bool initialization)
+    {
+        for (size_t boundary = 0; boundary < 3; ++boundary)
+        {
+            SCOPED_TRACE(::testing::Message() << "initialization=" << initialization << " boundary=" << boundary);
+            const auto directory = tempDir();
+            const auto layout = makeLayout();
+            const auto key = [](int index) {
+                return makePrefixCacheKey(testKey().fingerprint, 0, index, 2 * index,
+                    {2 * index + 1, 2 * index + 2});
+            };
+            {
+                DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+                ASSERT_TRUE(disk.ready()) << disk.initializationError();
+                RamPrefixStorageBackend ram(layout.totalBytes());
+                auto put = [&](DiskPrefixStorageBackend &owner, int index) {
+                    auto source = ram.allocate(key(index), layout);
+                    if (!source.valid()) return std::string("could not allocate authored block");
+                    std::string error;
+                    const bool written = owner.writeBlock(source, nullptr, nullptr, &error);
+                    ram.release(source);
+                    return written ? std::string{} : (error.empty() ? std::string("authored journal put failed") : error);
+                };
+                ASSERT_EQ(put(disk, 0), "");
+                const size_t first_tail_offset = authoredJournalBytes(disk.archivePath()).size();
+                // A real independent owner appends beyond disk's cached scan offset.
+                DiskPrefixStorageBackend peer(archivePath(directory), 0u, kModelArtifactIdentity);
+                ASSERT_TRUE(peer.ready()) << peer.initializationError();
+                ASSERT_EQ(put(peer, 1), "");
+                ASSERT_EQ(put(peer, 2), "");
+                const std::string original = authoredJournalBytes(disk.archivePath());
+                // The production v5 header is 80 bytes; footer/metadata lengths
+                // come from the actual committed framing, not payload geometry.
+                const auto regions = authoredJournalRecordRegions(original, initialization ? 80u : first_tail_offset);
+                const std::array<const char *, 3> names{"preamble", "metadata", "footer"};
+                {
+                    JournalNativeReadFailure failure(disk.archivePath(), regions[boundary].offset, regions[boundary].bytes);
+                    if (initialization)
+                    {
+                        DiskPrefixStorageBackend reopened(archivePath(directory), 0u, kModelArtifactIdentity);
+                        EXPECT_FALSE(reopened.ready());
+                        EXPECT_NE(reopened.initializationError().find(std::string("stat-bounded prefix record ") + names[boundary]), std::string::npos);
+                    }
+                    else
+                    {
+                        std::string error;
+                        EXPECT_TRUE(disk.compatibleEntries(testKey().fingerprint, layout, &error).empty());
+                        EXPECT_NE(error.find(std::string("stat-bounded prefix record ") + names[boundary]), std::string::npos);
+                    }
+                    EXPECT_TRUE(failure.injected.load()) << "The exact journal extent must actually fail";
+                    EXPECT_EQ(std::filesystem::file_size(disk.archivePath()), original.size());
+                    EXPECT_EQ(authoredJournalBytes(disk.archivePath()), original);
+                }
+                std::string error;
+                const auto entries = disk.compatibleEntries(testKey().fingerprint, layout, &error);
+                ASSERT_EQ(entries.size(), 3u) << error;
+                for (int index = 0; index < 3; ++index)
+                {
+                    EXPECT_TRUE(std::any_of(entries.begin(), entries.end(), [&](const auto &entry) { return entry.key == key(index); }));
+                }
+                DiskPrefixStorageBackend reopened(archivePath(directory), 0u, kModelArtifactIdentity);
+                ASSERT_TRUE(reopened.ready()) << reopened.initializationError();
+                EXPECT_EQ(reopened.compatibleEntries(testKey().fingerprint, layout, &error).size(), 3u) << error;
+                EXPECT_EQ(authoredJournalBytes(disk.archivePath()), original);
+            }
+            std::filesystem::remove_all(directory);
+        }
+    }
+}
+
+/** @test A native stat-bounded journal read failure cannot initialize a truncated archive. */
+TEST(Test__DiskPrefixStorageBackend, JournalNativeReadFailureDuringInitializationPreservesCommittedBytes)
+{
+    proveJournalNativeReadFailurePreservesCommittedBytes(true);
+}
+
+/** @test A native read failure in an appended suffix cannot truncate acknowledged commits. */
+TEST(Test__DiskPrefixStorageBackend, JournalNativeReadFailureDuringRefreshPreservesCommittedBytes)
+{
+    proveJournalNativeReadFailurePreservesCommittedBytes(false);
 }
 
 /** @test Concurrent writers/touches/deletes survive the worker's exact tail frontier. */
@@ -1646,4 +1966,587 @@ TEST(Test__DiskPrefixStorageBackend, AccessedRecordSurvivesBudgetEvictionAndRest
         &error))
         << error;
     cleanup();
+}
+
+/** @test RAM/SSD roundtrips preserve compact QFN sections and row-only hydration never reads endpoints. */
+TEST(Test__DiskPrefixStorageBackend, FlashNextCompactAuxiliarySectionsPersistAndSelectLiveRows)
+{
+    const auto directory = tempDir();
+    auto layout = makeLayout();
+    layout.mtp_layers = 1;
+    layout.includes_mtp_state = true;
+    layout.mtp_kv_bytes = 8;
+    layout.main_auxiliary = {CacheAuxiliaryStateKind::QwenFlashNext, 8, 12, true};
+    layout.mtp_auxiliary = {CacheAuxiliaryStateKind::QwenFlashNext, 4, 16, true};
+    {
+        RamPrefixStorageBackend ram(1024u);
+        auto source = ram.allocate(testKey(), layout);
+        ASSERT_TRUE(source.valid());
+        ASSERT_TRUE(source.model_auxiliary_storage);
+        for (size_t i = 0; i < source.model_auxiliary_storage->size(); ++i)
+            (*source.model_auxiliary_storage)[i] = static_cast<uint8_t>(i + 1);
+        DiskPrefixStorageBackend disk(archivePath(directory), 1024u, kModelArtifactIdentity);
+        std::string error;
+        ASSERT_TRUE(disk.writeBlock(source, nullptr, nullptr, &error)) << error;
+    }
+    {
+        auto disk = std::make_shared<DiskPrefixStorageBackend>(archivePath(directory), 1024u, kModelArtifactIdentity);
+        RamPrefixStorageBackend ram(1024u);
+        std::string error;
+        auto ticket = disk->captureLookupSource(testKey(), layout, &error);
+        ASSERT_TRUE(ticket) << error;
+        ASSERT_TRUE(disk->selectHydrationSections(*ticket, PrefixPayloadReadSet::SequenceRows, &error)) << error;
+        PayloadReadObservation reads(singlePayloadPath(disk->archivePath()), layout.totalBytes());
+        PrefixBlockHandle rows;
+        ASSERT_TRUE(disk->hydrateSelected(*ticket, ram, &rows, &error)) << error;
+        EXPECT_EQ(rows.layout.modelAuxiliaryBytes(), 12u);
+        EXPECT_EQ(reads.bytes, 16u + 8u + 12u);
+        ASSERT_EQ(rows.model_auxiliary_storage->size(), 12u);
+        for (size_t i = 0; i < 12; ++i) EXPECT_EQ((*rows.model_auxiliary_storage)[i], i + 1);
+        EXPECT_EQ(rows.mainAuxiliaryEndpointData(), nullptr);
+        EXPECT_EQ(rows.mtpAuxiliaryEndpointData(), nullptr);
+        ASSERT_TRUE(ram.release(rows));
+    }
+    {
+        DiskPrefixStorageBackend disk(archivePath(directory), 1024u, kModelArtifactIdentity);
+        PrefixBlockHandle whole;
+        std::string error;
+        ASSERT_TRUE(disk.readBlock(testKey(), layout, &whole, &error)) << error;
+        EXPECT_EQ(whole.layout.main_auxiliary, layout.main_auxiliary);
+        EXPECT_EQ(whole.layout.mtp_auxiliary, layout.mtp_auxiliary);
+        ASSERT_EQ(whole.model_auxiliary_storage->size(), 40u);
+        for (size_t i = 0; i < 40; ++i) EXPECT_EQ((*whole.model_auxiliary_storage)[i], i + 1);
+        EXPECT_EQ(*whole.mainAuxiliaryEndpointData(), 13u);
+        EXPECT_EQ(*whole.mtpAuxiliaryEndpointData(), 25u);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/** @brief Restart preserves the authenticated format and refuses same-size foreign hydration. */
+TEST(Test__DiskPrefixStorageBackend,
+     HybridRecurrenceLayoutSurvivesRestartAndRejectsForeignHydration)
+{
+    using L = GDNRecurrenceStateLayout;
+    const auto dir = tempDir();
+    auto layout = makeLayout();
+    layout.includes_hybrid_state = true;
+    layout.hybrid_device_state_bytes = 6 * sizeof(float);
+    layout.hybrid_state_bytes = layout.hybrid_device_state_bytes;
+    layout.hybrid_device_recurrence_layout = L::ValueMajorKeyContiguous;
+    RamPrefixStorageBackend ram(1024);
+    auto source = ram.allocate(testKey(), layout);
+    ASSERT_TRUE(source.valid());
+    ASSERT_NE(source.hybrid_storage, nullptr);
+    std::fill(source.hybrid_storage->begin(), source.hybrid_storage->end(), 0x5a);
+    source.has_hybrid_state = true;
+    std::string error;
+    {
+        DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelArtifactIdentity);
+        ASSERT_TRUE(disk.ready()) << disk.initializationError();
+        PrefixBlockHandle stored;
+        ASSERT_TRUE(disk.writeBlock(source, &stored, nullptr, &error)) << error;
+    }
+    {
+        DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelArtifactIdentity);
+        ASSERT_TRUE(disk.ready()) << disk.initializationError();
+        PrefixBlockHandle restored;
+        auto foreign = layout;
+        foreign.hybrid_device_recurrence_layout = L::KeyMajorValueContiguous;
+        EXPECT_FALSE(disk.readBlock(testKey(), foreign, &restored, &error));
+        ASSERT_TRUE(disk.readBlock(testKey(), layout, &restored, &error)) << error;
+        EXPECT_EQ(restored.layout.hybrid_device_recurrence_layout, L::ValueMajorKeyContiguous);
+        ASSERT_NE(restored.hybrid_storage, nullptr);
+        EXPECT_EQ(*source.hybrid_storage, *restored.hybrid_storage);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+namespace
+{
+    /**
+     * @brief Rewrite only tiny authored journal metadata with valid v5 framing.
+     * @param path Real test archive, after every writer has retired.
+     * @param fingerprint Exact CPU generation whose layout is reauthored.
+     * @param edit Mutation of bounded metadata; immutable payload files are never read.
+     * @param entire_record True permits record mutation; default retains existing layout-only callers.
+     * @param authored_type Nonzero explicitly reauthors a committed type for bounded corruption tests.
+     */
+    void reauthorCPUArchiveMetadata(const std::filesystem::path &path, uint64_t fingerprint,
+                                   const std::function<void(nlohmann::json &)> &edit,
+                                   bool entire_record = false, uint32_t authored_type = 0)
+    {
+        const auto original = authoredJournalBytes(path);
+        std::string result = original.substr(0, 80);
+        const auto load = [&](size_t offset, size_t bytes) {
+            uint64_t word = 0;
+            for (size_t b = 0; b < bytes; ++b)
+                word |= uint64_t(static_cast<unsigned char>(original.at(offset + b))) << (8 * b);
+            return word;
+        };
+        const auto store = [](std::string &bytes, size_t offset, uint64_t word, size_t count) {
+            for (size_t b = 0; b < count; ++b) bytes.at(offset + b) = static_cast<char>(word >> (8 * b));
+        };
+        size_t changed = 0;
+        for (size_t cursor = 80; cursor < original.size();)
+        {
+            const auto regions = authoredJournalRecordRegions(original, cursor);
+            const size_t record_bytes = regions[0].bytes + regions[1].bytes + regions[2].bytes;
+            auto metadata = nlohmann::json::parse(original.substr(regions[1].offset, regions[1].bytes));
+            if (load(cursor + 12, 4) == 1 && metadata.at("key").at("fingerprint").get<uint64_t>() == fingerprint)
+            {
+                edit(entire_record ? metadata : metadata.at("layout"));
+                const auto text = metadata.dump();
+                std::string preamble = original.substr(cursor, regions[0].bytes);
+                std::string footer = original.substr(regions[2].offset, regions[2].bytes);
+                const auto checksum = hashPrefixBytes(text.data(), text.size());
+                const uint32_t type = authored_type ? authored_type : static_cast<uint32_t>(load(cursor + 12, 4));
+                store(preamble, 12, type, 4);
+                store(preamble, 16, preamble.size() + text.size() + footer.size(), 8);
+                store(preamble, 24, text.size(), 8);
+                store(preamble, 48, checksum, 8);
+                uint64_t commit = combinePrefixHash(checksum, type);
+                commit = combinePrefixHash(commit, load(cursor + 40, 8));
+                for (const auto &section : metadata.at("sections"))
+                    commit = combinePrefixHash(commit, section.at("bytes").get<uint64_t>());
+                store(footer, 8, commit, 8);
+                result += preamble + text + footer;
+                ++changed;
+            }
+            else result.append(original, cursor, record_bytes);
+            cursor += record_bytes;
+        }
+        if (changed != 1) throw std::logic_error("Expected exactly one authored CPU record");
+        std::ofstream journal(path, std::ios::binary | std::ios::trunc);
+        journal.write(result.data(), static_cast<std::streamsize>(result.size()));
+        if (!journal) throw std::runtime_error("Failed to publish authored metadata framing");
+    }
+
+    /**
+     * @brief Read one tiny committed layout for metadata-only preservation evidence.
+     * @param path Authored journal, never its immutable payload file.
+     * @param fingerprint Exact retained generation.
+     * @return Original JSON layout including unknown bounded fields.
+     */
+    nlohmann::json authoredCPUArchiveLayout(const std::filesystem::path &path, uint64_t fingerprint)
+    {
+        const auto journal = authoredJournalBytes(path);
+        for (size_t cursor = 80; cursor < journal.size();)
+        {
+            const auto regions = authoredJournalRecordRegions(journal, cursor);
+            auto metadata = nlohmann::json::parse(journal.substr(regions[1].offset, regions[1].bytes));
+            if (metadata.contains("layout") && metadata.at("key").at("fingerprint").get<uint64_t>() == fingerprint)
+                return metadata.at("layout");
+            cursor += regions[0].bytes + regions[1].bytes + regions[2].bytes;
+        }
+        throw std::logic_error("Missing authored CPU layout");
+    }
+
+    /** @return Actual square-head cache with one CPU epoch bank and convolution state. */
+    std::unique_ptr<llaminar2::CPUHybridRingKVCacheFP32> diskEpochCache(int phase)
+    {
+        HybridKVCacheConfig config;
+        config.layer_types = {"gdn"};
+        config.gdn_conv_kernel_size = 3;
+        config.gdn_state_size = 3;
+        config.gdn_group_count = config.gdn_time_step_rank = config.n_heads = 1;
+        static MPIContext context(0, 1, MPI_COMM_WORLD);
+        auto cache = std::make_unique<CPUHybridRingKVCacheFP32>(config, context, 1, 1, 32, 1, 3, DeviceId::cpu());
+        auto *state = cache->getGDNState(0);
+        const CPUGDNStateLayout layout(1, 3, 3);
+        std::fill(state->recurrence_state.begin(), state->recurrence_state.end(), -999.0f);
+        state->recurrence_state[0] = static_cast<float>(phase);
+        for (size_t i = 1; i < layout.packedHeadBytes(phase) / sizeof(float); ++i)
+            state->recurrence_state[i] = float(static_cast<int>(i % 17) - 8) / 64.0f;
+        for (size_t i = 0; i < state->conv_state.size(); ++i) state->conv_state[i] = float(i + 1) / 32.0f;
+        return cache;
+    }
+
+    /** @return Exact durable descriptor for the retained layout extent. */
+    HybridPrefixStateDescriptor diskEpochDescriptor(const PrefixPayloadLayout &layout)
+    {
+        HybridPrefixStateDescriptor descriptor;
+        descriptor.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+        descriptor.host_payload_bytes = layout.hybrid_host_state_bytes;
+        return descriptor;
+    }
+}
+
+/** @test Real packed wire extent survives RAM/disk restart and exact subsequent recurrence. */
+TEST(Test__DiskPrefixStorageBackend, CPUFixedEpochPackedRestartUsesLiveBytes)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    const auto directory = tempDir();
+    auto source = diskEpochCache(6), restored = diskEpochCache(1);
+    const auto schema = buildDensePrefixPayloadLayout(*source, DeviceId::cpu(), 16);
+    auto live = schema;
+    applyHybridPrefixPayloadExtent(live, *source, 0);
+    ASSERT_LT(live.hybrid_host_state_bytes, schema.hybrid_host_state_bytes);
+    // A coincident physical/local length must never infer a durable encoding.
+    ASSERT_EQ(live.hybrid_host_state_bytes, source->hybridPrefixStateMetadata().host_bytes);
+    RamPrefixStorageBackend ram(schema.totalBytes() * 2);
+    auto record = ram.allocate(testKey(), live);
+    ASSERT_TRUE(record.valid());
+    ASSERT_TRUE(source->exportHybridPrefixState(diskEpochDescriptor(live), record.hybrid_payload, nullptr));
+    record.has_hybrid_state = true;
+    {
+        DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+        std::string error;
+        ASSERT_TRUE(disk.writeBlock(record, nullptr, nullptr, &error)) << error;
+    }
+    // A restart restore hydrates into a fresh RAM key owner, not alongside
+    // the original source incarnation. Capacity alone never permits duplicate
+    // ownership of one key in the same RAM backend.
+    EXPECT_EQ(ram.allocationCount(), 1u);
+    EXPECT_EQ(ram.usedBytes(), live.totalBytes());
+    std::string duplicate_error;
+    EXPECT_FALSE(ram.allocateWithDiagnostics(testKey(), live, &duplicate_error).valid());
+    EXPECT_NE(duplicate_error.find("prefix key already owns a RAM archive allocation"), std::string::npos);
+    EXPECT_EQ(ram.allocationCount(), 1u);
+    EXPECT_EQ(ram.usedBytes(), live.totalBytes());
+    ASSERT_TRUE(ram.release(record));
+    record = {};
+    EXPECT_EQ(ram.allocationCount(), 0u);
+    EXPECT_EQ(ram.usedBytes(), 0u);
+    {
+        auto disk = std::make_shared<DiskPrefixStorageBackend>(archivePath(directory), 0u, kModelArtifactIdentity);
+        ASSERT_TRUE(disk->ready()) << disk->initializationError();
+        std::string error;
+        auto ticket = disk->captureLookupSource(testKey(), schema, &error);
+        ASSERT_TRUE(ticket) << error;
+        PayloadReadObservation reads(singlePayloadPath(disk->archivePath()), live.totalBytes());
+        PrefixBlockHandle hydrated;
+        // Capturing immutable metadata does not authorize payload reads. The
+        // production selection frontier fixes the read set and recency first.
+        EXPECT_FALSE(disk->hydrateSelected(*ticket, ram, &hydrated, &error));
+        EXPECT_FALSE(hydrated.valid());
+        EXPECT_EQ(reads.bytes, 0u);
+        ASSERT_TRUE(disk->selectHydrationSections(*ticket, PrefixPayloadReadSet::WholeArchive, &error)) << error;
+        EXPECT_EQ(reads.bytes, 0u) << "Read-set admission is metadata-only";
+        ASSERT_TRUE(disk->hydrateSelected(*ticket, ram, &hydrated, &error)) << error;
+        EXPECT_EQ(reads.bytes, live.totalBytes());
+        PrefixBlockHandle second;
+        EXPECT_FALSE(disk->hydrateSelected(*ticket, ram, &second, &error));
+        EXPECT_FALSE(second.valid());
+        EXPECT_EQ(reads.bytes, live.totalBytes()) << "Consumed ticket cannot reread the payload";
+        EXPECT_EQ(hydrated.total_bytes, live.totalBytes());
+        EXPECT_EQ(hydrated.hybridBytes(), live.hybrid_host_state_bytes);
+        EXPECT_EQ(ram.allocationCount(), 1u);
+        EXPECT_EQ(ram.usedBytes(), live.totalBytes());
+        ASSERT_TRUE(restored->importHybridPrefixState(diskEpochDescriptor(hydrated.layout), hydrated.hybrid_payload, nullptr));
+        auto wrong = diskEpochDescriptor(hydrated.layout);
+        wrong.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        EXPECT_FALSE(restored->importHybridPrefixState(wrong, hydrated.hybrid_payload, nullptr));
+        const auto *a = source->getGDNState(0);
+        auto *b = restored->getGDNState(0);
+        const CPUGDNStateLayout state_layout(1, 3, 3);
+        const auto active = state_layout.packedHeadBytes(6);
+        EXPECT_EQ(std::memcmp(a->recurrence_state.data(), b->recurrence_state.data(), active), 0);
+        EXPECT_EQ(a->conv_state, b->conv_state);
+        EXPECT_TRUE(std::all_of(b->recurrence_state.begin() + active / sizeof(float), b->recurrence_state.end(),
+                                [](float value) { return std::bit_cast<uint32_t>(value) == 0u; }));
+        auto oracle = a->recurrence_state;
+        CPUGatedDeltaNet kernel;
+        const float q[]{0.2f,-0.7f,0.4f}, k[]{-0.3f,0.6f,0.1f}, v[]{0.1f,0.3f,-0.4f};
+        const float alpha=0.2f,beta=-0.1f,alog=-0.4f,bias=0.05f;
+        float expected[3]{}, actual[3]{};
+        ASSERT_TRUE(kernel.recurrent_step(q,k,v,&alpha,&beta,&alog,&bias,expected,oracle.data(),1,3,3,true));
+        ASSERT_TRUE(kernel.recurrent_step(q,k,v,&alpha,&beta,&alog,&bias,actual,b->recurrence_state.data(),1,3,3,true));
+        EXPECT_EQ(std::memcmp(expected, actual, sizeof(expected)), 0);
+        ASSERT_TRUE(ram.release(hydrated));
+        hydrated = {};
+        EXPECT_EQ(ram.allocationCount(), 0u);
+        EXPECT_EQ(ram.usedBytes(), 0u);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/** @test Unsupported CPU generations remain indexed/evictable but never hydrate in mixed archives. */
+TEST(Test__DiskPrefixStorageBackend, CPUFixedEpochMixedLegacyArchivePreservesOpaqueRecords)
+{
+    for (int encoding : {-1, 1, 77})
+    {
+        SCOPED_TRACE(encoding);
+        const auto directory = tempDir();
+        auto cache = diskEpochCache(2);
+        auto schema = buildDensePrefixPayloadLayout(*cache, DeviceId::cpu(), 16), live = schema;
+        applyHybridPrefixPayloadExtent(live, *cache, 0);
+        const auto key = [](uint64_t fingerprint) { return makePrefixCacheKey(fingerprint, 0, 0, 0, {1,2}); };
+        const auto old_key=key(101), current_key=key(102), attention_key=key(103), gpu_key=key(104);
+        auto attention = makeLayout(), gpu = makeLayout();
+        gpu.device = DeviceId(DeviceType::ROCm, 0);
+        gpu.gdn_layers = 1; gpu.total_layers = 2;
+        gpu.includes_hybrid_state = true;
+        gpu.hybrid_state_bytes = gpu.hybrid_device_state_bytes = 32;
+        gpu.hybrid_device_recurrence_layout = GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+        RamPrefixStorageBackend ram(8192u);
+        std::filesystem::path old_payload;
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            std::string error;
+            for (const auto &identity : {old_key, current_key, attention_key, gpu_key})
+            {
+                const auto &layout = identity == attention_key ? attention : identity == gpu_key ? gpu : live;
+                auto item = ram.allocate(identity, layout);
+                ASSERT_TRUE(item.valid());
+                if (identity == old_key || identity == current_key)
+                {
+                    ASSERT_TRUE(cache->exportHybridPrefixState(diskEpochDescriptor(live), item.hybrid_payload, nullptr));
+                }
+                item.has_hybrid_state = layout.includes_hybrid_state;
+                ASSERT_TRUE(disk.writeBlock(item, nullptr, nullptr, &error)) << error;
+                if (identity == old_key) old_payload = singlePayloadPath(disk.archivePath());
+                ASSERT_TRUE(ram.release(item));
+            }
+        }
+        reauthorCPUArchiveMetadata(archivePath(directory), old_key.fingerprint, [&](auto &layout) {
+            if (encoding < 0) { layout.erase("hybrid_host_encoding"); layout.erase("hybrid_host_state_capacity_bytes"); }
+            else layout["hybrid_host_encoding"] = encoding;
+            layout["future_opaque_cpu_field"] = {3, 7, 11};
+        });
+        const auto opaque_layout = authoredCPUArchiveLayout(archivePath(directory), old_key.fingerprint);
+        const auto retained = [&] { struct stat state{}; if (::stat(old_payload.c_str(),&state))
+            throw std::runtime_error("Missing retained unsupported CPU payload"); return state; }();
+        {
+            MaintenancePayloadReads reads(old_payload, live.totalBytes());
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            ASSERT_TRUE(disk.ready()) << disk.initializationError();
+            std::string error;
+            EXPECT_TRUE(disk.compatibleEntries(old_key.fingerprint, schema, &error).empty());
+            EXPECT_FALSE(disk.captureLookupSource(old_key, schema, &error));
+            PrefixBlockHandle hydrated;
+            EXPECT_FALSE(disk.readBlock(old_key, schema, &hydrated, &error));
+            ASSERT_TRUE(disk.readBlock(current_key, schema, &hydrated, &error)) << error;
+            ASSERT_TRUE(disk.readBlock(attention_key, attention, &hydrated, &error)) << error;
+            ASSERT_TRUE(disk.readBlock(gpu_key, gpu, &hydrated, &error)) << error;
+            EXPECT_EQ(disk.usedBytes(), 2 * live.totalBytes() + attention.totalBytes() + gpu.totalBytes());
+            ASSERT_TRUE(disk.requestCompaction(&error)) << error;
+            ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+            EXPECT_EQ(reads.bytes.load(), 0u);
+        }
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            ASSERT_TRUE(disk.ready()) << disk.initializationError();
+            const auto after = [&] { struct stat state{}; EXPECT_EQ(::stat(old_payload.c_str(), &state),0); return state; }();
+            EXPECT_EQ(after.st_dev, retained.st_dev); EXPECT_EQ(after.st_ino, retained.st_ino); EXPECT_EQ(after.st_size, retained.st_size);
+            const auto metadata = authoredJournalBytes(disk.archivePath());
+            EXPECT_NE(metadata.find("future_opaque_cpu_field"), std::string::npos);
+            EXPECT_EQ(authoredCPUArchiveLayout(disk.archivePath(), old_key.fingerprint), opaque_layout);
+            std::string error;
+            PrefixBlockHandle restored;
+            ASSERT_TRUE(disk.readBlock(current_key, schema, &restored, &error)) << error;
+            EXPECT_FALSE(disk.readBlock(old_key, schema, &restored, &error));
+        }
+        // Unsupported entries remain ordinary capacity owners; no immortal side index.
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), attention.totalBytes(), kModelArtifactIdentity);
+            ASSERT_TRUE(disk.ready()) << disk.initializationError();
+            auto replacement = ram.allocate(key(105), attention);
+            std::string error;
+            ASSERT_TRUE(disk.writeBlock(replacement, nullptr, nullptr, &error)) << error;
+            EXPECT_FALSE(std::filesystem::exists(old_payload));
+        }
+        std::filesystem::remove_all(directory);
+    }
+}
+
+/** @test A malformed supported committed CPU layout never authorizes journal truncation or recreation. */
+TEST(Test__DiskPrefixStorageBackend, CPUFixedEpochMalformedCommittedLayoutPreservesArchive)
+{
+    for (int malformed : {0, 1, 2})
+    {
+        SCOPED_TRACE(malformed);
+        const auto directory = tempDir();
+        auto cache = diskEpochCache(3);
+        auto layout = buildDensePrefixPayloadLayout(*cache, DeviceId::cpu(), 16);
+        applyHybridPrefixPayloadExtent(layout, *cache, 0);
+        RamPrefixStorageBackend ram(layout.totalBytes());
+        auto item = ram.allocate(testKey(), layout);
+        ASSERT_TRUE(cache->exportHybridPrefixState(diskEpochDescriptor(layout), item.hybrid_payload, nullptr));
+        item.has_hybrid_state = true;
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            std::string error;
+            ASSERT_TRUE(disk.writeBlock(item, nullptr, nullptr, &error)) << error;
+        }
+        reauthorCPUArchiveMetadata(archivePath(directory), testKey().fingerprint, [&](auto &metadata) {
+            if (malformed == 0) metadata["hybrid_host_state_capacity_bytes"] = 0u;
+            if (malformed == 1) metadata.erase("block_size");
+            if (malformed == 2) metadata["gdn_layers"] = "invalid";
+        });
+        const auto original = authoredJournalBytes(archivePath(directory));
+        const auto payload = singlePayloadPath(archivePath(directory));
+        for (int reopen = 0; reopen < 2; ++reopen)
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            EXPECT_FALSE(disk.ready());
+            EXPECT_NE(disk.initializationError().find("Malformed committed CPU prefix layout"), std::string::npos);
+            EXPECT_EQ(authoredJournalBytes(archivePath(directory)), original);
+            EXPECT_TRUE(std::filesystem::exists(payload));
+        }
+        std::filesystem::remove_all(directory);
+    }
+}
+
+namespace
+{
+    /** @brief Typed persisted-layout cases sharing the committed record invariant. */
+    enum class CommittedArchiveFixtureLayout { PackedCPU, OpaqueCPU, PureAttention };
+}
+
+/**
+ * @test A framed committed identity error preserves all records and payload files.
+ * @details Current/opaque CPU and pure-attention layouts share the universal Put identity
+ * invariant. A bad middle record is never treated as an interrupted journal tail.
+ */
+TEST(Test__DiskPrefixStorageBackend, CommittedIdentityCorruptionPreservesArchive)
+{
+    for (const auto layout_kind : {CommittedArchiveFixtureLayout::PackedCPU,
+                                   CommittedArchiveFixtureLayout::OpaqueCPU,
+                                   CommittedArchiveFixtureLayout::PureAttention})
+    for (const char *identity : {"payload_identity", "storage_identity"})
+    for (int malformed : {0, 1, 2, 3, 4})
+    {
+        SCOPED_TRACE(static_cast<int>(layout_kind));
+        SCOPED_TRACE(identity);
+        SCOPED_TRACE(malformed);
+        const auto directory = tempDir();
+        auto cache = diskEpochCache(3);
+        auto layout = layout_kind == CommittedArchiveFixtureLayout::PureAttention
+            ? makeLayout() : buildDensePrefixPayloadLayout(*cache, DeviceId::cpu(), 16);
+        if (layout_kind != CommittedArchiveFixtureLayout::PureAttention)
+            applyHybridPrefixPayloadExtent(layout, *cache, 0);
+        RamPrefixStorageBackend ram(layout.totalBytes());
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            ASSERT_TRUE(disk.ready()) << disk.initializationError();
+            std::string error;
+            for (uint64_t fingerprint : {101u, 102u, 103u})
+            {
+                auto key = makePrefixCacheKey(fingerprint, 0, 0, 0, {1, 2});
+                auto item = ram.allocate(key, layout);
+                ASSERT_TRUE(item.valid());
+                if (layout_kind != CommittedArchiveFixtureLayout::PureAttention)
+                {
+                    ASSERT_TRUE(cache->exportHybridPrefixState(
+                        diskEpochDescriptor(layout), item.hybrid_payload, nullptr));
+                }
+                item.has_hybrid_state = layout.includes_hybrid_state;
+                ASSERT_TRUE(disk.writeBlock(item, nullptr, nullptr, &error)) << error;
+                ASSERT_TRUE(ram.release(item));
+            }
+        }
+        reauthorCPUArchiveMetadata(archivePath(directory), 102u, [&](auto &metadata) {
+            if (layout_kind == CommittedArchiveFixtureLayout::OpaqueCPU)
+                metadata["layout"]["hybrid_host_encoding"] = 77u;
+            if (malformed == 0) metadata.erase(identity);
+            if (malformed == 1) metadata[identity] = "invalid";
+            if (malformed == 2) metadata[identity] = nlohmann::json::array({1u});
+            if (malformed == 3) metadata[identity] = nlohmann::json::array({0u, 0u});
+            if (malformed == 4) metadata[identity] = nlohmann::json::array({-1, 2});
+        }, true);
+        const auto original = authoredJournalBytes(archivePath(directory));
+        std::vector<std::pair<std::filesystem::path, uintmax_t>> payloads;
+        for (const auto &entry : std::filesystem::recursive_directory_iterator(directory))
+            if (entry.is_regular_file() && entry.path() != archivePath(directory))
+                payloads.emplace_back(entry.path(), entry.file_size());
+        ASSERT_GE(payloads.size(), 3u);
+        for (int reopen = 0; reopen < 2; ++reopen)
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            EXPECT_FALSE(disk.ready());
+            EXPECT_NE(disk.initializationError().find("committed prefix"), std::string::npos);
+            EXPECT_NE(disk.initializationError().find("identity; archive preserved"), std::string::npos);
+            EXPECT_EQ(authoredJournalBytes(archivePath(directory)), original);
+            for (const auto &[path, bytes] : payloads)
+            {
+                ASSERT_TRUE(std::filesystem::exists(path));
+                EXPECT_EQ(std::filesystem::file_size(path), bytes);
+            }
+        }
+        std::filesystem::remove_all(directory);
+    }
+}
+
+/**
+ * @test A framed committed semantic error preserves all records and payload files.
+ * @details Current/opaque CPU and pure-attention layouts share the universal Put identity
+ * invariant. A bad middle record is never treated as an interrupted journal tail.
+ */
+TEST(Test__DiskPrefixStorageBackend, CommittedMetadataCorruptionPreservesArchive)
+{
+    for (const auto layout_kind : {CommittedArchiveFixtureLayout::PackedCPU,
+                                   CommittedArchiveFixtureLayout::OpaqueCPU,
+                                   CommittedArchiveFixtureLayout::PureAttention})
+    for (int malformed : {0, 1, 2, 3, 4, 5, 6, 7})
+    {
+        SCOPED_TRACE(static_cast<int>(layout_kind));
+        SCOPED_TRACE(malformed);
+        const auto directory = tempDir();
+        auto cache = diskEpochCache(3);
+        auto layout = layout_kind == CommittedArchiveFixtureLayout::PureAttention
+            ? makeLayout() : buildDensePrefixPayloadLayout(*cache, DeviceId::cpu(), 16);
+        if (layout_kind != CommittedArchiveFixtureLayout::PureAttention)
+            applyHybridPrefixPayloadExtent(layout, *cache, 0);
+        RamPrefixStorageBackend ram(layout.totalBytes());
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            ASSERT_TRUE(disk.ready()) << disk.initializationError();
+            std::string error;
+            for (uint64_t fingerprint : {101u, 102u, 103u})
+            {
+                auto key = makePrefixCacheKey(fingerprint, 0, 0, 0, {1, 2});
+                auto item = ram.allocate(key, layout);
+                ASSERT_TRUE(item.valid());
+                if (layout_kind != CommittedArchiveFixtureLayout::PureAttention)
+                {
+                    ASSERT_TRUE(cache->exportHybridPrefixState(
+                        diskEpochDescriptor(layout), item.hybrid_payload, nullptr));
+                }
+                item.has_hybrid_state = layout.includes_hybrid_state;
+                ASSERT_TRUE(disk.writeBlock(item, nullptr, nullptr, &error)) << error;
+                ASSERT_TRUE(ram.release(item));
+            }
+        }
+        reauthorCPUArchiveMetadata(archivePath(directory), 102u, [&](auto &metadata) {
+            if (layout_kind == CommittedArchiveFixtureLayout::OpaqueCPU)
+                metadata["layout"]["hybrid_host_encoding"] = 77u;
+            if (malformed == 0) metadata["layout"].erase("device_type");
+            if (malformed == 1) metadata["sections"] = nlohmann::json::object();
+            if (malformed == 2) metadata["sections"].erase(metadata["sections"].end() - 1);
+            if (malformed == 3) metadata["sections"][0]["name"] = "foreign";
+            if (malformed == 4) metadata["total_bytes"] = 0u;
+            if (malformed == 5) metadata["sections"][0]["bytes"] =
+                metadata["sections"][0]["bytes"].template get<uint64_t>() + 1u;
+            if (malformed == 6) metadata["key"]["fingerprint"] = 999u;
+            if (malformed == 7)
+            {
+                const size_t source = layout_kind == CommittedArchiveFixtureLayout::PureAttention ? 0u : 1u;
+                const size_t destination = source == 0u ? 1u : 0u;
+                metadata["sections"][source]["bytes"] =
+                    metadata["sections"][source]["bytes"].template get<uint64_t>() - 1u;
+                metadata["sections"][destination]["bytes"] =
+                    metadata["sections"][destination]["bytes"].template get<uint64_t>() + 1u;
+            }
+        }, true, malformed == 6 ? 3u : 0u);
+        const auto original = authoredJournalBytes(archivePath(directory));
+        std::vector<std::pair<std::filesystem::path, uintmax_t>> payloads;
+        for (const auto &entry : std::filesystem::recursive_directory_iterator(directory))
+            if (entry.is_regular_file() && entry.path() != archivePath(directory))
+                payloads.emplace_back(entry.path(), entry.file_size());
+        ASSERT_GE(payloads.size(), 3u);
+        for (int reopen = 0; reopen < 2; ++reopen)
+        {
+            DiskPrefixStorageBackend disk(archivePath(directory), 0u, kModelArtifactIdentity);
+            EXPECT_FALSE(disk.ready());
+            EXPECT_NE(disk.initializationError().find("committed"), std::string::npos);
+            EXPECT_NE(disk.initializationError().find("archive preserved"), std::string::npos);
+            EXPECT_EQ(authoredJournalBytes(archivePath(directory)), original);
+            for (const auto &[path, bytes] : payloads)
+            {
+                ASSERT_TRUE(std::filesystem::exists(path));
+                EXPECT_EQ(std::filesystem::file_size(path), bytes);
+            }
+        }
+        std::filesystem::remove_all(directory);
+    }
 }

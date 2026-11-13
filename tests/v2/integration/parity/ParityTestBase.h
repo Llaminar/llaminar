@@ -10,6 +10,8 @@
  * - Table visualization of layer-by-layer results
  * - Pass/fail assertions with configurable thresholds
  * - Snapshot loading and regeneration
+ * - Setup-frozen exact diagnostic capture requests using the existing arena admission
+ * - Rank-owned fresh artifact setup before validated metadata publication
  *
  * MPI Support:
  *   For tensor-parallel tests, set mpi_ctx_ in SetUp() and override
@@ -47,13 +49,31 @@
  *
  * @author David Sanftenberg
  * @date 2026-01-11
+ * Explicit frozen observation shards retain complete gold/source validation while
+ * one immutable semantic selection controls diagnostic capture, BOM and scoring.
  */
 
 #pragma once
+#include "PipelineParityEvidence.h"
+#include "execution/moe/MoEPipelinePreparedPlan.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include "FinalLogitMeanKLContract.h"
+#include "FrozenParityHistoryReplay.h"
+#include "ParityHardwareRequirements.h"
+#include "snapshots/SnapshotSelectedIds.h"
+#include "snapshots/SnapshotEmptyObservation.h"
+#include "../../utils/TypedNpySnapshot.h"
+#include "../../utils/MTPParityComparisonPlacement.h"
+#include "../../utils/QwenSparseQueryParityEvidence.h"
 
 #include "ParityReferenceCache.h"
+#include "ParityPredictorSource.h"
 #include "ProductionParityPrefixRestorePlan.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "utils/NativeVerifierRowEvidence.h"
+#include "utils/ScopedMoEParityCoordinatedSession.h"
+#include "app/modes/MoEMovementLedgerJson.h"
+#include "execution/moe/MoEExpertOwnerMap.h"
 
 #include <gtest/gtest.h>
 #include <memory>
@@ -117,6 +137,7 @@
 #include "utils/Sha256.h"
 #include "utils/ProductionParityEvidence.h"
 #include "utils/ParitySnapshotMemoryCapacity.h"
+#include "ParityArtifactDirectory.h"
 #include "utils/ReferenceGenerationLease.h"
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -177,11 +198,6 @@ namespace llaminar2::test::parity
     // Configuration
     // =============================================================================
 
-    enum class ParityForwardPhase
-    {
-        Prefill,
-        Decode,
-    };
 
     /**
      * @brief Evidence contract for the prefill that precedes decode parity.
@@ -486,20 +502,19 @@ namespace llaminar2::test::parity
             rocm_count);
     }
 
-    /** Request-lifetime physical expert-movement contract for one parity cell. */
-    enum class ParityMoEMovementExpectation : std::uint8_t
-    {
-        NotApplicable,
-        NoMovement,
-        PhysicalMovement,
-    };
-
     /** Request-lifetime MTP policy contract for one generated parity cell. */
     enum class ParityMTPExpectation : std::uint8_t
     {
         Disabled,
         FixedDepth,
         DynamicDepth,
+    };
+
+    /** @brief Keep functional byte replay separate from reference-scored numerical acceptance. */
+    enum class MTPParityProofPurpose : std::uint8_t
+    {
+        ReferenceNumerics,
+        NativeExactReplay,
     };
 
     /**
@@ -512,10 +527,13 @@ namespace llaminar2::test::parity
     {
         // Model and test setup — MUST be set by subclass (no defaults)
         std::string model_path;
+        /** Explicit second source, retained even when this cell disables MTP. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
         std::string snapshot_dir;
         std::string prompt;
         std::vector<int> token_ids;
         int decode_steps = 5;
+        std::optional<FinalLogitMeanKLContract> final_logit_mean_kl; ///< Ordinary final-logit policy only; absent preserves legacy gates.
 
         // Layer-by-layer thresholds
         float cosine_threshold = 0.99f;  ///< Minimum avg cosine similarity for layer pass
@@ -694,6 +712,9 @@ namespace llaminar2::test::parity
     {
         std::string stage_name;
         bool passed = false;
+        bool evidence_valid = false; ///< Actual shape/finite/exact-identity witness, independent of cosine verdict.
+        std::string scalar_type = "FP32"; ///< Exact diagnostic scalar family.
+        std::optional<std::size_t> integer_mismatch_count; ///< Exact identities never use floating metrics.
         float cosine_similarity = 0.0f;
         float cosine_drop = 0.0f; ///< Drop from previous stage (positive = error introduced)
         float rel_l2_norm = 0.0f;
@@ -712,6 +733,8 @@ namespace llaminar2::test::parity
         float routing_top1_match = std::numeric_limits<float>::quiet_NaN(); ///< Fraction of tokens where top-1 expert matches (indices only)
         float routing_weight_l1 = std::numeric_limits<float>::quiet_NaN();  ///< Mean L1 distance of sparse weight vectors (weights only)
         std::optional<MoERouteConditionedProof> route_conditioned_proof; ///< Explicit additional HF-input equation; original metrics stay intact.
+        ParityCheckpointEvidenceKind checkpoint_evidence_kind=ParityCheckpointEvidenceKind::ComparedValues;
+        std::optional<QwenSparseQueryEvidence> query_work_evidence; ///< Original row provenance; empty structural evidence never grants numerical equality.
     };
 
     /**
@@ -723,13 +746,14 @@ namespace llaminar2::test::parity
         float avg_cosine_sim = 0.0f;
         float min_cosine_sim = 1.0f;
         std::string worst_stage;
-        float max_cosine_drop = 0.0f; ///< Largest single-stage cosine drop (error introduced)
+        float max_cosine_drop = 0.0f; ///< Prefill compares semantic stages; raw adjacent drops stay in stage_results.
         std::string max_drop_stage;   ///< Stage that introduced the most error
         int stages_compared = 0;
         bool passed = false;
         float max_kurtosis = 0.0f;                        ///< Highest excess kurtosis across stages
         std::string max_kurtosis_stage;                   ///< Stage with highest kurtosis
         std::vector<StageComparisonResult> stage_results; ///< Per-stage detailed results
+        bool evidence_valid = false; ///< All actual raw witnesses are valid, independent of aggregate cosine.
     };
 
     /**
@@ -740,6 +764,7 @@ namespace llaminar2::test::parity
         // Embedding
         float embedding_cosine = 0.0f;
         bool embedding_passed = false;
+        bool embedding_evidence_valid = false; ///< Exact nonempty finite original embedding observation.
 
         // Per-layer stats
         std::vector<LayerStats> layer_stats;
@@ -753,6 +778,10 @@ namespace llaminar2::test::parity
         int lm_head_llaminar_token = -1; ///< Production argmax at the prompt boundary.
         int lm_head_pytorch_token = -1; ///< Reference argmax at the prompt boundary.
         bool lm_head_passed = false;
+        bool lm_head_evidence_valid = false; ///< Actual complete finite final-logit operands, not a numerical tolerance.
+
+        std::optional<PipelineParityEvidence> pipeline_evidence; ///< Completed original diagnostic union; no tensor/snapshot storage.
+        bool pipeline_local_embedding_passed=false; ///< Original local fragment, before global scalar metric projection.
 
         // Overall
         int early_layers_passed = 0;
@@ -767,6 +796,7 @@ namespace llaminar2::test::parity
     {
         int step_idx = 0;
         bool has_logit_data = false; ///< This PP rank owns the LM-head result for the step
+        bool logit_evidence_valid = false; ///< Exact complete finite final-position operands.
         float cosine_similarity = 0.0f;
         float kl_divergence = 0.0f;
         float top1_overlap = 0.0f;
@@ -778,6 +808,7 @@ namespace llaminar2::test::parity
         bool top3_match = false; ///< True if PyTorch top-1 appears in Llaminar top-3
         bool passed = false;
         std::vector<LayerStats> layer_stats; ///< Per-layer cosine similarity for this decode step
+        std::optional<PipelineParityEvidence> pipeline_evidence; ///< Completed original phase/step union, without model values.
     };
 
     /**
@@ -908,6 +939,20 @@ namespace llaminar2::test::parity
         }
     };
 
+    /** @brief Numerical policy applied only to the one-row partial-prefix continuation proof. */
+    enum class PrefixPartialCheckpointPolicy : uint8_t { NotApplicable, LegacyCosine, FinalLogitMeanKL };
+    /** @return Stable CSV spelling, independent of the retained raw cosine diagnostic. */
+    inline const char *prefixPartialCheckpointPolicyName(PrefixPartialCheckpointPolicy policy)
+    {
+        switch(policy)
+        {
+        case PrefixPartialCheckpointPolicy::NotApplicable: return "not_applicable";
+        case PrefixPartialCheckpointPolicy::LegacyCosine: return "legacy_cosine";
+        case PrefixPartialCheckpointPolicy::FinalLogitMeanKL: return "final_logit_mean_kl_decode";
+        }
+        throw std::logic_error("Unknown partial-prefix checkpoint numerical policy");
+    }
+
     /**
      * @brief Machine-readable proof for one mandatory prefix lifecycle phase.
      *
@@ -989,6 +1034,10 @@ namespace llaminar2::test::parity
         bool checkpoint_compared = false;
         float checkpoint_cosine = 0.0f;
         bool checkpoint_passed = false;
+        PrefixPartialCheckpointPolicy partial_checkpoint_policy = PrefixPartialCheckpointPolicy::NotApplicable;
+        uint64_t partial_checkpoint_rows = 0; ///< Every actual full-vocabulary publication must pass separately.
+        float partial_checkpoint_maximum_kl = 0.0f; ///< Worst per-row KL, never an across-participant mean.
+        float partial_checkpoint_kl_limit = 0.0f; ///< Decode budget, populated only for the explicit KL policy.
         bool passed = false;
     };
 
@@ -1004,6 +1053,21 @@ namespace llaminar2::test::parity
     class ParityCSVArtifactWriter final
     {
     public:
+        /**
+         * @brief Encode the complete existing test identity into a bounded relative path.
+         * @param test_name Original suite/test/parameter identity, never a shortened configuration.
+         * @return Original sanitized component through 255 bytes, or its lossless chunk hierarchy.
+         *
+         * The reserved namespace cannot alias an ordinary short identity. Each
+         * chunk has a distinct prefix and the terminal leaf has another name,
+         * so one complete identity cannot become another identity's ancestor.
+         * Removing a cell's terminal directory therefore cannot delete siblings.
+         */
+        static std::filesystem::path testIdentityPath(std::string test_name)
+        {
+            return parity::artifactIdentityPath(std::move(test_name));
+        }
+
         /**
          * @brief Return the canonical per-test results directory.
          *
@@ -1025,17 +1089,7 @@ namespace llaminar2::test::parity
                             "/" +
                             std::string(info->name() ? info->name() : "");
             }
-            for (char &character : test_name)
-            {
-                if (character == '/' || character == '\\' ||
-                    character == ':' || character == '*' ||
-                    character == '?' || character == '"' ||
-                    character == '<' || character == '>' ||
-                    character == '|')
-                {
-                    character = '_';
-                }
-            }
+            const auto test_path = testIdentityPath(std::move(test_name));
 
             // Aggregate campaigns own a fresh, report-addressable root. This
             // makes stale files unrepresentable while focused/manual tests
@@ -1050,7 +1104,7 @@ namespace llaminar2::test::parity
                         "LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT must be an "
                         "absolute path");
                 }
-                return explicit_root / test_name;
+                return explicit_root / test_path;
             }
 
 #ifdef LLAMINAR_PARITY_SOURCE_DIR
@@ -1075,7 +1129,7 @@ namespace llaminar2::test::parity
                 }
                 pclose(pipe);
             }
-            return parity_dir / "results" / hash / test_name;
+            return parity_dir / "results" / hash / test_path;
         }
 
         /**
@@ -1422,7 +1476,9 @@ namespace llaminar2::test::parity
                    "shifted_mtp_kv_numerically_compared,shifted_mtp_kv_exact_prefix_segments,"
                    "shifted_mtp_kv_numerical_suffix_payloads,shifted_mtp_kv_numerical_elements,"
                    "shifted_mtp_kv_minimum_cosine,shifted_mtp_kv_maximum_relative_l2,"
-                   "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed\n";
+                   "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed,"
+                   "partial_checkpoint_policy,partial_checkpoint_rows,"
+                   "partial_checkpoint_maximum_kl,partial_checkpoint_kl_limit\n";
             for (const auto &row : evidence)
             {
                 out << csvEscape(backend) << ','
@@ -1521,7 +1577,12 @@ namespace llaminar2::test::parity
                     << shifted.numerical_suffix_payloads << ','
                     << shifted.elements << ',' << shifted.minimum_cosine << ','
                     << shifted.maximum_relative_l2 << ',' << shifted.maximum_abs << ','
-                    << boolText(shifted.passed) << '\n';
+                    << boolText(shifted.passed) << ','
+                    << prefixPartialCheckpointPolicyName(row.partial_checkpoint_policy) << ','
+                    << row.partial_checkpoint_rows << ',' << row.partial_checkpoint_maximum_kl << ',';
+                if(row.partial_checkpoint_policy==PrefixPartialCheckpointPolicy::FinalLogitMeanKL)
+                    out << row.partial_checkpoint_kl_limit;
+                out << '\n';
             }
             return out.good();
         }
@@ -1740,8 +1801,13 @@ namespace llaminar2::test::parity
 
         static void writeDistribution(
             std::ofstream &out,
-            const TensorDistributionStats &stats)
+            const TensorDistributionStats &stats, bool applicable = true)
         {
+            if (!applicable)
+            {
+                out << std::string(14, ',');
+                return;
+            }
             out << stats.min << ',' << stats.max << ','
                 << stats.mean << ',' << stats.stddev << ','
                 << stats.kurtosis << ',' << stats.skewness << ','
@@ -1752,6 +1818,15 @@ namespace llaminar2::test::parity
                 << stats.element_count;
         }
 
+        /**
+         * @brief Publish original stage verdicts and typed query provenance without inventing values.
+         * @param path Owned canonical CSV destination. @param backend Actual compared participant label.
+         * @param layers Retained original stage bank. @param decode_step Original Decode ordinal, or Prefill.
+         * @param append Append later Decode rows beneath the existing exact schema.
+         * @return Whether the complete CSV write succeeded.
+         * @details Structural query evidence leaves metrics and distributions blank
+         * and numerical pass false. Authored useful queries retain normal metrics.
+         */
         static bool writeStages(
             const std::filesystem::path &path,
             const std::string &backend,
@@ -1778,35 +1853,84 @@ namespace llaminar2::test::parity
                 writeDistributionHeader(out, "pytorch_");
                 out << ',';
                 writeMoERouteProofCSVHeader(out);
-                out << ",passed";
+                out << ",scalar_type,integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,"
+                       "history_prompt_rows,history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,"
+                       "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
+                       "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
+                       "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
+                       "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row,query_program_observation";
                 out << '\n';
             }
             for (const auto &layer : layers)
             {
                 for (const auto &stage : layer.stage_results)
                 {
+                    const bool structural=stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery;
                     out << csvEscape(backend) << ',';
                     if (decode_step)
                         out << *decode_step << ',';
                     out << layer.layer_idx << ','
                         << csvEscape(stage.stage_name) << ','
-                        << (stage.is_routing_stage ? "" : std::to_string(stage.cosine_similarity)) << ','
-                        << (stage.is_routing_stage ? "" : std::to_string(stage.cosine_drop)) << ','
-                        << (stage.is_routing_stage ? "" : std::to_string(stage.rel_l2_norm)) << ','
-                        << stage.max_abs_diff << ','
-                        << (stage.is_routing_stage ? "" : std::to_string(stage.snr_db)) << ','
-                        << (stage.is_routing_stage ? "" : std::to_string(stage.rmse)) << ','
-                        << (stage.is_routing_stage ? "" : std::to_string(stage.error_entropy)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.cosine_similarity)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.cosine_drop)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.rel_l2_norm)) << ','
+                        << ((stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.max_abs_diff)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.snr_db)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.rmse)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.error_entropy)) << ','
                         << (stage.is_routing_stage ? "1" : "0") << ','
                         << (stage.is_routing_stage ? std::to_string(stage.routing_overlap) : "") << ','
                         << (std::isnan(stage.routing_top1_match) ? "" : std::to_string(stage.routing_top1_match)) << ','
                         << (std::isnan(stage.routing_weight_l1) ? "" : std::to_string(stage.routing_weight_l1)) << ',';
-                    writeDistribution(out, stage.llaminar_stats);
+                    writeDistribution(out, stage.llaminar_stats, !stage.integer_mismatch_count && !structural);
                     out << ',';
-                    writeDistribution(out, stage.pytorch_stats);
+                    writeDistribution(out, stage.pytorch_stats, !stage.integer_mismatch_count && !structural);
                     out << ',';
-                    writeMoERouteProofCSV(out, stage.route_conditioned_proof, stage.passed);
+                    if(structural)out << "structural_query_interval,0,0,,,,,,";
+                    else writeMoERouteProofCSV(out, stage.route_conditioned_proof, stage.passed);
+                    out << ',' << stage.scalar_type << ',';
+                    if (stage.integer_mismatch_count) out << *stage.integer_mismatch_count;
                     out << ',' << (stage.passed ? 1 : 0);
+                    const bool authored_query=stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::AuthoredQuery;
+                    out << ',' << (structural?"unauthored_query":authored_query?"authored_query":"compared_values");
+                    if(stage.query_work_evidence && (structural || authored_query) &&
+                       stage.query_work_evidence->observation.authored_token_rows &&
+                       stage.query_work_evidence->observation.authored_token_rows->requests.size()==1)
+                    {
+                        const auto &proof=*stage.query_work_evidence;
+                        const auto &actual=proof.observation;
+                        const auto &observation=*actual.authored_token_rows;
+                        const auto &record=observation.requests.front();
+                        out << ',' << (validParityCheckpointEvidence(stage,true,
+                            decode_step?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill)?1:0)
+                            << ',' << (record.emptyReason==SnapshotEmptyReason::RankingNotRequired?"ranking_not_required":
+                                record.emptyReason==SnapshotEmptyReason::None?"none":"invalid")
+                            << ',' << proof.history.promptRows << ',' << proof.history.decodeRowsBefore
+                            << ',' << proof.history.liveRows << ',' << proof.history.sourceCapacity
+                            << ',' << observation.requests.size() << ',' << record.prefixRows << ',' << record.liveRows
+                            << ',' << record.rowCapacity << ',' << record.sourceCapacity << ',' << record.firstRequiredLogicalRow
+                            << ',' << record.rowOffset << ',' << record.firstRow << ',' << record.endRow
+                            << ',' << record.payloadRowOffset << ',' << observation.physicalRows
+                            << ',' << observation.repeatsPerRow << ',' << observation.sliceFirstRow
+                            << ',' << actual.rows << ',' << actual.cols << ',' << actual.size
+                            << ',' << proof.referenceElements/512 << ',' << proof.referenceFirstRow;
+                    }
+                    else if(structural && stage.query_work_evidence && stage.query_work_evidence->omitted_program)
+                    {
+                        const auto &proof=*stage.query_work_evidence;
+                        out << ',' << (validParityCheckpointEvidence(stage,true,
+                            decode_step?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill)?1:0)
+                            << ",program_omitted_ranking_not_required"
+                            << ',' << proof.history.promptRows << ',' << proof.history.decodeRowsBefore
+                            << ',' << proof.history.liveRows << ',' << proof.history.sourceCapacity
+                            << std::string(16,',') << ',' << proof.referenceElements/512
+                            << ',' << proof.referenceFirstRow;
+                    }
+                    else out << std::string(24,',');
+                    out << ',';
+                    if(stage.query_work_evidence && stage.query_work_evidence->omitted_program)
+                        out << csvEscape(qwenSparseQueryProgramObservationJSON(
+                            *stage.query_work_evidence->omitted_program));
                     out << '\n';
                 }
             }
@@ -1882,6 +2006,7 @@ namespace llaminar2::test::parity
 
         // Embedding
         TPStageComparisonResult embedding_result;
+        bool embedding_evidence_valid = false; ///< Complete combined finite original embedding observation.
 
         // Per-layer stats
         std::vector<TPLayerStats> layer_stats;
@@ -1893,6 +2018,7 @@ namespace llaminar2::test::parity
         float lm_head_top5 = 0.0f;
         bool lm_head_pytorch_top1_in_top3 = false;
         bool lm_head_passed = false;
+        bool lm_head_evidence_valid = false; ///< Actual complete finite final-logit operands, not a numerical tolerance.
 
         // Overall
         int early_layers_passed = 0;
@@ -1937,9 +2063,39 @@ namespace llaminar2::test::parity
         HOST,          ///< Host-based collective (staging through CPU)
         NCCL,          ///< NVIDIA NCCL (CUDA-CUDA)
         RCCL,          ///< AMD RCCL (ROCm-ROCm)
-        HETEROGENEOUS, ///< Cross-vendor heterogeneous (CUDA-ROCm)
+        HETEROGENEOUS, ///< Participant-specific mixed-device transports, including CPU/GPU PP
         MPI,           ///< MPI backend (for global TP, cross-rank)
     };
+
+    /**
+     * @brief Check compiled collective capability independently of hardware discovery.
+     * @param collective Exact configured TP/PP transport policy.
+     * @param nccl_available Whether this executable includes NCCL support.
+     * @param rccl_available Whether this executable includes RCCL support.
+     * @return Missing capability reason, or no failure after participant inventory admission.
+     *
+     * HETEROGENEOUS selects participant-specific transports, including CPU/GPU
+     * PP. Its actual device requirements are checked from participants, not an
+     * assumed CUDA+ROCm pair. It is not a request for a PCIe-BAR implementation.
+     */
+    inline std::optional<std::string> parityCollectiveCapabilityFailure(
+        Collective collective, bool nccl_available, bool rccl_available)
+    {
+        switch (collective)
+        {
+        case Collective::NCCL:
+            return nccl_available ? std::nullopt : std::optional<std::string>{"NCCL not available"};
+        case Collective::RCCL:
+            return rccl_available ? std::nullopt : std::optional<std::string>{"RCCL not available"};
+        case Collective::HETEROGENEOUS:
+        case Collective::MPI:
+        case Collective::HOST:
+        case Collective::None:
+            return std::nullopt;
+        }
+        return "Unknown parity collective capability";
+    }
+
 
     // =============================================================================
     // Device Configuration Utilities
@@ -2093,6 +2249,7 @@ namespace llaminar2::test::parity
         int early_layers_count = 4;                     ///< Number of early layers to check
         int min_early_layers_passed = 4;                ///< Min early layers that must pass
         float kl_threshold = 0.05f;                     ///< Max KL divergence for logits
+        std::optional<FinalLogitMeanKLContract> final_logit_mean_kl; ///< Explicit ordinary policy, separate from recursive MTP budgets.
         /** Optional prefill-only KL budget; unset retains the ordinary logit limit. */
         std::optional<float> prefill_kl_threshold;
         /**
@@ -2114,8 +2271,10 @@ namespace llaminar2::test::parity
     /**
      * @brief Complete declarative test configuration
      *
-     * The devices vector is the single source of truth for device configuration.
-     * Use the helper methods device_count() and primary_device() to derive values.
+     * The devices vector describes the legacy execution adapter. Typed local
+     * topologies additionally project exact hardware ordinal requirements so a
+     * sparse GPU ordinal is not mistaken for one sequential family entry.
+     * Use device_count() and primary_device() for legacy execution policy.
      */
     struct TestConfig
     {
@@ -2135,8 +2294,11 @@ namespace llaminar2::test::parity
 
         /// Model path override. If non-empty, overrides ParityConfig::model_path.
         /// Use this to test different quantization formats (e.g., Q4_0 vs Q8_0)
-        /// which exercise different GEMM code paths (native-VNNI vs INT8-VNNI).
+        /// which exercise different GEMM code paths (native-quantised vs INT8-VNNI).
         std::string model_path;
+
+        /** Exact optional predictor source; never inferred from the main filename. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
 
         /// Snapshot directory override. If non-empty, overrides ParityConfig::snapshot_dir.
         /// Must be unique per model to avoid snapshot collisions between quant formats.
@@ -2223,9 +2385,26 @@ namespace llaminar2::test::parity
         std::optional<ParityCollectiveEvidenceSource>
             collective_evidence_source;
 
+        /** Exact ordinal requirements projected by a typed rank-local topology. */
+        std::optional<ParityHardwareRequirements> local_hardware_requirements;
+
         // Derived accessors
         size_t device_count() const { return devices.size(); }
         ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
+        /**
+         * @brief Whether any authored participant can own a GPU serving snapshot arena.
+         * @return True for CUDA/ROCm anywhere in the original participant list.
+         *
+         * The typed case projects every participant into this base contract;
+         * primary_device() alone loses CPU-first or CPU-tail mixed pipelines.
+         * This does not discover hardware or create a second placement policy.
+         */
+        bool has_gpu_participant() const
+        {
+            return std::any_of(devices.begin(), devices.end(), [](ParityDeviceType device) {
+                return device == ParityDeviceType::CUDA || device == ParityDeviceType::ROCm;
+            });
+        }
         bool is_local_tp() const { return parallelism == Parallelism::LocalTP; }
         bool is_local_pp() const { return parallelism == Parallelism::LocalPP; }
         bool is_node_tp() const { return parallelism == Parallelism::NodeTP; }
@@ -2301,6 +2480,20 @@ namespace llaminar2::test::parity
                 required_rocm++;
         }
 
+        // Legacy declarations above name sequential devices of each family.
+        // Typed local declarations retain their actual sparse/shared ordinals.
+        if (cfg.local_hardware_requirements)
+        {
+            required_cuda = cfg.local_hardware_requirements->cuda_devices;
+            required_rocm = cfg.local_hardware_requirements->rocm_devices;
+            if (required_cuda < 0 || required_rocm < 0)
+                return "Parity hardware requires nonnegative GPU device counts";
+            const bool declares_cuda = std::find(cfg.devices.begin(), cfg.devices.end(), ParityDeviceType::CUDA) != cfg.devices.end();
+            const bool declares_rocm = std::find(cfg.devices.begin(), cfg.devices.end(), ParityDeviceType::ROCm) != cfg.devices.end();
+            if ((required_cuda > 0) != declares_cuda || (required_rocm > 0) != declares_rocm)
+                return "Parity exact hardware requirements disagree with declared participant families";
+        }
+
         /*
          * A production campaign's typed backend signature is also its physical
          * resource claim.  Constructing the other vendor's backend merely to
@@ -2316,12 +2509,8 @@ namespace llaminar2::test::parity
         const int rocm_count =
             required_rocm > 0 ? getRocmDeviceCount() : 0;
 
-        if (required_cuda > cuda_count)
-            return "Need " + std::to_string(required_cuda) + " CUDA devices, found " + std::to_string(cuda_count);
-        if (required_rocm > rocm_count)
-            return "Need " + std::to_string(required_rocm) + " ROCm devices, found " + std::to_string(rocm_count);
-
-        return std::nullopt; // Hardware is available
+        return parityHardwareInventoryFailure(
+            {required_cuda, required_rocm}, {cuda_count, rocm_count});
     }
 
     // =============================================================================
@@ -2522,7 +2711,16 @@ namespace llaminar2::test::parity
      * This is the numerical authority shared by the classic fixture and the
      * production MTP/MoE artifact recorders.  It deliberately retains all
      * diagnostics used by the established CSV contract rather than reducing a
-     * checkpoint to a token match or a single cosine value.
+     * checkpoint to a token match or a single cosine value. Both operand
+     * distributions are authenticated before error-histogram indexing. A
+     * nonfinite operand/error has undefined entropy (NaN) and cannot pass;
+     * ordinary finite histogram arithmetic and comparison budgets are unchanged.
+     * @param actual Original production FP32 checkpoint.
+     * @param expected Independent canonical FP32 checkpoint of the same extent.
+     * @param size Exact compared element count; empty/missing inputs retain a failed empty result.
+     * @param stage_name Semantic checkpoint identity retained in raw diagnostics.
+     * @param cosine_threshold Existing caller-owned threshold, never changed by diagnostics.
+     * @return Raw metrics and both operand distributions; invalid finite witnesses cannot pass.
      */
     inline StageComparisonResult compareParityTensorData(
         const float *actual,
@@ -2585,9 +2783,22 @@ namespace llaminar2::test::parity
             result.snr_db = 100.0f;
         }
 
+        // Distribution witnesses must precede histogram indexing: NaN/Inf
+        // operands or finite-subtraction overflow make error*scale undefined.
+        // In particular, Inf*0 cannot be converted to an integer bin safely.
+        result.llaminar_stats = computeDistributionStats(actual, size);
+        result.pytorch_stats = computeDistributionStats(expected, size);
+        const bool finite_operands = result.llaminar_stats.nan_count == 0 &&
+            result.llaminar_stats.inf_count == 0 && result.pytorch_stats.nan_count == 0 &&
+            result.pytorch_stats.inf_count == 0;
+        const bool finite_error = std::isfinite(max_abs_diff);
         constexpr int error_bins = 64;
         std::array<size_t, error_bins> histogram{};
-        if (max_abs_diff > 1.0e-10f)
+        if (!finite_operands || !finite_error)
+        {
+            result.error_entropy = std::numeric_limits<float>::quiet_NaN();
+        }
+        else if (max_abs_diff > 1.0e-10f)
         {
             const float scale =
                 static_cast<float>(error_bins - 1) / max_abs_diff;
@@ -2610,11 +2821,10 @@ namespace llaminar2::test::parity
             result.error_entropy = static_cast<float>(entropy);
         }
 
-        result.llaminar_stats = computeDistributionStats(actual, size);
-        result.pytorch_stats = computeDistributionStats(expected, size);
-        result.passed = result.cosine_similarity >= cosine_threshold &&
-                        result.llaminar_stats.nan_count == 0 &&
-                        result.llaminar_stats.inf_count == 0;
+        result.evidence_valid = finite_operands && finite_error &&
+            std::isfinite(result.cosine_similarity) && std::isfinite(result.rel_l2_norm);
+        result.passed = finite_operands && finite_error &&
+                        result.cosine_similarity >= cosine_threshold;
         return result;
     }
 
@@ -2705,6 +2915,54 @@ namespace llaminar2::test::parity
         }
 
         return static_cast<float>(total_kl / seq_len);
+    }
+
+    /** @brief Complete finite/geometry witness and worst-row diagnostics for a prefix suffix projection. */
+    struct PrefixPartialLogitComparison
+    {
+        bool evidence_valid = false, passed = false;
+        uint64_t rows = 0;
+        float minimum_cosine = 1.0f, maximum_relative_l2 = 0.0f, maximum_abs = 0.0f, maximum_kl = 0.0f;
+    };
+
+    /**
+     * @brief Apply the ordinary decode final-logit contract to every published partial-prefix row.
+     * @param actual Actual graph snapshot or terminal publication, retaining all TP copies.
+     * @param expected Original decode-step reference; only its final complete vocabulary row is the target.
+     * @param vocabulary Authenticated model vocabulary, never allocation capacity.
+     * @param final_policy Optional explicit ordinary policy; absence retains the original cosine gate.
+     * @param cosine_threshold Original legacy threshold, also used for raw diagnostic comparisons.
+     * @return Finite exact-row evidence, all-row acceptance and unmodified raw cosine/error diagnostics.
+     * @note Partial restore consumes one authenticated decode token, so the decode KL budget applies.
+     *       This does not relax exact prefix/state equivalence or average good and bad participants.
+     */
+    inline PrefixPartialLogitComparison comparePrefixPartialLogits(std::span<const float> actual,
+        std::span<const float> expected, size_t vocabulary,
+        const std::optional<FinalLogitMeanKLContract> &final_policy, float cosine_threshold)
+    {
+        PrefixPartialLogitComparison result;
+        if(!vocabulary || actual.empty() || actual.size()%vocabulary || expected.empty() ||
+            expected.size()%vocabulary || !std::isfinite(cosine_threshold) ||
+            !finiteParityOperands(actual)) return result;
+        const auto reference=expected.last(vocabulary);
+        if(!finiteParityOperands(reference)) return result;
+        result.evidence_valid=true;result.passed=true;result.rows=actual.size()/vocabulary;
+        for(size_t offset=0;offset<actual.size();offset+=vocabulary)
+        {
+            const auto raw=compareParityTensorData(actual.data()+offset,reference.data(),vocabulary,
+                "PREFIX_PARTIAL_LM_HEAD",cosine_threshold);
+            const float kl=computeKLDivergence(actual.data()+offset,reference.data(),vocabulary,vocabulary);
+            result.evidence_valid=result.evidence_valid && raw.evidence_valid &&
+                (!final_policy || (std::isfinite(kl) && kl>=0.0f));
+            result.passed=result.passed && raw.evidence_valid &&
+                (final_policy ? final_policy->accepts(kl,false) : raw.passed);
+            result.minimum_cosine=std::min(result.minimum_cosine,raw.cosine_similarity);
+            result.maximum_relative_l2=std::max(result.maximum_relative_l2,raw.rel_l2_norm);
+            result.maximum_abs=std::max(result.maximum_abs,raw.max_abs_diff);
+            result.maximum_kl=std::max(result.maximum_kl,kl);
+        }
+        result.passed=result.passed && result.evidence_valid;
+        return result;
     }
 
     /**
@@ -3406,6 +3664,12 @@ namespace llaminar2::test::parity
          */
         void resolveSnapshotDirIfNeeded()
         {
+            if (frozen_history_replay_)
+            {
+                accuracy::requireQFN(config_.snapshot_dir == frozen_history_replay_->referenceDirectory(),
+                                     "Frozen history cannot rebind its original reference directory");
+                return;
+            }
             if (config_.snapshot_dir.empty())
             {
                 config_.snapshot_dir = inferSnapshotDirFromModelPath(config_.model_path);
@@ -3434,8 +3698,10 @@ namespace llaminar2::test::parity
             // Without them, a parameterized process can incorrectly bless the
             // first pack for a later case that reuses the same directory.
             return config_.snapshot_dir + "|" + config_.model_path +
+                   parityPredictorIdentity(config_.shared_predictor) +
                    "|prompt=" + config_.prompt +
-                   "|decode_steps=" + std::to_string(config_.decode_steps);
+                   "|decode_steps=" + std::to_string(config_.decode_steps) +
+                   (frozen_history_replay_ ? "|history_replay=" + frozen_history_replay_->identity() : std::string{});
         }
 
         void setParityEnvOverride(const char *name, const std::string &value)
@@ -3459,6 +3725,15 @@ namespace llaminar2::test::parity
             setenv(name, value.c_str(), 1);
         }
 
+    protected:
+        /**
+         * @brief Restore this fixture's environment and refresh its parsed controls.
+         *
+         * Full fixtures call this from TearDown after native retirement. A
+         * metadata-only derived probe uses the same cleanup without entering
+         * the model lifecycle or touching backend caches. Repeated cleanup is
+         * harmless because the saved values are consumed exactly once.
+         */
         void restoreParityEnvOverrides()
         {
             for (auto it = parity_env_overrides_.rbegin();
@@ -3474,7 +3749,6 @@ namespace llaminar2::test::parity
             mutableDebugEnv().reload();
         }
 
-    protected:
         class ParityProfileScope
         {
         public:
@@ -3584,24 +3858,43 @@ namespace llaminar2::test::parity
         }
 
         /**
-         * @brief Capture production parity at the authenticated prompt geometry.
+         * @brief Declare the public production cap when the typed cell owns an exact retained family.
+         * @return Explicit native-pipeline cap, or absence for historical fixture geometry.
+         */
+        virtual std::optional<int> productionParityRetainedPrefillCap() const { return std::nullopt; }
+
+        /**
+         * @brief Bind production parity startup bucket inputs before snapshot admission.
          *
-         * The serving default pads small prompts to a 256-row graph bucket for
-         * throughput reuse. Stage-by-stage parity materializes every published
-         * row, so comparing the oracle's nine real rows plus 247 known padding
-         * rows multiplies diagnostic transfer and CSV work without adding a
-         * mathematical input. Production campaigns instead declare one exact
-         * graph bucket from authenticated `token_ids`. The mandatory
-         * prompt-plus-token partial-prefix suffix reuses this same retained
-         * executable with production padding, so one logical suffix cannot
-         * manufacture a second full-model graph. Geometry remains part of
-         * cache identity; this method never permits eager execution or
-         * recapture.
+         * Ordinary parity uses one prompt-sized bucket. Frozen standalone
+         * replay uses its declared serving ladder. A typed native exact
+         * pipeline uses the public serving candidates for both snapshot BOM
+         * and production admission. The actual admitted cap then determines
+         * the retained exact widths and the request's live chunk schedule.
          */
         void configureExactProductionParityPrefillGraphBucket()
         {
             if (!productionParityCampaignEnabled())
                 return;
+            const auto native_cap = productionParityRetainedPrefillCap();
+            if (native_cap || frozen_history_replay_)
+            {
+                const auto capture = native_cap
+                    ? FrozenParityHistoryReplay::ServingPrefillCapture{
+                        prefillGraphBucketSizes(*native_cap),
+                        std::min(*native_cap, kDefaultPrefillGraphMinBucketSize), 0}
+                    : frozen_history_replay_->servingPrefillCapture();
+                std::string buckets;
+                for (const int rows : capture.bucket_rows)
+                {
+                    if (!buckets.empty()) buckets += ',';
+                    buckets += std::to_string(rows);
+                }
+                setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", std::to_string(capture.minimum_rows));
+                setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
+                setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", buckets);
+                return;
+            }
             ASSERT_FALSE(config_.token_ids.empty())
                 << "Production parity requires authenticated prompt tokens "
                    "before graph-bucket configuration";
@@ -3698,6 +3991,19 @@ namespace llaminar2::test::parity
         {
             (void)metadata_path;
             return {true, {}};
+        }
+
+        /**
+         * @brief Name the checkpoint order owned by the authenticated reference adapter.
+         * @return HF grouping for existing HF-based adapters; native GGUF adapters override explicitly.
+         *
+         * Specialized adapters authenticate their semantic schema before this
+         * policy reaches either prefill or decode comparison. Head geometry
+         * alone cannot identify an oracle's source layout.
+         */
+        virtual ParityGDNReferenceLayout referenceGDNSnapshotLayout() const
+        {
+            return ParityGDNReferenceLayout::HuggingFaceGrouped;
         }
 
         /**
@@ -3845,6 +4151,20 @@ namespace llaminar2::test::parity
                 if (!model_specific_validation.usable)
                     return model_specific_validation;
             }
+            if (frozen_history_replay_)
+            {
+                try
+                {
+                    const auto prompt = readSnapshotTokenIdentity(metadata_path, "token_ids");
+                    const auto teachers = readSnapshotTokenIdentity(metadata_path, "decode_tokens");
+                    if (!prompt || !teachers) return {false, "Frozen reference prompt/teacher metadata is missing"};
+                    frozen_history_replay_->requireReference(metadata_path, prompt->first, teachers->first);
+                }
+                catch (const std::exception &error)
+                {
+                    return {false, error.what()};
+                }
+            }
             if (!require_content_identity)
                 return {true, {}};
 
@@ -3961,6 +4281,29 @@ namespace llaminar2::test::parity
             return {true, {}};
         }
 
+        /**
+         * @brief Authenticate the existing reference-header inventory for native snapshot admission.
+         * Native byte replay retains its declared inputs and native numerical
+         * oracle. The same-model pack supplies only authenticated metadata and
+         * NPY shapes to deriveParitySnapshotMemoryCapacity before initialization;
+         * no reference values or teacher token trajectory enter execution.
+         * Missing or incompatible packs fail here without implicit generation.
+         */
+        void prepareNativeExactSnapshotGeometryMetadata()
+        {
+            resolveSnapshotDirIfNeeded();
+            const auto metadata = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
+            const auto validation = validateReferenceSnapshotMetadata(metadata, true);
+            ASSERT_TRUE(validation.usable)
+                << "Native exact snapshot-header geometry is unavailable or incompatible: "
+                << validation.reason;
+            const auto tokens = readSnapshotTokenIdentity(metadata, "token_ids");
+            ASSERT_TRUE(tokens.has_value());
+            const std::vector<int> declared(tokens->first.begin(), tokens->first.end());
+            ASSERT_EQ(declared, config_.token_ids)
+                << "Native exact snapshot-header geometry must match the original declared prompt IDs";
+        }
+
         const std::chrono::steady_clock::time_point parity_fixture_started_at_ =
             std::chrono::steady_clock::now();
         bool production_parity_campaign_active_ = false;
@@ -3977,15 +4320,25 @@ namespace llaminar2::test::parity
         /** One owned native row bank; never a pointer into reusable snapshots. */
         std::map<std::string, std::vector<float>> production_parity_native_serial_rows_;
         /** The exact input boundary selecting that bank, not an epoch heuristic. */
+        /** Exact integer checkpoints share the same serial boundary without floating conversion. */
+        std::map<std::string, std::vector<std::int64_t>> production_parity_native_serial_integer_rows_;
         std::optional<ProductionParityMTPSerialOracleBoundary> production_parity_native_serial_boundary_;
         std::vector<PrefixRestoreEvidence>
             production_parity_prefix_restore_evidence_;
         ParityConfig config_;
+        /** Explicit diagnostic metadata; no model/topology policy is stored here. */
+        std::optional<FrozenParityHistoryReplay> frozen_history_replay_;
+        std::set<int> observation_terminal_rows_; ///< Original closed LM exports, -1=prefill; scoped to this fixture/history only.
+        std::set<int> observation_auxiliary_terminal_rows_; ///< Explicit negative-step diagnostic probes, never original history coverage.
+        CoordinatedPassiveEvidenceObligation coordinated_passive_evidence_; ///< Session-owned deferred audit phase.
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
         IInferenceRunner *borrowed_runner_ = nullptr;
         std::unordered_map<std::string, std::vector<float>> pytorch_snapshots_;
         mutable std::unordered_map<std::string, std::vector<float>> active_snapshot_combined_cache_;
+        /** Setup-only diagnostic keys; an empty engaged value also freezes the request. */
+        mutable std::optional<std::vector<std::string>>
+            parity_diagnostic_capture_keys_;
         mutable std::string parity_reference_capture_filter_cache_dir_;
         mutable std::vector<std::string>
             parity_reference_capture_filter_cache_;
@@ -4026,6 +4379,10 @@ namespace llaminar2::test::parity
          */
         std::vector<int32_t> orchestration_parity_decode_trajectory_;
         size_t orchestration_parity_decode_trajectory_index_ = 0;
+        /// Exact diagnostic invocation history and existing path counters; never inference state.
+        size_t parity_query_next_decode_step_ = 0;
+        std::optional<size_t> parity_query_decode_step_;
+        QwenSparseQueryProgramObservation parity_query_program_observation_;
         ParityForcedTokenCommitMode orchestration_parity_force_mode_ =
             ParityForcedTokenCommitMode::Unknown;
 
@@ -4363,12 +4720,11 @@ namespace llaminar2::test::parity
         virtual std::shared_ptr<ModelContext> acquireParityModelContext(
             WeightDistributionStrategy strategy)
         {
-            auto context = ModelContext::create(
+            auto context = config_.shared_predictor ? ModelContext::create(
                 config_.model_path,
-                mpi_ctx_,
-                nullptr,
-                nullptr,
-                strategy);
+                parityModelContextConfig(mpi_ctx_, strategy, config_.shared_predictor,
+                    config_.mtp_expected_graph_capacity)) : ModelContext::create(
+                config_.model_path, mpi_ctx_, nullptr, nullptr, strategy);
             if (context)
                 configureModel(context);
             return context;
@@ -4452,8 +4808,25 @@ namespace llaminar2::test::parity
             return quoted;
         }
 
+        /**
+         * @brief Publish original setup metadata after fresh artifact-directory creation.
+         * @throws std::exception When original metadata validation or publication fails.
+         *
+         * Only the artifact-authority rank invokes this hook, exactly once per
+         * setup, before reference/model admission. SetUp converts failure into
+         * its existing readiness broadcast before every rank asserts success.
+         * Derived fixtures retain their original validated metadata owner;
+         * this hook must not reconstruct evidence from expected inference output.
+         */
+        virtual void onParityArtifactDirectoryReady() {}
+
         void SetUp() override
         {
+            // Freeze before any backend/model initialization can construct a
+            // retained graph. Later environment changes cannot change topology.
+            freezeParityDiagnosticSnapshotKeys(
+                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).enabled ||
+                parityGraphSnapshotPolicy(ParityForwardPhase::Decode).enabled);
             // Model parity is a production-path canary. Do not let an inherited
             // shell env or a previous test route it through deterministic GEMM.
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
@@ -4477,6 +4850,7 @@ namespace llaminar2::test::parity
                 {
                     config_.model_path = productionParityResolvedModelPath(
                         config_.model_path);
+                    config_.shared_predictor = resolveParityPredictorSource(config_.shared_predictor);
                 }
                 catch (const std::exception &error)
                 {
@@ -4522,23 +4896,16 @@ namespace llaminar2::test::parity
              * Rank zero owns deletion; every other rank waits until that exact
              * artifact authority has been recreated.
              */
-            int32_t results_dir_ready = 1;
-            if (isRank0())
-            {
-                const auto dir = getResultsDir();
-                std::error_code ec;
-                std::filesystem::remove_all(dir, ec);
-                if (!ec)
-                    std::filesystem::create_directories(dir, ec);
-                results_dir_ready = ec ? 0 : 1;
-            }
+            const auto artifact_preparation = prepareParityArtifactDirectory(
+                getResultsDir(), isRank0(), [this] { onParityArtifactDirectoryReady(); });
+            int32_t results_dir_ready = artifact_preparation.ready;
             if (mpi_ctx_ && mpiWorldSize() > 1)
                 parityCoordinationMPIContext()->broadcast_int32(
                     &results_dir_ready, 1, 0);
             mpiBarrier();
             ASSERT_EQ(results_dir_ready, 1)
                 << "Cannot prepare a fresh parity artifact directory for "
-                << getTestName();
+                << getTestName() << ": " << artifact_preparation.error;
 
             /*
              * Every rank owns a separate diagnostic stream. The artifact
@@ -4586,6 +4953,18 @@ namespace llaminar2::test::parity
                              << " (populate MODELS_DIR on the runner)";
             }
 
+            if (config_.shared_predictor &&
+                !std::filesystem::is_regular_file(config_.shared_predictor->path()))
+                FAIL() << "Selected parity predictor GGUF not found: " << config_.shared_predictor->path();
+
+            // Native exact replay uses authenticated same-model reference
+            // headers for snapshot capacity only. It never regenerates a pack,
+            // imports teacher tokens, reads numerical payloads or scores HF.
+            if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
+            {
+                ASSERT_NO_FATAL_FAILURE(prepareNativeExactSnapshotGeometryMetadata());
+                return;
+            }
             resolveSnapshotDirIfNeeded();
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
@@ -4733,6 +5112,7 @@ namespace llaminar2::test::parity
 
         void TearDown() override
         {
+            EXPECT_NO_THROW(coordinated_passive_evidence_.requireCompletedIfBound());
             /*
              * GoogleTest invokes TearDown after a derived SetUp skips or fails
              * before calling this base.  That is the only valid no-lifecycle
@@ -4953,7 +5333,7 @@ namespace llaminar2::test::parity
          * @param expert_ids Sorted union of independently validated selected routes.
          * @param rows HF input rows.
          * @param hidden HF output width.
-         * @return HF expert bank and model RMS parameters; unsupported models fail closed.
+         * @return HF expert bank and explicit model-owned suffix contract; unsupported models fail closed.
          */
         virtual MoEIndependentReference independentMoEMTPExpertReference(
             const std::string &prefix, const std::vector<int> &expert_ids,
@@ -4971,6 +5351,7 @@ namespace llaminar2::test::parity
          */
         std::vector<float> loadPyTorchSnapshot(const std::string &name)
         {
+            if(frozen_history_replay_ && !frozen_history_replay_->observesReferenceKey(name))return {};
             if (pytorch_snapshots_.find(name) != pytorch_snapshots_.end())
             {
                 auto scope = profileParityScope("pytorch_snapshot.cache_copy");
@@ -4980,6 +5361,9 @@ namespace llaminar2::test::parity
             auto scope = profileParityScope("pytorch_snapshot.load_npy");
             std::string npy_path = config_.snapshot_dir + "/" + name + ".npy";
 
+            if (std::filesystem::exists(npy_path) &&
+                inspectNpySnapshot(npy_path).scalar == NpySnapshotScalar::INT64)
+                throw std::logic_error("integer reference requires typed snapshot comparison: " + name);
             try
             {
                 cnpy::NpyArray arr = cnpy::npy_load(npy_path);
@@ -5048,15 +5432,16 @@ namespace llaminar2::test::parity
         /**
          * @brief GDN head configuration with MoE detection for V-head permutation
          *
-         * V-head permutation is only needed for MoE models where the Python
-         * GGUF loader applies V-head reversal (tiled→grouped). Dense models
-         * skip reversal, so both sides use tiled order and no permutation
-         * is needed at comparison time.
+         * The authenticated reference adapter owns its snapshot order.
+         * HF-based MoE loaders reverse GGUF value-head tiling; exact-GGUF
+         * equations retain native order. The same geometry must therefore
+         * carry an explicit reference policy for prefill and decode alike.
          */
         ParityGDNHeadConfig getGDNHeadConfig() const
         {
-            return parityGDNHeadConfigFromModel(
-                activeModelContextForDiagnostics());
+            auto geometry = parityGDNHeadConfigFromModel(activeModelContextForDiagnostics());
+            geometry.reference_layout = referenceGDNSnapshotLayout();
+            return geometry;
         }
 
         /**
@@ -5140,6 +5525,36 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Compare full weighted route blocks by original row/expert identity, for diagnostics only.
+         * @param actual Native contributions in native router-slot order.
+         * @param expected Independent contributions in reference router-slot order.
+         * @param actual_ids Native IDs for these exact rows. @param expected_ids Corresponding reference IDs.
+         * @param top_k Original route width. @param num_experts Original expert domain.
+         * @param threshold Unchanged ordinary caller comparator threshold.
+         * @param reference_window Exact optional value window captured at the existing decode crop site.
+         * @return Real comparator result, or no comparison when valid complete expert sets differ.
+         * @throws std::invalid_argument For malformed geometry/identity; unavailable is never a pass.
+         */
+        static std::optional<StageComparisonResult> compareExpertAlignedRouteContributions(
+            std::span<const float> actual, std::span<const float> expected,
+            std::span<const float> actual_ids, std::span<const float> expected_ids,
+            std::size_t top_k, std::size_t num_experts, float threshold,
+            std::optional<RouteContributionReferenceWindow> reference_window = std::nullopt)
+        {
+            if (reference_window)
+                expected_ids = reference_window->projectIds(expected_ids, actual_ids.size(), expected.size(), top_k);
+            const auto alignment = alignRouteContributionReference(
+                actual_ids, expected_ids, expected, actual.size(), top_k, num_experts);
+            if (alignment.status == RouteContributionAlignmentStatus::DifferentExpertSets)
+            {
+                LOG_INFO("[Parity] MOE_ROUTE_CONTRIBUTIONS_EXPERT_ALIGNED unavailable: different complete same-row expert sets");
+                return std::nullopt;
+            }
+            return compareParityTensorData(actual.data(), alignment.reference_in_production_order.data(),
+                actual.size(), "MOE_ROUTE_CONTRIBUTIONS_EXPERT_ALIGNED", threshold);
+        }
+
+        /**
          * @brief Compare MoE routing indices (expert selection).
          *
          * For each token, computes the set overlap between selected expert IDs
@@ -5164,6 +5579,12 @@ namespace llaminar2::test::parity
 
             if (expected.empty() || expected.size() != size || top_k <= 0)
                 return result;
+
+            const int experts = getMoEConfig().num_experts;
+            result.evidence_valid = actual && expected.size() == size &&
+                validParityRouteIds({actual, size}, top_k, experts) &&
+                validParityRouteIds(expected, top_k, experts);
+            if (!result.evidence_valid && config_.final_logit_mean_kl) return result;
 
             const size_t seq_len = size / static_cast<size_t>(top_k);
             double total_overlap = 0.0;
@@ -5237,6 +5658,20 @@ namespace llaminar2::test::parity
 
             if (expected_weights.empty() || expected_weights.size() != size || top_k <= 0)
                 return result;
+
+            result.evidence_valid = actual_weights && actual_indices &&
+                expected_weights.size() == size && expected_indices.size() == size &&
+                finiteParityOperands({actual_weights, size}) && finiteParityOperands(expected_weights) &&
+                validParityRouteIds({actual_indices, size}, top_k, num_experts) &&
+                validParityRouteIds(expected_indices, top_k, num_experts);
+            // The original QFN builder declares norm_topk_prob=true. Do not
+            // impose probability bounds on other families' scaled route weights.
+            const auto *context = activeModelContextForDiagnostics();
+            if (config_.final_logit_mean_kl && context && context->architecture() == "qwen4exp")
+                result.evidence_valid = result.evidence_valid &&
+                    validNormalizedParityWeights({actual_weights, size}, top_k) &&
+                    validNormalizedParityWeights(expected_weights, top_k);
+            if (!result.evidence_valid && config_.final_logit_mean_kl) return result;
 
             const size_t seq_len = size / static_cast<size_t>(top_k);
             double total_cosine = 0.0;
@@ -5579,6 +6014,8 @@ namespace llaminar2::test::parity
                     combined_size == pytorch_data.size() &&
                     result.combined_result.passed;
                 result.combined_result.passed = result.combined_passed;
+                result.combined_result.evidence_valid = result.combined_result.evidence_valid &&
+                    combined_size == pytorch_data.size();
 
                 LOG_DEBUG("[TP Parity] Combined: size=" << combined_size
                                                         << " pytorch_size=" << pytorch_data.size()
@@ -5589,6 +6026,11 @@ namespace llaminar2::test::parity
                 LOG_WARN("[TP Parity] Failed to compute combined data for " << tp_snapshot.key);
             }
 
+            result.combined_result.evidence_valid = result.combined_result.evidence_valid &&
+                std::all_of(tp_snapshot.device_data.begin(), tp_snapshot.device_data.end(), [](const auto &device) {
+                    return device.rows > 0 && device.cols > 0 && device.rows <= device.data.size() / device.cols &&
+                        device.rows * device.cols == device.data.size() && finiteParityOperands(device.data);
+                });
             // Overall pass: combined must pass
             result.passed = result.combined_passed;
 
@@ -5826,6 +6268,24 @@ namespace llaminar2::test::parity
          * reaches the later numerical-comparison phase. Encoding that choice
          * as a scoped policy keeps callers from relying on a positional bool.
          */
+        /** @return Explicit snapshot payload policy; existing model declarations retain their original envelope. */
+        virtual ParitySnapshotPayloadProjection referenceSnapshotPayloadProjection() const
+        {
+            return ParitySnapshotPayloadProjection::ObservationEnvelope;
+        }
+
+        /**
+         * @brief Declare source-owned authored outputs selected by the frozen diagnostic filter.
+         * @param keys Canonical prefill/decode capture union installed on this same runner.
+         * @return No source replacement for existing ordinary models by default.
+         */
+        virtual std::vector<GraphSnapshotSourceOutput> nativeSnapshotSourceOutputs(
+            const std::vector<std::string> &keys) const
+        {
+            (void)keys;
+            return {};
+        }
+
         enum class ParitySnapshotSetupMode
         {
             Enabled,
@@ -5896,6 +6356,13 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Optional original MPI owner used only by fresh production construction.
+         * @return Empty for historical helper behavior; original published context for distributed fixtures.
+         * @note This configuration hook emits no production factory/helper in metadata-only vtables.
+         */
+        virtual std::shared_ptr<IMPIContext> freshParityMPIContext() const { return {}; }
+
+        /**
          * @brief Install exactly one fresh production runner implementation.
          *
          * The two public overloads differ only at the model-authority boundary;
@@ -5908,6 +6375,16 @@ namespace llaminar2::test::parity
             std::optional<ModelContextReuseContract> reuse_contract,
             ParitySnapshotSetupMode snapshot_mode)
         {
+            // Reject an explicit diagnostic request on a lean-only setup before
+            // replacing any runner or creating model/backend resources.
+            freezeParityDiagnosticSnapshotKeys(
+                snapshot_mode != ParitySnapshotSetupMode::Disabled);
+            OrchestrationConfig runner_config = orch_config;
+            if (frozen_history_replay_)
+                frozen_history_replay_->applyCPUWorkers(runner_config);
+            runner_config.shared_predictor = bindParityPredictorSource(config_.shared_predictor,
+                resolveParityPredictorSource(orch_config.shared_predictor));
+
             // Install one runner/model authority.  A stale legacy context must
             // never shadow the model owned by the modern production runner.
             runner_.reset();
@@ -5923,18 +6400,21 @@ namespace llaminar2::test::parity
             if (reuse_contract)
             {
                 orch_runner_ = test::TestOrchestrationHelper::create(
-                    orch_config,
+                    runner_config,
                     std::move(*reuse_contract));
             }
             else if (preloaded_model_context)
             {
                 orch_runner_ = test::TestOrchestrationHelper::create(
-                    orch_config,
+                    runner_config,
                     std::move(preloaded_model_context));
             }
             else
             {
-                orch_runner_ = test::TestOrchestrationHelper::create(orch_config);
+                if(const auto original=freshParityMPIContext())
+                    orch_runner_=createOrchestrationRunnerFactory(original)->createFromOrchestrationConfig(runner_config);
+                else
+                    orch_runner_=test::TestOrchestrationHelper::create(runner_config);
             }
             if (!orch_runner_)
             {
@@ -5952,16 +6432,27 @@ namespace llaminar2::test::parity
                  * user list to the authenticated reference checkpoint set;
                  * only an explicit EveryPublishedOutput policy selects all.
                  */
+                // Price the serving family, including buckets captured eagerly before
+                // the first live request, rather than only this reference prompt.
+                // Read the SAME effective startup inventory as production capture;
+                // direct config fields cannot replace an unpublished process policy.
                 const int retained_graph_rows =
-                    resolveRetainedGraphRowCapacity(
+                    paritySnapshotServingGraphRows(
                         static_cast<int>(config_.token_ids.size()),
-                        orch_config.mtp);
+                        runner_config.max_seq_len,
+                        debugEnv().execution.prefill_graph_bucket_sizes,
+                        cfg().has_gpu_participant() && debugEnv().execution.gpu_graphs &&
+                            debugEnv().execution.prefill_graph_buckets,
+                        runner_config.mtp);
+                const auto snapshot_filter = paritySnapshotSetupCaptureFilter();
                 const auto snapshot_memory =
                     deriveParitySnapshotMemoryCapacity(
                         config_.snapshot_dir,
                         static_cast<int>(config_.token_ids.size()),
                         retained_graph_rows,
-                        config_.allreduce_stages);
+                        config_.allreduce_stages,
+                        nativeSnapshotSourceOutputs(snapshot_filter), referenceSnapshotPayloadProjection(),
+                        frozen_history_replay_?frozen_history_replay_->observationKeys():std::vector<std::string>{});
                 if (!snapshot_memory.valid() ||
                     !orch_runner_->setSnapshotMemoryCapacity(
                         snapshot_memory.capacity))
@@ -5989,8 +6480,7 @@ namespace llaminar2::test::parity
                         << snapshot_memory.collective_alias_bytes);
                 }
 
-                orch_runner_->setSnapshotCaptureFilter(
-                    paritySnapshotSetupCaptureFilter());
+                orch_runner_->setSnapshotCaptureFilter(snapshot_filter);
                 if (snapshot_mode == ParitySnapshotSetupMode::Enabled)
                 {
                     orch_runner_->enableSnapshotCapture();
@@ -6106,6 +6596,224 @@ namespace llaminar2::test::parity
             return 0;
         }
 
+        /** @brief Return exact typed diagnostic bytes from the active canonical runner. */
+        SnapshotInfo activeTypedSnapshot(const std::string &key) const
+        {
+            if (orch_runner_) return orch_runner_->getSnapshotWithShape(key);
+            if (const auto *runner = activeLegacyRunner()) return runner->getSnapshotWithShape(key);
+            return {};
+        }
+
+        /** @brief Freeze actual rank-local model participants for diagnostic path evidence.
+         * @return Exact unique device identities; ambiguity fails closed rather than guessing from counters.
+         */
+        std::vector<std::string> canonicalQueryParticipantDevices() const
+        {
+            std::vector<std::string> devices;
+            if(orch_runner_) {
+                const auto &plan=orch_runner_->executionPlan();
+                const auto *original=dynamic_cast<const OrchestrationRunner*>(orch_runner_.get());
+                const auto *prepared=original?original->pipelinePreparedPlanForDiagnostics():nullptr;
+                const auto admission=prepared?prepared->admission():nullptr;
+                if(admission) {
+                    if(admission->rankPlan().rank!=plan.rank)return {};
+                    std::set<std::string> seen;
+                    for(const auto &stage:admission->stages()) {
+                        const auto members=qwenSparseQueryParticipantDevices(stage.rankPlan(),plan.rank);
+                        if(members.empty())return {};
+                        for(const auto &member:members) {
+                            if(!seen.insert(member).second)return {};
+                            devices.push_back(member);
+                        }
+                    }
+                } else devices=qwenSparseQueryParticipantDevices(plan,plan.rank);
+            } else if(const auto *rank=dynamic_cast<const RankOrchestrator *>(activeLegacyRunner())) {
+                for(int participant=0;participant<rank->device_count();++participant) {
+                    const auto *child=rank->deviceRunner(participant);
+                    if(!child)return {};
+                    devices.push_back(child->primaryDeviceId().toString());
+                }
+            } else if(activeLegacyRunner())devices.push_back(activePrimaryDevice().toString());
+            return devices;
+        }
+
+        /**
+         * @brief Resolve independent admitted query context from immutable setup authorities.
+         * @return Original context capacity, or zero for an unsupported/unbound legacy composite.
+         *
+         * Resident graph buckets size activation storage separately. The admitted
+         * plan's full context must agree with the original runner configuration;
+         * native query metadata cannot select either expected value.
+         */
+        int canonicalQuerySourceCapacity() const
+        {
+            if(orch_runner_) {
+                const int admitted=orch_runner_->executionPlan().runtime.max_seq_len;
+                return admitted>0 && admitted==orch_runner_->config().max_seq_len ? admitted : 0;
+            }
+            if(const auto *device=dynamic_cast<const DeviceGraphOrchestrator *>(activeLegacyRunner()))
+                return device->max_seq_len();
+            if(const auto *rank=dynamic_cast<const RankOrchestrator *>(activeLegacyRunner()))
+            {
+                int admitted=0;
+                if(rank->device_count()<=0)return 0;
+                // Direct legacy TP borrows each existing immutable graph
+                // configuration. No live cache/count observation selects it.
+                for(int participant=0;participant<rank->device_count();++participant)
+                {
+                    const auto *device=dynamic_cast<const DeviceGraphOrchestrator *>(rank->deviceRunner(participant));
+                    const int capacity=device?device->max_seq_len():0;
+                    if(capacity<=0 || (admitted && admitted!=capacity))return 0;
+                    admitted=capacity;
+                }
+                return admitted;
+            }
+            return 0;
+        }
+
+        /**
+         * @brief Compare typed identities, exact empty state, or original-coordinate query evidence.
+         * @param reference_key Exact authenticated NumPy reference checkpoint.
+         * @param production_key Canonical acquired native checkpoint identity.
+         * @param stage Original semantic stage, never an optional derived diagnostic.
+         * @param query_decode_step Original single-row Decode trajectory ordinal; absent for Prefill.
+         * @return An actual typed result, or absence for the unchanged ordinary floating route.
+         * @details Query history is canonical input history, independent of the
+         * acquired metadata. Only useful original reference rows enter numerical
+         * comparison; an owned empty query never acquires a numerical verdict.
+         */
+        std::optional<StageComparisonResult> compareIntegerReference(
+            const std::string &reference_key, const std::string &production_key, const std::string &stage,
+            std::optional<std::size_t> query_decode_step=std::nullopt)
+        {
+            if(frozen_history_replay_ && !frozen_history_replay_->observesReferenceKey(reference_key))return std::nullopt;
+            const auto path = config_.snapshot_dir + "/" + reference_key + ".npy";
+            if (!std::filesystem::exists(path)) return std::nullopt;
+            if(isQwenSparseQueryCheckpoint(stage))
+            {
+                const auto published_keys=activeSnapshotKeys();
+                // Published Prefill values retain their existing numerical
+                // comparison contract. Only genuinely absent producers enter
+                // the complete-request omission proof; Decode keeps its
+                // established authored-interval provenance contract.
+                if(!query_decode_step &&
+                   std::find(published_keys.begin(),published_keys.end(),production_key)!=published_keys.end())
+                    return std::nullopt;
+                const auto descriptor=inspectNpySnapshot(path);
+                const auto actual=activeTypedSnapshot(production_key);
+                const QwenSparseQueryHistory history{
+                    .promptRows=config_.token_ids.size(),.decodeRowsBefore=query_decode_step.value_or(0),
+                    .liveRows=query_decode_step?1:static_cast<int>(config_.token_ids.size()),
+                    .sourceCapacity=canonicalQuerySourceCapacity(),
+                    .phase=query_decode_step?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill};
+                auto proof=inspectQwenSparseQueryEvidence(actual,history,descriptor.count);
+                if(!proof.valid &&
+                   std::find(published_keys.begin(),published_keys.end(),production_key)==published_keys.end() &&
+                   parity_query_decode_step_==query_decode_step)
+                    proof=inspectOmittedQwenSparseQueryEvidence(parity_query_program_observation_,
+                        history,descriptor.count);
+                const auto &shape=descriptor.shape;
+                const bool reference_shape=(shape.size()==3 && shape[0]==1 && shape[2]==512) ||
+                    (stage=="QSA_INDEXER_QUERY" && shape.size()==4 && shape[0]==1 && shape[2]==4 && shape[3]==128);
+                proof.valid=proof.valid && descriptor.scalar==NpySnapshotScalar::FP32 && reference_shape &&
+                    (query_decode_step ? reference_key.starts_with("decode_step"+std::to_string(*query_decode_step)+"_") :
+                        !reference_key.starts_with("decode_step"));
+                EXPECT_TRUE(proof.valid)<<"Query snapshot disagrees with independent original history: "<<production_key;
+                StageComparisonResult result;result.stage_name=stage;
+                const auto expected=expectedQwenSparseQueryInterval(proof.history);
+                const bool empty=expected && expected->firstRow==expected->endRow;
+                result.checkpoint_evidence_kind=empty?ParityCheckpointEvidenceKind::UnauthoredQuery:
+                    ParityCheckpointEvidenceKind::AuthoredQuery;
+                if(proof.valid && !empty)
+                {
+                    const auto reference=loadPyTorchSnapshot(reference_key);
+                    const auto first=proof.referenceFirstRow*512;
+                    if(reference.size()!=descriptor.count || first>reference.size() || actual.size>reference.size()-first)
+                        proof.valid=false;
+                    else
+                    {
+                        // Original history chooses this interval. Native payload
+                        // length never selects a final-position reference crop.
+                        const std::vector<float> useful(reference.begin()+static_cast<std::ptrdiff_t>(first),
+                            reference.begin()+static_cast<std::ptrdiff_t>(first+actual.size));
+                        result=compareTensors(actual.data,useful,actual.size,stage);
+                        result.checkpoint_evidence_kind=ParityCheckpointEvidenceKind::AuthoredQuery;
+                    }
+                }
+                if(empty)
+                    result.cosine_similarity=result.rel_l2_norm=result.max_abs_diff=result.snr_db=result.rmse=
+                        result.error_entropy=std::numeric_limits<float>::quiet_NaN();
+                result.query_work_evidence=std::move(proof);
+                // Empty required Q retains identity and structural evidence;
+                // numerical passed/evidence_valid remain false with zero samples.
+                return result;
+            }
+            if(reference_key.ends_with("_QSA_INDEXER_POOLED_KEYS"))
+            {
+                const auto descriptor=inspectNpySnapshot(path);
+                if(descriptor.count==0)
+                {
+                    const auto actual=activeTypedSnapshot(production_key);
+                    const auto columns=descriptor.shape.empty()?0:descriptor.shape.back();
+                    StageComparisonResult result;result.stage_name=stage;
+                    result.cosine_similarity=std::numeric_limits<float>::quiet_NaN();
+                    result.rel_l2_norm=result.snr_db=result.rmse=result.error_entropy=result.cosine_similarity;
+                    result.passed=descriptor.scalar==NpySnapshotScalar::FP32&&columns==128&&
+                        matchesFloatingEmptyObservation(actual,columns);
+                    result.evidence_valid = result.passed;
+                    EXPECT_TRUE(result.passed)<<"Empty pooled-state checkpoint requires an owned exact 0x128 observation: "<<production_key;
+                    return result;
+                }
+            }
+            if(reference_key.ends_with("_QSA_SELECTED_INDICES"))
+            {
+                const auto descriptor=inspectNpySnapshot(path);
+                const auto reference=loadTypedNpySnapshot(path);
+                const auto actual=activeTypedSnapshot(production_key);
+                StageComparisonResult result;result.stage_name=stage;result.scalar_type="INT32";
+                result.total_elements=reference.size();result.cosine_similarity=std::numeric_limits<float>::quiet_NaN();
+                const auto columns=descriptor.shape.empty()?0:descriptor.shape.back();
+                const bool shape=actual&&columns==2051&&actual.cols==columns&&
+                    actual.rows==descriptor.count/columns&&actual.size==descriptor.count;
+                if(!shape||actual.isInteger()||reference.isInteger()) {
+                    result.integer_mismatch_count=std::max<std::size_t>(1,reference.size());
+                    ADD_FAILURE()<<"Selected-ID checkpoint requires exact canonical row geometry: "<<production_key;
+                    return result;
+                }
+                const auto comparison=compareSnapshotSelectedIds({actual.data,actual.size},reference.floats(),columns);
+                result.integer_mismatch_count=comparison.identityMismatches+comparison.countMismatches+comparison.malformedRows;
+                result.passed=comparison.equal();
+                result.evidence_valid=result.passed;
+                EXPECT_TRUE(result.passed)<<"Selected-ID checkpoint "<<production_key<<" wrong IDs="<<comparison.identityMismatches
+                    <<", wrong counts="<<comparison.countMismatches<<", malformed rows="<<comparison.malformedRows;
+                return result;
+            }
+            if(inspectNpySnapshot(path).scalar != NpySnapshotScalar::INT64) return std::nullopt;
+            const auto descriptor = inspectNpySnapshot(path);
+            const auto reference = loadTypedNpySnapshot(path);
+            const auto actual = activeTypedSnapshot(production_key);
+            StageComparisonResult result;
+            result.stage_name = stage;
+            result.scalar_type = "INT64";
+            result.total_elements = reference.size();
+            result.cosine_similarity = std::numeric_limits<float>::quiet_NaN();
+            if (!actual || !actual.isInteger())
+            {
+                result.integer_mismatch_count = reference.size();
+                ADD_FAILURE() << "Integer checkpoint requires exact native publication: " << production_key;
+                return result;
+            }
+            const auto columns = descriptor.shape.empty() ? 1 : descriptor.shape.back();
+            const bool exact_shape = columns != 0 && actual.cols == columns &&
+                actual.rows == descriptor.count / columns && actual.size == descriptor.count;
+            result.integer_mismatch_count = integerSnapshotMismatches(actual.integerValues(), reference.integers());
+            result.passed = exact_shape && *result.integer_mismatch_count == 0;
+            result.evidence_valid = result.passed;
+            EXPECT_TRUE(result.passed) << "Integer checkpoint " << production_key << " mismatches="
+                << *result.integer_mismatch_count << ", shape_matches=" << exact_shape;
+            return result;
+        }
+
         /**
          * @brief Get snapshot from whichever runner is active
          *
@@ -6196,6 +6904,64 @@ namespace llaminar2::test::parity
             return values;
         }
 
+        /**
+         * @brief Freeze an optional exact diagnostic inventory before runner initialization.
+         *
+         * This request adds capture nodes, not numerical-reference obligations.
+         * Keys use identifier syntax only; patterns, paths and empty members
+         * are rejected rather than widening the captured topology. The existing
+         * snapshot policy, source-output projection and PMA admission still own
+         * the graph and its physical storage.
+         *
+         * @param snapshots_enabled Whether this setup prepares diagnostic graphs.
+         * @return The same immutable request for every later phase/reset.
+         * @throws std::invalid_argument For a malformed request or disabled capture.
+         */
+        const std::vector<std::string> &freezeParityDiagnosticSnapshotKeys(
+            bool snapshots_enabled) const
+        {
+            constexpr const char *name = "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS";
+            if (!parity_diagnostic_capture_keys_)
+            {
+                auto keys = readParityEnvList(name);
+                if (const char *raw = std::getenv(name); raw && *raw)
+                {
+                    // readParityEnvList trims members and omits empty ones.
+                    // Preserve that shared parser while rejecting omitted members
+                    // in an explicit capture request (including a trailing comma).
+                    const std::string request(raw);
+                    const auto members = static_cast<std::size_t>(
+                        std::count(request.begin(), request.end(), ',')) + 1u;
+                    if (keys.size() != members)
+                        throw std::invalid_argument(
+                            std::string(name) + " requires nonempty comma-separated exact keys");
+                    const auto letter = [](char c)
+                    {
+                        return (c >= 'A' && c <= 'Z') ||
+                               (c >= 'a' && c <= 'z') || c == '_';
+                    };
+                    for (const auto &key : keys)
+                    {
+                        if (!letter(key.front()) ||
+                            !std::all_of(key.begin(), key.end(), [&](char c)
+                            {
+                                return letter(c) || (c >= '0' && c <= '9');
+                            }))
+                            throw std::invalid_argument(
+                                std::string(name) + " requires exact identifier keys, without "
+                                "wildcards, paths or whitespace: " + key);
+                    }
+                }
+                std::sort(keys.begin(), keys.end());
+                keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+                parity_diagnostic_capture_keys_ = std::move(keys);
+            }
+            if (!snapshots_enabled && !parity_diagnostic_capture_keys_->empty())
+                throw std::invalid_argument(
+                    std::string(name) + " requires enabled diagnostic snapshot capture");
+            return *parity_diagnostic_capture_keys_;
+        }
+
         static std::set<int> readParityEnvStepSet(const char *name)
         {
             std::set<int> steps;
@@ -6266,6 +7032,44 @@ namespace llaminar2::test::parity
             return escaped;
         }
 
+        /**
+         * @brief Retain generic presence guards only when the exact observation owns that stage.
+         * @param stage Canonical unqualified semantic stage suffix.
+         * @return True for ordinary full mode, or a selected matching observation key.
+         */
+        bool requiresObservationStagePresence(const std::string& stage) const
+        {
+            if(!frozen_history_replay_ || !frozen_history_replay_->hasObservationShard())return true;
+            const auto keys=frozen_history_replay_->observationKeys();
+            return std::any_of(keys.begin(),keys.end(),[&](const auto& key){return key==stage || key.ends_with("_"+stage);});
+        }
+
+        /**
+         * @brief Record one actually closed terminal export without counting auxiliary probes as history.
+         * @param step Original -1/prefill or decode offset; values below -1 are auxiliary probes.
+         * @throws std::invalid_argument For an out-of-range positive decode coordinate.
+         */
+        void recordObservationTerminal(int step)
+        {
+            if(!frozen_history_replay_ || !frozen_history_replay_->hasObservationShard())
+                throw std::invalid_argument("Terminal observation requires its explicit frozen shard");
+            if(step<-1)observation_auxiliary_terminal_rows_.insert(step);
+            else {
+                if(step>=frozen_history_replay_->decodeRows())
+                    throw std::invalid_argument("Observation terminal exceeds original frozen history");
+                observation_terminal_rows_.insert(step);
+            }
+        }
+
+        /** @return Whether every original frozen LM observation has an actual closed export; default full mode is unchanged. */
+        bool hasCompleteObservationTerminals() const
+        {
+            if(!frozen_history_replay_ || !frozen_history_replay_->hasObservationShard())return true;
+            for(int step=-1;step<frozen_history_replay_->decodeRows();++step)
+                if(!observation_terminal_rows_.contains(step))return false;
+            return true;
+        }
+
         void exportActiveSnapshotsForParityDiagnostics(
             ParityForwardPhase phase,
             int decode_step)
@@ -6273,12 +7077,13 @@ namespace llaminar2::test::parity
             if (!isRank0())
                 return;
 
-            const auto filters =
+            const bool observation_shard=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
+            const auto filters = observation_shard?frozen_history_replay_->observationKeys():
                 readParityEnvList("LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS");
             if (filters.empty())
                 return;
 
-            if (phase == ParityForwardPhase::Decode)
+            if (!observation_shard && phase == ParityForwardPhase::Decode)
             {
                 const auto allowed_steps =
                     readParityEnvStepSet("LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS");
@@ -6292,6 +7097,8 @@ namespace llaminar2::test::parity
             const size_t max_elements =
                 readParityEnvSize("LLAMINAR_PARITY_EXPORT_SNAPSHOT_MAX_ELEMENTS", 0);
 
+            if(observation_shard && max_elements!=0)
+                throw std::invalid_argument("Observation shard exports cannot truncate selected evidence");
             auto out_dir = ensureResultsDir() / "llaminar_snapshots";
             std::error_code ec;
             std::filesystem::create_directories(out_dir, ec);
@@ -6317,7 +7124,7 @@ namespace llaminar2::test::parity
             }
             if (write_header)
             {
-                manifest << "backend,phase,step,key,elements,exported_elements,file\n";
+                manifest << "backend,phase,step,key,elements,exported_elements,file,scalar_type\n";
             }
 
             const std::string phase_name = parityForwardPhaseName(phase);
@@ -6326,13 +7133,17 @@ namespace llaminar2::test::parity
                     ? ("step" + std::to_string(decode_step))
                     : "prefill";
 
+            bool terminal_exported=false;
             for (const auto &key : activeSnapshotKeys())
             {
                 if (!paritySnapshotKeyMatches(key, filters))
                     continue;
 
-                size_t elements = 0;
-                const float *data = activeSnapshot(key, elements);
+                const auto typed = activeTypedSnapshot(key);
+                const bool integer = typed && typed.isInteger();
+                size_t elements = integer ? typed.size : 0;
+                const void *data = integer ? static_cast<const void *>(typed.integerValues().data())
+                                          : activeSnapshot(key, elements);
                 if (!data || elements == 0)
                     continue;
 
@@ -6340,7 +7151,7 @@ namespace llaminar2::test::parity
                     (max_elements > 0) ? std::min(elements, max_elements) : elements;
                 const std::string safe_key = sanitizeSnapshotToken(key);
                 auto file_path = out_dir /
-                                 (phase_name + "_" + step_name + "_" + safe_key + ".f32");
+                                 (phase_name + "_" + step_name + "_" + safe_key + (integer ? ".i64" : ".f32"));
 
                 std::ofstream out(file_path, std::ios::binary);
                 if (!out.is_open())
@@ -6351,20 +7162,37 @@ namespace llaminar2::test::parity
 
                 out.write(
                     reinterpret_cast<const char *>(data),
-                    static_cast<std::streamsize>(exported_elements * sizeof(float)));
+                    static_cast<std::streamsize>(exported_elements * (integer ? sizeof(std::int64_t) : sizeof(float))));
                 if (!out.good())
                 {
                     LOG_WARN("[Parity Snapshot Export] Failed while writing " << file_path);
                     continue;
                 }
 
+                out.close();
+                if(observation_shard && !out)throw std::runtime_error("Observation shard snapshot output failed");
+                terminal_exported=terminal_exported || key=="LM_HEAD";
                 manifest << csvEscape(getBackendName()) << ","
                          << phase_name << ","
                          << decode_step << ","
                          << csvEscape(key) << ","
                          << elements << ","
                          << exported_elements << ","
-                         << csvEscape(file_path.string()) << "\n";
+                         << csvEscape(file_path.string()) << "," << (integer ? "INT64" : "FP32") << "\n";
+            }
+            if(observation_shard) {
+                manifest.close();
+                if(!terminal_exported || !manifest)
+                    throw std::runtime_error("Observation shard omitted its actual complete terminal LM row");
+                recordObservationTerminal(phase==ParityForwardPhase::Prefill?-1:decode_step);
+                const nlohmann::json terminals={{"schema",1},{"scope","noncertifying_observation_shard"},
+                    {"descriptor_sha256",frozen_history_replay_->identity()},
+                    {"actual_terminal_rows",observation_terminal_rows_},
+                    {"auxiliary_terminal_rows",observation_auxiliary_terminal_rows_},
+                    {"complete",hasCompleteObservationTerminals()},{"payload_manifest",manifest_path.string()}};
+                std::ofstream progress(ensureResultsDir()/"history_replay_observation_terminals.json");
+                progress<<terminals.dump(2)<<'\n';progress.close();
+                if(!progress)throw std::runtime_error("Cannot close actual observation terminal inventory");
             }
         }
 
@@ -6548,6 +7376,23 @@ namespace llaminar2::test::parity
             return ParityRunnerEvidenceLifetime::FreshRunner;
         }
 
+        /**
+         * @brief Freeze standalone snapshot admission at its explicit history geometry.
+         *
+         * Fixture SetUp precedes the GTest body, so an isolated SnapshotAdmission
+         * has not yet entered the production evidence lifetime when SetUp first
+         * resolves graph buckets. Activate that lifetime before reusing the exact
+         * production bucket resolver, then initialize the runner. Explicit frozen
+         * replay still selects its original serving ladder, including M512.
+         * No checkpoint, allocation owner or numerical policy is changed here.
+         * @note Callers must propagate a fatal geometry assertion before setup.
+         */
+        void beginProductionParitySnapshotAdmission()
+        {
+            beginProductionParityEvidence();
+            configureExactProductionParityPrefillGraphBucket();
+        }
+
         /** @brief Reset cell work while respecting authenticated runner ownership. */
         void beginProductionParityEvidence()
         {
@@ -6557,6 +7402,7 @@ namespace llaminar2::test::parity
             production_parity_decode_boundaries_.clear();
             production_parity_mtp_transaction_boundaries_.clear();
             production_parity_native_serial_rows_.clear();
+            production_parity_native_serial_integer_rows_.clear();
             production_parity_native_serial_boundary_.reset();
             production_parity_prefix_restore_evidence_.clear();
 
@@ -7200,6 +8046,8 @@ namespace llaminar2::test::parity
                 float cosine = 0.0f;
                 float rel_l2 = 0.0f;
                 float max_abs = 0.0f;
+                float maximum_kl = 0.0f;
+                uint64_t rows = 0;
             };
             static_assert(std::is_trivially_copyable_v<PartialCheckpointProof>);
 
@@ -7212,102 +8060,42 @@ namespace llaminar2::test::parity
                     "LM_HEAD") != local_snapshot_keys.end()
                     ? 1
                     : 0;
+            // Both actual publication authorities consume the same declared final-logit policy.
+            const auto compare_checkpoint = [&](const float *actual, size_t elements)
+            {
+                const auto reference = loadPyTorchSnapshot("decode_step0_LM_HEAD");
+                const auto result = comparePrefixPartialLogits(
+                    actual ? std::span<const float>{actual,elements} : std::span<const float>{}, reference,
+                    static_cast<size_t>(getActiveVocabSize()), config_.final_logit_mean_kl,
+                    config_.decode_cosine_threshold);
+                EXPECT_TRUE(result.evidence_valid)
+                    << "Partial prefix LM-head authority published invalid geometry or nonfinite operands";
+                local_checkpoint.compared = result.evidence_valid ? 1 : 0;
+                local_checkpoint.passed = result.passed ? 1 : 0;
+                local_checkpoint.cosine = result.minimum_cosine;
+                local_checkpoint.rel_l2 = result.maximum_relative_l2;
+                local_checkpoint.max_abs = result.maximum_abs;
+                local_checkpoint.maximum_kl = result.maximum_kl;
+                local_checkpoint.rows = result.rows;
+            };
             if (local_checkpoint.advertised != 0)
             {
-                local_checkpoint.authority =
-                    PartialCheckpointProof::Authority::GraphSnapshot;
-                size_t live_logits_size = 0;
-                const float *live_logits =
-                    activeSnapshot("LM_HEAD", live_logits_size);
-                std::vector<float> reference_logits =
-                    loadPyTorchSnapshot("decode_step0_LM_HEAD");
-                const bool valid_geometry =
-                    live_logits != nullptr &&
-                    live_logits_size > 0u &&
-                    !reference_logits.empty() &&
-                    reference_logits.size() >= live_logits_size &&
-                    reference_logits.size() % live_logits_size == 0u;
-                EXPECT_TRUE(valid_geometry)
-                    << "Partial prefix LM-head owner published an invalid checkpoint geometry";
-                if (valid_geometry)
-                {
-                    const float *reference_tail =
-                        reference_logits.data() +
-                        (reference_logits.size() - live_logits_size);
-                    const StageComparisonResult logits =
-                        compareParityTensorData(
-                            live_logits,
-                            reference_tail,
-                            live_logits_size,
-                            "PREFIX_PARTIAL_LM_HEAD",
-                            config_.decode_cosine_threshold);
-                    local_checkpoint.compared = 1;
-                    local_checkpoint.passed = logits.passed ? 1 : 0;
-                    local_checkpoint.cosine = logits.cosine_similarity;
-                    local_checkpoint.rel_l2 = logits.rel_l2_norm;
-                    local_checkpoint.max_abs = logits.max_abs_diff;
-                }
+                local_checkpoint.authority = PartialCheckpointProof::Authority::GraphSnapshot;
+                size_t elements = 0;
+                const float *actual = activeSnapshot("LM_HEAD", elements);
+                compare_checkpoint(actual,elements);
             }
             else if (!restored.terminal_logits_values.empty())
             {
-                /* Restored-prefix suffix execution is a scalar captured decode
-                 * bridge. Its production output authority is the terminal
-                 * logits publication, not the ordinary prefill snapshot bank.
-                 * A TP aggregate may contain one identical full-vocabulary row
-                 * per participant; compare every published row so a corrupt
-                 * participant cannot hide behind the continuation owner. */
-                local_checkpoint.authority = PartialCheckpointProof::Authority::
-                    TerminalLogitsPublication;
+                // Scalar captured decode-bridge publication may retain one full row per TP participant.
+                // Compare every row; a good continuation owner cannot hide a corrupt peer.
+                local_checkpoint.authority = PartialCheckpointProof::Authority::TerminalLogitsPublication;
                 local_checkpoint.advertised = 1;
-                std::vector<float> reference_logits =
-                    loadPyTorchSnapshot("decode_step0_LM_HEAD");
-                const size_t vocab_size =
-                    static_cast<size_t>(getActiveVocabSize());
-                const bool valid_geometry =
-                    vocab_size > 0u &&
-                    !reference_logits.empty() &&
-                    reference_logits.size() >= vocab_size &&
-                    reference_logits.size() % vocab_size == 0u &&
-                    restored.terminal_logits_values.size() % vocab_size == 0u &&
-                    restored.terminal_logits_bytes ==
-                        restored.terminal_logits_values.size() * sizeof(float);
-                EXPECT_TRUE(valid_geometry)
-                    << "Partial prefix terminal-logits authority published an invalid checkpoint geometry";
-                if (valid_geometry)
-                {
-                    const float *const reference_tail =
-                        reference_logits.data() +
-                        (reference_logits.size() - vocab_size);
-                    local_checkpoint.compared = 1;
-                    local_checkpoint.passed = 1;
-                    local_checkpoint.cosine = 1.0f;
-                    const size_t published_rows =
-                        restored.terminal_logits_values.size() / vocab_size;
-                    for (size_t row = 0u; row < published_rows; ++row)
-                    {
-                        const StageComparisonResult logits =
-                            compareParityTensorData(
-                                restored.terminal_logits_values.data() +
-                                    row * vocab_size,
-                                reference_tail,
-                                vocab_size,
-                                "PREFIX_PARTIAL_TERMINAL_LOGITS",
-                                config_.decode_cosine_threshold);
-                        local_checkpoint.passed =
-                            (local_checkpoint.passed != 0 && logits.passed)
-                                ? 1
-                                : 0;
-                        local_checkpoint.cosine = std::min(
-                            local_checkpoint.cosine,
-                            logits.cosine_similarity);
-                        local_checkpoint.rel_l2 = std::max(
-                            local_checkpoint.rel_l2,
-                            logits.rel_l2_norm);
-                        local_checkpoint.max_abs = std::max(
-                            local_checkpoint.max_abs,
-                            logits.max_abs_diff);
-                    }
-                }
+                const bool published_geometry = restored.terminal_logits_bytes ==
+                    restored.terminal_logits_values.size()*sizeof(float);
+                EXPECT_TRUE(published_geometry) << "Partial prefix terminal-logits byte extent disagrees";
+                if(published_geometry)
+                    compare_checkpoint(restored.terminal_logits_values.data(),restored.terminal_logits_values.size());
             }
 
             std::vector<PartialCheckpointProof> checkpoint_proofs{
@@ -7339,7 +8127,9 @@ namespace llaminar2::test::parity
             float checkpoint_cosine = 1.0f;
             float checkpoint_rel_l2 = 0.0f;
             float checkpoint_max_abs = 0.0f;
-            bool checkpoint_passed = compared_checkpoints > 0;
+            float checkpoint_maximum_kl = 0.0f;
+            uint64_t checkpoint_rows = 0;
+            bool checkpoint_passed = compared_checkpoints > 0 && compared_checkpoints == advertised_checkpoints;
             for (const auto &proof : checkpoint_proofs)
             {
                 if (proof.compared == 0)
@@ -7350,6 +8140,8 @@ namespace llaminar2::test::parity
                     std::max(checkpoint_rel_l2, proof.rel_l2);
                 checkpoint_max_abs =
                     std::max(checkpoint_max_abs, proof.max_abs);
+                checkpoint_maximum_kl = std::max(checkpoint_maximum_kl,proof.maximum_kl);
+                checkpoint_rows += proof.rows;
                 checkpoint_passed =
                     checkpoint_passed && proof.passed != 0;
             }
@@ -7401,6 +8193,11 @@ namespace llaminar2::test::parity
                 .checkpoint_compared = true,
                 .checkpoint_cosine = checkpoint_cosine,
                 .checkpoint_passed = checkpoint_passed,
+                .partial_checkpoint_policy = config_.final_logit_mean_kl
+                    ? PrefixPartialCheckpointPolicy::FinalLogitMeanKL : PrefixPartialCheckpointPolicy::LegacyCosine,
+                .partial_checkpoint_rows = checkpoint_rows,
+                .partial_checkpoint_maximum_kl = checkpoint_maximum_kl,
+                .partial_checkpoint_kl_limit = config_.final_logit_mean_kl ? config_.final_logit_mean_kl->decode_maximum : 0.0f,
                 .passed = lifecycle_passed &&
                           static_cast<bool>(state_match) &&
                           checkpoint_passed,
@@ -7409,7 +8206,11 @@ namespace llaminar2::test::parity
                 << "Partial prefix LM_HEAD cosine="
                 << checkpoint_cosine
                 << " rel_l2=" << checkpoint_rel_l2
-                << " max_abs=" << checkpoint_max_abs;
+                << " max_abs=" << checkpoint_max_abs
+                << " maximum_row_kl=" << checkpoint_maximum_kl
+                << " rows=" << checkpoint_rows
+                << " policy=" << prefixPartialCheckpointPolicyName(config_.final_logit_mean_kl
+                    ? PrefixPartialCheckpointPolicy::FinalLogitMeanKL : PrefixPartialCheckpointPolicy::LegacyCosine);
         }
 
         /**
@@ -7449,6 +8250,7 @@ namespace llaminar2::test::parity
                     return key.rfind("layer", 0) == 0;
                 }))
                 << "Production forward published no per-layer snapshot";
+            if(requiresObservationStagePresence("FFN_RESIDUAL"))
             EXPECT_TRUE(std::any_of(
                 keys.begin(),
                 keys.end(),
@@ -7470,9 +8272,12 @@ namespace llaminar2::test::parity
          * inference and any coordinated worker protocol have completed.
          *
          * @param records Process-local records retained for this campaign cell.
+         * @param boundary Only an explicit intermediate ordinary request postpones
+         * positive Dynamic proof; Final and all Static obligations remain strict.
          */
         void assertProductionParityMoEMovementEvidence(
-            const std::vector<PerfStatRecord> &records) const
+            const std::vector<PerfStatRecord> &records,
+            ParityMoEMovementEvidenceBoundary boundary = ParityMoEMovementEvidenceBoundary::Final) const
         {
             if (config_.moe_movement_expectation ==
                 ParityMoEMovementExpectation::NotApplicable)
@@ -7484,79 +8289,21 @@ namespace llaminar2::test::parity
                 << "ExpertOverlay parity requires PerfStats movement evidence";
             ASSERT_TRUE(
                 PerfStatsCollector::isDomainEnabled("moe_rebalance") ||
-                PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+                PerfStatsCollector::isDomainEnabled("moe_overlay_residency") ||
+                PerfStatsCollector::isDomainEnabled("moe_overlay_controller"))
                 << "ExpertOverlay parity must enable moe_rebalance or "
-                   "moe_overlay_residency PerfStats";
+                   "moe_overlay_residency or moe_overlay_controller PerfStats";
 
-            const auto counter = [&](const char *domain, const char *name)
-            {
-                return std::accumulate(
-                    records.begin(), records.end(), 0.0,
-                    [&](double total, const PerfStatRecord &record)
-                    {
-                        return total +
-                               (record.kind == PerfStatRecord::Kind::Counter &&
-                                        record.domain == domain &&
-                                        record.name == name
-                                    ? record.value
-                                    : 0.0);
-                    });
-            };
-
-            /*
-             * Host-authoritative multi-tier movement and device-authoritative
-             * homogeneous movement publish different counters, but both must
-             * prove the same four facts. Keep the mapping here at the common
-             * parity boundary rather than teaching each model fixture backend
-             * implementation details.
-             */
-            std::array<float, 4> local = {
-                static_cast<float>(
-                    counter("moe_overlay_residency", "committed_expert_migrations") +
-                    counter("moe_overlay_controller", "dynamic_movement_transactions") +
-                    counter("moe_rebalance", "device_rebalance_dynamic_ownership_swap_accepts") +
-                    counter("moe_rebalance", "device_rebalance_selected_replicas")),
-                static_cast<float>(
-                    counter("moe_overlay_residency", "cpu_native_copy_bytes") +
-                    counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
-                    counter("moe_overlay_residency", "placement_transfer_operations_completed") +
-                    counter("moe_overlay_residency", "device_physical_destinations_staged") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfers") +
-                    counter("moe_rebalance", "weight_transfer_outgoing_entries") +
-                    counter("moe_rebalance", "weight_transfer_incoming_entries") +
-                    counter("moe_rebalance", "mask_apply_received_entries") +
-                    counter("moe_rebalance", "device_rebalance_copy_copied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_transfer_current_copied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_wave_copied_arrivals_total") +
-                    counter("moe_rebalance", "device_rebalance_request_copied_payload_lower_bound")),
-                static_cast<float>(
-                    counter("moe_overlay_residency", "cpu_native_copy_bytes") +
-                    counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
-                    counter("moe_overlay_residency", "placement_transfer_payload_bytes_completed") +
-                    counter("moe_overlay_controller", "dynamic_physical_bytes") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfer_incoming_bytes") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfer_outgoing_bytes") +
-                    counter("moe_rebalance", "weight_transfer_incoming_bytes") +
-                    counter("moe_rebalance", "weight_transfer_outgoing_bytes") +
-                    counter("moe_rebalance", "mask_apply_received_bytes") +
-                    counter("moe_rebalance", "device_rebalance_transfer_useful_payload_bytes") +
-                    counter("moe_rebalance", "device_rebalance_request_useful_payload_bytes_lower_bound")),
-                static_cast<float>(
-                    counter("moe_overlay_residency", "expert_migration_edges") +
-                    counter("moe_overlay_residency", "device_physical_epoch_published") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfers") +
-                    counter("moe_rebalance", "ownership_change_entries") +
-                    counter("moe_rebalance", "replica_arrivals") +
-                    counter("moe_rebalance", "mask_apply_received_entries") +
-                    counter("moe_rebalance", "device_rebalance_apply_applied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_transfer_current_applied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_wave_applied_arrivals_total") +
-                    counter("moe_rebalance", "device_rebalance_request_applied_payload_lower_bound")),
-            };
+            const auto local = parityMoEMovementFacts(records);
             std::array<float, 4> global = local;
             if (mpi_ctx_ && mpiWorldSize() > 1)
                 parityCoordinationMPIContext()->allreduce_sum(
                     local.data(), global.data(), global.size());
+
+            const auto status = parityMoEMovementEvidenceAtBoundary(
+                config_.moe_movement_expectation, global, boundary);
+            if (status == ParityMoEMovementEvidenceStatus::Intermediate)
+                return; // Incomplete observation; the ordinary cohort must still finish Final.
 
             const float movement_total =
                 global[0] + global[1] + global[2] + global[3];
@@ -7586,6 +8333,61 @@ namespace llaminar2::test::parity
             EXPECT_GT(global[3], 0.0f)
                 << "Dynamic ExpertOverlay parity applied no moved placement.\n"
                 << summary;
+
+            if(cfg().moe_routed_expert_plan && MoEExpertOwnerMap::usesCPUJointFragments(*cfg().moe_routed_expert_plan)){
+                ASSERT_TRUE(orch_runner_)<<"Dynamic cohort terminal evidence lost its original runner";
+                const auto* info=::testing::UnitTest::GetInstance()->current_test_info();
+                ASSERT_NE(info,nullptr);
+                const auto stats=nlohmann::json::parse(PerfStatsCollector::jsonString({"moe_overlay_residency"}));
+                const auto rank=mpi_ctx_?mpi_ctx_->rank():0;
+                // Serialize the existing owner snapshot only at the closed
+                // original worker boundary. No inference state is read back.
+                const nlohmann::json document={{"schema","llaminar.cohort-parity-movement.v1"},
+                    {"case",std::string(info->test_suite_name())+"."+info->name()},
+                    {"world_rank",rank},{"world_size",mpiWorldSize()},
+                    {"topology",moeMovementTopologyJson(orch_runner_->moeOptimizationMovementTopology())},
+                    {"movement",moeMovementLedgerJson(orch_runner_->moeOptimizationMovementLedger())},
+                    {"records",stats.at("records")}};
+                std::ofstream output(ensureResultsDir()/("cohort_movement_rank_"+std::to_string(rank)+".json"),std::ios::trunc);
+                ASSERT_TRUE(output.is_open());output<<document.dump(2)<<'\n';output.close();ASSERT_TRUE(output.good());
+            }
+        }
+
+        /** @brief Immutable original layer inventory required by both symmetric and coordinated audits. */
+        struct MoEOwnerOrderEvidencePreparation
+        {
+            std::string expected_order; ///< Original authored participant order.
+            int main_layer_count; ///< Original main transformer population.
+            std::vector<int> expected_layers; ///< Main and actually retained MoE predictor source layers.
+        };
+        /**
+         * @brief Validate local prerequisites before any owner-order evidence collective.
+         * @return Exact original main/predictor layer inventory without ownership reconstruction.
+         * @throws std::logic_error For unavailable counters/model/source manifests.
+         */
+        MoEOwnerOrderEvidencePreparation prepareProductionParityMoEOwnerOrderEvidence() const
+        {
+            if(!PerfStatsCollector::isEnabled() || !PerfStatsCollector::isDomainEnabled("moe_placement"))
+                throw std::logic_error("ExpertOverlay parity requires physical owner-order evidence");
+            MoEOwnerOrderEvidencePreparation result{
+                routedExpertOwnerOrderToString(cfg().routed_expert_owner_order),parityLayerCount(),{}};
+            if(result.main_layer_count<=0)
+                throw std::logic_error("Owner-order evidence has no original main source layers");
+            for(int layer=0;layer<result.main_layer_count;++layer)result.expected_layers.push_back(layer);
+            if(config_.mtp_expected_graph_capacity>0)
+            {
+                const auto* model=activeModelContextForDiagnostics();
+                if(!model)throw std::logic_error("Owner-order evidence lost original live model diagnostics");
+                const auto manifest=discoverMTPWeightManifest(model->concreteLoader(),model->architecture(),
+                    std::max(model->totalBlockCount(),model->blockCount()),true);
+                if(!manifest.available)throw std::logic_error(manifest.diagnostic);
+                for(const auto& depth:manifest.depths)
+                    if(depth.moe_ffn_layout)result.expected_layers.push_back(depth.source_layer_index);
+            }
+            std::sort(result.expected_layers.begin(),result.expected_layers.end());
+            result.expected_layers.erase(std::unique(result.expected_layers.begin(),result.expected_layers.end()),
+                result.expected_layers.end());
+            return result;
         }
 
         /**
@@ -7616,45 +8418,13 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            ASSERT_TRUE(PerfStatsCollector::isEnabled());
-            ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("moe_placement"))
-                << "ExpertOverlay parity requires physical owner-order evidence";
-
-            const std::string expected_order =
-                routedExpertOwnerOrderToString(
-                    cfg().routed_expert_owner_order);
-            const int main_layer_count = parityLayerCount();
-            ASSERT_GT(main_layer_count, 0);
-
-            std::vector<int> expected_layers;
-            expected_layers.reserve(static_cast<std::size_t>(main_layer_count) + 1u);
-            for (int layer = 0; layer < main_layer_count; ++layer)
-                expected_layers.push_back(layer);
-
-            if (config_.mtp_expected_graph_capacity > 0)
-            {
-                const ModelContext *active_model =
-                    activeModelContextForDiagnostics();
-                ASSERT_NE(active_model, nullptr);
-                const int raw_layer_count = std::max(
-                    active_model->totalBlockCount(),
-                    active_model->blockCount());
-                const MTPWeightManifest manifest = discoverMTPWeightManifest(
-                    active_model->concreteLoader(),
-                    active_model->architecture(),
-                    raw_layer_count,
-                    /*explicit_mtp=*/true);
-                ASSERT_TRUE(manifest.available) << manifest.diagnostic;
-                for (const auto &depth : manifest.depths)
-                {
-                    if (depth.moe_ffn_layout)
-                        expected_layers.push_back(depth.source_layer_index);
-                }
-            }
-            std::sort(expected_layers.begin(), expected_layers.end());
-            expected_layers.erase(
-                std::unique(expected_layers.begin(), expected_layers.end()),
-                expected_layers.end());
+            std::optional<MoEOwnerOrderEvidencePreparation> preparation;
+            try { preparation=prepareProductionParityMoEOwnerOrderEvidence(); }
+            catch(const std::exception& error) { FAIL()<<error.what(); }
+            const auto& prepared=*preparation;
+            const auto& expected_order=prepared.expected_order;
+            const int main_layer_count=prepared.main_layer_count;
+            const auto& expected_layers=prepared.expected_layers;
 
             std::vector<float> local_layer_coverage(
                 expected_layers.size(), 0.0f);
@@ -8204,6 +8974,56 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Apply only the model's explicit independent suffix authority to existing raw stages.
+         * @param contract CanonicalComparisons never rewrites suffix verdicts; only the RMS arm owns gains.
+         * @param prerequisites Existing route/input/KL/weight admission proof.
+         * @param routed Independently reconstructed selected-expert equation.
+         * @param inputs Original independently gated non-routed HF operands.
+         * @param actual Native suffix rows, comparison outputs only.
+         * @param canonical Original immutable HF suffix rows.
+         * @param reconstructed Original routes recombined from the independent HF-input bank.
+         * @param conditioned Actual validated routes recombined from the same bank.
+         * @param operands Independently captured non-routed HF inputs.
+         * @param minimum_cosine Unchanged cell threshold.
+         * @param stages Original raw stage bank; metrics remain unchanged even when RMS evidence is appended.
+         */
+        static void applyIndependentMoESuffixEvidence(
+            const MoEReferenceSuffixContract &contract,
+            const MoERouteConditionedPrerequisites &prerequisites,
+            const MoERouteConditionedProof &routed, const MoESuffixInputProof &inputs,
+            const MoESuffixRows &actual, const MoESuffixRows &canonical,
+            std::span<const float> reconstructed, std::span<const float> conditioned,
+            const MoEHFSuffixOperands &operands, double minimum_cosine,
+            std::vector<StageComparisonResult> &stages)
+        {
+            if (std::holds_alternative<MoECanonicalComparisons>(contract))
+                return;
+            const auto &normalization = std::get<MoEOrdinaryRMSReconstruction>(contract).normalization;
+            constexpr std::array suffixes{"_MOE_COMBINED_OUTPUT", "_FFN_RESIDUAL", "_FINAL_NORM"};
+            std::array<std::size_t, 3> indices{};
+            std::array<bool, 3> original_passed{};
+            for (std::size_t i = 0; i < suffixes.size(); ++i)
+            {
+                const auto found = std::find_if(stages.begin(), stages.end(), [&](const auto &stage)
+                    { return stage.stage_name.ends_with(suffixes[i]); });
+                if (found == stages.end())
+                    return;
+                indices[i] = static_cast<std::size_t>(found - stages.begin());
+                original_passed[i] = found->passed;
+            }
+            const auto proofs = proveMoERouteConditionedSuffix(prerequisites, routed, inputs,
+                actual, canonical, original_passed,
+                reconstructMoEHFSuffix(reconstructed, operands, normalization),
+                reconstructMoEHFSuffix(conditioned, operands, normalization), minimum_cosine);
+            for (std::size_t i = 0; i < suffixes.size(); ++i)
+            {
+                auto &stage = stages[indices[i]];
+                stage.route_conditioned_proof = proofs[i];
+                stage.passed = proofs[i].equivalent;
+            }
+        }
+
+        /**
          * @brief Prove normalized routes and, for a cutoff swap, its HF-input equation.
          * @param reference_prefix Authenticated HF branch/checkpoint identity.
          * @param runtime_prefix Native snapshot context, not an HF replay prefix.
@@ -8283,7 +9103,7 @@ namespace llaminar2::test::parity
             const auto canonical = reference("MOE_EXPERT_OUTPUT");
             const size_t rows = ids.size() / top_k;
             std::vector<float> conditioned, reconstructed;
-            MoEReferenceNormalization normalization;
+            MoEReferenceSuffixContract suffix_contract = MoEOrdinaryRMSReconstruction{};
             if (prerequisites.valid() && !canonical.empty() && canonical.size() % rows == 0)
             {
                 const size_t hidden = canonical.size() / rows;
@@ -8291,7 +9111,7 @@ namespace llaminar2::test::parity
                 const auto bank = independentMoEMTPExpertReference(reference_prefix, bank_ids, rows, hidden);
                 conditioned = sumMoEReferenceBank(bank.experts, bank_ids, ids, weights, top_k, hidden);
                 reconstructed = sumMoEReferenceBank(bank.experts, bank_ids, hf_ids, hf_weights, top_k, hidden);
-                normalization = bank.normalization;
+                suffix_contract = bank.suffix;
             }
             expert->route_conditioned_proof = proveMoERouteConditionedEquation(
                 prerequisites, expert->passed, actual, conditioned, canonical,
@@ -8313,13 +9133,11 @@ namespace llaminar2::test::parity
                 .gated_shared = original_input_verdict("MOE_SHARED_GATE_OUTPUT"),
             };
             MoESuffixRows native_suffix, hf_suffix;
-            std::array<bool, 3> original_passed{};
             bool complete = true;
             for (size_t i = 0; i < suffixes.size(); ++i)
             {
                 const auto found = stage(std::string("_") + suffixes[i]);
                 complete = complete && found != stages.end();
-                original_passed[i] = found != stages.end() && found->passed;
                 native_suffix[i] = production(suffixes[i]);
                 hf_suffix[i] = reference(suffixes[i]);
             }
@@ -8329,17 +9147,9 @@ namespace llaminar2::test::parity
                 const auto attention = reference("ATTENTION_OUTPUT");
                 const auto shared = reference("MOE_SHARED_GATE_OUTPUT");
                 const MoEHFSuffixOperands operands{fc, attention, shared};
-                const auto proofs = proveMoERouteConditionedSuffix(prerequisites,
+                applyIndependentMoESuffixEvidence(suffix_contract, prerequisites,
                     *expert->route_conditioned_proof, inputs, native_suffix, hf_suffix,
-                    original_passed, reconstructMoEHFSuffix(reconstructed, operands, normalization),
-                    reconstructMoEHFSuffix(conditioned, operands, normalization),
-                    config_.decode_cosine_threshold);
-                for (size_t i = 0; i < suffixes.size(); ++i)
-                {
-                    auto found = stage(std::string("_") + suffixes[i]);
-                    found->route_conditioned_proof = proofs[i];
-                    found->passed = proofs[i].equivalent;
-                }
+                    reconstructed, conditioned, operands, config_.decode_cosine_threshold, stages);
             }
             LOG_INFO("[Parity] Route-conditioned HF equation " << reference_prefix
                 << " canonical_cosine=" << expert->cosine_similarity
@@ -8770,10 +9580,34 @@ namespace llaminar2::test::parity
                 return {};
             if (!boundary.valid() || production_parity_native_serial_boundary_)
                 return "native verifier oracle requires exactly one valid serial boundary";
-            for (const auto &key : activeSnapshotKeys())
+            const auto published_keys = activeSnapshotKeys();
+            // The declared decode contract owns completeness. An absent key
+            // cannot disappear from both banks and thereby waive its proof.
+            const auto required = parityGraphSnapshotPolicy(ParityForwardPhase::Decode)
+                .requiredSnapshotKeys(ParityForwardPhase::Decode);
+            for (const auto &key : required)
+            {
+                if (isNativeVerifierRowCheckpoint(key) &&
+                    std::find(published_keys.begin(), published_keys.end(), key) == published_keys.end())
+                    return "native serial verifier omitted declared checkpoint: " + key;
+            }
+            for (const auto &key : published_keys)
             {
                 if (!isNativeVerifierRowCheckpoint(key))
                     continue;
+                const auto typed = activeTypedSnapshot(key);
+                if (typed.isInteger())
+                {
+                    const auto values = typed.integerValues();
+                    if (!typed || values.empty() || typed.rows != 1 ||
+                        typed.cols != values.size() || typed.size != values.size())
+                        return "native serial integer checkpoint has invalid row geometry: " + key;
+                    production_parity_native_serial_integer_rows_.emplace(
+                        key, std::vector<std::int64_t>(values.begin(), values.end()));
+                    continue;
+                }
+                if (key.ends_with("_PLE_HASH_INDICES"))
+                    return "native PLE hash checkpoint requires its original INT64 publication: " + key;
                 size_t size = 0;
                 const float *data = activeSnapshot(key, size);
                 if (!data || size == 0)
@@ -8803,7 +9637,8 @@ namespace llaminar2::test::parity
          * HF comparisons remain separate and retain their original thresholds.
          */
         void compareProductionParityNativeVerifierRows(
-            const ProductionParityMTPTransactionBoundary &boundary)
+            const ProductionParityMTPTransactionBoundary &boundary,
+            int native_prefix_rows = 0)
         {
             if (!isRank0())
                 return;
@@ -8825,7 +9660,9 @@ namespace llaminar2::test::parity
             ASSERT_GE(physical_rows, static_cast<size_t>(boundary.snapshot_execution_draft_depth + 1));
             ASSERT_LE(physical_rows, static_cast<size_t>(config_.mtp_expected_graph_capacity + 1));
 
-            const auto path = getResultsDir() / "mtp_native_verifier_rows.csv";
+            const auto suffix = native_prefix_rows > 0
+                ? "_prefix_" + std::to_string(native_prefix_rows) : std::string{};
+            const auto path = getResultsDir() / ("mtp_native_verifier_rows" + suffix + ".csv");
             std::ofstream csv(path);
             ASSERT_TRUE(csv.is_open()) << path;
             csv << "reference_step,condition_position,stage,physical_rows,row,row_elements,"
@@ -8852,6 +9689,164 @@ namespace llaminar2::test::parity
             }
             csv.flush();
             ASSERT_TRUE(csv.good()) << "Could not publish native verifier evidence: " << path;
+            if (!production_parity_native_serial_integer_rows_.empty())
+            {
+                std::ofstream integers(getResultsDir() / ("mtp_native_verifier_integer_rows" + suffix + ".csv"));
+                ASSERT_TRUE(integers.is_open());
+                integers << "stage,physical_rows,row,row_elements,status,first_mismatch,"
+                            "grouped_int64,serial_int64,passed\n";
+                for (const auto &[key, serial] : production_parity_native_serial_integer_rows_)
+                {
+                    const auto actual = activeTypedSnapshot(key);
+                    ASSERT_TRUE(actual && actual.isInteger()) << key;
+                    ASSERT_EQ(actual.rows, physical_rows) << key;
+                    ASSERT_EQ(actual.cols, serial.size()) << key;
+                    ASSERT_EQ(actual.size, actual.integerValues().size()) << key;
+                    const auto evidence = compareNativeVerifierIntegerMatrixRow(
+                        actual.integerValues(), physical_rows, 0, serial);
+                    integers << key << ',' << physical_rows << ",0," << serial.size() << ','
+                             << evidence.name() << ',' << evidence.first_mismatch << ','
+                             << evidence.grouped_value << ',' << evidence.serial_value << ','
+                             << evidence.passed() << '\n';
+                    EXPECT_TRUE(evidence.passed()) << "Native INT64 row zero: " << key;
+                }
+                integers.flush();
+                ASSERT_TRUE(integers.good());
+            }
+        }
+
+        /** @brief Seed the exact proof from the original native prompt, without a reference trajectory.
+         * The standard admitted runner and declared capture policy publish the
+         * same complete-prefix state consumed by the existing serial oracle.
+         */
+        void prepareProductionParityNativeExactCheckpoint()
+        {
+            ASSERT_NE(orch_runner_, nullptr);
+            const std::vector<std::int32_t> prompt(config_.token_ids.begin(), config_.token_ids.end());
+            activeClearSnapshots();
+            ASSERT_TRUE(orch_runner_->prefill(prompt)) << orch_runner_->lastError();
+            ASSERT_TRUE(validateParityGraphSnapshots(
+                ParityForwardPhase::Prefill, parityGraphSnapshotPolicy(ParityForwardPhase::Prefill)));
+            production_parity_decode_prefill_state_ = activePrefixStateProbe();
+        }
+
+        /** @brief Compare every actual verifier input against same-state native M=1 execution.
+         * @param boundary Original committed observation, including rejected proposals.
+         * @param prompt Original checkpoint prefix restored by the shared proof.
+         * Copy grouped snapshots before reset. Only the original recorded
+         * condition and drafts are forwarded, excluding inactive padding.
+         * The forced-token commit result proves each scalar row completed.
+         */
+        void compareProductionParityNativeVerifierInputRows(
+            const ProductionParityMTPTransactionBoundary &boundary,
+            const std::vector<std::int32_t> &prompt,
+            int native_prefix_rows = 0)
+        {
+            ASSERT_TRUE(isRank0());
+            ASSERT_NE(orch_runner_, nullptr);
+            ASSERT_TRUE(boundary.after.mtp_observed_verifier_condition_token);
+            ASSERT_GT(boundary.after.mtp_observed_verifier_transaction_count, 0);
+            const auto &serial_head = production_parity_native_serial_rows_.at("LM_HEAD");
+            size_t head_size = 0;
+            const auto *head = activeSnapshot("LM_HEAD", head_size);
+            ASSERT_NE(head, nullptr);
+            ASSERT_FALSE(serial_head.empty());
+            ASSERT_EQ(head_size % serial_head.size(), 0u);
+            const auto physical_rows = head_size / serial_head.size();
+            ASSERT_EQ(boundary.after.mtp_observed_verifier_draft_depth,
+                      boundary.snapshot_execution_draft_depth);
+            std::vector<std::int32_t> inputs;
+            ASSERT_NO_THROW(inputs = nativeVerifierInputRows(
+                *boundary.after.mtp_observed_verifier_condition_token,
+                boundary.after.mtp_observed_verifier_draft_tokens,
+                boundary.after.mtp_observed_verifier_draft_depth, physical_rows));
+
+            std::map<std::string, std::vector<float>> grouped;
+            for (const auto &[key, serial] : production_parity_native_serial_rows_)
+            {
+                size_t elements = 0;
+                const auto *data = activeSnapshot(key, elements);
+                ASSERT_NE(data, nullptr) << key;
+                ASSERT_EQ(elements, physical_rows * serial.size()) << key;
+                grouped.emplace(key, std::vector<float>(data, data + elements));
+            }
+            std::map<std::string, std::vector<std::int64_t>> grouped_integers;
+            for (const auto &[key, serial] : production_parity_native_serial_integer_rows_)
+            {
+                const auto actual = activeTypedSnapshot(key);
+                ASSERT_TRUE(actual && actual.isInteger()) << key;
+                const auto values = actual.integerValues();
+                ASSERT_EQ(actual.rows, physical_rows) << key;
+                ASSERT_EQ(actual.cols, serial.size()) << key;
+                ASSERT_EQ(actual.size, values.size()) << key;
+                ASSERT_EQ(values.size(), physical_rows * serial.size()) << key;
+                grouped_integers.emplace(key, std::vector<std::int64_t>(values.begin(), values.end()));
+            }
+            std::string error;
+            const auto restored = restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP, &error);
+            ASSERT_TRUE(restored) << error;
+            const auto identical = compareMTPRuntimeStateSnapshots(boundary.before, restored->state);
+            ASSERT_TRUE(identical) << identical.reason;
+            const auto suffix = native_prefix_rows > 0
+                ? "_prefix_" + std::to_string(native_prefix_rows) : std::string{};
+            std::ofstream csv(getResultsDir() / ("mtp_native_verifier_all_rows" + suffix + ".csv"));
+            ASSERT_TRUE(csv.is_open());
+            csv << "physical_rows,live_rows,row,input_token,stage,scalar_type,row_elements,status,"
+                   "first_mismatch,grouped_value_or_bits,serial_value_or_bits,passed\n";
+            for (size_t row = 0; row < inputs.size(); ++row)
+            {
+                activeClearSnapshots();
+                const auto before = activePrefixStateProbe();
+                const auto result = orch_runner_->forceDecodeToken(inputs[row]);
+                ASSERT_TRUE(result.success()) << result.error;
+                ASSERT_EQ(result.tokens.size(), 1u);
+                ASSERT_EQ(result.tokens.front(), inputs[row]);
+                ASSERT_EQ(result.returned_token_commit, ReturnedTokenCommitState::Committed)
+                    << "Exact replay requires the original GPU committed forced-token contract";
+                const auto after = activePrefixStateProbe();
+                ASSERT_EQ(after.current_position, before.current_position + 1);
+                ASSERT_EQ(after.mtp_verifier_runs, before.mtp_verifier_runs);
+                ASSERT_EQ(after.mtp_draft_steps, before.mtp_draft_steps);
+                for (const auto &[key, matrix] : grouped)
+                {
+                    size_t elements = 0;
+                    const auto *data = activeSnapshot(key, elements);
+                    const auto evidence = compareNativeVerifierMatrixRow(
+                        matrix, physical_rows, row,
+                        data ? std::span<const float>{data, elements} : std::span<const float>{});
+                    csv << physical_rows << ',' << inputs.size() << ',' << row << ',' << inputs[row]
+                        << ',' << key << ",FP32," << elements << ',' << evidence.name() << ','
+                        << evidence.first_mismatch << ',' << evidence.grouped_bits << ','
+                        << evidence.serial_bits << ',' << evidence.passed() << '\n';
+                    EXPECT_TRUE(evidence.passed()) << "Original verifier row " << row << " stage "
+                        << key << " input " << inputs[row] << " mismatch " << evidence.first_mismatch;
+                }
+                for (const auto &[key, matrix] : grouped_integers)
+                {
+                    const auto actual = activeTypedSnapshot(key);
+                    ASSERT_TRUE(actual && actual.isInteger()) << key;
+                    const auto values = actual.integerValues();
+                    ASSERT_EQ(actual.rows, 1u) << key;
+                    ASSERT_EQ(actual.cols, values.size()) << key;
+                    ASSERT_EQ(actual.size, values.size()) << key;
+                    const auto evidence = compareNativeVerifierIntegerMatrixRow(
+                        matrix, physical_rows, row, values);
+                    csv << physical_rows << ',' << inputs.size() << ',' << row << ',' << inputs[row]
+                        << ',' << key << ",INT64," << values.size() << ',' << evidence.name() << ','
+                        << evidence.first_mismatch << ',' << evidence.grouped_value << ','
+                        << evidence.serial_value << ',' << evidence.passed() << '\n';
+                    EXPECT_TRUE(evidence.passed()) << "Original INT64 verifier row " << row
+                        << " stage " << key << " mismatch " << evidence.first_mismatch;
+                }
+            }
+            csv.flush();
+            ASSERT_TRUE(csv.good());
+            const auto final_restore = restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP, &error);
+            ASSERT_TRUE(final_restore) << error;
+            const auto reset_match = compareMTPRuntimeStateSnapshots(boundary.before, final_restore->state);
+            ASSERT_TRUE(reset_match) << reset_match.reason;
         }
 
         /**
@@ -8868,7 +9863,8 @@ namespace llaminar2::test::parity
          * @param prompt Exact authenticated request prefix.
          * @param output_count Number of serial response tokens required.
          * @param checkpoint_reference_output_index Serial row retained for
-         *        grouped-verifier checkpoint comparison.
+         *        grouped-verifier checkpoint comparison, or nullopt to collect
+         *        only the existing native history without retaining a bank.
          * @param error Receives the first lifecycle or execution failure.
          * @param checkpoint_input Optional retained diagnostic input for an
          *        exact same-prefix verifier comparison; never execution state.
@@ -8878,7 +9874,7 @@ namespace llaminar2::test::parity
         captureProductionParityMTPSerialOracle(
             const std::vector<int32_t> &prompt,
             int output_count,
-            size_t checkpoint_reference_output_index,
+            std::optional<size_t> checkpoint_reference_output_index,
             std::string *error,
             PrefixRuntimeStateSnapshot *checkpoint_input = nullptr)
         {
@@ -8896,6 +9892,9 @@ namespace llaminar2::test::parity
                 return fail("serial MTP oracle requires the production runner");
             if (output_count <= 0)
                 return fail("serial MTP oracle requires a positive output count");
+            if (checkpoint_reference_output_index &&
+                *checkpoint_reference_output_index >= static_cast<size_t>(output_count))
+                return fail("serial MTP checkpoint index exceeds its original output extent");
 
             std::string restore_error;
             const auto complete_prefix =
@@ -8941,7 +9940,8 @@ namespace llaminar2::test::parity
                     .verifier_runs = before.mtp_verifier_runs,
                 };
 
-                if (static_cast<size_t>(output_index) == checkpoint_reference_output_index)
+                if (checkpoint_reference_output_index &&
+                    static_cast<size_t>(output_index) == *checkpoint_reference_output_index)
                 {
                     traceProductionParityMTPInputBoundary("serial_oracle", before);
                     if (checkpoint_input)
@@ -9017,8 +10017,8 @@ namespace llaminar2::test::parity
                     .output_index = static_cast<size_t>(output_index),
                     .token = result.tokens.front(),
                     .checkpoint_reference =
-                        static_cast<size_t>(output_index) ==
-                        checkpoint_reference_output_index,
+                        checkpoint_reference_output_index &&
+                        static_cast<size_t>(output_index) == *checkpoint_reference_output_index,
                     .before = before,
                     .after = after,
                 };
@@ -9049,6 +10049,42 @@ namespace llaminar2::test::parity
             return tokens;
         }
 
+        /** @brief One synchronous native checkpoint's immutable original input and diagnostic state. */
+        struct NativeMTPParityCheckpointAttempt
+        {
+            int prefix_rows;
+            int maximum_prefix_rows;
+            const std::vector<int32_t> &prompt;
+            const std::vector<int32_t> &policy_serial_oracle;
+            MTPParityNativeCheckpointWitness &selection;
+            std::ostream &trace;
+        };
+
+        /** @return The existing production topology's initial maintenance boundary, if any. */
+        std::optional<int> productionParityMTPInitialMaintenanceRows() const
+        {
+            const auto &runtime = orch_runner_->config();
+            return runtime.moe_routed_expert_plan &&
+                MoEOverlayCapacityAdmission::selectMigrationStorage(
+                    *runtime.moe_routed_expert_plan, runtime.moe_rebalance.mode) ==
+                    MoEOverlayMigrationStorageKind::DeviceTransferDirectory
+                ? std::optional<int>{runtime.moe_rebalance.device_initial_maintenance_period_tokens}
+                : std::nullopt;
+        }
+
+        /**
+         * @return Frozen native-functional continuation window for this fixture.
+         *
+         * The default preserves the numerical history. An explicit native-only
+         * fixture may declare a longer fixed history before execution so a short
+         * numerical sample does not imply guaranteed predictor acceptance.
+         * This changes neither the prompt nor the reference-scoring horizon.
+         */
+        virtual int nativeMTPFunctionalHistoryRows() const noexcept
+        {
+            return config_.decode_steps;
+        }
+
         /**
          * @brief Execute the production MTP path without rebuilding the model.
          *
@@ -9060,14 +10096,96 @@ namespace llaminar2::test::parity
          * and runs one full-budget transaction to prove the adaptive
          * controller. Keeping those roles explicit prevents a maintenance
          * boundary from either overwriting numerical evidence or masquerading
-         * as a dynamic-depth observation.
+         * as a dynamic-depth observation. Native exact replay retains every
+         * attempted checkpoint bank and requires genuine acceptance within the
+         * already-declared native decode history, including checkpoint zero.
          */
-        void runProductionParityMTPProof(DecodeParitySummary &summary)
+        void runProductionParityMTPProof(DecodeParitySummary &summary,
+            MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics)
         {
-            auto profile_scope = profileParityScope("mtp_proof.total");
+            if (purpose == MTPParityProofPurpose::ReferenceNumerics ||
+                config_.mtp_expectation == ParityMTPExpectation::Disabled)
+            {
+                runProductionParityMTPCheckpointProof(summary, purpose, nullptr);
+                return;
+            }
+            ASSERT_NE(orch_runner_, nullptr);
+            const int functional_history_rows = nativeMTPFunctionalHistoryRows();
+            ASSERT_GT(functional_history_rows, 0)
+                << "Native acceptance requires its frozen functional history";
+            ASSERT_GE(functional_history_rows, config_.decode_steps)
+                << "The native window cannot omit original numerical-history checkpoints";
+            LOG_INFO("[ParityMTPNativeWindow] numerical_rows=" << config_.decode_steps
+                     << " functional_prefix_rows=" << functional_history_rows);
+            const bool dynamic = config_.mtp_expectation == ParityMTPExpectation::DynamicDepth;
+            const auto adaptive = makeMTPParityAdaptiveWitnessPlan(
+                config_.mtp_expected_draft_depth, productionParityMTPInitialMaintenanceRows());
+            ASSERT_TRUE(adaptive.valid());
+            const int history_rows = std::max(functional_history_rows,
+                dynamic ? adaptive.serial_oracle_tokens : 0);
+            const std::vector<int32_t> original_prompt(config_.token_ids.begin(), config_.token_ids.end());
+            std::string error;
+            const auto history = captureProductionParityMTPSerialOracle(
+                original_prompt, history_rows, std::nullopt, &error);
+            ASSERT_TRUE(history) << error;
+            ASSERT_EQ(history->size(), static_cast<size_t>(history_rows));
+            MTPParityNativeCheckpointWitness selection(functional_history_rows);
+            std::ofstream trace(getResultsDir() / "mtp_native_checkpoint_witnesses.csv");
+            ASSERT_TRUE(trace.is_open());
+            trace << "prefix_rows,condition_token,draft_tokens,accepted_delta,rejected_delta,verifier_runs,accepted_checkpoint,native_history_rows,numerical_history_rows\n";
+            for (std::int64_t prefix_index = 0; prefix_index <= functional_history_rows; ++prefix_index)
+            {
+                const int prefix_rows = static_cast<int>(prefix_index);
+                std::vector<int32_t> checkpoint = original_prompt;
+                checkpoint.insert(checkpoint.end(), history->begin(), history->begin() + prefix_rows);
+                production_parity_native_serial_rows_.clear();
+                production_parity_native_serial_integer_rows_.clear();
+                production_parity_native_serial_boundary_.reset();
+                NativeMTPParityCheckpointAttempt attempt{
+                    prefix_rows, functional_history_rows, checkpoint, *history, selection, trace};
+                ASSERT_NO_FATAL_FAILURE(runProductionParityMTPCheckpointProof(summary, purpose, &attempt));
+                if (::testing::Test::HasFailure())
+                    return;
+                if (selection.acceptedPrefixRows())
+                    return;
+            }
+            ASSERT_TRUE(selection.acceptedPrefixRows())
+                << "No actual accepting checkpoint in frozen native functional window [0,"
+                << functional_history_rows << "]; original rejection and complete row-bank evidence retained";
+        }
+
+        /** @brief Execute the unchanged shared transaction proof for one original checkpoint.
+         * @param summary Existing numerical accumulator, unused by native-only row evidence.
+         * @param purpose Numerical reference scoring or exact native execution.
+         * @param native_attempt Present only for an ordered native checkpoint from the same loaded runner. */
+        void runProductionParityMTPCheckpointProof(DecodeParitySummary &summary,
+            MTPParityProofPurpose purpose, const NativeMTPParityCheckpointAttempt *native_attempt)
+        {
             if (config_.mtp_expectation == ParityMTPExpectation::Disabled)
                 return;
+            ASSERT_NE(orch_runner_, nullptr);
+            runProductionParityMTPCheckpointComparisons(summary, purpose, native_attempt);
+        }
 
+        /** @brief Keep one unchanged comparison under the admitted placement authority.
+         * @param body Existing public request/reset calls and their exact comparison.
+         * @note Each callback owns an independent scope. Maintenance remains active
+         * between comparisons; no placement scope spans the outer history search.
+         */
+        void withProductionParityMTPComparisonPlacement(const std::function<void()> &body)
+        {
+            withMTPParityComparisonPlacement(*orch_runner_, body);
+        }
+
+        /** @brief Run primary, adaptive and acceptance comparisons with independent placement ancestry.
+         * @param summary Original numerical accumulator.
+         * @param purpose Reference numerical or native exact contract.
+         * @param native_attempt Original frozen checkpoint, present only for native exact proof.
+         */
+        void runProductionParityMTPCheckpointComparisons(DecodeParitySummary &summary,
+            MTPParityProofPurpose purpose, const NativeMTPParityCheckpointAttempt *native_attempt)
+        {
+            auto profile_scope = profileParityScope("mtp_proof.total");
             ASSERT_NE(orch_runner_.get(), nullptr)
                 << "Production MTP proof requires the server-facing runner";
             ASSERT_GT(config_.mtp_expected_draft_depth, 0);
@@ -9083,23 +10201,13 @@ namespace llaminar2::test::parity
                 config_.mtp_expectation ==
                 ParityMTPExpectation::DynamicDepth;
             const int limited_depth = config_.mtp_expected_draft_depth;
-            const auto &runtime = orch_runner_->config();
-            // Use the production topology resolver, not vendor/rank heuristics.
-            // Other overlays have a different maintenance clock and retain the
-            // existing one-row prefix-to-generation warmup.
-            const std::optional<int> initial_device_maintenance_rows =
-                runtime.moe_routed_expert_plan &&
-                MoEOverlayCapacityAdmission::selectMigrationStorage(
-                    *runtime.moe_routed_expert_plan, runtime.moe_rebalance.mode) ==
-                    MoEOverlayMigrationStorageKind::DeviceTransferDirectory
-                    ? std::optional<int>{
-                          runtime.moe_rebalance.device_initial_maintenance_period_tokens}
-                    : std::nullopt;
+            ASSERT_EQ(purpose == MTPParityProofPurpose::NativeExactReplay, native_attempt != nullptr);
+            const auto initial_device_maintenance_rows = productionParityMTPInitialMaintenanceRows();
             const auto adaptive_witness = makeMTPParityAdaptiveWitnessPlan(
                 limited_depth, initial_device_maintenance_rows);
             ASSERT_TRUE(adaptive_witness.valid());
             const auto accepted_reference =
-                dynamic_depth
+                (dynamic_depth || purpose == MTPParityProofPurpose::NativeExactReplay)
                     ? std::optional<MTPParityAcceptedDraftReference>{
                           MTPParityAcceptedDraftReference{
                               .reference_step = 0u,
@@ -9108,8 +10216,8 @@ namespace llaminar2::test::parity
             ASSERT_TRUE(accepted_reference.has_value())
                 << "The authenticated MTP reference pack contains no valid "
                    "checkpoint with a matching native condition and first draft";
-            const size_t checkpoint_reference_step =
-                accepted_reference->reference_step;
+            const size_t checkpoint_reference_step = native_attempt
+                ? static_cast<size_t>(native_attempt->prefix_rows) : accepted_reference->reference_step;
             const int dynamic_policy_witness_budget =
                 dynamic_depth
                     ? adaptive_witness.response_tokens
@@ -9119,16 +10227,19 @@ namespace llaminar2::test::parity
             // One request identity owns the checkpoint's serial tokens, input
             // state and main-verifier tensors. Never seed this observer from
             // teacher-forced rows or another request in the same placement.
-            const auto transaction_prompt = dynamic_depth
-                ? prompt
-                : mtpParityCheckpointPrompt(
-                      prompt, readDecodeTokensFromMetadata(), *accepted_reference);
-            const int serial_oracle_output_count = dynamic_depth
-                ? adaptive_witness.serial_oracle_tokens
+            const auto transaction_prompt = native_attempt ? native_attempt->prompt
+                : dynamic_depth ? prompt
+                : mtpParityCheckpointPrompt(prompt, readDecodeTokensFromMetadata(), *accepted_reference);
+            const int serial_oracle_output_count = native_attempt
+                ? (activePrimaryDevice().is_gpu() ? 2 : limited_depth + 1)
+                : dynamic_depth ? adaptive_witness.serial_oracle_tokens
                 : (activePrimaryDevice().is_gpu() ? 2 : limited_depth + 1);
+            std::optional<std::vector<int32_t>> serial_oracle;
+            ProductionParityMTPTransactionBoundary boundary{};
+            const auto primary_comparison = [&] {
             PrefixRuntimeStateSnapshot checkpoint_input;
             std::string serial_oracle_error;
-            const auto serial_oracle = captureProductionParityMTPSerialOracle(
+            serial_oracle = captureProductionParityMTPSerialOracle(
                 transaction_prompt, serial_oracle_output_count, 0u,
                 &serial_oracle_error, &checkpoint_input);
             ASSERT_TRUE(serial_oracle.has_value())
@@ -9296,7 +10407,7 @@ namespace llaminar2::test::parity
                     checkpoint_serial.begin(),
                     checkpoint_serial.begin() + static_cast<std::ptrdiff_t>(result.tokens.size()));
 
-                ProductionParityMTPTransactionBoundary boundary{
+                boundary = ProductionParityMTPTransactionBoundary{
                     .requested_draft_depth =
                         before.mtp_current_depth > 0
                             ? before.mtp_current_depth
@@ -9351,20 +10462,62 @@ namespace llaminar2::test::parity
                         boundary.emitted_tokens;
                     boundary.acceptance_witness_serial_oracle_tokens =
                         boundary.serial_oracle_tokens;
-                    EXPECT_GT(
-                        boundary.acceptance_witness_accepted_token_delta,
-                        0u)
-                        << "The authenticated accepting checkpoint row did "
-                           "not commit a production draft";
+                    if (!native_attempt)
+                        EXPECT_GT(boundary.acceptance_witness_accepted_token_delta, 0u)
+                            << "The authenticated accepting checkpoint row did not commit a production draft";
                 }
 
-                compareProductionParityMTPCheckpoints(boundary, summary);
-                compareProductionParityNativeVerifierRows(boundary);
-                observeComparedProductionParityMTPTransaction(
-                    boundary, *serial_oracle);
+                if (purpose == MTPParityProofPurpose::ReferenceNumerics)
+                    compareProductionParityMTPCheckpoints(boundary, summary);
+                compareProductionParityNativeVerifierRows(
+                    boundary, native_attempt ? native_attempt->prefix_rows : 0);
+                if (native_attempt)
+                {
+                    ASSERT_NO_FATAL_FAILURE(compareProductionParityNativeVerifierInputRows(
+                        boundary, transaction_prompt, native_attempt->prefix_rows));
+                    ASSERT_GE(after.mtp_accepted_tokens, before.mtp_accepted_tokens);
+                    ASSERT_GE(after.mtp_rejected_tokens, before.mtp_rejected_tokens);
+                    const auto accepted = after.mtp_accepted_tokens - before.mtp_accepted_tokens;
+                    const auto rejected = after.mtp_rejected_tokens - before.mtp_rejected_tokens;
+                    native_attempt->selection.observe(native_attempt->prefix_rows,
+                        accepted, rejected, boundary.verifier_transactions);
+                    native_attempt->trace << native_attempt->prefix_rows << ','
+                        << after.mtp_observed_verifier_condition_token.value_or(-1) << ',';
+                    for (const auto token : after.mtp_observed_verifier_draft_tokens)
+                        native_attempt->trace << token << ';';
+                    native_attempt->trace << ',' << accepted << ',' << rejected << ','
+                        << boundary.verifier_transactions << ',' << (accepted > 0) << ','
+                        << native_attempt->maximum_prefix_rows << ',' << config_.decode_steps << '\n';
+                    native_attempt->trace.flush();
+                    ASSERT_TRUE(native_attempt->trace.good());
+                    if (!native_attempt->selection.acceptedPrefixRows())
+                        return;
+                }
+                else
+                    observeComparedProductionParityMTPTransaction(boundary, *serial_oracle);
+
+            }
+            };
+            withProductionParityMTPComparisonPlacement(primary_comparison);
+            if (::testing::Test::HasFatalFailure() ||
+                (native_attempt && !native_attempt->selection.acceptedPrefixRows()))
+                return;
 
                 if (dynamic_depth)
                 {
+                    const auto adaptive_comparison = [&] {
+                    std::optional<std::vector<int32_t>> placement_serial_oracle;
+                    if (mtpParityComparisonPlacementOwner(orch_runner_->config()) !=
+                        MTPParityComparisonPlacementOwner::Unscoped)
+                    {
+                        std::string error;
+                        placement_serial_oracle = captureProductionParityMTPSerialOracle(
+                            prompt, adaptive_witness.serial_oracle_tokens, std::nullopt, &error);
+                        ASSERT_TRUE(placement_serial_oracle) << error;
+                    }
+                    const auto &policy_serial_oracle = placement_serial_oracle
+                        ? *placement_serial_oracle
+                        : native_attempt ? native_attempt->policy_serial_oracle : *serial_oracle;
                     /*
                      * Numerical snapshots have already been consumed. Start a
                      * fresh server-facing request without a stop token, then
@@ -9399,7 +10552,7 @@ namespace llaminar2::test::parity
                         ASSERT_EQ(maintenance_result.tokens.size(), 1u);
                         ASSERT_FALSE(maintenance_result.is_complete)
                             << "Dynamic MTP warmup terminated before adaptive admission";
-                        ASSERT_EQ(maintenance_result.tokens.front(), serial_oracle->at(row))
+                        ASSERT_EQ(maintenance_result.tokens.front(), policy_serial_oracle.at(row))
                             << "Dynamic MTP maintenance warmup diverged at row " << row;
                         ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(1u))
                             << "Dynamic MTP maintenance warmup failed: "
@@ -9451,13 +10604,13 @@ namespace llaminar2::test::parity
                         static_cast<size_t>(adaptive_witness.warmup_tokens);
                     ASSERT_LE(
                         oracle_offset + witness_result.tokens.size(),
-                        serial_oracle->size())
+                        policy_serial_oracle.size())
                         << "Dynamic MTP policy witness exceeded its serial "
                            "oracle suffix";
                     std::vector<int32_t> witness_serial_tokens(
-                        serial_oracle->begin() +
+                        policy_serial_oracle.begin() +
                             static_cast<std::ptrdiff_t>(oracle_offset),
-                        serial_oracle->begin() +
+                        policy_serial_oracle.begin() +
                             static_cast<std::ptrdiff_t>(
                                 oracle_offset +
                                 witness_result.tokens.size()));
@@ -9496,32 +10649,396 @@ namespace llaminar2::test::parity
                     ASSERT_GE(
                         witness_after.mtp_accepted_tokens,
                         witness_before.mtp_accepted_tokens);
-                    boundary.acceptance_witness_executed = true;
-                    boundary.acceptance_witness_serial_token_exact =
-                        witness_comparison.exact;
-                    boundary.acceptance_witness_accepted_token_delta =
-                        witness_after.mtp_accepted_tokens -
-                        witness_before.mtp_accepted_tokens;
-                    boundary.acceptance_witness_attempted_draft_tokens =
-                        boundary
-                            .dynamic_policy_witness_attempted_draft_tokens;
-                    boundary.acceptance_witness_verifier_transactions =
-                        boundary
-                            .dynamic_policy_witness_verifier_transactions;
-                    boundary.acceptance_witness_emitted_tokens =
-                        boundary.dynamic_policy_witness_emitted_tokens;
-                    boundary.acceptance_witness_serial_oracle_tokens =
-                        boundary
-                            .dynamic_policy_witness_serial_oracle_tokens;
-                    EXPECT_GT(
-                        boundary.acceptance_witness_accepted_token_delta,
-                        0u)
-                        << "Dynamic-depth production MTP accepted no draft "
-                           "token across its full-width policy witness";
+                    };
+                    withProductionParityMTPComparisonPlacement(adaptive_comparison);
+                    if (::testing::Test::HasFatalFailure()) return;
+                    // The adaptive workload retains rejection coverage even
+                    // when its first draft is wrong. Acceptance has its own
+                    // independently authenticated checkpoint and continuation.
+                    runProductionParityMTPAcceptanceWitness(boundary, purpose,
+                        native_attempt ? &transaction_prompt : nullptr,
+                        native_attempt ? native_attempt->maximum_prefix_rows : 0);
                 }
                 production_parity_mtp_transaction_boundaries_.push_back(
                     std::move(boundary));
+        }
+
+        /**
+         * @brief Prove dynamic acceptance independently of the adaptive workload.
+         * @param boundary Receives the authenticated positive transaction evidence.
+         * @param purpose Original reference-numerical or native-only proof.
+         * @param native_accepting_prompt Actual native prefix that already proved acceptance.
+         * @param native_history_rows Frozen functional window carried from the original proof.
+         *
+         * A valid adaptive observation may reject every draft. The HF sidecar
+         * and certified native serial rows select a separate accepting edge;
+         * no seed search or forced token participates in this request. Two
+         * ordinary continuation rows then expose stale rejected KV, recurrence,
+         * convolution, and terminal state through a complete byte comparison.
+         */
+        void runProductionParityMTPAcceptanceWitness(
+            ProductionParityMTPTransactionBoundary &boundary,
+            MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics,
+            const std::vector<int32_t> *native_accepting_prompt = nullptr,
+            int native_history_rows = 0)
+        {
+            withProductionParityMTPComparisonPlacement([&] {
+                runProductionParityMTPAcceptanceAtOriginalPlacement(
+                    boundary, purpose, native_accepting_prompt, native_history_rows);
+            });
+        }
+
+        /** @brief Consume the unchanged acceptance/continuation proof within its caller's placement.
+         * @param boundary Original checkpoint evidence receiving actual acceptance observations.
+         * @param purpose Original numerical or native exact purpose.
+         * @param native_accepting_prompt Previously authenticated original native checkpoint.
+         * @param native_history_rows Original finite functional-history bound.
+         */
+        void runProductionParityMTPAcceptanceAtOriginalPlacement(
+            ProductionParityMTPTransactionBoundary &boundary,
+            MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics,
+            const std::vector<int32_t> *native_accepting_prompt = nullptr,
+            int native_history_rows = 0)
+        {
+            auto reference = purpose == MTPParityProofPurpose::NativeExactReplay
+                ? std::optional<MTPParityAcceptedDraftReference>{MTPParityAcceptedDraftReference{.reference_step=0u}}
+                : productionParityMTPAcceptedDraftReference();
+            ASSERT_TRUE(reference.has_value())
+                << "Dynamic MTP needs an independently authenticated accepting edge";
+            const std::vector<int32_t> base_prompt(
+                config_.token_ids.begin(), config_.token_ids.end());
+            if (purpose == MTPParityProofPurpose::NativeExactReplay)
+            {
+                ASSERT_NE(native_accepting_prompt, nullptr);
+                ASSERT_GT(native_history_rows, 0);
+                ASSERT_GE(native_accepting_prompt->size(), base_prompt.size());
+                ASSERT_LE(native_accepting_prompt->size() - base_prompt.size(),
+                          static_cast<size_t>(native_history_rows));
+                ASSERT_TRUE(std::equal(
+                    base_prompt.begin(), base_prompt.end(), native_accepting_prompt->begin()));
+                reference->reference_step = native_accepting_prompt->size() - base_prompt.size();
             }
+            const auto prompt = purpose == MTPParityProofPurpose::NativeExactReplay
+                ? *native_accepting_prompt
+                : mtpParityCheckpointPrompt(base_prompt, readDecodeTokensFromMetadata(), *reference);
+            const int response_tokens = config_.mtp_expected_draft_depth + 2;
+            constexpr int continuation_tokens = 2;
+            const int total_tokens = response_tokens + continuation_tokens;
+            orch_runner_->setStopTokens({});
+            PrefixProbeCapturePolicy probe = PrefixProbeCapturePolicy::fromEnvironment();
+            // Required original pending-token proof reuses the existing packed
+            // diagnostic export; its staging was admitted by the outer fixture.
+            probe.capture_device_logical_state = activePrimaryDevice().is_gpu();
+            probe.hash_full_kv_payloads = true;
+            probe.hash_gdn_device_state = true;
+            probe.hash_terminal_state = true;
+            probe.capture_terminal_hidden_values = true;
+            probe.capture_terminal_logits_values = true;
+            std::string error;
+            const auto serial_prefix =
+                restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                    prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP,
+                    &error);
+            ASSERT_TRUE(serial_prefix.has_value()) << error;
+            std::vector<int32_t> serial;
+            std::vector<PrefixRuntimeStateSnapshot> serial_states;
+            // Capture the producing graph's independent LM-head diagnostic;
+            // the prefix probe instead follows the current publication owner.
+            const auto native_logits = [&]()
+            {
+                size_t elements = 0;
+                const float *values = activeSnapshot("LM_HEAD", elements);
+                return values ? std::vector<float>(values, values + elements)
+                              : std::vector<float>{};
+            };
+            std::vector<std::vector<float>> serial_native_logits;
+            for (int row = 0; row < total_tokens; ++row)
+            {
+                activeClearSnapshots();
+                orch_runner_->setDecodeStepTokenBudget(1);
+                const auto result = orch_runner_->decodeStep();
+                orch_runner_->setDecodeStepTokenBudget(0);
+                ASSERT_TRUE(result.success()) << result.error;
+                ASSERT_EQ(result.tokens.size(), 1u);
+                ASSERT_FALSE(result.is_complete);
+                serial.push_back(result.tokens.front());
+                serial_states.push_back(activePrefixStateProbe(probe));
+                serial_native_logits.push_back(native_logits());
+                ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(1u))
+                    << orch_runner_->lastError();
+            }
+            const auto grouped_prefix =
+                restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                    prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP,
+                    &error);
+            ASSERT_TRUE(grouped_prefix.has_value()) << error;
+            const auto same_input = compareMTPRuntimeStateSnapshots(
+                serial_prefix->state, grouped_prefix->state);
+            ASSERT_TRUE(same_input) << same_input.reason;
+            const auto terminal_publication_counters = []()
+            {
+                std::pair<double, double> totals{};
+                for (const auto &record : PerfStatsCollector::snapshot({"mtp"}))
+                {
+                    if (record.kind != PerfStatRecord::Kind::Counter) continue;
+                    if (record.name == "accepted_terminal_logits_rows") totals.first += record.value;
+                    if (record.name == "accepted_terminal_logits_bytes") totals.second += record.value;
+                }
+                return totals;
+            };
+            const auto publication_before = terminal_publication_counters();
+            const auto before = activePrefixStateProbe();
+            activeClearSnapshots();
+            orch_runner_->setDecodeStepTokenBudget(response_tokens);
+            const auto result = orch_runner_->decodeStep();
+            orch_runner_->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(result.success()) << result.error;
+            ASSERT_FALSE(result.tokens.empty());
+            ASSERT_LE(result.tokens.size(), static_cast<size_t>(response_tokens));
+            ASSERT_FALSE(result.is_complete);
+            const auto after = activePrefixStateProbe();
+            ASSERT_GE(after.mtp_accepted_tokens, before.mtp_accepted_tokens);
+            boundary.acceptance_witness_executed = true;
+            boundary.acceptance_witness_accepted_token_delta =
+                after.mtp_accepted_tokens - before.mtp_accepted_tokens;
+            boundary.acceptance_witness_attempted_draft_tokens =
+                mtpParityAttemptedDraftTokenCount(
+                    {before.mtp_draft_steps, before.mtp_verifier_runs},
+                    {after.mtp_draft_steps, after.mtp_verifier_runs});
+            boundary.acceptance_witness_verifier_transactions =
+                mtpParityExecutedTransactionCount(
+                    {before.mtp_draft_steps, before.mtp_verifier_runs},
+                    {after.mtp_draft_steps, after.mtp_verifier_runs});
+            boundary.acceptance_witness_emitted_tokens = result.tokens;
+            boundary.acceptance_witness_serial_oracle_tokens.assign(
+                serial.begin(), serial.begin() + result.tokens.size());
+            boundary.acceptance_witness_serial_token_exact =
+                boundary.acceptance_witness_emitted_tokens ==
+                boundary.acceptance_witness_serial_oracle_tokens;
+            ASSERT_TRUE(boundary.acceptance_witness_serial_token_exact);
+            ASSERT_GE(boundary.acceptance_witness_attempted_draft_tokens,
+                      static_cast<uint64_t>(before.mtp_current_depth));
+            ASSERT_EQ(before.mtp_current_depth, config_.mtp_expected_draft_depth);
+            ASSERT_TRUE(before.mtp_request.adaptive_depth_enabled);
+            if (activePrimaryDevice().is_gpu())
+            {
+                // The isolated accepted checkpoint above proves the original
+                // full depth. This depth+2 response may execute several real
+                // transactions; its published identity names the LAST one.
+                ASSERT_TRUE(validMTPParityAcceptanceDepthAttribution(
+                    boundary.snapshot_execution_draft_depth,
+                    resolveMTPMaximumDraftDepth(orch_runner_->config().mtp),
+                    {boundary.after.mtp_observed_verifier_draft_depth,
+                     boundary.after.mtp_observed_verifier_draft_tokens.size(),
+                     boundary.verifier_transactions, boundary.attempted_draft_tokens},
+                    {after.mtp_observed_verifier_draft_depth,
+                     after.mtp_observed_verifier_draft_tokens.size(),
+                     boundary.acceptance_witness_verifier_transactions,
+                     boundary.acceptance_witness_attempted_draft_tokens}))
+                    << "Acceptance response lost its isolated full-depth proof or terminal verifier identity";
+            }
+            else
+                ASSERT_EQ(after.mtp_observed_verifier_draft_depth, before.mtp_current_depth);
+            ASSERT_TRUE(grouped_prefix->state.prefix_request.hit);
+            ASSERT_TRUE(grouped_prefix->state.prefix_request.mtp_state_restored);
+            ASSERT_GT(boundary.acceptance_witness_accepted_token_delta, 0u)
+                << "Authenticated accepting edge failed at reference step "
+                << reference->reference_step;
+            ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(result.tokens.size()))
+                << orch_runner_->lastError();
+            const size_t continuation_end = result.tokens.size() + continuation_tokens;
+            for (size_t row = result.tokens.size(); row < continuation_end; ++row)
+            {
+                activeClearSnapshots();
+                orch_runner_->setDecodeStepTokenBudget(1);
+                const auto continuation = orch_runner_->decodeStep();
+                orch_runner_->setDecodeStepTokenBudget(0);
+                ASSERT_TRUE(continuation.success()) << continuation.error;
+                ASSERT_EQ(continuation.tokens.size(), 1u);
+                ASSERT_EQ(continuation.tokens.front(), serial[row]);
+                ASSERT_FALSE(continuation.is_complete);
+                ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(1u))
+                    << orch_runner_->lastError();
+            }
+            // The independent serial oracle does not populate recursive sidecar
+            // KV. Main KV, full recurrent/conv state, terminal payloads and
+            // logical metadata retain the strict native-byte contract.
+            MTPRuntimeSnapshotComparisonOptions options;
+            options.compare_shifted_mtp_kv = false;
+            const auto candidate_state = activePrefixStateProbe(probe);
+            const auto candidate_native_logits = native_logits();
+            if (activePrimaryDevice().is_cpu())
+            {
+                const auto publication_after = terminal_publication_counters();
+                const double rows = publication_after.first - publication_before.first;
+                const double bytes = publication_after.second - publication_before.second;
+                ASSERT_GT(rows, 0.0) << "Accepted CPU verifier published no terminal logits";
+                ASSERT_EQ(bytes, rows * static_cast<double>(orch_runner_->vocabSize()) * sizeof(float))
+                    << "Accepted CPU verifier must copy exactly one live vocabulary row per publication";
+            }
+            ASSERT_TRUE(candidate_state.terminal_hidden_hash_available);
+            ASSERT_TRUE(candidate_state.terminal_logits_hash_available);
+            std::vector<int> serial_committed_positions;
+            serial_committed_positions.reserve(continuation_end);
+            for (size_t row = 0; row < continuation_end; ++row)
+                serial_committed_positions.push_back(serial_states[row].current_position);
+            const auto committed_frontier = selectMTPParityCommittedFrontier(
+                serial_committed_positions,
+                std::span<const int32_t>(serial.data(), continuation_end),
+                candidate_state.current_position, candidate_state.resident_condition);
+            ASSERT_TRUE(committed_frontier)
+                << "Acceptance continuation has no authenticated exact committed frontier";
+            const auto state_match = compareMTPRuntimeStateSnapshots(
+                serial_states.at(*committed_frontier), candidate_state, options);
+            // Diagnose each owning state bank even when the complete gate
+            // stops at terminal logits. These copies never certify a relaxed
+            // state: the unchanged complete state_match below remains fatal.
+            auto bank_oracle = serial_states.at(*committed_frontier);
+            auto bank_candidate = candidate_state;
+            bank_oracle.terminal_hidden_hash_available = false;
+            bank_oracle.terminal_logits_hash_available = false;
+            bank_candidate.terminal_hidden_hash_available = false;
+            bank_candidate.terminal_logits_hash_available = false;
+            const auto bank_diagnostic = compareMTPRuntimeStateSnapshots(
+                bank_oracle, bank_candidate, options);
+            const auto diagnostic_path = getResultsDir() / "mtp_acceptance_state_diagnostic.csv";
+            std::ofstream diagnostic(diagnostic_path);
+            ASSERT_TRUE(diagnostic.is_open()) << diagnostic_path;
+            diagnostic << "role,output_index,token,position,session_epoch,live_state_epoch,"
+                          "hidden_hash,logits_hash,logits_bytes,native_elements,"
+                          "probe_vs_native_status,first_mismatch,probe_bits,native_bits,"
+                          "max_abs_diff,matches_candidate_logits\n";
+            const auto diagnostic_row = [&](const char *role, size_t row, int32_t token,
+                                             const PrefixRuntimeStateSnapshot &state,
+                                             const std::vector<float> &native)
+            {
+                const auto evidence = compareNativeVerifierRow(
+                    state.terminal_logits_values, native);
+                diagnostic << role << ',' << row << ',' << token << ','
+                           << state.current_position << ',' << state.session_epoch << ','
+                           << state.live_state_epoch << ',' << state.terminal_hidden_hash << ','
+                           << state.terminal_logits_hash << ',' << state.terminal_logits_bytes << ','
+                           << native.size() << ',' << evidence.name() << ','
+                           << evidence.first_mismatch << ',' << evidence.grouped_bits << ','
+                           << evidence.serial_bits << ',' << evidence.max_abs_diff << ','
+                           << (state.terminal_logits_hash == candidate_state.terminal_logits_hash)
+                           << '\n';
+            };
+            for (size_t row = 0; row < serial_states.size(); ++row)
+                diagnostic_row("serial", row, serial[row], serial_states[row], serial_native_logits[row]);
+            diagnostic_row("candidate", continuation_end - 1u, serial[continuation_end - 1u],
+                           candidate_state, candidate_native_logits);
+            diagnostic << "# diagnostic_only_banks_exact=" << static_cast<bool>(bank_diagnostic)
+                       << ";reason=" << bank_diagnostic.reason << '\n';
+            diagnostic.flush();
+            ASSERT_TRUE(diagnostic.good()) << diagnostic_path;
+            const auto &oracle_logits = serial_states.at(*committed_frontier).terminal_logits_values;
+            const auto &candidate_logits = candidate_state.terminal_logits_values;
+            const auto logit_diff_path = getResultsDir() / "mtp_acceptance_logits_diff.csv";
+            std::ofstream logit_diff(logit_diff_path);
+            ASSERT_TRUE(logit_diff.is_open()) << logit_diff_path;
+            logit_diff << "vocab_index,serial_value,candidate_value,serial_bits,candidate_bits\n";
+            logit_diff << std::setprecision(17);
+            size_t mismatches = 0;
+            double maximum_difference = 0;
+            for (size_t i = 0; i < std::min(oracle_logits.size(), candidate_logits.size()); ++i)
+            {
+                uint32_t oracle_bits = 0, candidate_bits = 0;
+                std::memcpy(&oracle_bits, &oracle_logits[i], sizeof(oracle_bits));
+                std::memcpy(&candidate_bits, &candidate_logits[i], sizeof(candidate_bits));
+                if (oracle_bits == candidate_bits) continue;
+                if (mismatches < 8u)
+                    logit_diff << i << ',' << oracle_logits[i] << ',' << candidate_logits[i]
+                               << ',' << oracle_bits << ',' << candidate_bits << '\n';
+                ++mismatches;
+                maximum_difference = std::max(maximum_difference,
+                    std::abs(static_cast<double>(oracle_logits[i]) - candidate_logits[i]));
+            }
+            logit_diff << "# mismatches=" << mismatches << ";max_abs=" << maximum_difference
+                       << ";serial_elements=" << oracle_logits.size()
+                       << ";candidate_elements=" << candidate_logits.size() << '\n';
+            logit_diff.flush();
+            ASSERT_TRUE(logit_diff.good()) << logit_diff_path;
+            const auto native_rows_path = getResultsDir() / "mtp_acceptance_native_logit_rows.csv";
+            std::ofstream native_rows(native_rows_path);
+            ASSERT_TRUE(native_rows.is_open()) << native_rows_path;
+            native_rows << "row,hash,vs_serial_status,vs_probe_status,serial_max_abs,probe_max_abs\n";
+            if (!oracle_logits.empty() && candidate_native_logits.size() % oracle_logits.size() == 0)
+            {
+                for (size_t row = 0; row < candidate_native_logits.size() / oracle_logits.size(); ++row)
+                {
+                    const std::span<const float> values(candidate_native_logits.data() +
+                        row * oracle_logits.size(), oracle_logits.size());
+                    const auto serial_evidence = compareNativeVerifierRow(values, oracle_logits);
+                    const auto probe_evidence = compareNativeVerifierRow(values, candidate_logits);
+                    native_rows << row << ',' << hashByteBufferForPrefixProbe(values.data(), values.size_bytes())
+                                << ',' << serial_evidence.name() << ',' << probe_evidence.name() << ','
+                                << serial_evidence.max_abs_diff << ',' << probe_evidence.max_abs_diff << '\n';
+                }
+            }
+            native_rows.flush();
+            ASSERT_TRUE(native_rows.good()) << native_rows_path;
+            // Retain bounded provenance for the exact committed-row comparison.
+            // The one-off full raw exports that diagnosed stale publication live
+            // with their original failed receipt, not every future passing run.
+            const auto frontier_path = getResultsDir() / "mtp_acceptance_same_frontier.csv";
+            std::ofstream frontier(frontier_path);
+            ASSERT_TRUE(frontier.is_open()) << frontier_path;
+            frontier << "serial_row,serial_position,candidate_position,state_byte_exact,"
+                        "original_publication_generation,original_live_epoch,"
+                        "original_pending_token,original_publication_ok,original_stopped,"
+                        "authenticated_already_emitted\n";
+            frontier << *committed_frontier << ','
+                     << serial_states.at(*committed_frontier).current_position << ','
+                     << candidate_state.current_position << ',' << static_cast<bool>(state_match) << ',';
+            if (candidate_state.resident_condition)
+            {
+                const auto &condition = *candidate_state.resident_condition;
+                frontier << condition.publication_generation << ',' << condition.live_state_epoch << ','
+                         << condition.next_condition_token << ',' << condition.publication_ok << ','
+                         << condition.stopped << ',' << condition.isAlreadyEmitted();
+            }
+            else
+                frontier << ",,,,,";
+            frontier << '\n';
+            frontier.flush();
+            ASSERT_TRUE(frontier.good()) << frontier_path;
+            const auto witness_path = getResultsDir() / "mtp_acceptance_witness.csv";
+            std::ofstream witness_csv(witness_path);
+            ASSERT_TRUE(witness_csv.is_open()) << witness_path;
+            witness_csv << "reference_step,condition_token,authenticated_first_draft,"
+                           "admitted_depth,attempted_drafts,verifier_transactions,"
+                           "accepted_drafts,emitted_tokens,serial_tokens,"
+                           "continuation_tokens,state_byte_exact,observed_depth,"
+                           "prefix_restored,adaptive_enabled\n";
+            witness_csv << reference->reference_step << ',' << reference->base_token << ','
+                        << reference->first_draft_token << ',' << before.mtp_current_depth << ','
+                        << boundary.acceptance_witness_attempted_draft_tokens << ','
+                        << boundary.acceptance_witness_verifier_transactions << ','
+                        << boundary.acceptance_witness_accepted_token_delta << ',';
+            const auto write_tokens = [&](const std::vector<int32_t> &tokens)
+            {
+                for (size_t i = 0; i < tokens.size(); ++i)
+                {
+                    if (i != 0) witness_csv << ';';
+                    witness_csv << tokens[i];
+                }
+            };
+            write_tokens(boundary.acceptance_witness_emitted_tokens);
+            witness_csv << ',';
+            write_tokens(boundary.acceptance_witness_serial_oracle_tokens);
+            witness_csv << ',' << continuation_tokens << ','
+                        << (state_match ? "true" : "false") << ','
+                        << after.mtp_observed_verifier_draft_depth << ','
+                        << (grouped_prefix->state.prefix_request.hit &&
+                            grouped_prefix->state.prefix_request.mtp_state_restored ? "true" : "false")
+                        << ',' << (before.mtp_request.adaptive_depth_enabled ? "true" : "false")
+                        << '\n';
+            witness_csv.flush();
+            ASSERT_TRUE(witness_csv.good()) << witness_path;
+            ASSERT_TRUE(state_match)
+                << "Accepted dynamic MTP continuation state: " << state_match.reason;
+            activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
         }
 
         /**
@@ -9696,8 +11213,12 @@ namespace llaminar2::test::parity
 
         /**
          * @brief Export graph-path and economy evidence for a campaign.
+         * @param movement_boundary Final by default; an ordinary multi-request
+         * cohort may observe its first request while background calibration runs.
+         * Every graph/MTP/owner check and every Static check remains per request.
          */
-        void finishProductionParityEvidence()
+        void finishProductionParityEvidence(
+            ParityMoEMovementEvidenceBoundary movement_boundary = ParityMoEMovementEvidenceBoundary::Final)
         {
             if (!productionParityCampaignEnabled())
                 return;
@@ -9756,8 +11277,17 @@ namespace llaminar2::test::parity
             }
 
             assertProductionParityMTPEvidence();
-            assertProductionParityMoEOwnerOrderEvidence(records);
-            assertProductionParityMoEMovementEvidence(records);
+            // Server-shaped peers are still receiving inference commands here.
+            // Their original session owns the all-rank passive audit after
+            // SHUTDOWN, while the original model/source diagnostics remain live.
+            if (parityReferenceGenerationCoordination() ==
+                ParityReferenceGenerationCoordination::SymmetricRanks)
+            {
+                assertProductionParityMoEOwnerOrderEvidence(records);
+                assertProductionParityMoEMovementEvidence(records, movement_boundary);
+            }
+            else
+                coordinated_passive_evidence_.requireServing();
 
             if (isRank0())
             {
@@ -9789,6 +11319,62 @@ namespace llaminar2::test::parity
             // including fixture and RAM staging. A cell may finish after that
             // point and must still publish complete numerical diagnostics; the
             // aggregate driver reports the performance miss after all cells run.
+        }
+
+        /**
+         * @brief Bind the deferred evidence obligation to the original session callback.
+         * @return Single-use all-rank audit; missing/repeated bindings fail explicitly.
+         */
+        std::function<void()> bindCoordinatedProductionParityMoEEvidence()
+        {
+            if(parityReferenceGenerationCoordination()!=
+                ParityReferenceGenerationCoordination::ArtifactAuthorityOnly)
+                throw std::logic_error("Symmetric parity cannot defer collective evidence");
+            return coordinated_passive_evidence_.bind(
+                [this]{assertCoordinatedProductionParityMoEEvidence();});
+        }
+
+        /**
+         * @brief Complete deferred collective audits at the original session's closed-worker boundary.
+         * @note Every original rank invokes this only after its worker loop is
+         * released. Model/source owners are still live; records remain local
+         * until the unchanged owner-order and movement audits reduce them.
+         * Ordinary symmetric fixtures audit inline and cannot enter this phase.
+         */
+        void assertCoordinatedProductionParityMoEEvidence()
+        {
+            ASSERT_EQ(parityReferenceGenerationCoordination(),
+                      ParityReferenceGenerationCoordination::ArtifactAuthorityOnly);
+            // A missing local manifest/counter domain must be agreed before
+            // any peer enters the original coverage49/totals2/movement4 sums.
+            std::string prerequisite_error;
+            std::vector<int> original_layers;
+            try
+            {
+                if(config_.moe_movement_expectation!=ParityMoEMovementExpectation::NotApplicable)
+                {
+                    original_layers=prepareProductionParityMoEOwnerOrderEvidence().expected_layers;
+                    if(!PerfStatsCollector::isDomainEnabled("moe_rebalance") &&
+                       !PerfStatsCollector::isDomainEnabled("moe_overlay_residency") &&
+                       !PerfStatsCollector::isDomainEnabled("moe_overlay_controller"))
+                        throw std::logic_error("ExpertOverlay parity requires PerfStats movement evidence");
+                }
+            }
+            catch(const std::exception& error) { prerequisite_error=error.what(); }
+            float local_failed=prerequisite_error.empty()?0.0f:1.0f, any_failed=0.0f;
+            parityCoordinationMPIContext()->allreduce_sum(&local_failed,&any_failed,1);
+            ASSERT_EQ(any_failed,0.0f)<<"Original rank passive-evidence prerequisite failure: "<<prerequisite_error;
+            requireCoordinatedPassiveEvidenceLayers(*parityCoordinationMPIContext(),original_layers);
+            const auto records=PerfStatsCollector::snapshot(
+                {"moe_rebalance","moe_overlay_controller","moe_overlay_residency","moe_placement"});
+            assertProductionParityMoEOwnerOrderEvidence(records);
+            assertProductionParityMoEMovementEvidence(records);
+        }
+
+        /** @return Explicit test obligation; numerical fixtures always retain reference scoring. */
+        virtual MTPParityProofPurpose mtpParityProofPurpose() const noexcept
+        {
+            return MTPParityProofPurpose::ReferenceNumerics;
         }
 
         virtual ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
@@ -9918,7 +11504,9 @@ namespace llaminar2::test::parity
          * Prefill and decode share a serving graph family and therefore cannot
          * change diagnostic graph nodes at phase boundaries. The default
          * inventory is the union of authenticated reference filenames and any
-         * explicitly required keys. Capturing every publication is available
+         * explicitly required keys plus the setup-frozen diagnostic exact list.
+         * Diagnostic additions do not become reference/comparison obligations.
+         * Capturing every publication is available
          * only through the typed @ref ParitySnapshotCaptureInventory policy;
          * an accidentally empty vector can no longer allocate unrelated graph
          * scratch for every retained bucket.
@@ -9936,11 +11524,21 @@ namespace llaminar2::test::parity
             const auto &decode_keys =
                 decode.decode_snapshot_capture_filter;
 
+            const auto &diagnostic_keys = freezeParityDiagnosticSnapshotKeys(
+                prefill.enabled || decode.enabled);
             if (!prefill.enabled && !decode.enabled)
             {
                 return {};
             }
 
+            const bool scoped_observation=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
+            if(scoped_observation &&
+               (prefill.capture_inventory==ParitySnapshotCaptureInventory::EveryPublishedOutput ||
+                decode.capture_inventory==ParitySnapshotCaptureInventory::EveryPublishedOutput))
+                throw std::invalid_argument("Observation shard cannot capture every published output");
+            if(scoped_observation)for(const auto& key:diagnostic_keys)
+                if(!frozen_history_replay_->observesReferenceKey(key))
+                    throw std::invalid_argument("Additional diagnostic capture key conflicts with observation shard");
             if ((prefill.enabled &&
                  prefill.capture_inventory ==
                      ParitySnapshotCaptureInventory::EveryPublishedOutput) ||
@@ -9951,7 +11549,7 @@ namespace llaminar2::test::parity
                 return {};
             }
 
-            std::vector<std::string> union_keys;
+            std::vector<std::string> union_keys = diagnostic_keys;
             if (prefill.enabled)
             {
                 union_keys.insert(
@@ -9970,12 +11568,15 @@ namespace llaminar2::test::parity
                     decode.required_decode_snapshot_keys.begin(),
                     decode.required_decode_snapshot_keys.end());
             }
-            const auto reference_keys =
-                authenticatedReferenceSnapshotCaptureFilter();
-            union_keys.insert(
-                union_keys.end(),
-                reference_keys.begin(),
-                reference_keys.end());
+            const bool observation_shard=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
+            const auto reference_keys = observation_shard?frozen_history_replay_->observationKeys():
+                mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay
+                    ? std::vector<std::string>{}
+                    : authenticatedReferenceSnapshotCaptureFilter();
+            if(observation_shard)union_keys=reference_keys;
+            else union_keys.insert(union_keys.end(), reference_keys.begin(), reference_keys.end());
+            if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
+                union_keys.push_back("FINAL_NORM");
 
             /*
              * A completed collective is a distinct live graph value, not an
@@ -10147,10 +11748,13 @@ namespace llaminar2::test::parity
                     orchestration_parity_decode_trajectory_index_ = 0;
                     orchestration_parity_force_mode_ =
                         ParityForcedTokenCommitMode::Unknown;
-                    for (const int token : readDecodeTokensFromMetadata())
+                    if (mtpParityProofPurpose() == MTPParityProofPurpose::ReferenceNumerics)
                     {
-                        orchestration_parity_decode_trajectory_.push_back(
-                            static_cast<int32_t>(token));
+                        for (const int token : readDecodeTokensFromMetadata())
+                        {
+                            orchestration_parity_decode_trajectory_.push_back(
+                                static_cast<int32_t>(token));
+                        }
                     }
                     std::vector<int32_t> input;
                     input.reserve(static_cast<size_t>(std::max(token_count, 0)));
@@ -10385,6 +11989,14 @@ namespace llaminar2::test::parity
                 }
             }
 
+            if(usesDistributedPipelineEvidence() &&
+               (!originalPipelineParityOwnership().first ||
+                config_.collective_evidence_source!=ParityCollectiveEvidenceSource::PostCollectiveSnapshot ||
+                !config_.allreduce_stages.empty()))
+            {
+                ADD_FAILURE()<<"Split pipeline parity requires original admitted owners and completed local-collective snapshots";
+                return false;
+            }
             if (policy.require_snapshot_publication)
             {
                 const auto keys = activeSnapshotKeys();
@@ -10395,46 +12007,74 @@ namespace llaminar2::test::parity
                     return false;
                 }
 
+                std::vector<std::string> missing;
                 for (const auto &key : policy.requiredSnapshotKeys(phase))
                 {
+                    if(usesDistributedPipelineEvidence() && !ownsPipelineParityKey(key))continue;
                     if (std::find(keys.begin(), keys.end(), key) == keys.end())
                     {
-                        std::ostringstream present;
-                        constexpr size_t kInventoryLimit = 24;
-                        for (size_t index = 0;
-                             index < keys.size() && index < kInventoryLimit;
-                             ++index)
-                        {
-                            if (index > 0)
-                                present << ',';
-                            present << keys[index];
-                        }
-                        if (keys.size() > kInventoryLimit)
-                            present << ",...(" << keys.size() << " total)";
-                        std::ostringstream related;
-                        size_t related_count = 0;
-                        for (const auto &published_key : keys)
-                        {
-                            if (published_key.find("DOMAIN_ROUTE") ==
-                                    std::string::npos &&
-                                published_key.find("RUNTIME_ROUTE") ==
-                                    std::string::npos &&
-                                published_key.find("OVERLAY_ROUTE") ==
-                                    std::string::npos)
-                            {
-                                continue;
-                            }
-                            if (related_count++ > 0)
-                                related << ',';
-                            related << published_key;
-                        }
-                        ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
-                                      << " missing required snapshot '" << key
-                                      << "'; published={" << present.str()
-                                      << "}; related_route_keys={"
-                                      << related.str() << '}';
-                        return false;
+                        const auto source=GraphSnapshotSourceOutput::fromQwenSparseSemanticKey(key);
+                        if((phase==ParityForwardPhase::Prefill || parity_query_decode_step_) && source &&
+                           (source->role()==GraphSnapshotSourceRole::QwenSparseRawQuery ||
+                            source->role()==GraphSnapshotSourceRole::QwenSparseQuery) &&
+                           inspectOmittedQwenSparseQueryEvidence(parity_query_program_observation_,
+                               {.promptRows=config_.token_ids.size(),.decodeRowsBefore=parity_query_decode_step_.value_or(0),
+                                .liveRows=phase==ParityForwardPhase::Prefill?static_cast<int>(config_.token_ids.size()):1,
+                                .sourceCapacity=canonicalQuerySourceCapacity(),
+                                .phase=phase==ParityForwardPhase::Prefill?QwenSparseQueryPhase::Prefill:QwenSparseQueryPhase::Decode},0).valid)
+                            continue;
+                        missing.push_back(key);
                     }
+                }
+                if (!missing.empty())
+                {
+                    // Preserve the complete failed inventory in one report.
+                    // A missing early checkpoint must not hide later wiring
+                    // defects behind another expensive model reload.
+                    std::ostringstream missing_keys;
+                    for (size_t index = 0; index < missing.size(); ++index)
+                    {
+                        if (index > 0) missing_keys << ',';
+                        missing_keys << missing[index];
+                    }
+                    std::ostringstream present;
+                    constexpr size_t kInventoryLimit = 24;
+                    for (size_t index = 0;
+                         index < keys.size() && index < kInventoryLimit;
+                         ++index)
+                    {
+                        if (index > 0)
+                            present << ',';
+                        present << keys[index];
+                    }
+                    if (keys.size() > kInventoryLimit)
+                        present << ",...(" << keys.size() << " total)";
+                    std::ostringstream related;
+                    size_t related_count = 0;
+                    for (const auto &published_key : keys)
+                    {
+                        if (published_key.find("DOMAIN_ROUTE") ==
+                                std::string::npos &&
+                            published_key.find("RUNTIME_ROUTE") ==
+                                std::string::npos &&
+                            published_key.find("OVERLAY_ROUTE") ==
+                                std::string::npos)
+                        {
+                            continue;
+                        }
+                        if (related_count++ > 0)
+                            related << ',';
+                        related << published_key;
+                    }
+                    ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
+                                  << " missing required snapshot '" << missing.front()
+                                  << "'; all_missing={" << missing_keys.str()
+                                  << "}; published={" << present.str()
+                                  << "}; related_route_keys={"
+                                  << related.str() << '}'
+                                  << "; query_program_observation="
+                                  << qwenSparseQueryProgramObservationJSON(parity_query_program_observation_);
+                    return false;
                 }
             }
 
@@ -10448,6 +12088,14 @@ namespace llaminar2::test::parity
             const ParityGraphSnapshotPolicy &policy)
         {
             const std::string phase_name = parityForwardPhaseName(phase);
+            parity_query_decode_step_.reset();
+            parity_query_program_observation_={};
+            if(phase==ParityForwardPhase::Prefill)parity_query_next_decode_step_=0;
+            else {
+                parity_query_decode_step_=parity_query_next_decode_step_++;
+            }
+            parity_query_program_observation_=QwenSparseQueryProgramObservation::begin(
+                canonicalQueryParticipantDevices(),[]{return PerfStatsCollector::snapshot({"qsa"});});
             auto total_scope = profileParityScope("forward." + phase_name + ".total");
             if (policy.enabled)
             {
@@ -10478,10 +12126,13 @@ namespace llaminar2::test::parity
                 auto scope = profileParityScope("forward." + phase_name + ".capture_retry");
                 activeClearCache();
                 activeClearSnapshots();
+                parity_query_program_observation_=QwenSparseQueryProgramObservation::begin(
+                    canonicalQueryParticipantDevices(),[]{return PerfStatsCollector::snapshot({"qsa"});});
                 if (!executeActiveParityForward(phase, tokens, token_count))
                     return false;
             }
 
+            parity_query_program_observation_.finish([]{return PerfStatsCollector::snapshot({"qsa"});});
             {
                 auto scope = profileParityScope("forward." + phase_name + ".validate_snapshots");
                 return validateParityGraphSnapshots(phase, policy);
@@ -10785,6 +12436,680 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Finalize ordinary phase numerics with independent finite/integer witnesses.
+         * @param stats Complete raw comparison bank; every StageComparisonResult stays intact.
+         * @param config Existing phase thresholds and prefill average/minimum policy.
+         * @param phase Decode retains its existing average and decode threshold; prefill is unchanged.
+         * @param routed_expert_set_exact Actual branch comparability; prefill always supplies true.
+         *
+         * Positional route contributions remain diagnostic because route slots
+         * can name different experts. Use the same shared classification as
+         * decode, but retain true for the raw MOE_EXPERT_OUTPUT: prefill still
+         * compares that complete semantic sum strictly even if routes differ.
+         * Integer and exact empty observations have no cosine; their existing
+         * pass/fail witnesses remain authoritative. Authenticated unauthored Q
+         * adds structural evidence while its numerical verdict stays unset. A layer needs at least one
+         * finite comparable numerical stage, so routing-only or empty evidence
+         * cannot pass by inheriting the minimum's initial value of one.
+         *
+         * Nonempty continuous finite-data/error witnesses remain mandatory
+         * even for excluded positional route slots. Dedicated routing metrics
+         * retain their intentional NaN sentinels, without entering cosine.
+         * Raw adjacent cosine_drop fields are computed by the caller for CSV.
+         * Aggregate drop/worst/min/average instead share the same comparable
+         * sequence. This method never rewrites or conditions raw checkpoints.
+         */
+        static void finalizeLayerNumerics(LayerStats &stats, const ParityConfig &config,
+                                          ParityForwardPhase phase, bool routed_expert_set_exact)
+        {
+            stats.avg_cosine_sim = 0.0f;
+            stats.min_cosine_sim = 1.0f;
+            stats.stages_compared = 0;
+            stats.worst_stage.clear();
+            stats.max_cosine_drop = 0.0f;
+            stats.max_drop_stage.clear();
+            bool witnesses_passed = true;
+            bool actual_evidence_valid = !stats.stage_results.empty();
+            bool finite_numerics = true;
+            std::optional<float> previous_comparable;
+            for (const auto &stage : stats.stage_results)
+            {
+                actual_evidence_valid = actual_evidence_valid && validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                    phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill);
+                if(stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
+                {
+                    // A structural witness contributes no numerical sample or
+                    // tolerance verdict and cannot establish layer coverage.
+                    witnesses_passed=witnesses_passed && validParityCheckpointEvidence(stage,true,
+                        phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill);
+                    continue;
+                }
+                if (stage.integer_mismatch_count)
+                {
+                    // Exact identities never acquire a floating cosine. Both
+                    // their exact count and established verdict must agree.
+                    witnesses_passed = witnesses_passed && stage.passed && *stage.integer_mismatch_count == 0;
+                    continue;
+                }
+                if (stage.total_elements == 0)
+                {
+                    // compareIntegerReference also admits authenticated empty
+                    // floating observations without inventing numerical rows.
+                    witnesses_passed = witnesses_passed && stage.passed;
+                    continue;
+                }
+                // Finiteness is independent of positional comparability. In
+                // particular, diagnostic route slots cannot conceal NaN/Inf
+                // data merely because their expert identities differ. Only
+                // dedicated routing metrics retain their intentional NaN
+                // floating-metric sentinels; integer/empty cases were handled
+                // above and never invent numerical observations.
+                const bool finite = isRoutingStage(stage.stage_name) ||
+                    (std::isfinite(stage.cosine_similarity) &&
+                     std::isfinite(stage.rel_l2_norm) && std::isfinite(stage.max_abs_diff) &&
+                     stage.llaminar_stats.nan_count == 0 && stage.llaminar_stats.inf_count == 0 &&
+                     stage.pytorch_stats.nan_count == 0 && stage.pytorch_stats.inf_count == 0);
+                finite_numerics = finite_numerics && finite;
+                if (!parityStageContributesToLayerCosine(stage.stage_name, routed_expert_set_exact))
+                    continue;
+                ++stats.stages_compared;
+                stats.avg_cosine_sim += stage.cosine_similarity;
+                if (!finite)
+                {
+                    if (std::isfinite(stats.min_cosine_sim))
+                    {
+                        stats.min_cosine_sim = std::numeric_limits<float>::quiet_NaN();
+                        stats.worst_stage = stage.stage_name;
+                    }
+                }
+                else if (stage.cosine_similarity < stats.min_cosine_sim)
+                {
+                    stats.min_cosine_sim = stage.cosine_similarity;
+                    stats.worst_stage = stage.stage_name;
+                }
+                if (previous_comparable && std::isfinite(*previous_comparable) && finite)
+                {
+                    const float drop = *previous_comparable - stage.cosine_similarity;
+                    if (drop > stats.max_cosine_drop)
+                    {
+                        stats.max_cosine_drop = drop;
+                        stats.max_drop_stage = stage.stage_name;
+                    }
+                }
+                previous_comparable = stage.cosine_similarity;
+            }
+            if (stats.stages_compared > 0)
+                stats.avg_cosine_sim /= static_cast<float>(stats.stages_compared);
+            const bool average = phase == ParityForwardPhase::Decode || config.use_avg_cosine;
+            const float threshold = phase == ParityForwardPhase::Decode
+                ? config.decode_cosine_threshold : config.cosine_threshold;
+            const float check = average ? stats.avg_cosine_sim : stats.min_cosine_sim;
+            stats.passed = stats.stages_compared > 0 && finite_numerics && witnesses_passed &&
+                check >= threshold;
+            stats.evidence_valid = actual_evidence_valid && stats.stages_compared > 0 &&
+                finite_numerics && witnesses_passed;
+        }
+
+        /**
+         * @brief Preserve ordinary prefill's complete expert-sum and configured average/minimum gates.
+         * @param stats Original raw comparison bank, retained unchanged.
+         * @param config Existing canonical prefill thresholds.
+         */
+        static void finalizePrefillLayerNumerics(LayerStats &stats, const ParityConfig &config)
+        {
+            finalizeLayerNumerics(stats, config, ParityForwardPhase::Prefill, true);
+        }
+
+        /**
+         * @brief Finalize ordinary decode without hiding invalid excluded or integer observations.
+         * @param stats Original raw decode bank; positional slots remain diagnostic-only.
+         * @param config Existing decode threshold; its average policy is unchanged.
+         * @param routed_expert_set_exact Existing complete expert-sum branch comparability.
+         * @note This neither conditions experts nor waives combined/HC/final/logit comparisons.
+         */
+        static void finalizeDecodeLayerNumerics(LayerStats &stats, const ParityConfig &config,
+                                                bool routed_expert_set_exact)
+        {
+            finalizeLayerNumerics(stats, config, ParityForwardPhase::Decode, routed_expert_set_exact);
+        }
+
+        /**
+         * @brief Retain a missing declared comparison as invalid evidence rather than losing it to continue.
+         * @tparam Layer Ordinary or TP layer bank. @param layer Original bank receiving the diagnostic.
+         * @param semantic_key Exact key selected by the original graph policy. @param stage Bare CSV stage.
+         * @param required Original phase-specific publication requirements, not a copied model table.
+         * @return Whether this phase actually declared the missing raw observation.
+         */
+        template <typename Layer>
+        static bool retainMissingRequiredParityStage(Layer &layer, const std::string &semantic_key,
+            const std::string &stage, const std::vector<std::string> &required)
+        {
+            if (std::find(required.begin(), required.end(), semantic_key) == required.end()) return false;
+            if constexpr (requires { layer.avg_combined_cosine; })
+            {
+                TPStageComparisonResult missing; missing.stage_name = stage;
+                missing.combined_result.stage_name = stage;
+                layer.stage_results.push_back(std::move(missing));
+            }
+            else
+            {
+                StageComparisonResult missing; missing.stage_name = stage;
+                layer.stage_results.push_back(std::move(missing));
+            }
+            return true;
+        }
+
+        /**
+         * @brief Require every original declared raw layer checkpoint, independently of diagnostic verdicts.
+         * @tparam Layers Ordinary or TP source-indexed records.
+         * @param layers Actual comparison banks. @param required Existing phase-specific graph declaration.
+         * @param phase Mandatory actual main phase; Decode requires independently authenticated query provenance.
+         * @return Success only when each declared layer key has one valid typed evidence record.
+         *
+         * EMBEDDING and LM_HEAD have separate default-invalid witnesses. Optional
+         * derived alignment is never added to this original publication authority.
+         */
+        template <typename Layers>
+        static ::testing::AssertionResult acceptsRequiredRawParityStages(
+            const Layers &layers, const std::vector<std::string> &required,
+            ParityForwardPhase phase)
+        {
+            if (required.empty()) return ::testing::AssertionFailure() << "Final-logit contract has no original required snapshot declaration";
+            for (const auto &key : required)
+            {
+                if (key == "EMBEDDING" || key == "LM_HEAD") continue;
+                std::size_t matches = 0;
+                for (const auto &layer : layers)
+                {
+                    const auto prefix = "layer" + std::to_string(layer.layer_idx) + "_";
+                    if (!key.starts_with(prefix)) continue;
+                    const auto stage_name = key.substr(prefix.size());
+                    for (const auto &record : layer.stage_results)
+                    {
+                        if (record.stage_name != stage_name) continue;
+                        ++matches;
+                        const auto &stage = [&]() -> const auto & {
+                            if constexpr (requires { record.combined_result; }) return record.combined_result;
+                            else return record;
+                        }();
+                        if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                    phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill))
+                            return ::testing::AssertionFailure() << "Missing or invalid declared raw checkpoint " << key;
+                    }
+                }
+                if (matches != 1)
+                    return ::testing::AssertionFailure() << "Required raw checkpoint " << key << " needs exactly one original evidence record, observed " << matches;
+            }
+            return ::testing::AssertionSuccess();
+        }
+
+        /**
+         * @brief Authenticate the total original layer bank before any final-logit-only acceptance.
+         * @tparam Layers Actual ordinary/TP records. @param layers Observed raw source records.
+         * @param config Original model geometry and phase publication declarations.
+         * @param phase Actual compared main phase. @return First missing/invalid observation, or success.
+         */
+        template <typename Layers>
+        static ::testing::AssertionResult acceptsFinalLogitRawEvidence(const Layers &layers,
+            const ParityConfig &config, ParityForwardPhase phase)
+        {
+            if (config.early_layers_count <= 0 || layers.size() != static_cast<std::size_t>(config.early_layers_count))
+                return ::testing::AssertionFailure() << "Final-logit evidence needs exactly " << config.early_layers_count
+                    << " original decoder records; observed " << layers.size();
+            for (int index = 0; index < config.early_layers_count; ++index)
+            {
+                if (std::count_if(layers.begin(), layers.end(), [index](const auto &layer) { return layer.layer_idx == index; }) != 1)
+                    return ::testing::AssertionFailure() << "Final-logit evidence has missing or duplicate decoder " << index;
+            }
+            for (const auto &layer : layers)
+            {
+                if (layer.stages_compared <= 0 || layer.stage_results.empty())
+                    return ::testing::AssertionFailure() << "Final-logit evidence has no actual stages for decoder " << layer.layer_idx;
+                for (const auto &record : layer.stage_results)
+                {
+                    const auto &stage = [&]() -> const auto & {
+                        if constexpr (requires { record.combined_result; }) return record.combined_result;
+                        else return record;
+                    }();
+                    if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                    phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill) ||
+                        (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
+                        return ::testing::AssertionFailure() << "Invalid raw checkpoint " << stage.stage_name << " in decoder " << layer.layer_idx;
+                }
+            }
+            return acceptsRequiredRawParityStages(layers, config.graph_snapshot_policy.requiredSnapshotKeys(phase),phase);
+        }
+
+        /** @return Whether strict evidence belongs to genuine split pipeline owners. */
+        bool usesDistributedPipelineEvidence() const noexcept
+        { return config_.uses_cross_rank_pipeline && config_.final_logit_mean_kl.has_value(); }
+
+        /** @brief Passive projection of the actual initialized original admission, not a rank heuristic.
+         * @return Local original scopes; empty/invalid metadata stays invalid for collective rejection. */
+        std::pair<bool,std::vector<PipelineParityStageOwnership>> originalPipelineParityOwnership() const
+        {
+            std::vector<PipelineParityStageOwnership> result;
+            const auto* original=dynamic_cast<const OrchestrationRunner*>(orch_runner_.get());
+            const auto* prepared=original ? original->pipelinePreparedPlanForDiagnostics() : nullptr;
+            const auto admission=prepared ? prepared->admission() : nullptr;
+            if(!admission || !admission->globalPipeline() || !mpi_ctx_ ||
+               admission->globalPipeline()->total_layers!=config_.early_layers_count ||
+               admission->globalPipeline()->world_size!=mpiWorldSize() ||
+               admission->rankPlan().rank!=mpiRank())return {false,{}};
+            std::set<int> stages;
+            for(const auto& stage:admission->stages())
+            {
+                const auto& scope=stage.topology().scope();
+                const auto& plan=stage.rankPlan();
+                if(stage.topology().stageId()<0 || !stages.insert(stage.topology().stageId()).second || plan.rank!=mpiRank() ||
+                   scope.first_layer<0 || scope.last_layer<=scope.first_layer ||
+                   scope.last_layer>config_.early_layers_count ||
+                   plan.first_layer!=scope.first_layer || plan.last_layer!=scope.last_layer-1 ||
+                   (scope.has_embedding && scope.first_layer!=0) ||
+                   (scope.has_lm_head && scope.last_layer!=config_.early_layers_count) ||
+                   plan.global_tp_domain_size>1)return {false,{}};
+                result.push_back({stage.topology().stageId(),mpiRank(),scope.first_layer,scope.last_layer,
+                    scope.has_embedding,scope.has_lm_head});
+            }
+            return {true,std::move(result)};
+        }
+
+        /** @brief Resolve one original diagnostic key against passive admitted stage ownership.
+         * @param key Canonical snapshot key already selected by the original framework.
+         * @return Whether this actual rank owns its comparison/publication obligation. */
+        bool ownsPipelineParityKey(const std::string& key) const
+        {
+            if(!usesDistributedPipelineEvidence())return true;
+            const auto [valid,stages]=originalPipelineParityOwnership();
+            if(!valid)return false;
+            for(const auto& stage:stages)
+            {
+                if(key=="EMBEDDING" && stage.embedding)return true;
+                if((key=="LM_HEAD" || key=="FINAL_NORM") && stage.logits)return true;
+                for(int layer=stage.first_layer;layer<stage.last_layer;++layer)
+                    if(key.starts_with("layer"+std::to_string(layer)+"_"))return true;
+            }
+            return false;
+        }
+
+        /** @brief Validate this original owner's raw finite/exact records before metadata exchange.
+         * @param layers Actual local records, retaining original global decoder indices.
+         * @param stages Original admitted local scopes, retaining global decoder indices.
+         * @param config Unchanged canonical required-stage and threshold declaration.
+         * @param phase Actual comparison phase; query provenance is never waived.
+         * @param actual_rank Original current MPI rank, independent of NUMA or stage order.
+         * @return Original required-stage/evidence verdict scoped only to authenticated owned layers. */
+        template<class Layers>
+        static ::testing::AssertionResult acceptsOwnedPipelineRawEvidence(const Layers& layers,
+            std::span<const PipelineParityStageOwnership> stages,const ParityConfig& config,ParityForwardPhase phase,int actual_rank)
+        {
+            std::vector<int> owned;
+            for(const auto& stage:stages)
+            {
+                if(stage.rank!=actual_rank || stage.stage<0 || stage.first_layer<0 ||
+                   stage.last_layer<=stage.first_layer || stage.last_layer>config.early_layers_count)
+                    return ::testing::AssertionFailure()<<"Pipeline raw evidence contains a foreign original scope";
+                for(int layer=stage.first_layer;layer<stage.last_layer;++layer)owned.push_back(layer);
+            }
+            if(layers.size()!=owned.size())return ::testing::AssertionFailure()<<"Pipeline local decoder cardinality disagrees";
+            for(int index:owned)
+                if(std::count_if(layers.begin(),layers.end(),[index](const auto& value){return value.layer_idx==index;})!=1)
+                    return ::testing::AssertionFailure()<<"Pipeline missing/duplicate owned decoder "<<index;
+            for(const auto& layer:layers)
+            {
+                if(layer.stages_compared<=0 || layer.stage_results.empty())
+                    return ::testing::AssertionFailure()<<"Pipeline owned decoder has no original stages";
+                for(const auto& record:layer.stage_results)
+                {
+                    if(!validParityCheckpointEvidence(record,phase==ParityForwardPhase::Decode || record.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                        phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill) ||
+                       (record.integer_mismatch_count && *record.integer_mismatch_count!=0))
+                        return ::testing::AssertionFailure()<<"Pipeline invalid original raw checkpoint "<<record.stage_name;
+                }
+            }
+            std::vector<std::string> required;
+            for(const auto& key:config.graph_snapshot_policy.requiredSnapshotKeys(phase))
+            {
+                if(key=="EMBEDDING" || key=="LM_HEAD")required.push_back(key);
+                else for(int layer:owned)
+                    if(key.starts_with("layer"+std::to_string(layer)+"_")){required.push_back(key);break;}
+            }
+            // An idle owner has no raw obligation. It still participates in the
+            // complete original-world certificate and cannot claim a decoder.
+            if(owned.empty() && required.empty())return ::testing::AssertionSuccess();
+            return acceptsRequiredRawParityStages(layers,required,phase);
+        }
+
+        /** @brief Project exact original local records into fixed diagnostic cardinalities.
+         * @param layers Actual completed local comparator records.
+         * @param stages Original admitted exclusive stage scopes.
+         * @param count Authenticated global main decoder count.
+         * @param raw Actual original finite/exact required-checkpoint verdict.
+         * @param actual_rank Original current MPI rank whose observation is projected.
+         * @return One cell per original decoder; foreign/duplicate records remain invalid.
+         */
+        static std::vector<PipelineParityLayerObservation> pipelineParityLayerObservations(
+            const std::vector<LayerStats>& layers,std::span<const PipelineParityStageOwnership> stages,
+            int count,bool raw,int actual_rank)
+        {
+            if(count<=0)throw std::invalid_argument("Pipeline evidence requires its original main boundary");
+            std::vector<PipelineParityLayerObservation> result(static_cast<std::size_t>(count));
+            for(const auto& stage:stages)
+            {
+                if(stage.rank!=actual_rank || stage.stage<0 || stage.first_layer<0 || stage.last_layer<=stage.first_layer || stage.last_layer>count)
+                    throw std::invalid_argument("Pipeline evidence stage escapes its original main boundary");
+                for(int layer=stage.first_layer;layer<stage.last_layer;++layer)++result[layer].claims;
+            }
+            for(const auto& layer:layers)
+            {
+                if(layer.layer_idx<0 || layer.layer_idx>=count)
+                    throw std::invalid_argument("Pipeline evidence contains a foreign decoder");
+                ++result[layer.layer_idx].records;
+                if(raw)++result[layer.layer_idx].valid_records;
+            }
+            return result;
+        }
+
+        /** @brief Exchange only completed comparison metadata through the original MPI owner.
+         * @param local Exact original scalar comparison header.
+         * @param layers Actual local global-indexed raw diagnostics.
+         * @param phase Original phase; no tensor/snapshot or controller state is exchanged.
+         * @param step Exact original decode index; prefill uses minus one.
+         * @return Complete immutable diagnostic certificate, or a collective metadata rejection. */
+        PipelineParityEvidence collectPipelineParityEvidence(PipelineParityObservation local,
+            const std::vector<LayerStats>& layers,ParityForwardPhase phase,int step)
+        {
+            // Exact original literal identities prevent same-geometry evidence
+            // from another case/reference/request entering this diagnostic union.
+            const auto* test=::testing::UnitTest::GetInstance()->current_test_info();
+            if(!test)throw std::logic_error("Pipeline comparison has no original canonical test identity");
+            std::string identity;
+            // Length framing keeps literal path/prompt fields unambiguous;
+            // frozen-history identity includes its exact teacher trajectory.
+            const auto append=[&](const std::string& value) {
+                identity+=std::to_string(value.size())+":"+value;
+            };
+            append(test->test_suite_name());append(test->name());append(cfg().name);append(getBackendName());
+            // Frame every original reference-pack field independently. The
+            // local cache key uses separators and is not a wire identity parser.
+            append(config_.snapshot_dir);append(config_.model_path);
+            append(parityPredictorIdentity(config_.shared_predictor));append(config_.prompt);
+            append(std::to_string(config_.decode_steps));
+            append(frozen_history_replay_ ? frozen_history_replay_->identity() : std::string{});
+            append(std::to_string(config_.token_ids.size()));
+            for(const auto token:config_.token_ids)append(std::to_string(token));
+            if(identity.size()>std::size_t(std::numeric_limits<int>::max()))
+                throw std::invalid_argument("Pipeline comparison identity exceeds original MPI extent");
+            const int bytes=static_cast<int>(identity.size());
+            std::vector<int> sizes(static_cast<std::size_t>(mpiWorldSize())),offsets(sizes.size());
+            parityCoordinationMPIContext()->allgather_bytes(&bytes,sizes.data(),sizeof(bytes));
+            int total=0;
+            for(std::size_t rank=0;rank<sizes.size();++rank)
+            {
+                if(sizes[rank]<=0 || sizes[rank]>std::numeric_limits<int>::max()-total)
+                    throw std::invalid_argument("Pipeline comparison identity metadata extent is invalid");
+                offsets[rank]=total;total+=sizes[rank];
+            }
+            std::string joined(static_cast<std::size_t>(total),'\0');
+            parityCoordinationMPIContext()->allgatherv_bytes(identity.data(),bytes,joined.data(),sizes.data(),offsets.data());
+            std::vector<std::string> identities;
+            for(std::size_t rank=0;rank<sizes.size();++rank)
+                identities.emplace_back(joined.data()+offsets[rank],static_cast<std::size_t>(sizes[rank]));
+            requirePipelineParityIdentities(identities);
+            // A split owner compares its production-completed local TP
+            // snapshot. Summing tensor values across PP owners would both
+            // invent evidence and mismatch their different layer scopes.
+            if(config_.collective_evidence_source!=ParityCollectiveEvidenceSource::PostCollectiveSnapshot ||
+               !config_.allreduce_stages.empty())
+                throw std::invalid_argument("Split pipeline parity requires original completed local-collective snapshots");
+            const int count=config_.early_layers_count;
+            const auto [valid,stages]=originalPipelineParityOwnership();
+            local.rank=mpiRank();local.world=mpiWorldSize();local.layers=count;
+            local.phase=static_cast<int>(phase);local.step=step;local.scope_valid=valid;
+            const auto raw=valid ? acceptsOwnedPipelineRawEvidence(layers,stages,config_,phase,mpiRank())
+                : ::testing::AssertionFailure()<<"Pipeline parity lost its original admitted stage authority";
+            EXPECT_TRUE(raw)<<raw.message();
+            local.local_raw_valid=bool(raw);
+            std::vector<PipelineParityLayerObservation> owned(count>0 ? std::size_t(count) : 0);
+            for(const auto& stage:stages)
+            {
+                local.embedding_claims+=stage.embedding;local.logits_claims+=stage.logits;
+            }
+            try { owned=pipelineParityLayerObservations(layers,stages,count,bool(raw),mpiRank()); }
+            catch(const std::invalid_argument&) { local.local_raw_valid=0; }
+            std::vector<PipelineParityObservation> headers(static_cast<std::size_t>(mpiWorldSize()));
+            parityCoordinationMPIContext()->allgather_bytes(&local,headers.data(),sizeof(local));
+            if(count<=0 || std::any_of(headers.begin(),headers.end(),[&](const auto& header){
+                    return header.layers!=count || header.world!=mpiWorldSize();}) ||
+               std::size_t(count)>std::size_t(std::numeric_limits<int>::max())/sizeof(PipelineParityLayerRecord)/headers.size())
+                throw std::invalid_argument("Pipeline comparison metadata geometry disagrees before exchange");
+            const auto compact=compactPipelineParityLayers(owned);
+            const int local_bytes=static_cast<int>(compact.size()*sizeof(PipelineParityLayerRecord));
+            parityCoordinationMPIContext()->allgather_bytes(&local_bytes,sizes.data(),sizeof(local_bytes));
+            total=0;
+            std::vector<std::size_t> rank_counts(sizes.size());
+            for(std::size_t rank=0;rank<sizes.size();++rank)
+            {
+                if(sizes[rank]<0 || sizes[rank]%sizeof(PipelineParityLayerRecord) ||
+                   std::size_t(sizes[rank])/sizeof(PipelineParityLayerRecord)>std::size_t(count) ||
+                   sizes[rank]>std::numeric_limits<int>::max()-total)
+                    throw std::invalid_argument("Pipeline comparison compact metadata extent is invalid");
+                offsets[rank]=total;total+=sizes[rank];
+                rank_counts[rank]=std::size_t(sizes[rank])/sizeof(PipelineParityLayerRecord);
+            }
+            std::vector<PipelineParityLayerRecord> received(std::size_t(total)/sizeof(PipelineParityLayerRecord));
+            parityCoordinationMPIContext()->allgatherv_bytes(compact.data(),local_bytes,received.data(),sizes.data(),offsets.data());
+            const auto all=expandPipelineParityLayers(received,rank_counts,count);
+            return mergePipelineParityEvidence(headers,all,count,phase,step);
+        }
+
+        /** @brief Collect actual prefill evidence and copy only original head/tail scalar metrics.
+         * @param summary Actual local comparator output; local layer/stage CSV diagnostics are retained. */
+        void completePipelinePrefillEvidence(ParityTestSummary& summary)
+        {
+            PipelineParityObservation local;
+            summary.pipeline_local_embedding_passed=summary.embedding_passed;
+            local.embedding_valid=summary.embedding_evidence_valid;
+            local.embedding_cosine=summary.embedding_cosine;local.embedding_passed=summary.embedding_passed;
+            local.has_logits=summary.lm_head_evidence_valid;local.logits_valid=summary.lm_head_evidence_valid;
+            local.cosine=summary.lm_head_cosine;local.kl=summary.lm_head_kl;
+            local.top1=summary.lm_head_top1;local.top5=summary.lm_head_top5;
+            local.logit_passed=summary.lm_head_passed;local.reference_in_top3=summary.lm_head_pytorch_top1_in_top3;
+            local.actual_token=summary.lm_head_llaminar_token;local.reference_token=summary.lm_head_pytorch_token;
+            summary.pipeline_evidence=collectPipelineParityEvidence(local,summary.layer_stats,ParityForwardPhase::Prefill,-1);
+            const auto& head=summary.pipeline_evidence->head();const auto& tail=summary.pipeline_evidence->tail();
+            summary.embedding_evidence_valid=head.embedding_valid;summary.embedding_cosine=head.embedding_cosine;
+            summary.embedding_passed=head.embedding_passed;
+            summary.lm_head_evidence_valid=tail.logits_valid;summary.lm_head_cosine=tail.cosine;summary.lm_head_kl=tail.kl;
+            summary.lm_head_top1=tail.top1;summary.lm_head_top5=tail.top5;summary.lm_head_passed=tail.logit_passed;
+            summary.lm_head_pytorch_top1_in_top3=tail.reference_in_top3;
+            summary.lm_head_llaminar_token=tail.actual_token;summary.lm_head_pytorch_token=tail.reference_token;
+        }
+
+        /** @brief Combine every original decode step before unchanged final numerical acceptance.
+         * @param summary Actual local diagnostic trajectory.
+         * @param sum_cosine Original tail's ordered sum, copied unchanged to other participants.
+         * @param sum_kl Original tail's ordered sum, never averaged/reduced across ranks. */
+        void completePipelineDecodeEvidence(DecodeParitySummary& summary,float& sum_cosine,float& sum_kl)
+        {
+            struct Totals{float cosine,kl;int steps,top1,top3,top5;std::uint64_t records;};
+            const Totals local{sum_cosine,sum_kl,summary.steps_total,summary.top1_matches,summary.top3_matches,
+                summary.top5_matches,summary.step_stats.size()};
+            std::vector<Totals> totals(static_cast<std::size_t>(mpiWorldSize()));
+            parityCoordinationMPIContext()->allgather_bytes(&local,totals.data(),sizeof(local));
+            // Agree every participant's complete cardinality before any
+            // step exchange: a truncated local bank must fail collectively.
+            if(std::any_of(totals.begin(),totals.end(),[&](const auto& value){
+                    return value.steps!=config_.decode_steps || value.records!=std::uint64_t(config_.decode_steps);}))
+                throw std::invalid_argument("Pipeline parity lost its complete original decode trajectory");
+            summary.steps_passed=0;
+            int tail_rank=-1;
+            for(auto& step:summary.step_stats)
+            {
+                PipelineParityObservation observed;
+                observed.has_logits=step.has_logit_data;observed.logits_valid=step.logit_evidence_valid;
+                observed.cosine=step.cosine_similarity;observed.kl=step.kl_divergence;
+                observed.top1=step.top1_overlap;observed.top5=step.top5_overlap;
+                observed.actual_token=step.llaminar_token;observed.reference_token=step.pytorch_token;
+                observed.token_match=step.token_match;observed.top3_match=step.top3_match;observed.top5_match=step.top5_match;
+                step.pipeline_evidence=collectPipelineParityEvidence(observed,step.layer_stats,ParityForwardPhase::Decode,step.step_idx);
+                const auto& tail=step.pipeline_evidence->tail();
+                if(tail_rank>=0 && tail_rank!=step.pipeline_evidence->tailRank())
+                    throw std::invalid_argument("Pipeline final-logit owner changed within original trajectory");
+                tail_rank=step.pipeline_evidence->tailRank();
+                step.has_logit_data=tail.has_logits;step.logit_evidence_valid=tail.logits_valid;
+                step.cosine_similarity=tail.cosine;step.kl_divergence=tail.kl;step.top1_overlap=tail.top1;step.top5_overlap=tail.top5;
+                step.llaminar_token=tail.actual_token;step.pytorch_token=tail.reference_token;
+                step.token_match=tail.token_match;step.top3_match=tail.top3_match;step.top5_match=tail.top5_match;
+                step.passed=step.logit_evidence_valid && config_.final_logit_mean_kl->accepts(step.kl_divergence,false);
+                summary.steps_passed+=step.passed;
+            }
+            if(tail_rank<0)throw std::invalid_argument("Pipeline decode has no original final-logit owner");
+            sum_cosine=totals[tail_rank].cosine;sum_kl=totals[tail_rank].kl;
+            summary.top1_matches=totals[tail_rank].top1;summary.top3_matches=totals[tail_rank].top3;summary.top5_matches=totals[tail_rank].top5;
+        }
+
+        /** @brief Consume only complete original distributed evidence or the unchanged local law.
+         * @param summary Actual original diagnostic bank, ordinary or TP.
+         * @param config Original thresholds/required stage declaration.
+         * @param phase Actual compared phase. @param step Actual original decode index, or minus one.
+         * @return Exact complete evidence verdict; missing pipeline proof is failure. */
+        template<class Summary>
+        static ::testing::AssertionResult acceptsFinalLogitSummaryRawEvidence(const Summary& summary,
+            const ParityConfig& config,ParityForwardPhase phase,int step=-1)
+        {
+            if(config.uses_cross_rank_pipeline)
+            {
+                if constexpr(requires{summary.pipeline_evidence;})
+                    if(summary.pipeline_evidence && summary.pipeline_evidence->matches(phase,step,config.early_layers_count))
+                        return ::testing::AssertionSuccess();
+                return ::testing::AssertionFailure()<<"Missing/mismatched complete original pipeline comparison evidence";
+            }
+            return acceptsFinalLogitRawEvidence(summary.layer_stats,config,phase);
+        }
+
+        /** @return Additional original decoder evidence; legacy families retain their policy. */
+        virtual ::testing::AssertionResult acceptsAdditionalDecodeEvidence(const DecodeParitySummary &) const
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        /**
+         * @brief Judge each original final-logit step independently; no across-step average can hide a bad row.
+         * @param summary Actual completed original teacher trajectory.
+         * @param contract Explicit ordinary-only limits, never an MTP allowance.
+         * @return Success only for the exact original complete ordered trajectory and valid final rows.
+         */
+        static ::testing::AssertionResult acceptsFinalLogitDecodeEvidence(
+            const DecodeParitySummary &summary, const FinalLogitMeanKLContract &contract)
+        {
+            if (!contract.valid() || summary.steps_total != contract.decode_steps ||
+                summary.step_stats.size() != static_cast<std::size_t>(contract.decode_steps))
+                return ::testing::AssertionFailure() << "Final-logit decode requires exactly " << contract.decode_steps
+                    << " original steps; observed " << summary.steps_total << "/" << summary.step_stats.size();
+            for (int index = 0; index < contract.decode_steps; ++index)
+            {
+                const auto &step = summary.step_stats[index];
+                if (step.step_idx != index || !step.has_logit_data || !step.logit_evidence_valid)
+                    return ::testing::AssertionFailure() << "Final-logit step " << index << " has missing, duplicate, malformed or nonfinite evidence";
+                if (!contract.accepts(step.kl_divergence, false))
+                    return ::testing::AssertionFailure() << "Final-logit numerical limit phase=decode step=" << index << " meanKL=" << step.kl_divergence
+                        << " requires finite nonnegative meanKL < " << contract.decode_maximum;
+            }
+            return ::testing::AssertionSuccess();
+        }
+
+        /**
+         * @brief Publish ordinary decode acceptance while preserving legacy arithmetic verbatim.
+         * @param summary Original raw metrics; average KL remains diagnostic only.
+         * @param config Explicit optional final-logit contract or original legacy thresholds.
+         * @param structural_accepted Actual model-owned observation proof, never defaulted for the opt-in caller.
+         */
+        static void finalizeDecodeSummaryNumerics(DecodeParitySummary &summary,
+            const ParityConfig &config, bool structural_accepted)
+        {
+            int min_steps_required = static_cast<int>(summary.steps_total * config.min_decode_pass_rate);
+            bool topk_gate = (config.pytorch_top1_in_topk <= 0) ||
+                             (summary.top3_matches == summary.steps_total);
+            summary.overall_passed = (summary.steps_passed >= min_steps_required) &&
+                                     (summary.top5_accuracy >= config.min_top5_accuracy) &&
+                                     (summary.avg_cosine >= config.decode_cosine_threshold) &&
+                                     topk_gate;
+            if (config.final_logit_mean_kl)
+            {
+                summary.overall_passed = acceptsFinalLogitDecodeEvidence(summary, *config.final_logit_mean_kl) &&
+                    structural_accepted;
+                for (const auto &step : summary.step_stats)
+                    summary.overall_passed = summary.overall_passed &&
+                        acceptsFinalLogitSummaryRawEvidence(step, config, ParityForwardPhase::Decode, step.step_idx);
+            }
+        }
+
+        /**
+         * @brief Additional model-specific prefill evidence, before prefix certification.
+         * @param summary Original ordinary numerical checkpoints, not a regenerated forward.
+         * @return True by default, preserving every existing family's acceptance policy.
+         */
+        virtual ::testing::AssertionResult acceptsAdditionalPrefillEvidence(const ParityTestSummary &summary) const
+        {
+            (void)summary;
+            return ::testing::AssertionSuccess();
+        }
+
+        /**
+         * @brief Additional model-specific evidence for the TP summary path.
+         * @param summary Original combined TP numerical checkpoints.
+         * @return True by default; specialized models may require a complete decoder window.
+         */
+        virtual ::testing::AssertionResult acceptsAdditionalPrefillEvidence(const TPParityTestSummary &summary) const
+        {
+            (void)summary;
+            return ::testing::AssertionSuccess();
+        }
+
+        /**
+         * @brief Finalize the existing prefill counters and model-specific acceptance.
+         * @tparam Summary Actual ordinary or TP numerical summary.
+         * @param summary Original raw layer records; individual verdicts remain unchanged.
+         * @param config Existing thresholds, shared with decode and left unchanged.
+         * @param embedding_passed Existing embedding verdict.
+         * @param additional_accepted Model-specific proof, defaulting to legacy acceptance.
+         *
+         * Keep the historical embedding-inclusive counters for every model.
+         * Additional correctness requirements join overall_passed before that
+         * result can certify the fresh prefix. This is not a numerical threshold.
+         */
+        template <typename Summary>
+        static void finalizePrefillSummaryNumerics(
+            Summary &summary, const ParityConfig &config,
+            bool embedding_passed, bool additional_accepted = true)
+        {
+            bool local_embedding_passed=embedding_passed;
+            if constexpr(requires{summary.pipeline_evidence;summary.pipeline_local_embedding_passed;})
+                if(summary.pipeline_evidence)local_embedding_passed=summary.pipeline_local_embedding_passed;
+            summary.early_layers_passed = local_embedding_passed ? 1 : 0;
+            for (int index = 0; index < std::min(config.early_layers_count,
+                     static_cast<int>(summary.layer_stats.size())); ++index)
+            {
+                if (summary.layer_stats[index].passed)
+                    ++summary.early_layers_passed;
+            }
+            summary.total_layers_passed = local_embedding_passed ? 1 : 0;
+            for (const auto &layer : summary.layer_stats)
+            {
+                if (layer.passed)
+                    ++summary.total_layers_passed;
+            }
+            summary.overall_passed = config.final_logit_mean_kl
+                ? config.final_logit_mean_kl->valid() && summary.embedding_evidence_valid &&
+                    summary.lm_head_evidence_valid && summary.lm_head_passed &&
+                    config.final_logit_mean_kl->accepts(summary.lm_head_kl, true) && additional_accepted &&
+                    acceptsFinalLogitSummaryRawEvidence(summary, config, ParityForwardPhase::Prefill)
+                : summary.early_layers_passed >= config.min_early_layers_passed &&
+                    summary.lm_head_passed && additional_accepted;
+        }
+
+        /**
          * @brief Run prefill parity test using existing runner_
          *
          * Compares layer-by-layer Llaminar snapshots against PyTorch reference.
@@ -10834,10 +13159,13 @@ namespace llaminar2::test::parity
             const bool require_complete_segmented_prefill_snapshots =
                 prefill_probe.prefill_chunk_successful_schedules > 0;
 
-            int n_layers = parityLayerCount();
+            int n_layers = usesDistributedPipelineEvidence() ? config_.early_layers_count : parityLayerCount();
 
             // Stages to compare per layer
             std::vector<std::string> per_layer_stages = {
+                "GR_NORM", "GR_READ", "GR_WRITE",
+                "QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
+                "PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION",
                 "ATTENTION_NORM",
                 // GDN sub-stages (skipped for FA layers where they don't exist)
                 "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
@@ -10902,6 +13230,8 @@ namespace llaminar2::test::parity
                         if (llaminar_size != pytorch_embedding.size())
                             return summary;
                     }
+                    summary.embedding_evidence_valid = llaminar_size == pytorch_embedding.size() &&
+                        finiteParityOperands({llaminar_data, llaminar_size}) && finiteParityOperands(pytorch_embedding);
                     summary.embedding_cosine = computeCosineSimilarity(
                         llaminar_data, pytorch_embedding.data(),
                         std::min(llaminar_size, pytorch_embedding.size()));
@@ -10923,9 +13253,11 @@ namespace llaminar2::test::parity
             // Compare each layer
             for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
             {
+                if(usesDistributedPipelineEvidence() &&
+                   !ownsPipelineParityKey("layer"+std::to_string(layer_idx)+"_"))continue;
                 LayerStats stats;
+                std::optional<StageComparisonResult> aligned_route_diagnostic;
                 stats.layer_idx = layer_idx;
-                float sum_cosine = 0.0f;
 
                 for (const auto &stage : per_layer_stages)
                 {
@@ -10944,9 +13276,18 @@ namespace llaminar2::test::parity
                         "layer" + std::to_string(layer_idx) + "_" + stage;
                     const std::string pytorch_key = semantic_key;
 
+                    if (auto integer_result = compareIntegerReference(pytorch_key, semantic_key, stage))
+                    {
+                        stats.stage_results.push_back(*integer_result);
+                        continue;
+                    }
                     auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                     if (pytorch_data.empty())
+                    {
+                        if (config_.final_logit_mean_kl)
+                            retainMissingRequiredParityStage(stats, semantic_key, stage, parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
                         continue;
+                    }
 
                     const bool stage_requires_reduction =
                         !config_.allreduce_stages.empty() &&
@@ -10987,14 +13328,22 @@ namespace llaminar2::test::parity
                     }
 
                     if (!has_local_snapshot)
+                    {
+                        if (config_.final_logit_mean_kl)
+                            retainMissingRequiredParityStage(stats, semantic_key, stage, parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
                         continue;
+                    }
 
                     size_t llaminar_size;
                     const float *llaminar_data = activeSnapshot(llaminar_key, llaminar_size);
                     if (!llaminar_data)
+                    {
+                        if (config_.final_logit_mean_kl)
+                            retainMissingRequiredParityStage(stats, semantic_key, stage, parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
                         continue;
+                    }
 
-                    if (require_complete_segmented_prefill_snapshots &&
+                    if ((require_complete_segmented_prefill_snapshots || config_.final_logit_mean_kl) &&
                         llaminar_size != pytorch_data.size())
                     {
                         ADD_FAILURE()
@@ -11004,6 +13353,11 @@ namespace llaminar2::test::parity
                             << pytorch_data.size()
                             << ". A final chunk is not a valid replacement "
                                "for the complete prompt checkpoint.";
+                        if (config_.final_logit_mean_kl)
+                        {
+                            StageComparisonResult invalid; invalid.stage_name = stage;
+                            stats.stage_results.push_back(std::move(invalid));
+                        }
                         continue;
                     }
 
@@ -11037,7 +13391,13 @@ namespace llaminar2::test::parity
                         size_t ll_idx_size;
                         const float *ll_idx = activeSnapshot(idx_key, ll_idx_size);
                         auto pt_idx = loadPyTorchSnapshot(idx_key);
-                        if (ll_idx && !pt_idx.empty())
+                        if (config_.final_logit_mean_kl && !parityRouteFrameHasExactExtents(
+                            {compare_data, llaminar_size}, pytorch_data,
+                            ll_idx ? std::span<const float>(ll_idx, ll_idx_size) : std::span<const float>{}, pt_idx))
+                        {
+                            result.stage_name = stage; // Explicit invalid ownership witness, no continuous replacement.
+                        }
+                        else if (ll_idx && !pt_idx.empty())
                             result = compareRoutingWeights(compare_data, pytorch_data, ll_idx, pt_idx,
                                                            llaminar_size, moe_cfg.top_k, moe_cfg.num_experts, stage);
                         else
@@ -11047,16 +13407,18 @@ namespace llaminar2::test::parity
                     {
                         result = compareTensors(compare_data, pytorch_data, llaminar_size, stage);
                     }
-                    stats.stage_results.push_back(result);
-
-                    // Routing stages use set-overlap (Jaccard), not cosine similarity.
-                    // Include them in stage_results for logging/CSV but exclude from
-                    // layer-level min/avg aggregation to avoid metric contamination.
-                    if (!isRoutingStage(stage))
+                    if (stage == "MOE_ROUTE_CONTRIBUTIONS")
                     {
-                        stats.stages_compared++;
-                        sum_cosine += result.cosine_similarity;
+                        const auto key = "layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
+                        std::size_t ids_size = 0;
+                        const float *ids = activeSnapshot(key, ids_size);
+                        const auto reference_ids = loadPyTorchSnapshot(key);
+                        aligned_route_diagnostic = compareExpertAlignedRouteContributions(
+                            {compare_data, llaminar_size}, pytorch_data,
+                            ids ? std::span<const float>(ids, ids_size) : std::span<const float>{}, reference_ids,
+                            moe_cfg.top_k, moe_cfg.num_experts, config_.cosine_threshold);
                     }
+                    stats.stage_results.push_back(result);
 
                     // Per-stage logging for diagnostics
                     if (result.is_routing_stage)
@@ -11135,11 +13497,6 @@ namespace llaminar2::test::parity
                         stats.max_kurtosis_stage = stage;
                     }
 
-                    if (!isRoutingStage(stage) && result.cosine_similarity < stats.min_cosine_sim)
-                    {
-                        stats.min_cosine_sim = result.cosine_similarity;
-                        stats.worst_stage = stage;
-                    }
                 }
 
                 // Compute per-stage cosine drops (error introduced by each stage)
@@ -11150,29 +13507,25 @@ namespace llaminar2::test::parity
                     {
                         bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
                         bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
-                        if (curr_routing || prev_routing)
+                        if (curr_routing || prev_routing || stats.stage_results[s].integer_mismatch_count ||
+                            stats.stage_results[s - 1].integer_mismatch_count ||
+                            stats.stage_results[s].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery ||
+                            stats.stage_results[s - 1].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
                             continue; // Skip drops involving routing stages
 
                         float drop = stats.stage_results[s - 1].cosine_similarity -
                                      stats.stage_results[s].cosine_similarity;
                         stats.stage_results[s].cosine_drop = drop;
 
-                        if (drop > stats.max_cosine_drop)
-                        {
-                            stats.max_cosine_drop = drop;
-                            stats.max_drop_stage = stats.stage_results[s].stage_name;
-                        }
                     }
                 }
 
-                if (stats.stages_compared > 0)
-                {
-                    stats.avg_cosine_sim = sum_cosine / stats.stages_compared;
-                }
-
-                // Pass criteria based on config
-                float check_value = config_.use_avg_cosine ? stats.avg_cosine_sim : stats.min_cosine_sim;
-                stats.passed = (check_value >= config_.cosine_threshold);
+                // Keep raw adjacent-stage drops above for CSV diagnostics. The
+                // layer aggregate uses one comparable semantic sequence instead.
+                // Append only after original raw metrics/drops; never alter their adjacency.
+                if (aligned_route_diagnostic)
+                    stats.stage_results.push_back(std::move(*aligned_route_diagnostic));
+                finalizePrefillLayerNumerics(stats, config_);
 
                 summary.layer_stats.push_back(stats);
             }
@@ -11187,6 +13540,13 @@ namespace llaminar2::test::parity
                 {
                     size_t vocab_size =
                         static_cast<size_t>(getActiveVocabSize());
+                    if (config_.final_logit_mean_kl &&
+                        (finalParityLogitRow(llaminar_data, llaminar_size, vocab_size).empty() ||
+                         finalParityLogitRow(pytorch_lm_head.data(), pytorch_lm_head.size(), vocab_size).empty()))
+                    {
+                        ADD_FAILURE() << "Final-logit prefill evidence requires complete finite vocabulary rows";
+                        return summary;
+                    }
                     size_t llaminar_seq_len = llaminar_size / vocab_size;
                     size_t pytorch_seq_len = pytorch_lm_head.size() / vocab_size;
 
@@ -11202,6 +13562,9 @@ namespace llaminar2::test::parity
                                            pytorch_lm_head.begin() + pytorch_last_offset + vocab_size),
                         vocab_size, "LM_HEAD");
                     summary.lm_head_cosine = result.cosine_similarity;
+                    summary.lm_head_evidence_valid = result.evidence_valid && vocab_size > 0 &&
+                        llaminar_size >= vocab_size && pytorch_lm_head.size() >= vocab_size &&
+                        llaminar_size % vocab_size == 0 && pytorch_lm_head.size() % vocab_size == 0;
 
                     if (llaminar_seq_len > 0 && pytorch_seq_len > 0)
                     {
@@ -11253,30 +13616,19 @@ namespace llaminar2::test::parity
                     }
                 }
             }
-            summary.lm_head_passed = (summary.lm_head_kl < config_.prefillKLThreshold()) &&
+            summary.lm_head_passed = config_.final_logit_mean_kl
+                ? summary.lm_head_evidence_valid && config_.final_logit_mean_kl->accepts(summary.lm_head_kl, true)
+                : (summary.lm_head_kl < config_.prefillKLThreshold()) &&
                                      ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
                                      ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
                                      (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
 
-            // Count early layers passed
-            summary.early_layers_passed = summary.embedding_passed ? 1 : 0;
-            for (int i = 0; i < std::min(config_.early_layers_count, static_cast<int>(summary.layer_stats.size())); ++i)
-            {
-                if (summary.layer_stats[i].passed)
-                    summary.early_layers_passed++;
-            }
-
-            // Count total layers passed
-            summary.total_layers_passed = summary.embedding_passed ? 1 : 0;
-            for (const auto &stats : summary.layer_stats)
-            {
-                if (stats.passed)
-                    summary.total_layers_passed++;
-            }
-
-            // Overall pass
-            summary.overall_passed = (summary.early_layers_passed >= config_.min_early_layers_passed) &&
-                                     summary.lm_head_passed;
+            if(usesDistributedPipelineEvidence())completePipelinePrefillEvidence(summary);
+            const auto additional_accepted = acceptsAdditionalPrefillEvidence(summary);
+            EXPECT_TRUE(additional_accepted)
+                << "Model-specific complete prefill evidence failed: embedding/logits or original decoder identities";
+            finalizePrefillSummaryNumerics(
+                summary, config_, summary.embedding_passed, additional_accepted);
 
             if (productionParityCampaignEnabled() &&
                 summary.lm_head_llaminar_token >= 0)
@@ -11364,6 +13716,9 @@ namespace llaminar2::test::parity
             // fused gates or other widened projections without silently
             // truncating their comparison.
             std::vector<std::string> per_layer_stages = {
+                "GR_NORM", "GR_READ", "GR_WRITE",
+                "QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
+                "PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION",
                 "ATTENTION_NORM",
                 "Q_PROJECTION", // DIAGNOSTIC: check QKV GEMM output
                 "K_PROJECTION", // DIAGNOSTIC: check K projection
@@ -11399,6 +13754,8 @@ namespace llaminar2::test::parity
                     pytorch_embedding.size(), seq_len);
                 summary.embedding_result = compareTPSnapshot(
                     tp_snap, pytorch_embedding, seq_len, embedding_cols);
+                summary.embedding_evidence_valid = summary.embedding_result.combined_result.evidence_valid &&
+                    summary.embedding_result.combined_elements == summary.embedding_result.reference_elements;
             }
 
             // Compare each layer
@@ -11415,12 +13772,33 @@ namespace llaminar2::test::parity
                     std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage_name;
                     std::string pytorch_key = llaminar_key;
 
-                    if (!available_snapshots.count(llaminar_key))
+                    if (auto integer_result = compareIntegerReference(pytorch_key, llaminar_key, stage_name))
+                    {
+                        TPStageComparisonResult result;
+                        result.stage_name = stage_name;
+                        result.sharding_mode = SnapshotShardingMode::REPLICATED;
+                        result.combined_result = *integer_result;
+                        result.combined_elements = integer_result->total_elements;
+                        result.reference_elements = integer_result->total_elements;
+                        result.combined_passed = result.passed = integer_result->passed;
+                        layer_stats.stage_results.push_back(std::move(result));
                         continue;
+                    }
+                    if (!available_snapshots.count(llaminar_key))
+                    {
+                        if (config_.final_logit_mean_kl)
+                            retainMissingRequiredParityStage(layer_stats, llaminar_key, stage_name,
+                                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
+                        continue;
+                    }
 
                     auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                     if (pytorch_data.empty())
+                    {
+                        if (config_.final_logit_mean_kl)
+                            retainMissingRequiredParityStage(layer_stats, llaminar_key, stage_name, parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
                         continue;
+                    }
 
                     TPSnapshot tp_snap = multi_device->getTPSnapshot(llaminar_key);
                     const size_t reference_cols = parityTPReferenceColumnCount(
@@ -11573,7 +13951,10 @@ namespace llaminar2::test::parity
                 }
 
                 // Pass criteria based on combined cosine
-                layer_stats.passed = (layer_stats.avg_combined_cosine >= config_.cosine_threshold);
+                layer_stats.passed = (layer_stats.avg_combined_cosine >= config_.cosine_threshold) &&
+                    std::all_of(layer_stats.stage_results.begin(), layer_stats.stage_results.end(), [](const auto &stage) {
+                        return !stage.combined_result.integer_mismatch_count || stage.passed;
+                    });
 
                 summary.layer_stats.push_back(layer_stats);
             }
@@ -11591,6 +13972,13 @@ namespace llaminar2::test::parity
                 {
                     // Llaminar may only output the last row (last-token-only optimization).
                     // PyTorch always outputs all rows. Compare the last row from each.
+                    if (config_.final_logit_mean_kl &&
+                        (finalParityLogitRow(combined_ptr, combined_size, vocab_size).empty() ||
+                         finalParityLogitRow(pytorch_lm_head.data(), pytorch_lm_head.size(), vocab_size).empty()))
+                    {
+                        ADD_FAILURE() << "Final-logit prefill evidence requires complete finite vocabulary rows";
+                        return summary;
+                    }
                     size_t llaminar_seq_len = combined_size / vocab_size;
                     size_t pytorch_seq_len = pytorch_lm_head.size() / vocab_size;
                     size_t llaminar_last_offset = (llaminar_seq_len > 0) ? (llaminar_seq_len - 1) * vocab_size : 0;
@@ -11603,6 +13991,11 @@ namespace llaminar2::test::parity
 
                     if (llaminar_seq_len > 0 && pytorch_seq_len > 0)
                     {
+                        summary.lm_head_evidence_valid = vocab_size > 0 && combined_size >= vocab_size &&
+                            pytorch_lm_head.size() >= vocab_size && combined_size % vocab_size == 0 &&
+                            pytorch_lm_head.size() % vocab_size == 0 &&
+                            finiteParityOperands({combined_ptr + llaminar_last_offset, vocab_size}) &&
+                            finiteParityOperands({pytorch_lm_head.data() + pytorch_last_offset, vocab_size});
                         summary.lm_head_kl = computeKLDivergence(
                             combined_ptr + llaminar_last_offset,
                             pytorch_lm_head.data() + pytorch_last_offset,
@@ -11634,30 +14027,18 @@ namespace llaminar2::test::parity
                     }
                 }
             }
-            summary.lm_head_passed = (summary.lm_head_kl < config_.prefillKLThreshold()) &&
+            summary.lm_head_passed = config_.final_logit_mean_kl
+                ? summary.lm_head_evidence_valid && config_.final_logit_mean_kl->accepts(summary.lm_head_kl, true)
+                : (summary.lm_head_kl < config_.prefillKLThreshold()) &&
                                      ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
                                      ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
                                      (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
 
-            // Count early layers passed
-            summary.early_layers_passed = summary.embedding_result.passed ? 1 : 0;
-            for (int i = 0; i < std::min(config_.early_layers_count, static_cast<int>(summary.layer_stats.size())); ++i)
-            {
-                if (summary.layer_stats[i].passed)
-                    summary.early_layers_passed++;
-            }
-
-            // Count total layers passed
-            summary.total_layers_passed = summary.embedding_result.passed ? 1 : 0;
-            for (const auto &stats : summary.layer_stats)
-            {
-                if (stats.passed)
-                    summary.total_layers_passed++;
-            }
-
-            // Overall pass
-            summary.overall_passed = (summary.early_layers_passed >= config_.min_early_layers_passed) &&
-                                     summary.lm_head_passed;
+            const auto additional_accepted = acceptsAdditionalPrefillEvidence(summary);
+            EXPECT_TRUE(additional_accepted)
+                << "Model-specific complete prefill evidence failed: embedding/logits or original decoder identities";
+            finalizePrefillSummaryNumerics(
+                summary, config_, summary.embedding_result.passed, additional_accepted);
 
             return summary;
         }
@@ -11813,6 +14194,23 @@ namespace llaminar2::test::parity
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
                 step_stats.has_logit_data = true;
+                if (config_.final_logit_mean_kl)
+                {
+                    size_t actual_elements = 0;
+                    const auto *actual = activeSnapshot("LM_HEAD", actual_elements);
+                    const auto actual_row = finalParityLogitRow(actual, actual_elements, vocab_size);
+                    const auto reference_row = finalParityLogitRow(pytorch_lm_head.data(), pytorch_lm_head.size(), vocab_size);
+                    step_stats.logit_evidence_valid = !actual_row.empty() && !reference_row.empty();
+                    if (!step_stats.logit_evidence_valid)
+                    {
+                        ADD_FAILURE() << "Final-logit TP decode step " << step << " requires complete finite vocabulary rows";
+                        summary.step_stats.push_back(std::move(step_stats));
+                        continue;
+                    }
+                    llaminar_logits = actual_row.data(); pytorch_logits = reference_row.data();
+                    pytorch_logits_count = reference_row.size();
+                }
+
 
                 step_stats.cosine_similarity = computeCosineSimilarity(
                     llaminar_logits, pytorch_logits,
@@ -11875,8 +14273,11 @@ namespace llaminar2::test::parity
                     summary.top3_matches++;
 
                 // Pass criteria: either cosine >= threshold OR KL < threshold
-                step_stats.passed = (step_stats.cosine_similarity >= config_.decode_cosine_threshold) ||
-                                    (step_stats.kl_divergence < config_.kl_threshold);
+                step_stats.passed = config_.final_logit_mean_kl
+                    ? step_stats.logit_evidence_valid && config_.final_logit_mean_kl->accepts(step_stats.kl_divergence, false) &&
+                        acceptsFinalLogitRawEvidence(step_stats.layer_stats, config_, ParityForwardPhase::Decode)
+                    : (step_stats.cosine_similarity >= config_.decode_cosine_threshold) ||
+                        (step_stats.kl_divergence < config_.kl_threshold);
 
                 if (step_stats.passed)
                 {
@@ -11900,13 +14301,14 @@ namespace llaminar2::test::parity
             }
 
             // Overall pass criteria
-            int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
-            bool topk_gate = (config_.pytorch_top1_in_topk <= 0) ||
-                             (summary.top3_matches == summary.steps_total);
-            summary.overall_passed = (summary.steps_passed >= min_steps_required) &&
-                                     (summary.top5_accuracy >= config_.min_top5_accuracy) &&
-                                     (summary.avg_cosine >= config_.decode_cosine_threshold) &&
-                                     topk_gate;
+            const auto structural = config_.final_logit_mean_kl
+                ? acceptsAdditionalDecodeEvidence(summary) : ::testing::AssertionSuccess();
+            finalizeDecodeSummaryNumerics(summary, config_, structural);
+            if (config_.final_logit_mean_kl)
+            {
+                EXPECT_TRUE(structural) << structural.message();
+            }
+
 
             activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
             assertParityMoERebalanceExercise(
@@ -11927,6 +14329,25 @@ namespace llaminar2::test::parity
             if (isRank0())
             {
                 renderTPParityTable(summary, config_, getBackendName());
+            }
+
+            if (config_.final_logit_mean_kl)
+            {
+                exportTPPrefillCSV(summary);
+                const auto raw = acceptsFinalLogitSummaryRawEvidence(summary, config_, ParityForwardPhase::Prefill);
+                EXPECT_TRUE(raw) << raw.message();
+                if (!summary.embedding_evidence_valid || !summary.lm_head_evidence_valid)
+                {
+                    ADD_FAILURE() << "Final-logit structural evidence phase=prefill: missing, nonfinite or malformed embedding/final-logit operands";
+                }
+                else
+                {
+                    EXPECT_TRUE(config_.final_logit_mean_kl->accepts(summary.lm_head_kl, true))
+                        << "Final-logit numerical limit phase=prefill meanKL=" << summary.lm_head_kl
+                        << " requires meanKL < " << config_.final_logit_mean_kl->prefill_maximum;
+                }
+                EXPECT_TRUE(summary.overall_passed) << "Final-logit TP prefill failed its KL or complete structural evidence contract";
+                return;
             }
 
             // Assertions
@@ -11978,6 +14399,7 @@ namespace llaminar2::test::parity
                 summary.embedding_result.combined_result.cosine_similarity;
             canonical.embedding_passed =
                 summary.embedding_result.combined_passed;
+            canonical.embedding_evidence_valid = summary.embedding_evidence_valid;
             canonical.lm_head_cosine = summary.lm_head_cosine;
             canonical.lm_head_kl = summary.lm_head_kl;
             canonical.lm_head_top1 = summary.lm_head_top1;
@@ -11985,6 +14407,7 @@ namespace llaminar2::test::parity
             canonical.lm_head_pytorch_top1_in_top3 =
                 summary.lm_head_pytorch_top1_in_top3;
             canonical.lm_head_passed = summary.lm_head_passed;
+            canonical.lm_head_evidence_valid = summary.lm_head_evidence_valid;
             canonical.early_layers_passed = summary.early_layers_passed;
             canonical.total_layers_passed = summary.total_layers_passed;
             canonical.overall_passed = summary.overall_passed;
@@ -12118,6 +14541,24 @@ namespace llaminar2::test::parity
                 }
             }
 
+            if (config_.final_logit_mean_kl)
+            {
+                const auto raw = acceptsFinalLogitSummaryRawEvidence(summary, config_, ParityForwardPhase::Prefill);
+                EXPECT_TRUE(raw) << raw.message();
+                if (!summary.embedding_evidence_valid || !summary.lm_head_evidence_valid)
+                {
+                    ADD_FAILURE() << "Final-logit structural evidence phase=prefill: missing, nonfinite or malformed embedding/final-logit operands";
+                }
+                else
+                {
+                    EXPECT_TRUE(config_.final_logit_mean_kl->accepts(summary.lm_head_kl, true))
+                        << "Final-logit numerical limit phase=prefill meanKL=" << summary.lm_head_kl
+                        << " requires meanKL < " << config_.final_logit_mean_kl->prefill_maximum;
+                }
+                EXPECT_TRUE(summary.overall_passed) << "Final-logit prefill failed its KL or complete structural evidence contract";
+                return;
+            }
+
             // Early layer assertions (skip if this rank has no early layer data, e.g. PP tail)
             if (has_early_layer_data)
             {
@@ -12199,6 +14640,9 @@ namespace llaminar2::test::parity
 
             // Stages to compare per layer during decode (same as prefill)
             const std::vector<std::string> decode_per_layer_stages = {
+                "GR_NORM", "GR_READ", "GR_WRITE",
+                "QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
+                "PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION",
                 "ATTENTION_NORM",
                 "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
                 "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
@@ -12209,7 +14653,7 @@ namespace llaminar2::test::parity
                 "FFN_NORM",
                 "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN",
                 "MOE_ROUTER_OUTPUT", "MOE_ROUTING_INDICES", "MOE_ROUTING_WEIGHTS",
-                "MOE_EXPERT_OUTPUT", "MOE_SHARED_EXPERT_OUTPUT", "MOE_SHARED_GATE_OUTPUT", "MOE_COMBINED_OUTPUT",
+                "MOE_ROUTE_CONTRIBUTIONS", "MOE_EXPERT_OUTPUT", "MOE_SHARED_EXPERT_OUTPUT", "MOE_SHARED_GATE_OUTPUT", "MOE_COMBINED_OUTPUT",
                 "FFN_RESIDUAL"};
 
             // Check if decode snapshots exist
@@ -12438,13 +14882,25 @@ namespace llaminar2::test::parity
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
                 step_stats.has_logit_data = llaminar_logits != nullptr;
+                if (config_.final_logit_mean_kl && llaminar_logits)
+                {
+                    const auto actual_row = finalParityLogitRow(llaminar_logits, decode_logits_size, vocab_size);
+                    const auto reference_row = finalParityLogitRow(pytorch_lm_head.data(), pytorch_lm_head.size(), vocab_size);
+                    step_stats.logit_evidence_valid = !actual_row.empty() && !reference_row.empty();
+                    if (step_stats.logit_evidence_valid)
+                    {
+                        llaminar_logits = actual_row.data(); decode_logits_size = actual_row.size();
+                        pytorch_logits = reference_row.data(); pytorch_logits_count = reference_row.size();
+                    }
+                }
+
 
                 // ---------------------------------------------------------------
                 // Per-layer cosine similarity comparison for this decode step
                 // ---------------------------------------------------------------
                 {
                     auto scope = profileParityScope("decode_parity.step.layer_compare");
-                    int n_layers = parityLayerCount();
+                    int n_layers = usesDistributedPipelineEvidence() ? config_.early_layers_count : parityLayerCount();
                     auto snapshot_keys = activeSnapshotKeys();
                     std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
                     const auto gdn_cfg_decode = getGDNHeadConfig();
@@ -12452,9 +14908,11 @@ namespace llaminar2::test::parity
 
                     for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
                     {
+                        if(usesDistributedPipelineEvidence() &&
+                           !ownsPipelineParityKey("layer"+std::to_string(layer_idx)+"_"))continue;
                         LayerStats stats;
+                        std::optional<StageComparisonResult> aligned_route_diagnostic;
                         stats.layer_idx = layer_idx;
-                        float sum_cosine = 0.0f;
                         bool routed_expert_set_exact = true;
 
                         for (const auto &stage : decode_per_layer_stages)
@@ -12476,9 +14934,18 @@ namespace llaminar2::test::parity
 
                             // PyTorch snapshot key: decode_step{N}_layer{L}_{STAGE}
                             std::string pytorch_key = step_prefix + "_layer" + std::to_string(layer_idx) + "_" + stage;
+                            if (auto integer_result = compareIntegerReference(pytorch_key, semantic_key, stage, step))
+                            {
+                                stats.stage_results.push_back(*integer_result);
+                                continue;
+                            }
                             auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                             if (pytorch_data.empty())
+                            {
+                                if (config_.final_logit_mean_kl)
+                                    retainMissingRequiredParityStage(stats, semantic_key, stage, parityGraphSnapshotPolicy(ParityForwardPhase::Decode).requiredSnapshotKeys(ParityForwardPhase::Decode));
                                 continue;
+                            }
 
                             const bool stage_requires_reduction =
                                 !config_.allreduce_stages.empty() &&
@@ -12522,13 +14989,22 @@ namespace llaminar2::test::parity
                             }
 
                             if (!has_local_snapshot)
+                            {
+                                if (config_.final_logit_mean_kl)
+                                    retainMissingRequiredParityStage(stats, semantic_key, stage, parityGraphSnapshotPolicy(ParityForwardPhase::Decode).requiredSnapshotKeys(ParityForwardPhase::Decode));
                                 continue;
+                            }
 
                             size_t llaminar_size;
                             const float *llaminar_data = activeSnapshot(llaminar_key, llaminar_size);
                             if (!llaminar_data)
+                            {
+                                if (config_.final_logit_mean_kl)
+                                    retainMissingRequiredParityStage(stats, semantic_key, stage, parityGraphSnapshotPolicy(ParityForwardPhase::Decode).requiredSnapshotKeys(ParityForwardPhase::Decode));
                                 continue;
+                            }
 
+                            std::optional<RouteContributionReferenceWindow> route_reference_window;
                             // PyTorch decode snapshots contain full-sequence output
                             // (all positions including prompt), while Llaminar only
                             // captures the last position during incremental decode.
@@ -12537,13 +15013,22 @@ namespace llaminar2::test::parity
                                 pytorch_data.size() % llaminar_size == 0)
                             {
                                 size_t last_offset = pytorch_data.size() - llaminar_size;
+                                if (stage == "MOE_ROUTE_CONTRIBUTIONS" ||
+                                    (config_.final_logit_mean_kl && stage == "MOE_ROUTING_WEIGHTS"))
+                                    route_reference_window = RouteContributionReferenceWindow::checked(
+                                        pytorch_data.size(), last_offset, llaminar_size);
                                 pytorch_data = std::vector<float>(
                                     pytorch_data.begin() + static_cast<ptrdiff_t>(last_offset),
                                     pytorch_data.end());
                             }
                             else if (pytorch_data.size() != llaminar_size)
                             {
-                                continue; // Size mismatch, skip
+                                if (config_.final_logit_mean_kl)
+                                {
+                                    StageComparisonResult invalid; invalid.stage_name = stage;
+                                    stats.stage_results.push_back(std::move(invalid));
+                                }
+                                continue; // Legacy diagnostic skip; selected contract retains failure.
                             }
 
                             // Apply GDN V-head permutation if needed
@@ -12586,7 +15071,19 @@ namespace llaminar2::test::parity
                                 size_t ll_idx_size;
                                 const float *ll_idx = activeSnapshot(ll_idx_key, ll_idx_size);
                                 auto pt_idx = loadPyTorchSnapshot(pt_idx_key);
-                                if (ll_idx && !pt_idx.empty())
+                                if (config_.final_logit_mean_kl && route_reference_window && ll_idx && ll_idx_size == llaminar_size)
+                                {
+                                    const auto selected_ids = route_reference_window->projectIds(
+                                        pt_idx, ll_idx_size, pytorch_data.size(), moe_cfg_decode.top_k);
+                                    pt_idx = std::vector<float>(selected_ids.begin(), selected_ids.end());
+                                }
+                                if (config_.final_logit_mean_kl && !parityRouteFrameHasExactExtents(
+                                    {decode_compare, llaminar_size}, pytorch_data,
+                                    ll_idx ? std::span<const float>(ll_idx, ll_idx_size) : std::span<const float>{}, pt_idx))
+                                {
+                                    result.stage_name = stage;
+                                }
+                                else if (ll_idx && !pt_idx.empty())
                                     result = compareRoutingWeights(decode_compare, pytorch_data, ll_idx, pt_idx,
                                                                    llaminar_size, moe_cfg_decode.top_k,
                                                                    moe_cfg_decode.num_experts, stage);
@@ -12597,24 +15094,20 @@ namespace llaminar2::test::parity
                             {
                                 result = compareTensors(decode_compare, pytorch_data, llaminar_size, stage);
                             }
+                            if (stage == "MOE_ROUTE_CONTRIBUTIONS")
+                            {
+                                const auto key = "layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
+                                std::size_t ids_size = 0;
+                                const float *ids = activeSnapshot(key, ids_size);
+                                const auto reference_ids = loadPyTorchSnapshot(
+                                    "decode_step" + std::to_string(step) + "_" + key);
+                                aligned_route_diagnostic = compareExpertAlignedRouteContributions(
+                                    {decode_compare, llaminar_size}, pytorch_data,
+                                    ids ? std::span<const float>(ids, ids_size) : std::span<const float>{}, reference_ids,
+                                    moe_cfg_decode.top_k, moe_cfg_decode.num_experts, config_.cosine_threshold,
+                                    route_reference_window);
+                            }
                             stats.stage_results.push_back(result);
-
-                            const bool contributes_to_layer_cosine =
-                                parityStageContributesToLayerCosine(
-                                    stage,
-                                    routed_expert_set_exact);
-                            if (contributes_to_layer_cosine)
-                            {
-                                stats.stages_compared++;
-                                sum_cosine += result.cosine_similarity;
-                            }
-
-                            if (contributes_to_layer_cosine &&
-                                result.cosine_similarity < stats.min_cosine_sim)
-                            {
-                                stats.min_cosine_sim = result.cosine_similarity;
-                                stats.worst_stage = stage;
-                            }
                         }
 
                         // Compute per-stage cosine drops (error introduced by each stage)
@@ -12625,7 +15118,10 @@ namespace llaminar2::test::parity
                             {
                                 bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
                                 bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
-                                if (curr_routing || prev_routing)
+                                if (curr_routing || prev_routing || stats.stage_results[s].integer_mismatch_count ||
+                            stats.stage_results[s - 1].integer_mismatch_count ||
+                            stats.stage_results[s].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery ||
+                            stats.stage_results[s - 1].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
                                     continue;
 
                                 float drop = stats.stage_results[s - 1].cosine_similarity -
@@ -12640,11 +15136,14 @@ namespace llaminar2::test::parity
                             }
                         }
 
-                        if (stats.stages_compared > 0)
-                        {
-                            stats.avg_cosine_sim = sum_cosine / stats.stages_compared;
-                        }
-                        stats.passed = (stats.avg_cosine_sim >= config_.decode_cosine_threshold);
+                        // The same witness authority as prefill checks ALL raw
+                        // floating/integer records before cosine eligibility.
+                        // Raw per-stage drops above remain available in CSV;
+                        // aggregate drops use comparable semantic stages only.
+                        // Append only after original raw metrics/drops; never alter their adjacency.
+                        if (aligned_route_diagnostic)
+                            stats.stage_results.push_back(std::move(*aligned_route_diagnostic));
+                        finalizeDecodeLayerNumerics(stats, config_, routed_expert_set_exact);
 
                         step_stats.layer_stats.push_back(stats);
                     }
@@ -12661,6 +15160,13 @@ namespace llaminar2::test::parity
                 // leave aggregate logit metrics to the tail rank.
                 if (!step_stats.has_logit_data)
                 {
+                    summary.step_stats.push_back(std::move(step_stats));
+                    continue;
+                }
+
+                if (config_.final_logit_mean_kl && !step_stats.logit_evidence_valid)
+                {
+                    ADD_FAILURE() << "Final-logit decode step " << step << " requires complete finite vocabulary rows";
                     summary.step_stats.push_back(std::move(step_stats));
                     continue;
                 }
@@ -12750,8 +15256,11 @@ namespace llaminar2::test::parity
                 }
 
                 // Pass criteria: either cosine >= threshold OR KL < threshold
-                step_stats.passed = (step_stats.cosine_similarity >= config_.decode_cosine_threshold) ||
-                                    (step_stats.kl_divergence < config_.kl_threshold);
+                step_stats.passed = config_.final_logit_mean_kl
+                    ? step_stats.logit_evidence_valid && config_.final_logit_mean_kl->accepts(step_stats.kl_divergence, false) &&
+                        acceptsFinalLogitRawEvidence(step_stats.layer_stats, config_, ParityForwardPhase::Decode)
+                    : (step_stats.cosine_similarity >= config_.decode_cosine_threshold) ||
+                        (step_stats.kl_divergence < config_.kl_threshold);
 
                 if (step_stats.passed)
                 {
@@ -12764,6 +15273,7 @@ namespace llaminar2::test::parity
                 summary.step_stats.push_back(step_stats);
             }
 
+            if(usesDistributedPipelineEvidence())completePipelineDecodeEvidence(summary,sum_cosine,sum_kl);
             // Compute aggregate statistics
             if (summary.steps_total > 0)
             {
@@ -12775,13 +15285,14 @@ namespace llaminar2::test::parity
             }
 
             // Overall pass criteria
-            int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
-            bool topk_gate = (config_.pytorch_top1_in_topk <= 0) ||
-                             (summary.top3_matches == summary.steps_total);
-            summary.overall_passed = (summary.steps_passed >= min_steps_required) &&
-                                     (summary.top5_accuracy >= config_.min_top5_accuracy) &&
-                                     (summary.avg_cosine >= config_.decode_cosine_threshold) &&
-                                     topk_gate;
+            const auto structural = config_.final_logit_mean_kl
+                ? acceptsAdditionalDecodeEvidence(summary) : ::testing::AssertionSuccess();
+            finalizeDecodeSummaryNumerics(summary, config_, structural);
+            if (config_.final_logit_mean_kl)
+            {
+                EXPECT_TRUE(structural) << structural.message();
+            }
+
 
             activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
             assertParityMoERebalanceExercise(
@@ -13029,6 +15540,12 @@ namespace llaminar2::test::parity
             // Skip if no decode steps were tested
             if (summary.steps_total == 0)
             {
+                if (config_.final_logit_mean_kl)
+                {
+                    exportDecodeCSV(summary);
+                    ADD_FAILURE() << "Final-logit contract requires its complete original teacher-forced trajectory";
+                    return;
+                }
                 GTEST_SKIP() << "No decode snapshots found - skipping decode parity assertions";
             }
 
@@ -13064,6 +15581,21 @@ namespace llaminar2::test::parity
             {
                 auto export_scope = profileParityScope("assert_decode.export_csv");
                 exportDecodeCSV(summary);
+            }
+
+            if (config_.final_logit_mean_kl)
+            {
+                const auto metrics = acceptsFinalLogitDecodeEvidence(summary, *config_.final_logit_mean_kl);
+                const auto structural = acceptsAdditionalDecodeEvidence(summary);
+                EXPECT_TRUE(metrics) << metrics.message();
+                EXPECT_TRUE(structural) << structural.message();
+                for (const auto &step : summary.step_stats)
+                {
+                    const auto raw = acceptsFinalLogitSummaryRawEvidence(step, config_, ParityForwardPhase::Decode, step.step_idx);
+                    EXPECT_TRUE(raw) << "step " << step.step_idx << ": " << raw.message();
+                }
+                EXPECT_TRUE(summary.overall_passed) << "Final-logit decode failed independent per-step or structural evidence";
+                return;
             }
 
             // Decode also captures per-layer snapshots when the runner exposes
@@ -13206,6 +15738,24 @@ namespace llaminar2::test::parity
                 return;
             }
 
+            std::optional<ParityTestSummary> original_fragment;
+            if(summary.pipeline_evidence)
+            {
+                original_fragment=summary;
+                if(summary.pipeline_evidence->headRank()!=mpiRank())
+                {
+                    original_fragment->embedding_cosine=0;original_fragment->embedding_passed=false;
+                    original_fragment->embedding_evidence_valid=false;
+                }
+                if(summary.pipeline_evidence->tailRank()!=mpiRank())
+                {
+                    original_fragment->lm_head_cosine=original_fragment->lm_head_kl=0;
+                    original_fragment->lm_head_top1=original_fragment->lm_head_top5=0;
+                    original_fragment->lm_head_passed=false;original_fragment->lm_head_evidence_valid=false;
+                    original_fragment->lm_head_pytorch_top1_in_top3=false;
+                }
+            }
+            const auto& local_summary=original_fragment ? *original_fragment : summary;
             ASSERT_NE(mpi_ctx_, nullptr);
             ASSERT_GT(mpiWorldSize(), 1);
 
@@ -13226,27 +15776,26 @@ namespace llaminar2::test::parity
             };
 
             RankPrefillSummary local{};
-            local.embedding_cosine = summary.embedding_cosine;
-            local.embedding_passed = summary.embedding_passed ? 1 : 0;
-            local.has_embedding_data =
-                (summary.embedding_passed || summary.embedding_cosine != 0.0f)
-                    ? 1
-                    : 0;
-            local.lm_head_cosine = summary.lm_head_cosine;
-            local.lm_head_kl = summary.lm_head_kl;
-            local.lm_head_top1 = summary.lm_head_top1;
-            local.lm_head_top5 = summary.lm_head_top5;
+            local.embedding_cosine = local_summary.embedding_cosine;
+            local.embedding_passed = local_summary.embedding_passed ? 1 : 0;
+            local.has_embedding_data = summary.pipeline_evidence
+                ? int(local_summary.embedding_evidence_valid)
+                : int(local_summary.embedding_passed || local_summary.embedding_cosine != 0.0f);
+            local.lm_head_cosine = local_summary.lm_head_cosine;
+            local.lm_head_kl = local_summary.lm_head_kl;
+            local.lm_head_top1 = local_summary.lm_head_top1;
+            local.lm_head_top5 = local_summary.lm_head_top5;
             local.lm_head_top1_in_topk =
-                summary.lm_head_pytorch_top1_in_top3 ? 1 : 0;
-            local.lm_head_passed = summary.lm_head_passed ? 1 : 0;
+                local_summary.lm_head_pytorch_top1_in_top3 ? 1 : 0;
+            local.lm_head_passed = local_summary.lm_head_passed ? 1 : 0;
             local.has_lm_head_data =
-                (summary.lm_head_passed || summary.lm_head_cosine != 0.0f ||
-                 summary.lm_head_kl != 0.0f || summary.lm_head_top1 != 0.0f ||
-                 summary.lm_head_top5 != 0.0f)
+                (local_summary.lm_head_passed || local_summary.lm_head_cosine != 0.0f ||
+                 local_summary.lm_head_kl != 0.0f || local_summary.lm_head_top1 != 0.0f ||
+                 local_summary.lm_head_top5 != 0.0f)
                     ? 1
                     : 0;
-            local.early_layers_passed = summary.early_layers_passed;
-            local.total_layers_passed = summary.total_layers_passed;
+            local.early_layers_passed = local_summary.early_layers_passed;
+            local.total_layers_passed = local_summary.total_layers_passed;
 
             std::vector<RankPrefillSummary> rank_summaries(
                 static_cast<size_t>(mpiWorldSize()));
@@ -13260,7 +15809,7 @@ namespace llaminar2::test::parity
                 dir / (".pipeline_prefill_rank_" + std::to_string(mpiRank()));
             const int32_t local_write_ok =
                 ParityCSVArtifactWriter::writePrefill(
-                    fragment_dir, getBackendName(), summary)
+                    fragment_dir, getBackendName(), local_summary)
                     ? 1
                     : 0;
             std::vector<int32_t> write_status(
@@ -13275,8 +15824,8 @@ namespace llaminar2::test::parity
             if (isRank0())
             {
                 ParityTestSummary aggregate;
-                const auto &head = rank_summaries.front();
-                const auto &tail = rank_summaries.back();
+                const auto &head = rank_summaries[summary.pipeline_evidence ? summary.pipeline_evidence->headRank() : 0];
+                const auto &tail = rank_summaries[summary.pipeline_evidence ? summary.pipeline_evidence->tailRank() : rank_summaries.size()-1];
                 EXPECT_EQ(head.has_embedding_data, 1)
                     << "Pipeline head published no embedding comparison";
                 EXPECT_EQ(tail.has_lm_head_data, 1)
@@ -13303,6 +15852,12 @@ namespace llaminar2::test::parity
                         config_.min_early_layers_passed &&
                     aggregate.lm_head_passed;
 
+                if(summary.pipeline_evidence)
+                {
+                    aggregate.overall_passed=summary.overall_passed;
+                    aggregate.embedding_evidence_valid=summary.embedding_evidence_valid;
+                    aggregate.lm_head_evidence_valid=summary.lm_head_evidence_valid;
+                }
                 std::vector<std::filesystem::path> rank_dirs;
                 rank_dirs.reserve(static_cast<size_t>(mpiWorldSize()));
                 for (int rank = 0; rank < mpiWorldSize(); ++rank)
@@ -13360,6 +15915,10 @@ namespace llaminar2::test::parity
                 return;
             }
 
+            auto original_fragment=summary;
+            for(auto& step:original_fragment.step_stats)
+                if(step.pipeline_evidence && step.pipeline_evidence->tailRank()!=mpiRank())
+                    step.has_logit_data=false;
             ASSERT_NE(mpi_ctx_, nullptr);
             ASSERT_GT(mpiWorldSize(), 1);
             const auto dir = ensureResultsDir();
@@ -13367,7 +15926,7 @@ namespace llaminar2::test::parity
                 dir / (".pipeline_decode_rank_" + std::to_string(mpiRank()));
             const int32_t local_write_ok =
                 ParityCSVArtifactWriter::writeDecode(
-                    fragment_dir, getBackendName(), summary)
+                    fragment_dir, getBackendName(), original_fragment)
                     ? 1
                     : 0;
             std::vector<int32_t> write_status(

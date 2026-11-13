@@ -4,7 +4,9 @@
  *
  * Backends pass this descriptor unchanged to the controller initializer. Its
  * device ticket pointer authenticates continuation without exposing mutable
- * depth state to the host or allocating a second copy of that state.
+ * depth state to the host or allocating a second copy of that state. A graph
+ * with native pre-admission failure producers may additionally retain the same
+ * canonical first-error word until the existing ordered request-reset boundary.
  */
 #pragma once
 #include <cstdint>
@@ -23,6 +25,16 @@ namespace llaminar2::sampling_math
         ContinueResponse,
     };
 
+    /** @brief Whether response admission may discard an earlier forward failure.
+     * A model with pre-admission native failure producers selects preservation;
+     * only the existing request-reset transaction may then clear that status.
+     */
+    enum class DeviceGenerationForwardFailurePolicy : int
+    {
+        ResetAtResponseAdmission,
+        PreserveUntilRequestReset,
+    };
+
     /**
      * @brief Immutable identity for initializing resident response-window data.
      *
@@ -38,13 +50,18 @@ namespace llaminar2::sampling_math
         uint64_t session_epoch = 0; ///< Immutable request identity, never a live counter.
         uint64_t workspace_generation = 0; ///< Arena identity owning the retained row.
         const DeviceGenerationDispatchTicket *prior_tickets = nullptr; ///< Existing device ticket storage.
+        DeviceGenerationForwardFailurePolicy forward_failure_policy =
+            DeviceGenerationForwardFailurePolicy::ResetAtResponseAdmission; ///< Immutable graph-owned failure lifetime.
 
         /** @return Whether the immutable descriptor can authenticate its boundary. */
         LLAMINAR_GENERATION_ADMISSION_HD bool valid() const
         {
-            return kind == DeviceGenerationAdmissionKind::NewRequest ||
+            const bool valid_forward_policy =
+                forward_failure_policy == DeviceGenerationForwardFailurePolicy::ResetAtResponseAdmission ||
+                forward_failure_policy == DeviceGenerationForwardFailurePolicy::PreserveUntilRequestReset;
+            return valid_forward_policy && (kind == DeviceGenerationAdmissionKind::NewRequest ||
                 (kind == DeviceGenerationAdmissionKind::ContinueResponse &&
-                 session_epoch != 0 && workspace_generation != 0 && prior_tickets);
+                 session_epoch != 0 && workspace_generation != 0 && prior_tickets));
         }
 
     };

@@ -269,7 +269,7 @@ namespace llaminar2::test
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(
             result,
-            "routed_prefill_assignment=least-loaded-resident but is not a multi-participant collective domain"));
+            "expert_prefill_assignment=least-loaded-resident but is not a multi-participant collective domain"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedDecodeAssignmentOnSingleParticipantDomains)
@@ -286,7 +286,7 @@ namespace llaminar2::test
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(
             result,
-            "routed_decode_assignment=least-loaded-resident but is not a multi-participant collective domain"));
+            "expert_decode_assignment=least-loaded-resident but is not a multi-participant collective domain"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedPrefillAssignmentWhenWorkIsNotParticipantAssigned)
@@ -301,7 +301,7 @@ namespace llaminar2::test
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(
             result,
-            "routed_prefill_assignment=least-loaded-resident but that workload does not use participant-assigned complete experts"));
+            "expert_prefill_assignment=least-loaded-resident but that workload does not use participant-assigned complete experts"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedDecodeAssignmentWhenWorkIsNotParticipantAssigned)
@@ -319,7 +319,7 @@ namespace llaminar2::test
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(
             result,
-            "routed_decode_assignment=least-loaded-resident but that workload does not use participant-assigned complete experts"));
+            "expert_decode_assignment=least-loaded-resident but that workload does not use participant-assigned complete experts"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, AcceptsValidThreeTierTieredOverlayPlan)
@@ -505,7 +505,7 @@ namespace llaminar2::test
         const auto result = validateMoERoutedExpertPlacementPlan(plan, twoLayerFourExpertOptions());
 
         EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "routed_compute=tensor-sharded"));
+        EXPECT_TRUE(hasErrorContaining(result, "expert_compute=tensor-sharded"));
         EXPECT_TRUE(hasErrorContaining(result, "multi-participant collective domain"));
     }
 

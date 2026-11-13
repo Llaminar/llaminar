@@ -1,0 +1,2469 @@
+/**
+ * @file Perf__CUDANativeQuantisedGemm.cpp
+ * @brief Correctness and performance harness for tensor-core native-quantised prefill GEMM.
+ *
+ * Production-prepared weights and persistent explicit-stream workspaces back
+ * every candidate. Full-output serial byte comparisons are separate from
+ * native-event timing, and compiler resource checks reject new spilling
+ * specializations before they can enter the timing corpus. Functional resource
+ * certification is registered independently from the performance tournament.
+ * Every installable timing row measures a retained native graph of complete
+ * projection operations and records its amortization count in the raw corpus.
+ * IQ4_XS resource sweeps use physical24 including its secondary plane;
+ * installed tile/staging expectation remains the explicit source4 schedule.
+ */
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <set>
+#include <span>
+#include <thread>
+#include <tuple>
+
+#ifdef HAVE_CUDA
+
+#include <cuda_runtime.h>
+
+#include "../../native_quantised_dispatch/GPUTrainerVerification.h"
+#include "CUDANativeQuantisedGemmPerfCommon.h"
+#include "../../../../utils/ScopedGPUStream.h"
+#include "../../../../utils/CUDACapturedKernelProbe.h"
+#include "../../../../utils/DensePrefillTiming.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedPrefillDiagnostics.h"
+#include "kernels/cuda/gemm/CUDADenseProductionPrefillOverlayGenerated.inc"
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
+#include "fort.hpp"
+
+using namespace llaminar2::test::native_quantised_gemm_perf;
+using llaminar2::DeviceId;
+using llaminar2::DeviceWorkspaceManager;
+using llaminar2::FP32Tensor;
+using llaminar2::ITensorGemm;
+using llaminar2::IWorkspaceConsumer;
+using llaminar2::test::TestTensorFactory;
+using llaminar2::TensorBase;
+using llaminar2::WorkspaceDescriptor;
+using llaminar2::WorkspaceRequirements;
+using llaminar2::cuda::prefill::PrefillStagingSchedule;
+
+extern "C"
+{
+    void cudaNativeQuantisedPrefill_setBK256Mode(int mode);
+    int cudaNativeQuantisedPrefill_getBK256Mode();
+    void cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(bool enabled);
+    bool cudaNativeQuantisedPrefill_getCanonicalKPartitionMode();
+    void cudaNativeQuantisedPrefill_setExactOverlayEnabled(bool enabled);
+    bool cudaNativeQuantisedPrefill_getExactOverlayEnabled();
+    void cudaNativeQuantisedPrefill_setForceTile(int tile_id);
+    void cudaNativeQuantisedPrefill_getForceTile(int *tile_id);
+    void cudaNativeQuantisedPrefill_getLastLaunchSelection(
+        int *tile_id,
+        int *k_partitions,
+        int *used_bk256,
+        int *used_canonical_kpart);
+    int cudaNativeQuantisedPrefill_getTileCount(int tile_id, int M, int N);
+    bool cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        int n,
+        int k,
+        int *shape_id,
+        int *tile_n,
+        int *cpt,
+        int *exact_kb);
+    double cudaNativeQuantisedGemvTuned_measureGeneratedDispatchNs(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        const int *ns,
+        const int *ks,
+        int query_count,
+        int iterations,
+        uint64_t *out_checksum);
+}
+
+namespace
+{
+    /**
+     * @brief Temporarily expose the generic prefill policy to a tournament.
+     *
+     * Incremental collection often runs after older exact overlays have been
+     * installed. The AUTO evidence row must still mean the generic policy,
+     * otherwise an old winner can masquerade as AUTO and contaminate both
+     * candidate identity and workspace publication. The guard restores the
+     * process's production setting even when a GoogleTest assertion unwinds.
+     */
+    class ScopedDensePrefillOverlayBypass
+    {
+    public:
+        /** @brief Preserve thread-local policy while collecting generic evidence. */
+        ScopedDensePrefillOverlayBypass()
+            : previous_(cudaNativeQuantisedPrefill_getExactOverlayEnabled()),
+              previous_staging_(cudaNativeQuantisedPrefill_getStagingSchedule())
+        {
+            cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
+        }
+
+        /** @brief Restore both independent policies, including assertion unwinding. */
+        ~ScopedDensePrefillOverlayBypass()
+        {
+            cudaNativeQuantisedPrefill_setStagingSchedule(previous_staging_);
+            cudaNativeQuantisedPrefill_setExactOverlayEnabled(previous_);
+        }
+
+        ScopedDensePrefillOverlayBypass(
+            const ScopedDensePrefillOverlayBypass &) = delete;
+        ScopedDensePrefillOverlayBypass &operator=(
+            const ScopedDensePrefillOverlayBypass &) = delete;
+
+    private:
+        bool previous_ = true;
+        PrefillStagingSchedule previous_staging_;
+    };
+
+    const llaminar2::NativeQuantisedFormatInfo &requireNativeQuantisedInfo(
+        const TensorBase *weights,
+        const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(weights);
+        const llaminar2::NativeQuantisedFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("CUDA NativeQuantised sweep format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
+
+    TEST(CUDANativeQuantisedGemmPerfOffline, FormatListCodebookIdsMatchTensorMetadata)
+    {
+        const std::set<std::string> expected_formats = {
+            "Q4_0", "IQ4_NL", "IQ4_XS", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
+            "Q5_K", "Q6_K", "Q3_K", "Q2_K", "IQ3_S", "IQ3_XXS", "IQ2_S",
+            "IQ2_XS", "IQ2_XXS", "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K"};
+        std::set<std::string> observed_formats;
+        for (const auto &format : kFormats)
+        {
+            auto weights = format.create(/*n=*/2, /*k=*/256);
+            ASSERT_NE(weights, nullptr) << format.name;
+
+            const auto &info = requireNativeQuantisedInfo(weights.get(), format.name);
+            EXPECT_EQ(info.codebook_id, format.codebook_id) << format.name;
+            EXPECT_TRUE(observed_formats.insert(format.name).second)
+                << "duplicate CUDA NativeQuantised source format " << format.name;
+        }
+        EXPECT_EQ(observed_formats, expected_formats);
+    }
+
+    TEST(CUDANativeQuantisedGemmPerfOffline, ShapeListMatchesCanonicalExactOverlays)
+    {
+        std::set<std::tuple<std::string, int, int>> expected;
+        for (const auto &shape :
+             llaminar2::test::native_quantised_dispatch::nativeQuantisedShapeManifest())
+        {
+            if (shape.role == "production" && shape.exact_overlay)
+                expected.emplace(shape.name, shape.N, shape.K);
+        }
+
+        std::set<std::tuple<std::string, int, int>> observed;
+        for (const auto &shape : kQwenShapes)
+            EXPECT_TRUE(observed.emplace(shape.name, shape.n, shape.k).second)
+                << "duplicate CUDA NativeQuantised exact geometry " << shape.name;
+        EXPECT_EQ(observed, expected);
+    }
+
+    TEST(CUDANativeQuantisedGemmPerfOffline, PrefillRowsExcludeDecodeAndVerifierDepths)
+    {
+        EXPECT_EQ(kPrefillMValues, llaminar2::supportedPrefillGraphBucketSizes());
+        EXPECT_EQ(std::count(kPrefillMValues.begin(), kPrefillMValues.end(), 1), 0);
+        for (int m = 2; m <= llaminar2::kDefaultNativeQuantisedVerifierRowCapacity;
+             ++m)
+            EXPECT_EQ(std::count(kPrefillMValues.begin(), kPrefillMValues.end(), m), 0)
+                << "M=" << m << " belongs to grouped verifier training";
+    }
+
+    /**
+     * @test Keep CUDA generated decode dispatch within a few host nanoseconds.
+     *
+     * A decode or grouped-verifier projection can be small enough for host
+     * policy overhead to become visible. This test calls the same cached
+     * generated selector as production while deliberately avoiding every CUDA
+     * runtime API. It measures one repeatedly hot graph-capture/eager-launch
+     * Q8 key and a rotating set of production Qwen geometries. Graph replay
+     * itself owns fixed kernel nodes and does not call this host selector. A
+     * loop-only control performs the same indexing, checksum update, and
+     * compiler fence; its median cost is subtracted from the selector median.
+     *
+     * Q8 source aliases are normalized to execution codebook 19 before this
+     * selector. The test therefore verifies NativeQuantised dispatch itself rather
+     * than reviving a format-specific Q8 route.
+     */
+    TEST(CUDANativeQuantisedGemmPerfOffline, GeneratedDecodeDispatchCacheLatency)
+    {
+        struct Query
+        {
+            int n;
+            int k;
+        };
+
+        constexpr uint8_t codebook_id = 19;
+        constexpr int graph_captured = 1;
+        constexpr int iterations = 100000;
+        constexpr int samples = 7;
+        constexpr std::array<Query, 1> hot = {{{512, 2048}}};
+        constexpr std::array<Query, 8> working_set = {{
+            {512, 2048},
+            {2048, 512},
+            {2048, 2048},
+            {4096, 2048},
+            {8192, 2048},
+            {1024, 5120},
+            {6144, 5120},
+            {5120, 17408},
+        }};
+
+        for (const Query &query : working_set)
+        {
+            int shape_id = 0;
+            int tile_n = 0;
+            int cpt = 0;
+            int exact_kb = 0;
+            ASSERT_TRUE(cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
+                codebook_id,
+                graph_captured,
+                1,
+                query.n,
+                query.k,
+                &shape_id,
+                &tile_n,
+                &cpt,
+                &exact_kb))
+                << "missing CUDA Q8 NativeQuantised policy for "
+                << query.n << 'x' << query.k;
+        }
+
+        const auto measure = [&](const auto &queries)
+        {
+            std::array<double, samples> net_ns{};
+            std::array<int, queries.size()> ns{};
+            std::array<int, queries.size()> ks{};
+            for (size_t index = 0; index < queries.size(); ++index)
+            {
+                ns[index] = queries[index].n;
+                ks[index] = queries[index].k;
+            }
+
+            for (int sample = 0; sample < samples; ++sample)
+            {
+                uint64_t checksum = 0;
+                net_ns[static_cast<size_t>(sample)] =
+                    cudaNativeQuantisedGemvTuned_measureGeneratedDispatchNs(
+                        codebook_id,
+                        graph_captured,
+                        1,
+                        ns.data(),
+                        ks.data(),
+                        static_cast<int>(queries.size()),
+                        iterations,
+                        &checksum);
+                EXPECT_NE(checksum, 0u);
+            }
+
+            std::sort(net_ns.begin(), net_ns.end());
+            return net_ns[net_ns.size() / 2];
+        };
+
+        const double hot_ns = measure(hot);
+        const double working_set_ns = measure(working_set);
+
+        EXPECT_LT(hot_ns, 10.0);
+        EXPECT_LT(working_set_ns, 20.0);
+        std::cout
+            << "[CUDANativeQuantised][DISPATCH_CACHE_LATENCY] hot_ns="
+            << hot_ns
+            << " working_set_ns=" << working_set_ns
+            << std::endl;
+    }
+
+    /**
+     * @brief Admit only compiled, spill-free sweep candidates before constructing tasks.
+     * @param codebook Execution codebook after source-format promotion.
+     * @param tile_id Exact physical BK64/BK256 tile.
+     * @param canonical_kpart Whether the ordered BK64 reducer is required.
+     * @param ordered_bk256 Whether the ordered BK256 specialization is required.
+     * @param staging Requested operand-delivery schedule.
+     * @return False for explicitly uninstantiated resource/ownership identities.
+     * @throws std::runtime_error For an unexpected missing compiler-resource record.
+     *
+     * Release spill enforcement deliberately removes several RegisterDecode
+     * specializations. Treating their absent symbols as a failed CUDA query
+     * prevented the all-format tournament from reaching any timing cell. The
+     * independent exhaustive resource inventory below authenticates every
+     * exclusion and also exercises this same task-admission surface.
+     */
+    bool sweepCandidateIsResourceEligible(
+        uint8_t codebook, int tile_id, bool canonical_kpart,
+        bool ordered_bk256, PrefillStagingSchedule staging)
+    {
+        CUDADensePrefillKernelResources primary{};
+        CUDADensePrefillKernelResources auxiliary{};
+        if (!cudaNativeQuantisedPrefill_queryCandidateResources(
+                codebook, tile_id, canonical_kpart ? 1 : 0,
+                ordered_bk256 ? 1 : 0, 0, &primary, &auxiliary, staging))
+        {
+            const bool excluded_register_tile =
+                ((codebook == 10 || codebook == 17) &&
+                 (tile_id == 1 || tile_id == 4 || tile_id == 5)) ||
+                (!canonical_kpart &&
+                 (codebook == 8 || codebook == 9 || codebook == 13 || codebook == 14) &&
+                 (tile_id == 1 || tile_id == 4));
+            // The corpus validator independently requires every supported
+            // async identity; unsupported ownership geometry is not substituted.
+            if (staging != PrefillStagingSchedule::RegisterDecode || excluded_register_tile)
+                return false;
+            throw std::runtime_error(
+                "CUDA dense prefill candidate inventory query failed: codebook=" +
+                std::to_string(codebook) + " tile=" + std::to_string(tile_id) +
+                " canonical_kpart=" + std::to_string(canonical_kpart));
+        }
+        return primary.local_memory_bytes_per_thread == 0 &&
+               auxiliary.local_memory_bytes_per_thread == 0;
+    }
+
+    class CUDANativeQuantisedGemmPerf : public ::testing::Test
+    {
+    protected:
+        void SetUp() override
+        {
+            int device_count = 0;
+            if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+                GTEST_SKIP() << "No CUDA devices available";
+
+            ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+            device_count_ = device_count;
+            peak_tc_tops_ = estimatePeakInt8TensorCoreTops();
+            if (peak_tc_tops_ > 0.0)
+                std::fprintf(stderr, "[CUDANativeQuantisedGemm] Peak dense INT8 tensor-core throughput: %.1f TOPS\n", peak_tc_tops_);
+        }
+
+        double peak_tc_tops_ = 0.0;
+        int device_count_ = 0;
+    };
+
+    TEST_F(CUDANativeQuantisedGemmPerf, CompilerResources_AllCodebooksAndCandidates)
+    {
+        // Source aliases and CPU-promoted formats must reach the same resource
+        // gate. A copied ID list previously omitted the expanded-min format.
+        std::set<uint8_t> codebooks;
+        std::set<uint8_t> staged_codebooks;
+        for (const auto &source : llaminar2::native_quantised_formats::kAllSourceFormats)
+        {
+            const auto &format = *source.metadata;
+            codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format));
+            codebooks.insert(llaminar2::migrationStableDeviceVnniFormat(format).codebook_id);
+            if (format.payload_bytes == 16 || format.payload_bytes == 20)
+                staged_codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format));
+        }
+        const std::string csv_path =
+            getEnvString("LLAMINAR_TILE_RESOURCE_CSV");
+        FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr) << "Failed to open " << csv_path;
+            std::fprintf(
+                csv,
+                "codebook,tile_id,canonical_kpart,ordered_bk256,"
+                "primary_registers_per_thread,"
+                "primary_local_memory_bytes_per_thread,"
+                "primary_static_shared_memory_bytes,"
+                "primary_dynamic_shared_memory_bytes,"
+                "primary_threads_per_block,"
+                "primary_max_threads_per_block,"
+                "primary_max_active_blocks_per_sm,"
+                "auxiliary_registers_per_thread,"
+                "auxiliary_local_memory_bytes_per_thread,"
+                "auxiliary_static_shared_memory_bytes,"
+                "auxiliary_dynamic_shared_memory_bytes,"
+                "auxiliary_threads_per_block,"
+                "auxiliary_max_threads_per_block,"
+                "auxiliary_max_active_blocks_per_sm,spill_free,staging_schedule\n");
+        }
+
+        // These identities were already rejected by production admission.
+        // Compile-time spill enforcement now removes their unreachable kernel
+        // instantiations too: the query must reject them, not certify a known
+        // spilling symbol. Keep this independent inventory to catch accidental
+        // loss of an otherwise supported candidate.
+        std::set<std::tuple<int, int, int, int, int>> expected_rejected;
+        for (int codebook : {8, 9, 13, 14})
+            for (int tile_id : {1, 4})
+                expected_rejected.emplace(codebook, tile_id, 0, 0, 0);
+        for (int codebook : {10, 17})
+            for (int tile_id : {1, 4, 5})
+                for (int canonical_kpart : {0, 1})
+                    expected_rejected.emplace(codebook, tile_id, canonical_kpart, 0, 0);
+        for (int codebook : {5, 7})
+            for (int staging : {2, 3})
+                expected_rejected.emplace(codebook, 2, 0, 0, staging);
+
+        size_t queried = 0;
+        size_t spilling = 0;
+        std::set<std::tuple<int, int, int, int, int>> observed_rejected;
+        const auto inspect = [&](uint8_t codebook,
+                                 int tile_id,
+                                 int canonical_kpart,
+                                 int ordered_bk256,
+                                 PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode)
+        {
+            SCOPED_TRACE(::testing::Message()
+                         << "codebook=" << static_cast<int>(codebook)
+                         << " tile=" << tile_id << " canonical=" << canonical_kpart
+                         << " ordered_bk256=" << ordered_bk256
+                         << " staging=" << static_cast<int>(staging));
+            const auto identity = std::make_tuple(
+                static_cast<int>(codebook), tile_id, canonical_kpart,
+                ordered_bk256, static_cast<int>(staging));
+            CUDADensePrefillKernelResources primary{};
+            CUDADensePrefillKernelResources auxiliary{};
+            const bool implemented = cudaNativeQuantisedPrefill_queryCandidateResources(
+                codebook,
+                tile_id,
+                canonical_kpart,
+                ordered_bk256,
+                /*cuda_device_id=*/0,
+                &primary,
+                &auxiliary,
+                staging);
+            // Inventory every request, including unsupported physical schedules.
+            // A missing specialization must not silently become RegisterDecode.
+            const bool structurally_supported =
+                staging == PrefillStagingSchedule::RegisterDecode ||
+                (staged_codebooks.contains(codebook) && tile_id >= 0 && tile_id != 1);
+            const bool expected_implemented =
+                structurally_supported && !expected_rejected.contains(identity);
+            if (structurally_supported && !implemented)
+                observed_rejected.insert(identity);
+            ASSERT_EQ(implemented, expected_implemented);
+            EXPECT_EQ(sweepCandidateIsResourceEligible(
+                codebook, tile_id, canonical_kpart != 0, ordered_bk256 != 0, staging),
+                expected_implemented);
+            if (!implemented)
+                return;
+            EXPECT_NE(primary.kernel_symbol, nullptr);
+            EXPECT_GT(primary.registers_per_thread, 0);
+            EXPECT_GT(primary.threads_per_block, 0);
+            EXPECT_GE(
+                primary.max_threads_per_block,
+                primary.threads_per_block);
+            EXPECT_GT(primary.max_active_blocks_per_sm, 0);
+            if (canonical_kpart)
+            {
+                EXPECT_GT(auxiliary.registers_per_thread, 0);
+                EXPECT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                EXPECT_GT(auxiliary.threads_per_block, 0);
+                EXPECT_GE(
+                    auxiliary.max_threads_per_block,
+                    auxiliary.threads_per_block);
+                EXPECT_GT(auxiliary.max_active_blocks_per_sm, 0);
+            }
+            else
+            {
+                EXPECT_EQ(auxiliary.registers_per_thread, 0);
+                EXPECT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                EXPECT_EQ(auxiliary.threads_per_block, 0);
+                EXPECT_EQ(auxiliary.max_active_blocks_per_sm, 0);
+            }
+
+            const bool spill_free =
+                primary.local_memory_bytes_per_thread == 0 &&
+                auxiliary.local_memory_bytes_per_thread == 0;
+            ++queried;
+            spilling += spill_free ? 0 : 1;
+            EXPECT_TRUE(spill_free) << "Every compiled candidate must be spill-free";
+            if (csv)
+            {
+                std::fprintf(
+                    csv,
+                    "%u,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d,"
+                    "%d,%zu,%zu,%zu,%d,%d,%d,%d,%d\n",
+                    static_cast<unsigned>(codebook),
+                    tile_id,
+                    canonical_kpart,
+                    ordered_bk256,
+                    primary.registers_per_thread,
+                    primary.local_memory_bytes_per_thread,
+                    primary.static_shared_memory_bytes,
+                    primary.dynamic_shared_memory_bytes,
+                    primary.threads_per_block,
+                    primary.max_threads_per_block,
+                    primary.max_active_blocks_per_sm,
+                    auxiliary.registers_per_thread,
+                    auxiliary.local_memory_bytes_per_thread,
+                    auxiliary.static_shared_memory_bytes,
+                    auxiliary.dynamic_shared_memory_bytes,
+                    auxiliary.threads_per_block,
+                    auxiliary.max_threads_per_block,
+                    auxiliary.max_active_blocks_per_sm,
+                    spill_free ? 1 : 0,
+                    static_cast<int>(staging));
+            }
+        };
+
+        for (uint8_t codebook : codebooks)
+        {
+            for (int tile_id = 0; tile_id < 6; ++tile_id)
+            {
+                for (PrefillStagingSchedule staging : {
+                         PrefillStagingSchedule::RegisterDecode,
+                         PrefillStagingSchedule::AsyncPayload,
+                         PrefillStagingSchedule::AsyncWeightOperands,
+                         PrefillStagingSchedule::AsyncAllOperands})
+                {
+                    inspect(codebook, tile_id, 0, 0, staging);
+                    inspect(codebook, tile_id, 1, 0, staging);
+                }
+            }
+        }
+        for (int tile_id : {-3, -2})
+        {
+            inspect(/*Q4_0=*/0, tile_id, 0, 0);
+            inspect(/*Q4_0=*/0, tile_id, 0, 1);
+        }
+        if (csv)
+        {
+            std::fflush(csv);
+            std::fclose(csv);
+        }
+        std::fprintf(
+            stderr,
+            "[TileSweep][resources] queried=%zu spilling=%zu spill_free=%zu\n",
+            queried,
+            spilling,
+            queried - spilling);
+        EXPECT_EQ(queried, codebooks.size() * 6u * 2u +
+                           staged_codebooks.size() * 5u * 2u * 3u + 4u -
+                           expected_rejected.size());
+        EXPECT_EQ(spilling, 0u);
+        EXPECT_EQ(observed_rejected, expected_rejected)
+            << "Compiler resource drift changed the launchable candidate set";
+    }
+
+    TEST_F(CUDANativeQuantisedGemmPerf, Correctness_AllFormats_KeyShapes)
+    {
+        const RunConfig cfg = loadRunConfig();
+
+        struct CorrectnessTask
+        {
+            const FormatSpec *format = nullptr;
+            const Shape *shape = nullptr;
+        };
+
+        struct CorrectnessResult
+        {
+            std::string label;
+            double cosine = 0.0;
+            bool passed = false;
+        };
+
+        std::vector<CorrectnessTask> tasks;
+        tasks.reserve(static_cast<size_t>(cfg.max_cases));
+        for (const auto &format : kFormats)
+        {
+            if (!shouldRunName(cfg.format_filters, format.name))
+                continue;
+            for (const auto &shape : kQwenShapes)
+            {
+                if (!shouldRunName(cfg.shape_filters, shape.name))
+                    continue;
+                if ((shape.k % 32) != 0)
+                    continue;
+                if (static_cast<int>(tasks.size()) >= cfg.max_cases)
+                    break;
+                tasks.push_back(CorrectnessTask{&format, &shape});
+            }
+            if (static_cast<int>(tasks.size()) >= cfg.max_cases)
+                break;
+        }
+
+        ASSERT_FALSE(tasks.empty()) << "No correctness cases selected. Check LLAMINAR_CUDA_NATIVE_GEMM_FORMATS / LLAMINAR_CUDA_NATIVE_GEMM_SHAPES.";
+
+        int worker_count = std::min(2, std::max(1, device_count_));
+        if (cfg.performance_workers > 0)
+            worker_count = std::min(worker_count, cfg.performance_workers);
+
+        std::fprintf(stderr,
+                     "[CUDANativeQuantisedGemm][Correctness] using %d worker thread(s) across %d CUDA device(s), %zu cases\n",
+                     worker_count, worker_count, tasks.size());
+
+        std::vector<CorrectnessResult> results(tasks.size());
+        std::atomic<size_t> next_task{0};
+        std::mutex log_mutex;
+
+        auto worker = [&](int worker_index)
+        {
+            const int device_id = worker_index;
+            while (true)
+            {
+                const size_t task_index = next_task.fetch_add(1, std::memory_order_relaxed);
+                if (task_index >= tasks.size())
+                    break;
+
+                const auto &format = *tasks[task_index].format;
+                const auto &shape = *tasks[task_index].shape;
+
+                {
+                    std::lock_guard<std::mutex> lock(log_mutex);
+                    std::fprintf(stderr,
+                                 "[CUDANativeQuantisedGemm][Correctness][gpu=%d] format=%s shape=%s prefill_m=%d\n",
+                                 device_id, format.name.c_str(), shape.name.c_str(), cfg.correctness_prefill_m);
+                }
+
+                // Create shared input so both cuBLAS and NativeQuantised see identical data
+                auto h_input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(cfg.correctness_prefill_m), static_cast<size_t>(shape.k)}, -0.25f, 0.25f, 7);
+                const float *input_ptr = h_input->data();
+
+                // cuBLAS FP32 reference (ground truth)
+                auto ref_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                const RunResult cublas_ref = runCuBLASReference(ref_weights.get(), input_ptr,
+                    cfg.correctness_prefill_m, shape.n, shape.k, device_id);
+
+                // NativeQuantised quantized GEMM
+                auto native_quantised_weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                const RunResult native_quantised = runKernel(native_quantised_weights.get(),
+                    cfg.correctness_prefill_m, shape.n, shape.k, RunPath::NativeQuantisedTensorCore,
+                    0, 1, device_id, input_ptr);
+
+                const double cosine = cosineSimilarity(cublas_ref.output, native_quantised.output);
+                results[task_index] = {format.name + " " + shape.name, cosine, cosine >= kCosineGate};
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (int i = 0; i < worker_count; ++i)
+            workers.emplace_back(worker, i);
+        for (auto &t : workers)
+            t.join();
+
+        for (const auto &r : results)
+        {
+            EXPECT_TRUE(r.passed) << r.label << " cosine=" << r.cosine << " < " << kCosineGate;
+        }
+    }
+
+    TEST_F(CUDANativeQuantisedGemmPerf, Performance_AllFormats_AllShapes)
+    {
+        const RunConfig cfg = loadRunConfig();
+
+        struct PerfTask
+        {
+            const FormatSpec *format = nullptr;
+            const Shape *shape = nullptr;
+        };
+
+        struct PerfRow
+        {
+            std::string format_name;
+            uint8_t codebook_id = 0;
+            std::string shape_name;
+            int m = 0;
+            int n = 0;
+            int k = 0;
+            int warmup_runs = 0;
+            int bench_runs = 0;
+            size_t weight_bytes = 0;
+            std::string native_family;
+            double min_us = 0.0;
+            double mean_us = 0.0;
+            double tops = 0.0;
+            double pct_tc_peak = 0.0;
+        };
+
+        std::vector<PerfTask> tasks;
+        tasks.reserve(static_cast<size_t>(cfg.max_cases));
+        for (const auto &format : kFormats)
+        {
+            if (!shouldRunName(cfg.format_filters, format.name))
+                continue;
+
+            for (const auto &shape : kQwenShapes)
+            {
+                if (!shouldRunName(cfg.shape_filters, shape.name))
+                    continue;
+                if ((shape.k % 32) != 0)
+                    continue;
+                if (static_cast<int>(tasks.size()) >= cfg.max_cases)
+                    break;
+                tasks.push_back(PerfTask{&format, &shape});
+            }
+
+            if (static_cast<int>(tasks.size()) >= cfg.max_cases)
+                break;
+        }
+
+        ASSERT_FALSE(tasks.empty()) << "No performance cases selected. Check LLAMINAR_CUDA_NATIVE_GEMM_FORMATS / LLAMINAR_CUDA_NATIVE_GEMM_SHAPES.";
+
+        int worker_count = std::min(2, std::max(1, device_count_));
+        if (cfg.performance_workers > 0)
+            worker_count = std::min(worker_count, cfg.performance_workers);
+
+        std::fprintf(stderr,
+                     "[CUDANativeQuantisedGemm][Perf] using %d worker thread(s) across %d CUDA device(s)\n",
+                     worker_count,
+                     worker_count);
+
+        std::vector<std::vector<PerfRow>> task_rows(tasks.size());
+        std::atomic<size_t> next_task{0};
+        std::mutex log_mutex;
+
+        auto worker = [&](int worker_index)
+        {
+            const int device_id = worker_index;
+
+            while (true)
+            {
+                const size_t task_index = next_task.fetch_add(1, std::memory_order_relaxed);
+                if (task_index >= tasks.size())
+                    break;
+
+                const PerfTask &task = tasks[task_index];
+                const auto &format = *task.format;
+                const auto &shape = *task.shape;
+
+                std::vector<PerfRow> rows;
+                rows.reserve(cfg.performance_prefill_m.size());
+
+                for (int m : cfg.performance_prefill_m)
+                {
+                    auto weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                    const uint8_t codebook_id = requireNativeQuantisedInfo(weights.get(), format.name).codebook_id;
+                    const size_t weight_bytes = weights->size_bytes();
+                    const RunResult result = runKernel(weights.get(), m, shape.n, shape.k, RunPath::NativeQuantisedTensorCore, cfg.warmup_runs, cfg.bench_runs, device_id);
+
+                    const auto metrics = computeGemmThroughputMetrics(m, shape.n, shape.k, result.min_us, peak_tc_tops_);
+
+                    {
+                        std::lock_guard<std::mutex> lock(log_mutex);
+                        std::fprintf(stderr,
+                                     "[CUDANativeQuantisedGemm][Perf][gpu=%d] format=%s codebook=%u shape=%s M=%d N=%d K=%d "
+                                     "family=%s min_us=%.3f tops=%.3f pct_tc_peak=%.1f%%\n",
+                                     device_id,
+                                     format.name.c_str(),
+                                     static_cast<unsigned>(codebook_id),
+                                     shape.name.c_str(),
+                                     m,
+                                     shape.n,
+                                     shape.k,
+                                     result.native_family.c_str(),
+                                     result.min_us,
+                                     metrics.achieved_tops,
+                                     metrics.pct_tc_peak);
+                    }
+
+                    rows.push_back(PerfRow{
+                        format.name,
+                        codebook_id,
+                        shape.name,
+                        m,
+                        shape.n,
+                        shape.k,
+                        cfg.warmup_runs,
+                        cfg.bench_runs,
+                        weight_bytes,
+                        result.native_family,
+                        result.min_us,
+                        result.mean_us,
+                        metrics.achieved_tops,
+                        metrics.pct_tc_peak,
+                    });
+                }
+
+                task_rows[task_index] = std::move(rows);
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (int worker_index = 0; worker_index < worker_count; ++worker_index)
+            workers.emplace_back(worker, worker_index);
+        for (auto &thread : workers)
+            thread.join();
+
+        std::FILE *csv = nullptr;
+        if (!cfg.csv_path.empty())
+        {
+            csv = std::fopen(cfg.csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr) << "Failed to open CSV: " << cfg.csv_path;
+            std::fprintf(
+                csv,
+                "format,codebook,shape,m,n,k,warmup_runs,bench_runs,weight_bytes,family,min_us,mean_us,tops,pct_tc_peak\n");
+        }
+
+        int executed_cases = 0;
+        for (const auto &rows : task_rows)
+        {
+            if (rows.empty())
+                continue;
+
+            for (const auto &row : rows)
+            {
+                if (csv)
+                {
+                    std::fprintf(
+                        csv,
+                        "%s,%u,%s,%d,%d,%d,%d,%d,%zu,%s,%.3f,%.3f,%.3f,%.1f\n",
+                        row.format_name.c_str(),
+                        static_cast<unsigned>(row.codebook_id),
+                        row.shape_name.c_str(),
+                        row.m,
+                        row.n,
+                        row.k,
+                        row.warmup_runs,
+                        row.bench_runs,
+                        row.weight_bytes,
+                        row.native_family.c_str(),
+                        row.min_us,
+                        row.mean_us,
+                        row.tops,
+                        row.pct_tc_peak);
+                }
+                ++executed_cases;
+            }
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            std::fprintf(stderr,
+                         "[CUDANativeQuantisedGemm][Perf] wrote sweep CSV to %s\n",
+                         cfg.csv_path.c_str());
+        }
+
+        ASSERT_GT(executed_cases, 0) << "No performance cases selected. Check LLAMINAR_CUDA_NATIVE_GEMM_FORMATS / LLAMINAR_CUDA_NATIVE_GEMM_SHAPES.";
+    }
+
+    // =========================================================================
+    // Tile + Strategy Sweep
+    //
+    // Sweeps all tile configs × strategies × shapes × M to compare:
+    //   - AUTO:     production output-tile heuristic
+    //   - STD:      BK64 with a forced output tile and direct ownership
+    //   - KPART:    BK64 with the exact public-M1 ordered K partitions
+    //   - BK256:    BK256 forced with the public-M=1 reduction schedule
+    //
+    // Environment variables:
+    //   LLAMINAR_TILE_SWEEP_SHAPES       - Comma-separated shape names (default: all kQwenShapes)
+    //   LLAMINAR_TILE_SWEEP_PREFILL_M    - Comma-separated M values
+    //                                     (default: MTP rows + canonical prefill buckets)
+    //   LLAMINAR_TILE_SWEEP_TILES        - Comma-separated tile IDs 0..5 for BK64 (default: all)
+    //   LLAMINAR_TILE_SWEEP_STRATEGIES   - Comma-separated: auto,std,kpart,bk256
+    //   LLAMINAR_TILE_SWEEP_WARMUP       - Warmup runs (default: 3)
+    //   LLAMINAR_TILE_SWEEP_BENCH        - Benchmark runs (default: 10)
+    //   LLAMINAR_TILE_SWEEP_CSV          - CSV output path
+    //   LLAMINAR_TILE_SWEEP_TIMING_CSV   - Raw native-event timing sidecar
+    //   LLAMINAR_TILE_SWEEP_FORMAT       - Quant format: Q4_0 (default), IQ4_NL, etc.
+    // =========================================================================
+
+    struct TileSpec
+    {
+        int tile_id;
+        const char *name;
+        int bm, bn;
+        int warps_m, warps_n;
+        int block_size;
+    };
+
+    static constexpr TileSpec kAllTiles[] = {
+        {0, "T64x64_w2x2", 64, 64, 2, 2, 128},
+        {1, "T64x128_w2x2", 64, 128, 2, 2, 128},
+        {2, "T64x128_w4x2", 64, 128, 4, 2, 256},
+        {3, "T64x128_w2x4", 64, 128, 2, 4, 256},
+        {4, "T128x128_w4x2", 128, 128, 4, 2, 256},
+        {5, "T128x128_w4x4", 128, 128, 4, 4, 512},
+    };
+
+    enum class Strategy
+    {
+        Auto,               // Production heuristic
+        Standard,           // BK64 with one complete canonical K walk
+        CanonicalKpart,     // BK64 with public-M1 partitions + ordered reducer
+        BK256,              // BK256 with one complete canonical K walk
+    };
+
+    struct SweepConfig
+    {
+        int warmup_runs = 3;
+        int bench_runs = 10;
+        std::vector<int> prefill_m = llaminar2::supportedPrefillGraphBucketSizes();
+        std::set<std::string> shape_filters;
+        std::vector<int> tile_ids = {0, 1, 2, 3, 4, 5};
+        /*
+         * Every candidate in this inventory is byte-eligible by construction.
+         * KPART obtains its partition geometry from public M=1; no independent
+         * split count is accepted by this sweep.
+         */
+        std::vector<Strategy> strategies = {
+            Strategy::Auto,
+            Strategy::Standard,
+            Strategy::CanonicalKpart,
+            Strategy::BK256};
+        std::string csv_path;
+        std::string timing_csv_path;
+        std::string format_name = "Q4_0";
+    };
+
+    static SweepConfig loadSweepConfig()
+    {
+        SweepConfig cfg;
+        if (const auto v = getEnvInt("LLAMINAR_TILE_SWEEP_WARMUP"))
+            cfg.warmup_runs = std::max(1, *v);
+        if (const auto v = getEnvInt("LLAMINAR_TILE_SWEEP_BENCH"))
+            cfg.bench_runs = std::max(1, *v);
+
+        const auto m_vals = getEnvCsvInts("LLAMINAR_TILE_SWEEP_PREFILL_M");
+        if (!m_vals.empty())
+            cfg.prefill_m = m_vals;
+
+        cfg.shape_filters = getEnvCsvSet("LLAMINAR_TILE_SWEEP_SHAPES");
+
+        const auto tile_vals = getEnvCsvInts("LLAMINAR_TILE_SWEEP_TILES");
+        if (!tile_vals.empty())
+        {
+            cfg.tile_ids.clear();
+            for (int t : tile_vals)
+                if (t >= 0 && t < static_cast<int>(std::size(kAllTiles)))
+                    cfg.tile_ids.push_back(t);
+        }
+
+        const auto strat_set = getEnvCsvSet("LLAMINAR_TILE_SWEEP_STRATEGIES");
+        if (!strat_set.empty())
+        {
+            cfg.strategies.clear();
+            if (strat_set.count("auto"))
+                cfg.strategies.push_back(Strategy::Auto);
+            if (strat_set.count("std"))
+                cfg.strategies.push_back(Strategy::Standard);
+            if (strat_set.count("kpart"))
+                cfg.strategies.push_back(Strategy::CanonicalKpart);
+            if (strat_set.count("bk256"))
+                cfg.strategies.push_back(Strategy::BK256);
+        }
+
+        const std::string csv = getEnvString("LLAMINAR_TILE_SWEEP_CSV");
+        if (!csv.empty())
+            cfg.csv_path = csv;
+
+        const std::string timing_csv =
+            getEnvString("LLAMINAR_TILE_SWEEP_TIMING_CSV");
+        if (!timing_csv.empty())
+            cfg.timing_csv_path = timing_csv;
+
+        const std::string fmt = getEnvString("LLAMINAR_TILE_SWEEP_FORMAT");
+        if (!fmt.empty())
+            cfg.format_name = fmt;
+
+        return cfg;
+    }
+
+    static const char *strategyName(Strategy s)
+    {
+        switch (s)
+        {
+        case Strategy::Auto:
+            return "AUTO";
+        case Strategy::Standard:
+            return "STD";
+        case Strategy::CanonicalKpart:
+            return "KPART";
+        case Strategy::BK256:
+            return "BK256";
+        }
+        return "???";
+    }
+
+    struct SweepRow
+    {
+        std::string format_name;
+        uint8_t codebook_id = 0;
+        std::string shape_name;
+        int m, n, k;
+        std::string tile_name;
+        int tile_id;
+        int tiles; // tile count for this config
+        std::string strategy;
+        int requested_k_partitions; // 0=inherit public-M1; 1=full-K
+        double min_us;
+        double mean_us;
+        double tops;
+        double pct_peak;
+        int gpu_id;
+        size_t byte_mismatches;
+        uint64_t first_byte_mismatch;
+        bool correctness_pass;
+        bool canonical_kpart_available;
+        int observed_tile_id;
+        int observed_k_partitions;
+        int observed_bk256;
+        int observed_canonical_kpart;
+        PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode;
+        PrefillStagingSchedule observed_staging = PrefillStagingSchedule::RegisterDecode;
+        int primary_registers_per_thread;
+        size_t primary_local_memory_bytes_per_thread;
+        size_t primary_static_shared_memory_bytes;
+        size_t primary_dynamic_shared_memory_bytes;
+        int primary_threads_per_block;
+        int primary_max_threads_per_block;
+        int primary_max_active_blocks_per_sm;
+        int auxiliary_registers_per_thread;
+        size_t auxiliary_local_memory_bytes_per_thread;
+        size_t auxiliary_static_shared_memory_bytes;
+        size_t auxiliary_dynamic_shared_memory_bytes;
+        int auxiliary_threads_per_block;
+        int auxiliary_max_threads_per_block;
+        int auxiliary_max_active_blocks_per_sm;
+    };
+
+    struct SweepTask
+    {
+        const Shape *shape;
+        int m;
+        Strategy strat;
+        int tile_id; // -1=auto, -2=BK256, 0..5=BK64 tile
+        int requested_k_partitions;
+        std::string tile_name;
+        int tiles;
+        PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode;
+    };
+
+    /**
+     * @brief Apply one forceable prefill candidate to the production launcher.
+     *
+     * These controls are process-wide debug state. The turnkey collector masks
+     * one GPU into each process, so a complete setup/launch transaction remains
+     * isolated from every other device lane.
+     */
+    static void configureSweepTask(const SweepTask &task)
+    {
+        if (!cudaNativeQuantisedPrefill_setStagingSchedule(task.staging))
+            throw std::runtime_error("unknown CUDA prefill staging identity");
+        if (task.strat == Strategy::Auto)
+        {
+            cudaNativeQuantisedPrefill_setBK256Mode(0);
+            cudaNativeQuantisedPrefill_setForceTile(-1);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+        }
+        else if (task.tile_id == -2)
+        {
+            cudaNativeQuantisedPrefill_setBK256Mode(1);
+            cudaNativeQuantisedPrefill_setForceTile(-1);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+        }
+        else
+        {
+            cudaNativeQuantisedPrefill_setBK256Mode(-1);
+            cudaNativeQuantisedPrefill_setForceTile(task.tile_id);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(
+                task.strat == Strategy::CanonicalKpart);
+        }
+    }
+
+    /**
+     * @brief Merge candidate-specific workspace plans into one persistent plan.
+     *
+     * A shape/M tournament changes tile and reduction policies while retaining
+     * the same production kernel. Every named buffer is allocated once at the
+     * largest requested size so candidate timing cannot include allocator work
+     * or observe a missing buffer after a force-mode transition.
+     */
+    static WorkspaceRequirements tournamentWorkspaceRequirements(
+        IWorkspaceConsumer *consumer,
+        const std::vector<SweepTask> &tasks,
+        const Shape *shape,
+        int m)
+    {
+        WorkspaceRequirements merged;
+        if (!consumer)
+            return merged;
+
+        const auto merge = [&merged](const WorkspaceRequirements &requirements)
+        {
+            for (const auto &buffer : requirements.buffers)
+            {
+                auto existing = std::find_if(
+                    merged.buffers.begin(), merged.buffers.end(),
+                    [&buffer](const WorkspaceDescriptor &candidate)
+                    { return candidate.name == buffer.name; });
+                if (existing == merged.buffers.end())
+                {
+                    merged.buffers.push_back(buffer);
+                    continue;
+                }
+                existing->size_bytes =
+                    std::max(existing->size_bytes, buffer.size_bytes);
+                existing->alignment =
+                    std::max(existing->alignment, buffer.alignment);
+                existing->required = existing->required || buffer.required;
+            }
+        };
+
+        for (const auto &task : tasks)
+        {
+            if (task.shape != shape || task.m != m)
+                continue;
+            configureSweepTask(task);
+            merge(consumer->getWorkspaceRequirements(m, shape->n, shape->k));
+        }
+
+        /*
+         * The ordinary-prefill tournament has a different arithmetic contract
+         * from grouped verifier decode.  Verifier M=2..16 must reproduce the
+         * public M=1 K-partition tree exactly; prefill candidates must reproduce
+         * the production exact-M prefill result while changing only physical
+         * tile geometry.  Include that AUTO route even when a caller requests
+         * only forced candidates so the immutable workspace can always build
+         * the correct exact-M oracle.
+         */
+        cudaNativeQuantisedPrefill_setBK256Mode(0);
+        cudaNativeQuantisedPrefill_setForceTile(-1);
+        cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+        cudaNativeQuantisedPrefill_setStagingSchedule(PrefillStagingSchedule::RegisterDecode);
+        merge(consumer->getWorkspaceRequirements(m, shape->n, shape->k));
+        return merged;
+    }
+
+    /** @brief Move-only ownership for one CUDA timing event. */
+    class ScopedCUDATimingEvent
+    {
+    public:
+        ScopedCUDATimingEvent()
+        {
+            const cudaError_t error = cudaEventCreate(&event_);
+            if (error != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("failed to create CUDA timing event: ") +
+                    cudaGetErrorString(error));
+            }
+        }
+
+        ~ScopedCUDATimingEvent()
+        {
+            if (event_)
+                (void)cudaEventDestroy(event_);
+        }
+
+        ScopedCUDATimingEvent(const ScopedCUDATimingEvent &) = delete;
+        ScopedCUDATimingEvent &operator=(const ScopedCUDATimingEvent &) = delete;
+
+        ScopedCUDATimingEvent(ScopedCUDATimingEvent &&other) noexcept
+            : event_(other.event_)
+        {
+            other.event_ = nullptr;
+        }
+
+        ScopedCUDATimingEvent &operator=(ScopedCUDATimingEvent &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (event_)
+                    (void)cudaEventDestroy(event_);
+                event_ = other.event_;
+                other.event_ = nullptr;
+            }
+            return *this;
+        }
+
+        [[nodiscard]] cudaEvent_t get() const noexcept { return event_; }
+
+    private:
+        cudaEvent_t event_ = nullptr;
+    };
+
+    /**
+     * @brief Persistent device state for one shape/M candidate tournament.
+     *
+     * Construction performs every allocation and transfer shared by the
+     * candidates. `measure()` contains only production kernel launches and
+     * stream-local event timing. `byteMismatches()` compares every output byte
+     * on device after timing and downloads only mismatch metadata. Dedicated
+     * grouped-verifier integration suites retain the stricter M=1
+     * serial-decode oracle for M=2..16.
+     */
+    class PreparedSweepExecution
+    {
+    public:
+        /**
+         * @brief Admit persistent buffers, exact-stream bindings, and an untimed oracle.
+         * @param kernel Production GEMM whose prepared weights outlive this fixture.
+         * @param m Positive physical activation row count.
+         * @param n Positive participant-local output width.
+         * @param k Positive participant-local reduction width.
+         * @param device_id CUDA ordinal owning every retained tensor and workspace.
+         * @param requirements Union of the candidates' persistent workspace contracts.
+         * @param maximum_bench_runs Number of preallocated timing-event pairs.
+         * @throws std::runtime_error if admission, publication, or oracle execution fails.
+         */
+        PreparedSweepExecution(
+            ITensorGemm *kernel,
+            int m,
+            int n,
+            int k,
+            int device_id,
+            const WorkspaceRequirements &requirements,
+            int maximum_bench_runs)
+            : kernel_(kernel), m_(m), n_(n), k_(k), device_id_(device_id)
+        {
+            if (!kernel_ || maximum_bench_runs <= 0 ||
+                cudaSetDevice(device_id_) != cudaSuccess)
+                throw std::runtime_error("invalid CUDA sweep execution device");
+
+            workspace_consumer_ = dynamic_cast<IWorkspaceConsumer *>(kernel_);
+            if (workspace_consumer_)
+            {
+                const size_t required = requirements.total_bytes_with_alignment();
+                const size_t budget = std::max(
+                    required + required / 10, size_t{64} * 1024 * 1024);
+                workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                    DeviceId::cuda(device_id_), budget);
+                if (!workspace_->allocate(requirements))
+                    throw std::runtime_error(
+                        "failed to allocate persistent CUDA sweep workspace");
+                workspace_consumer_->bindWorkspace(workspace_.get());
+            }
+
+            host_input_ = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m_), static_cast<size_t>(k_)},
+                -0.25f, 0.25f, 7);
+            input_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(k_)});
+            std::memcpy(
+                input_->mutable_data(), host_input_->data(),
+                static_cast<size_t>(m_) * k_ * sizeof(float));
+            output_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_)});
+            oracle_output_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_)});
+            comparison_state_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{4});
+
+            stream_owner_ = std::make_unique<llaminar2::test::ScopedGPUStream>(
+                DeviceId::cuda(device_id_));
+            stream_ = static_cast<cudaStream_t>(stream_owner_->get());
+            kernel_->setGPUStream(static_cast<void *>(stream_));
+
+            /*
+             * Upload and publish every persistent tensor on the same exact
+             * stream consumed by the measured kernel.  A null-stream setup
+             * publication would violate the production ownership contract and
+             * make this harness blind to stream-ordering regressions.
+             */
+            const DeviceId device = DeviceId::cuda(device_id_);
+            if (!input_->ensureOnDevice(device, stream_) ||
+                !output_->ensureOnDevice(device, stream_) ||
+                !oracle_output_->ensureOnDevice(device, stream_) ||
+                !comparison_state_->ensureOnDevice(device, stream_))
+            {
+                throw std::runtime_error(
+                    "failed to allocate persistent CUDA sweep tensors");
+            }
+
+            start_events_.reserve(static_cast<size_t>(maximum_bench_runs));
+            stop_events_.reserve(static_cast<size_t>(maximum_bench_runs));
+            for (int index = 0; index < maximum_bench_runs; ++index)
+            {
+                start_events_.emplace_back();
+                stop_events_.emplace_back();
+            }
+            times_us_.resize(static_cast<size_t>(maximum_bench_runs));
+
+            buildExactMPrefillOracle();
+        }
+
+        /** @brief Retire all test submissions before releasing workspace bindings. */
+        ~PreparedSweepExecution()
+        {
+            if (stream_)
+                (void)cudaStreamSynchronize(stream_);
+            if (kernel_)
+                kernel_->clearGPUStreamBinding();
+            if (workspace_consumer_)
+                workspace_consumer_->unbindWorkspace();
+        }
+
+        PreparedSweepExecution(const PreparedSweepExecution &) = delete;
+        PreparedSweepExecution &operator=(const PreparedSweepExecution &) = delete;
+
+        /** @brief Choose direct trainer submission or retained production replay. */
+        enum class Submission { Direct, Captured };
+
+        /**
+         * @brief Time the prepared projection, including its activation quantizer.
+         * @param warmup_runs Untimed submissions before measurement.
+         * @param bench_runs Number of independent event samples to retain.
+         * @param submission Capture amortizes host launch cost over sixteen operations.
+         * @param probe_identity Optional diagnostic-only physical-kernel inventory.
+         * @return Aggregate statistics over the retained native-event observations.
+         * @throws std::invalid_argument for incomplete or mismatched timing geometry.
+         * @throws std::runtime_error for any failed capture, launch, or observation.
+         * The captured probe leaves installed dispatch overlays enabled. It is
+         * a pipeline measurement, not a GEMM-only or multi-device speedup claim.
+         */
+        RunResult measure(int warmup_runs, int bench_runs,
+                          Submission submission = Submission::Direct,
+                          const llaminar2::test::CUDACapturedKernelProbeIdentity *probe_identity = nullptr)
+        {
+            if (warmup_runs <= 0 || bench_runs <= 0 ||
+                static_cast<size_t>(bench_runs) > start_events_.size())
+            {
+                throw std::invalid_argument(
+                    "invalid CUDA NativeQuantised timing repetition count");
+            }
+            if (probe_identity && (submission != Submission::Captured ||
+                probe_identity->m != m_ || probe_identity->n != n_ || probe_identity->k != k_))
+                throw std::invalid_argument("physical-kernel probe requires its exact captured projection geometry");
+            kernel_probe_records_.clear();
+            const int operations = submission == Submission::Captured
+                ? llaminar2::test::kDensePrefillCapturedOperations : 1;
+            std::unique_ptr<llaminar2::CUDAGraphCapture> graph;
+            if (submission == Submission::Captured)
+            {
+                graph = std::make_unique<llaminar2::CUDAGraphCapture>(stream_, device_id_);
+                llaminar2::ScopedBackendGraphCapture recording(*graph, "CUDA projection scaling");
+                if (!recording.begin())
+                    throw std::runtime_error("cannot capture CUDA projection scaling probe");
+                for (int operation = 0; operation < operations; ++operation)
+                    launch(m_, input_.get(), output_.get());
+                recording.finish();
+                if (!graph->instantiate())
+                    throw std::runtime_error("cannot instantiate CUDA projection scaling probe");
+            }
+            const auto submit = [&] {
+                if (graph)
+                {
+                    if (!graph->launch())
+                        throw std::runtime_error("cannot replay CUDA projection scaling probe");
+                }
+                else launch(m_, input_.get(), output_.get());
+            };
+            for (int iteration = 0; iteration < warmup_runs; ++iteration)
+                submit();
+            checkStream("warmup");
+
+            for (int iteration = 0; iteration < bench_runs; ++iteration)
+            {
+                const size_t index = static_cast<size_t>(iteration);
+                if (cudaEventRecord(start_events_[index].get(), stream_) !=
+                    cudaSuccess)
+                    throw std::runtime_error(
+                        "CUDA sweep start-event recording failed");
+                submit();
+                if (cudaEventRecord(stop_events_[index].get(), stream_) !=
+                    cudaSuccess)
+                    throw std::runtime_error(
+                        "CUDA sweep stop-event recording failed");
+            }
+            if (cudaEventSynchronize(
+                    stop_events_[static_cast<size_t>(bench_runs - 1)].get()) !=
+                cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "CUDA sweep candidate event-batch synchronization failed");
+            }
+            for (int iteration = 0; iteration < bench_runs; ++iteration)
+            {
+                float elapsed_ms = 0.0f;
+                if (cudaEventElapsedTime(
+                        &elapsed_ms,
+                        start_events_[static_cast<size_t>(iteration)].get(),
+                        stop_events_[static_cast<size_t>(iteration)].get()) !=
+                    cudaSuccess)
+                    throw std::runtime_error(
+                        "CUDA sweep elapsed-time query failed");
+                times_us_[static_cast<size_t>(iteration)] =
+                    static_cast<double>(elapsed_ms) * 1000.0 / operations;
+            }
+            if (const cudaError_t error = cudaGetLastError();
+                error != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("CUDA sweep candidate failed: ") +
+                    cudaGetErrorString(error));
+            }
+
+            RunResult result;
+            result.min_us = *std::min_element(
+                times_us_.begin(),
+                times_us_.begin() + bench_runs);
+            result.mean_us = std::accumulate(
+                                 times_us_.begin(),
+                                 times_us_.begin() + bench_runs,
+                                 0.0) /
+                             static_cast<double>(bench_runs);
+            result.native_family = "native_quantised_tc";
+            last_timing_sample_count_ = static_cast<size_t>(bench_runs);
+            if (probe_identity)
+            {
+                kernel_probe_records_ = llaminar2::test::probeIndependentCUDAKernels(
+                    graph->graph(), stream_,
+                    llaminar2::test::CUDAIndependentKernelFixture::StatelessProjection,
+                    *probe_identity, {.warmup_runs = warmup_runs,
+                                      .sample_count = bench_runs,
+                                      .operations_per_sample = operations});
+                // Isolated producers may overwrite shared scratch. Restore
+                // the complete ordered pipeline before the byte certificate.
+                submit();
+                checkStream("restore complete projection after kernel isolation");
+            }
+            return result;
+        }
+
+        /** @return Exact physical-kernel records from the last diagnostic replay. */
+        [[nodiscard]] const std::vector<nlohmann::json> &kernelProbeRecords() const noexcept
+        {
+            return kernel_probe_records_;
+        }
+
+        /** @brief Poison every output byte before captured publication, outside timed replay. */
+        void poisonOutput()
+        {
+            if (cudaMemsetAsync(output_->gpu_data_ptr(), 0xa5,
+                    static_cast<std::size_t>(m_) * n_ * sizeof(float), stream_) != cudaSuccess)
+                throw std::runtime_error("CUDA installed prefill output poison failed");
+        }
+
+        /**
+         * @brief Return the exact native-event samples from the last candidate.
+         *
+         * The view aliases persistent host storage owned by this prepared
+         * tournament and remains valid until the next `measure()` call. This
+         * avoids a per-candidate allocation while allowing the durable corpus
+         * writer to retain every observation used by the aggregate statistics.
+         */
+        [[nodiscard]] std::span<const double> timingSamples() const noexcept
+        {
+            return std::span<const double>(
+                times_us_.data(), last_timing_sample_count_);
+        }
+
+        /**
+         * @brief Resolve one candidate before querying compiler resources.
+         *
+         * AUTO is a shape-dependent policy rather than a kernel symbol. One
+         * untimed launch is therefore required to publish the exact physical
+         * specialization selected by production. The stream wait is setup
+         * work and occurs before any canonical timing event is recorded.
+         */
+        void probeLaunch()
+        {
+            launch(m_, input_.get(), output_.get());
+            checkStream("resource-identity probe");
+        }
+
+        /**
+         * @brief Compare every restored pipeline output byte with its exact-M oracle.
+         * @return Mismatched byte count; only that count and its first offset cross to host.
+         * @throws std::runtime_error if comparison or terminal metadata publication fails.
+         */
+        size_t byteMismatches()
+        {
+            auto *comparison_words = reinterpret_cast<uint64_t *>(
+                comparison_state_->gpu_data_ptr());
+            if (!llaminar2::test::enqueueCudaFP32ByteComparison(
+                    reinterpret_cast<const float *>(output_->gpu_data_ptr()),
+                    reinterpret_cast<const float *>(
+                        oracle_output_->gpu_data_ptr()),
+                    static_cast<size_t>(m_) * static_cast<size_t>(n_),
+                    comparison_words,
+                    comparison_words + 1,
+                    stream_))
+            {
+                throw std::runtime_error(
+                    "CUDA sweep full-buffer byte comparison launch failed");
+            }
+
+            std::array<uint64_t, 2> result{};
+            if (cudaMemcpyAsync(
+                    result.data(),
+                    comparison_words,
+                    sizeof(result),
+                    cudaMemcpyDeviceToHost,
+                    stream_) != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "CUDA sweep mismatch metadata download failed");
+            }
+            checkStream("full-buffer byte certificate");
+            first_byte_mismatch_ = result[1];
+            return static_cast<size_t>(result[0]);
+        }
+
+        /** @return Least mismatched byte offset or `UINT64_MAX`. */
+        uint64_t firstByteMismatch() const
+        {
+            return first_byte_mismatch_;
+        }
+
+    private:
+        /**
+         * @brief Submit the public production projection on its retained exact stream.
+         * @param m Live physical activation rows.
+         * @param input Persistent activation tensor.
+         * @param output Persistent destination with the same admitted geometry.
+         * @throws std::runtime_error if the public kernel rejects execution.
+         */
+        void launch(int m, FP32Tensor *input, FP32Tensor *output)
+        {
+            if (!kernel_->multiply_tensor(input, output, m, n_, k_))
+                throw std::runtime_error("CUDA NativeQuantised sweep launch failed");
+        }
+
+        /**
+         * @brief Observe a setup or terminal diagnostic boundary outside timed replay.
+         * @param operation Named fixture lifecycle boundary for precise failure reporting.
+         * @throws std::runtime_error if the owning stream's submissions failed.
+         */
+        void checkStream(const char *operation)
+        {
+            if (const cudaError_t error = cudaStreamSynchronize(stream_);
+                error != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("CUDA sweep ") + operation + " failed: " +
+                    cudaGetErrorString(error));
+            }
+        }
+
+        /**
+         * @brief Run one exact-M public projection before candidate controls are applied.
+         * @throws std::runtime_error if the untimed device oracle fails.
+         */
+        void buildExactMPrefillOracle()
+        {
+            cudaNativeQuantisedPrefill_setStagingSchedule(PrefillStagingSchedule::RegisterDecode);
+            cudaNativeQuantisedPrefill_setBK256Mode(0);
+            cudaNativeQuantisedPrefill_setForceTile(-1);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+            launch(m_, input_.get(), oracle_output_.get());
+            checkStream("exact-M device oracle construction");
+        }
+
+        ITensorGemm *kernel_ = nullptr;
+        IWorkspaceConsumer *workspace_consumer_ = nullptr;
+        int m_ = 0;
+        int n_ = 0;
+        int k_ = 0;
+        int device_id_ = 0;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+        std::unique_ptr<FP32Tensor> host_input_;
+        std::unique_ptr<FP32Tensor> input_;
+        std::unique_ptr<FP32Tensor> output_;
+        std::unique_ptr<FP32Tensor> oracle_output_;
+        std::unique_ptr<FP32Tensor> comparison_state_;
+        std::unique_ptr<llaminar2::test::ScopedGPUStream> stream_owner_;
+        cudaStream_t stream_ = nullptr;
+        std::vector<ScopedCUDATimingEvent> start_events_;
+        std::vector<ScopedCUDATimingEvent> stop_events_;
+        std::vector<double> times_us_;
+        std::vector<nlohmann::json> kernel_probe_records_;
+        size_t last_timing_sample_count_ = 0;
+        uint64_t first_byte_mismatch_ = std::numeric_limits<uint64_t>::max();
+    };
+
+    /**
+     * @brief Measure installed dispatch at explicit physical projection shapes.
+     *
+     * Unlike the training tournament this test does not disable exact overlays.
+     * The shared manifest resolves shapes; full-output byte identity against
+     * the untimed production call is required before publishing any samples.
+     */
+    TEST_F(CUDANativeQuantisedGemmPerf, CapturedProductionShapes)
+    {
+        RunConfig cfg = loadRunConfig();
+        // An unfiltered diagnostic stays bounded; broad format/shape training
+        // remains the explicit tournament's responsibility.
+        if (cfg.format_filters.empty()) cfg.format_filters.insert("q6_k");
+        if (cfg.shape_filters.empty()) cfg.shape_filters.insert("3b_attnout");
+        int cases = 0;
+        std::printf("format,shape,m,n,k,sample_index,latency_us,byte_mismatches,registers,scratch_bytes,threads,active_blocks_per_sm,operation\n");
+        for (const auto &format : kFormats)
+        {
+            if (!shouldRunName(cfg.format_filters, format.name)) continue;
+            for (const auto &shape : kQwenShapes)
+            {
+                if (!shouldRunName(cfg.shape_filters, shape.name)) continue;
+                auto weights = format.create(shape.n, shape.k);
+                auto prepared = llaminar2::test::makeGpuPreparedGemm(
+                    weights.get(), DeviceId::cuda(0), "cuda.scaling." + shape.name);
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(prepared.kernel);
+                ASSERT_NE(consumer, nullptr);
+                for (const int m : cfg.performance_prefill_m)
+                {
+                    PreparedSweepExecution execution(prepared.kernel, m, shape.n, shape.k,
+                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs);
+                    execution.measure(cfg.warmup_runs, cfg.bench_runs,
+                        PreparedSweepExecution::Submission::Captured);
+                    ASSERT_EQ(execution.byteMismatches(), 0u);
+                    CUDADensePrefillKernelResources primary{}, auxiliary{};
+                    ASSERT_TRUE(cudaNativeQuantisedPrefill_queryLastLaunchResources(
+                        format.runtimeCodebook(), shape.n, shape.k, 0, &primary, &auxiliary));
+                    ASSERT_EQ(primary.local_memory_bytes_per_thread, 0u);
+                    ASSERT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                    const auto samples = execution.timingSamples();
+                    for (size_t index = 0; index < samples.size(); ++index)
+                        std::printf("%s,%s,%d,%d,%d,%zu,%.9f,0,%d,%zu,%d,%d,pipeline\n",
+                            format.name.c_str(), shape.name.c_str(), m, shape.n, shape.k,
+                            index, samples[index], primary.registers_per_thread,
+                            primary.local_memory_bytes_per_thread, primary.threads_per_block,
+                            primary.max_active_blocks_per_sm);
+                    ++cases;
+                }
+            }
+        }
+        ASSERT_GT(cases, 0) << "No production shapes matched the requested filters";
+    }
+
+    /**
+     * @test An exact BK64 policy survives a geometry selected by generic Q4_0 BK256.
+     *
+     * The former selector ran the generic BK256 heuristic after finding this
+     * exact cell. Output bytes still matched, hiding that the admitted producer
+     * never ran. Independent Auto supplies the oracle; retained replay must
+     * publish the measured tuple and keep every output byte identical.
+     */
+    TEST_F(CUDANativeQuantisedGemmPerf, ExactOverlayPrecedesQ40BK256Heuristic)
+    {
+        constexpr int m = 64, n = 5120, k = 17408;
+        const auto format = std::find_if(kFormats.begin(), kFormats.end(),
+            [](const auto &entry) { return entry.name == "Q4_0"; });
+        ASSERT_NE(format, kFormats.end());
+        llaminar2::cuda::generated::CUDADensePrefillOverlayConfig expected{};
+        ASSERT_TRUE(llaminar2::cuda::generated::selectCUDADensePrefillOverlay(0, m, n, k, expected));
+        ASSERT_FALSE(expected.bk256) << "Retain a distinct generic/exact producer sentinel";
+        ASSERT_TRUE(expected.canonical_kpart);
+        auto weights = format->create(n, k);
+        auto prepared = llaminar2::test::makeGpuPreparedGemm(
+            weights.get(), DeviceId::cuda(0), "cuda.exact-prefill-precedence");
+        auto *consumer = dynamic_cast<IWorkspaceConsumer *>(prepared.kernel);
+        ASSERT_NE(consumer, nullptr);
+        ScopedDensePrefillOverlayBypass restore_policy;
+        auto requirements = consumer->getWorkspaceRequirements(m, n, k);
+        cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
+        requirements.merge(consumer->getWorkspaceRequirements(m, n, k));
+        cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
+        PreparedSweepExecution execution(prepared.kernel, m, n, k, 0, requirements, 1);
+        int tile = -1, partitions = 0, bk256 = 0, canonical = 0;
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &partitions, &bk256, &canonical);
+        ASSERT_NE(bk256, 0) << "The independent generic oracle must exercise the former masking path";
+        cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
+        execution.poisonOutput();
+        execution.measure(1, 1, PreparedSweepExecution::Submission::Captured);
+        cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &partitions, &bk256, &canonical);
+        EXPECT_EQ(tile, expected.tile_id);
+        EXPECT_EQ(bk256, 0);
+        EXPECT_EQ(canonical, 1);
+        EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule(), expected.staging);
+        CUDADensePrefillKernelResources primary{}, auxiliary{};
+        ASSERT_TRUE(cudaNativeQuantisedPrefill_queryLastLaunchResources(0, n, k, 0, &primary, &auxiliary));
+        EXPECT_EQ(primary.local_memory_bytes_per_thread, 0u);
+        EXPECT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+        EXPECT_GT(primary.max_active_blocks_per_sm, 0);
+        EXPECT_GT(auxiliary.max_active_blocks_per_sm, 0);
+        ASSERT_EQ(execution.byteMismatches(), 0u) << "first offset=" << execution.firstByteMismatch();
+    }
+
+    /** @brief Disjoint format groups share the complete physical dense/TP inventory. */
+    class CUDAInstalledDensePrefillTest : public CUDANativeQuantisedGemmPerf,
+                                         public ::testing::WithParamInterface<int> {};
+
+    /**
+     * @test Installed producer, arena and byte identity against independent generic Auto.
+     *
+     * Prepared weights are reused across four row regimes. Every output is
+     * poisoned before retained replay, and all bytes and the exact physical
+     * resource/dispatch tuple are checked. This is a functional production
+     * admission gate; its event samples are never tuning evidence.
+     */
+    TEST_P(CUDAInstalledDensePrefillTest, AllSourceFormats)
+    {
+        const std::array<std::string_view, 12> names{
+            "QwenDense27B_TP2_FFN_GateUp", "QwenDense27B_TP2_FFN_DownProjection", "32B_AttnOut",
+            "QwenDense27B_TP2_GDN_ZProjection", "QwenDense27B_TP2_GDN_OutputProjection",
+            "QwenDense27B_TP2_AttnKVProjection", "Qwen36_GDN_ZProjection", "Qwen36_FFN_GateUp",
+            "Qwen36_FFN_DownProjection", "Qwen36_GDN_InnerProjection",
+            "Qwen36_GDN_OutputProjection", "Qwen36_GDN_TimeProjection"};
+        std::set<std::pair<int, int>> projections;
+        for (const auto &shape : kQwenShapes)
+            if (std::find(names.begin(), names.end(), shape.name) != names.end())
+                projections.emplace(shape.n, shape.k);
+        ASSERT_EQ(projections.size(), names.size());
+        ScopedDensePrefillOverlayBypass restore_policy;
+        std::size_t cases = 0;
+        for (std::size_t index = static_cast<std::size_t>(GetParam()); index < kFormats.size(); index += 4)
+        {
+            const auto &format = kFormats[index];
+            SCOPED_TRACE(format.name);
+            for (const auto &[n, k] : projections)
+            {
+                auto weights = format.create(n, k);
+                auto prepared = llaminar2::test::makeGpuPreparedGemm(
+                    weights.get(), DeviceId::cuda(0), "cuda.installed-prefill." + format.name);
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(prepared.kernel);
+                ASSERT_NE(consumer, nullptr);
+                for (const int m : {64, 384, 448, 512})
+                {
+                    SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);
+                    llaminar2::cuda::generated::CUDADensePrefillOverlayConfig expected{};
+                    ASSERT_TRUE(llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
+                        format.runtimeCodebook() == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
+                            ? uint8_t{4} : format.runtimeCodebook(), m, n, k, expected));
+                    cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
+                    auto requirements = consumer->getWorkspaceRequirements(m, n, k);
+                    cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
+                    requirements.merge(consumer->getWorkspaceRequirements(m, n, k));
+                    cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
+                    PreparedSweepExecution execution(prepared.kernel, m, n, k, 0, requirements, 1);
+                    cudaNativeQuantisedPrefill_setExactOverlayEnabled(true);
+                    execution.poisonOutput();
+                    execution.measure(1, 1, PreparedSweepExecution::Submission::Captured);
+                    int tile = -1, partitions = 0, bk256 = 0, canonical = 0;
+                    cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &partitions, &bk256, &canonical);
+                    EXPECT_EQ(tile, expected.tile_id);
+                    EXPECT_EQ(bk256 != 0, expected.bk256);
+                    EXPECT_EQ(canonical != 0, expected.canonical_kpart);
+                    EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule(), expected.staging);
+                    CUDADensePrefillKernelResources primary{}, auxiliary{};
+                    ASSERT_TRUE(cudaNativeQuantisedPrefill_queryLastLaunchResources(
+                        format.runtimeCodebook(), n, k, 0, &primary, &auxiliary));
+                    EXPECT_EQ(primary.local_memory_bytes_per_thread, 0u);
+                    EXPECT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                    EXPECT_GT(primary.max_active_blocks_per_sm, 0);
+                    ASSERT_EQ(execution.byteMismatches(), 0u) << "first offset=" << execution.firstByteMismatch();
+                    ++cases;
+                }
+            }
+        }
+        EXPECT_EQ(cases, ((kFormats.size() + 3u - GetParam()) / 4u) * projections.size() * 4u);
+    }
+
+    INSTANTIATE_TEST_SUITE_P(InstalledCUDADensePrefill, CUDAInstalledDensePrefillTest,
+        ::testing::Values(0, 1, 2, 3));
+
+    /**
+     * @brief Isolate production projection kernels without any communication.
+     *
+     * Shared format/shape/M filters select exact participant-local geometries.
+     * M=2..16 explicitly enters the production decode-equivalent verifier lane;
+     * larger M enters ordinary prefill. The full pipeline is timed first and
+     * replayed after isolation before a complete device byte comparison. Raw
+     * observations are diagnostics, never evidence for installing a dispatch.
+     */
+    TEST_F(CUDANativeQuantisedGemmPerf, CapturedProductionKernelScaling)
+    {
+        RunConfig cfg = loadRunConfig();
+        if (cfg.format_filters.empty()) cfg.format_filters.insert("q6_k");
+        if (cfg.shape_filters.empty()) cfg.shape_filters.insert("3b_attnout");
+        int cases = 0;
+        for (const auto &format : kFormats)
+        {
+            if (!shouldRunName(cfg.format_filters, format.name)) continue;
+            for (const auto &shape : kQwenShapes)
+            {
+                if (!shouldRunName(cfg.shape_filters, shape.name)) continue;
+                auto weights = format.create(shape.n, shape.k);
+                auto prepared = llaminar2::test::makeGpuPreparedGemm(
+                    weights.get(), DeviceId::cuda(0), "cuda.kernel-scaling." + shape.name);
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(prepared.kernel);
+                ASSERT_NE(consumer, nullptr);
+                for (const int m : cfg.performance_prefill_m)
+                {
+                    ASSERT_GT(m, 0);
+                    auto verifier = m > 1 && m <= 16
+                        ? prepared.kernel->beginVerifierDecodeEquivalentScope() : nullptr;
+                    PreparedSweepExecution execution(prepared.kernel, m, shape.n, shape.k,
+                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs);
+                    const llaminar2::test::CUDACapturedKernelProbeIdentity identity{
+                        .operation = shape.name, .format = format.name,
+                        .m = m, .n = shape.n, .k = shape.k};
+                    execution.measure(cfg.warmup_runs, cfg.bench_runs,
+                        PreparedSweepExecution::Submission::Captured, &identity);
+                    ASSERT_EQ(execution.byteMismatches(), 0u);
+                    nlohmann::json pipeline{{"diagnostic_only", true},
+                        {"mode", "production_projection_pipeline"},
+                        {"operation", shape.name}, {"format", format.name},
+                        {"m", m}, {"n", shape.n}, {"k", shape.k},
+                        {"byte_mismatches", 0}, {"samples_us", execution.timingSamples()}};
+                    std::cout << "CUDA_KERNEL_PROBE," << pipeline.dump() << '\n';
+                    for (const auto &record : execution.kernelProbeRecords())
+                        std::cout << "CUDA_KERNEL_PROBE," << record.dump() << '\n';
+                    ++cases;
+                }
+            }
+        }
+        ASSERT_GT(cases, 0) << "No physical projection shapes matched the requested filters";
+    }
+
+    static size_t estimateVramBytes(int m, int n, int k)
+    {
+        const size_t a_bytes = static_cast<size_t>(m) * k * sizeof(float);
+        const size_t c_bytes = static_cast<size_t>(m) * n * sizeof(float);
+        // Q4_0 weight: n*k / 2 (4 bits per element) + scale overhead
+        const size_t w_bytes = static_cast<size_t>(n) * k / 2 + static_cast<size_t>(n) * (k / 32) * 2;
+        // Workspace: quant_a(M*K) + scales_a(M*4) + acc_int32(M*N*4) +
+        //            concurrent prefill extra acc slots(2*M*N*4) +
+        //            scales_a_blockwise(M*(K/32)*4) + temp_c_fp32(M*N*4)
+        const size_t workspace_bytes = static_cast<size_t>(m) * k                     // quant_a (int8)
+                                       + static_cast<size_t>(m) * 4                   // scales_a
+                                       + static_cast<size_t>(m) * n * 4               // acc_int32
+                                       + 2 * static_cast<size_t>(m) * n * 4           // concurrent prefill extra acc
+                                       + static_cast<size_t>(m) * ((k + 31) / 32) * 4 // scales_a_blockwise
+                                       + static_cast<size_t>(m) * n * 4;              // temp_c_fp32
+        return a_bytes + c_bytes + w_bytes + workspace_bytes;
+    }
+
+    TEST_F(CUDANativeQuantisedGemmPerf, TileSweep_AllStrategies)
+    {
+        ScopedDensePrefillOverlayBypass overlay_bypass;
+        const SweepConfig cfg = loadSweepConfig();
+        const double peak_tops = peak_tc_tops_;
+        // Force-mode controls are process-wide. The turnkey collector obtains
+        // parallelism by launching one masked process per physical GPU, keeping
+        // each candidate transaction isolated and allowing persistent state to
+        // remain bound for the complete shape/M tournament.
+        constexpr int worker_count = 1;
+
+        // Query VRAM on device 0
+        size_t vram_free = 0, vram_total = 0;
+        cudaMemGetInfo(&vram_free, &vram_total);
+        // Use 85% of free VRAM as budget (leave headroom for driver allocations)
+        const size_t vram_budget = static_cast<size_t>(static_cast<double>(vram_free) * 0.85);
+
+        std::fprintf(stderr,
+                     "[TileSweep] %d GPU(s) detected, VRAM free=%.0f MB, budget=%.0f MB\n",
+                     worker_count,
+                     static_cast<double>(vram_free) / (1024.0 * 1024.0),
+                     static_cast<double>(vram_budget) / (1024.0 * 1024.0));
+
+        // Find the format factory
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create_weights;
+        std::string resolved_format_name;
+        uint8_t resolved_codebook_id = 0;
+        uint8_t resolved_execution_codebook_id = 0;
+        {
+            std::string fmt_lower = toLower(cfg.format_name);
+            bool found = false;
+            for (const auto &f : kFormats)
+            {
+                if (toLower(f.name) == fmt_lower)
+                {
+                    create_weights = f.create;
+                    resolved_format_name = f.name;
+                    resolved_codebook_id = f.codebook_id;
+                    resolved_execution_codebook_id = f.runtimeCodebook();
+                    found = true;
+                    break;
+                }
+            }
+            ASSERT_TRUE(found) << "Unknown format: " << cfg.format_name;
+        }
+
+        // ── Build flat task list ──
+        std::vector<SweepTask> tasks;
+        const uint8_t execution_codebook_id =
+            resolved_execution_codebook_id;
+        const auto has_canonical_kpart =
+            [execution_codebook_id](int n, int k)
+        {
+            int shape_id = -1;
+            int tile_n = 0;
+            int cpt = 0;
+            int exact_kb = 0;
+            if (!cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
+                    execution_codebook_id,
+                    /*graph_captured=*/1,
+                    /*m=*/1,
+                    n,
+                    k,
+                    &shape_id,
+                    &tile_n,
+                    &cpt,
+                    &exact_kb))
+            {
+                throw std::runtime_error(
+                    "generated M=1 dispatch is incomplete for dense sweep");
+            }
+            // NativeGemvShape::KPAR is the second scoped-enum value.
+            return shape_id == 1;
+        };
+        const auto resource_eligible =
+            [execution_codebook_id](
+                int tile_id,
+                bool canonical_kpart,
+                bool ordered_bk256,
+                PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode)
+        {
+            return sweepCandidateIsResourceEligible(
+                execution_codebook_id, tile_id, canonical_kpart,
+                ordered_bk256, staging);
+        };
+
+        for (const auto &shape : kQwenShapes)
+        {
+            if (!shouldRunName(cfg.shape_filters, shape.name))
+                continue;
+
+            for (int m : cfg.prefill_m)
+            {
+                // Check VRAM budget before adding tasks for this (shape, M)
+                const size_t estimated_vram = estimateVramBytes(m, shape.n, shape.k);
+                if (estimated_vram > vram_budget)
+                {
+                    std::fprintf(stderr,
+                                 "[TileSweep] SKIPPED %s M=%d: estimated %.0f MB > budget %.0f MB\n",
+                                 shape.name.c_str(), m,
+                                 static_cast<double>(estimated_vram) / (1024.0 * 1024.0),
+                                 static_cast<double>(vram_budget) / (1024.0 * 1024.0));
+                    continue;
+                }
+
+                for (Strategy strat : cfg.strategies)
+                {
+                    /*
+                     * BK256 is implemented only by the Q4_0 execution family.
+                     * Advertising it for another codebook merely relaunches
+                     * AUTO under a false candidate name and corrupts the
+                     * tournament, so do not create that task.
+                     */
+                    if (strat == Strategy::BK256 &&
+                        resolved_format_name != "Q4_0")
+                    {
+                        continue;
+                    }
+                    if (strat == Strategy::BK256 &&
+                        (!resource_eligible(-3, false, false) ||
+                         !resource_eligible(-3, false, true) ||
+                         !resource_eligible(-2, false, false) ||
+                         !resource_eligible(-2, false, true)))
+                    {
+                        continue;
+                    }
+                    if (strat == Strategy::CanonicalKpart &&
+                        !has_canonical_kpart(shape.n, shape.k))
+                    {
+                        continue;
+                    }
+                    if (strat == Strategy::Auto)
+                    {
+                        tasks.push_back({&shape, m, strat, -1, 0, "AUTO", 0});
+                    }
+                    else if (strat == Strategy::BK256)
+                    {
+                        const int bk256_tiles = ((m + 127) / 128) * ((shape.n + 127) / 128);
+                        tasks.push_back(
+                            {&shape, m, strat, -2, 1,
+                             "BK256_128x128", bk256_tiles});
+                    }
+                    else
+                    {
+                        // BK64 strategies: iterate tiles
+                        for (int tile_id : cfg.tile_ids)
+                        {
+                            for (PrefillStagingSchedule staging : {
+                                    PrefillStagingSchedule::RegisterDecode,
+                                    PrefillStagingSchedule::AsyncPayload,
+                                    PrefillStagingSchedule::AsyncWeightOperands,
+                                    PrefillStagingSchedule::AsyncAllOperands})
+                            {
+                                if (!resource_eligible(
+                                        tile_id,
+                                        strat == Strategy::CanonicalKpart,
+                                        false, staging))
+                                {
+                                    continue;
+                                }
+                                const int tile_count = cudaNativeQuantisedPrefill_getTileCount(tile_id, m, shape.n);
+                                const int candidate_k_partitions =
+                                    strat == Strategy::CanonicalKpart ? 0 : 1;
+                                tasks.push_back(
+                                    {&shape, m, strat, tile_id,
+                                     candidate_k_partitions,
+                                     kAllTiles[tile_id].name, tile_count, staging});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ASSERT_FALSE(tasks.empty()) << "No tile sweep cases selected. Check env var filters.";
+
+        std::fprintf(stderr,
+                     "[TileSweep] %zu tasks to run across %d GPU(s)\n",
+                     tasks.size(), worker_count);
+
+        // ── Open CSV for incremental output ──
+        FILE *csv_fp = nullptr;
+        if (!cfg.csv_path.empty())
+        {
+            csv_fp = std::fopen(cfg.csv_path.c_str(), "w");
+            ASSERT_NE(csv_fp, nullptr) << "Failed to open CSV: " << cfg.csv_path;
+            std::fprintf(csv_fp,
+                         "format,codebook,shape,m,n,k,tile,tile_id,strategy,requested_k_partitions,tiles,"
+                         "min_us,mean_us,tops,pct_peak,gpu,byte_mismatches,"
+                         "first_byte_mismatch,correctness_pass,observed_tile_id,"
+                         "observed_k_partitions,observed_bk256,"
+                         "observed_canonical_kpart,canonical_kpart_available,"
+                         "primary_registers_per_thread,"
+                         "primary_local_memory_bytes_per_thread,"
+                         "primary_static_shared_memory_bytes,"
+                         "primary_dynamic_shared_memory_bytes,"
+                         "primary_threads_per_block,"
+                         "primary_max_threads_per_block,"
+                         "primary_max_active_blocks_per_sm,"
+                         "auxiliary_registers_per_thread,"
+                         "auxiliary_local_memory_bytes_per_thread,"
+                         "auxiliary_static_shared_memory_bytes,"
+                         "auxiliary_dynamic_shared_memory_bytes,"
+                         "auxiliary_threads_per_block,"
+                         "auxiliary_max_threads_per_block,"
+                         "auxiliary_max_active_blocks_per_sm,staging_schedule,observed_staging_schedule\n");
+            std::fflush(csv_fp);
+        }
+
+        FILE *timing_csv_fp = nullptr;
+        if (!cfg.timing_csv_path.empty())
+        {
+            timing_csv_fp = std::fopen(cfg.timing_csv_path.c_str(), "w");
+            ASSERT_NE(timing_csv_fp, nullptr)
+                << "Failed to open raw timing CSV: " << cfg.timing_csv_path;
+            std::fprintf(
+                timing_csv_fp,
+                "backend,phase,format,codebook,shape,m,n,k,tile,tile_id,"
+                "strategy,requested_k_partitions,sample_index,timed_replays,latency_us,"
+                "latency_us_hex,staging_schedule,captured_operations\n");
+            std::fflush(timing_csv_fp);
+        }
+
+        // ── Run one allocation-free candidate tournament on the masked GPU ──
+        std::vector<SweepRow> rows(tasks.size());
+        std::vector<bool> row_valid(tasks.size(), false);
+        constexpr int gpu_id = 0;
+        const Shape *prepared_shape = nullptr;
+        int prepared_m = 0;
+        std::unique_ptr<TensorBase> weights;
+        std::unique_ptr<llaminar2::test::GpuPreparedGemm> prepared;
+        std::unique_ptr<PreparedSweepExecution> execution;
+
+        for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx)
+        {
+            const SweepTask &task = tasks[task_idx];
+            const auto &shape = *task.shape;
+            std::fprintf(stderr,
+                         "[TileSweep][gpu=%d] %s M=%d %s %s kpart=%d tiles=%d\n",
+                         gpu_id, shape.name.c_str(), task.m,
+                         task.tile_name.c_str(), strategyName(task.strat),
+                         task.requested_k_partitions, task.tiles);
+
+            if (prepared_shape != task.shape)
+            {
+                execution.reset();
+                prepared.reset();
+                weights = create_weights(
+                    static_cast<size_t>(shape.n),
+                    static_cast<size_t>(shape.k));
+                prepared = std::make_unique<llaminar2::test::GpuPreparedGemm>(
+                    llaminar2::test::makeGpuPreparedGemm(
+                        weights.get(), DeviceId::cuda(gpu_id),
+                        "perf.cuda_native_quantised_prefill." + shape.name));
+                prepared_shape = task.shape;
+                prepared_m = 0;
+            }
+            if (prepared_m != task.m)
+            {
+                execution.reset();
+                auto *consumer =
+                    dynamic_cast<IWorkspaceConsumer *>(prepared->kernel);
+                const WorkspaceRequirements requirements =
+                    tournamentWorkspaceRequirements(
+                        consumer, tasks, task.shape, task.m);
+                execution = std::make_unique<PreparedSweepExecution>(
+                    prepared->kernel, task.m, shape.n, shape.k, gpu_id,
+                    requirements, cfg.bench_runs);
+                prepared_m = task.m;
+            }
+
+            configureSweepTask(task);
+            const uint8_t source_codebook_id =
+                requireNativeQuantisedInfo(weights.get(), resolved_format_name)
+                    .codebook_id;
+            if (source_codebook_id != resolved_codebook_id)
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill source codebook identity changed");
+            }
+
+            /*
+             * Resolve AUTO through the real production launcher, then inspect
+             * that exact symbol before timing it. A spilling specialization
+             * is an invalid dispatch target, so it fails the transaction here
+             * rather than contributing even one canonical timing sample.
+             */
+            execution->probeLaunch();
+            int probed_tile_id = -99;
+            int probed_k_partitions = -99;
+            int probed_bk256 = -99;
+            int probed_canonical_kpart = -99;
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(
+                &probed_tile_id,
+                &probed_k_partitions,
+                &probed_bk256,
+                &probed_canonical_kpart);
+            const auto probed_staging = cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule();
+            if (probed_staging != task.staging)
+                throw std::runtime_error("forced CUDA prefill staging did not execute");
+
+            CUDADensePrefillKernelResources primary_resources{};
+            CUDADensePrefillKernelResources auxiliary_resources{};
+            if (!cudaNativeQuantisedPrefill_queryLastLaunchResources(
+                    execution_codebook_id,
+                    shape.n,
+                    shape.k,
+                    gpu_id,
+                    &primary_resources,
+                    &auxiliary_resources))
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill candidate resource query failed");
+            }
+            const int primary_registers =
+                primary_resources.registers_per_thread;
+            const size_t primary_local_bytes =
+                primary_resources.local_memory_bytes_per_thread;
+            const size_t primary_static_shared_bytes =
+                primary_resources.static_shared_memory_bytes;
+            const size_t primary_dynamic_shared_bytes =
+                primary_resources.dynamic_shared_memory_bytes;
+            const int primary_threads = primary_resources.threads_per_block;
+            const int primary_max_threads =
+                primary_resources.max_threads_per_block;
+            const int primary_active_blocks =
+                primary_resources.max_active_blocks_per_sm;
+            const int auxiliary_registers =
+                auxiliary_resources.registers_per_thread;
+            const size_t auxiliary_local_bytes =
+                auxiliary_resources.local_memory_bytes_per_thread;
+            const size_t auxiliary_static_shared_bytes =
+                auxiliary_resources.static_shared_memory_bytes;
+            const size_t auxiliary_dynamic_shared_bytes =
+                auxiliary_resources.dynamic_shared_memory_bytes;
+            const int auxiliary_threads =
+                auxiliary_resources.threads_per_block;
+            const int auxiliary_max_threads =
+                auxiliary_resources.max_threads_per_block;
+            const int auxiliary_active_blocks =
+                auxiliary_resources.max_active_blocks_per_sm;
+            if (primary_registers <= 0 || primary_threads <= 0 ||
+                primary_max_threads < primary_threads ||
+                primary_active_blocks <= 0 || primary_local_bytes != 0 ||
+                auxiliary_local_bytes != 0 ||
+                (auxiliary_threads > 0 &&
+                 (auxiliary_registers <= 0 ||
+                  auxiliary_max_threads < auxiliary_threads ||
+                  auxiliary_active_blocks <= 0)))
+            {
+                std::fprintf(
+                    stderr,
+                    "[TileSweep][resources] rejected %s/%s/M=%d/%s/%s "
+                    "primary={regs=%d,local=%zu,static_smem=%zu,"
+                    "dynamic_smem=%zu,threads=%d,max_threads=%d,"
+                    "active_blocks=%d} auxiliary={regs=%d,local=%zu,"
+                    "static_smem=%zu,dynamic_smem=%zu,threads=%d,"
+                    "max_threads=%d,active_blocks=%d}\n",
+                    resolved_format_name.c_str(),
+                    shape.name.c_str(),
+                    task.m,
+                    task.tile_name.c_str(),
+                    strategyName(task.strat),
+                    primary_registers,
+                    primary_local_bytes,
+                    primary_static_shared_bytes,
+                    primary_dynamic_shared_bytes,
+                    primary_threads,
+                    primary_max_threads,
+                    primary_active_blocks,
+                    auxiliary_registers,
+                    auxiliary_local_bytes,
+                    auxiliary_static_shared_bytes,
+                    auxiliary_dynamic_shared_bytes,
+                    auxiliary_threads,
+                    auxiliary_max_threads,
+                    auxiliary_active_blocks);
+                throw std::runtime_error(
+                    "CUDA dense prefill candidate failed the zero-spill/"
+                    "occupancy eligibility gate");
+            }
+
+            const RunResult rr = execution->measure(
+                cfg.warmup_runs, cfg.bench_runs,
+                PreparedSweepExecution::Submission::Captured);
+            int observed_tile_id = -99;
+            int observed_k_partitions = -99;
+            int observed_bk256 = -99;
+            int observed_canonical_kpart = -99;
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(
+                &observed_tile_id,
+                &observed_k_partitions,
+                &observed_bk256,
+                &observed_canonical_kpart);
+            const auto observed_staging = cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule();
+            if (std::tie(
+                    observed_tile_id,
+                    observed_k_partitions,
+                    observed_bk256,
+                    observed_canonical_kpart) !=
+                std::tie(
+                    probed_tile_id,
+                    probed_k_partitions,
+                    probed_bk256,
+                    probed_canonical_kpart) || observed_staging != probed_staging)
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill route changed after resource proof");
+            }
+            const size_t byte_mismatches = execution->byteMismatches();
+            const auto metrics = computeGemmThroughputMetrics(
+                task.m, shape.n, shape.k, rr.min_us, peak_tops);
+            if (timing_csv_fp)
+            {
+                const auto samples = execution->timingSamples();
+                for (size_t sample_index = 0;
+                     sample_index < samples.size(); ++sample_index)
+                {
+                    const double latency_us = samples[sample_index];
+                    std::fprintf(
+                        timing_csv_fp,
+                        "cuda,prefill,%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,"
+                        "%zu,1,%.9f,%a,%d,%d\n",
+                        resolved_format_name.c_str(),
+                        static_cast<unsigned>(source_codebook_id),
+                        shape.name.c_str(), task.m, shape.n, shape.k,
+                        task.tile_name.c_str(), task.tile_id,
+                        strategyName(task.strat), task.requested_k_partitions,
+                        sample_index, latency_us, latency_us, static_cast<int>(task.staging),
+                        llaminar2::test::kDensePrefillCapturedOperations);
+                }
+                std::fflush(timing_csv_fp);
+            }
+
+            SweepRow &row = rows[task_idx];
+            row.format_name = resolved_format_name;
+            row.codebook_id = source_codebook_id;
+            row.shape_name = shape.name;
+            row.m = task.m;
+            row.n = shape.n;
+            row.k = shape.k;
+            row.tile_name = task.tile_name;
+            row.tile_id = task.tile_id;
+            row.tiles = task.tiles;
+            row.strategy = strategyName(task.strat);
+            row.requested_k_partitions = task.requested_k_partitions;
+            row.min_us = rr.min_us;
+            row.mean_us = rr.mean_us;
+            row.tops = metrics.achieved_tops;
+            row.pct_peak = metrics.pct_tc_peak;
+            row.gpu_id = gpu_id;
+            row.byte_mismatches = byte_mismatches;
+            row.first_byte_mismatch = execution->firstByteMismatch();
+            row.correctness_pass = byte_mismatches == 0;
+            row.canonical_kpart_available =
+                has_canonical_kpart(shape.n, shape.k);
+            row.observed_tile_id = observed_tile_id;
+            row.observed_k_partitions = observed_k_partitions;
+            row.observed_bk256 = observed_bk256;
+            row.observed_canonical_kpart = observed_canonical_kpart;
+            row.staging = task.staging;
+            row.observed_staging = observed_staging;
+            row.primary_registers_per_thread = primary_registers;
+            row.primary_local_memory_bytes_per_thread = primary_local_bytes;
+            row.primary_static_shared_memory_bytes =
+                primary_static_shared_bytes;
+            row.primary_dynamic_shared_memory_bytes =
+                primary_dynamic_shared_bytes;
+            row.primary_threads_per_block = primary_threads;
+            row.primary_max_threads_per_block = primary_max_threads;
+            row.primary_max_active_blocks_per_sm = primary_active_blocks;
+            row.auxiliary_registers_per_thread = auxiliary_registers;
+            row.auxiliary_local_memory_bytes_per_thread =
+                auxiliary_local_bytes;
+            row.auxiliary_static_shared_memory_bytes =
+                auxiliary_static_shared_bytes;
+            row.auxiliary_dynamic_shared_memory_bytes =
+                auxiliary_dynamic_shared_bytes;
+            row.auxiliary_threads_per_block = auxiliary_threads;
+            row.auxiliary_max_threads_per_block = auxiliary_max_threads;
+            row.auxiliary_max_active_blocks_per_sm = auxiliary_active_blocks;
+            row_valid[task_idx] = true;
+
+            if (csv_fp)
+            {
+                std::fprintf(csv_fp,
+                             "%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,%d,"
+                             "%.3f,%.3f,%.9f,%.9f,%d,%zu,%llu,%d,%d,%d,%d,%d,%d,"
+                             "%d,%zu,%zu,%zu,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d,%d,%d\n",
+                             row.format_name.c_str(),
+                             static_cast<unsigned>(row.codebook_id),
+                             row.shape_name.c_str(), row.m, row.n, row.k,
+                             row.tile_name.c_str(), row.tile_id,
+                             row.strategy.c_str(), row.requested_k_partitions, row.tiles,
+                             row.min_us, row.mean_us, row.tops, row.pct_peak,
+                             row.gpu_id, row.byte_mismatches,
+                             static_cast<unsigned long long>(
+                                 row.first_byte_mismatch),
+                             row.correctness_pass ? 1 : 0,
+                             row.observed_tile_id,
+                             row.observed_k_partitions,
+                             row.observed_bk256,
+                             row.observed_canonical_kpart,
+                             row.canonical_kpart_available ? 1 : 0,
+                             row.primary_registers_per_thread,
+                             row.primary_local_memory_bytes_per_thread,
+                             row.primary_static_shared_memory_bytes,
+                             row.primary_dynamic_shared_memory_bytes,
+                             row.primary_threads_per_block,
+                             row.primary_max_threads_per_block,
+                             row.primary_max_active_blocks_per_sm,
+                             row.auxiliary_registers_per_thread,
+                             row.auxiliary_local_memory_bytes_per_thread,
+                             row.auxiliary_static_shared_memory_bytes,
+                             row.auxiliary_dynamic_shared_memory_bytes,
+                             row.auxiliary_threads_per_block,
+                             row.auxiliary_max_threads_per_block,
+                             row.auxiliary_max_active_blocks_per_sm,
+                             static_cast<int>(row.staging), static_cast<int>(row.observed_staging));
+                std::fflush(csv_fp);
+            }
+        }
+
+        execution.reset();
+        prepared.reset();
+
+        // Restore original modes
+        cudaNativeQuantisedPrefill_setBK256Mode(0);
+        cudaNativeQuantisedPrefill_setForceTile(-1);
+        cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(false);
+
+        // Collect valid rows
+        std::vector<SweepRow> valid_rows;
+        valid_rows.reserve(tasks.size());
+        for (size_t i = 0; i < tasks.size(); ++i)
+            if (row_valid[i])
+                valid_rows.push_back(std::move(rows[i]));
+
+        ASSERT_FALSE(valid_rows.empty()) << "No tile sweep cases ran.";
+
+        // ── Render summary table ──
+        // Group by (shape, M), find best tile+strategy per group
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Shape" << "M" << "N" << "K" << "Tile" << "Strat"
+              << "SK" << "Tiles" << "Min (us)" << "TOPS" << "%Peak" << "Best?"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(4).set_cell_text_align(fort::text_align::left);
+        for (int c = 1; c <= 11; ++c)
+            if (c != 4)
+                table.column(c).set_cell_text_align(fort::text_align::right);
+
+        // Find best per (shape, M)
+        std::map<std::string, double> best_for_group;
+        for (const auto &r : valid_rows)
+        {
+            if (!r.correctness_pass)
+                continue;
+            std::string key = r.shape_name + "_" + std::to_string(r.m);
+            auto it = best_for_group.find(key);
+            if (it == best_for_group.end() || r.min_us < it->second)
+                best_for_group[key] = r.min_us;
+        }
+
+        for (const auto &r : valid_rows)
+        {
+            char min_us[16], tops[16], pct[16];
+            std::snprintf(min_us, sizeof(min_us), "%.1f", r.min_us);
+            std::snprintf(tops, sizeof(tops), "%.2f", r.tops);
+            std::snprintf(pct, sizeof(pct), "%.1f%%", r.pct_peak);
+
+            std::string key = r.shape_name + "_" + std::to_string(r.m);
+            const auto best = best_for_group.find(key);
+            const bool is_best = r.correctness_pass &&
+                                 best != best_for_group.end() &&
+                                 r.min_us <= best->second * 1.001;
+
+            table << r.shape_name << r.m << r.n << r.k
+                  << r.tile_name << r.strategy << r.requested_k_partitions << r.tiles
+                  << min_us << tops << pct << (is_best ? "<< BEST" : "")
+                  << fort::endr;
+        }
+
+        std::fprintf(stderr, "\n%s\n", table.to_string().c_str());
+
+        // ── Close CSV ──
+        if (csv_fp)
+        {
+            std::fclose(csv_fp);
+            std::fprintf(stderr,
+                         "[TileSweep] Results written to %s\n",
+                         cfg.csv_path.c_str());
+        }
+        if (timing_csv_fp)
+        {
+            ASSERT_EQ(std::fclose(timing_csv_fp), 0);
+            std::fprintf(
+                stderr,
+                "[TileSweep] Raw timings written to %s\n",
+                cfg.timing_csv_path.c_str());
+        }
+
+        // Summary: for each (shape, M), print winner
+        std::fprintf(stderr, "\n[TileSweep] Winners per (shape, M):\n");
+        std::string prev_key;
+        for (const auto &r : valid_rows)
+        {
+            std::string key = r.shape_name + "_" + std::to_string(r.m);
+            if (key == prev_key)
+                continue;
+            const auto best = best_for_group.find(key);
+            const bool is_best = r.correctness_pass &&
+                                 best != best_for_group.end() &&
+                                 r.min_us <= best->second * 1.001;
+            if (is_best)
+            {
+                std::fprintf(stderr, "  %s M=%d: %s %s sk=%d → %.1f us\n",
+                             r.shape_name.c_str(), r.m, r.tile_name.c_str(),
+                             r.strategy.c_str(), r.requested_k_partitions, r.min_us);
+                prev_key = key;
+            }
+        }
+
+        std::set<std::string> selected_groups;
+        for (const auto &task : tasks)
+            selected_groups.insert(
+                task.shape->name + "_" + std::to_string(task.m));
+        EXPECT_EQ(best_for_group.size(), selected_groups.size())
+            << "Every exact-overlay shape/M tournament requires at least one "
+               "byte-exact candidate";
+    }
+}
+
+#endif

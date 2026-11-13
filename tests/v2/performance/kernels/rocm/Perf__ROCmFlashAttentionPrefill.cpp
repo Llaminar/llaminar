@@ -21,6 +21,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #endif
 
 #include <vector>
@@ -183,9 +184,11 @@ namespace
         std::string device_name_;
         bool has_device_ = false;
 
+        /** @brief Admit immutable physical limits before direct benchmark HIP setup. */
         void SetUp() override
         {
 #ifdef HAVE_ROCM
+            llaminar2::initializeROCmHardwareMetadata();
             int count = 0;
             hipError_t err = hipGetDeviceCount(&count);
             has_device_ = (err == hipSuccess && count > 0);

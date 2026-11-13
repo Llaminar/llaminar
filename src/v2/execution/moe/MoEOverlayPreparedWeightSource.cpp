@@ -41,8 +41,8 @@ namespace llaminar2
          * engine, so both cases must be recognized explicitly.
          */
         bool resolveGpuExecutionFormat(
-            const DeviceNativeVNNIMatrixDesc &descriptor,
-            const NativeVnniFormatInfo &source,
+            const DeviceNativeQuantisedMatrixDesc &descriptor,
+            const NativeQuantisedFormatInfo &source,
             GpuExecutionFormat &format,
             std::string *error) noexcept
         {
@@ -60,9 +60,9 @@ namespace llaminar2
             }
 
             const auto cpu_encoding =
-                cpu::native_vnni::preparedEncodingForSource(source);
+                cpu::native_quantised::preparedEncodingForSource(source);
             if (cpu_encoding !=
-                cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
             {
                 return rejectPreparedSource(
                     error,
@@ -71,7 +71,7 @@ namespace llaminar2
 
             const std::uint8_t normalized =
                 source.is_asymmetric
-                    ? kNativeVnniExpandedInt8MinCodebook
+                    ? kNativeQuantisedExpandedInt8MinCodebook
                     : static_cast<std::uint8_t>(19);
             if (descriptor.codebook_id != normalized)
             {
@@ -89,7 +89,7 @@ namespace llaminar2
 
         /** @brief Validate optional GPU arrays and reusable-slot capacities. */
         bool validateGpuPhysicalStorage(
-            const DeviceNativeVNNIMatrixDesc &descriptor,
+            const DeviceNativeQuantisedMatrixDesc &descriptor,
             const GpuExecutionFormat &format,
             std::string *error) noexcept
         {
@@ -99,7 +99,7 @@ namespace llaminar2
             {
                 return rejectPreparedSource(
                     error,
-                    "GPU prepared source has invalid NativeVNNI geometry");
+                    "GPU prepared source has invalid NativeQuantised geometry");
             }
             if (format.is_asymmetric && !descriptor.mins)
             {
@@ -153,16 +153,16 @@ namespace llaminar2
                 "Prepared migration source lacks retained engine ownership or valid format provenance");
         }
 
-        if (kind == MoEOverlayPreparedWeightSourceKind::CpuNativeVnni)
+        if (kind == MoEOverlayPreparedWeightSourceKind::CpuNativeQuantised)
         {
-            if (!format.isNativeVnni() || !device.is_cpu() || !cpu_packed ||
+            if (!format.isNativeQuantised() || !device.is_cpu() || !cpu_packed ||
                 gpu_packed.valid() || floating.valid() ||
                 cpu_packed->N <= 0 || cpu_packed->K <= 0 ||
                 cpu_packed->blocks_per_row != cpu_packed->K / 32 ||
                 cpu_packed->native_interleaved.empty() ||
-                cpu_packed->codebook_id != format.native_vnni.codebook_id ||
+                cpu_packed->codebook_id != format.native_quantised.codebook_id ||
                 cpu_packed->is_superblock !=
-                    format.native_vnni.is_superblock)
+                    format.native_quantised.is_superblock)
             {
                 return rejectPreparedSource(
                     error,
@@ -172,14 +172,14 @@ namespace llaminar2
         }
 
         if (kind ==
-            MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeVnni)
+            MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeQuantised)
         {
-            if (!format.isNativeVnni() || !device.is_gpu() || cpu_packed ||
+            if (!format.isNativeQuantised() || !device.is_gpu() || cpu_packed ||
                 !gpu_packed.valid() || floating.valid())
             {
                 return rejectPreparedSource(
                     error,
-                    "GPU prepared migration source disagrees with its device or NativeVNNI layout authority");
+                    "GPU prepared migration source disagrees with its device or NativeQuantised layout authority");
             }
             return true;
         }
@@ -220,9 +220,9 @@ namespace llaminar2
                 "Prepared migration source requires an owned engine and CPU/GPU participant");
         }
 
-        NativeVnniSourceIdentity source_identity;
+        NativeQuantisedSourceIdentity source_identity;
         const bool has_native_identity =
-            engine->exportNativeVNNISourceIdentity(source_identity) &&
+            engine->exportNativeQuantisedSourceIdentity(source_identity) &&
             source_identity.present;
         ContiguousFloatingPointWeightDescriptor floating;
         const bool has_floating =
@@ -251,8 +251,8 @@ namespace llaminar2
             return output.valid(error);
         }
 
-        const NativeVnniFormatInfo *source =
-            native_vnni_formats::forSourceIdentity(
+        const NativeQuantisedFormatInfo *source =
+            native_quantised_formats::forSourceIdentity(
                 source_identity.codebook_id,
                 source_identity.is_superblock);
         if (!source)
@@ -263,10 +263,10 @@ namespace llaminar2
         }
 
         const auto *cpu_packed =
-            engine->exportCPUNativeVNNIPackedWeights();
-        DeviceNativeVNNIMatrixDesc gpu_descriptor;
+            engine->exportCPUNativeQuantisedPackedWeights();
+        DeviceNativeQuantisedMatrixDesc gpu_descriptor;
         const bool has_gpu_descriptor =
-            engine->exportNativeVNNIMatrixDesc(gpu_descriptor);
+            engine->exportNativeQuantisedMatrixDesc(gpu_descriptor);
         if (device.is_cpu())
         {
             if (!cpu_packed || has_gpu_descriptor)
@@ -277,9 +277,9 @@ namespace llaminar2
             }
             output = {
                 .kind =
-                    MoEOverlayPreparedWeightSourceKind::CpuNativeVnni,
+                    MoEOverlayPreparedWeightSourceKind::CpuNativeQuantised,
                 .device = device,
-                .format = ExpertWeightFormat::nativeVnni(source_identity),
+                .format = ExpertWeightFormat::nativeQuantised(source_identity),
                 .engine = std::move(engine),
                 .cpu_packed = cpu_packed,
             };
@@ -302,9 +302,9 @@ namespace llaminar2
 
         output = {
             .kind =
-                MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeVnni,
+                MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeQuantised,
             .device = device,
-            .format = ExpertWeightFormat::nativeVnni(source_identity),
+            .format = ExpertWeightFormat::nativeQuantised(source_identity),
             .engine = std::move(engine),
             .gpu_packed = makeGpuExpertPackedDescriptor(
                 gpu_descriptor,

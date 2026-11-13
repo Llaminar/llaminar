@@ -149,7 +149,7 @@ namespace llaminar2::test
             swiglu = allocate<int8_t>(static_cast<size_t>(slots) * intermediate);
             swiglu_scales = allocate<float>(static_cast<size_t>(slots) * (intermediate / 32));
             output = allocate<float>(static_cast<size_t>(capacity) * width);
-            std::vector<DeviceNativeVNNIMatrixDesc> gate_host, up_host;
+            std::vector<DeviceNativeQuantisedMatrixDesc> gate_host, up_host;
             for (int expert = 0; expert < experts; ++expert)
             {
                 gate_host.push_back(prepare(formats_.gate_up, intermediate, width, 1100 + expert));
@@ -265,14 +265,14 @@ namespace llaminar2::test
 
         /** @brief Launch the production bridge with unowned phase bindings absent. */
         void launch(int rows, const MoEPrefillProjectionExecution &execution,
-            const DeviceNativeVNNIMatrixDesc *selected_down = nullptr, float *selected_output = nullptr)
+            const DeviceNativeQuantisedMatrixDesc *selected_down = nullptr, float *selected_output = nullptr)
         {
             launchOnStream(stream, rows, execution, selected_down, selected_output);
         }
 
         /** @brief Bind the exact shared transaction stream, never a guessed producer. */
         void launchOnStream(hipStream_t execution_stream, int rows, const MoEPrefillProjectionExecution &execution,
-            const DeviceNativeVNNIMatrixDesc *selected_down = nullptr, float *selected_output = nullptr,
+            const DeviceNativeQuantisedMatrixDesc *selected_down = nullptr, float *selected_output = nullptr,
             float *canonical_routes = nullptr)
         {
             if (!execution_stream) throw std::invalid_argument("projection launch needs an explicit stream");
@@ -291,9 +291,12 @@ namespace llaminar2::test
                     experts, width, intermediate, rows * top_k, top_k, 0,
                     uint32_t{1} << formats_.gate_up.device_execution_codebook_id,
                     uint32_t{1} << formats_.down.device_execution_codebook_id,
-                    nativeVnniCodebookMaskBit(canonicalDeviceVnniCodebookId(formats_.gate_up.source_codebook_id)),
-                    nativeVnniCodebookMaskBit(canonicalDeviceVnniCodebookId(formats_.down.source_codebook_id)),
-                    device.ordinal, execution_stream, execution))
+                    nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(formats_.gate_up.source_codebook_id)),
+                    nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(formats_.down.source_codebook_id)),
+                    device.ordinal, execution_stream, execution,
+                    // Diagnostic resets may alternate all-route/owner coverage
+                    // after capture; this fixture never certifies an exact corpus row.
+                    MoEPrefillRouteScope::Unspecified))
                 throw std::runtime_error("production grouped projection launch failed: gate/up=" +
                     std::string(formats_.gate_up.label) + ", down=" + formats_.down.label +
                     ", rows=" + std::to_string(rows));
@@ -305,7 +308,7 @@ namespace llaminar2::test
          * @return Persistent native descriptor bank for every domain expert.
          * @throws std::invalid_argument when the fixture is not that source layer.
          */
-        DeviceNativeVNNIMatrixDesc *slice(const MoEExpertProjectionOwnership &ownership)
+        DeviceNativeQuantisedMatrixDesc *slice(const MoEExpertProjectionOwnership &ownership)
         {
             if (ownership.geometry() != MoEExpertProjectionOwnership::Geometry{experts, width, intermediate})
                 throw std::invalid_argument("projection preparation received a different source geometry");
@@ -320,10 +323,10 @@ namespace llaminar2::test
          * byte-offset view would be wrong: each K block needs the selected N
          * columns. Setup uses pitched D2D copies and retains original provenance.
          */
-        DeviceNativeVNNIMatrixDesc *slice(int begin, int count)
+        DeviceNativeQuantisedMatrixDesc *slice(int begin, int count)
         {
-            const auto &metadata = *native_vnni_formats::forQuantType(formats_.down.label);
-            std::vector<DeviceNativeVNNIMatrixDesc> result;
+            const auto &metadata = *native_quantised_formats::forQuantType(formats_.down.label);
+            std::vector<DeviceNativeQuantisedMatrixDesc> result;
             for (const auto &source : down_host_)
             {
                 auto copy = [&](const void *plane, size_t block_bytes) -> const void *
@@ -380,15 +383,15 @@ namespace llaminar2::test
 
     private:
         /** @return One descriptor backed by a real prepared-weight lifetime owner. */
-        DeviceNativeVNNIMatrixDesc prepare(const QuantizedVerifierFormatCase &format,
+        DeviceNativeQuantisedMatrixDesc prepare(const QuantizedVerifierFormatCase &format,
             int rows, int columns, unsigned seed)
         {
             weights_.push_back(format.create({static_cast<size_t>(rows), static_cast<size_t>(columns)}, seed));
             prepared_.push_back(makeGpuPreparedGemm(weights_.back().get(), device,
                 "projection-boundary." + std::string(format.label) + "." + std::to_string(seed),
                 ModelContextId{980000u + seed}));
-            DeviceNativeVNNIMatrixDesc result;
-            if (!prepared_.back().kernel->exportNativeVNNIMatrixDesc(result))
+            DeviceNativeQuantisedMatrixDesc result;
+            if (!prepared_.back().kernel->exportNativeQuantisedMatrixDesc(result))
                 throw std::runtime_error("projection weight descriptor export failed");
             return result;
         }
@@ -397,8 +400,8 @@ namespace llaminar2::test
         std::vector<std::shared_ptr<DeviceTransferBuffer>> buffers_;
         std::vector<std::unique_ptr<TensorBase>> weights_;
         std::vector<GpuPreparedGemm> prepared_;
-        std::vector<DeviceNativeVNNIMatrixDesc> down_host_;
-        DeviceNativeVNNIMatrixDesc *gate_table = nullptr, *up_table = nullptr, *down_table = nullptr;
+        std::vector<DeviceNativeQuantisedMatrixDesc> down_host_;
+        DeviceNativeQuantisedMatrixDesc *gate_table = nullptr, *up_table = nullptr, *down_table = nullptr;
         float *hidden = nullptr, *route_weights = nullptr;
         float *input_scales = nullptr, *gate = nullptr, *up = nullptr;
         int *counts = nullptr, *offsets = nullptr, *tokens = nullptr;

@@ -9,24 +9,31 @@
  * - Per-device CUDA streams and completion events
  * - Proper ncclGroupStart/End semantics for multi-GPU collectives
  * - Thread-safe work queue for operation submission
+ * - Mutex-owned complete readiness publication before callers may retire the owner
  *
  * Setup and grouped host transactions use the coordinator worker. Captured
  * participant-local operations enqueue directly on their caller's explicit
  * stream; each participant retains a consistent communicator operation order.
  * No coordinator queue, default stream or host wait is inserted into those
  * captured operations, including output-partitioned sum/reduce-scatter.
+ * Independent collective control inherits the admitted OpenMP partition;
+ * construction restores its caller before waiting for native initialization.
  */
 
 #include "NCCLCoordinator.h"
+#include "backends/NativeDeviceBinding.h"
 #include "../NativeReduceScatterContract.h"
 #include "../NativeCollectiveRowsContract.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <optional>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -281,6 +288,21 @@ namespace llaminar2
             return false;
         }
 
+        // Authenticate all participants before creating a worker or native
+        // resources. The worker later borrows these same immutable records.
+        try
+        {
+            initializeCUDAHardwareMetadata();
+            for (const int ordinal : device_ordinals)
+                (void)cudaHardwareMetadata().at(ordinal);
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = std::string("NCCL physical device admission: ") + error.what();
+            LOG_ERROR("[NCCLCoordinator] " << last_error_);
+            return false;
+        }
+
         if (!installNCCLGraphOrderingPolicy(last_error_))
         {
             LOG_ERROR("[NCCLCoordinator] " << last_error_);
@@ -316,8 +338,13 @@ namespace llaminar2
         init_complete_.store(false);
         running_.store(false);
 
-        // Start coordinator thread
-        coordinator_thread_ = std::thread(&NCCLCoordinator::coordinatorLoop, this);
+        {
+            // Native initializer/proxy children inherit this control worker's
+            // admitted partition. Native setup may further bind its own thread;
+            // restore only the creator before waiting for that independent work.
+            const ScopedOpenMPPartitionAffinity control_affinity;
+            coordinator_thread_ = std::thread(&NCCLCoordinator::coordinatorLoop, this);
+        }
 
         // Wait for initialization to complete
         {
@@ -409,28 +436,37 @@ namespace llaminar2
         std::vector<std::thread> abort_threads;
         abort_threads.reserve(active_count);
 
-        for (size_t rank = 0; rank < communicators.size(); ++rank)
         {
-            if (!communicators[rank])
-                continue;
-            abort_threads.emplace_back([&, rank]()
+            // Outer host retirement grants independent abort helpers the rank's
+            // admitted partition. An active OpenMP caller instead retains its
+            // assigned compute/subpartition mask; this any-thread failure API
+            // must not expand placement beyond that caller's explicit context.
+            std::optional<ScopedOpenMPPartitionAffinity> control_affinity;
+            if (active_count != 0 && omp_get_level() == 0)
+                control_affinity.emplace();
+            for (size_t rank = 0; rank < communicators.size(); ++rank)
             {
-                if (rank >= device_ordinals_.size())
+                if (!communicators[rank])
+                    continue;
+                abort_threads.emplace_back([&, rank]()
                 {
-                    device_results[rank] = cudaErrorInvalidDevice;
-                    abort_results[rank] = nccl::ncclInvalidArgument;
-                    return;
-                }
-                device_results[rank] = cudaSetDevice(device_ordinals_[rank]);
-                if (device_results[rank] != cudaSuccess)
-                {
-                    abort_results[rank] = nccl::ncclUnhandledCudaError;
-                    return;
-                }
-                abort_results[rank] = nccl::ncclCommAbort(
-                    static_cast<nccl::ncclComm_t>(communicators[rank]));
-            });
-        }
+                    if (rank >= device_ordinals_.size())
+                    {
+                        device_results[rank] = cudaErrorInvalidDevice;
+                        abort_results[rank] = nccl::ncclInvalidArgument;
+                        return;
+                    }
+                    device_results[rank] = cudaSetDevice(device_ordinals_[rank]);
+                    if (device_results[rank] != cudaSuccess)
+                    {
+                        abort_results[rank] = nccl::ncclUnhandledCudaError;
+                        return;
+                    }
+                    abort_results[rank] = nccl::ncclCommAbort(
+                        static_cast<nccl::ncclComm_t>(communicators[rank]));
+                });
+            }
+        } // Restore the creator before joining helpers or cleaning handles.
 
         /* All active ranks have entered their abort call before any join. */
         for (std::thread &thread : abort_threads)
@@ -583,6 +619,12 @@ namespace llaminar2
     // Coordinator Thread Implementation
     // ============================================================================
 
+    /**
+     * @brief Initialize, atomically publish readiness, then drain the original work queue.
+     * @note Readiness and shutdown use the same predicate mutex. The complete
+     * running outcome precedes init_complete so an immediate owner retirement
+     * cannot be overwritten or lose its notification before worker waiting.
+     */
     void NCCLCoordinator::coordinatorLoop()
     {
         LOG_TRACE("[NCCLCoordinator] Coordinator thread starting");
@@ -590,8 +632,14 @@ namespace llaminar2
         // Initialize on this thread
         initializeOnThread();
 
-        // Signal that initialization is complete
-        init_complete_.store(true);
+        // Publish the whole ready outcome while holding the constructor's
+        // predicate mutex. An immediate shutdown may clear running_ after this
+        // publication; the worker must never overwrite that stop afterwards.
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_.store(init_success_.load());
+            init_complete_.store(true);
+        }
         queue_cv_.notify_all();
 
         if (!init_success_.load())
@@ -600,7 +648,6 @@ namespace llaminar2
             return;
         }
 
-        running_.store(true);
         LOG_TRACE("[NCCLCoordinator] Coordinator loop started");
 
         // Main work loop
@@ -731,22 +778,14 @@ namespace llaminar2
         // Authenticate the complete physical pair once during construction.
         // Peer reachability, not a launch-time guess, distinguishes this SHM
         // measurement from a future peer/NVLink-connected installation.
-        std::vector<cudaDeviceProp> properties(num_devices_);
         std::vector<NCCLCardIdentity> cards;
         cards.reserve(num_devices_);
         for (int i = 0; i < num_devices_; ++i)
         {
-            if (const auto error = cudaGetDeviceProperties(&properties[i], device_ordinals_[i]); error != cudaSuccess)
-            {
-                last_error_ = std::string("NCCL profile device identity: ") + cudaGetErrorString(error);
-                LOG_ERROR("[NCCLCoordinator] " << last_error_);
-                cleanupOnThread();
-                return;
-            }
-            const auto &card = properties[i];
+            const auto &card = cudaHardwareMetadata().at(device_ordinals_[i]);
             cards.push_back({.name = card.name, .ordinal = device_ordinals_[i],
-                .architecture_major = card.major, .architecture_minor = card.minor,
-                .multiprocessors = card.multiProcessorCount, .memory_bytes = card.totalGlobalMem});
+                .architecture_major = card.sm_major, .architecture_minor = card.sm_minor,
+                .multiprocessors = card.sm_count, .memory_bytes = card.total_memory});
         }
         std::vector<NCCLPeerAccess> directed_peers;
         if (num_devices_ == 2)
@@ -1613,19 +1652,16 @@ namespace llaminar2
         nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
         cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
 
-        // Fast path: skip cudaSetDevice if this thread already has the right device.
-        // In LOCAL TP decode, each worker thread always targets the same device,
-        // so after the first call the branch is always taken (~1-3μs saved per call).
-        static thread_local int tl_last_cuda_device = -1;
-        if (tl_last_cuda_device != ordinal)
+        // Observe actual thread state; another collective or runtime call may have changed it.
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return cudaGetDevice(observed); },
+            [](int selected) { return cudaSetDevice(selected); });
+        if (!binding.succeeded())
         {
-            cudaError_t err = cudaSetDevice(ordinal);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-            tl_last_cuda_device = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "cudaGetDevice failed: " : "cudaSetDevice failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(binding.native_status));
+            return false;
         }
 
         // 2. Launch allreduce directly on the caller's stream.
@@ -1651,6 +1687,115 @@ namespace llaminar2
         (void)stream;
         last_error_ = "NCCL not available";
         return false;
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+    bool NCCLCoordinator::signalNativeCompletionAbort()
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || comms_.size() != static_cast<std::size_t>(num_devices_)) return false;
+        for (const auto comm : comms_)
+            if (!comm || nccl::signalNativeCompletionAbort(static_cast<nccl::ncclComm_t>(comm)) != nccl::ncclSuccess)
+                return false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+    NativeCompletionAuthority NCCLCoordinator::nativeCompletionAuthority(int participant)
+    {
+#ifdef HAVE_NCCL
+        if (initialized_.load() && participant >= 0 && participant < num_devices_) {
+            ncclLlaminarCompletionAuthority original{};
+            if (nccl::nativeCompletionAuthority(static_cast<nccl::ncclComm_t>(comms_[participant]), &original) == nccl::ncclSuccess &&
+                original.abortFlag && original.deviceCommunicator)
+                return NativeCompletionAuthority(original);
+        }
+#else
+        (void)participant;
+#endif
+        return {};
+    }
+
+    /** @copydoc ICollectiveBackend::nativeTransferBytesOnStream */
+    NativeCollectiveEnqueueResult NCCLCoordinator::nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes, NativeByteEdge edge, int participant, void* stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !payload ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (!edge.contains(num_devices_,participant) || !bytes.participantValid(num_devices_, participant, edge.producer())))
+        {
+            return NativeCollectiveEnqueueResult::failure("NCCL addressed bytes changed its original participant/root/buffer/stream");
+        }
+        const auto selected = cudaSetDevice(device_ordinals_[participant]);
+        if (selected != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes device selection failed: ") + cudaGetErrorString(selected));
+        }
+        const auto producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes original producer failed: ") + cudaGetErrorString(producer_error));
+        }
+        const auto result = nccl::nativeTransferBytes(payload, bytes, edge, participant,
+            static_cast<nccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != nccl::ncclSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes enqueue failed: ") +
+                nccl::ncclGetErrorString(result));
+        }
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes runtime enqueue failed: ") + cudaGetErrorString(enqueue_error));
+        }
+        return NativeCollectiveEnqueueResult::success();
+#else
+        (void)payload; (void)bytes; (void)edge; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("NCCL not available");
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeBroadcastBytesOnStream */
+    NativeCollectiveEnqueueResult NCCLCoordinator::nativeBroadcastBytesOnStream(const void* send, void* receive,
+        const NativeCollectiveBytes& bytes, int root, int participant, void* stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !send || !receive ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !bytes.participantValid(num_devices_, participant, root))
+        {
+            return NativeCollectiveEnqueueResult::failure("NCCL byte Broadcast changed its original participant/root/buffer/stream");
+        }
+        const auto selected = cudaSetDevice(device_ordinals_[participant]);
+        if (selected != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast device selection failed: ") + cudaGetErrorString(selected));
+        }
+        const auto producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast original producer failed: ") + cudaGetErrorString(producer_error));
+        }
+        const auto result = nccl::nativeBroadcastBytes(send, receive, bytes, root,
+            static_cast<nccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != nccl::ncclSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast enqueue failed: ") +
+                nccl::ncclGetErrorString(result));
+        }
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast runtime enqueue failed: ") + cudaGetErrorString(enqueue_error));
+        }
+        return NativeCollectiveEnqueueResult::success();
+#else
+        (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("NCCL not available");
 #endif
     }
 
@@ -1793,16 +1938,15 @@ namespace llaminar2
         nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
         cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
 
-        static thread_local int tl_last_cuda_device_for_allgather = -1;
-        if (tl_last_cuda_device_for_allgather != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return cudaGetDevice(observed); },
+            [](int selected) { return cudaSetDevice(selected); });
+        if (!binding.succeeded())
         {
-            cudaError_t err = cudaSetDevice(ordinal);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-            tl_last_cuda_device_for_allgather = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "cudaGetDevice failed: " : "cudaSetDevice failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(binding.native_status));
+            return false;
         }
 
         /*
@@ -1904,16 +2048,15 @@ namespace llaminar2
         nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
         cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
 
-        static thread_local int tl_last_cuda_device_for_broadcast = -1;
-        if (tl_last_cuda_device_for_broadcast != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return cudaGetDevice(observed); },
+            [](int selected) { return cudaSetDevice(selected); });
+        if (!binding.succeeded())
         {
-            cudaError_t err = cudaSetDevice(ordinal);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-            tl_last_cuda_device_for_broadcast = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "cudaGetDevice failed: " : "cudaSetDevice failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(binding.native_status));
+            return false;
         }
 
         nccl::ncclResult_t r = nccl::ncclBroadcast(
@@ -1991,17 +2134,15 @@ namespace llaminar2
             static_cast<nccl::ncclComm_t>(comms_[device_idx]);
         const auto caller_stream = static_cast<cudaStream_t>(stream);
 
-        static thread_local int tl_last_cuda_device_for_reduce = -1;
-        if (tl_last_cuda_device_for_reduce != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return cudaGetDevice(observed); },
+            [](int selected) { return cudaSetDevice(selected); });
+        if (!binding.succeeded())
         {
-            const cudaError_t err = cudaSetDevice(ordinal);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice failed: ") +
-                              cudaGetErrorString(err);
-                return false;
-            }
-            tl_last_cuda_device_for_reduce = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "cudaGetDevice failed: " : "cudaSetDevice failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(binding.native_status));
+            return false;
         }
 
         const nccl::ncclResult_t result = nccl::ncclReduce(
@@ -2063,16 +2204,15 @@ namespace llaminar2
         nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
         cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
 
-        static thread_local int tl_last_cuda_device_for_grouped_p2p = -1;
-        if (tl_last_cuda_device_for_grouped_p2p != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return cudaGetDevice(observed); },
+            [](int selected) { return cudaSetDevice(selected); });
+        if (!binding.succeeded())
         {
-            cudaError_t err = cudaSetDevice(ordinal);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-            tl_last_cuda_device_for_grouped_p2p = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "cudaGetDevice failed: " : "cudaSetDevice failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(binding.native_status));
+            return false;
         }
 
         nccl::ncclResult_t r = nccl::ncclGroupStart();

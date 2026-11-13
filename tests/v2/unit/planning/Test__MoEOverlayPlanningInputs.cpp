@@ -9,9 +9,18 @@
  * arithmetic remains covered by the existing
  * all-codebook MoEOverlayCapacityResolver suite downstream of this adapter.
  */
+#include "../../fixtures/planning/RecordedHostServicePlanning.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
+#include "execution/moe/MoEOverlayActivationChannelPlan.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "config/OrchestrationConfig.h"
+#include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "loaders/ModelLoader.h"
+#include "planning/PlanningModelMetadata.h"
+#include "fixtures/planning/RecordedNgramOrdering.h"
 #include <gtest/gtest.h>
 #include <limits>
 
@@ -74,7 +83,13 @@ namespace llaminar2
                     topology(backend, world_size > 1));
                 inventory.world_size = world_size;
                 inventory.ranks.resize(world_size);
-                for (int index = 0; index < world_size; ++index) inventory.ranks[index].rank = index;
+                // Authored gathered node identity is distinct from world rank.
+                // This fixture declares one physical host per rank.
+                for (int index = 0; index < world_size; ++index) {
+                    inventory.ranks[index].rank = index;
+                    inventory.ranks[index].node_id = index;
+                    inventory.ranks[index].local_rank = 0;
+                }
                 execution = resolveMoEExpertOverlayExecutionPlan(config.moe_routed_expert_plan,
                     {.current_world_rank = 0, .world_size = world_size});
                 policy = resolveMoEOverlayCapacityAdmissionPolicy(
@@ -91,7 +106,8 @@ namespace llaminar2
                     .inventory = inventory, .execution = execution, .capacity_policy = policy,
                     .retained_mtp = rank.runtime.mtp, .graph_family = family,
                     .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1, .maximum_cached_buckets = 16},
-                    .gpu_weight_load = {.maximum_source_bytes = 1234}};
+                    .gpu_weight_load = {.maximum_source_bytes = 1234},
+                    .native_source_placement = CPUStoragePlacement::local()};
             }
 
             /**
@@ -121,6 +137,33 @@ namespace llaminar2
                     .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head};
             }
         };
+    }
+
+    /**
+     * @test Authored topology is accepted before native geometry, and missing/duplicate owners reject.
+     * @details This calls the original shared admission boundary without SDK
+     * objects, workers or fabricated compiled-backend capability. The fixture
+     * declares its topology; production still requires actual gathered facts.
+     */
+    TEST(MoEOverlayMemoryPlanInputs, ObservedNodeIdentityPrecedesNativeGeometryAdmission)
+    {
+        for (const auto backend : {DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+        for (const int ranks : {1,2}) {
+            SCOPED_TRACE(::testing::Message()<<deviceTypeToString(backend)<<'/'<<ranks);
+            MemoryInputsFixture fixture(backend,ranks);
+            const auto project=[&] {
+                return MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                    *fixture.config.moe_routed_expert_plan,fixture.inventory,fixture.family);
+            };
+            EXPECT_NO_THROW((void)project());
+            fixture.inventory.ranks.back().node_id=-1;
+            EXPECT_THROW((void)project(),std::invalid_argument);
+            fixture.inventory.ranks.back().node_id=ranks-1;
+            if(ranks>1) {
+                fixture.inventory.ranks.back().rank=0;
+                EXPECT_THROW((void)project(),std::invalid_argument);
+            }
+        }
     }
 
     TEST(MoEOverlayPlanningInputs, StaticDoesNotPriceAnyMigrationStorageOnAnyBackend)
@@ -245,7 +288,7 @@ namespace llaminar2
             EXPECT_EQ(input.resident_graph_rows, 8);
             EXPECT_EQ(input.activation_channel_row_capacity, 8);
             EXPECT_EQ(input.activation_graph_family_count, 1u);
-            EXPECT_EQ(result.model_graph_identity_count, 4u);
+            EXPECT_EQ(result.model_graph_identity_count, 5u); // Two buckets, two prefill reserves, serial decode.
             EXPECT_TRUE(input.captured_graph_plan.valid());
             EXPECT_EQ(input.host_demand_memory.has_value(), backend == DeviceType::CPU);
         }
@@ -323,6 +366,36 @@ namespace llaminar2
 
         fixture.config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
         EXPECT_FALSE(buildMoEOverlayMemoryPlanInputs(fixture.request(), 32).local_capacity.host_demand_memory);
+    }
+
+    /** @test Movable host authorities still require evidence; device owners forbid its mirror. */
+    TEST(MoEOverlayMemoryPlanInputs, LocalCapacityDemandValidationPreservesMovableAuthority)
+    {
+        MemoryInputsFixture host(DeviceType::CPU, 2);
+        host.rank.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        auto host_input = buildMoEOverlayMemoryPlanInputs(host.request(), 32).local_capacity;
+        ASSERT_TRUE(host_input.host_demand_memory);
+        const auto evidence = host_input.host_demand_memory;
+        host_input.host_demand_memory.reset();
+        try
+        {
+            (void)test::planWithRecordedHostServices(host_input);
+            FAIL() << "Movable host capacity accepted missing routing evidence";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("requires exactly its routing-evidence BOM"), std::string::npos);
+        }
+
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            MemoryInputsFixture device(backend);
+            device.rank.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+            auto input = buildMoEOverlayMemoryPlanInputs(device.request(), 32).local_capacity;
+            ASSERT_FALSE(input.host_demand_memory);
+            input.host_demand_memory = evidence;
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
+        }
     }
 
     TEST(MoEOverlayMemoryPlanInputs, SnapshotVariantsRemainExecutableOwnersNotCompilationUnits)
@@ -436,4 +509,383 @@ namespace llaminar2
             EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(request, 8), std::invalid_argument);
         }
     }
+    /** @test Main-only block_count and inline block_count retain the same exact routed sidecar owners. */
+    TEST(MoEOverlayMemoryPlanInputs, SourceCountContractPreservesSeparateAndInlinePredictors)
+    {
+        const test::Qwen4ExpSidecarFixture source;
+        const auto separate = ModelMemoryProfile::fromGGUF(source.main, source.predictor,
+            SharedPredictorMaterialization::Active);
+        ASSERT_EQ(separate.mainLayerCount(), 48);
+        ASSERT_EQ(separate.totalLayerCount(), 49);
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+            for (const bool separate_source : {false, true})
+                for (const bool retained : {false, true})
+                {
+                    SCOPED_TRACE(::testing::Message() << int(backend) << '/' << separate_source << '/' << retained);
+                    MemoryInputsFixture fixture(backend);
+                    fixture.model.n_layers = separate_source ? 48 : 49;
+                    fixture.model.mtp_layer_count = 1;
+                    if (separate_source) fixture.model = separate;
+                    fixture.rank.runtime.mtp.enabled = retained;
+                    fixture.family.main_layer_count = 48;
+                    fixture.family.mtp_source_layers = retained ? std::vector<int>{48} : std::vector<int>{};
+                    fixture.family.max_decode_rows = std::max(1, resolveMTPRetainedTargetQueryRows(fixture.rank.runtime.mtp));
+                    fixture.family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(fixture.rank.runtime.mtp);
+                    fixture.policy = resolveMoEOverlayCapacityAdmissionPolicy(*fixture.config.moe_routed_expert_plan,
+                        fixture.config, 1, fixture.family.routedLayerCapacity(), fixture.model.expert_count);
+                    const auto result = buildMoEOverlayMemoryPlanInputs(fixture.request(), 8);
+                    EXPECT_EQ(result.local_capacity.model_profile, &fixture.model);
+                    EXPECT_EQ(result.local_capacity.model_profile->n_layers, separate_source ? 48 : 49);
+                    EXPECT_EQ(result.local_capacity.graph_family.main_layer_count, 48);
+                    EXPECT_EQ(result.local_capacity.graph_family.routedLayerCapacity(), retained ? 49 : 48);
+                    EXPECT_EQ(result.local_capacity.graph_family.mtp_source_layers, fixture.family.mtp_source_layers);
+                    EXPECT_EQ(result.local_capacity.captured_graph_plan.compilation.compilation_units_per_model_graph,
+                        backend == DeviceType::CPU ? 49u : 1u);
+                }
+    }
+
+    /** @test An authored PP terminal scope owns source48; foreign main/source bounds still fail. */
+    TEST(MoEOverlayMemoryPlanInputs, SeparatePredictorPipelineUsesCanonicalMainAndTotalBounds)
+    {
+        const test::Qwen4ExpSidecarFixture source;
+        const auto separate = ModelMemoryProfile::fromGGUF(source.main, source.predictor,
+            SharedPredictorMaterialization::Active);
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+            for (int mutation = -1; mutation < 7; ++mutation)
+            {
+                SCOPED_TRACE(::testing::Message() << int(backend) << '/' << mutation);
+                MemoryInputsFixture fixture(backend);
+                fixture.model = separate;
+                fixture.rank.first_layer = 20;
+                fixture.rank.last_layer = 47;
+                fixture.rank.has_embedding = false;
+                fixture.rank.has_lm_head = true;
+                fixture.rank.runtime.mtp.enabled = true;
+                fixture.config.moe_routed_expert_plan->first_model_layer = 20;
+                fixture.family.first_model_layer = 20;
+                fixture.family.main_layer_count = 28;
+                fixture.family.mtp_source_layers = {48};
+                fixture.family.max_decode_rows = resolveMTPRetainedTargetQueryRows(fixture.rank.runtime.mtp);
+                fixture.family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(fixture.rank.runtime.mtp);
+                fixture.policy = resolveMoEOverlayCapacityAdmissionPolicy(*fixture.config.moe_routed_expert_plan,
+                    fixture.config, 1, 29, fixture.model.expert_count);
+                auto request = fixture.request();
+                request.pipeline_stage = FactoryPPStageConfig{.first_layer = 20, .last_layer = 48,
+                    .has_embedding = false, .has_lm_head = true};
+                switch (mutation)
+                {
+                case 0: fixture.family.mtp_source_layers = {49}; break;
+                case 1: request.pipeline_stage->last_layer = 47; break;
+                case 2: fixture.rank.last_layer = 48; break;
+                case 3: fixture.family.main_layer_count = 29; break;
+                case 4: fixture.family.first_model_layer = 48; break;
+                case 5: fixture.model.mtp_layer_count = -1; break;
+                case 6: fixture.model.n_layers = std::numeric_limits<int>::max(); break;
+                default: break;
+                }
+                if (mutation == -1)
+                {
+                    const auto result = buildMoEOverlayMemoryPlanInputs(request, 8);
+                    EXPECT_EQ(result.local_capacity.graph_family.first_model_layer, 20);
+                    EXPECT_EQ(result.local_capacity.graph_family.main_layer_count, 28);
+                    EXPECT_EQ(result.local_capacity.graph_family.routedLayerCapacity(), 29);
+                    EXPECT_EQ(result.local_capacity.graph_family.mtp_source_layers, (std::vector<int>{48}));
+                }
+                else if (mutation == 6)
+                    EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(request, 8), std::overflow_error);
+                else
+                    EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(request, 8), std::invalid_argument);
+            }
+    }
+
+    /** @test Fixed-owner admission has an explicit global zero-residency entry for source48. */
+    TEST(MoEOverlayMemoryPlanInputs, SeparatePredictorFixedOwnersIncludeOriginalRoutedSourceIndex)
+    {
+        test::Qwen4ExpSidecarFixture source;
+        // This bounded terminal fixture executes main47 plus predictor48. Add
+        // the real main expert-parent geometry needed by the CPU workspace
+        // probe, without expanding any native payload or unrelated layers.
+        for (const char *role : {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"})
+        {
+            const bool down = std::string_view(role) == "ffn_down_exps";
+            GGUFTensorInfo tensor{.name = std::string("blk.47.") + role + ".weight",
+                .dimensions = down ? std::vector<uint64_t>{640, 2560, 512}
+                                   : std::vector<uint64_t>{2560, 640, 512},
+                .type = GGUFTensorType::Q8_0};
+            test::Qwen4ExpSidecarFixture::sealBytes(tensor);
+            source.main.tensors.push_back(std::move(tensor));
+        }
+        MemoryInputsFixture fixture(DeviceType::CPU);
+        fixture.model = ModelMemoryProfile::fromGGUF(source.main, source.predictor,
+            SharedPredictorMaterialization::Active);
+        fixture.rank.first_layer = fixture.rank.last_layer = 47;
+        fixture.rank.has_embedding = false;
+        fixture.rank.has_lm_head = true;
+        fixture.rank.primary_device = GlobalDeviceAddress::cpu();
+        fixture.rank.runtime.max_seq_len = 32;
+        fixture.rank.runtime.prefix_cache.enabled = false;
+        fixture.rank.runtime.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
+        fixture.rank.runtime.mtp.enabled = true;
+        auto &overlay = *fixture.config.moe_routed_expert_plan;
+        overlay.first_model_layer = 47;
+        overlay.domains.front().scope = ExecutionDomainScope::SINGLE;
+        overlay.domains.front().participants = {GlobalDeviceAddress::cpu()};
+        fixture.execution = resolveMoEExpertOverlayExecutionPlan(fixture.config.moe_routed_expert_plan,
+            {.current_world_rank = 0, .world_size = 1});
+        fixture.family.first_model_layer = 47;
+        fixture.family.main_layer_count = 1;
+        fixture.family.mtp_source_layers = {48};
+        fixture.family.max_decode_rows = resolveMTPRetainedTargetQueryRows(fixture.rank.runtime.mtp);
+        fixture.family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(fixture.rank.runtime.mtp);
+        fixture.policy = resolveMoEOverlayCapacityAdmissionPolicy(overlay, fixture.config, 1, 2, fixture.model.expert_count);
+        auto &observed = fixture.inventory.ranks.front();
+        observed.cpu_cores = observed.cpu_worker_threads = 8;
+        observed.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+        observed.cpu.memory_bytes = observed.cpu.free_memory_bytes = observed.cpu_memory_bytes = 32ull << 30;
+        auto request = fixture.request();
+        request.pipeline_stage = FactoryPPStageConfig{.first_layer = 47, .last_layer = 48,
+            .has_embedding = false, .has_lm_head = true};
+        const auto inputs = buildMoEOverlayMemoryPlanInputs(request, 8);
+        const auto fixed = test::planWithRecordedHostServices(inputs.local_capacity);
+        ASSERT_EQ(fixed.device_inputs.size(), 1u);
+        const auto &residency = fixed.device_inputs.front().weight_residency;
+        // The fixed contribution excludes every routed expert while retaining
+        // its source-indexed owner slot. The quota phase alone charges experts.
+        EXPECT_EQ(residency.selectedRoutedExpertsForLayer(47), 0);
+        EXPECT_EQ(residency.selectedRoutedExpertsForLayer(48), 0);
+        EXPECT_THROW((void)residency.selectedRoutedExpertsForLayer(49), std::out_of_range);
+        EXPECT_EQ(fixed.device_inputs.front().last_layer, 47);
+        EXPECT_TRUE(fixed.device_inputs.front().mtp_enabled);
+        EXPECT_FALSE(fixed.host_demand_memory);
+    }
+
+    /** @test Complete source-owned fixed BOMs retain production prefix RAM/disk and dense predictor KV. */
+    TEST(MoEOverlayMemoryPlanInputs, CompleteQwenSourcePrefixEnabledFixedBOMWholeAndPipeline)
+    {
+        test::Qwen4ExpPlanningGGUFFixture file;
+        ModelLoader loader;
+        ASSERT_TRUE(loader.loadModel(file.path()));
+        test::Qwen4ExpSidecarFixture source;
+        for (const auto &tensor : loader.getModel().tensors)
+            if (!source.main.findTensor(tensor.name)) source.main.tensors.push_back(tensor);
+        const auto profile = ModelMemoryProfile::fromGGUF(source.main,source.predictor,
+            SharedPredictorMaterialization::Active);
+        ASSERT_EQ(profile.mainLayerCount(),48);
+        ASSERT_EQ(profile.totalLayerCount(),49);
+        ASSERT_EQ(profile.flashNextSparseLayerCount(48,48),0u);
+        for (const auto backend : {DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+            for (const auto interval : {std::pair{0,47},std::pair{0,7},std::pair{8,19},std::pair{20,47},
+                                       std::pair{0,0},std::pair{1,1},std::pair{2,47}})
+                for (const auto storage : {ImmutableRowStoragePreference::RAM,ImmutableRowStoragePreference::MemoryMapped})
+                    for (const auto mode : {MoERebalanceRuntimeMode::Off,MoERebalanceRuntimeMode::Dynamic})
+                    {
+                        SCOPED_TRACE(::testing::Message()<<int(backend)<<'/'<<interval.first<<'/'<<interval.second<<'/'<<int(storage)<<'/'<<int(mode));
+                        MemoryInputsFixture f(backend);
+                        f.model=profile;
+                        f.rank.first_layer=interval.first;
+                        f.rank.last_layer=interval.second;
+                        f.rank.has_embedding=interval.first==0;
+                        f.rank.has_lm_head=interval.second==47;
+                        f.rank.primary_device=GlobalDeviceAddress::fromLocalDeviceId(DeviceId{backend,0});
+                        f.buckets={1,8,32,64,256,512};
+                        f.rank.runtime.batch_size=1;
+                        f.rank.runtime.moe_routed_prefill.overlay_segment_rows=512;
+                        f.rank.runtime.max_seq_len=4096;
+                        f.rank.runtime.kv_cache_precision=KVCachePrecision::FP16;
+                        f.rank.runtime.mtp.enabled=true;
+                        f.rank.runtime.mtp.draft_tokens=1;
+                        f.rank.runtime.mtp.graph_capacity_draft_tokens=1;
+                        f.rank.runtime.mtp.max_request_batch=1;
+                        f.rank.runtime.ngram_table_policy.storage=storage;
+                        f.rank.runtime.moe_rebalance.mode=mode;
+                        auto &prefix=f.rank.runtime.prefix_cache;
+                        prefix.enabled=true;
+                        prefix.storage_mode=PrefixCacheStorageMode::Tiered;
+                        prefix.block_size=64;
+                        prefix.ram_budget_bytes=256ull<<20;
+                        prefix.device_budget_bytes=512ull<<20;
+                        prefix.disk_budget_bytes=1ull<<30;
+                        prefix.disk_dir="/tmp/qfn-prefix-bom-metadata-only";
+                        auto &overlay=*f.config.moe_routed_expert_plan;
+                        overlay.first_model_layer=interval.first;
+                        overlay.authority_execution=MoEOverlayAuthorityExecutionKind::HostResident;
+                        overlay.domains.front().scope=ExecutionDomainScope::SINGLE;
+                        overlay.domains.front().participants={f.rank.primary_device};
+                        if(backend!=DeviceType::CPU)
+                        {
+                            overlay.topology=RoutedExpertPlacementTopology::TieredOverlay;
+                            auto host=overlay.domains.front();
+                            host.name="host-capacity";
+                            host.backend=CollectiveBackendType::MPI;
+                            host.participants={GlobalDeviceAddress::cpu()};
+                            overlay.domains.push_back(host);
+                            overlay.routed_tiers.push_back({.name="host-owners",.domain=host.name,.priority=38,.fallback=true});
+                            overlay.routed_tiers.front().fallback=false;
+                        }
+                        f.config.moe_rebalance.mode=mode;
+                        f.execution=resolveMoEExpertOverlayExecutionPlan(f.config.moe_routed_expert_plan,
+                            {.current_world_rank=0,.world_size=1});
+                        f.family.max_graph_rows=512;
+                        f.family.first_model_layer=interval.first;
+                        f.family.main_layer_count=interval.second-interval.first+1;
+                        f.family.mtp_source_layers=f.rank.has_lm_head?std::vector<int>{48}:std::vector<int>{};
+                        f.family.max_decode_rows=resolveMTPRetainedTargetQueryRows(f.rank.runtime.mtp);
+                        f.family.max_mtp_draft_depth=resolveMTPRetainedDraftCapacity(f.rank.runtime.mtp);
+                        f.policy=resolveMoEOverlayCapacityAdmissionPolicy(overlay,f.config,1,
+                            f.family.routedLayerCapacity(),profile.expert_count);
+                        auto &observed=f.inventory.ranks.front();
+                        observed.cpu_cores=observed.cpu_worker_threads=8;
+                        observed.cpu_execution=test::kSyntheticCPUExecutionGeometry;
+                        observed.cpu.memory_bytes=observed.cpu.free_memory_bytes=observed.cpu_memory_bytes=256ull<<30;
+                        if(backend!=DeviceType::CPU) observed.gpus.push_back({.type=backend,.local_device_id=0,
+                            .memory_bytes=256ull<<30,.free_memory_bytes=256ull<<30,.compute_units=60});
+                        // The admitted lane BOM consumes the same original main and
+                        // retained predictor tensor directories as this full-source fixture.
+                        auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(source.main,
+                            f.family.main_layer_count, profile.expert_count, interval.first);
+                        if (f.rank.has_lm_head) {
+                            auto predictor = buildMoEOverlayLayerWeightManifestFromGGUF(
+                                source.predictor, 1, profile.expert_count, 48);
+                            manifest.insert(manifest.end(), predictor.begin(), predictor.end());
+                        }
+                        auto request=f.request();
+                        request.original_expert_manifest = manifest;
+                        request.native_source_placement=loader.nativeWeightSourcePlacement();
+                        request.gpu_weight_load={.policy=GPUWeightLoadMemoryPolicy{},
+                            .maximum_source_bytes=maximumGGUFTensorPayloadBytes(source.main)};
+                        if(interval!=std::pair{0,47}) request.pipeline_stage=FactoryPPStageConfig{
+                            .first_layer=interval.first,.last_layer=interval.second+1,
+                            .has_embedding=f.rank.has_embedding,.has_lm_head=f.rank.has_lm_head};
+                        if (backend != DeviceType::CPU && interval == std::pair{0,0})
+                            request.snapshot_capacity = {.per_accelerator_bytes = 8192,
+                                .effective_kv = GraphSnapshotMemoryCapacity::EffectiveKV{}};
+                        auto inputs=buildMoEOverlayMemoryPlanInputs(request,512);
+                        inputs.local_capacity.native_ordering_events=test::recordedNgramOrdering(f.rank.primary_device.toLocalDeviceId());
+                        if (backend != DeviceType::CPU && mode == MoERebalanceRuntimeMode::Dynamic) {
+                            auto missing = inputs.local_capacity;
+                            missing.original_expert_manifest = {};
+                            EXPECT_THROW((void)test::planWithRecordedHostServices(missing), std::invalid_argument);
+                        }
+                        const auto fixed=test::planWithRecordedHostServices(inputs.local_capacity);
+                        ASSERT_NE(fixed.physical_memory_admission,nullptr);
+                        const auto exact=MemoryPlanner::plan(profile,fixed.device_inputs);
+                        size_t host_tier=0,archive=0;
+                        for(const auto &resource:fixed.physical_memory_admission->plan().resources())
+                        {
+                            const auto *bill=exact.physicalPlan().find({resource.resource().world_rank,resource.resource().device});
+                            ASSERT_NE(bill,nullptr);
+                            for(const auto owner:{PhysicalMemoryOwner::PrefixHostTier,PhysicalMemoryOwner::PrefixDeviceTier,
+                                PhysicalMemoryOwner::PrefixArchiveStaging}) EXPECT_EQ(resource.bytes(owner),bill->bytes(owner));
+                            host_tier+=resource.bytes(PhysicalMemoryOwner::PrefixHostTier);
+                            archive+=resource.bytes(PhysicalMemoryOwner::PrefixArchiveStaging);
+                        }
+                        EXPECT_GT(host_tier,0u);
+                        EXPECT_GT(archive,0u);
+                        const auto continuation=std::find_if(fixed.device_inputs.begin(),fixed.device_inputs.end(),
+                            [](const auto &input){return input.execution_role==DeviceExecutionMemoryRole::ContinuationGraph;});
+                        ASSERT_NE(continuation,fixed.device_inputs.end());
+                        if (request.snapshot_capacity.valid())
+                        {
+                            ASSERT_TRUE(continuation->graph_snapshot_memory.serving_arenas);
+                            const auto &arenas = *continuation->graph_snapshot_memory.serving_arenas;
+                            EXPECT_EQ(arenas.scalarMainOwners(), 2u * profile.sparseQueryProgramCount());
+                            EXPECT_EQ(arenas.wideMainOwners(), 1u);
+                            EXPECT_EQ(arenas.conditionMainOwners(), 1u);
+                            ASSERT_TRUE(continuation->graph_snapshot_memory.effective_kv);
+                            EXPECT_EQ(continuation->graph_snapshot_memory.effective_kv->retained_arena_count, arenas.allOwners());
+                        }
+                        EXPECT_TRUE(continuation->prefix_cache.enabled);
+                        EXPECT_EQ(continuation->prefix_cache.storage_mode,PrefixCacheStorageMode::Tiered);
+                        EXPECT_EQ(continuation->prefix_cache.disk_budget_bytes,1ull<<30);
+                        if(f.rank.has_lm_head) EXPECT_EQ(continuation->weight_residency.selectedRoutedExpertsForLayer(48),0);
+                    }
+    }
+
+    /** @test Device type and authored parent boundary own retained MTP graph counts. */
+    TEST(MoEOverlayMemoryPlanInputs, GenerationDeclarationOwnsSharedVerifierInventory)
+    {
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto domain : {DeviceGenerationExecutionDomain::NativeDomain,
+                                  DeviceGenerationExecutionDomain::HostedBoundary})
+        for (const bool terminal : {false, true})
+        {
+            MemoryInputsFixture fixture(backend);
+            auto scope = fixture.stage(terminal ? 32 : 0, terminal ? 64 : 32, true);
+            scope.generation_domain = domain;
+            fixture.rank.runtime.mtp.graph_capacity_draft_tokens = 15;
+            fixture.family.max_decode_rows = resolveMTPRetainedTargetQueryRows(fixture.rank.runtime.mtp);
+            fixture.family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(fixture.rank.runtime.mtp);
+            auto request = fixture.request();
+            request.pipeline_stage = scope;
+            const auto result = buildMoEOverlayMemoryPlanInputs(request, 1);
+            const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                declaredDeviceGenerationExecutionPolicy(backend, domain)));
+            const auto role = terminal ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower;
+            const MTPGraphOwnerPlan owners(fixture.rank.runtime.mtp, family, role);
+            EXPECT_EQ(result.local_capacity.generation_domain, domain);
+            EXPECT_EQ(result.local_capacity.generation_parent_role, role);
+            EXPECT_EQ(result.local_capacity.captured_graph_plan.resident_executables.auxiliary_executable_count,
+                result.local_capacity.activation_graph_family_count + owners.generalAuxiliaryExecutableSlotCount());
+            EXPECT_EQ(result.local_capacity.captured_graph_plan.resident_executables.bounded_helper_executable_count,
+                owners.boundedHelperExecutableSlotCount());
+            if (backend == DeviceType::CUDA && domain == DeviceGenerationExecutionDomain::HostedBoundary)
+            {
+                const MTPGraphOwnerPlan wrong(fixture.rank.runtime.mtp, MTPVerifierGraphFamily::BoundedBuckets, role);
+                EXPECT_GT(owners.generalAuxiliaryExecutableSlotCount(), wrong.generalAuxiliaryExecutableSlotCount());
+            }
+            request.pipeline_stage->generation_domain = static_cast<DeviceGenerationExecutionDomain>(255);
+            EXPECT_THROW(buildMoEOverlayMemoryPlanInputs(request, 1), std::invalid_argument);
+        }
+    }
+
+    /** @test Whole-main programs multiply real prefill/runtime/fixed owners while preserving shared helpers. */
+    TEST(MoEOverlayMemoryPlanInputs, QueryProgramsPricePrefillAndRuntimeOwnersAndPreserveSnapshots)
+    {
+        MemoryInputsFixture fixture(DeviceType::ROCm);
+        auto scope = fixture.stage(0, 32, true);
+        fixture.model.flash_next.emplace();
+        fixture.model.n_layers = 64; // Flash Next counts main separately from its predictor.
+        fixture.model.flash_next->sparse_decoder_layers = {64}; // Predictor only: one main program.
+        fixture.rank.runtime.mtp.graph_capacity_draft_tokens = 15;
+        fixture.family.max_decode_rows = resolveMTPRetainedTargetQueryRows(fixture.rank.runtime.mtp);
+        fixture.family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(fixture.rank.runtime.mtp);
+        auto request = fixture.request();
+        request.pipeline_stage = scope;
+        request.snapshot_capacity = {.per_accelerator_bytes = 4096};
+        const auto one = buildMoEOverlayMemoryPlanInputs(request, 1);
+        fixture.model.flash_next->sparse_decoder_layers = {63, 64}; // Main QSA lies outside this owned stage.
+        ASSERT_EQ(fixture.model.sparseQueryProgramCount(), 2u);
+        const auto two = buildMoEOverlayMemoryPlanInputs(request, 1);
+        const auto one_serving = resolveCapturedServingGraphMemoryInventory(
+            {},
+            fixture.rank.runtime.mtp,
+            MTPVerifierGraphFamily::ExactRows,
+            MTPGenerationParentRole::PipelineFollower,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            1u);
+        const auto two_serving = resolveCapturedServingGraphMemoryInventory(
+            {},
+            fixture.rank.runtime.mtp,
+            MTPVerifierGraphFamily::ExactRows,
+            MTPGenerationParentRole::PipelineFollower,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            2u);
+        EXPECT_EQ(two.model_graph_identity_count - one.model_graph_identity_count,
+                  two_serving.fixed_executable_count - one_serving.fixed_executable_count + 3u);
+        EXPECT_EQ(one.model_graph_identity_count - one_serving.fixed_executable_count, 3u); // Bucket + two reserves.
+        EXPECT_EQ(two.model_graph_identity_count - two_serving.fixed_executable_count, 6u); // Both programs retain the bucket and two original runtime identities.
+        EXPECT_EQ(two_serving.mtp_graph_owners.sidecarGraphSlots(), one_serving.mtp_graph_owners.sidecarGraphSlots());
+        EXPECT_EQ(two_serving.mtp_graph_owners.boundedHelperExecutableSlotCount(),
+                  one_serving.mtp_graph_owners.boundedHelperExecutableSlotCount());
+        EXPECT_EQ(two.local_capacity.captured_graph_plan.resident_executables.auxiliary_executable_count,
+                  two.local_capacity.activation_graph_family_count + two_serving.mtp_graph_owners.generalAuxiliaryExecutableSlotCount());
+        EXPECT_EQ(two.local_capacity.captured_graph_plan.resident_executables.model_graph_topology_variant_count, 1u);
+        request.model_graph_topology_variant_count = 2;
+        const auto diagnostics = buildMoEOverlayMemoryPlanInputs(request, 1);
+        EXPECT_EQ(diagnostics.model_graph_identity_count, two.model_graph_identity_count);
+        EXPECT_EQ(diagnostics.local_capacity.captured_graph_plan.resident_executables.auxiliary_executable_count,
+                  two.local_capacity.captured_graph_plan.resident_executables.auxiliary_executable_count);
+        EXPECT_EQ(diagnostics.local_capacity.captured_graph_plan.resident_executables.model_graph_topology_variant_count, 2u);
+    }
+
 }

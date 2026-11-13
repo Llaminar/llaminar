@@ -8,20 +8,28 @@
  */
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningKernelServiceCatalog.h"
+#include "planning/RankHardwareOwnership.h"
 #include "planning/PlanningWeightServiceModel.h"
+#include "planning/WorkspaceMemoryEstimator.h"
 #include "planning/PlanningCommunicationService.h"
 #include "planning/PlanningCommunicationCost.h"
+#include "planning/PlanningExecutionMeasurement.h"
 #include "planning/PlanningRequestCostModel.h"
 #include "config/OrchestrationConfigParser.h"
 #include "utils/CPUFeatures.h"
 #include "utils/DebugEnv.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "../../utils/PlanningGGUFFixture.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <limits>
+#include <map>
 #include <set>
+#include <tuple>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -76,6 +84,14 @@ namespace
         auto result = inventory();
         for (auto &rank : result.ranks)
         {
+            // Known remote host scope: this rank may first-touch pages, but
+            // its NUMA7 does not authorize the visible NUMA0 GPUs.
+            if (rank.rank == 0)
+            {
+                rank.cpu.numa_node = 7;
+                rank.cpu_socket_info.front().numa_node = 7;
+                rank.cpu_socket_info.front().physical_cores = {2, 3};
+            }
             const auto first = rank.gpus;
             for (const auto &gpu : first)
                 for (int index = 1; index < (rank.rank == 1 ? 3 : 2); ++index)
@@ -85,6 +101,13 @@ namespace
                     extra.uuid = "0-" + gpu.uuid + "-" + std::to_string(index);
                     rank.gpus.push_back(extra);
                 }
+            for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+            {
+                auto &width = backend == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count;
+                auto &matrix = backend == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+                width = std::count_if(rank.gpus.begin(), rank.gpus.end(), [&](const auto &gpu) { return gpu.type == backend; });
+                matrix.assign(size_t(width) * width, true); // Explicit synthetic physical access, independent of ordinal order.
+            }
         }
         return result;
     }
@@ -98,12 +121,38 @@ namespace
         {
             const auto &sample = plan.native()[index];
             PlanningLocalTPObservations observed{sample.request, {}};
+            observed.mode = sample.mode;
+            if (sample.mode == PlanningLocalTPMeasurementMode::NativeCollective)
             for (int rows : {1, sample.request.prefillRows()})
             {
                 PlanningLocalTPPhaseObservation phase{rows, sample.request.payloadBytes(rows), {}};
                 for (const auto device : sample.request.devices())
                     phase.endpoints.push_back({device, 3, .0001 * (phase.endpoints.size() + 1)});
                 observed.phases.push_back(std::move(phase));
+            }
+            if(sample.mode==PlanningLocalTPMeasurementMode::NativeCollective)
+                for(const auto protocol:{PlanningNativeGatherProtocol::FixedAllgather,PlanningNativeGatherProtocol::CountedAllgather})
+                    for(const size_t bytes:{protocol==PlanningNativeGatherProtocol::FixedAllgather?size_t{1}:size_t{0},sample.request.activationBytes()}){
+                        PlanningLocalTPGatherPhaseObservation phase{protocol,bytes,sample.request.devices().size(),{}};
+                        for(const auto device:sample.request.devices())phase.endpoints.push_back({device,std::max<size_t>(3,sample.request.devices().size()),
+                            .0001*(phase.endpoints.size()+1)*(protocol==PlanningNativeGatherProtocol::FixedAllgather?1.:2.)*(bytes==sample.request.activationBytes()?64.:1.)});
+                        observed.gather_phases.push_back(std::move(phase));
+                    }
+            if (sample.pair_sampling == PlanningPairSampling::Enabled)
+            {
+                auto &pairs = observed.pair_sampling;
+                pairs.payload_anchors = sample.request.pairPayloadAnchors();
+                pairs.direct_peer_access = sample.direct_peer_access;
+                for (size_t source = 0; source < sample.request.devices().size(); ++source)
+                    for (size_t destination = 0; destination < sample.request.devices().size(); ++destination)
+                        if (pairs.direct_peer_access[source * sample.request.devices().size() + destination])
+                            for (const auto bytes : pairs.payload_anchors)
+                                pairs.directed_pairs.push_back({source, destination, bytes,
+                                    {.00001, .00002, .00003}, 4});
+                pairs.setup_wall_seconds = .01;
+                pairs.measurement_wall_seconds = .02;
+                pairs.capture_count = pairs.directed_pairs.size() / pairs.payload_anchors.size();
+                pairs.measured_launches = pairs.capture_count;
             }
             groups.at(sample.discovery_rank).emplace_back(index, std::move(observed));
         }
@@ -117,7 +166,7 @@ namespace
                         observed.phases.push_back({mechanism, direction, payload, 1,
                             PlanningServiceObservation(PlanningWorkUnit::Bytes, 3.0 * payload, .0003,
                                 "synthetic completed GPU/host codec sample")});
-            host_groups[request.rank()].emplace_back(index, std::move(observed));
+            host_groups[request.gpuRank()].emplace_back(index, std::move(observed));
         }
         std::vector<std::vector<uint8_t>> result;
         for (size_t rank = 0; rank < groups.size(); ++rank)
@@ -143,8 +192,7 @@ namespace
             result = PlanningCPUExpertObservations{observer.device(), 2,
                 ISALevel::AVX2, ISALevel::AVX512, shape.matrices[0].k, shape.matrices[0].n, 1024,
                 shape.formats, plan.request(), {}};
-        for (auto phase : {ExpertHistogramSource::DecodeToken, ExpertHistogramSource::PrefillChunk,
-                           ExpertHistogramSource::GroupedVerifier})
+        for (auto phase : kPlanningExpertStartupPhases)
         {
             const int rows = MoEOverlayCPUServiceMeasurement::rowsForPhase(phase);
             PlanningServiceObservation service(PlanningWorkUnit::ArithmeticOperations,
@@ -176,10 +224,11 @@ namespace
     }
 
     /** @return Source-free byte receipts; topology comes from transport and inventory, not timings. */
-    std::vector<std::vector<uint8_t>> streamingReceipts(const ClusterInventory &cluster)
+    std::vector<std::vector<uint8_t>> streamingReceipts(const ClusterInventory &cluster,
+        const AutomaticOrchestrationRequest &policy = AutomaticOrchestrationRequest{})
     {
         std::vector<std::vector<PlanningKernelObservation>> rows(cluster.world_size);
-        for (const auto &observer : PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{}))
+        for (const auto &observer : PlanningKernelServiceCatalog::observers(cluster, policy))
         {
             const auto request = PlanningMemoryBandwidthRequest::fromInventory(
                 cluster.ranks[observer.discoveryRank()], observer.device());
@@ -217,11 +266,12 @@ namespace
 
     /** @return Synthetic operation-specific receipts, using each rank's published CPU geometry. */
     std::vector<std::vector<uint8_t>> projectionReceipts(const ClusterInventory &cluster,
-        const PlanningProjectionServicePlan &plan)
+        const PlanningProjectionServicePlan &plan,
+        const AutomaticOrchestrationRequest &policy = AutomaticOrchestrationRequest{})
     {
         std::vector<std::vector<PlanningKernelObservation>> rows(cluster.world_size);
         const auto shape = plan.matrix().geometry();
-        for (const auto &observer : PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{}))
+        for (const auto &observer : PlanningKernelServiceCatalog::observers(cluster, policy))
         {
             PlanningProjectionObservations value{plan.matrix(), observer.device(), 1024, {}, {}};
             if (observer.device().is_cpu()) value.cpu = PlanningProjectionCPUObservation{
@@ -699,8 +749,15 @@ namespace
         auto cluster = multiple_gpus ? communicationInventory() : inventory();
         for (auto &rank : cluster.ranks)
         {
+            // Request arithmetic chooses rank zero; author its actual bound
+            // NUMA rather than borrowing the codec fixture's separate host scope.
+            rank.cpu.numa_node = 0;
             rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = size_t{16} << 30;
-            for (auto &socket : rank.cpu_socket_info) socket.memory_bytes = size_t{16} << 30;
+            for (auto &socket : rank.cpu_socket_info)
+            {
+                socket.numa_node = rank.cpu.numa_node;
+                socket.memory_bytes = size_t{16} << 30;
+            }
             for (auto &gpu : rank.gpus)
             {
                 gpu.memory_bytes = gpu.free_memory_bytes = size_t{16} << 30;
@@ -723,8 +780,26 @@ namespace
         return cluster;
     }
 
+    /** @brief Perturb only raw measured service; identities, work and format remain authentic fixture inputs. */
+    void scaleComputeReceipts(std::vector<std::vector<uint8_t>> &receipts,
+        const std::map<DeviceId,double> &factors)
+    {
+        for(auto &receipt:receipts) {
+            auto wire=nlohmann::json::parse(receipt);
+            for(auto &observation:wire.at("observations")) {
+                const DeviceId device{static_cast<DeviceType>(observation.at("backend").get<int>()),
+                    observation.at("ordinal").get<int>()};
+                if(const auto found=factors.find(device);found!=factors.end())
+                    for(auto &phase:observation.at("phases"))
+                        phase["seconds"]=phase.at("seconds").get<double>()*found->second;
+            }
+            const auto text=wire.dump();receipt.assign(text.begin(),text.end());
+        }
+    }
+
     /** @return Complete synthetic source-family evidence for pure request arithmetic tests. */
-    PlanningWeightServiceModel requestWeights(const PlanningModelSource &source, const ClusterInventory &cluster)
+    PlanningWeightServiceModel requestWeights(const PlanningModelSource &source, const ClusterInventory &cluster,
+        const std::map<DeviceId,double> &factors = {})
     {
         std::vector<PlanningKernelServiceCatalog> kernels;
         for (const auto &sample : PlanningWeightServiceModel::samples(source.metadata()))
@@ -733,14 +808,16 @@ namespace
                 if constexpr (std::is_same_v<Request, PlanningModelSampleRequest>)
                 {
                     const PlanningProjectionServicePlan plan(PlanningMatrixSamplePlan::resolve(source, request), 64);
-                    const auto encoded = projectionReceipts(cluster, plan);
+                    auto encoded = projectionReceipts(cluster, plan);
+                    scaleComputeReceipts(encoded,factors);
                     kernels.push_back(PlanningKernelServiceCatalog::accept(cluster, AutomaticOrchestrationRequest{},
                         plan, borrow(encoded)));
                 }
                 else
                 {
                     const auto plan = PlanningExpertSamplePlan::resolve(source, request);
-                    const auto encoded = receipts(cluster, plan);
+                    auto encoded = receipts(cluster, plan);
+                    scaleComputeReceipts(encoded,factors);
                     kernels.push_back(PlanningKernelServiceCatalog::accept(cluster, AutomaticOrchestrationRequest{},
                         plan, borrow(encoded)));
                 }
@@ -752,7 +829,8 @@ namespace
     AdmittedOrchestrationCandidate requestCandidate(const PlanningModelSource &source, const ClusterInventory &cluster,
         DeviceType backend, OrchestrationStrategy strategy,
         MoERebalanceRuntimeMode movement = MoERebalanceRuntimeMode::Off,
-        RoutedExpertComputePolicy routed = RoutedExpertComputePolicy::Apportioned)
+        RoutedExpertComputePolicy routed = RoutedExpertComputePolicy::Apportioned,
+        const PlanningHostServiceBudgets &host_services = {})
     {
         OrchestrationConfig request;
         request.model_path = source.path();
@@ -769,19 +847,78 @@ namespace
             if (found || candidate.membership.discoveryRanks() != std::vector<int>{0}) return;
             found = AdmittedOrchestrationCandidate::admit(std::move(candidate), source,
                 {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-                 .maximum_cached_prefill_buckets = 8});
+                 .maximum_cached_prefill_buckets = 8, .retained_host_services = host_services});
         });
         if (!found) throw std::logic_error("No request-cost fixture candidate");
         return std::move(*found);
     }
 
     /** @return Complete source-free proxy matching the codec fixture's physical observers. */
-    PlanningKernelServiceCatalog requestArithmetic(const ClusterInventory &cluster)
+    PlanningKernelServiceCatalog requestArithmetic(const ClusterInventory &cluster,
+        const std::map<DeviceId,double> &factors = {})
     {
-        const auto encoded = arithmeticReceipts(cluster);
+        auto encoded = arithmeticReceipts(cluster);
+        scaleComputeReceipts(encoded,factors);
         return PlanningKernelServiceCatalog::accept(cluster, AutomaticOrchestrationRequest{},
             PlanningFP32ArithmeticPlan{}, borrow(encoded));
     }
+}
+
+/**
+ * @test CPU allocation identity is independent of whole-host or bound NUMA affinity.
+ *
+ * A rank's -1 affinity denotes an observed whole-host CPU resource, not an
+ * invalid process CPU allocator. GPU execution additionally requires exact
+ * locality, so the unqualified GPU arms are negative controls. Binding NUMA3
+ * likewise cannot invent CPU ordinal3. Exercise the actual model-aware compiler and complete BOM on every backend;
+ * no model payload or accelerator is loaded by these metadata fixtures.
+ */
+TEST(PlanningRequestCostModel, CPUAllocatorDoesNotUseNUMAAffinityAsDeviceOrdinal)
+{
+    PlanningGGUFFixture file(false, false, GGUFTensorType::F32);
+    PlanningModelSource source(file.path());
+    for (const int affinity : {-1, 3})
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(::testing::Message() << affinity << '/' << int(backend));
+            auto observed = requestInventory(false);
+            for (auto &rank : observed.ranks)
+            {
+                rank.cpu.numa_node = affinity;
+                rank.numa_nodes = affinity < 0 ? 1 : 4;
+                for (auto &socket : rank.cpu_socket_info) socket.numa_node = affinity < 0 ? 0 : affinity;
+                if (affinity >= 0)
+                    for (auto &gpu : rank.gpus) gpu.numa_node = affinity;
+            }
+            observed.buildNodeAggregations();
+            if (affinity < 0 && backend != DeviceType::CPU)
+            {
+                // Whole-host CPU ownership cannot authorize any GPU executor.
+                EXPECT_THROW(requestCandidate(source, observed, backend,
+                    OrchestrationStrategy::SingleDevice), std::logic_error);
+                continue;
+            }
+            std::optional<AdmittedOrchestrationCandidate> admitted;
+            EXPECT_NO_THROW(admitted.emplace(requestCandidate(source, observed, backend,
+                OrchestrationStrategy::SingleDevice)));
+            if (!admitted) continue;
+            ASSERT_EQ(admitted->rankPlans().size(), 1u);
+            EXPECT_EQ(admitted->rankPlans().front().numa_node, affinity);
+            ASSERT_EQ(admitted->devicePlans().size(), 1u);
+            const auto &device = admitted->devicePlans().front();
+            if (backend == DeviceType::CPU)
+                EXPECT_EQ(device.device, DeviceId::cpu());
+            else
+            {
+                ASSERT_TRUE(device.associated_host_memory);
+                EXPECT_EQ(device.associated_host_memory->device, DeviceId::cpu());
+                EXPECT_EQ(device.associated_host_memory->world_rank, 0);
+            }
+            const auto &physical = admitted->physicalAdmission().plan();
+            EXPECT_NE(physical.find({0, DeviceId::cpu()}), nullptr);
+            if (affinity == 3)
+                EXPECT_EQ(physical.find({0, DeviceId{DeviceType::CPU, 3}}), nullptr);
+        }
 }
 
 TEST(PlanningRequestCostModel, SingleDeviceHasNoLinksAndLiveContextCostsMoreAcrossBackendsAndFormats)
@@ -818,15 +955,19 @@ TEST(PlanningRequestCostModel, TPRequiresNativeEvidenceAndPricesTheTypedDecodePo
     constexpr std::array precision{PlanningAllreducePrecision::FP32};
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 256, 64, precision);
     const auto encoded = nativeReceipts(plan, cluster.world_size);
-    const auto native = PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(encoded)).native;
+    const auto observed = PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(encoded));
     for (bool moe : {false, true})
     {
         PlanningGGUFFixture file(moe);
         PlanningModelSource source(file.path());
         const PlanningRequestCostModel costs(source.metadata(), cluster, requestWeights(source, cluster),
-            requestArithmetic(cluster), PlanningCommunicationCost(cluster, native, {}));
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, observed.native, {}, observed.host_device));
         const PlanningRequestCostModel missing(source.metadata(), cluster, requestWeights(source, cluster),
-            requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}));
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observed.host_device));
+        // This inventory explicitly has no direct peers. Retaining native
+        // collective evidence alone cannot price the physical host-staged edge.
+        const PlanningRequestCostModel missing_host(source.metadata(), cluster, requestWeights(source, cluster),
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, observed.native, {}));
         for (auto backend : {DeviceType::CUDA, DeviceType::ROCm})
         {
             const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::TensorParallel);
@@ -846,10 +987,302 @@ TEST(PlanningRequestCostModel, TPRequiresNativeEvidenceAndPricesTheTypedDecodePo
                 EXPECT_NE(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
             else
                 EXPECT_EQ(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
-            EXPECT_NE(cost.evidence().find("measured native FP32 group service"), std::string::npos);
+            EXPECT_NE(cost.evidence().find("measured native allreduce fixed latency"), std::string::npos);
             EXPECT_EQ(cost.evidence().find("point-to-point traffic"), std::string::npos);
             EXPECT_THROW(missing.evaluate(candidate, {64, 16}), std::invalid_argument);
+            EXPECT_THROW(missing_host.evaluate(candidate, {64, 16}), std::invalid_argument);
         }
+    }
+}
+
+/** @test Real candidate scoring consumes directed measurements and preserves workload-dependent placement. */
+TEST(PlanningRequestCostModel, MeasuredPairsOverrideSwitchPreferenceAcrossWorkloads)
+{
+    PlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        // One actual rank owns three GPUs on its own NUMA node. The first
+        // two share a switch; the third belongs to another local switch.
+        // Fabric times below are a decision oracle, not performance evidence.
+        auto cluster = requestInventory(true);
+        auto rank = cluster.ranks[1];
+        rank.rank = rank.local_rank = rank.node_id = 0;
+        std::erase_if(rank.gpus, [&](const auto &gpu) { return gpu.type != backend; });
+        ASSERT_EQ(rank.gpus.size(), 3u);
+        std::sort(rank.gpus.begin(), rank.gpus.end(), [](const auto &a, const auto &b) {
+            return a.local_device_id < b.local_device_id;
+        });
+        std::vector<int> ordinals;
+        for (size_t i = 0; i < rank.gpus.size(); ++i)
+        {
+            auto &gpu = rank.gpus[i];
+            gpu.pcie_upstream_bdfs = {i < 2 ? "0000:86:00.0" : "0000:af:00.0", "0000:80:00.0"};
+            ordinals.push_back(gpu.local_device_id);
+        }
+        rank.p2p_cuda_count = backend == DeviceType::CUDA ? 3 : 0;
+        rank.p2p_rocm_count = backend == DeviceType::ROCm ? 3 : 0;
+        rank.p2p_cuda.assign(backend == DeviceType::CUDA ? 9 : 0, true);
+        rank.p2p_rocm.assign(backend == DeviceType::ROCm ? 9 : 0, true);
+        cluster.ranks = {std::move(rank)}; cluster.world_size = 1; cluster.buildNodeAggregations();
+        OrchestrationConfig request;
+        request.model_path = source.path(); request.max_seq_len = 8192;
+        request.prefill_max_bucket_size = 64;
+        request.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        request.automatic_planning.only_backends = std::vector{backend};
+        request.automatic_planning.only_strategies = std::vector{OrchestrationStrategy::TensorParallel};
+        request.automatic_planning.device_counts = {{backend, 2}};
+        const auto constraints = std::get<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(request));
+        constexpr std::array precisions{PlanningAllreducePrecision::FP32};
+        const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, constraints, 256, 64, precisions);
+        const auto encoded = nativeReceipts(plan, 1);
+        auto original = PlanningCommunicationService::acceptLocal(plan, 1, borrow(encoded)).native;
+        // This ranking fixture observes actual payload-dependent excess above
+        // the native small-message floor; a flat curve cannot price subgroup improvement.
+        for(auto &receipt:original)for(auto &phase:receipt.observation.phases)
+            for(auto &endpoint:phase.endpoints)endpoint.seconds_per_collective*=phase.rows;
+        const auto weights = requestWeights(source, cluster);
+        const auto arithmetic = requestArithmetic(cluster);
+        for (const bool ties : {true, false})
+        {
+            auto measured = original;
+            for (auto &receipt : measured)
+                for (auto &edge : receipt.observation.pair_sampling.directed_pairs)
+                {
+                    const auto low = std::min(edge.source_index, edge.destination_index);
+                    const auto high = std::max(edge.source_index, edge.destination_index);
+                    const bool bulk = edge.payload_bytes == receipt.sample.request.activationBytes();
+                    const bool quick = high == 2 && low == (bulk ? 1u : 0u);
+                    edge.seconds_per_transfer.assign(PlanningLocalTPPairSampling::kSamples,
+                        ties ? .00001 : quick ? .000001 : .001);
+                }
+            const PlanningRequestCostModel costs(source.metadata(), cluster, weights, arithmetic,
+                PlanningCommunicationCost(cluster, measured, {}));
+            for (const auto workload : {OrchestrationPlanningWorkload{1, 256}, OrchestrationPlanningWorkload{32, 256}, OrchestrationPlanningWorkload{256, 1}})
+            {
+                const auto selected = AutomaticOrchestrationPlanner::select(request, source, cluster,
+                    {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
+                     .maximum_cached_prefill_buckets = 8}, workload,
+                    [&](const auto &candidate, const auto &work) { return costs.evaluate(candidate, work); });
+                std::set<int> actual;
+                for (const auto &device : selected.candidate().devicePlans()) actual.insert(device.device.ordinal);
+                const std::set<int> expected = (ties || workload.promptTokens()==1) ? std::set{ordinals[0], ordinals[1]} :
+                    std::set{ordinals[workload.generationTokens() > 1 ? 0 : 1], ordinals[2]};
+                EXPECT_EQ(actual, expected) << "backend=" << int(backend) << ", ties=" << ties;
+                EXPECT_NE(selected.cost().evidence().find("measured native allreduce fixed latency"), std::string::npos);
+            }
+        }
+    }
+}
+
+namespace {
+    /** @return Fully identified homogeneous compute devices, with explicit immutable peer facts. */
+    ClusterInventory medianComputeInventory(DeviceType backend,size_t count)
+    {
+        auto cluster=requestInventory(true);auto rank=cluster.ranks[1];rank.rank=rank.local_rank=rank.node_id=0;
+        std::erase_if(rank.gpus,[&](const auto &gpu){return gpu.type!=backend;});
+        const auto prototype=rank.gpus.front();rank.gpus.clear();
+        for(size_t i=0;i<count;++i){auto gpu=prototype;gpu.local_device_id=int(i);
+            gpu.uuid="median-fixture-"+std::to_string(int(backend))+"-"+std::to_string(i);
+            gpu.name="Recorded homogeneous GPU";gpu.native_isa=backend==DeviceType::ROCm?"gfx906":"sm_80";
+            gpu.compute_capability_major=8;gpu.compute_capability_minor=0;gpu.compute_units=32;
+            gpu.pcie_upstream_bdfs={i<2?"0000:86:00.0":"0000:af:00.0","0000:80:00.0"};rank.gpus.push_back(gpu);}
+        rank.p2p_cuda_count=backend==DeviceType::CUDA?int(count):0;rank.p2p_rocm_count=backend==DeviceType::ROCm?int(count):0;
+        rank.p2p_cuda.assign(backend==DeviceType::CUDA?count*count:0,true);
+        rank.p2p_rocm.assign(backend==DeviceType::ROCm?count*count:0,true);
+        cluster.ranks={std::move(rank)};cluster.world_size=1;cluster.buildNodeAggregations();return cluster;
+    }
+    /** @return Exact admitted singleton at the requested original ordinal, without a substitute topology. */
+    AdmittedOrchestrationCandidate medianComputeCandidate(const PlanningModelSource &source,const ClusterInventory &cluster,DeviceType backend,int ordinal,int discovery_rank=0)
+    {
+        OrchestrationConfig request;request.model_path=source.path();request.max_seq_len=8192;
+        request.prefill_max_bucket_size=64;request.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        request.automatic_planning.only_backends=std::vector{backend};
+        request.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::SingleDevice};
+        request.automatic_planning.device_counts={{backend,1}};
+        std::optional<AdmittedOrchestrationCandidate> selected;
+        visitAutomaticOrchestrationCandidates(request,source.metadata(),cluster,[&](auto proposal){
+            if(selected || proposal.membership.discoveryRanks()!=std::vector<int>{discovery_rank})return;
+            auto admitted=AdmittedOrchestrationCandidate::admit(std::move(proposal),source,
+                {.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8});
+            if(admitted.devicePlans().size()==1 && admitted.devicePlans()[0].device.ordinal==ordinal)selected.emplace(std::move(admitted));});
+        if(!selected)throw std::logic_error("No exact median compute fixture candidate");return std::move(*selected);
+    }
+}
+
+/** @test Same-class raw timing permutations cannot reshuffle compute placement; actual faster peer service decides. */
+TEST(PlanningRequestCostModel, SameClassMedianComputeKeepsMeasuredFastestGroup)
+{
+    PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
+        const auto cluster=medianComputeInventory(backend,3);
+        OrchestrationConfig request;request.model_path=source.path();request.max_seq_len=8192;request.prefill_max_bucket_size=64;
+        request.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;request.automatic_planning.only_backends=std::vector{backend};
+        request.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::TensorParallel};request.automatic_planning.device_counts={{backend,2}};
+        const auto policy=std::get<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(request));
+        constexpr std::array precisions{PlanningAllreducePrecision::FP32};
+        const auto plan=PlanningCommunicationSamplePlan::resolve(cluster,policy,256,64,precisions);
+        const auto wire=nativeReceipts(plan,1);auto native=PlanningCommunicationService::acceptLocal(plan,1,borrow(wire)).native;
+        // This ranking fixture observes actual payload-dependent excess above
+        // the native small-message floor; a flat curve cannot price subgroup improvement.
+        for(auto &receipt:native)for(auto &phase:receipt.observation.phases)
+            for(auto &endpoint:phase.endpoints)endpoint.seconds_per_collective*=phase.rows;
+        for(const bool cross_fast:{false,true}){
+            auto links=native;for(auto &receipt:links)for(auto &edge:receipt.observation.pair_sampling.directed_pairs){
+                const auto low=std::min(edge.source_index,edge.destination_index),high=std::max(edge.source_index,edge.destination_index);
+                const bool fastest=cross_fast?(low==0 && high==2):(low==0 && high==1);
+                edge.seconds_per_transfer.assign(PlanningLocalTPPairSampling::kSamples,fastest?.00003:.00008);}
+            std::optional<double> baseline;
+            for(const bool reverse:{false,true}){
+                const std::map<DeviceId,double> factors{{{backend,0},reverse?100.:.01},{{backend,1},1.},{{backend,2},reverse?.01:100.}};
+                const auto weights=requestWeights(source,cluster,factors);const auto arithmetic=requestArithmetic(cluster,factors);
+                const auto raw=std::get<PlanningFP32ArithmeticObservations>(arithmetic.serviceFor(0,{backend,0}).observation).phases[0].service.elapsedSeconds();
+                EXPECT_DOUBLE_EQ(raw,.0002*factors.at(DeviceId{backend,0}));
+                const PlanningRequestCostModel costs(source.metadata(),cluster,weights,arithmetic,PlanningCommunicationCost(cluster,links,{}));
+                const auto selected=AutomaticOrchestrationPlanner::select(request,source,cluster,
+                    {.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8},
+                    {256,256},[&](const auto &candidate,const auto &work){return costs.evaluate(candidate,work);});
+                std::set<int> actual;for(const auto &device:selected.candidate().devicePlans())actual.insert(device.device.ordinal);
+                EXPECT_EQ(actual,(cross_fast?std::set<int>{0,2}:std::set<int>{0,1}));
+                if(baseline)EXPECT_DOUBLE_EQ(selected.cost().requestSeconds(),*baseline);else baseline=selected.cost().requestSeconds();
+                EXPECT_DOUBLE_EQ(std::get<PlanningFP32ArithmeticObservations>(arithmetic.serviceFor(0,{backend,0}).observation).phases[0].service.elapsedSeconds(),raw);
+            }
+        }
+    }
+}
+
+/** @test Singleton, odd and larger cohorts retain one class median without changing original raw catalogs. */
+TEST(PlanningRequestCostModel, SameClassMedianComputeSupportsArbitraryCohortSizes)
+{
+    PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const size_t count:{1u,3u,9u}){
+        const auto cluster=medianComputeInventory(DeviceType::ROCm,count);const auto candidate=medianComputeCandidate(source,cluster,DeviceType::ROCm,0);
+        std::optional<double> baseline;
+        for(const bool reverse:{false,true}){
+            std::map<DeviceId,double> factors;for(size_t i=0;i<count;++i)factors.emplace(DeviceId::rocm(int(i)),double((reverse?count-1-i:i)+1));
+            const auto weights=requestWeights(source,cluster,factors);const auto arithmetic=requestArithmetic(cluster,factors);
+            const PlanningRequestCostModel costs(source.metadata(),cluster,weights,arithmetic,PlanningCommunicationCost(cluster,{},{}));
+            const auto estimate=costs.evaluate(candidate,{256,256});
+            if(baseline)EXPECT_DOUBLE_EQ(estimate.requestSeconds(),*baseline);else baseline=estimate.requestSeconds();
+        }
+    }
+}
+
+/** @test A permitted compute receipt alias resolves its original observer before class membership or ordinal lookup. */
+TEST(PlanningRequestCostModel, SameClassMedianComputeResolvesOriginalObserverAliases)
+{
+    PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
+        auto cluster=requestInventory(true);
+        for(auto &rank:cluster.ranks)for(auto &gpu:rank.gpus){
+            gpu.name="Recorded alias GPU";gpu.native_isa=gpu.type==DeviceType::CUDA?"sm_80":"gfx906";
+            gpu.compute_capability_major=8;gpu.compute_capability_minor=0;}
+        cluster.buildNodeAggregations();
+        const auto canonical=medianComputeCandidate(source,cluster,backend,4,0);
+        const auto alias=medianComputeCandidate(source,cluster,backend,0,1);
+        const std::map<DeviceId,double> factors{{{backend,4},100.},{{backend,0},.01},{{backend,10},1.},{{backend,20},2.}};
+        const PlanningRequestCostModel costs(source.metadata(),cluster,requestWeights(source,cluster,factors),
+            requestArithmetic(cluster,factors),PlanningCommunicationCost(cluster,{},{}));
+        EXPECT_DOUBLE_EQ(costs.evaluate(canonical,{256,256}).requestSeconds(),costs.evaluate(alias,{256,256}).requestSeconds());
+    }
+}
+
+/** @test Different or incomplete physical compute facts cannot pool independent endpoint evidence. */
+TEST(PlanningRequestCostModel, SameClassMedianComputePreservesHardwareDistinctions)
+{
+    PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(int defect=0;defect<12;++defect){
+        SCOPED_TRACE(int(backend));
+        SCOPED_TRACE(defect);auto cluster=medianComputeInventory(backend,3);
+        auto &gpu=cluster.ranks[0].gpus[1];
+        if(defect==0)gpu.name+=" other";
+        if(defect==1)gpu.native_isa+="other";
+        if(defect==2)++gpu.compute_units;
+        if(defect==3)++gpu.compute_capability_major;
+        if(defect==4)++gpu.compute_capability_minor;
+        if(defect==5)gpu.memory_bytes+=4096;
+        if(defect==6)gpu.last_level_cache_bytes+=4096;
+        if(defect==7)gpu.tflops_fp16=123.;
+        if(defect==8)gpu.tflops_int8=123.;
+        if(defect==9)gpu.memory_bandwidth_gbps=123.;
+        if(defect==10)for(auto &device:cluster.ranks[0].gpus)device.name.clear();
+        if(defect==11)for(auto &device:cluster.ranks[0].gpus)device.native_isa.clear();
+        cluster.buildNodeAggregations();const auto candidate=medianComputeCandidate(source,cluster,backend,0);
+        std::array<double,2> predictions{};
+        for(size_t reverse=0;reverse<2;++reverse){
+            const std::map<DeviceId,double> factors{{{backend,0},reverse?100.:.01},{{backend,1},reverse?.01:100.},{{backend,2},1.}};
+            const PlanningRequestCostModel costs(source.metadata(),cluster,requestWeights(source,cluster,factors),requestArithmetic(cluster,factors),PlanningCommunicationCost(cluster,{},{}));
+            predictions[reverse]=costs.evaluate(candidate,{256,256}).requestSeconds();
+        }
+        if(defect==11 && backend==DeviceType::CUDA)EXPECT_DOUBLE_EQ(predictions[0],predictions[1]);
+        else EXPECT_NE(predictions[0],predictions[1]);
+    }
+}
+
+/** @test A supported GPU/CPU expert epoch requires measured mapped service, regardless of GPU vendor. */
+TEST(PlanningRequestCostModel, MappedOverlayDoesNotSubstituteNativePeerMeasurements)
+{
+    auto cluster = requestInventory(true);
+    cluster.world_size = 1; cluster.ranks.resize(1); cluster.buildNodeAggregations();
+    PlanningGGUFFixture file(true);
+    PlanningModelSource source(file.path());
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(deviceTypeToString(backend));
+        const AutomaticOrchestrationRequest constraints({.only_backends = {{backend, DeviceType::CPU}},
+            .only_strategies = {{OrchestrationStrategy::ExpertOverlay}}});
+        constexpr std::array precisions{PlanningAllreducePrecision::FP32};
+        const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, constraints, 256, 64, precisions);
+        const auto encoded = nativeReceipts(plan, 1);
+        const auto observed = PlanningCommunicationService::acceptLocal(plan, 1, borrow(encoded));
+        OrchestrationConfig request;
+        request.model_path = source.path(); request.max_seq_len = 8192; request.prefill_max_bucket_size = 64;
+        request.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        request.automatic_planning = constraints.options();
+        std::optional<AdmittedOrchestrationCandidate> selected;
+        size_t proposals = 0;
+        visitAutomaticOrchestrationCandidates(request, source.metadata(), cluster, [&](auto proposal) {
+            ++proposals;
+            if (selected || proposal.membership.discoveryRanks() != std::vector<int>{0}) return;
+            const auto &overlay = proposal.config.moe_routed_expert_plan;
+            if (!overlay || overlay->domains.size() != 2 || overlay->routed_tiers.size() != 2 ||
+                overlay->domains[0].participants.size() != 1 || overlay->domains[1].participants.size() != 1 ||
+                overlay->domains[0].participants[0].device_type != backend ||
+                !overlay->domains[1].participants[0].isCPU()) return;
+            // Keep a real positive CPU expert cohort: unconstrained GPU capacity
+            // would otherwise consume all experts and leave no mapped epoch.
+            proposal.config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*overlay);
+            proposal.config.moe_routed_expert_plan->routed_tiers[0].max_experts_per_layer = 4;
+            selected.emplace(AdmittedOrchestrationCandidate::admit(std::move(proposal), source,
+                {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
+                 .maximum_cached_prefill_buckets = 8,
+                 .retained_host_services = planningHostServiceBudgets(cluster.world_size)}));
+        });
+        ASSERT_TRUE(selected) << "Expected one GPU continuation plus a host-owned CPU expert tier; proposals=" << proposals;
+        const auto &candidate = *selected;
+        ASSERT_EQ(candidate.rankPlans().size(), 1u);
+        const auto &runtime = candidate.rankPlans().front().runtime;
+        ASSERT_TRUE(runtime.retained_host_services);
+        EXPECT_EQ(runtime.retained_host_services->worldRank(), 0);
+        EXPECT_TRUE(runtime.retained_host_services->contains(RetainedHostServiceInstance{
+            .worldRank = 0,
+            .consumer = candidate.rankPlans().front().primary_device.toLocalDeviceId(),
+            .role = RetainedHostServiceRole::ExecutorParentTicket}));
+        ASSERT_TRUE(candidate.overlayCapacity());
+        ASSERT_EQ(candidate.overlayCapacity()->tiers.size(), 2u);
+        for (const auto &tier : candidate.overlayCapacity()->tiers)
+        {
+            ASSERT_FALSE(tier.live_experts_per_layer.empty());
+            for (const int experts : tier.live_experts_per_layer) EXPECT_EQ(experts, 4);
+        }
+        const PlanningRequestCostModel mapped(source.metadata(), cluster, requestWeights(source, cluster),
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observed.host_device));
+        const auto estimate = mapped.evaluate(candidate, {64, 16});
+        EXPECT_NE(estimate.evidence().find("node-local activation epochs use directed mapped-byte primitives"), std::string::npos);
+        EXPECT_EQ(estimate.evidence().find("native grouped-P2P INT8 directed placement proxy"), std::string::npos);
+        const PlanningRequestCostModel wrong(source.metadata(), cluster, requestWeights(source, cluster),
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, observed.native, {}));
+        EXPECT_THROW(wrong.evaluate(candidate, {64, 16}), std::invalid_argument);
     }
 }
 
@@ -1122,8 +1555,8 @@ TEST(PlanningRequestCostModel, ProjectionPolicyRequiresActualFabricAndColumnPubl
             const auto estimate = costs.evaluate(candidate, {64, 16});
             EXPECT_GT(estimate.requestSeconds(), 0);
             EXPECT_NE(estimate.evidence().find("all-expert down slices"), std::string::npos);
-            EXPECT_NE(estimate.evidence().find("projection column gather"), std::string::npos);
-            EXPECT_NE(estimate.evidence().find(p2p ? "projection native intermediate" : "counted owner records"), std::string::npos);
+            EXPECT_NE(estimate.evidence().find("native fixed allgather; equal DeviceRows"), std::string::npos);
+            EXPECT_NE(estimate.evidence().find("projection intermediate uses measured native counted gather; live extents and completion charged once"), std::string::npos);
             EXPECT_EQ(estimate.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
             const PlanningRequestCostModel missing_native(source.metadata(), cluster, requestWeights(source, cluster),
                 requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observations.host_device));
@@ -1151,19 +1584,19 @@ TEST(PlanningCommunicationService, ProjectionOnlyTPSamplesItsActualHostScopes)
         EXPECT_TRUE(PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision).hostDevice().empty());
         const auto projection = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::GateUpOwnedDownColumns);
-        ASSERT_EQ(projection.hostDevice().size(), 7u);
+        ASSERT_EQ(projection.hostDevice().size(), 8u); // Owned GPUs retain every original same-machine host role.
         const auto automatic = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::Automatic);
         ASSERT_EQ(automatic.hostDevice().size(), projection.hostDevice().size());
         for (size_t index = 0; index < projection.hostDevice().size(); ++index)
             EXPECT_EQ(automatic.hostDevice()[index], projection.hostDevice()[index]);
-        std::set<std::pair<int, int>> scopes;
+        std::set<std::tuple<int, int, int>> scopes;
         for (const auto &sample : projection.hostDevice())
         {
             EXPECT_EQ(sample.device().type, backend);
-            EXPECT_EQ(sample, PlanningHostDeviceRequest::fromInventory(cluster.ranks.at(sample.rank()),
-                sample.device(), 257 * 31 * sizeof(float)));
-            EXPECT_TRUE(scopes.emplace(sample.rank(), sample.device().ordinal).second);
+            EXPECT_EQ(sample, PlanningHostDeviceRequest::fromInventory(cluster,
+                {sample.gpuRank(), sample.device()}, {sample.hostRank()}, 257 * 31 * sizeof(float)));
+            EXPECT_TRUE(scopes.emplace(sample.gpuRank(), sample.hostRank(), sample.device().ordinal).second);
         }
         const AutomaticOrchestrationRequest single({.only_backends = {{backend}},
             .only_strategies = {{OrchestrationStrategy::SingleDevice}}});
@@ -1209,7 +1642,7 @@ TEST(PlanningCommunicationService, SampleBasisIsPhysicalBoundedAndConstraintAwar
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precisions);
     EXPECT_EQ(plan.native().size(), 8u); // Two physical nodes, two vendors, two precisions.
     EXPECT_EQ(plan.mpi().size(), 18u); // Control plus two independently varied payload directions.
-    EXPECT_EQ(plan.hostDevice().size(), 14u); // Every rank's distinct first-touch scope is retained.
+    EXPECT_EQ(plan.hostDevice().size(), 16u); // Eight original executor/host pairs per backend.
     for (const auto &sample : plan.native())
     {
         EXPECT_EQ(sample.discovery_rank, sample.physical_node ? 2 : 1);
@@ -1308,6 +1741,94 @@ TEST(PlanningCommunicationService, CompleteNativeReceiptsPreserveRankNodeAndSlow
         for (const auto &phase : accepted[index].observation.phases)
             EXPECT_DOUBLE_EQ(phase.secondsPerCollective(), phase.endpoints.size() * .0001);
     }
+}
+
+/** @test One physical ordered group measures directed pairs only once across wire precisions. */
+TEST(PlanningCommunicationService, DirectedPairWireSamplesOncePerPhysicalGroupAcrossPrecisions)
+{
+    const auto cluster = communicationInventory();
+    const std::array precisions{PlanningAllreducePrecision::FP32, PlanningAllreducePrecision::FP16};
+    const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precisions);
+    const auto encoded = nativeReceipts(plan, cluster.world_size);
+    const auto accepted = PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(encoded));
+    using Group = std::tuple<int, int, DeviceType, std::vector<std::string>>;
+    std::map<Group, std::pair<size_t, size_t>> counts;
+    for (const auto &service : accepted.native)
+    {
+        const auto &sample = service.sample;
+        auto &count = counts[{sample.discovery_rank, sample.physical_node,
+            sample.request.devices().front().type, sample.uuids}];
+        const auto &pairs = service.observation.pair_sampling;
+        EXPECT_EQ(sample.pair_sampling, count.first + count.second == 0
+            ? PlanningPairSampling::Enabled : PlanningPairSampling::Disabled);
+        if (sample.pair_sampling == PlanningPairSampling::Enabled)
+        {
+            ++count.first;
+            EXPECT_EQ(pairs.payload_anchors, sample.request.pairPayloadAnchors());
+            ASSERT_EQ(pairs.payload_anchors.size(), 3u);
+            EXPECT_EQ(pairs.directed_pairs.size(), sample.uuids.size() * (sample.uuids.size() - 1) * 3);
+            EXPECT_EQ(pairs.capture_count, pairs.directed_pairs.size() / pairs.payload_anchors.size());
+            EXPECT_EQ(pairs.measured_launches, pairs.capture_count);
+            for (const auto &edge : pairs.directed_pairs)
+                EXPECT_EQ(edge.seconds_per_transfer, (std::vector<double>{.00001, .00002, .00003}));
+        }
+        else
+        {
+            ++count.second;
+            EXPECT_TRUE(pairs.payload_anchors.empty()); EXPECT_TRUE(pairs.directed_pairs.empty());
+            EXPECT_EQ(pairs.capture_count, 0u); EXPECT_EQ(pairs.measured_launches, 0u);
+            EXPECT_EQ(pairs.setup_wall_seconds, 0); EXPECT_EQ(pairs.measurement_wall_seconds, 0);
+        }
+    }
+    ASSERT_EQ(counts.size(), 4u);
+    for (const auto &entry : counts)
+    {
+        EXPECT_EQ(entry.second.first, 1u);
+        EXPECT_EQ(entry.second.second, 1u);
+    }
+}
+
+/** @test Strict v6 receipts reject altered direction, completion, ownership and duplicate work. */
+TEST(PlanningCommunicationService, DirectedPairWireRejectsMissingInvalidAndSubstitutedEvidence)
+{
+    const auto cluster = communicationInventory();
+    const std::array precisions{PlanningAllreducePrecision::FP32, PlanningAllreducePrecision::FP16};
+    const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precisions);
+    const auto encoded = nativeReceipts(plan, cluster.world_size);
+    for (int defect = 0; defect < 16; ++defect)
+    {
+        SCOPED_TRACE(defect); auto broken = encoded;
+        auto wire = nlohmann::json::parse(broken[1]);
+        nlohmann::json *enabled = nullptr, *disabled = nullptr;
+        for (auto &entry : wire["observations"])
+        {
+            if (entry["pairs"]["edges"].empty()) disabled = &entry;
+            else enabled = &entry;
+        }
+        ASSERT_NE(enabled, nullptr); ASSERT_NE(disabled, nullptr);
+        auto &pairs = (*enabled)["pairs"]; auto &edges = pairs["edges"];
+        if (defect == 0) edges.erase(0);
+        if (defect == 1) edges.push_back(edges[0]);
+        if (defect == 2) edges[0][0] = edges[0][1]; // Self-edge cannot replace one direction.
+        if (defect == 3) std::swap(edges[0][0], edges[0][1]); // Duplicates reverse; original direction is missing.
+        if (defect == 4) edges[0][3][0] = -1;
+        if (defect == 5) edges[0][3][0] = std::numeric_limits<double>::infinity();
+        if (defect == 6) edges[0][3].erase(0);
+        if (defect == 7) edges[0][4] = 0;
+        if (defect == 8) pairs["anchors"].erase(0);
+        if (defect == 9) pairs["captures"] = 0;
+        if (defect == 10) pairs["launches"] = 0;
+        if (defect == 11) (*disabled)["pairs"] = pairs;
+        if (defect == 12) edges[0][0] = 999; // Foreign source index is not another rank's alias.
+        if (defect == 13) wire["plan"]["native"][(*enabled)["index"].get<size_t>()]["uuids"][0] = "substituted-source";
+        if (defect == 14) wire["plan"]["native"][(*enabled)["index"].get<size_t>()]["rank"] = 2;
+        if (defect == 15) pairs["measurement_seconds"] = -1;
+        const auto text = wire.dump(); broken[1] = {text.begin(), text.end()};
+        EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(broken)), std::exception);
+    }
+    auto wrong_reporter = borrow(encoded);
+    std::swap(wrong_reporter[1].discovery_rank, wrong_reporter[2].discovery_rank);
+    EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, wrong_reporter), std::invalid_argument);
 }
 
 TEST(PlanningCommunicationService, MalformedOrSubstitutedNativeEvidenceNeverBecomesACost)
@@ -1441,7 +1962,12 @@ TEST(PlanningCommunicationCost, ChangedMembershipAndCorruptOrDuplicateReceiptsFa
 
 TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndMechanismAcrossGPUAliases)
 {
-    const auto cluster = communicationInventory();
+    auto cluster = communicationInventory();
+    // Both first-touch scopes are real local executors of this physical GPU.
+    // This variation gives the otherwise remote host NUMA-local GPU authority.
+    cluster.ranks[0].cpu.numa_node = 0;
+    cluster.ranks[0].cpu_socket_info.front().numa_node = 0;
+    cluster.ranks[0].cpu_socket_info.front().physical_cores = {0, 1};
     const std::array precision{PlanningAllreducePrecision::FP32};
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precision);
     const auto wire = nativeReceipts(plan, cluster.world_size);
@@ -1449,7 +1975,7 @@ TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndM
     for (auto &observed : evidence.host_device)
         for (auto &phase : observed.phases)
         {
-            const double time = .001 * (1 + 100 * observed.request.rank() + 10 * int(phase.mechanism) + 2 * int(phase.direction));
+            const double time = .001 * (1 + 100 * observed.request.hostRank() + 10 * int(phase.mechanism) + 2 * int(phase.direction));
             phase.service = {PlanningWorkUnit::Bytes, 3.0 * phase.payload_bytes,
                 3 * time * (phase.payload_bytes == 1 ? 1 : 2), "synthetic distinct direction/mechanism/first-touch times"};
         }
@@ -1470,6 +1996,14 @@ TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndM
         MappedTransferDirection::HostToDevice, 1), std::invalid_argument);
     EXPECT_THROW(costs.hostTransfer(0, DeviceId::cuda(4), 1, PlanningHostTransferMechanism::DMA,
         MappedTransferDirection::HostToDevice, 0), std::invalid_argument);
+    auto incomplete = evidence.host_device;
+    std::erase_if(incomplete, [](const auto &sample) {
+        return sample.request.gpuRank() == 0 && sample.request.hostRank() == 1 &&
+            sample.request.device() == DeviceId::cuda(4);
+    });
+    const PlanningCommunicationCost missing_executor_scope(cluster, evidence.native, {}, incomplete);
+    EXPECT_THROW(missing_executor_scope.hostTransfer(0, DeviceId::cuda(4), 1, PlanningHostTransferMechanism::DMA,
+        MappedTransferDirection::HostToDevice, 1), std::invalid_argument);
     const PlanningCommunicationCost no_host(cluster, evidence.native, {});
     EXPECT_THROW(no_host.hostTransfer(0, DeviceId::cuda(4), 0, PlanningHostTransferMechanism::DMA,
         MappedTransferDirection::HostToDevice, 1), std::invalid_argument);
@@ -1487,11 +2021,26 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
     const std::array precision{PlanningAllreducePrecision::FP32};
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precision);
     const auto encoded = nativeReceipts(plan, cluster.world_size);
+    ASSERT_FALSE(plan.hostDevice().empty());
+    const auto reporter = static_cast<std::size_t>(plan.hostDevice().front().gpuRank());
+    {
+        auto substituted = encoded;
+        auto source = nlohmann::json::parse(substituted[reporter]);
+        const int host = plan.hostDevice().front().hostRank();
+        ASSERT_NE(int(reporter), host);
+        auto destination = nlohmann::json::parse(substituted[host]);
+        destination["host_device"].push_back(source["host_device"][0]);
+        source["host_device"].erase(0);
+        const auto from = source.dump(), to = destination.dump();
+        substituted[reporter] = {from.begin(), from.end()};
+        substituted[host] = {to.begin(), to.end()};
+        EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(substituted)), std::exception);
+    }
     for (int defect = 0; defect < 12; ++defect)
     {
         SCOPED_TRACE(defect);
         auto broken = encoded;
-        auto wire = nlohmann::json::parse(broken[0]);
+        auto wire = nlohmann::json::parse(broken[reporter]);
         if (defect == 0) wire["host_device"].erase(0);
         if (defect == 1) wire["host_device"].push_back(wire["host_device"][0]);
         auto &sample = wire["host_device"][0];
@@ -1507,7 +2056,7 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
         if (defect == 10) phase[6] = "";
         if (defect == 11) wire["plan"]["host_device"][0]["host_numa"] = 99;
         const auto text = wire.dump();
-        broken[0] = {text.begin(), text.end()};
+        broken[reporter] = {text.begin(), text.end()};
         EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(broken)), std::exception);
     }
 }
@@ -1538,4 +2087,397 @@ TEST(PlanningWeightServiceModel, GDNHalfOperandsKeepSeparateServiceFamilies)
         EXPECT_TRUE(native_half);
         EXPECT_TRUE(gdn_half);
     }
+}
+
+/** @test Calibration may observe remote hardware but cannot execute on its remote visibility. */
+TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipFiltersNativeAndHostDeviceCalibration)
+{
+    auto cluster = communicationInventory();
+    const auto all = PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{});
+    for (const auto &observer : all)
+        if (observer.device().is_gpu())
+            EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(observer.discoveryRank()), observer.device(), "sample reporter"));
+    const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31,
+        std::array{PlanningAllreducePrecision::FP32});
+    for (const auto &sample : plan.native())
+        for (const auto device : sample.request.devices())
+            EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.discovery_rank), device, "native collective reporter"));
+    for (const auto &sample : plan.hostDevice())
+        EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.gpuRank()), sample.device(), "host/device reporter"));
+    // CPU participants retain their legitimate cross-rank protocol samples.
+    EXPECT_EQ(plan.mpi().size(), 18u);
+    EXPECT_EQ(cluster.ranks[0].gpus.size(), 4u);
+    // If no reporting rank has the GPU's NUMA, do not substitute a remote one.
+    for (auto &rank : cluster.ranks) rank.cpu.numa_node = 19;
+    const auto none = PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{});
+    EXPECT_TRUE(std::none_of(none.begin(), none.end(), [](const auto &observer) { return observer.device().is_gpu(); }));
+    const auto no_native = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31,
+        std::array{PlanningAllreducePrecision::FP32});
+    EXPECT_TRUE(no_native.native().empty());
+    EXPECT_TRUE(no_native.hostDevice().empty());
+    EXPECT_EQ(no_native.mpi().size(), 18u);
+}
+
+/** @test Locality filtering cannot turn corrupt visible inventory into an empty valid roster. */
+TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipRejectsMalformedRemoteAliases)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const bool duplicate_uuid : {false, true})
+    {
+        auto cluster = inventory();
+        for (auto &rank : cluster.ranks) rank.cpu.numa_node = 19;
+        auto &gpus = cluster.ranks[1].gpus;
+        const auto gpu = std::find_if(gpus.begin(), gpus.end(), [&](const auto &value) { return value.type == backend; });
+        ASSERT_NE(gpu, gpus.end());
+        if (duplicate_uuid)
+        {
+            auto duplicate = *gpu;
+            duplicate.local_device_id += 99;
+            gpus.push_back(duplicate);
+        }
+        else gpu->numa_node = 1;
+        EXPECT_THROW(PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{}), std::invalid_argument);
+        EXPECT_THROW(PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 1, 1,
+            std::array{PlanningAllreducePrecision::FP32}), std::invalid_argument);
+    }
+}
+
+/**
+ * @brief Replay terminal HC costing through the actual measured-service compositor.
+ *
+ * The existing source-free FP32 observations provide service, never a claimed
+ * QFN timing. Actual HC N/K observations are replayed as floating operands to
+ * isolate row/stage dispatch without manufacturing a second kernel sampler.
+ */
+TEST(PlanningRequestCostModel, QFNHyperconnectionWorkIsPricedAndReplayStable)
+{
+    const auto cluster = requestInventory(false);
+    PlanningGGUFFixture file(false, true, GGUFTensorType::F32);
+    PlanningModelSource source(file.path());
+    auto profile = source.metadata().memoryProfile();
+    for (const auto &tensor : std::vector<TensorSizeInfo>{
+             {"output_hc_down.weight", 320u * 10240u * 4u, "F32", 320u * 10240u, 10240, -1},
+             {"output_hc_up.weight", 10240u * 320u * 4u, "F32", 10240u * 320u, 320, -1},
+             {"output_hc_norm.weight", 10240u * 4u, "F32", 10240, 10240, -1},
+             {"blk.0.hc_attn_inject.weight", 4u * 10240u * 4u, "F32", 4u * 10240u, 10240, 0}})
+        profile.tensors.push_back(tensor);
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::SingleDevice);
+        const PlanningRequestCostModel original(source.metadata(), cluster, requestWeights(source, cluster),
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}));
+        const PlanningRequestCostModel extensions(PlanningModelMetadata(profile, source.metadata().mainLayerCount()),
+            cluster, requestWeights(source, cluster), requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}));
+        for (const auto workload : {OrchestrationPlanningWorkload{1, 1}, OrchestrationPlanningWorkload{64, 16},
+                                    OrchestrationPlanningWorkload{65, 16}})
+        {
+            const auto baseline = original.evaluate(candidate, workload);
+            const auto priced = extensions.evaluate(candidate, workload);
+            const auto replay = extensions.evaluate(candidate, workload);
+            EXPECT_GT(priced.prefillSeconds(), baseline.prefillSeconds());
+            EXPECT_GT(priced.decodeSecondsPerToken(), baseline.decodeSecondsPerToken());
+            EXPECT_DOUBLE_EQ(priced.prefillSeconds(), replay.prefillSeconds());
+            EXPECT_DOUBLE_EQ(priced.decodeSecondsPerToken(), replay.decodeSecondsPerToken());
+        }
+        auto unknown = profile;
+        unknown.tensors.push_back({"blk.0.future_op.weight", 256u * 4u, "F32", 256, 256, 0});
+        const PlanningRequestCostModel rejected(PlanningModelMetadata(unknown, source.metadata().mainLayerCount()),
+            cluster, requestWeights(source, cluster), requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}));
+        EXPECT_THROW((void)rejected.evaluate(candidate, {64, 16}), std::invalid_argument);
+    }
+}
+
+
+/** @brief Storage-only CPU bandwidth cannot widen GPU compute or substitute a projection sample. */
+TEST(PlanningWeightServiceModel, ImmutableHostSourceStreamingDoesNotAdmitCPUCompute)
+{
+    PlanningGGUFFixture file(false, false, GGUFTensorType::F32);
+    PlanningModelSource source(file.path());
+    const auto cluster = inventory();
+    AutomaticOrchestrationOptions gpu_options, host_options;
+    gpu_options.only_backends = std::vector{DeviceType::ROCm};
+    host_options.only_backends = std::vector{DeviceType::CPU};
+    const AutomaticOrchestrationRequest gpu_policy(gpu_options), host_policy(host_options);
+    const PlanningProjectionServicePlan plan(PlanningMatrixSamplePlan::resolve(source,
+        {"blk.0.ffn_gate.weight", PlanningWholeMatrix{}}), 7);
+    const auto gpu_stream_bytes = streamingReceipts(cluster, gpu_policy);
+    const auto cpu_stream_bytes = streamingReceipts(cluster, host_policy);
+    const auto gpu_kernel_bytes = projectionReceipts(cluster, plan, gpu_policy);
+    const auto gpu_stream = PlanningKernelServiceCatalog::accept(cluster, gpu_policy,
+        PlanningStreamingServicePlan{}, borrow(gpu_stream_bytes));
+    const auto cpu_stream = PlanningKernelServiceCatalog::accept(cluster, host_policy,
+        PlanningStreamingServicePlan{}, borrow(cpu_stream_bytes));
+    const auto gpu_kernel = PlanningKernelServiceCatalog::accept(cluster, gpu_policy, plan, borrow(gpu_kernel_bytes));
+    const PlanningWeightServiceModel no_host(gpu_stream, {gpu_kernel});
+    const PlanningWeightServiceModel with_host(gpu_stream, {gpu_kernel}, cpu_stream);
+    EXPECT_EQ(with_host.streamingEvidence().records().size(), gpu_stream.records().size());
+    for (const auto &record : with_host.streamingEvidence().records())
+        EXPECT_TRUE(record.observer.device().is_rocm());
+    for (const auto &record : cpu_stream.records())
+    {
+        const auto rank = record.observer.discoveryRank();
+        const auto device = record.observer.device();
+        const auto &observed = std::get<PlanningMemoryBandwidthObservation>(record.observation);
+        for (const double live_bytes : {1.0, 4096.0})
+        {
+            EXPECT_THROW((void)no_host.memorySeconds(rank, device, live_bytes), std::exception);
+            EXPECT_DOUBLE_EQ(with_host.memorySeconds(rank, device, live_bytes),
+                observed.service.secondsFor(PlanningWorkUnit::Bytes, live_bytes));
+        }
+        EXPECT_THROW((void)with_host.projectionSeconds(rank, device,
+            sourceOperand(source, "blk.0.ffn_gate.weight", device), 1), std::exception);
+    }
+    EXPECT_THROW((void)PlanningWeightServiceModel(gpu_stream, {gpu_kernel}, gpu_kernel), std::invalid_argument);
+    EXPECT_THROW((void)PlanningWeightServiceModel(gpu_stream, {gpu_kernel}, gpu_stream), std::invalid_argument);
+    const auto all_kernel_bytes = projectionReceipts(cluster, plan);
+    const auto all_kernel = PlanningKernelServiceCatalog::accept(cluster, AutomaticOrchestrationRequest{}, plan, borrow(all_kernel_bytes));
+    EXPECT_THROW((void)PlanningWeightServiceModel(memoryCatalog(cluster), {all_kernel}, cpu_stream), std::invalid_argument);
+    // Existing CPU compute already has one independently authenticated streaming
+    // source; the optional host arm must never replace or double-count it.
+    const PlanningWeightServiceModel existing_cpu(memoryCatalog(cluster), {all_kernel});
+    EXPECT_GT(existing_cpu.memorySeconds(1, DeviceId::cpu(), 4096), 0.0);
+}
+
+/** @brief Physical evidence cannot be promoted into an unmeasured collective protocol. */
+TEST(PlanningCommunicationService, PhysicalOnlyWireKeepsCopiesWithoutCollectiveSamples)
+{
+    const auto cluster = communicationInventory();
+    const std::array precisions{PlanningAllreducePrecision::FP32, PlanningAllreducePrecision::FP16};
+    const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31,
+        precisions, RoutedExpertComputePolicy::Apportioned, PlanningLocalTPMeasurementMode::PhysicalPeersOnly);
+    const auto encoded = nativeReceipts(plan, cluster.world_size);
+    const auto accepted = PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(encoded));
+    ASSERT_FALSE(accepted.native.empty());
+    std::set<std::pair<int, DeviceType>> observed;
+    for (const auto &service : accepted.native)
+    {
+        EXPECT_EQ(service.sample.mode, PlanningLocalTPMeasurementMode::PhysicalPeersOnly);
+        EXPECT_EQ(service.observation.mode, service.sample.mode);
+        EXPECT_TRUE(service.observation.phases.empty());
+        EXPECT_EQ(service.sample.pair_sampling, PlanningPairSampling::Enabled);
+        EXPECT_TRUE(observed.emplace(service.sample.discovery_rank, service.sample.request.devices().front().type).second);
+        EXPECT_NO_THROW(service.observation.pair_sampling.validate(service.sample.request));
+    }
+    const PlanningCommunicationCost cost(cluster, accepted.native, {});
+    const auto &first = accepted.native.front().sample;
+    EXPECT_THROW(cost.nativeAllreduce(first.discovery_rank, first.request.devices(), 257, 31,
+        first.request.precision()), std::invalid_argument);
+    EXPECT_GT(cost.physicalPeerTransfer(first.discovery_rank, first.request.devices()[0],
+        first.request.devices()[1], 16).seconds, 0);
+    PhysicalMemoryPlanBuilder builder;
+    const PhysicalMemoryResource host{.world_rank=first.discovery_rank, .device=DeviceId::cpu(),
+        .total_bytes=1ull<<40, .admission_available_bytes=1ull<<40};
+    std::vector<PhysicalMemoryResource> resources;
+    for (const auto device : first.request.devices())
+        resources.push_back({.world_rank=first.discovery_rank, .device=device,
+            .total_bytes=1ull<<40, .admission_available_bytes=1ull<<40});
+    PlanningLocalTPMeasurement::contributeMemory(first.request, host, resources, builder,
+        PlanningLocalTPMeasurementMode::PhysicalPeersOnly);
+    const auto physical_bom = builder.build();
+    for (const auto &resource : physical_bom.resources())
+        EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::LocalCollective), 0u);
+    auto wrong_mode = encoded;
+    for (auto &receipt : wrong_mode)
+    {
+        auto wire = nlohmann::json::parse(receipt);
+        if (wire["observations"].empty()) continue;
+        wire["observations"][0]["mode"] = int(PlanningLocalTPMeasurementMode::NativeCollective);
+        const auto text = wire.dump(); receipt.assign(text.begin(), text.end());
+        break;
+    }
+    EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(wrong_mode)), std::invalid_argument);
+    auto invented_collective = encoded;
+    for (auto &receipt : invented_collective)
+    {
+        auto wire = nlohmann::json::parse(receipt);
+        if (wire["observations"].empty()) continue;
+        wire["observations"][0]["phases"].push_back({{"rows", 1}, {"bytes", 1}, {"endpoints", nlohmann::json::array()}});
+        const auto text = wire.dump(); receipt.assign(text.begin(), text.end());
+        break;
+    }
+    EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(invented_collective)), std::invalid_argument);
+    EXPECT_THROW(PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31,
+        precisions, RoutedExpertComputePolicy::Apportioned, static_cast<PlanningLocalTPMeasurementMode>(99)), std::invalid_argument);
+}
+
+/** @test Shared source declaration is independent of any private GPU preparation and unchanged by publication origin. */
+TEST(PlanningKernelServiceCatalog, ProjectionSharedSourceBOMIsSingleAndSeparateFromGPUPrivate)
+{
+    PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    const auto plan=PlanningMatrixSamplePlan::resolve(source,{"blk.0.ffn_gate.weight",PlanningWholeMatrix{}});
+    const PhysicalMemoryResource host{.world_rank=0,.device=DeviceId::cpu(),
+        .total_bytes=1ull<<30,.admission_available_bytes=1ull<<30};
+    PhysicalMemoryPlanBuilder original,received;
+    PlanningProjectionMeasurement::contributeSourceMemory(plan,PlanningSampleOrigin::LocalGGUF,host,original);
+    PlanningProjectionMeasurement::contributeSourceMemory(plan,PlanningSampleOrigin::PublishedPayload,host,received);
+    const auto declared=original.build();const auto published=received.build();
+    ASSERT_EQ(declared.resources().size(),1u);ASSERT_EQ(published.resources().size(),1u);
+    EXPECT_EQ(declared.resources()[0].bytes(PhysicalMemoryOwner::ModelSourcePayload),plan.geometry().physicalBytes());
+    EXPECT_EQ(declared.summary(),published.summary());
+    for(const auto owner:{PhysicalMemoryOwner::PrimaryModelWeights,PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryOwner::WeightLoadStaging,PhysicalMemoryOwner::NativeGraphExecutable})
+        EXPECT_EQ(declared.resources()[0].bytes(owner),0u);
+    EXPECT_THROW(PlanningProjectionMeasurement::contributeSourceMemory(plan,static_cast<PlanningSampleOrigin>(255),host,original),std::invalid_argument);
+    EXPECT_THROW(PlanningProjectionMeasurement::contributeGPUParticipantMemory(plan,host,host,original,64),std::invalid_argument);
+}
+
+/** @test Startup ranking consumes exactly decode/prefill; missing, duplicate and obsolete verifier evidence never becomes a rate. */
+TEST(PlanningWeightServiceModel, StartupExpertTwoPhaseCoverageRejectsObsoleteGroupedEvidence)
+{
+    PlanningGGUFFixture file(true,false,GGUFTensorType::BF16,512);PlanningModelSource source(file.path());
+    const auto plan=PlanningExpertSamplePlan::resolve(source,request());const auto cluster=inventory();
+    const auto encoded=receipts(cluster,plan);
+    const auto accepted=PlanningKernelServiceCatalog::accept(cluster,AutomaticOrchestrationRequest{},plan,borrow(encoded));
+    for(const auto &record:accepted.records())std::visit([](const auto &observed){
+        if constexpr(requires{observed.formats;}){
+            ASSERT_EQ(observed.phases.size(),2u);
+            EXPECT_EQ(observed.phases[0].phase,ExpertHistogramSource::DecodeToken);
+            EXPECT_EQ(observed.phases[1].phase,ExpertHistogramSource::PrefillChunk);
+        }
+    },record.observation);
+    auto slowed=encoded;
+    for(auto &receipt:slowed){auto wire=nlohmann::json::parse(receipt);
+        for(auto &observed:wire["observations"])observed["phases"][1]["seconds"]=observed["phases"][1]["seconds"].get<double>()*100;
+        const auto text=wire.dump();receipt.assign(text.begin(),text.end());}
+    const auto slow_catalog=PlanningKernelServiceCatalog::accept(cluster,AutomaticOrchestrationRequest{},plan,borrow(slowed));
+    const PlanningWeightServiceModel fast(memoryCatalog(cluster,.000001),{accepted}),slow(memoryCatalog(cluster,.000001),{slow_catalog});
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)}){
+        PlanningRoutedExpertWeightWork work{0,8,2,{
+            sourceOperand(source,plan.request().gate.tensor_name,device,1),
+            sourceOperand(source,plan.request().up.tensor_name,device,1),
+            sourceOperand(source,plan.request().down.tensor_name,device,1)},
+            {{PlanningExpertExecution::OwnedExperts,8}}};
+        const double decode=fast.expertSeconds(1,device,work,1);
+        // Occupancy uses log1p/expm1: a one-row group can round just above
+        // one, exposing a few ULPs of the deliberately exaggerated slope.
+        EXPECT_NEAR(decode,slow.expertSeconds(1,device,work,1),
+            64*std::numeric_limits<double>::epsilon()*decode);
+        EXPECT_GT(slow.expertSeconds(1,device,work,128),fast.expertSeconds(1,device,work,128));
+    }
+    for(int defect=0;defect<5;++defect){SCOPED_TRACE(defect);auto broken=encoded;
+        auto wire=nlohmann::json::parse(broken[0]);auto &phases=wire["observations"][0]["phases"];
+        if(defect==0)phases.erase(1);
+        if(defect==1)phases[1]=phases[0];
+        if(defect==2){auto obsolete=phases[0];obsolete["phase"]=int(ExpertHistogramSource::GroupedVerifier);
+            obsolete["rows"]=MoEOverlayCPUServiceMeasurement::rowsForPhase(ExpertHistogramSource::GroupedVerifier);phases.push_back(obsolete);}
+        if(defect==3)wire["source"]["startup_phases"]={0,1,2};
+        if(defect==4)wire["schema"]="llaminar.planning-kernel-service.v4";
+        const auto text=wire.dump();broken[0].assign(text.begin(),text.end());
+        EXPECT_THROW(PlanningKernelServiceCatalog::accept(cluster,AutomaticOrchestrationRequest{},plan,borrow(broken)),std::invalid_argument);
+    }
+}
+
+/** @test Live service scope still retains grouped-verifier work; the startup-only workspace entry does not alter it. */
+TEST(PlanningWeightServiceModel, StartupExpertWorkspaceKeepsLiveVerifierContractSeparate)
+{
+    static_assert(kPlanningExpertStartupPhases.size()==2);
+    static_assert(kExpertHistogramProductionSourceCount==3);
+    EXPECT_EQ(expertHistogramProductionSourceIndex(ExpertHistogramSource::GroupedVerifier),2u);
+    EXPECT_GT(MoEOverlayCPUServiceMeasurement::rowsForPhase(ExpertHistogramSource::GroupedVerifier),1);
+    PlanningGGUFFixture file(true,false);PlanningModelSource source(file.path());
+    const auto &profile=source.metadata().memoryProfile();
+    WorkspaceMemoryGeometry geometry;
+    geometry.device=DeviceId::rocm(7);geometry.first_layer=0;geometry.last_layer=source.metadata().mainLayerCount()-1;
+    geometry.apportioned_routed_experts=true;
+    const auto startup=WorkspaceMemoryEstimator::estimateStartupExpertService(profile,geometry);
+    const auto live=WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,geometry);
+    EXPECT_GT(startup,0u);EXPECT_GE(live,startup);
+    EXPECT_EQ(WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,geometry),live);
+}
+
+/** @test Residual-trunk geometry changes PP traffic while identical compute-H TP collectives stay unchanged. */
+TEST(PlanningRequestCostModel, PipelineResidualTrunkPayloadIsIndependentOfComputeWidth)
+{
+    auto cluster=requestInventory(true);
+    cluster.world_size=1;cluster.ranks.resize(1);cluster.buildNodeAggregations();
+    Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    // Complete original QFN layer kinds, HC tensors and sparse geometry are retained.
+    for(auto &rank:cluster.ranks){rank.cpu_memory_bytes=rank.cpu.memory_bytes=rank.cpu.free_memory_bytes=1ull<<40;
+        for(auto &socket:rank.cpu_socket_info)socket.memory_bytes=socket.available_memory_bytes=1ull<<40;
+        for(auto &gpu:rank.gpus)gpu.memory_bytes=gpu.free_memory_bytes=1ull<<40;}
+    cluster.buildNodeAggregations();
+    constexpr std::array precisions{PlanningAllreducePrecision::FP32};
+    const auto sample=PlanningCommunicationSamplePlan::resolve(cluster,AutomaticOrchestrationRequest{},256,64,precisions);
+    const auto encoded=nativeReceipts(sample,1);
+    auto observed=PlanningCommunicationService::acceptLocal(sample,1,borrow(encoded));
+    // Both decode widths lie below this fixture's bulk anchor. Give each
+    // independently identified host mechanism/direction a positive byte slope;
+    // a flat latency floor cannot witness their different live payloads.
+    for(auto &host:observed.host_device)for(auto &phase:host.phases)
+        phase.service=PlanningServiceObservation(PlanningWorkUnit::Bytes,3.0*phase.payload_bytes,
+            .0003+3.0*phase.payload_bytes*1e-8,"authored PP payload-dependent host transfer service");
+    const auto weights=requestWeights(source,cluster);const auto arithmetic=requestArithmetic(cluster);
+    const auto makeCost=[&](std::optional<uint32_t> trunk) {
+        auto profile=source.metadata().memoryProfile();
+        if(!profile.flash_next)throw std::logic_error("PP residual test requires complete authenticated QFN geometry");
+        profile.flash_next->residual_width=trunk.value_or(profile.d_model);
+        return PlanningRequestCostModel(PlanningModelMetadata(std::move(profile),source.metadata().mainLayerCount()),
+            cluster,weights,arithmetic,PlanningCommunicationCost(cluster,observed.native,{},observed.host_device));
+    };
+    // Compare only the residual transport dimension over the same complete
+    // QFN source inventory; compute-H and all other authenticated facts stay fixed.
+    // This is a cost-composition diagnostic, not numerical model evidence.
+    const auto ordinary=makeCost(std::nullopt);
+    const auto expanded=makeCost(4*source.metadata().memoryProfile().d_model);
+    const auto invalid=makeCost(0);
+    std::vector<std::string> args{"llaminar2","--define-domain","head=cuda:4;scope=rank_local;backend=nccl;owner=0",
+        "--define-domain","tail=rocm:4;scope=rank_local;backend=rccl;owner=0",
+        "--pp-stage","0=head:0-0","--pp-stage","1=tail:1-1"};
+    const int midpoint=source.metadata().mainLayerCount()/2;
+    args[6]="0=head:0-"+std::to_string(midpoint-1);
+    args[8]="1=tail:"+std::to_string(midpoint)+"-"+std::to_string(source.metadata().mainLayerCount()-1);
+    std::vector<char*> argv;for(auto &arg:args)argv.push_back(arg.data());
+    auto config=OrchestrationConfigParser{}.parseArgs(argv.size(),argv.data());
+    config.model_path=source.path();config.max_seq_len=8192;config.prefill_max_bucket_size=64;
+    const auto services=planningHostServiceBudgets(cluster.world_size);
+    const auto pipeline=AdmittedOrchestrationCandidate::admit(
+        {OrchestrationStrategy::PipelineParallel,ExecutionRankMembership(cluster,{0}),std::move(config)},source,
+        {.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8,.retained_host_services=services});
+    const OrchestrationPlanningWorkload workload{64,16};
+    const auto small=ordinary.evaluate(pipeline,workload),large=expanded.evaluate(pipeline,workload);
+    EXPECT_GT(large.prefillSeconds(),small.prefillSeconds());
+    EXPECT_GT(large.decodeSecondsPerToken(),small.decodeSecondsPerToken());
+    EXPECT_GT(large.prefillSeconds()-small.prefillSeconds(),
+        large.decodeSecondsPerToken()-small.decodeSecondsPerToken());
+    EXPECT_THROW(invalid.evaluate(pipeline,workload),std::invalid_argument);
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
+        const auto tp=requestCandidate(source,cluster,backend,OrchestrationStrategy::TensorParallel,
+            MoERebalanceRuntimeMode::Off,RoutedExpertComputePolicy::Apportioned,services);
+        EXPECT_DOUBLE_EQ(ordinary.evaluate(tp,workload).requestSeconds(),expanded.evaluate(tp,workload).requestSeconds());
+    }
+}
+
+/** @test Native gather receipts require both real protocols, exact payload anchors and complete ordered original participants. */
+TEST(PlanningCommunicationService, NativeGatherWireRequiresBothProtocolsAndOriginalParticipants)
+{
+    const auto cluster=communicationInventory();const AutomaticOrchestrationRequest request;
+    constexpr std::array precision{PlanningAllreducePrecision::FP32};
+    const auto plan=PlanningCommunicationSamplePlan::resolve(cluster,request,256,64,precision);
+    const auto original=nativeReceipts(plan,cluster.world_size);ASSERT_FALSE(plan.native().empty());
+    const int owner=plan.native().front().discovery_rank;
+    EXPECT_NO_THROW(PlanningCommunicationService::acceptLocal(plan,cluster.world_size,borrow(original)));
+    for(int defect=0;defect<11;++defect){SCOPED_TRACE(defect);auto changed=original;
+        auto wire=nlohmann::json::parse(changed.at(owner));auto &entry=wire["observations"][0];
+        if(defect==0)entry.erase("gather_phases");
+        if(defect==1)entry["gather_phases"]=nlohmann::json::array();
+        if(defect==2)entry["gather_phases"][0]["bytes"]=2;
+        if(defect==3)entry["gather_phases"][0]["participants"]=0;
+        if(defect==4)entry["gather_phases"][0]["participants"]=999;
+        if(defect==5)entry["gather_phases"][0]["endpoints"][0][1]=999;
+        if(defect==6)entry["gather_phases"][0]["endpoints"].erase(entry["gather_phases"][0]["endpoints"].begin());
+        if(defect==7)entry["gather_phases"][0]["endpoints"][0][3]=-1;
+        if(defect==8)std::swap(entry["gather_phases"][0],entry["gather_phases"][1]);
+        if(defect==9)entry["gather_phases"][0]["protocol"]=99;
+        if(defect==10)entry["gather_phases"][2]["bytes"]=1;
+        const auto text=wire.dump();changed[owner].assign(text.begin(),text.end());
+        EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan,cluster.world_size,borrow(changed)),std::invalid_argument);
+    }
+    const auto physical=PlanningCommunicationSamplePlan::resolve(cluster,request,256,64,precision,
+        RoutedExpertComputePolicy::Apportioned,PlanningLocalTPMeasurementMode::PhysicalPeersOnly);
+    auto extra=nativeReceipts(physical,cluster.world_size);const int physical_owner=physical.native().front().discovery_rank;
+    auto wire=nlohmann::json::parse(extra[physical_owner]);
+    wire["observations"][0]["gather_phases"]=nlohmann::json::parse(original[owner])["observations"][0]["gather_phases"];
+    const auto text=wire.dump();extra[physical_owner].assign(text.begin(),text.end());
+    EXPECT_THROW(PlanningCommunicationService::acceptLocal(physical,cluster.world_size,borrow(extra)),std::invalid_argument);
 }

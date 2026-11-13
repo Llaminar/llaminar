@@ -5,11 +5,15 @@
  * Borrowed banks retain the original FP32 bits. The same transpose assembles
  * gathered columns and, with exchanged outer dimensions, packs reduce-scatter
  * input. Singleton dimensions still enqueue the required disjoint copy.
+ * Launch geometry combines admitted physical CU limits with the exact loaded
+ * function's occupancy, which remains a runtime/program resource observation.
  */
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <algorithm>
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/ColumnShardAssemblyKernels.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 
 namespace
 {
@@ -184,17 +188,16 @@ extern "C" bool rocmTPKV_deinterleave_live_rank_major_fp32(
     if (hipSetDevice(device_ordinal) != hipSuccess) return false;
     constexpr int threads = 256;
     const long long total = static_cast<long long>(rows.capacity()) * degree * local_dim;
-    int processors = 0;
+    const int processors = llaminar2::rocmHardwareMetadata().at(device_ordinal).compute_units;
     int resident_blocks = 0;
-    if (hipDeviceGetAttribute(&processors, hipDeviceAttributeMultiprocessorCount, device_ordinal) != hipSuccess ||
-        hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident_blocks,
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident_blocks,
             tpkv_deinterleave_live_rank_major_fp32_kernel, threads, 0) != hipSuccess ||
         processors <= 0 || resident_blocks <= 0) return false;
     // One resident wave keeps small/empty replays economical while the
     // grid-stride body still copies every live element of a larger bank.
-    // These immutable resource queries run during retained graph recording.
-    const int blocks = static_cast<int>(std::min(static_cast<long long>(processors) * resident_blocks,
-        (total + threads - 1) / threads));
+    // The exact loaded-function occupancy is observed during retained recording;
+    // physical CU identity survives resets, while function resources do not.
+    const int blocks = llaminar2::residentColumnAssemblyBlockCount(processors, resident_blocks, total, threads);
     hipLaunchKernelGGL(tpkv_deinterleave_live_rank_major_fp32_kernel, dim3(blocks), dim3(threads),
         0, static_cast<hipStream_t>(stream), rank_major, row_major, rows, degree, local_dim);
     return hipGetLastError() == hipSuccess;

@@ -37,6 +37,8 @@ class ServerExecutionContract:
     device_kinds: frozenset[str]
     attention_device_kinds: frozenset[str]
     features: RuntimeFeaturePolicy
+    flash_attention_participants: frozenset[tuple[int, str]]
+    sparse_attention_participants: frozenset[tuple[int, str]]
 
     @property
     def uses_gpu(self) -> bool:
@@ -92,6 +94,7 @@ def validate_server_execution_contract(data: Mapping[str, Any]) -> ServerExecuti
         raise ValueError("execution contract requires authenticated communicator membership")
     topologies: dict[int, tuple[frozenset[str], frozenset[str]]] = {}
     policies = []
+    flash_participants, sparse_participants = set(), set()
     records = data.get("records")
     if not isinstance(records, list):
         raise ValueError("execution contract requires records")
@@ -114,6 +117,14 @@ def validate_server_execution_contract(data: Mapping[str, Any]) -> ServerExecuti
         devices, attention = _devices(tags.get("devices")), _devices(tags.get("attention_devices"))
         if not attention <= devices:
             raise ValueError("attention ownership includes unselected devices")
+        if not {"flash_attention_devices", "sparse_attention_devices"} <= tags.keys():
+            raise ValueError("execution topology requires explicit attention family ownership")
+        flash = _devices(tags.get("flash_attention_devices"))
+        sparse = _devices(tags.get("sparse_attention_devices"))
+        if flash | sparse != attention:
+            raise ValueError("attention family ownership disagrees with attention devices")
+        flash_participants.update((rank, device) for device in flash)
+        sparse_participants.update((rank, device) for device in sparse)
         topologies[rank] = (devices, attention)
     if set(topologies) != set(range(size)):
         raise ValueError("missing execution topology for selected ranks")
@@ -134,7 +145,8 @@ def validate_server_execution_contract(data: Mapping[str, Any]) -> ServerExecuti
     attention_kinds = frozenset(d.partition(":")[0].lower() for _, devices in topologies.values() for d in devices)
     if not kinds or not attention_kinds:
         raise ValueError("execution topology has no model participants")
-    return ServerExecutionContract(kinds, attention_kinds, features)
+    return ServerExecutionContract(kinds, attention_kinds, features,
+                                   frozenset(flash_participants), frozenset(sparse_participants))
 
 
 def automatic_selection_policy(profile: Mapping[str, Any]) -> dict:

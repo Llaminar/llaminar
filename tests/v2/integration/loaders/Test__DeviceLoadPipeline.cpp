@@ -441,8 +441,8 @@ static void verifyQ4_0Slot(const WeightVRAMPool::WeightSlot& slot,
     // Download GPU results
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
-    downloadBytes(slot.d_native_vnni_payload, gpu_payload, total_output * 16);
-    downloadU16(slot.d_native_vnni_scales, gpu_scales, total_output);
+    downloadBytes(slot.d_native_quantised_payload, gpu_payload, total_output * 16);
+    downloadU16(slot.d_native_quantised_scales, gpu_scales, total_output);
 
     ASSERT_EQ(gpu_payload.size(), cpu_payload.size());
     EXPECT_EQ(gpu_payload, cpu_payload) << "Q4_0 payload mismatch";
@@ -467,10 +467,10 @@ static void verifyQ4_KSlot(const WeightVRAMPool::WeightSlot& slot,
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
     std::vector<uint16_t> gpu_mins;
-    downloadBytes(slot.d_native_vnni_payload, gpu_payload, total_output * 16);
-    downloadU16(slot.d_native_vnni_scales, gpu_scales, total_output);
-    ASSERT_NE(slot.d_native_vnni_mins, nullptr);
-    downloadU16(slot.d_native_vnni_mins, gpu_mins, total_output);
+    downloadBytes(slot.d_native_quantised_payload, gpu_payload, total_output * 16);
+    downloadU16(slot.d_native_quantised_scales, gpu_scales, total_output);
+    ASSERT_NE(slot.d_native_quantised_mins, nullptr);
+    downloadU16(slot.d_native_quantised_mins, gpu_mins, total_output);
 
     // Payload: byte-for-byte
     ASSERT_EQ(gpu_payload.size(), cpu_payload.size());
@@ -691,10 +691,10 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
     cpu_pack_q4_0(host_blocks.data(), N, K, expected_payload, expected_scales);
     std::vector<uint8_t> actual_payload(expected_payload.size());
     std::vector<uint16_t> actual_scales(expected_scales.size());
-    ASSERT_TRUE(backend->deviceToHost(actual_payload.data(), slot->d_native_vnni_payload,
+    ASSERT_TRUE(backend->deviceToHost(actual_payload.data(), slot->d_native_quantised_payload,
                                       actual_payload.size(), 0,
                                       verification_stream.get()));
-    ASSERT_TRUE(backend->deviceToHost(actual_scales.data(), slot->d_native_vnni_scales,
+    ASSERT_TRUE(backend->deviceToHost(actual_scales.data(), slot->d_native_quantised_scales,
                                       actual_scales.size() * sizeof(uint16_t), 0,
                                       verification_stream.get()));
     EXPECT_EQ(actual_payload, expected_payload);

@@ -57,7 +57,7 @@ namespace
     }
 
     /** @return One typed layer, failing the test if classification changes. */
-    PlanningAttentionStateWork attention(const PlanningModelMetadata &metadata, const DevicePlanConfig &device,
+    PlanningAttentionStateWork attentionWork(const PlanningModelMetadata &metadata, const DevicePlanConfig &device,
         int rows, double context, PlanningMainForwardPhase phase = PlanningMainForwardPhase::Prefill)
     {
         const auto work = compilePlanningForwardStateWork(metadata, device, phase, {rows, context});
@@ -71,8 +71,8 @@ TEST(PlanningForwardStateWork, LiveContextNotAllocatedCapacityDeterminesAttentio
     for (const auto endpoint : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
     {
         auto device = participant(endpoint);
-        const auto short_work = attention(model(), device, 1, 0, PlanningMainForwardPhase::Decode);
-        const auto long_work = attention(model(), device, 1, 8192, PlanningMainForwardPhase::Decode);
+        const auto short_work = attentionWork(model(), device, 1, 0, PlanningMainForwardPhase::Decode);
+        const auto long_work = attentionWork(model(), device, 1, 8192, PlanningMainForwardPhase::Decode);
         EXPECT_DOUBLE_EQ(short_work.causal_pairs, 1);
         EXPECT_DOUBLE_EQ(long_work.causal_pairs, 8193);
         EXPECT_DOUBLE_EQ(long_work.operations, 8193 * short_work.operations);
@@ -81,7 +81,7 @@ TEST(PlanningForwardStateWork, LiveContextNotAllocatedCapacityDeterminesAttentio
         EXPECT_DOUBLE_EQ(long_work.activation_bytes, short_work.activation_bytes);
         device.max_seq_len = 16384;
         device.activation_seq_len = 64;
-        const auto less_capacity = attention(model(), device, 1, 8192, PlanningMainForwardPhase::Decode);
+        const auto less_capacity = attentionWork(model(), device, 1, 8192, PlanningMainForwardPhase::Decode);
         EXPECT_DOUBLE_EQ(less_capacity.operations, long_work.operations);
         EXPECT_DOUBLE_EQ(less_capacity.kv_read_bytes, long_work.kv_read_bytes);
         EXPECT_DOUBLE_EQ(short_work.kv_write_bytes, 2 * 4 * 64 * sizeof(uint16_t));
@@ -96,11 +96,11 @@ TEST(PlanningForwardStateWork, MeanDecodeAndCausalChunkArithmeticMatchExplicitTo
     const auto device = participant(DeviceId::cpu());
     double serial = 0;
     for (int row = 0; row < 127; ++row)
-        serial += attention(model(), device, 1, 4096 + row).operations;
-    EXPECT_DOUBLE_EQ(attention(model(), device, 127, 4096).operations, serial);
-    EXPECT_DOUBLE_EQ(attention(model(), device, 1, 4096 + 126.0 / 2).operations * 127, serial);
-    const auto first = attention(model(), device, 64, 4096);
-    const auto second = attention(model(), device, 63, 4160);
+        serial += attentionWork(model(), device, 1, 4096 + row).operations;
+    EXPECT_DOUBLE_EQ(attentionWork(model(), device, 127, 4096).operations, serial);
+    EXPECT_DOUBLE_EQ(attentionWork(model(), device, 1, 4096 + 126.0 / 2).operations * 127, serial);
+    const auto first = attentionWork(model(), device, 64, 4096);
+    const auto second = attentionWork(model(), device, 63, 4160);
     EXPECT_DOUBLE_EQ(first.operations + second.operations, serial);
     // Query-row reuse is an explicit lower-bound traffic model, not repeated
     // full-cache reads for every prefill query or reserved graph row.
@@ -125,8 +125,8 @@ TEST(PlanningForwardStateWork, ExactUnevenHeadsAndReplicatedDecodeStayDifferent)
         slice.vocab_count = 1365;
         device.bindTensorParallelAssignment(slice);
         device.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
-        const auto prefill = attention(model(), device, 1, 5);
-        const auto decode = attention(model(), device, 1, 5, PlanningMainForwardPhase::Decode);
+        const auto prefill = attentionWork(model(), device, 1, 5);
+        const auto decode = attentionWork(model(), device, 1, 5, PlanningMainForwardPhase::Decode);
         EXPECT_EQ(prefill.query_heads, 11);
         EXPECT_EQ(prefill.kv_heads, 2);
         EXPECT_EQ(decode.query_heads, 32);
@@ -142,14 +142,14 @@ TEST(PlanningForwardStateWork, UniformTPThroughDegreeEightPreservesArithmeticAnd
     for (int degree : {1, 2, 4, 8})
     {
         auto device = participant(endpoint);
-        const auto complete = attention(model(), device, 32, 2048);
+        const auto complete = attentionWork(model(), device, 32, 2048);
         device.total_shards = degree;
         device.local_kv_heads = std::max(1, 4 / degree);
         double operations = 0, bytes = 0;
         for (int shard = 0; shard < degree; ++shard)
         {
             device.shard_index = shard;
-            const auto local = attention(model(), device, 32, 2048);
+            const auto local = attentionWork(model(), device, 32, 2048);
             operations += local.operations;
             bytes += local.kv_read_bytes;
         }
@@ -181,7 +181,8 @@ TEST(PlanningForwardStateWork, HybridUsesCanonicalMappingAndOnlyLocalLiveBanks)
             const auto &b = std::get<PlanningGDNStateWork>(late[layer].operation);
             const auto geometry = HybridGDNStateGeometry::resolve(32, 16, 16, 8, 32, 64, 2048, 4);
             EXPECT_EQ(a.geometry.local_recurrence_state_floats, geometry.local_recurrence_state_floats);
-            EXPECT_DOUBLE_EQ(a.state_bytes, 2 * geometry.localPayloadBytes(1));
+            EXPECT_DOUBLE_EQ(a.state_bytes, 2 * (endpoint.is_cpu() ? geometry.localPayloadBytes(1) :
+                sizeof(float) * static_cast<size_t>(geometry.local_conv_state_floats + geometry.local_recurrence_state_floats)));
             EXPECT_DOUBLE_EQ(a.operations, 7 * 65536 + 3 * 1024 + 2 * 4 * 1536 + 10 * 4 * 64);
             EXPECT_DOUBLE_EQ(a.operations, b.operations);
             EXPECT_DOUBLE_EQ(a.state_bytes, b.state_bytes);

@@ -17,7 +17,9 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
+#include <tuple>
 
 namespace llaminar2
 {
@@ -57,7 +59,57 @@ namespace llaminar2
         Norm,
         Bias,
         Other,
+        /** Immutable native rows owned by a lookup store, never an ordinary embedding/GEMM. */
+        ImmutableRowTable,
+        /** HC read/write/final-mixer low-rank projections at trunk/compute widths. */
+        HyperConnectionProjection,
+        /** Converter-authenticated final FP32 branch-normalization gains. */
+        HyperConnectionNorm,
+        /** Sparse indexer Q/K projections, distinct from core attention Q/K. */
+        SparseIndexerProjection,
+        /** Sparse indexer final FP32 normalization gains. */
+        SparseIndexerNorm,
+        /** PLE key/value projections after the immutable live-row gather. */
+        PerLayerEmbeddingProjection,
+        /** PLE key/query/convolution final FP32 normalization gains. */
+        PerLayerEmbeddingNorm,
+        /** Immutable FP32 dilated depthwise convolution taps. */
+        PerLayerEmbeddingConvolution,
+        /** Predictor embedding/hidden mixing projection. */
+        PredictorProjection,
     };
+
+    /**
+     * @brief Identify the original HC-up source roles shared by planning and observation.
+     * @param role Source-owned semantic role, independent of tensor geometry.
+     * @param name Original canonical GGUF tensor name, including any block prefix.
+     * @return True only for the existing block/terminal/predictor HC-up names.
+     * @note This is a source-role predicate, never a precision or serving selector.
+     */
+    inline bool isHyperConnectionUpProjection(WeightRole role, std::string_view name) noexcept
+    {
+        return role == WeightRole::HyperConnectionProjection &&
+            (name == "output_hc_up.weight" || name.ends_with(".hc_attn_up.weight") ||
+             name.ends_with(".hc_ffn_up.weight") || name.ends_with(".nextn.hc_head_up.weight"));
+    }
+
+    /** @brief Whether a Qwen4 immutable scalar/operator weight must materialize as FP32. */
+    inline constexpr bool isImmutableFP32WeightRole(WeightRole role) noexcept
+    {
+        return role == WeightRole::HyperConnectionNorm ||
+               role == WeightRole::SparseIndexerNorm ||
+               role == WeightRole::PerLayerEmbeddingNorm ||
+               role == WeightRole::PerLayerEmbeddingConvolution;
+    }
+
+    /** @brief Whether a Qwen4 projection has an explicit prepared-GEMM owner. */
+    inline bool isFlashNextProjectionRole(WeightRole role) noexcept
+    {
+        return role == WeightRole::HyperConnectionProjection ||
+               role == WeightRole::SparseIndexerProjection ||
+               role == WeightRole::PerLayerEmbeddingProjection ||
+               role == WeightRole::PredictorProjection;
+    }
 
     inline bool isRoutedExpertRole(WeightRole role)
     {
@@ -125,6 +177,22 @@ namespace llaminar2
         int overlay_participant_index = -1;
         int overlay_participant_world_rank = -1;
 
+        /**
+         * @brief Compare every immutable source/placement fact, not merely logical object identity.
+         * @param other Original retained Store/plan record required by a publication boundary.
+         * @return True only when model, instance, semantic source and exact participant scope agree.
+         */
+        bool sameSourceDefinition(const WeightIdentity &other) const
+        {
+            return std::tie(model_id.value,logical_id,instance_id,canonical_name,role,derivation,source_instance_id,
+                layer,expert,pp_stage,tp_domain,tp_rank_or_device_index,residency_category,overlay_domain,
+                overlay_participant_index,overlay_participant_world_rank) ==
+                std::tie(other.model_id.value,other.logical_id,other.instance_id,other.canonical_name,other.role,
+                other.derivation,other.source_instance_id,other.layer,other.expert,other.pp_stage,other.tp_domain,
+                other.tp_rank_or_device_index,other.residency_category,other.overlay_domain,
+                other.overlay_participant_index,other.overlay_participant_world_rank);
+        }
+
         bool operator==(const WeightIdentity &other) const
         {
             return model_id == other.model_id && instance_id == other.instance_id;
@@ -151,6 +219,8 @@ namespace llaminar2
          */
         std::vector<int> expert_ids;
         bool inner_is_presliced = false;
+        /** @return Exact original geometry/selection equality, including sparse expert order. */
+        bool operator==(const WeightSliceSpec &) const = default;
     };
 
     struct WeightResidency

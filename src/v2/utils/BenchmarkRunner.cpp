@@ -3,13 +3,23 @@
  * @brief Implementation of benchmark runner for prefill/decode performance
  *
  * Measures warmed production requests and exports tokens, runtime-path evidence,
- * and the runner-resolved configuration. Profiling remains separate from clean
+ * and the runner-resolved configuration. Result-owned setup arithmetic metadata
+ * remains distinct from measured counters. Exact per-layer physical expert
+ * selections survive as setup metadata without retaining runtime placement work.
+ * Profiling remains separate from clean
  * timing; hardware default selection belongs to execution planning, not here.
+ * Bounded transaction traces permit one fresh measured request per collector epoch,
+ * preserving exact controller inputs without cross-request aggregation.
+ * Opt-in terminal depth-window evidence describes measured eligible outcomes;
+ * reset removes warmup windows without expanding per-transaction MTP telemetry.
  * @author David Sanftenberg
  * @date 2025
  */
 
 #include "BenchmarkRunner.h"
+#include "execution/runner/ObservedFixedPipelineEvidence.h"
+#include "execution/qwen4exp/FixedHeadPipelineTerminalEvidence.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "app/modes/PrefixMovementJson.h"
 #include "Logger.h"
 #include "DebugEnv.h"
@@ -18,6 +28,7 @@
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
 #include "PerfStatsCollector.h"
+#include "MTPDepthTransactionTraceCPU.h"
 #include "Sha256.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
@@ -39,6 +50,23 @@
 
 namespace llaminar2
 {
+
+/** @copydoc observeFixedNativePipelineTerminal */
+nlohmann::json observeFixedNativePipelineTerminal(const IOrchestrationRunner& runner,
+    std::optional<std::uint64_t> expected_rows)
+{
+    const auto* model=runner.modelContextForDiagnostics();
+    const auto placement=model?model->resolvedImmutableRowTablePlacement():nullptr;
+    const auto* fixed=placement?placement->fixedHeadPipeline():nullptr;
+    if(!fixed)throw std::invalid_argument("Observed fixed native pipeline has no original terminal geometry");
+    const auto totals=qwen4exp::requireFixedHeadPipelineTerminalEvidence(
+        PerfStatsCollector::snapshot({"immutable_lookup"}),*fixed,placement->extent().rowBytes(),expected_rows);
+    nlohmann::json owners=nlohmann::json::object();
+    for(const auto& [device,values]:totals)
+        for(std::size_t metric=0;metric<values.size();++metric)
+            owners[device][std::string(qwen4exp::kFixedHeadPipelineTerminalMetrics[metric])]=values[metric];
+    return {{"schema","llaminar.fixed-native-pipeline-terminal.v1"},{"owners",std::move(owners)}};
+}
 
     /**
      * @brief Maximum request submissions needed by the prefill graph lifecycle.
@@ -127,6 +155,9 @@ namespace llaminar2
                snapshot.mtp_depth_policy_updates != 0 ||
                snapshot.mtp_depth_policy_promotions != 0 ||
                snapshot.mtp_depth_policy_demotions != 0 ||
+               snapshot.mtp_depth_policy_utility_returns != 0 ||
+               snapshot.mtp_depth_policy_utility_keeps != 0 ||
+               snapshot.mtp_depth_policy_utility_probes != 0 ||
                snapshot.mtp_depth_policy_observe_recommendations != 0 ||
                snapshot.mtp_request.enabled ||
                snapshot.mtp_request.bypassed ||
@@ -203,11 +234,19 @@ namespace llaminar2
         };
     }
 
-    static double mtpTokenAcceptanceRate(uint64_t accepted_tokens, uint64_t rejected_tokens)
+    /**
+     * @brief Fraction of attempted speculative draft tokens accepted by verification.
+     * @param accepted_tokens Actual accepted draft tokens in this measured window.
+     * @param draft_steps Actual attempted drafts, including rejected suffix work.
+     * @return Accepted drafts divided by attempted drafts, or zero without attempts.
+     *
+     * The legacy rejected_tokens field counts rejected transactions on the
+     * captured path. It cannot reconstruct token attempts at depth above one.
+     */
+    static double mtpTokenAcceptanceRate(uint64_t accepted_tokens, uint64_t draft_steps)
     {
-        const uint64_t attempted_tokens = accepted_tokens + rejected_tokens;
-        return attempted_tokens > 0
-                   ? static_cast<double>(accepted_tokens) / static_cast<double>(attempted_tokens)
+        return draft_steps > 0
+                   ? static_cast<double>(accepted_tokens) / static_cast<double>(draft_steps)
                    : 0.0;
     }
 
@@ -457,14 +496,35 @@ namespace llaminar2
         };
     }
 
+    /**
+     * @brief Select measured diagnostics and exact retained immutable setup families for JSON.
+     * @return Existing runtime filters plus the original per-layer physical expert selections.
+     *
+     * The exact terminal depth-policy family carries eligible window counts;
+     * unrelated per-transaction MTP counters remain outside this snapshot.
+     * Immutable lookup and native submission counters are terminal observations,
+     * not live probes. Their existing measured reset excludes warmup work.
+     * Selection records survive the measured reset as setup observations; their
+     * submission counts never represent measured replays, tokens or movement.
+     */
     static const std::vector<std::string> &benchmarkPerfStatFilters()
     {
         static const std::vector<std::string> filters{
             "kernel",
             "memory",
+            "immutable_lookup",
+            "ngram_lookup",
+            "immutable_lookup_setup.admitted_owner",
             "moe_overlay",
             "moe_overlay_controller",
+            "moe_placement.routed_expert_weight_selection",
             "moe_rebalance",
+            "mtp.device_generation_terminal_depth_policy_state",
+            "mtp.depth_transaction_trace.initial",
+            "mtp.depth_transaction_trace.record",
+            "mtp.depth_transaction_trace.final",
+            "mtp.output_tokens",
+            "mtp.grouped_outcome_host_state_publications",
             "tp_allreduce_bom",
             "tp_allreduce_runtime",
             "tp_allreduce_small_gpu",
@@ -510,7 +570,123 @@ namespace llaminar2
             {"total_ms", total_ms},
             {"avg_us", avg_us},
             {"min_us", min_us},
-            {"max_us", max_us}};
+            {"max_us", max_us},
+            {"sequence_word_count", record.sequence_word_count},
+            {"sequence_digest_lo", record.sequence_digest_lo},
+            {"sequence_digest_hi", record.sequence_digest_hi},
+            {"sequence_minimum_words", record.sequence_minimum_words},
+            {"sequence_maximum_words", record.sequence_maximum_words}};
+    }
+
+    /**
+     * @brief Copy only exact existing arithmetic families before measured counters reset.
+     * @return Result-owned records from the passive host collector; no backend probe or transfer.
+     * @details The ledger may include retained process setup as well as warmup.
+     * Qualified collector filters also match dotted descendants, so exact
+     * domain/name matching below prevents an unrelated neighboring family from
+     * becoming arithmetic evidence. Disabled collection returns an explicit
+     * observed-but-empty snapshot, even if stale collector storage still exists.
+     */
+    static BenchmarkSetupArithmeticObservation benchmarkSetupArithmeticObservation()
+    {
+        BenchmarkSetupArithmeticObservation observation;
+        observation.observed_before_measurement = true;
+        observation.collection_enabled = PerfStatsCollector::isEnabled();
+        if (!observation.collection_enabled)
+            return observation;
+
+        static const std::vector<PerfStatsCollector::RecordFamily> families{
+            // A retained composite submits only at capture/setup; measured
+            // graph replays perform no host callback to republish this family.
+            {"gdn_output", "normalization_submission"},
+            {"kernel", "gdn_projection_route"},
+            {"kernel", "hc_up_projection_submissions"},
+            {"weight_loading", "gdn_projection_arithmetic_prepared_weight"},
+            {"weight_loading", "moe_router_arithmetic_prepared_weight"},
+            {"kernel", "cpu_moe_fp16_operand_router_calls"},
+            {"kernel", "cpu_moe_grouped_router_calls"},
+            {"cuda_moe", "router_fp16_operands"},
+            {"cuda_moe", "router_fp16_owned_operands"},
+            {"cuda_moe", "router_fp16_grouped_operands"},
+            {"kernel", "rocm_moe_router_fp16_operand_calls"},
+            {"kernel", "rocm_moe_batch_invariant_prefill_router_calls"},
+            {"kernel", "rocm_moe_decode_equivalent_runtime_m_router_calls"},
+        };
+        std::vector<std::string> filters;
+        filters.reserve(families.size());
+        for (const auto &family : families)
+            filters.push_back(family.domain + "." + family.name);
+        for (auto &record : PerfStatsCollector::snapshot(filters))
+        {
+            if (std::any_of(families.begin(), families.end(),
+                    [&](const PerfStatsCollector::RecordFamily &family)
+                    { return record.domain == family.domain && record.name == family.name; }))
+                observation.records.push_back(std::move(record));
+        }
+        return observation;
+    }
+
+    /**
+     * @brief Serialize only the saved result-owned setup/warmup observation.
+     * @param observation Value captured before reset, independent of the live collector.
+     * @return Separately scoped arithmetic metadata using the canonical PerfStatRecord serializer.
+     */
+    static nlohmann::json benchmarkSetupArithmeticToJson(
+        const BenchmarkSetupArithmeticObservation &observation)
+    {
+        nlohmann::json records = nlohmann::json::array();
+        for (const auto &record : observation.records)
+            records.push_back(perfStatRecordToJson(record));
+        return nlohmann::json{
+            {"schema", "llaminar.benchmark.setup_warmup_arithmetic.v1"},
+            {"scope", "retained_process_setup_and_warmup_before_measured_reset"},
+            {"count_semantics", "host_recording_or_submission_observations_not_graph_replays_or_tokens"},
+            {"observed_before_measurement", observation.observed_before_measurement},
+            {"collection_enabled", observation.collection_enabled},
+            {"records", std::move(records)},
+        };
+    }
+
+    /**
+     * @return Only existing completed lookup producer records; names, units,
+     * identities and ordered evidence remain unchanged. Submission metadata and
+     * timers cannot masquerade as completed cache/traffic observations.
+     */
+    static std::vector<PerfStatRecord> benchmarkLookupTerminalRecords()
+    {
+        auto records = PerfStatsCollector::snapshot({"immutable_lookup", "ngram_lookup"});
+        std::erase_if(records, [](const auto &record) {
+            if (!PerfStatsCollector::isDomainEnabled(record.domain) ||
+                record.kind != PerfStatRecord::Kind::Counter) return true;
+            const auto authority = record.tags.find("authority");
+            if (record.phase == qwen4exp::kFixedHeadPipelineTerminalPhase && record.domain == "immutable_lookup" &&
+                authority != record.tags.end() && authority->second == "pipeline_generation_terminal")
+            {
+                const auto& names=qwen4exp::kFixedHeadPipelineTerminalMetrics;
+                return std::find(names.begin(),names.end(),record.name)==names.end();
+            }
+            if (record.phase != "generation_terminal") return true;
+            if (record.domain == "immutable_lookup") return false;
+            return record.domain != "ngram_lookup" || authority == record.tags.end() ||
+                authority->second != "completed_local_hot_terminal";
+        });
+        return records;
+    }
+
+    /** @return Source-window-preserving raw host observations, with no counter subtraction. */
+    static nlohmann::json benchmarkLookupTerminalToJson(const BenchmarkLookupTerminalBracket &bracket)
+    {
+        const auto records = [](const auto &input) {
+            auto output = nlohmann::json::array();
+            for (const auto &record : input) output.push_back(perfStatRecordToJson(record));
+            return output;
+        };
+        return {{"schema", "llaminar.benchmark.lookup-terminal-bracket.v1"},
+            {"collection_enabled", bracket.collection_enabled},
+            {"scope", "host_request_boundaries_native_windows_unchanged"},
+            {"counter_delta_inferred", false},
+            {"before_request", records(bracket.before_request)},
+            {"after_request", records(bracket.after_request)}};
     }
 
     static nlohmann::json benchmarkPerfStatsToJson()
@@ -520,7 +696,20 @@ namespace llaminar2
 
         nlohmann::json records_json = nlohmann::json::array();
         for (const auto &record : records)
+        {
+            if (record.domain == "mtp" && record.name.starts_with("grouped_outcome_host_state_publications") &&
+                record.name != "grouped_outcome_host_state_publications")
+                continue;
+            if (record.domain == "mtp" && record.name.starts_with("output_tokens."))
+                continue;
+            if (record.domain == "mtp" &&
+                record.name.starts_with("depth_transaction_trace.") &&
+                record.name != "depth_transaction_trace.initial" &&
+                record.name != "depth_transaction_trace.record" &&
+                record.name != "depth_transaction_trace.final")
+                continue;
             records_json.push_back(perfStatRecordToJson(record));
+        }
 
         return nlohmann::json{
             {"schema", "llaminar.perf_stats.v1"},
@@ -621,7 +810,8 @@ namespace llaminar2
               {"acceptance_rate",
                mtpTokenAcceptanceRate(
                    iteration.mtp_accepted_tokens,
-                   iteration.mtp_rejected_tokens)}}}};
+                   iteration.mtp_draft_steps)}}}};
+        result["lookup_terminal_observation"] = benchmarkLookupTerminalToJson(iteration.lookup_terminal);
         result["decode_windows"] = nlohmann::json::array();
         for (const auto &window : iteration.decode_windows)
         {
@@ -750,6 +940,9 @@ namespace llaminar2
             previous.mtp_depth_policy_promotions + sample.mtp_depth_policy_promotions;
         aggregate->mtp_depth_policy_demotions =
             previous.mtp_depth_policy_demotions + sample.mtp_depth_policy_demotions;
+        aggregate->mtp_depth_policy_utility_returns = previous.mtp_depth_policy_utility_returns + sample.mtp_depth_policy_utility_returns;
+        aggregate->mtp_depth_policy_utility_keeps = previous.mtp_depth_policy_utility_keeps + sample.mtp_depth_policy_utility_keeps;
+        aggregate->mtp_depth_policy_utility_probes = previous.mtp_depth_policy_utility_probes + sample.mtp_depth_policy_utility_probes;
         aggregate->mtp_depth_policy_observe_recommendations =
             previous.mtp_depth_policy_observe_recommendations +
             sample.mtp_depth_policy_observe_recommendations;
@@ -778,7 +971,7 @@ namespace llaminar2
             sample.mtp_request.stochastic_terminal_samples;
         aggregate->mtp_request.acceptance_rate =
             mtpTokenAcceptanceRate(aggregate->mtp_request.accepted_tokens,
-                                   aggregate->mtp_request.rejected_tokens);
+                                   aggregate->mtp_request.draft_steps);
         aggregate->mtp_request.stochastic_acceptance_rate =
             aggregate->mtp_request.stochastic_accept_tests > 0
                 ? static_cast<double>(aggregate->mtp_request.stochastic_accepts) /
@@ -890,13 +1083,16 @@ namespace llaminar2
                       {"depth_policy_updates", state.mtp_depth_policy_updates},
                       {"depth_policy_promotions", state.mtp_depth_policy_promotions},
                       {"depth_policy_demotions", state.mtp_depth_policy_demotions},
+                      {"depth_policy_utility_returns", state.mtp_depth_policy_utility_returns},
+                      {"depth_policy_utility_keeps", state.mtp_depth_policy_utility_keeps},
+                      {"depth_policy_utility_probes", state.mtp_depth_policy_utility_probes},
                       {"depth_policy_observe_recommendations", state.mtp_depth_policy_observe_recommendations},
                       {"current_depth", state.mtp_current_depth},
                       {"min_depth", state.mtp_min_depth},
                       {"max_depth", state.mtp_max_depth},
                       {"acceptance_rate", mtpTokenAcceptanceRate(
                                               state.mtp_accepted_tokens,
-                                              state.mtp_rejected_tokens)},
+                                              state.mtp_draft_steps)},
                       {"request", mtpRequestToJson(state.mtp_request)}}},
             {"prefill_chunks", {{"schedules", state.prefill_chunk_schedules},
                                  {"successful_schedules", state.prefill_chunk_successful_schedules},
@@ -905,6 +1101,7 @@ namespace llaminar2
                                  {"padded_tokens", state.prefill_chunk_padded_tokens},
                                  {"failures", state.prefill_chunk_failures}}},
             {"prefill_graphs", prefillGraphSummaryToJson(state)},
+            {"setup_warmup_arithmetic", benchmarkSetupArithmeticToJson(result.setup_warmup_arithmetic)},
             {"perf_stats", benchmarkPerfStatsToJson()},
         };
 
@@ -912,11 +1109,16 @@ namespace llaminar2
             doc["iterations"].push_back(
                 benchmarkIterationToJson(iteration));
 
+        if (!result.prompt_token_ids.empty())
+            doc["prompt"]["token_ids"] = result.prompt_token_ids;
         if (!result.prompt_file_path.empty())
             doc["prompt"]["file_path"] = result.prompt_file_path;
 
         if (config)
         {
+            // The original runner-resolved owner is serialized verbatim; this
+            // evidence never reconstructs placement from benchmark arguments.
+            doc["runtime_configuration"] = nlohmann::json::parse(serializeOrchestrationConfig(*config));
             nlohmann::json config_json{
                 {"benchmark_mode", config->benchmark_mode},
                 {"n_predict", config->n_predict},
@@ -930,6 +1132,7 @@ namespace llaminar2
                 {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
                 {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
+                {"mtp_initial_draft_tokens", config->mtp.depth_policy.initial_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
                 {"mtp_depth_generated_policy", config->mtp.depth_policy.use_generated_policy},
                 {"mtp_depth_defaults_profile", mtpDepthDefaultsProfileToString(config->mtp.depth_defaults_profile)},
@@ -1724,7 +1927,31 @@ namespace llaminar2
         return result;
     }
 
+    PreparedBenchmarkInput BenchmarkRunner::prepareInput(const OrchestrationConfig &config) const
+    {
+        auto prompt = resolveBenchmarkPrompt(config);
+        auto tokens = tokenizer_->encode(prompt.text, /*add_bos=*/false, /*add_eos=*/false);
+        if (tokens.empty() || tokens.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::runtime_error("benchmark prompt tokenization is empty or exceeds supported geometry");
+        const int vocabulary = runner_->vocab_size();
+        if (vocabulary <= 0 || std::any_of(tokens.begin(), tokens.end(), [vocabulary](int token) {
+                return token < 0 || token >= vocabulary;
+            })) throw std::runtime_error("benchmark prompt tokenization contains an invalid native token ID");
+        return PreparedBenchmarkInput(std::move(prompt), std::move(tokens));
+    }
+
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
+    {
+        return runImpl(config, std::nullopt);
+    }
+
+    BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config, const PreparedBenchmarkInput &input)
+    {
+        return runImpl(config, std::cref(input));
+    }
+
+    BenchmarkResult BenchmarkRunner::runImpl(const OrchestrationConfig &config,
+        std::optional<std::reference_wrapper<const PreparedBenchmarkInput>> prepared_input)
     {
         BenchmarkResult result;
         const int benchmark_iterations =
@@ -1745,6 +1972,32 @@ namespace llaminar2
                     : (runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{});
             return result;
         };
+
+        if (debugEnv().runtime_debug.mtp_depth_transaction_trace)
+        {
+            const auto scope = config.benchmark_mode && !config.serve_mode
+                ? sampling_math::MTPDepthTransactionTraceScope::BoundedBenchmark
+                : sampling_math::MTPDepthTransactionTraceScope::Other;
+            // Validate raw declarations, not clamped loop counts: an invalid
+            // authored zero-measurement request must not become measure1.
+            if (!debugEnv().runtime_debug.benchmark_iteration_overrides_valid ||
+                !validMTPDepthTransactionTracePolicy(config.mtp) ||
+                !sampling_math::validMTPDepthTransactionTraceScope(scope,
+                    debugEnv().runtime_debug.benchmark_warmup_iterations,
+                    debugEnv().runtime_debug.benchmark_iterations) ||
+                !sampling_math::validMTPDepthTransactionTraceAdmission(
+                    sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                    config.batch_size, config.n_predict < 0 ? 128 : config.n_predict))
+            {
+                last_failure_reason_ = "MTP depth-transaction trace requires a fresh scalar bounded benchmark with enabled positive-depth MTP (CPU bypass unsupported), warmup0/measure1, tokens1..256";
+                return capture_and_return();
+            }
+            if (!PerfStatsCollector::isDomainEnabled("mtp"))
+            {
+                last_failure_reason_ = "MTP depth-transaction trace requires enabled PerfStats collection of the mtp domain";
+                return capture_and_return();
+            }
+        }
 
         /*
          * Application startup owns all model preparation through the same
@@ -1771,26 +2024,19 @@ namespace llaminar2
 
         try
         {
-            const ResolvedBenchmarkPrompt resolved = resolveBenchmarkPrompt(config);
+            const PreparedBenchmarkInput prepared = prepared_input
+                ? prepared_input->get() : prepareInput(config);
+            const auto &resolved = prepared.prompt();
             prompt = resolved.text;
             result.prompt_source = resolved.source;
             result.prompt_file_path = resolved.file_path;
             result.prompt_bytes = resolved.text.size();
             result.prompt_sha256 = resolved.sha256;
-
-            LOG_DEBUG("Benchmark prompt source="
-                      << benchmarkPromptSourceToString(resolved.source)
-                      << " bytes=" << resolved.text.size()
-                      << " sha256=" << resolved.sha256);
-
-            tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
+            tokens = prepared.tokenIds();
+            if (prepared_input) result.prompt_token_ids = tokens;
             token_count = static_cast<int>(tokens.size());
-            if (tokens.empty())
-            {
-                last_failure_reason_ = "benchmark prompt tokenization failed";
-                LOG_ERROR(last_failure_reason_);
-                token_count = -1;
-            }
+            LOG_DEBUG("Benchmark prompt source=" << benchmarkPromptSourceToString(resolved.source)
+                      << " bytes=" << resolved.text.size() << " sha256=" << resolved.sha256);
         }
         catch (const std::exception &error)
         {
@@ -2189,6 +2435,9 @@ namespace llaminar2
          * BOM evidence, however, and must survive so auto-capacity, shadow
          * width, and movement concurrency remain auditable beside throughput.
          */
+        // Passive host-only copies are result-owned; do not preserve these
+        // submission counts in the measured kernel/router work window.
+        result.setup_warmup_arithmetic = benchmarkSetupArithmeticObservation();
         PerfStatsCollector::resetPreserving(
             {"memory",
              "weight_loading",
@@ -2197,6 +2446,11 @@ namespace llaminar2
              "tp_allreduce_bom",
              "tp_rooted_collective_bom"},
             {
+                // Immutable per-layer physical bank selections are setup evidence;
+                // preserve this exact family, never unrelated placement/movement.
+                {"moe_placement", "routed_expert_weight_selection"},
+                // Original admitted capacity survives; cache activity is measured-only.
+                {"immutable_lookup_setup", "admitted_owner"},
                 {"forward_graph", "full_graph_plan_graphs"},
                 {"forward_graph", "graph_replay_plan_graphs"},
                 {"forward_graph", "full_graph_capture_executable_nodes"},
@@ -2227,7 +2481,7 @@ namespace llaminar2
                  * retaining unrelated warmup kernel counters.
                  */
                 {"kernel", "cuda_fused_projection_stream_pool_calls"},
-                {"kernel", "cuda_native_vnni_small_m_fused_projection_calls"},
+                {"kernel", "cuda_native_quantised_small_m_fused_projection_calls"},
             });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
@@ -2253,6 +2507,14 @@ namespace llaminar2
 
         for (int iter = 0; iter < benchmark_iterations; ++iter)
         {
+            // Observe completed host records before reset; the reset may itself
+            // publish a previous source-service close. Preserve that native
+            // window rather than relabeling it as this request's cache work.
+            BenchmarkLookupTerminalBracket lookup_terminal;
+            lookup_terminal.collection_enabled = PerfStatsCollector::isDomainEnabled("immutable_lookup") ||
+                PerfStatsCollector::isDomainEnabled("ngram_lookup");
+            if (lookup_terminal.collection_enabled)
+                lookup_terminal.before_request = benchmarkLookupTerminalRecords();
             // Reset live request state and force an actual full-prefill sample.
             if (!resetForFullPrefill("measured iteration"))
                 return capture_and_return();
@@ -2261,6 +2523,7 @@ namespace llaminar2
             LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
             BenchmarkIterationResult iteration_result;
             iteration_result.iteration = iter + 1;
+            iteration_result.lookup_terminal = std::move(lookup_terminal);
             iteration_result.prefill_tokens = result.prefill_tokens;
             iteration_result.moe_runtime_movement_epoch_start =
                 runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
@@ -2411,6 +2674,8 @@ namespace llaminar2
             }
             captureCompletedDynamicMovement(
                 &iteration_result, dynamic_movement_start, runner_.get());
+            if (iteration_result.lookup_terminal.collection_enabled)
+                iteration_result.lookup_terminal.after_request = benchmarkLookupTerminalRecords();
             result.iterations.push_back(std::move(iteration_result));
             LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
                                       << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));

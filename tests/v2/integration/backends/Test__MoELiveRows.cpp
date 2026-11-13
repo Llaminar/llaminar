@@ -10,16 +10,22 @@
  * be overwritten; invalid routes may never read unowned compact scratch.
  * This detects stale scratch, double publication by two
  * dispatch families, and shared experts accidentally evaluating padded rows.
+ * Cold shared-stage preparation additionally receives poisoned unpublished
+ * controller storage: only captured execution may consume its live count.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
+#include "backends/IGPUGraphCapture.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/KernelFactory.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
@@ -55,7 +61,7 @@ namespace
     {
         std::vector<WeightCase> cases;
         for (const auto &format : quantizedMoEVerifierFormats())
-            cases.push_back({format.label, DeviceMoEWeightFormat::NativeVNNI, format.create});
+            cases.push_back({format.label, DeviceMoEWeightFormat::NativeQuantised, format.create});
         cases.push_back({"FP16", DeviceMoEWeightFormat::FP16,
             [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
             { return TestTensorFactory::createFP16Random(shape, -0.125f, 0.125f, seed); }});
@@ -71,6 +77,9 @@ namespace
     /** @brief Explicit original-Q8 producer exercised by the captured fixture. */
     enum class InputSource { PrivateQuantizer, RouterPublication };
 
+    /** @brief Select the complete inventory or its focused cold shared-stage gate. */
+    enum class ExpertCoverage { SharedAndRouted, SharedOnly };
+
     /**
      * @brief Exercise one endpoint on its worker's explicit non-default stream.
      * @param device Endpoint whose prepared weights and scratch own the graph.
@@ -80,12 +89,18 @@ namespace
      * @param width Expert intermediate width with the same serial reduction tree.
      * @param rows Physical captured token capacity; independent of live routes.
      * @param input_source Whether routing publishes canonical Q8 before gate/up.
+     * @param backing_rows Retained tensor/scratch capacity; zero selects exact rows.
+     * @param coverage Whether this invocation also proves routed expert execution.
      */
     void proveLiveRows(DeviceId device, IWorkerGPUContext &context,
                        const std::vector<WeightCase> &formats,
                        int hidden_size = 256, int width = 256, int rows = 16,
-                       InputSource input_source = InputSource::PrivateQuantizer)
+                       InputSource input_source = InputSource::PrivateQuantizer,
+                       int backing_rows = 0,
+                       ExpertCoverage coverage = ExpertCoverage::SharedAndRouted)
     {
+        if (backing_rows == 0) backing_rows = rows;
+        ASSERT_GE(backing_rows, rows);
         context.submitAndWait([&]()
         {
             auto *backend = getBackendFor(device);
@@ -116,7 +131,7 @@ namespace
                        backend->synchronizeStream(stream, 0);
             };
 
-            std::vector<float> hidden_values(rows * hidden_size);
+            std::vector<float> hidden_values(backing_rows * hidden_size);
             for (size_t index = 0; index < hidden_values.size(); ++index)
                 hidden_values[index] = 0.019f * static_cast<float>(
                     static_cast<int>((index * 17 + 3) % 47) - 23);
@@ -148,16 +163,38 @@ namespace
                         prepared[expert * 3].kernel, prepared[expert * 3 + 1].kernel,
                         prepared[expert * 3 + 2].kernel, hidden_size, width, descriptors[expert]));
                     ASSERT_EQ(descriptors[expert].weight_format, format.format);
+                    // Q5_K and Q5_1 share physical7, but original block
+                    // provenance must survive the real load/prepare/export path.
+                    if (std::string(format.label) == "Q5_1" || std::string(format.label) == "Q5_K")
+                    {
+                        const auto &registry = quantizedMoEVerifierFormats();
+                        const auto source = std::find_if(registry.begin(), registry.end(), [&](const auto &entry) {
+                            return std::string(entry.label) == format.label;
+                        });
+                        ASSERT_NE(source, registry.end());
+                        ASSERT_EQ(source->device_execution_codebook_id, uint8_t{7});
+                        ASSERT_EQ(source->source_codebook_id, uint8_t{7});
+                        ASSERT_EQ(source_weights[expert * 3 + 2]->native_type(), source->tensor_type);
+                        const auto &down = descriptors[expert].down;
+                        ASSERT_EQ(down.n, hidden_size);
+                        ASSERT_EQ(down.k, width);
+                        ASSERT_EQ(down.blocks_per_row, static_cast<uint32_t>(width / 32));
+                        ASSERT_EQ(down.codebook_id, source->device_execution_codebook_id);
+                        ASSERT_TRUE(down.source_identity_present);
+                        ASSERT_EQ(down.source_codebook_id, source->source_codebook_id);
+                        ASSERT_EQ(bool(down.source_is_superblock), source->source_is_superblock);
+                    }
                 }
 
                 for (const bool shared : {false, true})
                 {
+                    if (!shared && coverage == ExpertCoverage::SharedOnly) continue;
                     SCOPED_TRACE(shared ? "shared" : "routed");
                     const int experts = shared ? 1 : 16;
                     const int top_k = shared ? 1 : 4;
                     const auto requirements = device.is_cuda()
-                        ? MoEWorkspaceBuffers::cudaMoE(rows, hidden_size, width, experts, top_k)
-                        : MoEWorkspaceBuffers::rocmMoE(rows, hidden_size, width, experts, top_k);
+                        ? MoEWorkspaceBuffers::cudaMoE(backing_rows, hidden_size, width, experts, top_k)
+                        : MoEWorkspaceBuffers::rocmMoE(backing_rows, hidden_size, width, experts, top_k);
                     DeviceWorkspaceManager workspace(device,
                         requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
                     ASSERT_TRUE(workspace.allocate(requirements));
@@ -184,7 +221,7 @@ namespace
                             {.kind = MoERouteLaunchKind::DecodeEquivalentVerifier, .physical_rows = rows,
                              .d_model = hidden_size, .num_experts = experts, .top_k = top_k}));
                     }
-                    std::vector<DeviceNativeVNNIMatrixDesc> gates(experts), ups(experts), downs(experts);
+                    std::vector<DeviceNativeQuantisedMatrixDesc> gates(experts), ups(experts), downs(experts);
                     std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(experts), fp_ups(experts), fp_downs(experts);
                     for (int expert = 0; expert < experts; ++expert)
                     {
@@ -209,23 +246,155 @@ namespace
                     ASSERT_GE(gateup_table, 0);
                     ASSERT_GE(down_table, 0);
 
-                    auto hidden = tensor(rows, hidden_size);
-                    auto indices = tensor(rows, top_k);
-                    auto weights = tensor(rows, top_k);
-                    auto output = tensor(rows, hidden_size);
-                    auto contributions = tensor(rows * top_k, hidden_size);
-                    auto reduced_output = tensor(rows, hidden_size);
+                    auto hidden = tensor(backing_rows, hidden_size);
+                    auto indices = tensor(backing_rows, top_k);
+                    auto weights = tensor(backing_rows, top_k);
+                    auto output = tensor(backing_rows, hidden_size);
+                    auto contributions = tensor(backing_rows * top_k, hidden_size);
+                    auto reduced_output = tensor(backing_rows, hidden_size);
                     auto live_count = tensor(1, 1); // INT32 publication, opaque to TensorBase.
                     auto *count = static_cast<int32_t *>(live_count->gpu_data_ptr());
                     ASSERT_TRUE(upload(hidden.get(), hidden_values.data(), hidden_values.size() * sizeof(float)));
-                    std::vector<float> route_ids(rows * top_k), route_weights(rows * top_k);
-                    for (int row = 0; row < rows; ++row)
+                    std::vector<float> route_ids(backing_rows * top_k), route_weights(backing_rows * top_k);
+                    for (int row = 0; row < backing_rows; ++row)
                         for (int route = 0; route < top_k; ++route)
                         {
                             route_ids[row * top_k + route] = (row * 3 + route) % experts;
                             route_weights[row * top_k + route] = shared ? 1.0f :
                                 static_cast<float>(route + 1) / 10.0f;
                         }
+
+                    // Authenticate the actual production stage's exact M=3
+                    // binding against larger retained tensors using the SAME
+                    // real GPU-prepared engines as the executed kernel oracle.
+                    // No runtime table or native-ready state is fabricated.
+                    decltype(tensor(1, 1)) stage_output;
+                    std::unique_ptr<IDeviceContext> stage_context;
+                    std::unique_ptr<MoEExpertComputeStage> exact_stage, full_stage;
+                    std::unique_ptr<IGPUGraphCapture> full_capture;
+                    GpuPreparedFFNFixture shared_prepared;
+                    std::unique_ptr<DeviceWorkspaceManager> shared_workspace;
+                    decltype(tensor(1, 1)) shared_gate_scratch, shared_up_scratch;
+                    std::unique_ptr<SharedExpertFFNStage> shared_stage;
+                    if (backing_rows > rows && shared)
+                    {
+                        // Use one actual production prepared store for the
+                        // three stage weights. Independent serial kernel rows
+                        // below retain the original same-weight oracle.
+                        const std::string prefix = std::string("test.cold_shared.") + format.label;
+                        if (floating)
+                        {
+                            shared_prepared.store = std::make_unique<PreparedWeightStore>(ModelContextId{9902});
+                            shared_prepared.gate_ref = registerGpuPreparedFloatingPointGemmInStore(
+                                source_weights[0].get(), device, prefix + ".gate",
+                                *shared_prepared.store, shared_prepared.orchestrators);
+                            shared_prepared.up_ref = registerGpuPreparedFloatingPointGemmInStore(
+                                source_weights[1].get(), device, prefix + ".up",
+                                *shared_prepared.store, shared_prepared.orchestrators);
+                            shared_prepared.down_ref = registerGpuPreparedFloatingPointGemmInStore(
+                                source_weights[2].get(), device, prefix + ".down",
+                                *shared_prepared.store, shared_prepared.orchestrators);
+                        }
+                        else
+                            shared_prepared = makeGpuPreparedFFNFixture(source_weights[0].get(),
+                                source_weights[1].get(), source_weights[2].get(), device, prefix);
+                        stage_output = tensor(backing_rows, hidden_size);
+                        shared_gate_scratch = tensor(backing_rows, width);
+                        shared_up_scratch = tensor(backing_rows, width);
+                        stage_context = IDeviceContext::create(device);
+                        SharedExpertFFNStage::Params params;
+                        params.device_id = device;
+                        params.input = hidden.get();
+                        params.output = stage_output.get();
+                        params.gate_w = source_weights[0].get();
+                        params.up_w = source_weights[1].get();
+                        params.down_w = source_weights[2].get();
+                        params.gate_scratch = shared_gate_scratch.get();
+                        params.up_scratch = shared_up_scratch.get();
+                        params.seq_len = rows;
+                        params.d_model = hidden_size;
+                        params.intermediate = width;
+                        params.active_row_count_device = count;
+                        params.force_grouped_verifier_prefill_for_decode = true;
+                        params.prepared_ref_gate = shared_prepared.gate_ref;
+                        params.prepared_ref_up = shared_prepared.up_ref;
+                        params.prepared_ref_down = shared_prepared.down_ref;
+                        params.prepared_store = shared_prepared.store.get();
+                        shared_stage = std::make_unique<SharedExpertFFNStage>(std::move(params));
+                        const auto shared_requirements = shared_stage->getWorkspaceRequirements(backing_rows,
+                            hidden_size, width);
+                        shared_workspace = std::make_unique<DeviceWorkspaceManager>(device,
+                            shared_requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
+                        ASSERT_TRUE(shared_workspace->allocate(shared_requirements));
+                        shared_stage->bindWorkspace(shared_workspace.get());
+                        ASSERT_TRUE(shared_stage->usesGroupedVerifierPrefillRouteForTesting());
+                        const int32_t unpublished = std::numeric_limits<int32_t>::min();
+                        ASSERT_TRUE(upload(live_count.get(), &unpublished, sizeof(unpublished)));
+                        ASSERT_TRUE(shared_stage->prepareGraphLaunch(stage_context.get(), stream));
+                        int32_t untouched = 0;
+                        ASSERT_TRUE(backend->deviceToHost(&untouched, count, sizeof(untouched), device.ordinal, stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                        ASSERT_EQ(untouched, unpublished) << "cold preparation must not publish controller state";
+                    }
+                    if (backing_rows > rows && !shared)
+                    {
+                        stage_output = tensor(backing_rows, hidden_size);
+                        stage_context = IDeviceContext::create(device);
+                        MoEExpertComputeStage::Params params;
+                        params.device_id = device;
+                        params.input = hidden.get();
+                        params.output = stage_output.get();
+                        params.seq_len = rows;
+                        params.d_model = hidden_size;
+                        params.num_experts = experts;
+                        params.top_k = top_k;
+                        params.expert_intermediate = width;
+                        params.routing_indices = indices.get();
+                        params.routing_weights = weights.get();
+                        params.active_row_count_device = count;
+                        params.output_registered_in_arena = false;
+                        params.require_device_routing_tensor_decode = true;
+                        params.force_decode_equivalent_verifier_prefill = true;
+                        params.expert_weight_resolution_policy =
+                            MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+                        params.expert_mask.assign(experts, true);
+                        for (int expert = 0; expert < experts; ++expert)
+                        {
+                            const size_t base = (expert % descriptors.size()) * 3;
+                            params.prepared_gate_gemm.push_back(prepared[base].kernel);
+                            params.prepared_up_gemm.push_back(prepared[base + 1].kernel);
+                            params.prepared_down_gemm.push_back(prepared[base + 2].kernel);
+                        }
+                        // Distinct immutable captured shapes share the SAME
+                        // admitted-capacity workspace and tensor identities.
+                        // The full shape dirties the suffix before exact M=3.
+                        auto full_params = params;
+                        full_params.seq_len = backing_rows;
+                        full_stage = std::make_unique<MoEExpertComputeStage>(std::move(full_params));
+                        full_stage->bindWorkspace(&workspace);
+                        ASSERT_TRUE(full_stage->prepareGraphLaunch(stage_context.get(), stream));
+                        const auto mask = params.expert_mask;
+                        const auto gates = params.prepared_gate_gemm;
+                        const auto ups = params.prepared_up_gemm;
+                        const auto downs = params.prepared_down_gemm;
+                        exact_stage = std::make_unique<MoEExpertComputeStage>(std::move(params));
+                        MoEExpertComputeStage::SparseOverlayInvocation invocation;
+                        invocation.input = hidden.get();
+                        invocation.routing_indices = indices.get();
+                        invocation.routing_weights = weights.get();
+                        invocation.output = stage_output.get();
+                        invocation.live_rows = backing_rows + 1;
+                        invocation.engine_binding_generation = 1;
+                        invocation.expert_mask = &mask;
+                        invocation.gate_engines = gates;
+                        invocation.up_engines = ups;
+                        invocation.down_engines = downs;
+                        EXPECT_FALSE(exact_stage->bindSparseOverlayInvocation(invocation));
+                        invocation.live_rows = rows;
+                        ASSERT_TRUE(exact_stage->bindSparseOverlayInvocation(invocation));
+                        exact_stage->bindWorkspace(&workspace);
+                        ASSERT_TRUE(exact_stage->prepareGraphLaunch(stage_context.get(), stream));
+                    }
 
                     // The independent M=1 oracle uses the ordinary decode API,
                     // not the grouped implementation that is under test.
@@ -242,8 +411,8 @@ namespace
                         gate_outputs.push_back(gate_storage.back().get());
                         up_outputs.push_back(up_storage.back().get());
                     }
-                    std::vector<float> serial(rows * hidden_size), one_row(hidden_size);
-                    for (int row = 0; row < rows; ++row)
+                    std::vector<float> serial(backing_rows * hidden_size), one_row(hidden_size);
+                    for (int row = 0; row < backing_rows; ++row)
                     {
                         ASSERT_TRUE(upload(row_hidden.get(), hidden_values.data() + row * hidden_size,
                                            hidden_size * sizeof(float)));
@@ -312,6 +481,21 @@ namespace
 
                     ASSERT_TRUE(upload(indices.get(), route_ids.data(), route_ids.size() * sizeof(float)));
                     ASSERT_TRUE(upload(weights.get(), route_weights.data(), route_weights.size() * sizeof(float)));
+                    if (full_stage)
+                    {
+                        ASSERT_TRUE(upload(live_count.get(), &backing_rows, sizeof(backing_rows)));
+                        ASSERT_TRUE(full_stage->execute(stage_context.get()));
+                        ASSERT_TRUE(backend->synchronizeStream(stream, 0));
+                        full_capture = context.createGraphCapture(stream);
+                        ASSERT_NE(full_capture, nullptr);
+                        {
+                            GraphCaptureGuard recording;
+                            ASSERT_TRUE(full_capture->beginCapture());
+                            ASSERT_TRUE(full_stage->execute(stage_context.get()));
+                            ASSERT_TRUE(full_capture->endCapture());
+                        }
+                        ASSERT_TRUE(full_capture->instantiate());
+                    }
                     ASSERT_TRUE(upload(live_count.get(), &rows, sizeof(rows)));
                     auto enqueue = [&]()
                     {
@@ -330,7 +514,9 @@ namespace
                                 gateup_table, down_table, rows, hidden_size, width, experts, top_k,
                                 contributions.get()) &&
                             kernel->reduceCanonicalRouteContributions(contributions.get(), reduced_output.get(),
-                                rows, top_k, hidden_size);
+                                rows, top_k, hidden_size) &&
+                            (!exact_stage || exact_stage->execute(stage_context.get())) &&
+                            (!shared_stage || shared_stage->execute(stage_context.get()));
                     };
                     // Materialize every persistent scratch view before recording.
                     ASSERT_TRUE(enqueue());
@@ -344,10 +530,43 @@ namespace
                         ASSERT_TRUE(capture->endCapture());
                     }
                     ASSERT_TRUE(capture->instantiate());
-                    std::vector<float> actual(serial.size());
-                    std::vector<float> reduced(serial.size());
-                    const std::vector<float> poison(serial.size(), std::numeric_limits<float>::quiet_NaN());
-                    const std::vector<float> route_poison(rows * top_k * hidden_size,
+                    if (device.is_rocm() && (std::string(format.label) == "Q5_1" ||
+                                              std::string(format.label) == "Q5_K"))
+                    {
+                        // Runtime HIP symbols are raw mangled names. Inspect
+                        // the actual retained graph, never infer its family
+                        // from a label or from the scalar oracle's success.
+                        std::vector<GPUGraphKernelNodeInfo> nodes;
+                        std::string error;
+                        ASSERT_TRUE(capture->inspectKernelNodes(nodes, &error)) << error;
+                        // Explicit authored cells independently require both native families.
+                        ASSERT_TRUE((hidden_size == 256 && width == 256) || hidden_size == 2560);
+                        const bool workers = hidden_size == 256 ||
+                            (width != 32 && (rows == 1 || (shared && rows == 3)));
+                        const std::string expected_symbol = workers
+                            ? "moe_grouped_down_publish_canonical_routes_prefill_kernelILi7ELi4EE"
+                            : "moe_grouped_down_publish_canonical_routes_prefill_kernelILi7ELi1EE";
+                        const auto canonical = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+                            return node.name_resolved && node.name.find(
+                                expected_symbol) != std::string::npos;
+                        });
+                        ASSERT_NE(canonical, nodes.end());
+                        ASSERT_NE(canonical->function_identity, 0u);
+                        ASSERT_EQ(canonical->block_x, workers ? 256u : 64u);
+                        ASSERT_EQ(canonical->static_shared_memory_bytes,
+                            workers ? size_t(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u);
+                        ASSERT_EQ(canonical->dynamic_shared_memory_bytes, 0u);
+                        ASSERT_EQ(canonical->local_memory_bytes_per_thread, 0u);
+                        ASSERT_EQ(canonical->block_y, 1u);
+                        ASSERT_EQ(canonical->block_z, 1u);
+                        ASSERT_EQ(canonical->grid_x, static_cast<unsigned>((hidden_size + 63) / 64));
+                        ASSERT_EQ(canonical->grid_y, static_cast<unsigned>(std::min(rows * top_k, 32)));
+                        ASSERT_EQ(canonical->grid_z, 1u);
+                    }
+                    std::vector<float> actual(backing_rows * hidden_size);
+                    std::vector<float> reduced(actual.size()), stage_actual(actual.size());
+                    const std::vector<float> poison(actual.size(), std::numeric_limits<float>::quiet_NaN());
+                    const std::vector<float> route_poison(backing_rows * top_k * hidden_size,
                         std::numeric_limits<float>::quiet_NaN());
                     // A complete coprime cycle visits EVERY live prefix,
                     // including each partial 4/8/12/16-row expert tile. A fixed
@@ -363,6 +582,31 @@ namespace
                         const int active = replay == 0 ? rows : (replay * 7) % (rows + 1);
                         visited_live_counts[active] = true;
                         SCOPED_TRACE(::testing::Message() << "replay=" << replay << " live=" << active);
+                        if (shared_stage && replay == replay_count / 2)
+                        {
+                            // Reused request storage may be dirty again. Reset
+                            // data and prepare the original stage without
+                            // rebuilding/rebinding its retained executable.
+                            shared_stage->resetSessionStatePreservingCapturedReplay();
+                            const int32_t unpublished = std::numeric_limits<int32_t>::max();
+                            ASSERT_TRUE(upload(live_count.get(), &unpublished, sizeof(unpublished)));
+                            ASSERT_TRUE(shared_stage->prepareGraphLaunch(stage_context.get(), stream));
+                            int32_t untouched = 0;
+                            ASSERT_TRUE(backend->deviceToHost(&untouched, count, sizeof(untouched), device.ordinal, stream));
+                            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                            ASSERT_EQ(untouched, unpublished);
+                        }
+                        if (full_capture)
+                        {
+                            ASSERT_TRUE(upload(indices.get(), route_ids.data(), route_ids.size() * sizeof(float)));
+                            ASSERT_TRUE(upload(weights.get(), route_weights.data(), route_weights.size() * sizeof(float)));
+                            ASSERT_TRUE(upload(live_count.get(), &backing_rows, sizeof(backing_rows)));
+                            ASSERT_TRUE(full_capture->launch());
+                            ASSERT_TRUE(observe(stage_output.get(), stage_actual));
+                            for (size_t index = 0; index < serial.size(); ++index)
+                                ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]), std::bit_cast<uint32_t>(serial[index]))
+                                    << "large captured shape before exact small replay index=" << index;
+                        }
                         auto active_ids = route_ids, active_weights = route_weights;
                         const auto row_live = [&](int row) {
                             // Shared rows are a prefix; routed participants can
@@ -382,6 +626,10 @@ namespace
                         ASSERT_TRUE(upload(output.get(), poison.data(), poison.size() * sizeof(float)));
                         ASSERT_TRUE(upload(reduced_output.get(), poison.data(), poison.size() * sizeof(float)));
                         ASSERT_TRUE(upload(contributions.get(), route_poison.data(), route_poison.size() * sizeof(float)));
+                        if (exact_stage)
+                            ASSERT_TRUE(upload(stage_output.get(), poison.data(), size_t(rows) * hidden_size * sizeof(float)));
+                        if (shared_stage)
+                            ASSERT_TRUE(upload(stage_output.get(), poison.data(), poison.size() * sizeof(float)));
                         // Every mutable projection bank begins dirty. Complete
                         // producers define consumed values before reading them;
                         // absent routes must reject unowned intermediate slots
@@ -412,6 +660,7 @@ namespace
                         ASSERT_TRUE(capture->launch());
                         ASSERT_TRUE(observe(output.get(), actual));
                         ASSERT_TRUE(observe(reduced_output.get(), reduced));
+                        if (exact_stage || shared_stage) ASSERT_TRUE(observe(stage_output.get(), stage_actual));
                         if (!floating)
                         {
                             const size_t private_bytes = borrowed ? 0 : size_t(rows) * hidden_size;
@@ -427,7 +676,7 @@ namespace
                                     << "gate/up duplicated original hidden rows into route-expanded scratch";
                             }
                         }
-                        for (size_t index = 0; index < actual.size(); ++index)
+                        for (size_t index = 0; index < size_t(rows) * hidden_size; ++index)
                         {
                             const float expected = row_live(static_cast<int>(index / hidden_size))
                                 ? serial[index] : 0.0f;
@@ -436,6 +685,22 @@ namespace
                             ASSERT_EQ(std::bit_cast<uint32_t>(reduced[index]), std::bit_cast<uint32_t>(expected))
                                 << "canonical publication row=" << index / hidden_size
                                 << " col=" << index % hidden_size;
+                            if (exact_stage || shared_stage)
+                                ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]),
+                                          std::bit_cast<uint32_t>(expected))
+                                    << "actual production expert stage row=" << index / hidden_size;
+                        }
+                        // Capacity suffix is neither work nor a publication.
+                        // Its exact poison bits must survive every live/empty
+                        // replay, including recovery after a zero-row reset.
+                        for (size_t index = size_t(rows) * hidden_size; index < actual.size(); ++index)
+                        {
+                            ASSERT_EQ(std::bit_cast<uint32_t>(actual[index]), std::bit_cast<uint32_t>(poison[index]));
+                            ASSERT_EQ(std::bit_cast<uint32_t>(reduced[index]), std::bit_cast<uint32_t>(poison[index]));
+                            if (exact_stage)
+                                ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]), std::bit_cast<uint32_t>(serial[index]));
+                            if (shared_stage)
+                                ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]), std::bit_cast<uint32_t>(poison[index]));
                         }
                         if (shared)
                         {
@@ -479,6 +744,41 @@ namespace
             }
     }
 
+    /**
+     * @test Cooperative Q5 canonical publication retains the original ordered partition bytes.
+     *
+     * K256 has only singleton partitions. These source-authentic cells include
+     * the production 20-block geometry, singleton final ranges, kparts1 and a
+     * whole-superblock Q5_K source. M9/topK4 crosses the 32-slot grid stride,
+     * so serial publication covers successive original slots; the narrow
+     * projection fixture separately proves four-worker shared-bank reuse.
+     * Existing capture/poison/live-prefix cycles
+     * and the independent ordinary M1 oracle remain the only execution owners.
+     */
+    TEST_P(MoELiveRows, CanonicalQ5PartitionGeometry)
+    {
+        auto formats = liveRowsFormats();
+        std::erase_if(formats, [](const WeightCase &format) {
+            return std::string(format.label) != "Q5_1" && std::string(format.label) != "Q5_K";
+        });
+        ASSERT_EQ(formats.size(), 2u) << "Focused Q5 selection must not silently disappear or broaden";
+        struct Geometry { const char *source; int width; int rows; };
+        const std::array<Geometry, 7> cells = {{{"Q5_1", 640, 1}, {"Q5_1", 640, 3}, {"Q5_1", 640, 9},
+            {"Q5_1", 608, 1}, {"Q5_1", 672, 1}, {"Q5_1", 32, 1}, {"Q5_K", 768, 1}}};
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        for (const auto &cell : cells)
+        {
+            SCOPED_TRACE(::testing::Message() << "source=" << cell.source << " K=" << cell.width << " M=" << cell.rows);
+            auto selected = formats;
+            std::erase_if(selected, [&](const WeightCase &format) { return std::string(format.label) != cell.source; });
+            ASSERT_EQ(selected.size(), 1u);
+            ASSERT_EQ(std::string(selected.front().label), cell.source);
+            ASSERT_NO_FATAL_FAILURE(proveLiveRows(device, context, selected,
+                /*hidden_size=*/2560, cell.width, cell.rows));
+        }
+    }
+
     /** @test Fused floating intermediates retain serial bytes for every live M. */
     TEST_P(MoELiveRows, FloatingMultiPartitionGeometry)
     {
@@ -504,6 +804,30 @@ namespace
                 proveLiveRows(DeviceId::rocm(0), GPUDeviceContextPool::instance().getAMDContext(0),
                               formats, hidden, intermediate);
         }
+    }
+
+    /** @test Exact three-row retained graphs use four-row storage without touching its suffix. */
+    TEST_P(MoELiveRows, ExactThreeRowsInFourRowCapacityAllFormats)
+    {
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        ASSERT_GT(backend->deviceCount(), 0) << "Explicit native regression requires its backend";
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        proveLiveRows(device, context, liveRowsFormats(), 256, 256, 3,
+                      InputSource::PrivateQuantizer, 4);
+    }
+
+    /** @test Cold preparation ignores unpublished live state, then captured replay owns every live prefix. */
+    TEST_P(MoELiveRows, ColdSharedPreparationAllFormats)
+    {
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        ASSERT_GT(backend->deviceCount(), 0) << "Explicit native regression requires its backend";
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        proveLiveRows(device, context, liveRowsFormats(), 256, 256, 3,
+                      InputSource::PrivateQuantizer, 4, ExpertCoverage::SharedOnly);
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, MoELiveRows, ::testing::Values("CUDA", "ROCm"),

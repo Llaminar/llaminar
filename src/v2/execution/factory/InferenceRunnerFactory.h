@@ -54,9 +54,11 @@
  * config.tp_ctx = tp_ctx.get();
  * auto runner = createInferenceRunner(model_ctx, nullptr, DeviceId::cuda(0), config);
  * @endcode
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
+#include "TestableInferenceRunnerOverrides.h"
 
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../../loaders/ModelContext.h"
@@ -78,6 +80,10 @@
 
 namespace llaminar2
 {
+    class IGlobalTPContext;
+
+    class RetainedHostServiceDeclarations;
+
     // Forward declarations to avoid pulling in full headers
     class DeviceGraphOrchestrator;
     class ITPContext;
@@ -109,6 +115,13 @@ namespace llaminar2
     {
         int max_seq_len = 4096;
         int activation_seq_len = 0;
+        /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
+        /// Immutable admitted participant programs, copied into both factory paths.
+        std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
+            attention_participants;
+        /** Authored ordinary output demand, frozen before factory materialization. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
         int batch_size = 1;
 
         // Explicit graph path selection (only graph path is supported)
@@ -138,6 +151,12 @@ namespace llaminar2
 
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
+        ImmutableRowTablePolicy ngram_table_policy; ///< One rank-owned native PLE table policy.
+        ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled; ///< Same pre-admission phase policy.
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
+        std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> ngram_replicated_ple_cohort; ///< Borrowed actual Rank source/cohort declaration. ///< Exact PMA-selected rank placement.
 
         /// Multi-token prediction feature gates and verification mode.
         MTPRuntimeConfig mtp;
@@ -240,6 +259,8 @@ namespace llaminar2
          */
         std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
             moe_expert_overlay_participant_residency;
+        /** Original CPU expert-domain context; participant-local graph edges borrow, never recreate it. */
+        std::shared_ptr<IGlobalTPContext> moe_expert_overlay_cpu_joint_context;
 
         /**
          * @brief Shared histogram lifetime consumed by the residency authority.
@@ -320,6 +341,9 @@ namespace llaminar2
             InferenceRunnerConfig config;
             config.max_seq_len = runtime.max_seq_len;
             config.activation_seq_len = runtime.resident_graph_rows;
+            config.attention_participants = runtime.attention_participants;
+            config.cpu_serial_expert_storage = runtime.cpu_serial_expert_storage;
+            config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
             config.batch_size = runtime.batch_size;
             config.activation_precision = runtime.activation_precision;
             config.kv_cache_precision = runtime.kv_cache_precision;
@@ -335,6 +359,10 @@ namespace llaminar2
             config.moe_routed_prefill = runtime.moe_routed_prefill;
             config.moe_rebalance = runtime.moe_rebalance;
             config.prefix_cache = runtime.prefix_cache;
+            config.ngram_table_policy = runtime.ngram_table_policy;
+            config.ngram_lookup_schedule = runtime.ngram_lookup_schedule;
+            config.ngram_table_placement = runtime.ngram_table_placement;
+            config.retained_host_services = runtime.retained_host_services;
             config.mtp = runtime.mtp;
             return config;
         }
@@ -365,6 +393,8 @@ namespace llaminar2
      * @param model_ctx Model context interface (can be MockModelContext)
      * @param device Target device
      * @param config Runner configuration
+     * @param test_overrides Explicit model-light allocation admission after final graph resolution;
+     *        rejected for concrete ModelContext and required to return a non-null issuer.
      * @return Unique pointer to IInferenceRunner, or nullptr on failure
      *
      * @code
@@ -379,7 +409,8 @@ namespace llaminar2
     std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
-        const InferenceRunnerConfig &config = {});
+        const InferenceRunnerConfig &config = {},
+        const TestableInferenceRunnerOverrides &test_overrides = {});
 
     /**
      * @brief Freeze one tiered-overlay plan for the graph family that will run.

@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "../execution/moe/DeviceMoERuntimeABI.h"
+
 namespace llaminar2
 {
     namespace mpi_tags
@@ -109,18 +111,18 @@ namespace llaminar2
         // MoE Expert Weight Transfer Tags
         // ============================================================================
         // Two-phase protocol: size exchange (blocking) then data exchange (non-blocking).
-        // Size tags:  10000 + layer * 256 + expert_id          → max ~26k
-        // Data tags: 100000 + layer * 256 * 3 + expert * 3 + proj → max ~149k
+        // Size tags:  10000 + layer * 512 + expert_id          → max ~43k
+        // Data tags: 100000 + layer * 512 * 3 + expert * 3 + proj → max ~198k
 
-        constexpr int WEIGHT_TRANSFER_SIZE = 10000;  // [10000-25999] size exchange
-        constexpr int WEIGHT_TRANSFER_DATA = 100000; // [100000-149999] data exchange
-        constexpr int MAX_EXPERTS_PER_TAG = 256;     // Maximum experts for tag computation
+        constexpr int WEIGHT_TRANSFER_SIZE = 10000;  // [10000-42767] size exchange
+        constexpr int WEIGHT_TRANSFER_DATA = 100000; // [100000-198303] data exchange
+        constexpr int MAX_EXPERTS_PER_TAG = moe_runtime_abi::kMaxExperts;     // Maximum experts from the shared runtime ABI
 
         /**
          * @brief Tag for weight transfer SIZE exchange (Phase A).
          * @param layer      MoE layer index (0-based)
          * @param expert_id  Expert index (0-based, < MAX_EXPERTS_PER_TAG)
-         * @return Unique tag in [WEIGHT_TRANSFER_SIZE, WEIGHT_TRANSFER_SIZE + 16383]
+         * @return Unique tag in [WEIGHT_TRANSFER_SIZE, WEIGHT_TRANSFER_SIZE + 32767]
          */
         inline constexpr int weightTransferSizeTag(int layer, int expert_id)
         {
@@ -132,7 +134,7 @@ namespace llaminar2
          * @param layer      MoE layer index (0-based)
          * @param expert_id  Expert index (0-based, < MAX_EXPERTS_PER_TAG)
          * @param proj       Projection index: 0=gate, 1=up, 2=down
-         * @return Unique tag in [WEIGHT_TRANSFER_DATA, WEIGHT_TRANSFER_DATA + 49151]
+         * @return Unique tag in [WEIGHT_TRANSFER_DATA, WEIGHT_TRANSFER_DATA + 98303]
          */
         inline constexpr int weightTransferDataTag(int layer, int expert_id, int proj)
         {

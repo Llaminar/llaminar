@@ -4,6 +4,8 @@
  *
  * Tests that StageRunnerFactory builds the correct runner type for each stage
  * variant: single-device, local TP, and global TP (via injected context).
+ * Singleton stages retain an explicit full dense assignment so shared model
+ * preparation cannot inherit a preceding stage's narrower TP source windows.
  *
  * Acceptance criteria (Phase 3):
  * - Single-device stage: non-null runner, correct stage_id/domain, pp_stage_config,
@@ -26,9 +28,11 @@
 #include "execution/global/StageRunnerFactory.h"
 #include "execution/global/DomainCommunicatorRegistry.h"
 #include "collective/GlobalTPContext.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/TensorClasses.h"
 #include "mocks/MockModelContext.h"
+#include "utils/CPUFactoryTestAdmission.h"
 
 namespace llaminar2::test
 {
@@ -76,6 +80,8 @@ namespace llaminar2::test
         ctx.runtime.max_seq_len = 128;
         ctx.runtime.batch_size = 1;
         ctx.prepared_weight_store = std::make_shared<PreparedWeightStore>();
+        ctx.test_runner_overrides = cpuFactoryTestAdmission(
+            ctx.model_ctx,ctx.runtime.batch_size,ctx.runtime.max_seq_len);
         ctx.domain_registry = registry;
         return ctx;
     }
@@ -224,6 +230,15 @@ namespace llaminar2::test
         ASSERT_NE(entry.weight_context, nullptr);
         EXPECT_NE(entry.weight_context->prepared_store, nullptr);
         EXPECT_EQ(entry.weight_context->stage_id, entry.stage_id);
+        const auto* graph=dynamic_cast<const DeviceGraphOrchestrator*>(entry.runner.get());
+        ASSERT_NE(graph,nullptr);
+        const auto& dense=graph->graphBuilder()->config();
+        ASSERT_TRUE(dense.tp_config);
+        EXPECT_EQ(dense.tp_config->worldSize(),1);
+        EXPECT_EQ(dense.tp_config->forRank(0).head_count,dense.n_heads);
+        EXPECT_EQ(dense.tp_config->forRank(0).kv_head_count,dense.n_kv_heads);
+        EXPECT_EQ(dense.tp_config->forRank(0).vocab_count,dense.vocab_size);
+        EXPECT_FALSE(dense.qkv_column_parallel);
     }
 
     TEST(Test__StageRunnerFactory, SingleDevice_TailStage)

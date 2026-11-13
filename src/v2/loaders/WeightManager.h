@@ -10,6 +10,11 @@
  * For SHARDED strategy, weights are partitioned based on model-specific
  * sharding configuration defined in the model's schema (e.g., Qwen2Schema).
  * This keeps WeightManager generic and model-agnostic.
+ * Parallel participant setup retains immutable TP assignment snapshots. Atomic
+ * publication prevents a reconfiguration from invalidating another builder's
+ * weight-slicing declaration, without serializing participant construction.
+ * Typed cache identities distinguish CPU logical TP shards in one host address
+ * space while preserving ordinary unsharded and GPU device cache ownership.
  *
  * @see GraphSchema.h for WeightShardingConfig structure
  * @see models/qwen/Qwen2Schema.h for Qwen2-specific sharding patterns
@@ -18,6 +23,8 @@
  */
 
 #pragma once
+#include "gpu_pipeline/ReleasedWeightLoadStaging.h"
+#include <map>
 
 #include "ExpertGemmRegistry.h"
 #include "IModelLoader.h"
@@ -39,6 +46,7 @@
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -74,6 +82,8 @@ namespace llaminar2
      *   auto wq = mgr->getWeightForDevice("blk.0.attn_q.weight", device_idx);
      *   auto wk = mgr->getWeightForDevice("blk.0.attn_k.weight", device_idx);
      */
+    struct CPUPreparedWeightSource;
+
     class WeightManager : public IWeightManager
     {
     public:
@@ -189,6 +199,7 @@ namespace llaminar2
          * @param admission Whether to create exact prepared engines or adopt a
          *        complete set certified by the model-context reuse lifecycle.
          *        Certified adoption never falls back to source materialization.
+         * @param original_preparation SAME retained setup source authority; mandatory for CPU joint mode.
          * @return true after all scoped requests have been prepared.
          */
         bool prepareMoEExpertOverlayWeights(
@@ -197,7 +208,27 @@ namespace llaminar2
             const FrozenModelWeightSet *frozen_weights = nullptr,
             const MoEExpertOverlayExecutionPlan *execution_plan = nullptr,
             PreparedWeightAdmission admission =
-                PreparedWeightAdmission::AllocateCompleteSet);
+                PreparedWeightAdmission::AllocateCompleteSet,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> original_preparation = {});
+
+        /**
+         * @brief Prepare only the exact logical participants owned by one graph.
+         * @param runtime_plan Original retained overlay source.
+         * @param graph_scope Required source-bound selection used for source materialization.
+         * @param frozen_weights Exact immutable graph source bindings.
+         * @param execution_plan Optional rank authority applied before logical scope.
+         * @param admission Explicit allocate or certified-reuse lifecycle.
+         * @param original_preparation SAME retained setup source authority; mandatory for CPU joint mode.
+         * @return True after every selected request is prepared; missing bindings fail.
+         * @throws std::invalid_argument For foreign source or endpoint scope.
+         */
+        bool prepareMoEExpertOverlayWeightsForGraph(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            const MoEExpertOverlayGraphScope &graph_scope,
+            const FrozenModelWeightSet *frozen_weights,
+            const MoEExpertOverlayExecutionPlan *execution_plan,
+            PreparedWeightAdmission admission,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> original_preparation = {});
 
         /**
          * @brief Prepare weights for a single device, filtered to a layer range
@@ -259,11 +290,12 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Pack all GEMM weights for a target device
+         * @brief Prepare cache-owned primary GEMM weights for a CPU device.
          *
-         * Creates GEMM kernels for all GEMM weights and calls prepareWeights()
-         * on each kernel. For GPU kernels, this uploads weights to device memory.
-         * For CPU kernels, this is typically a no-op (packing is lazy).
+         * The model's prepared store retains each admitted final pack before
+         * optional raw source retirement. Repeated preparation shares that
+         * allocation. Other persistent owners use the frozen-weight overload
+         * of prepareWeightsForDevice; GPU devices use the loading pipeline.
          *
          * @param target_device Target device for weight packing
          * @param progress_cb Optional callback for progress reporting
@@ -287,6 +319,13 @@ namespace llaminar2
          * @param layer_filter Optional filter for specific layers
          * @return true if all GEMM weights were loaded successfully
          */
+        /** @brief Borrow a drained ordinary-loader slot for setup-only native table upload.
+         * @param device Exact GPU already prepared by this weight manager.
+         * @return Original slot/authority receipt, never newly resolved geometry.
+         * @throws std::logic_error If preparation did not publish released staging.
+         */
+        [[nodiscard]] ReleasedWeightLoadStaging releasedWeightLoadStaging(DeviceId device) const;
+
         bool packGemmWeightsViaPipeline(
             DeviceId target_device,
             std::function<bool(const std::string &)> layer_filter = nullptr,
@@ -436,7 +475,7 @@ namespace llaminar2
             // Tensor parallel config
             if (config.hasTensorParallelConfig())
             {
-                tp_config_ = config.tp_config;
+                tp_config_.store(config.tp_config, std::memory_order_release);
             }
 
             if (!config.routed_expert_assignment.valid())
@@ -532,6 +571,18 @@ namespace llaminar2
         WeightMetadataRegistry *weightMetadataRegistry() const { return weight_metadata_.get(); }
 
         /**
+         * @brief Inspect native source bytes without materializing a CPU consumer.
+         * @param name Exact original tensor name in the sealed loader directory.
+         * @return Row-padded native bytes, or zero for an absent optional source.
+         * @throws std::invalid_argument For invalid original source geometry.
+         * @throws std::overflow_error Before any dimension or byte product wraps.
+         * @note This is source metadata, not prepared storage or an allocation claim.
+         */
+        size_t originalWeightSourceBytes(const std::string &name) const;
+
+
+
+        /**
          * @brief Set the expert weight payload provider.
          *
          * Used by MoE stages to track which experts have been prepared/transferred.
@@ -560,6 +611,16 @@ namespace llaminar2
          */
         bool hostDataRequired(const TensorBase *tensor, const std::string &key) const;
 
+        /**
+         * @brief Materialize exactly the immutable sources declared by a weight plan.
+         * @param plan Required identities, physical slices and participant ownership.
+         * @return Frozen bindings retaining the declared source and slice lifetimes.
+         * @throws std::runtime_error If a required source is absent or an explicit
+         *         expert selection cannot supply its exact compact tensor geometry.
+         *
+         * An explicit expert selection never substitutes the complete parent:
+         * its physical expert slots must match the binding's logical ownership.
+         */
         FrozenModelWeightSet materialize(const WeightPlan &plan);
 
         /**
@@ -669,18 +730,27 @@ namespace llaminar2
          * heterogeneous tensor parallelism where devices get proportional work.
          *
          * @param config Tensor parallelism configuration with device assignments
+         * Existing readers retain their immutable assignment until their operation
+         * completes; cache invalidation uses the same cache lock as weight lookup.
          */
         void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
         {
-            tp_config_ = std::move(config);
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            tp_config_.store(std::move(config), std::memory_order_release);
             cache_.clear(); // Invalidate cache since slices may change
         }
 
         /**
-         * @brief Get tensor parallelism configuration
-         * @return Pointer to config, or nullptr if not set
+         * @brief Retain the immutable tensor parallelism assignment for one operation.
+         * @return Owning snapshot, or an empty owner when no assignment is installed.
+         * Publication may replace the manager's owner during parallel graph setup.
+         * Callers retain this value through every use; a borrowed raw pointer would
+         * dangle when another participant republishes its validated configuration.
          */
-        const TensorParallelConfig *tensorParallelConfig() const { return tp_config_.get(); }
+        std::shared_ptr<const TensorParallelConfig> tensorParallelConfig() const
+        {
+            return tp_config_.load(std::memory_order_acquire);
+        }
 
         /**
          * @brief Check if a weight is sharded (only valid for SHARDED strategy)
@@ -941,21 +1011,53 @@ namespace llaminar2
         }
 
     private:
-        /** @brief Execute one already-compiled role-specific preparation transaction. */
+        /**
+         * @brief Compile explicit bulk or graph-scoped preparation into the shared backend.
+         * @param runtime_plan Retained complete overlay source.
+         * @param target_device Physical execution device.
+         * @param frozen_weights Exact prepared-source lifetime authority.
+         * @param execution_plan Optional current-rank authority.
+         * @param admission Allocation or certified-reuse lifecycle.
+         * @param graph_scope Exact graph scope, or explicit existing device-wide operation.
+         * @param original_preparation Retained setup source authority, mandatory only for CPU joint mode.
+         * @return True after the shared preparation backend completes every request.
+         */
+        bool prepareMoEExpertOverlayWeightsWithScope(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            DeviceId target_device,
+            const FrozenModelWeightSet *frozen_weights,
+            const MoEExpertOverlayExecutionPlan *execution_plan,
+            PreparedWeightAdmission admission,
+            const std::optional<MoEExpertOverlayGraphScope> &graph_scope,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> original_preparation);
+
+        /**
+         * @brief Execute one already-compiled role-specific preparation transaction.
+         * @param runtime_plan Immutable source authenticated by graph scope.
+         * @param preparation_plan Complete source-authenticated role requests.
+         * @param target_device Actual graph or complete device-wide preparation endpoint.
+         * @param frozen_weights Immutable exact physical source bindings.
+         * @param execution_plan Optional rank ownership filter.
+         * @param admission Allocation or certified-reuse lifecycle.
+         * @param graph_scope Required for participant-local graph calls; absent for bulk calls.
+         * @return True only when all selected requests have prepared engines.
+         * @throws std::invalid_argument For stale source or device identity.
+         */
         bool prepareMoEExpertOverlayWeightsFromPlan(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
             MoEExpertOverlayPreparationPlan preparation_plan,
             DeviceId target_device,
             const FrozenModelWeightSet *frozen_weights,
             const MoEExpertOverlayExecutionPlan *execution_plan,
-            PreparedWeightAdmission admission);
+            PreparedWeightAdmission admission,
+            const std::optional<MoEExpertOverlayGraphScope> &graph_scope);
 
         /**
          * @brief Load weight with replicated strategy
          *
          * Each rank loads full tensor independently.
          */
-        std::shared_ptr<TensorBase> getReplicatedWeight(const std::string &name, DeviceId device);
+        std::shared_ptr<TensorBase> getReplicatedWeight(const std::string &name, DeviceId device, int original_tp_rank = -1);
 
         /**
          * @brief Load weight with sharded strategy
@@ -1084,10 +1186,81 @@ namespace llaminar2
             const WeightSliceSpec &logical_slice,
             WeightDerivationKind logical_derivation);
 
+        /** @brief Resolve a declared GPU preparation input from its genuine original CPU source owner.
+         * @param requirement Original GPU execution target and explicit CPU lookup declaration.
+         * @param name Sealed physical source name from that requirement.
+         * @return Original source owner/TP source descriptor, or null for an absent optional tensor.
+         * @throws std::invalid_argument For missing lookup/TP authority, foreign residence or a CPU final-consumer handle.
+         * @note Retired source metadata may reach exact prepared reuse; the actual consumer requires live bytes on a miss.
+         * @note This never invokes CPU final population or creates a CPU prepared owner.
+         */
+        std::shared_ptr<TensorBase> originalGPUPreparationSource(const WeightRequirement &requirement,
+            const std::string &name);
+
+        /** @brief Authenticate an indexed CPU final value against its actual retained Store binding/root.
+         * @param tensor Final value or metadata-only TensorSlice wrapper.
+         * @param device Exact original CPU allocator of the cache entry.
+         * @param original_store Store owner captured with the cache entry, validated outside the manager mutex.
+         * @return True only for the original model/PMA/source-bound completed owner; no readiness is minted.
+         */
+        bool hasOriginalCPUFinalOwner(const std::shared_ptr<TensorBase> &tensor,DeviceId device,
+            const std::shared_ptr<PreparedWeightStore> &original_store) const;
+
+        /** @brief Commit a legacy rectangular CPU request through the canonical bounded source consumer.
+         * @param name Sealed original source name.
+         * @param device Exact original CPU allocator.
+         * @param derivation Original source or authored slice purpose.
+         * @param slice Original source coordinates; an empty slice denotes the complete matrix/vector.
+         * @param assembly Optional ordered original native stripes forming one dense final consumer.
+         * @param original_tp_rank Original retained TP participant, or -1 for an unsharded source.
+         * @return Actual final tensor or prepared-only metadata retaining the committed engine.
+         * @throws std::logic_error If original model/PMA authority is absent or a raw expert parent is requested.
+         */
+        std::shared_ptr<TensorBase> loadCPUWeightRange(const std::string &name,DeviceId device,
+            WeightDerivationKind derivation,WeightSliceSpec slice,
+            std::optional<NativeWeightSourceAssembly> assembly = {}, int original_tp_rank = -1);
+
+        /**
+         * @brief Populate one final CPU consumer from exact original native ranges.
+         * @param original Plan-owned identity/selection without a materialized source tensor.
+         * @param name Same original physical source name owned by the sealed loader.
+         * @param source Exact original source geometry/range and resolved execution policy.
+         * @param memory_owner Original admitted persistent weight family.
+         * @param placement Same declared final/source NUMA policy for this source owner.
+         * @param budget Existing common CPU source/preparation staging cap.
+         * @return Committed real final tensor/engine binding after transient source retirement.
+         */
+        WeightBinding prepareCPUWeightSource(WeightBinding original, const std::string &name,
+            CPUPreparedWeightSource source, PhysicalMemoryOwner memory_owner,
+            CPUStoragePlacement placement, std::optional<size_t> budget);
+
+        /**
+         * @brief Bind implicit dense CPU source windows to their original TP assignment.
+         * @param requirement Immutable graph plan requirement, possibly already explicitly sliced.
+         * @param tp_config Same original assignment snapshot retained by materialization.
+         * @return Derived exact native range/assembly, or no replacement for an already complete declaration.
+         */
+        std::optional<WeightRequirement> projectCPUDenseTPRequirement(
+            const WeightRequirement &requirement,
+            const std::shared_ptr<const TensorParallelConfig> &tp_config) const;
+
+        /** @brief Populate ordinary complete or selected CPU sources through the shared consumer transaction.
+         * @param requirement Original source/range/role declaration.
+         * @param strategy Same original model identity as the frozen plan.
+         * @param memory_owner Existing persistent allocation family from that plan.
+         * @param budget Existing shared native source/conversion cap.
+         * @param builder Enclosing frozen publication, after actual consumer commit.
+         * @param original_tied_source Exact unambiguous source requirement borrowed from the SAME plan, if present.
+         */
+        void materializeCPURequirement(const WeightRequirement &requirement,const InferenceStrategy &strategy,
+            PhysicalMemoryOwner memory_owner,std::optional<size_t> budget,ModelWeightSetBuilder &builder,
+            const ExpertGemmRegistry::StaticProjectionLayer *existing = nullptr,
+            const WeightRequirement *original_tied_source = nullptr);
+
         IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
         std::shared_ptr<IMPIContext> mpi_ctx_;                                      ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
-        std::shared_ptr<TensorParallelConfig> tp_config_;                           ///< Tensor parallelism configuration (optional)
+        std::atomic<std::shared_ptr<const TensorParallelConfig>> tp_config_;       ///< Published immutable TP assignment; readers retain one owner per operation.
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
         WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
@@ -1126,7 +1299,25 @@ namespace llaminar2
         bool has_gdn_dimensions_ = false; ///< True if setGDNDimensions() was called
 
         // Decode weight shard cache (separate from prefill cache)
-        std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
+        /** @brief Exact decode source request identity; storage is still owned solely by the prepared Store. */
+        struct DecodeWeightCacheKey {
+            std::string name;
+            DeviceId device;
+            uint32_t fraction_bits; ///< Exact validated float words, never a rounded diagnostic spelling.
+            ShardingMode mode; ///< Original source slicing axis/replication policy.
+            bool operator==(const DecodeWeightCacheKey &) const = default;
+        };
+        /** @brief Hash only immutable source-request identity, never allocation or residency balances. */
+        struct DecodeWeightCacheKeyHash {
+            size_t operator()(const DecodeWeightCacheKey &key) const noexcept {
+                size_t hash=std::hash<std::string>{}(key.name);
+                for(const size_t value:{std::hash<DeviceId>{}(key.device),std::hash<uint32_t>{}(key.fraction_bits),
+                    std::hash<int>{}(static_cast<int>(key.mode))})
+                    hash^=value+0x9e3779b9U+(hash<<6U)+(hash>>2U);
+                return hash;
+            }
+        };
+        std::unordered_map<DecodeWeightCacheKey,std::shared_ptr<TensorBase>,DecodeWeightCacheKeyHash> decode_cache_; ///< Borrowed final decode handles, qualified by exact source request.
 
         std::shared_ptr<WeightMetadataRegistry> weight_metadata_;
         ExpertWeightPayloadProvider *expert_payload_provider_ = nullptr; ///< Optional, model-context owned
@@ -1287,9 +1478,77 @@ namespace llaminar2
         /// Progress tracker for weight loading (shared across devices)
         std::shared_ptr<WeightLoadProgress> weight_load_progress_;
 
-        /// Key: "device_type:ordinal:weight_name" e.g. "cuda:0:token_embd.weight"
-        /// Value: Device-specific tensor clone, uploaded to that device
-        std::unordered_map<std::string, std::shared_ptr<TensorBase>> per_device_cache_;
+        /**
+         * @brief One physical-device weight or a logical CPU TP participant's weight.
+         *
+         * CPU NUMA participants and host-staged GPU sources share DeviceId::cpu(),
+         * so their immutable TP assignment rank is required in addition to
+         * storage identity. GPU storage identities already distinguish their participants. Unsharded
+         * requests never alias a rank-qualified CPU shard.
+         */
+        struct DeviceWeightCacheKey
+        {
+            DeviceId device;
+            std::string name;
+            std::optional<int> cpu_tp_rank;
+            std::shared_ptr<const TensorParallelConfig> cpu_tp_owner; ///< Retained original assignment authority prevents stale geometry reuse at the same rank.
+
+            /** @return Exact equality of storage, canonical name and participant. */
+            bool operator==(const DeviceWeightCacheKey &other) const {
+                return device==other.device && name==other.name && cpu_tp_rank==other.cpu_tp_rank &&
+                    cpu_tp_owner.get()==other.cpu_tp_owner.get() &&
+                    !cpu_tp_owner.owner_before(other.cpu_tp_owner) && !other.cpu_tp_owner.owner_before(cpu_tp_owner);
+            }
+            /** @return Diagnostic spelling only; cache operations never parse it. */
+            std::string describe() const
+            {
+                return device.to_string() +
+                    (cpu_tp_rank ? "[tp_rank=" + std::to_string(*cpu_tp_rank) + "]" : "") +
+                    ":" + name;
+            }
+            /**
+             * @brief Construct ordinary device identity for unsharded/GPU access.
+             * @param device Actual storage endpoint.
+             * @param name Canonical requested weight name.
+             * @return Identity with no CPU TP participant.
+             */
+            static DeviceWeightCacheKey forDevice(DeviceId device, const std::string &name)
+            { return {device, name, std::nullopt}; }
+            /**
+             * @brief Preserve logical shard ownership in shared host storage.
+             * @param device Actual storage endpoint, which may be CPU during preparation.
+             * @param name Canonical requested weight name.
+             * @param assignment Retained canonical TP participant assignment.
+             * @param original_tp Exact retained immutable TP declaration supplying this assignment.
+             * @return Device identity plus logical rank/owner whenever actual storage is CPU.
+             * @details GPU participants can explicitly stage distinct sources on CPU.
+             * Their execution device cannot identify those shared host cache slots.
+             */
+            static DeviceWeightCacheKey forAssignment(DeviceId device, const std::string &name,
+                                                       const DeviceShardingAssignment &assignment,
+                                                       std::shared_ptr<const TensorParallelConfig> original_tp)
+            {
+                return {device, name, device.is_cpu()
+                    ? std::optional<int>{assignment.local_rank} : std::nullopt,
+                    device.is_cpu()?std::move(original_tp):nullptr};
+            }
+        };
+        /** @brief Hash every typed cache identity field without string encodings. */
+        struct DeviceWeightCacheKeyHash
+        {
+            /** @return Combined storage/name/participant hash; equality remains authoritative. */
+            size_t operator()(const DeviceWeightCacheKey &key) const noexcept
+            {
+                size_t hash=std::hash<DeviceId>{}(key.device);
+                for(const size_t value:{std::hash<std::string>{}(key.name),
+                                       std::hash<std::optional<int>>{}(key.cpu_tp_rank),
+                                       std::hash<const void*>{}(key.cpu_tp_owner.get())})
+                    hash ^= value + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                return hash;
+            }
+        };
+        std::unordered_map<DeviceWeightCacheKey, std::shared_ptr<TensorBase>,
+                           DeviceWeightCacheKeyHash> per_device_cache_;
 
         /// First device that requested weights - original tensors are used for this device
         std::optional<DeviceId> first_device_;
@@ -1337,10 +1596,11 @@ namespace llaminar2
          *
          * @param name Weight tensor name (to determine weight type)
          * @param total_rows Total number of rows in the weight
+         * @param assignment_config The caller's retained immutable assignment for this entire load.
          * @return {start_row, num_rows} pair for this rank's slice
          */
         std::pair<size_t, size_t> calculateProportionalColumnSlice(
-            const std::string &name, size_t total_rows) const;
+            const std::string &name, size_t total_rows, const TensorParallelConfig &assignment_config) const;
 
         /**
          * @brief Calculate proportional row slice for this rank
@@ -1350,10 +1610,11 @@ namespace llaminar2
          *
          * @param name Weight tensor name (to determine weight type)
          * @param total_cols Total number of columns in the weight
+         * @param assignment_config The caller's retained immutable assignment for this entire load.
          * @return {start_col, num_cols} pair for this rank's slice
          */
         std::pair<size_t, size_t> calculateProportionalRowSlice(
-            const std::string &name, size_t total_cols) const;
+            const std::string &name, size_t total_cols, const TensorParallelConfig &assignment_config) const;
 
     public:
         // =========================================================================
@@ -1409,6 +1670,7 @@ namespace llaminar2
          * @param name Weight tensor name
          * @param total_size Total size of the dimension to slice
          * @param assignment Device's sharding assignment
+         * @param tp_config Same retained original configuration that supplied the assignment.
          * @param out_start Output: start index for slicing
          * @param out_count Output: count of elements to include
          * @return true if boundaries computed successfully, false on error
@@ -1417,6 +1679,7 @@ namespace llaminar2
             const std::string &name,
             size_t total_size,
             const DeviceShardingAssignment &assignment,
+            const TensorParallelConfig &tp_config,
             size_t &out_start,
             size_t &out_count) const;
 
@@ -1519,7 +1782,19 @@ namespace llaminar2
          * that shard.
          */
         GDNHeadAssignment gdnHeadAssignmentFor(
-            const DeviceShardingAssignment &assignment) const;
+            const DeviceShardingAssignment &assignment, const TensorParallelConfig &tp_config) const;
+
+        /**
+         * @brief Resolve ordered native source rows for an ordinary or linked GDN fused projection.
+         * @param name Canonical original source name.
+         * @param total_rows Full GGUF N extent of the fused source.
+         * @param assignment Exact original participant assignment.
+         * @param tp_config Configuration retained alongside that assignment.
+         * @return Original ordered Q, K and V row intervals.
+         */
+        std::vector<GDNHeadSpan> fusedQKVSourceSpans(
+            const std::string &name, size_t total_rows, const DeviceShardingAssignment &assignment,
+            const std::shared_ptr<const TensorParallelConfig> &tp_config) const;
 
         /**
          * @brief Resolve economical modulo-linked ownership for equal-rank TP.
@@ -1556,7 +1831,7 @@ namespace llaminar2
             const std::string &name,
             DeviceId device,
             const std::vector<GDNHeadSpan> &spans,
-            size_t source_cols);
+            size_t source_cols, int original_tp_rank = -1);
 
         /**
          * @brief Load and row-wise concatenate non-contiguous source columns.
@@ -1569,7 +1844,7 @@ namespace llaminar2
             const std::string &name,
             DeviceId device,
             const std::vector<GDNHeadSpan> &spans,
-            size_t source_rows);
+            size_t source_rows, int original_tp_rank = -1);
 
         /**
          * @brief Load a TP GDN fused [Q|K|V] tensor in linked local order.
@@ -1673,6 +1948,9 @@ namespace llaminar2
 
         /** Exact weak ownership of every finalized GPU weight pool. */
         PreparedDeviceAllocationLedger prepared_device_allocations_;
+        /** Released setup geometry only; these receipts own no live allocation/capacity ledger. */
+        std::map<DeviceId, ReleasedWeightLoadStaging> released_weight_load_staging_;
+
 
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility

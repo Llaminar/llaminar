@@ -7,6 +7,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
 
 #include "../../utils/MTPParitySnapshotContext.h"
 
@@ -320,6 +321,36 @@ namespace llaminar2::test::parity
         EXPECT_FALSE(
             selectMTPParityCheckpointAcceptedDraftReference(13, serial, rows, rejected)
                 .has_value());
+    }
+
+    /** A rejecting adaptive workload cannot certify an unrelated accepting edge. */
+    TEST(Test__MTPParitySnapshotContext,
+         DynamicAcceptanceUsesIndependentAuthenticatedCheckpoint)
+    {
+        constexpr std::array<int32_t, 5> reference = {13, 271, 71093, 3841, 13477};
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 271},
+            MTPParityCertifiedDecodeRow{1u, 271, 71093},
+            MTPParityCertifiedDecodeRow{2u, 71093, 12305},
+            MTPParityCertifiedDecodeRow{3u, 3841, 198}};
+        constexpr std::array<MTPParityDraftPrediction, 4> drafts = {{
+            {198, 2.0f}, {760, 2.0f}, {12305, 2.0f}, {727, 2.0f}}};
+        const auto selected = selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, drafts);
+        ASSERT_TRUE(selected);
+        EXPECT_EQ(selected->reference_step, 2u);
+        EXPECT_EQ(selected->base_token, 71093);
+        EXPECT_EQ(selected->first_draft_token, 12305);
+        // The checkpoint reconstructs its authenticated teacher-forced prefix,
+        // while the native row owns its condition and the accepted successor.
+        constexpr std::array<int32_t, 2> prompt = {41, 42};
+        EXPECT_EQ(mtpParityCheckpointPrompt(prompt, reference, *selected),
+                  (std::vector<int32_t>{41, 42, 13, 271}));
+        const auto adaptive = makeMTPParityAdaptiveWitnessPlan(15);
+        ASSERT_TRUE(adaptive.valid());
+        EXPECT_EQ(adaptive.warmup_tokens, 1);
+        EXPECT_NE(selected->reference_step,
+                  static_cast<size_t>(adaptive.warmup_tokens));
     }
 
     TEST(Test__MTPParitySnapshotContext,
@@ -667,5 +698,129 @@ namespace llaminar2::test::parity
         EXPECT_EQ(
             mtpParityReferenceStepForConditionPosition(9, -1),
             -1);
+    }
+    TEST(Test__MTPParitySnapshotContext, NativePrefixWitnessRetainsRejectionBeforeAcceptance)
+    {
+        MTPParityNativeCheckpointWitness witness(6);
+        witness.observe(0, 0, 1, 1);
+        EXPECT_FALSE(witness.acceptedPrefixRows());
+        EXPECT_TRUE(witness.sawRejection());
+        EXPECT_FALSE(witness.exhausted());
+        witness.observe(1, 1, 0, 1);
+        ASSERT_TRUE(witness.acceptedPrefixRows());
+        EXPECT_EQ(*witness.acceptedPrefixRows(), 1);
+        EXPECT_TRUE(witness.sawRejection());
+        EXPECT_THROW(witness.observe(2, 1, 0, 1), std::invalid_argument);
+    }
+
+    TEST(Test__MTPParitySnapshotContext, NativePrefixWitnessFailsClosedWithinOriginalWindow)
+    {
+        MTPParityNativeCheckpointWitness witness(1);
+        EXPECT_THROW(witness.observe(1, 1, 0, 1), std::invalid_argument);
+        EXPECT_THROW(witness.observe(0, 1, 0, 0), std::invalid_argument);
+        witness.observe(0, 0, 0, 1);
+        EXPECT_FALSE(witness.sawRejection())
+            << "Budget clipping is not an observed rejection";
+        EXPECT_THROW(witness.observe(0, 1, 0, 1), std::invalid_argument);
+        witness.observe(1, 0, 1, 1);
+        EXPECT_TRUE(witness.exhausted());
+        EXPECT_FALSE(witness.acceptedPrefixRows());
+        EXPECT_THROW(witness.observe(2, 1, 0, 1), std::invalid_argument);
+        EXPECT_THROW(MTPParityNativeCheckpointWitness(-1), std::invalid_argument);
+    }
+    TEST(Test__MTPParitySnapshotContext, NativePrefixWitnessUsesSeparatelyFrozenFunctionalWindow)
+    {
+        constexpr int numerical_rows = 2;
+        constexpr int functional_rows = 32;
+        MTPParityNativeCheckpointWitness numerical(numerical_rows);
+        MTPParityNativeCheckpointWitness functional(functional_rows);
+        for (int prefix = 0; prefix <= numerical_rows; ++prefix)
+        {
+            numerical.observe(prefix, 0, 1, 1);
+            functional.observe(prefix, 0, 1, 1);
+        }
+        EXPECT_TRUE(numerical.exhausted());
+        EXPECT_FALSE(numerical.acceptedPrefixRows());
+        EXPECT_THROW(numerical.observe(3, 1, 0, 1), std::invalid_argument);
+        EXPECT_FALSE(functional.exhausted());
+        functional.observe(3, 1, 0, 1);
+        EXPECT_EQ(functional.acceptedPrefixRows(), 3);
+        EXPECT_TRUE(functional.sawRejection());
+
+        // The declaration is immutable: rejection cannot grow either window.
+        MTPParityNativeCheckpointWitness rejected(functional_rows);
+        for (int prefix = 0; prefix <= functional_rows; ++prefix)
+            rejected.observe(prefix, 0, 1, 1);
+        EXPECT_TRUE(rejected.exhausted());
+        EXPECT_FALSE(rejected.acceptedPrefixRows());
+        EXPECT_THROW(rejected.observe(functional_rows + 1, 1, 0, 1), std::invalid_argument);
+    }
+    /** @test Final response identity is not the initial isolated checkpoint identity. */
+    TEST(Test__MTPParitySnapshotContext, AcceptanceResponseAttributesTerminalDepthToItsOwnTransactions)
+    {
+        const MTPParityVerifierDepthObservation full{15,15,1,15};
+        const MTPParityVerifierDepthObservation tail{14,14,2,29};
+        EXPECT_NE(tail.draft_depth, full.draft_depth); // Original equality rejects this real trajectory.
+        EXPECT_TRUE(validMTPParityAcceptanceDepthAttribution(15,15,full,tail));
+        // Other models can start below capacity and legitimately grow later.
+        EXPECT_TRUE(validMTPParityAcceptanceDepthAttribution(3,15,{3,3,1,3},{8,8,2,11}));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,{},tail));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,{14,14,1,14},tail));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,{15,15,2,30},tail));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,full,{14,13,2,29}));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,full,{16,16,2,31}));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,full,{14,14,0,29}));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,full,{14,14,2,13}));
+        EXPECT_FALSE(validMTPParityAcceptanceDepthAttribution(15,15,full,{}));
+    }
+    /** @test Only original authenticated pending identity authorizes the preceding committed frontier. */
+    TEST(Test__MTPParitySnapshotContext, PendingConditionSelectsExactCommittedFrontierWithoutIgnoringBanks)
+    {
+        const std::array positions{29,30,31};
+        const std::array<int32_t,3> tokens{248069,271,760};
+        PrefixResidentConditionProbe original{.device=DeviceId::cuda(0),
+            .publication_generation=7,.live_state_epoch=4,.target_position=30,
+            .next_condition_token=760,.publication_ok=true,.stopped=false,
+            .response_disposition=sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+        // Production uses this exact existing handle check before attaching
+        // a ready disposition to the packed diagnostic projection.
+        std::array<int32_t,7> words{};
+        DeviceResidentLogicalSequenceStateHandle handle{
+            .target_positions_device=&words[0],.target_sequence_lengths_device=&words[0],
+            .accepted_state_counts_device=&words[1],.next_condition_tokens_device=&words[2],
+            .all_drafts_accepted_flags_device=&words[3],.stopped_flags_device=&words[4],
+            .publication_ok_flags_device=&words[5],.request_count=1,.device=DeviceId::cuda(0),
+            .stream=reinterpret_cast<void*>(0x1000),.ready_event=reinterpret_cast<void*>(0x2000),
+            .live_state_epoch=4,.publication_generation=7};
+        EXPECT_TRUE(handle.sameMailboxAs(handle));
+        for(int defect=0;defect<5;++defect){auto stale=handle;
+            switch(defect){case 0:++stale.publication_generation;break;case 1:++stale.live_state_epoch;break;
+                case 2:stale.stream=reinterpret_cast<void*>(0x3000);break;
+                case 3:stale.ready_event=reinterpret_cast<void*>(0x4000);break;
+                case 4:stale.next_condition_tokens_device=&words[6];break;}
+            EXPECT_FALSE(handle.sameMailboxAs(stale));}
+        EXPECT_EQ(selectMTPParityCommittedFrontier(positions,tokens,30,original),1u);
+        EXPECT_EQ(selectMTPParityCommittedFrontier(positions,tokens,31,std::nullopt),2u);
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(positions,tokens,30,std::nullopt));
+        for (int defect=0;defect<8;++defect) {
+            auto bad=original;
+            switch(defect){case 0:bad.response_disposition.reset();break;
+                case 1:bad.response_disposition=sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;break;
+                case 2:bad.publication_generation=0;break;case 3:bad.live_state_epoch=0;break;
+                case 4:bad.publication_ok=false;break;case 5:bad.stopped=true;break;
+                case 6:bad.next_condition_token=271;break;case 7:bad.target_position=29;break;}
+            EXPECT_FALSE(selectMTPParityCommittedFrontier(positions,tokens,30,bad));
+        }
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(std::array{30,30,31},tokens,30,original));
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(std::array{27,30,31},tokens,30,original));
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(std::array{29,30,32},tokens,30,original));
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(std::array{-1,30,31},tokens,30,original));
+        auto contradictory=original;contradictory.target_position=31;
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(positions,tokens,31,contradictory));
+        contradictory.next_condition_token=271;
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(positions,tokens,31,contradictory));
+        EXPECT_FALSE(selectMTPParityCommittedFrontier(positions,tokens,29,original));
+        // Selection grants no byte tolerance: the original full-state/hidden/logit
+        // comparator remains independently mandatory at the selected position.
     }
 } // namespace llaminar2::test::parity

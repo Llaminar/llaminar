@@ -30,7 +30,7 @@
  *
  * **CRITICAL**: Not all activation types work with all weight types!
  *
- * The NativeVNNI kernel uses INT8 VNNI instructions (vpdpbusd) which require:
+ * The NativeQuantised kernel uses INT8 VNNI instructions (vpdpbusd) which require:
  * - Activations quantized to Q8_1 format (8-bit with scale+sum)
  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
  *
@@ -65,11 +65,14 @@
  * DeviceType dev = KernelFactory::getDeviceType(device_idx_);
  * return KernelFactory::createGemm<IQ4_NLTensor>(this, dev);
  * ```
+ * CPU prepared handles accept immutable final-storage placement and allocation
+ * authority so packing materializes exactly one admitted owner before publication.
  */
 
 #pragma once
 
 #include "memory/CPUWeightStoragePlacement.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "FloatingActivationOperandPrecision.h"
 
 #include "../backends/DeviceType.h"            // Shared DeviceType enum
@@ -85,6 +88,7 @@
 // Forward declarations
 namespace llaminar2
 {
+    namespace qwen4exp { class IQwen4ExpKernels; class IQwenSparseAttentionKernels; }
     // KVCache types
     class IKVCache;
     class ICPUKVCache;
@@ -136,13 +140,6 @@ namespace llaminar2
     class PhysicalMemoryAuthority;
     class LoadOrchestrator;
     struct HybridKVCacheConfig;
-
-    /** @brief Physical pool stride, distinct from the initial execution codebook. */
-    enum class GPUPreparedWeightPoolLayout
-    {
-        SourceNative, ///< Pool contains the initial source's prepared representation.
-        MigrationReusable, ///< Each slot reserves the canonical initial/migrated union.
-    };
 
     enum class TensorType; // Forward declare from Tensors.h
 
@@ -437,7 +434,7 @@ namespace llaminar
                  * @brief Check if an activation type is compatible with a weight type for GEMM
                  *
                  * **Design Rationale**:
-                 * The NativeVNNI kernel uses INT8 VNNI instructions which require:
+                 * The NativeQuantised kernel uses INT8 VNNI instructions which require:
                  * - Activations in Q8_1 format (8-bit with scale+sum per block)
                  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
                  *
@@ -870,6 +867,23 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorShortConvolution> createShortConvolution(
                     DeviceType dev_type, int device_ordinal = -1);
+
+                /**
+                 * @brief Construct Flash Next residual/PLE primitives for one explicit device.
+                 * @param device Participant selected by the model graph's placement policy.
+                 * @return Stateless native implementation; never substitutes another backend.
+                 * @throws std::invalid_argument For an invalid or uncompiled device backend.
+                 */
+                static std::unique_ptr<llaminar2::qwen4exp::IQwen4ExpKernels>
+                createQwen4Exp(::llaminar2::DeviceId device);
+
+                /**
+                 * @brief Bind sparse indexer/attention kernels to one graph participant.
+                 * @param device Exact CPU, CUDA or ROCm execution participant.
+                 * @return Native implementation; unsupported backends fail immediately.
+                 */
+                static std::unique_ptr<llaminar2::qwen4exp::IQwenSparseAttentionKernels>
+                createQwenSparseAttention(::llaminar2::DeviceId device);
 
                 /**
                  * @brief Create GatedDeltaNet kernel for GDN layers
@@ -1364,15 +1378,22 @@ namespace llaminar
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
                     llaminar2::FloatingActivationOperandPrecision operand_precision =
-                        llaminar2::FloatingActivationOperandPrecision::Native);
+                        llaminar2::FloatingActivationOperandPrecision::Native,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
-                 * @brief Create a sliced CPU GEMM kernel without using the global sliced cache.
+                 * @brief Create an independently owned CPU row slice without a global cache.
+                 * @param tensor Original CPU matrix with live native source bytes.
+                 * @param row_start Inclusive output-row offset.
+                 * @param row_end Exclusive output-row limit.
+                 * @param placement Exact final-storage allocator and admission owner.
+                 * @return Prepared slice retaining its own physical allocation lease.
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemmSlicedLocal(
                     const llaminar2::TensorBase *tensor,
                     size_t row_start,
-                    size_t row_end);
+                    size_t row_end,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
                  * @brief Create a fused Gate/Up adapter from prepared handles without global cache insertion.
@@ -1402,6 +1423,21 @@ namespace llaminar
                     const llaminar2::PinnedHostTransferBuffer *upload_staging,
                     size_t vocab_offset = 0,
                     size_t total_vocab = 0);
+
+                /**
+                 * @brief Retain an already-final native CPU embedding without a second storage root.
+                 * @param final_tensor Owning quantized CPU table, populated through the native reader.
+                 * @param d_model Logical width matching the native row layout.
+                 * @param vocab_offset First global vocabulary row in this final shard.
+                 * @param total_vocab Full vocabulary extent; zero means this unsharded table.
+                 * @return Handle retaining the same tensor, native bytes and original allocation lease.
+                 * @throws std::invalid_argument For absent, non-CPU, non-native or inconsistent storage.
+                 * @details Floating embeddings retain their existing direct tensor path.
+                 * No backend allocation, transfer or new admission claim occurs here.
+                 */
+                static std::shared_ptr<llaminar2::PreparedEmbeddingHandle> prepareEmbeddingHandleFromFinalCPUStorage(
+                    std::shared_ptr<const llaminar2::TensorBase> final_tensor,
+                    int d_model, size_t vocab_offset = 0, size_t total_vocab = 0);
 
                 /**
                  * @brief Bind a GPU GEMM to a range in the canonical prepared-weight pool.
@@ -1473,7 +1509,7 @@ namespace llaminar
                 /**
                  * @brief Create a GEMM engine from a transferred (pre-packed) weight blob.
                  *
-                 * Deserializes the blob and constructs a CPUNativeVNNIGemmKernel directly
+                 * Deserializes the blob and constructs a CPUNativeQuantisedGemmKernel directly
                  * from the pre-packed representation. This avoids the expensive VNNI repack
                  * that prepareExpertGemmLocal() performs from raw tensor data.
                  *
@@ -1509,7 +1545,7 @@ namespace llaminar
                  * allocations owned by `packed_weights`; this factory moves those
                  * allocations into the kernel without a serialization round trip.
                  *
-                 * @param packed_weights Complete eager CPU NativeVNNI weights.
+                 * @param packed_weights Complete eager CPU NativeQuantised weights.
                  * @return Shared prepared engine, or `nullptr` for an incompatible
                  *         or incomplete packed representation.
                  */
@@ -1525,7 +1561,7 @@ namespace llaminar
                  * therefore receive a new execution handle over the identical
                  * immutable allocation, retained by the original engine. CPU
                  * kernels declare invocation-owned workspace: neither a shared
-                 * NativeVNNI engine nor a floating execution view can retain a
+                 * NativeQuantised engine nor a floating execution view can retain a
                  * mutable workspace binding. Each CPU stage supplies its own
                  * transform storage. No weights are copied, repacked,
                  * registered in a global cache, or admitted a second time.

@@ -11,6 +11,8 @@
  */
 
 #include "MoEOverlayCapacityAdmission.h"
+#include "MoEOverlayNoPeerResidency.h"
+#include "MoEOverlayPhysicalLaneDemand.h"
 
 #include <algorithm>
 #include <limits>
@@ -80,9 +82,12 @@ namespace llaminar2
             case RoutedExpertComputePolicy::Replicated:
                 return MoEOverlayTierCopyPolicy::Replicated;
             case RoutedExpertComputePolicy::TensorSharded:
-                throw std::invalid_argument(
-                    "ExpertOverlay exact whole-expert capacity does not yet "
-                    "admit tensor-sharded routed domain '" + domain.name + "'");
+                // A degree-one CPU tensor policy owns the complete matrix.
+                // Only multi-member CPU domains require fragment cohorts;
+                // the authored public compute policy remains unchanged.
+                if (domain.participants.size() == 1 && domain.participants.front().isCPU())
+                    return MoEOverlayTierCopyPolicy::Apportioned;
+                return MoEOverlayTierCopyPolicy::TensorSharded;
             case RoutedExpertComputePolicy::Unspecified:
             case RoutedExpertComputePolicy::Automatic:
                 throw std::invalid_argument(
@@ -186,6 +191,11 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Dynamic ExpertOverlay migration storage requires a normalized authority plan");
         }
+
+        // The frozen full-residency proof is sealed after quota resolution.
+        // Geometry already proves there is no second payload endpoint to price.
+        if (MoEOverlayNoPeerResidency::hasNoPeerTopology(plan))
+            return MoEOverlayMigrationStorageKind::NoPeer;
 
         if (plan.authority_execution !=
                 MoEOverlayAuthorityExecutionKind::DeviceResident ||
@@ -292,11 +302,26 @@ namespace llaminar2
         return result;
     }
 
+    std::map<DeviceId,std::size_t> MoEOverlayCapacityAdmission::executionStreamCounts(
+        const MoERoutedExpertPlacementPlan &plan,int world_rank,std::size_t maximum_execution_streams)
+    {
+        if(world_rank<0 || !maximum_execution_streams)
+            throw std::invalid_argument("Movement execution streams require an original rank and positive width");
+        std::map<DeviceId,std::size_t> result;
+        for(const auto& member:boundParticipants(plan))if(member.world_rank==world_rank && member.device.is_gpu()) {
+            auto& count=result[member.device];
+            count=checkedAdd(count,maximum_execution_streams,"original shared execution stream population");
+        }
+        return result;
+    }
+
     std::vector<MoEOverlayTransferStagingCharge>
     MoEOverlayCapacityAdmission::transferStagingBOM(
         const MoERoutedExpertPlacementPlan &plan,
         int world_size,
-        const MoEOverlayCapacityAdmissionPolicy &policy)
+        const MoEOverlayCapacityAdmissionPolicy &policy,
+        const std::vector<MoEOverlayLayerWeightManifest>& original_manifest,
+        int original_experts)
     {
         if (!policy.usesPhysicalResidencyFabric())
             return {};
@@ -318,152 +343,38 @@ namespace llaminar2
                 "ExpertOverlay migration fabric requires positive capacities and a communicator-consistent distributed policy");
         }
 
-        constexpr std::size_t kProjectionCount = 3;
-        constexpr std::size_t kRemoteRolesPerGpu = 2;
-        constexpr std::size_t kBlobSlots = 2;
-        constexpr std::size_t kPinnedRegionsPerBlobSlot = 2;
-
-        const auto participants = boundParticipants(plan);
-        std::map<int, std::map<DeviceId, std::size_t>>
-            participant_multiplicity_by_rank;
-        for (const auto &participant : participants)
-        {
-            if (participant.world_rank < 0 ||
-                participant.world_rank >= world_size)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay participant rank lies outside the overlay communicator");
-            }
-            ++participant_multiplicity_by_rank[participant.world_rank]
-                                               [participant.device];
-        }
-
-        std::map<PhysicalKey, std::size_t> bytes_by_resource;
-        const auto addChunks = [&](
-            int world_rank,
-            DeviceId device,
-            std::size_t chunks,
-            const char *what)
-        {
-            const std::size_t bytes = checkedMultiply(
-                chunks, policy.staging_capacity_bytes, what);
-            auto &total = bytes_by_resource[PhysicalKey{world_rank, device}];
-            total = checkedAdd(total, bytes, what);
+        const auto demand=configuredMoEOverlayLaneDemand(plan,original_manifest,original_experts,
+            world_size,policy.maximum_concurrent_cycles,policy.maximum_cycles_per_layer);
+        const auto counts=demand.materializedCounts();
+        std::map<PhysicalKey,std::size_t> bytes_by_resource;
+        const auto add=[&](int rank,DeviceId device,size_t count) {
+            const auto bytes=checkedMultiply(count,policy.staging_capacity_bytes,"physical piece staging chunks");
+            auto& total=bytes_by_resource[{rank,device}];total=checkedAdd(total,bytes,"physical piece staging BOM");
         };
-
-        for (int world_rank = 0; world_rank < world_size; ++world_rank)
-        {
-            const auto found = participant_multiplicity_by_rank.find(
-                world_rank);
-            const std::map<DeviceId, std::size_t> empty;
-            const auto &devices = found ==
-                    participant_multiplicity_by_rank.end()
-                ? empty
-                : found->second;
-
-            /*
-             * A closed cycle visits a logical participant at most once. Thus
-             * one physical edge can carry at most the smaller endpoint
-             * multiplicity per cycle. Materialize that exact upper bound for
-             * every admitted cycle so software never queues one independent
-             * move behind another.
-             */
-            for (const auto &[source, source_multiplicity] : devices)
-            {
-                for (const auto &[destination, destination_multiplicity] :
-                     devices)
-                {
-                    if (source == destination)
-                        continue;
-                    const std::size_t edge_lanes = checkedMultiply(
-                        policy.maximum_concurrent_cycles,
-                        std::min(
-                            source_multiplicity,
-                            destination_multiplicity),
-                        "local parallel migration lanes");
-                    if ((source.is_cpu() && destination.is_gpu()) ||
-                        (source.is_gpu() && destination.is_cpu()))
-                    {
-                        const DeviceId gpu =
-                            source.is_gpu() ? source : destination;
-                        addChunks(
-                            world_rank,
-                            gpu,
-                            checkedMultiply(
-                                kProjectionCount,
-                                edge_lanes,
-                                "local GPU/CPU projection lanes"),
-                            "local GPU/CPU device staging");
-                        addChunks(
-                            world_rank,
-                            DeviceId::cpu(),
-                            checkedMultiply(
-                                kProjectionCount,
-                                edge_lanes,
-                                "local GPU/CPU projection lanes"),
-                            "local GPU/CPU pinned staging");
-                    }
-                    else if (source.is_gpu() && destination.is_gpu() &&
-                             source.type != destination.type)
-                    {
-                        /* Two slots, each with source- and destination-runtime pinned storage. */
-                        addChunks(
-                            world_rank,
-                            DeviceId::cpu(),
-                            checkedMultiply(
-                                kProjectionCount,
-                                checkedMultiply(
-                                    edge_lanes,
-                                    kBlobSlots *
-                                        kPinnedRegionsPerBlobSlot,
-                                    "heterogeneous GPU parallel lanes"),
-                                "heterogeneous GPU blob staging chunks"),
-                            "heterogeneous GPU blob pinned staging");
-                    }
+        for(const auto& [key,count]:counts) {
+            switch(key.kind) {
+            case MoEOverlayPhysicalLaneKind::LocalDevice:
+                if(key.source.is_cpu()!=key.destination.is_cpu()) {
+                    add(key.world_rank,key.source.is_gpu()?key.source:key.destination,count);
+                    add(key.world_rank,DeviceId::cpu(),count);
+                } else if(key.source.is_gpu() && key.destination.is_gpu() && key.source.type!=key.destination.type)
+                    add(key.world_rank,DeviceId::cpu(),checkedMultiply(count,4,"two runtime-pinned regions per double-buffered blob"));
+                break;
+            case MoEOverlayPhysicalLaneKind::RemoteSource:
+            case MoEOverlayPhysicalLaneKind::RemoteDestination:
+                if(policy.distributed_transport) {
+                    add(key.world_rank,key.kind==MoEOverlayPhysicalLaneKind::RemoteSource?key.source:key.destination,count);
+                    add(key.world_rank,DeviceId::cpu(),count);
                 }
+                break;
+            case MoEOverlayPhysicalLaneKind::RemoteProjectionDirectory:
+                if(policy.distributed_transport)for(int rank=0;rank<world_size;++rank)add(rank,DeviceId::cpu(),count);
+                break;
+            case MoEOverlayPhysicalLaneKind::LocalCPUWorker:
+                // Existing NUMA workers copy admitted final roots directly;
+                // neither a rectangle nor a compact tail adds CPU scratch.
+                break;
             }
-
-            if (!policy.distributed_transport)
-                continue;
-
-            for (const auto &[device, multiplicity] : devices)
-            {
-                if (!device.is_gpu())
-                    continue;
-                const std::size_t remote_chunks = checkedMultiply(
-                    checkedMultiply(
-                        kProjectionCount,
-                        kRemoteRolesPerGpu,
-                        "remote GPU projection roles"),
-                    checkedMultiply(
-                        policy.maximum_concurrent_cycles,
-                        multiplicity,
-                        "remote GPU parallel lanes"),
-                    "remote GPU staging chunks");
-                addChunks(
-                    world_rank,
-                    device,
-                    remote_chunks,
-                    "remote GPU device staging");
-                addChunks(
-                    world_rank,
-                    DeviceId::cpu(),
-                    remote_chunks,
-                    "remote GPU pinned staging");
-            }
-
-            /* The MPI data plane retains one host payload per global projection lane. */
-            addChunks(
-                world_rank,
-                DeviceId::cpu(),
-                checkedMultiply(
-                    participants.size(),
-                    checkedMultiply(
-                        kProjectionCount,
-                        policy.maximum_concurrent_cycles,
-                        "remote MPI concurrent projection lanes"),
-                    "remote MPI projection lanes"),
-                "remote MPI payload staging");
         }
 
         std::vector<MoEOverlayTransferStagingCharge> result;
@@ -508,11 +419,15 @@ namespace llaminar2
              policy.migration_storage !=
                  MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
              policy.migration_storage !=
-                 MoEOverlayMigrationStorageKind::PhysicalResidencyFabric))
+                 MoEOverlayMigrationStorageKind::PhysicalResidencyFabric &&
+             policy.migration_storage != MoEOverlayMigrationStorageKind::NoPeer))
         {
             throw std::invalid_argument(
                 "ExpertOverlay capacity admission received an invalid migration storage policy");
         }
+        if (policy.migration_storage == MoEOverlayMigrationStorageKind::NoPeer &&
+            !MoEOverlayNoPeerResidency::hasNoPeerTopology(plan))
+            throw std::invalid_argument("No-peer admission cannot exempt a movable topology");
         if (policy.usesPhysicalResidencyFabric() &&
             (policy.shadow_slots_per_endpoint_layer == 0 ||
              policy.staging_capacity_bytes == 0 ||
@@ -569,7 +484,7 @@ namespace llaminar2
 
         const auto bound_participants = boundParticipants(plan);
         const auto staging_bom = transferStagingBOM(
-            plan, policy.overlay_world_size, policy);
+            plan, policy.overlay_world_size, policy,layer_weight_manifest,num_experts);
         std::map<PhysicalKey, std::size_t> staging_by_key;
         std::map<PhysicalKey, std::size_t> workspace_by_key;
         for (const auto &charge : staging_bom)
@@ -809,6 +724,21 @@ namespace llaminar2
                 participant_devices.push_back(device);
             }
 
+            if(request.copy_policy==MoEOverlayTierCopyPolicy::TensorSharded){
+                if(domain.scope!=ExecutionDomainScope::NODE_LOCAL ||
+                   domain.world_ranks.size()!=domain.participants.size())
+                    throw std::invalid_argument("CPU tensor-shard admission requires original node-local ranks");
+                std::vector<MoEExpertShardCohort::Participant> members;
+                for(std::size_t p=0;p<domain.participants.size();++p)
+                    members.push_back({request.participants[p].participant_id,
+                        boundParticipantWorldRank(domain,p),domain.participants[p]});
+                for(const auto& layer:layer_weight_manifest)
+                    request.shard_cohorts.push_back(std::make_shared<const MoEExpertShardCohort>(
+                        MoEExpertShardCohort::checked(layer,num_experts,members,
+                            MoEExpertShardCohort::balancedIntervals(layer,static_cast<int>(members.size())))));
+                if(tier.memory_budget_bytes!=0)
+                    throw std::invalid_argument("CPU shard tiers require physical PMA budgets, not an ambiguous aggregate tier byte cap");
+            }
             request.max_live_experts_per_layer.assign(
                 layer_count, num_experts);
             const auto tier_footprints =
@@ -855,6 +785,22 @@ namespace llaminar2
 
     std::vector<MoEOverlayResolvedCapacityPlan>
     MoEOverlayCapacityAdmission::resolvePipelineCapacity(
+        std::span<const MoEOverlayStageCapacityRequest> stages)
+    {
+        return resolvePipelineCapacityDraft(stages).admit();
+    }
+
+    MoEOverlayCapacityDraft MoEOverlayCapacityAdmission::resolveCapacityDraft(
+        const MoERoutedExpertPlacementPlan &plan,int num_experts,
+        const std::vector<MoEOverlayLayerWeightManifest> &manifest,
+        const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &budgets,
+        const MoEOverlayCapacityAdmissionPolicy &policy)
+    {
+        const MoEOverlayStageCapacityRequest stage{plan,num_experts,manifest,budgets,policy};
+        return resolvePipelineCapacityDraft(std::span(&stage,1u));
+    }
+
+    MoEOverlayCapacityDraft MoEOverlayCapacityAdmission::resolvePipelineCapacityDraft(
         std::span<const MoEOverlayStageCapacityRequest> stages)
     {
         if (stages.empty())
@@ -916,13 +862,14 @@ namespace llaminar2
                 inputs.push_back(buildResolverInput(stage.plan, stage.num_experts,
                     stage.layer_weight_manifest, stage.physical_budgets, candidate));
             }
-            auto result = MoEOverlayCapacityResolver::resolvePipeline(inputs);
-            for (std::size_t index = 0; index < stages.size(); ++index)
-                if (stages[index].policy.usesDeviceTransferDirectory())
-                    result[index].replica_cache_capacity = stages[index].plan.replica_cache_capacity
+            auto result = MoEOverlayCapacityResolver::resolvePipelineDraft(inputs);
+            std::vector<std::optional<MoEOverlayReplicaCacheCapacity>> admitted(stages.size());
+            for (std::size_t index=0;index<stages.size();++index)
+                if(stages[index].policy.usesDeviceTransferDirectory())
+                    admitted[index]=stages[index].plan.replica_cache_capacity
                         ? stages[index].plan.replica_cache_capacity
-                        : std::optional<MoEOverlayReplicaCacheCapacity>{std::in_place, requested[index], grants[index]};
-            return result;
+                        : std::optional<MoEOverlayReplicaCacheCapacity>{std::in_place,requested[index],grants[index]};
+            return result.withReplicaGrants(admitted);
         };
 
         try

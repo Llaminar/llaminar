@@ -96,7 +96,12 @@ def validate_report(report, *, source_revision, image, cpu_isa, corpus_manifest_
             or report.get('complete') is not True or type(report.get('passed')) is not bool
             or report.get('source_revision')!=source_revision or report.get('image')!=image
             or report.get('corpus_manifest_digest')!=corpus_manifest_digest
-            or report.get('diagnostic_only') is not False or cpu_isa not in ['AVX2','AVX512']
+            or report.get('diagnostic_only') is not False
+            or report.get('full_preflight') is False
+            or report.get('mode') == 'local_paired_focused_diagnostic'
+            or str(report.get('verdict','')).startswith('DIAGNOSTIC_')
+            or str(report.get('status','')).startswith('DIAGNOSTIC_')
+            or cpu_isa not in ['AVX2','AVX512']
             or report.get('cpu_isa')!=cpu_isa):
         raise ValueError('Incomplete or mismatched published-image KL report')
     cells=report.get('cells')

@@ -54,7 +54,7 @@ inline void runMixedPrefill(DeviceId device)
             PerfStatsCollector::reset();
             MixedPrefillOwners o(backend,stream,device);
             o.weights=sources(role);o.prepared.reserve(3);
-            std::array<DeviceNativeVNNIMatrixDesc,3> desc{};
+            std::array<DeviceNativeQuantisedMatrixDesc,3> desc{};
             const std::array<TensorBase*,3> raw{o.weights.gate.get(),o.weights.up.get(),o.weights.down.get()};
             for(int p=0;p<3;++p)
             {
@@ -63,7 +63,7 @@ inline void runMixedPrefill(DeviceId device)
                     ModelContextId{uint64_t(5994000+int(role)*16+p+(device.is_cuda()?0:1000))}));
                 ASSERT_NE(o.prepared.back().kernel,nullptr);
                 o.prepared.back().kernel->setGPUStream(stream);
-                ASSERT_TRUE(o.prepared.back().kernel->exportNativeVNNIMatrixDesc(desc[p]));
+                ASSERT_TRUE(o.prepared.back().kernel->exportNativeQuantisedMatrixDesc(desc[p]));
             }
             const int target=gateTarget(role)?0:1;
             ASSERT_EQ(desc[target].source_codebook_id,4);

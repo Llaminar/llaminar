@@ -16,9 +16,11 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "kernels/RowSelectPolicy.h"
 #include "../StageParamsBase.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
+#include "../../../execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include <cstdint>
 #include <memory>
@@ -127,6 +129,7 @@ namespace llaminar2
             const int32_t *input_position_ids_device = nullptr; ///< Admitted absolute request positions.
             int32_t *shifted_token_ids_output_device = nullptr; ///< Packed depth-zero condition tokens.
             int32_t *shifted_position_ids_output_device = nullptr; ///< Packed positions paired with condition tokens.
+            MTPShiftedCacheOrigin shifted_cache_origin = MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Model-owned coordinate policy, fixed before capture.
             int32_t *shifted_append_lengths_output_device = nullptr; ///< One real shifted append width per request.
             TensorBase *terminal_hidden_archive = nullptr; ///< Persistent prior/next terminal row per request.
             std::vector<const int32_t *> main_cached_tokens_by_request; ///< Canonical main-KV count addresses.
@@ -134,12 +137,25 @@ namespace llaminar2
             int request_count = 0; ///< Fixed request count represented by this graph.
             std::optional<BufferId> terminal_hidden_archive_buffer_id; ///< Arena identity of terminal_hidden_archive.
             ///@}
+            RowsSelectPolicy row_copy_policy{}; ///< Exact native strides and absent-row publication semantics.
         };
 
         explicit HiddenStateRowsSelectStage(Params params);
         ~HiddenStateRowsSelectStage() override;
 
         bool execute(IDeviceContext *ctx) override;
+        /** @return Immutable model-origin policy contribution to existing capture invalidation. */
+        uint64_t graphCaptureVariantSignature() const override
+        {
+            uint64_t identity = 0x4d54504f52494702ULL;
+            const auto mix = [&](uint64_t value) { identity = (identity ^ value) * UINT64_C(1099511628211); };
+            mix(static_cast<uint64_t>(params_.shifted_cache_origin));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.negative_rows));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.source_stride));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.destination_stride));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.fixed_first_row));
+            return identity;
+        }
         ComputeStageType type() const override { return ComputeStageType::ROW_SELECT; }
         size_t estimatedFlops() const override { return 0; }
         size_t estimatedMemoryBytes() const override;

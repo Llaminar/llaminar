@@ -19,6 +19,9 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
+#include "backends/GPUGraphMemoryContract.h"
+#include "planning/PlanningGPUClockBuffer.h"
+#include "kernels/KernelFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "interfaces/IWorkspaceConsumer.h"
@@ -85,6 +88,90 @@ namespace
                   << " seconds=" << observation.elapsedSeconds() << '\n';
     }
 
+    /** @brief Prove real warmup/parent invocation counts using an exact in-place production residual.
+     * @param device Native endpoint selected by the existing single-device fixture.
+     * Each body adds one to persistent FP32 state. Preparation executes none;
+     * one parent contains one warmup and three timed bodies, producing four
+     * without a host gap, including after fresh-owner/reset replay.
+     */
+    void provePreparedClockInvocationReplay(DeviceId device)
+    {
+        auto &worker=GPUDeviceContextPool::instance().getContext(device);
+        worker.submitAndWait([&] {
+            constexpr size_t elements=256;
+            constexpr size_t tensor_bytes=2*elements*sizeof(float);
+            const auto graph_bytes=PlanningExecutionMeasurement::kPreparedGraphCount*
+                GPUGraphMemoryContract::reservationBytesPerExecutable(device);
+            const auto host_bytes=tensor_bytes+PlanningNativeGPUClockBuffer::hostAllocationBytes(2);
+            const auto gpu_bytes=tensor_bytes+PlanningNativeGPUClockBuffer::deviceAllocationBytes(2);
+            PhysicalMemoryPlanBuilder builder;
+            // Only this deliberately small fixture's storage is certified here;
+            // no discovered capacity or model-performance claim is synthesized.
+            const PhysicalMemoryResource host{0,DeviceId::cpu(),host_bytes,host_bytes};
+            const PhysicalMemoryResource gpu{0,device,gpu_bytes+graph_bytes,gpu_bytes+graph_bytes};
+            builder.add(host,PhysicalMemoryOwner::ExecutionWorkspace,tensor_bytes);
+            builder.add(gpu,PhysicalMemoryOwner::ExecutionWorkspace,tensor_bytes);
+            PlanningExecutionMeasurement::contributeGPUObservationMemory(host,gpu,builder);
+            auto memory=std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()),0);
+            const ExplicitGPUStream stream(worker.defaultStream());
+            for(int replay=0;replay<2;++replay) {
+                {
+                    auto graph_claim=memory->reserveNewAllocations(device,PhysicalMemoryOwner::NativeGraphExecutable,graph_bytes);
+                    auto host_claim=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,tensor_bytes);
+                    auto gpu_claim=memory->claimNewAllocation(device,PhysicalMemoryOwner::ExecutionWorkspace,tensor_bytes);
+                    auto accumulator=TestTensorFactory::createFP32({1,elements});
+                    auto ones=TestTensorFactory::createFP32({1,elements});
+                    std::fill_n(accumulator->mutable_data(),elements,0.f);
+                    std::fill_n(ones->mutable_data(),elements,1.f);
+                    ASSERT_TRUE(accumulator->ensureOnDevice(device,stream.get()));
+                    ASSERT_TRUE(ones->ensureOnDevice(device,stream.get()));
+                    auto kernel=llaminar::v2::kernels::KernelFactory::createResidualAdd(
+                        accumulator.get(),device.type,device.ordinal);
+                    ASSERT_NE(kernel,nullptr);
+                    kernel->bindGPUStream(stream);
+                    auto graph=worker.createGraphCapture(stream.get());
+                    ASSERT_NE(graph,nullptr);
+                    {
+                        ScopedBackendGraphCapture capture(worker,*graph,"prepared clock exact invocation count");
+                        ASSERT_TRUE(capture.begin());
+                        ASSERT_TRUE(kernel->apply_tensor(accumulator.get(),ones.get(),accumulator.get(),
+                            elements,nullptr,device.toKernelDeviceIndex()));
+                        capture.finish();
+                    }
+                    const auto original_nodes=graph->nodeCount();
+                    ASSERT_GT(original_nodes,0u);
+                    const PlanningMeasurementWork work(PlanningWorkUnit::Bytes,3.0*elements*sizeof(float),
+                        "native prepared-clock residual invocation/reset proof");
+                    auto clock=std::make_unique<PlanningNativeGPUClockBuffer>(worker,device,stream,2,memory);
+                    auto observation=PlanningExecutionMeasurement::recordGPU(work,worker,std::move(clock),std::move(graph));
+                    observation.prepare(memory);
+                    EXPECT_EQ(observation.graphNodeCount(),original_nodes);
+                    // Preparation only seals/instantiates. This diagnostic
+                    // download proves it executed no body; the pending parent
+                    // owns warmup followed contiguously by three timed bodies.
+                    TransferEngine::publishDeviceWrite(accumulator.get(),device,stream.get());
+                    ASSERT_TRUE(accumulator->ensureOnHost(stream.get()));
+                    for(size_t i=0;i<elements;++i)EXPECT_EQ(accumulator->data()[i],0.f);
+                    const auto service=observation.observe();
+                    EXPECT_DOUBLE_EQ(service.completedWork(),3*work.perInvocation());
+                    EXPECT_GT(service.elapsedSeconds(),0);
+                    EXPECT_TRUE(std::isfinite(service.unitsPerSecond()));
+                    EXPECT_EQ(observation.graphNodeCount(),original_nodes);
+                    TransferEngine::publishDeviceWrite(accumulator.get(),device,stream.get());
+                    ASSERT_TRUE(accumulator->ensureOnHost(stream.get()));
+                    for(size_t i=0;i<elements;++i)EXPECT_EQ(accumulator->data()[i],4.f);
+                    EXPECT_THROW(observation.observe(),std::logic_error);
+                }
+                for(const auto allocator:{DeviceId::cpu(),device}) {
+                    EXPECT_EQ(memory->claimedBytes(allocator,PhysicalMemoryOwner::ExecutionWorkspace,
+                        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+                    EXPECT_EQ(memory->reservedBytes(allocator,PhysicalMemoryOwner::NativeGraphExecutable),0u);
+                }
+            }
+        });
+    }
+
     /**
      * @brief Execute one independently bound matrix through a retained graph.
      * @param kernel Production engine retaining its prepared pool ownership.
@@ -149,17 +236,17 @@ namespace
         constexpr size_t rows = 256;
         constexpr size_t blocks_per_row = 8;
         const size_t words = weights.size() * rows * blocks_per_row;
-        ASSERT_NE(slot.d_native_vnni_scales, nullptr);
-        ASSERT_NE(slot.d_native_vnni_mins, nullptr);
+        ASSERT_NE(slot.d_native_quantised_scales, nullptr);
+        ASSERT_NE(slot.d_native_quantised_mins, nullptr);
         ASSERT_EQ(slot.scales_bytes, words * sizeof(uint16_t));
         ASSERT_EQ(slot.mins_bytes, words * sizeof(uint16_t));
         ASSERT_NE(stream, nullptr);
         std::vector<uint16_t> bases(words), coefficients(words);
         // load()/finalize() have already drained the producer streams. These
         // diagnostic copies and their completion remain outside graph capture.
-        ASSERT_TRUE(backend.deviceToHostOnStream(bases.data(), slot.d_native_vnni_scales,
+        ASSERT_TRUE(backend.deviceToHostOnStream(bases.data(), slot.d_native_quantised_scales,
             slot.scales_bytes, device.ordinal, stream));
-        ASSERT_TRUE(backend.deviceToHostOnStream(coefficients.data(), slot.d_native_vnni_mins,
+        ASSERT_TRUE(backend.deviceToHostOnStream(coefficients.data(), slot.d_native_quantised_mins,
             slot.mins_bytes, device.ordinal, stream));
         ASSERT_TRUE(backend.synchronizeStream(stream, device.ordinal));
         for (size_t group = 0; group < weights.size(); ++group)
@@ -219,10 +306,11 @@ namespace
             const std::string name = "blk.0.ffn_gate_exps.weight";
             const size_t bytes = standalone->size_bytes();
             fixture.writePayload(name, 7 * bytes, {static_cast<const uint8_t *>(standalone->raw_data()), bytes});
+            const auto physical = CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes);
             const PhysicalMemoryResource resource{.world_rank = 0, .device = DeviceId::cpu(),
-                .total_bytes = 2 * bytes, .admission_available_bytes = 2 * bytes};
+                .total_bytes = physical + bytes, .admission_available_bytes = physical + bytes};
             PhysicalMemoryPlanBuilder bom;
-            bom.add(resource, PhysicalMemoryOwner::ModelSourcePayload, bytes);
+            bom.add(resource, PhysicalMemoryOwner::ModelSourcePayload, physical);
             bom.add(resource, PhysicalMemoryOwner::WeightLoadStaging, bytes);
             auto memory = std::make_shared<PhysicalMemoryAuthority>(
                 std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(bom.build()), 0);
@@ -382,7 +470,7 @@ namespace
                         const auto &source = *dynamic_cast<const IINT8Unpackable &>(*weights.front()).vnniFormatInfo();
                         const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
                             ? reusableDeviceVnniAllocationFormat(source)
-                            : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
+                            : NativeQuantisedReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
                                 canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
                         job.format = codebookIdToRepackFormat(source.codebook_id, source.is_superblock).value();
                         job.is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric;
@@ -541,6 +629,12 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_SourceSamples)
 }
 
 #ifdef HAVE_CUDA
+/** @test One contiguous CUDA parent preserves warmup plus three timed bodies after reset. */
+TEST(PlanningExecutionMeasurementIntegration, CUDA_PreparedClockInvocationReplay)
+{
+    ensureNvidiaFactoryRegistered();
+    provePreparedClockInvocationReplay(DeviceId::cuda(0));
+}
 /** @test Every weight format uses retained CUDA execution and native event time. */
 TEST(PlanningExecutionMeasurementIntegration, CUDA)
 {
@@ -564,6 +658,12 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_CoalescedPool)
 }
 #endif
 #ifdef HAVE_ROCM
+/** @test One contiguous HIP parent preserves warmup plus three timed bodies after reset. */
+TEST(PlanningExecutionMeasurementIntegration, ROCm_PreparedClockInvocationReplay)
+{
+    ensureAMDFactoryRegistered();
+    provePreparedClockInvocationReplay(DeviceId::rocm(0));
+}
 /** @test Every weight format uses retained HIP execution and native event time. */
 TEST(PlanningExecutionMeasurementIntegration, ROCm)
 {

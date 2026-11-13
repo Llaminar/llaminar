@@ -15,10 +15,14 @@
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "collective/VocabularyGatherWorkspaceContract.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
+#include "tensors/Tensors.h"
+#include "../../../../mocks/MockLocalTPContext.h"
 #include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "memory/CPUGroupedMoEStorageLayout.h"
 #include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
@@ -1369,7 +1373,7 @@ TEST(Test__WorkspaceAllocator, CompactRegimeDescriptorAliasesInsteadOfInflatingP
 /**
  * @brief Prefill-only scratch is absent from decode and grouped participants.
  *
- * A kernel object may expose both NativeVNNI prefill accumulators and grouped
+ * A kernel object may expose both NativeQuantised prefill accumulators and grouped
  * verifier KPAR storage. Device-event ordering makes those graph roles mutually
  * exclusive, so the compact arena must be able to occupy the prefill interval
  * rather than forcing the physical workspace to contain their union.
@@ -2395,4 +2399,182 @@ TEST(Test__WorkspaceAllocator, AppendOnlyGrowthNeverPublishesNullOrNewManager)
         {
             return workspace == nullptr;
         }));
+}
+
+/**
+ * @test Real canonical descriptors survive the allocator's exact Prefill role filter.
+ * @details Only immutable requirements are carried by the existing CPU metadata
+ * stage, so Unit runs the real graph-family/PMA allocator without pretending to
+ * execute a canonical GPU collective on CPU. The count owner is never read.
+ */
+TEST(Test__WorkspaceAllocator, CanonicalPredictorRankBanksSurvivePrefillParticipants)
+{
+    if (!hasCPUBackend()) initCPUBackend(-1);
+    for (const auto native_device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int rows : {1, 3, 16, 512, 1024})
+            for (const auto policy : {TPAllreduceArithmeticPolicy::CanonicalRankOrder,
+                                     TPAllreduceArithmeticPolicy::NativeCollective})
+            {
+                SCOPED_TRACE(::testing::Message() << "native_device=" << native_device.toString()
+                    << " rows=" << rows << " policy=" << static_cast<int>(policy));
+                constexpr std::size_t width = 2560, degree = 4;
+                llaminar2::test::MockLocalTPContext tp;
+                std::vector<GlobalDeviceAddress> members;
+                for (int rank = 0; rank < int(degree); ++rank)
+                    members.push_back(native_device.is_cuda() ? GlobalDeviceAddress::cuda(rank) : GlobalDeviceAddress::rocm(rank));
+                tp.setDevices(std::move(members));
+                tp.setBackend(native_device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+                FP32Tensor shape({std::size_t(rows), width}, DeviceId::cpu());
+                std::int32_t declared_count = 0;
+                TPAllreduceStage::Params params;
+                params.device_id = native_device;
+                params.tp_ctx = &tp;
+                params.tensor = &shape;
+                params.count = std::size_t(rows) * width;
+                params.stage_name = "mtp0_embedding_allreduce";
+                params.sideband_device_index = 0;
+                params.arithmetic_policy = policy;
+                params.request_rows = NativeAllreduceRequestRows(1, rows, width, &declared_count);
+                TPAllreduceStage native_declaration(params);
+                const auto requirements = native_declaration.getWorkspaceRequirements(rows, 0, 0);
+                const bool canonical = policy == TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+                if (canonical)
+                {
+                    ASSERT_EQ(requirements.buffers.size(), 1u);
+                    EXPECT_EQ(requirements.buffers.front().size_bytes, std::size_t(rows) * width * degree * sizeof(float));
+                }
+                else EXPECT_TRUE(requirements.buffers.empty());
+
+                // The admitted bytes come from the real production declaration.
+                // A native-sum control gets the same available fixture resource
+                // but must claim/materialize no canonical scratch at all.
+                const auto admitted_bytes = std::size_t(rows) * width * degree * sizeof(float);
+                PhysicalMemoryPlanBuilder plan;
+                plan.add({.world_rank = 0, .device = DeviceId::cpu(), .total_bytes = admitted_bytes,
+                    .admission_available_bytes = admitted_bytes}, PhysicalMemoryOwner::ExecutionWorkspace, admitted_bytes);
+                auto authority = std::make_shared<PhysicalMemoryAuthority>(
+                    std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+                WorkspaceAllocator allocator(authority);
+                ComputeGraph decode;
+                ComputeGraph prefill;
+                auto metadata = std::make_unique<GraphFamilyWorkspaceStage>(DeviceId::cpu(),
+                    std::vector<size_t>{std::size_t(rows), width}, requirements.buffers);
+                auto *consumer = metadata.get();
+                prefill.addNode("predictor_collective_requirements", std::move(metadata), DeviceId::cpu());
+                auto hints = tinyHints();
+                hints.serial_family_max_rows = rows;
+                hints.serial_family_max_compact_rows = 3;
+                hints.graph_family_policy = WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+                ASSERT_TRUE(allocator.allocateForGraphFamily(decode, WorkspaceGraphParticipantRole::Decode,
+                    {WorkspaceGraphParticipant{.graph = &prefill, .role = WorkspaceGraphParticipantRole::Prefill}},
+                    hints, {}, unitBudgetConfig()));
+                auto *workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
+                if (canonical)
+                {
+                    ASSERT_NE(workspace, nullptr);
+                    EXPECT_EQ(consumer->boundWorkspace(), workspace);
+                    EXPECT_EQ(workspace->getBufferSize("tp_allreduce_canonical_rank_banks"), admitted_bytes);
+                    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                        PhysicalMemoryMaterializationKind::NewAllocation), admitted_bytes);
+                }
+                else
+                {
+                    EXPECT_TRUE(!workspace || !workspace->hasBuffer("tp_allreduce_canonical_rank_banks"));
+                    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+                }
+            }
+}
+
+/** @test Independent allocator owners keep same-device/same-name payloads disjoint. */
+TEST(Test__WorkspaceAllocator, IndependentExclusiveAllocatorOwnersRetainDistinctPhysicalStorage)
+{
+    if (!hasCPUBackend()) initCPUBackend(-1);
+    constexpr size_t bytes=4096;
+    const auto cpu=DeviceId::cpu();
+    auto authority=makeWorkspaceAuthority(cpu,2*bytes);
+    WorkspaceAllocator firstOwner(authority),secondOwner(authority);
+    ComputeGraph firstGraph,secondGraph;
+    MockWorkspaceConsumer first({{"owner_payload",bytes,256,true}});
+    MockWorkspaceConsumer second({{"owner_payload",bytes,256,true}});
+    auto hints=tinyHints();hints.graph_family_policy=WorkspaceGraphFamilyPolicy::ExclusiveLifetime;
+    ASSERT_TRUE(firstOwner.allocateForGraph(firstGraph,hints,{requestFor(first,cpu)},unitBudgetConfig()));
+    ASSERT_TRUE(secondOwner.allocateForGraph(secondGraph,hints,{requestFor(second,cpu)},unitBudgetConfig()));
+    auto *firstManager=firstOwner.getDeviceWorkspace(cpu);
+    auto *secondManager=secondOwner.getDeviceWorkspace(cpu);
+    ASSERT_NE(firstManager,nullptr);ASSERT_NE(secondManager,nullptr);
+    EXPECT_NE(firstManager,secondManager);
+    EXPECT_EQ(first.boundWorkspace(),firstManager);EXPECT_EQ(second.boundWorkspace(),secondManager);
+    auto firstRegion=firstManager->retainBuffer("owner_payload",0,bytes);
+    auto secondRegion=secondManager->retainBuffer("owner_payload",0,bytes);
+    EXPECT_NE(firstRegion->data(),secondRegion->data());
+    *static_cast<uint32_t *>(firstRegion->data())=0x12345678u;
+    *static_cast<uint32_t *>(secondRegion->data())=0xabcdef01u;
+    EXPECT_EQ(*static_cast<uint32_t *>(firstRegion->data()),0x12345678u);
+    EXPECT_GT(firstOwner.deviceGeneration(cpu),0u);EXPECT_GT(secondOwner.deviceGeneration(cpu),0u);
+    EXPECT_EQ(authority->claimedBytes(cpu,PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),2*bytes);
+    firstOwner.releaseAll();
+    EXPECT_EQ(firstOwner.getDeviceWorkspace(cpu),nullptr);
+    EXPECT_EQ(secondOwner.getDeviceWorkspace(cpu),secondManager);
+    EXPECT_EQ(*static_cast<uint32_t *>(secondRegion->data()),0xabcdef01u);
+    // Physical ownership follows retained regions even after their allocator retires.
+    EXPECT_EQ(authority->claimedBytes(cpu,PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),2*bytes);
+    firstRegion.reset();
+    EXPECT_EQ(authority->claimedBytes(cpu,PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+    secondOwner.releaseAll();secondRegion.reset();
+    EXPECT_EQ(authority->claimedBytes(cpu,PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+}
+/** @test Repeated declarations extend one existing owner rather than create another. */
+TEST(Test__WorkspaceAllocator, ExclusiveOwnerMayAppendNamesWithoutRebindingExistingPayload)
+{
+    if (!hasCPUBackend()) initCPUBackend(-1);
+    constexpr size_t bytes=4096;
+    const auto cpu=DeviceId::cpu();auto authority=makeWorkspaceAuthority(cpu,2*bytes);
+    WorkspaceAllocator owner(authority);ComputeGraph graph;
+    MockWorkspaceConsumer first({{"owner_payload",bytes,256,true}});
+    MockWorkspaceConsumer extension({{"owner_payload",bytes,256,true},{"new_payload",bytes,256,true}});
+    auto hints=tinyHints();hints.graph_family_policy=WorkspaceGraphFamilyPolicy::ExclusiveLifetime;
+    ASSERT_TRUE(owner.allocateForGraph(graph,hints,{requestFor(first,cpu)},unitBudgetConfig()));
+    auto *manager=owner.getDeviceWorkspace(cpu);ASSERT_NE(manager,nullptr);
+    auto region=manager->retainBuffer("owner_payload",0,bytes);
+    const auto address=region->data();*static_cast<uint32_t *>(address)=0x12345678u;
+    ASSERT_TRUE(owner.allocateForGraph(graph,hints,{requestFor(extension,cpu)},unitBudgetConfig()));
+    EXPECT_EQ(owner.getDeviceWorkspace(cpu),manager);
+    EXPECT_EQ(manager->getBuffer("owner_payload"),address);
+    EXPECT_NE(manager->getBuffer("new_payload"),address);
+    EXPECT_EQ(*static_cast<uint32_t *>(address),0x12345678u);
+    EXPECT_EQ(authority->claimedBytes(cpu,PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),2*bytes);
+}
+
+/** @test Transient grouped scratch cannot collapse surviving participant contents. */
+TEST(Test__WorkspaceAllocator, PersistentParticipantRejectsTransientCPUGroupedBundleBeforeAllocation)
+{
+    if(!hasCPUBackend())initCPUBackend(-1);
+    class PersistentGroupedStage final:public DeclaredShapeWorkspaceStage
+    {
+    public:
+        PersistentGroupedStage():DeclaredShapeWorkspaceStage(DeviceId::cpu(),{2,5},{2,5}){}
+        WorkspaceRequirements getWorkspaceRequirements(int m,int=0,int=0)const override
+        {
+            WorkspaceRequirements req;
+            req.cpu_grouped_moe_storage=std::make_shared<const CPUGroupedMoEStorageLayout>(
+                CPUGroupedMoEStorageLayout::declare(size_t(std::max(1,m)),5,17,4,2,DeviceId::cpu()));
+            return req;
+        }
+    };
+    auto authority=makeWorkspaceAuthority(DeviceId::cpu(),65536);
+    WorkspaceAllocator allocator(authority);ComputeGraph primary,persistent;
+    persistent.addNode("persistent_grouped",std::make_unique<PersistentGroupedStage>(),DeviceId::cpu());
+    auto hints=tinyHints();hints.graph_family_policy=WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+    const std::vector<WorkspaceGraphParticipant> participants{{&persistent,WorkspaceGraphParticipantRole::Decode,
+        WorkspaceGraphParticipantLifetime::PersistentAcrossParticipants}};
+    EXPECT_THROW(allocator.allocateForGraphFamily(primary,WorkspaceGraphParticipantRole::Prefill,
+        participants,hints),std::invalid_argument);
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
 }

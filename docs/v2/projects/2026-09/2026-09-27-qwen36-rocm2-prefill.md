@@ -251,7 +251,7 @@ flowchart LR
     C --> R
 ```
 
-GPU memory traffic uses the source format's existing NativeVNNI logical-plane
+GPU memory traffic uses the source format's existing NativeQuantised logical-plane
 size or its actual floating scalar width. No weight conversion, precision
 change, GPU state readback, or anonymous memory allowance is introduced.
 Arithmetic rates remain explicitly qualified extrapolations from the measured
@@ -318,7 +318,7 @@ Both profiler lifetimes and the native A/B/B/A have clean complete driver
 windows. Evidence: `issue16-nail-short-abba/`, `issue16-nail-fixed3-trace2/`
 and `issue16-nail-dynamic-trace/` under the ignored root above.
 
-Single-projection ROCm NativeVNNI producer/reducer kernels now use the same
+Single-projection ROCm NativeQuantised producer/reducer kernels now use the same
 bounded live-row worker contract already used by fused projections. Physical
 split-K strides and ascending serial-row arithmetic remain unchanged. The
 focused preflight entry passes **149 tests**, including all 21 codebooks at a
@@ -429,8 +429,8 @@ formats and malformed geometry. The explicit admission preflight entry passes
 in the twelve-entry delta above.
 
 Public auto plans for both two and three ROCm cards now reject the exact source
-with an actionable layer-34 diagnostic: `ffn_gate_exps=NativeVNNI/Q8_0`,
-`ffn_up_exps=NativeVNNI/Q8_0`, `ffn_down_exps=floating/BF16`. Both driver windows
+with an actionable layer-34 diagnostic: `ffn_gate_exps=NativeQuantised/Q8_0`,
+`ffn_up_exps=NativeQuantised/Q8_0`, `ffn_down_exps=floating/BF16`. Both driver windows
 are clean. No source tensor was converted. This implements the reporter's
 requested diagnostic option; it does **not** implement mixed-arithmetic FFNs,
 certify the independently reported complete-residency limit, or make a
@@ -3344,7 +3344,7 @@ publication launch. ROCm already consumes canonical Q8 hidden rows in original
 token order. CUDA previously expanded those rows to grouped route order,
 including copying an already-published router representation. CUDA gate/up now
 borrows the original rows through `MoEGroupedSourceRows`; without a router
-publication it quantizes each original token once. All gate/up NativeVNNI
+publication it quantizes each original token once. All gate/up NativeQuantised
 codebooks use the same addressing contract. Weight arithmetic, down projections,
 FP32 activation policy, arena reservation and wire precision are unchanged.
 
@@ -4113,7 +4113,7 @@ The new explicit preflight entry `V2_Integration_ROCmActivationQuantization`
 proves both public APIs across 124 geometries and twenty changing-input retained
 replays each. It checks every output byte, scale word, integer sum, tail/leading
 guard and null-stream rejection. Together with the existing all-codebook
-NativeVNNI prefill and grouped-verifier proofs, **3/3 focused preflight entries
+NativeQuantised prefill and grouped-verifier proofs, **3/3 focused preflight entries
 pass in 44.26 seconds**, with a clean driver window. This is not yet a fresh
 full Unit/preflight or HF certificate for the candidate.
 
@@ -4682,11 +4682,11 @@ no production override was installed. The driver interval is clean. Evidence:
 - **Q8 producer identity missing from the same trainer:** the resumed run
   reaches Q8_0 and fails before timing with `could not inspect its launch`.
   Q8_0/Q8_1/Q8_K use the distinct INT8-VNNI producer, while the trainer both
-  forces NativeVNNI-only controls and queries NativeVNNI-only metadata. This
+  forces NativeQuantised-only controls and queries NativeQuantised-only metadata. This
   is not evidence of a numerical failure. Repair must name the actual producer,
   sweep only its real controls, inspect its exact compiler resources, retain
   source aliases independently, and byte-certify every candidate. It must not
-  pretend ignored NativeVNNI knobs changed Q8 execution or replace Q8 weights.
+  pretend ignored NativeQuantised knobs changed Q8 execution or replace Q8 weights.
   Preserve this incomplete generation and recollect against the corrected
   producer identity. `native-dag-dense-resume-1*` retains the failure and a
   clean driver interval.
@@ -7101,7 +7101,7 @@ overlap shared-expert work. This confirms that the remaining gap is not simply
 an unsharded GEMM; exchange and fixed recurrence latency remain important.
 
 A scoped experiment removed the extra pre-publication barrier from the
-existing two-slot NativeVNNI GEMM loop. Its following barrier already retires
+existing two-slot NativeQuantised GEMM loop. Its following barrier already retires
 the current readers and publishes the independent next slot. The 12 captured
 Q6 projection probes (six canonical N/K shapes, M=64 and 512, 31 samples each)
 improved only 0.5–0.8%, with zero spills and agreement with the probe's Auto
@@ -7758,7 +7758,7 @@ installed dispatch policies remain unchanged. No P2P setting was changed.
 The main prefix chunk contains 448 live rows in a 512-row bucket. The final
 chunk contains 64 rows. Both matter: the short tail scales considerably worse
 for several projections. Dense physical N/K points come from the shared
-NativeVNNI trainer manifest, head geometry comes from the release-model
+NativeQuantised trainer manifest, head geometry comes from the release-model
 catalog, and experts remain whole matrices while the locally owned route
 count halves. Attention replicates K/V heads when the TP degree exceeds their
 count. Balanced synthetic expert ownership is an upper-bound experiment, not
@@ -7805,10 +7805,10 @@ MoE retains seven. MoE includes route grouping, gate/up, activation, down and
 publication, with zero output-byte differences from serial rows. It deliberately
 keeps fixed bookkeeping and inactive slots, so it is labeled a pipeline, not
 one kernel. This suite does not certify the entire model or every format.
-The NativeVNNI producer-only probe cannot stand in for the distinct INT8-VNNI
+The NativeQuantised producer-only probe cannot stand in for the distinct INT8-VNNI
 producer used for Q8 weights; requesting that family is rejected rather than
 silently repacking it or reporting another kernel's resource metadata.
-The producer probe's separate 18-format NativeVNNI check at M=64, N=K=2048
+The producer probe's separate 18-format NativeQuantised check at M=64, N=K=2048
 passed with zero differing output bytes; the initial request including Q8
 failed at that probe-family boundary, not from a numerical mismatch. This is
 not a claim of Q8 producer coverage or all-format model certification.

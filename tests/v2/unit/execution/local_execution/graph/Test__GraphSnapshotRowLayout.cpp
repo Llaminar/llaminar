@@ -12,6 +12,8 @@
 #include "snapshots/SnapshotCapture.h"
 #include "tensors/GpuTensorView.h"
 #include "tensors/Tensors.h"
+#include "transfer/TransferEngine.h"
+#include "mocks/MockBackend.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -174,7 +176,7 @@ TEST(GraphSnapshotRowLayout, CapturedPublicationPreservesOwnedRowsAcrossBackends
             ASSERT_EQ(snapshot->publication, SnapshotPublication::RowPartition);
             ASSERT_EQ(snapshot->rows, size_t(live));
             EXPECT_EQ(snapshot->cols, size_t(cols));
-            values[participant] = snapshot->data;
+            values[participant] = snapshot->data.floats();
             ownership[participant] = snapshot->row_ownership;
             EXPECT_EQ(std::memcmp(fixture.source.data(), physical.data(), physical.size()*sizeof(float)),0);
         }
@@ -229,4 +231,45 @@ TEST(GraphSnapshotRowLayout, RecordingRejectsOwnershipDescriptorDrift)
     }
     EXPECT_NE((SnapshotRowLayout{SnapshotOwnedRows{{{0,2},{4,1}}}}),
               (SnapshotRowLayout{SnapshotOwnedRows{{{0,2},{5,1}}}}));
+}
+
+/** @test Exact composed-parent streams publish real manifest bytes without querying withdrawn child streams. */
+TEST(GraphSnapshotRowLayout, ExplicitParentStreamPublishesWithoutChildStageStream)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+        test::MockBackend backend(device.type);
+        FrozenRouter fixture(device,{1.0f,2.0f,3.0f,4.0f},2,{});
+        // The mock backend owns all event/copy/allocation calls in host memory.
+        // Neither the inert source descriptor nor its stage gets a GPU stream.
+        auto &arena=*fixture.manifest.storage_arena;
+        arena.setBackendForTesting(&backend);
+        void *const parent_stream=reinterpret_cast<void*>(0x1234);
+        TransferEngine::prepareDeviceInput(&arena,device,parent_stream);
+        EXPECT_THROW((void)fixture.stage->gpuStream(),std::logic_error);
+        const auto capture_count=fixture.manifest.bulk_download_count;
+        backend.resetTransferStats();
+        for(int replay=0;replay<6;++replay) {
+            fixture.capture.clear();
+            ASSERT_TRUE(fixture.executor.publishSnapshotsAfterGraphExecution(fixture.graph,parent_stream,
+                "original_composed_parent",&fixture.manifest));
+            const auto value=fixture.capture.getShared("layer0_MOE_ROUTER_OUTPUT");
+            ASSERT_TRUE(value);
+            EXPECT_EQ(value->data,fixture.source);
+            EXPECT_EQ(fixture.manifest.bulk_download_count,capture_count+replay+1);
+            // Publication must not silently restore an obsolete child stream.
+            EXPECT_THROW((void)fixture.stage->gpuStream(),std::logic_error);
+        }
+        const auto transfers=backend.getTransferStats();
+        EXPECT_EQ(transfers.d2h_count,6u);EXPECT_EQ(transfers.h2d_count,0u);
+        for(const auto &event:backend.getEventRecords())
+            if(event.stream)EXPECT_EQ(event.stream,parent_stream);
+        // Preserve hard failure when neither a parent nor a live child owns
+        // the producer, or the caller supplies a reserved default stream.
+        EXPECT_THROW((void)fixture.executor.publishSnapshotsAfterGraphExecution(fixture.graph,nullptr,
+            "missing_original_parent",&fixture.manifest),std::logic_error);
+        for(const std::uintptr_t invalid:{1u,2u})
+            EXPECT_THROW((void)fixture.executor.publishSnapshotsAfterGraphExecution(fixture.graph,
+                reinterpret_cast<void*>(invalid),"default_parent",&fixture.manifest),std::invalid_argument);
+        EXPECT_EQ(backend.getTransferStats().d2h_count,6u);
+    }
 }

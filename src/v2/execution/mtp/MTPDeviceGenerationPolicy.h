@@ -94,7 +94,26 @@ namespace llaminar2
         policy.learned = {
             .enabled = depth.use_generated_policy && depth.mode == MTPDepthPolicyMode::Dynamic,
             .backend = depth.backend, .model_class = depth.model_class,
-            .verify_mode = mtp.verify_mode};
+            .verify_mode = mtp.verify_mode, .scope = depth.scope};
         return policy;
     }
+    /**
+     * @brief Build a query-only positive-depth envelope for host-owned MTP responses.
+     * @param mtp Existing complete execution request, including its permitted maximum.
+     * @return Ordinary visibility or a fixed maximum-depth visibility envelope.
+     *
+     * This record is consumed ONLY by sparse-query admission. It is never
+     * installed into a CPU depth controller or a native generation controller.
+     * CPU dynamic policies may legitimately demote to zero and later promote;
+     * that ordinary zero branch is bounded by the same positive maximum envelope.
+     * Native resident policy conversion/validity remains deliberately unchanged.
+     */
+    [[nodiscard]] inline sampling_math::DeviceGenerationPolicy
+    resolveSparseQueryHostDepthEnvelope(const MTPRuntimeConfig &mtp)
+    {
+        return mtp.enabled
+            ? sampling_math::DeviceGenerationPolicy::fixed(resolveMTPMaximumExecutionDraftDepth(mtp))
+            : sampling_math::DeviceGenerationPolicy::ordinary();
+    }
+
 }

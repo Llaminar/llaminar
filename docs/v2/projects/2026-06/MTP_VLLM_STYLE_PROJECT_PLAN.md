@@ -1,5 +1,117 @@
 # vLLM-Style MTP Project Plan
 
+## Current branch integration and backend port
+
+The October 25 CPU results below originated on the incoming GDN harness branch
+against its pinned develop control. Current `feat/qwen-flash-next` integration,
+fresh correctness/economy evidence and CUDA/ROCm work are tracked in the
+[backend port plan](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md). Historical
+passes and speedups do not certify this merged source or its experimental GPU
+leaves. The complete production integration and model qualification remain open.
+
+## 2026-10-25 follow-up: shallow CPU GDN economy and develop comparison
+
+Immutable checkpoint retention, shared query SIMD, direct accepted-state scatter
+and correct terminal-logit publication close the selected CPU failures below.
+Complete prerequisites pass 737 Unit and 625 preflight entries; all 13 selected
+original-model cells pass, including positive dynamic acceptance. All 672
+production-layout depth-2/3/4 kernel cases preserve bytes and beat serial across
+the measured ISAs, phases, geometries and physical worker counts. All 48 isolated
+counter profiles pass; this is CPU evidence, not a release or GPU certificate.
+
+Twenty-four Release model runs compare the complete feature with exact develop
+`ef1f54b09`, using the same losslessly expanded FP32-router model fixture.
+Median paired decode gains are 1.9%, 5.5% and 5.9% at depths 2, 3 and 4.
+Dynamic depth gains 38.5% while performing fewer draft steps; changed arithmetic
+and accepted work contribute to these version deltas. Prefill remains slower.
+The user canceled 16k/64k testing before a paired long-context cohort completed.
+Implementation, limits and receipts: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
+
+## 2026-10-25: CPU fixed-epoch production implementation and model timing
+
+The combined P=8 backward-query/shared-prefix candidate now runs in ordinary CPU
+decode, prefill and grouped verification. Complete checkpoint/history storage is
+owned consistently by request banks, workspace, admission and prefix snapshots;
+the new arithmetic identity invalidates old CPU prefix entries. AVX2 and AVX-512
+independent-oracle tests preserve serial/grouped output and continuation bytes.
+Complete prerequisites pass 737 Unit and 613 preflight entries. Seven dense and
+five selected IQ3S MoE model cells pass unchanged references. The dynamic-depth
+acceptance witness fails three times with zero accepted drafts, although its HF
+numeric and serial-token comparisons pass. Qualification remains red.
+
+Eighteen alternating Release runs compare the implemented candidate with the
+frozen, previously qualified one-hop binary on one 28-core CPU socket. Median
+paired prefill-plus-decode throughput changes are +8.3% for 0.8B Q4_0, −1.9% for
+4B Q8_0 and +32.8% for 35B-A3B IQ3S with stochastic dynamic MTP. Generated tokens
+are repeatable within each implementation but differ between arithmetic
+contracts. The MoE gain includes fewer draft steps and verifier tokens, so it
+cannot be attributed entirely to GDN kernel speed. Median prefill regresses on
+all three models. The grouped M=8 kernel beats serial at 28 workers but loses at
+1, 7 and 14. State storage grows 12.6% per 128×128 head. Keep the candidate
+experimental until both qualification and economy gates pass; no release is
+certified.
+
+Implementation, arithmetic contract, paired ranges, failed gates and local
+receipts: [CPU fixed-epoch production results](../2026-10/gated-deltanet-epoch-production-results.md).
+
+## 2026-10-24: CPU shared GDN readout and backward-query experiments
+
+In the isolated `feat/gdn-speculative-leaf-harness` worktree, the authorized new
+CPU readout makes serial and grouped adjusted queries byte identical while
+retaining rounded dense state advancement. This changes old serial output bytes;
+prefix-cache identity records the arithmetic revision. Complete CPU prerequisites
+pass 737 Unit and 612 preflight entries. The seven dense Qwen3.5 CPU model cells
+and six selected Qwen3.6 IQ3S MTP cells pass unchanged HF/reference gates. A native
+BF16 router repair closes a preexisting CPU MTP failure, with focused preflight
+coverage. Release stochastic dynamic MTP completes 384 tokens and proves both
+new kernel counters.
+
+Leaf projection elimination remains in the research tree harness. Complete
+two-round lifecycle timing improves 1.71x at four siblings and 2.18x at 39 against
+the previous compact algorithm, but one sibling regresses. Backward-query-only
+and combined prefix/two-update-suffix experiments pass exact algebra and accepted
+state bytes, yet fail output bytes in 44/81 and 29/81 cases. Their 2.12x and 1.90x
+gains over leaf-only on a ternary depth-three tree are inadmissible under the
+one-hop contract.
+
+A subsequent fixed-epoch contract rebases ordinary M=1 as well as grouped
+execution. Complete checkpoint/history snapshots preserve rounding boundaries
+independently of grouping and acceptance. Backward and combined implementations
+pass 837 tree/phase/geometry cases against an independent serial interpreter,
+plus repartitioning and adversarial lifecycle tests; all six research CTests pass.
+At P=8, including every checkpoint phase, combined shared-prefix/backward
+execution is 1.265x faster than qualified leaf-only on a ternary depth-three tree
+and 1.262x on a binary depth-four tree. Backward alone loses there. Stars regress
+and chains show no reliable combined gain. The full research state costs 12.6%
+more per 128-by-128 head. Keep the combination as a branching-tree candidate;
+its production state/cache integration and fresh model qualification remain open.
+Whole-model timing does not establish a speed win, and low-worker grouped-GDN
+economy diagnostics fail on both old and new cores. No release is certified.
+
+Definitions, counters, exact counterexample, baseline comparison and local
+receipts: [CPU GDN report](../2026-10/gated-deltanet-shared-readout-and-backward-query-results.md).
+
+## 2026-10-20 QFN: CPU direct-emission checkpoint origin
+
+The real QFN CPU fixed-depth-1 parity cell now reaches generation, but its
+budget-limited direct-emission branch fails a shifted-KV boundary check:
+eleven resident rows are compared against a required twelve. That branch
+unconditionally adds one to the saved shifted count. QFN's visible token-zero
+bootstrap has offset zero; successor-pair-only models have offset one.
+
+The repair derives the CPU append coordinate from the immutable checkpoint's
+typed model origin. It does not synthesize missing KV rows or alter the
+device-owned GPU transaction. Focused regressions cover both origins, overflow,
+invalid tags, and the real CPU cache validator's missing-row and explicit
+speculative-discard behavior. Both have explicit ProductionTestPreflight
+registrations. Source is installed in QFN build46; build, focused execution
+and the original real-model rerun remain pending. The failed build45b artifacts
+are retained, including the absent transaction/verifier CSVs. This is a runtime
+failure, distinct from QFN's remaining numerical divergence.
+
+Evidence and current qualification are tracked in
+[the QFN implementation plan](../2026-10/QWEN_FLASH_NEXT_IMPLEMENTATION.md).
+
 ## 2026-10-09 r41: DRM memory units in the resource observer
 
 The first hybrid app launch stopped before sending any model request. The
@@ -4435,7 +4547,7 @@ typed expert ownership passes CUDA/HIP 20/20 each, Unit 632/632, and preflight
 at 600 seconds during structured generation; no stale epoch recurs through
 epoch 127. Next: attribute throughput and command-local DMA warning latency.
 Command-local diagnostic timing now passes Unit 633/633 and preflight 90/90.
-CPU sampling identifies OpenMP waits and ordered NativeVNNI expert projections;
+CPU sampling identifies OpenMP waits and ordered NativeQuantised expert projections;
 their critical-path contribution is not yet isolated. No kernel speedup is
 claimed. 122B ROCm4+CPU2 now passes all eight full behavioral checks, including
 2048 generated tokens and 7595/8192 context. Its certificate remains red:
@@ -4657,13 +4769,13 @@ declare M=1..4 GEMV KPAR scratch even when first planned for large prefill, so
 prefill/decode phase reuse cannot lose the canonical decode arena. The broad
 gate passed `19/19`:
 `GroupedVerifierRows_{CPU,CUDA,ROCm}_{AllFormats,...}`, CUDA GEMM parity, CPU
-NativeVNNI GEMV, and ROCm quantized small-M.
+NativeQuantised GEMV, and ROCm quantized small-M.
 
-2026-07-09 update: CPU NativeVNNI fused grouped verifier rows now share the
+2026-07-09 update: CPU NativeQuantised fused grouped verifier rows now share the
 caller-thread K-parallel partial-sum arena across the OpenMP team instead of
 addressing each worker's empty `thread_local` arena. The regression
 `MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows` forces
-`LLAMINAR_CPU_VNNI_K_TILES=4`, sweeps every CPU NativeVNNI format, and requires
+`LLAMINAR_CPU_VNNI_K_TILES=4`, sweeps every CPU NativeQuantised format, and requires
 byte equality against serial decode plus the fused grouped verifier counter. It
 is part of `V2_Integration_GroupedVerifierRows_CPU_AllFormats`. The canonical
 precommit/CI grouped verifier gate now runs `^V2_Integration_GroupedVerifierRows_`
@@ -4672,7 +4784,7 @@ gate passed `16/16` across CPU/CUDA/ROCm.
 
 2026-07-10 update: The intermittent ROCm Qwen3.6 MoE M=2 verifier failure was a
 real router-to-expert Q8 publication bug. The router hidden quantizer used
-`value / scale`, while ordinary NativeVNNI M=1 expert decode computes one
+`value / scale`, while ordinary NativeQuantised M=1 expert decode computes one
 reciprocal per block and multiplies by it. Those FP32 expressions differ at
 half-way rounding boundaries, so router-owned Q8 rows could differ by one int8
 byte from serial decode. ROCm router-hidden M=1 and grouped M=2..4 publication
@@ -4693,7 +4805,7 @@ M=1..4; and the complete discovered
 not an M=2..4 architecture. Graph/schema tests reserve 31 target-query rows,
 and the canonical kernel inventory proves every grouped M=2..16 plus M=31;
 M=1 remains the independent production serial-decode oracle and M=31 is a
-deeper sentinel, not a maximum. CPU NativeVNNI composes arbitrary M from
+deeper sentinel, not a maximum. CPU NativeQuantised composes arbitrary M from
 bounded two-row AVX2 or up-to-four-row AVX512 physical tiles. Both the direct
 grouped projection and fused multi-projection long-K scheduler share decoded
 weights across each tile and reduce K partials through one runtime-ISA-selected,
@@ -5350,7 +5462,7 @@ Open gaps:
   verifier-base checkpoint. The focused CPU parity regression also proves the
   main all-position verifier rows match serial decode rows, including shifted
   cache preconditioning. The slow CPU serial LM-head verifier helper was removed
-  after the batched NativeVNNI all-position path matched serial decode rows, so
+  after the batched NativeQuantised all-position path matched serial decode rows, so
   future failures should be treated as real state or publication drift rather
   than a checker-base artifact.
 - Phase 3 row-indexed verifier work is accepted for dense SingleDevice:
@@ -6114,10 +6226,10 @@ Status:
   (`20260611T-rocm-dense-catchup-baseline/`: fixed d3 67.6 tok/s, 2.16x).
   ROCm stochastic has now caught CUDA by speedup class after the accepted
   top-k=40 specialization, batched target/bonus top-k/top-p distribution API,
-  and the latest NativeVNNI graph-capture cleanup. The batched API is a
+  and the latest NativeQuantised graph-capture cleanup. The batched API is a
   backend/runner contract for contiguous all-position verifier rows; it uses
   declared orchestrator scratch, explicit streams, and no allocation or
-  synchronization in the kernels. ROCm NativeVNNI small-M graph capture now
+  synchronization in the kernels. ROCm NativeQuantised small-M graph capture now
   defaults to workspace split-reduce, with atomic reduce kept as an explicit
   tuning opt-in. `20260611T-rocm-dense-stochastic-split-reduce/` reports fixed
   d2 at 42.1 tok/s versus 30.2 baseline (1.394x), while
@@ -6140,7 +6252,7 @@ Status:
   depth 2 without rollbacks. The remaining dense ROCm work is absolute
   verifier/condition throughput, not a correctness or policy blocker.
   Focused gates passed: `V2_Unit_MTPDepthController`,
-  `V2_Integration_ROCm_NativeVNNI_GEMV`,
+  `V2_Integration_ROCm_NativeQuantised_GEMV`,
   `V2_Integration_ROCmQuantisedGemmSmallM`, and ROCm Qwen3.6 stochastic
   verifier parity. Remaining ROCm dense absolute-gap evidence points at
   verifier/sidecar work drained at the all-position stochastic batch outcome
@@ -6149,29 +6261,29 @@ Status:
   A one-token condition-decode replay-preservation experiment was
   benchmark-rejected and removed because the bounded lane reached
   warmup/capture but not replay, dropping ROCm d2 to 32.23 tok/s.
-- ROCm batched NativeVNNI generated dispatch is not accepted for runtime use.
+- ROCm batched NativeQuantised generated dispatch is not accepted for runtime use.
   The 2026-06-11 dense guard proved microbench cosine is not a sufficient
   promotion gate: generated batched entries collapsed ROCm dense d2 acceptance
   to near zero, while the restored generic path kept the expected 80%
   acceptance. The trainer now resets KB/TW overrides before building its
   canonical reference, but future batched generated entries must pass a
   model/verifier-equivalence gate before runtime promotion.
-- NativeVNNI decode dispatch training is now M-aware and shared across the CUDA
+- NativeQuantised decode dispatch training is now M-aware and shared across the CUDA
   and ROCm refresh path. CUDA sweep CSVs include `m`, the CUDA tree trainer
   keys features by `(M,N,K)`, exact overlay keys pack `M`, and the CUDA small-M
   runtime path consumes generated shape/tuning for verifier rows instead of
   using an N,K-only route. ROCm decode trainer and runtime already use the same
-  M-aware key shape. `scripts/refresh_native_vnni_dispatch_tables.sh` is the
+  M-aware key shape. `scripts/refresh_native_quantised_dispatch_tables.sh` is the
   canonical sweep -> train -> validate wrapper for CUDA and ROCm; it has a
   dry-run unit guard, a stratified `family-smoke` profile that runs one bounded
   sweep per requested format before combining CSVs, and can install validated
   generated includes. The compact CUDA smoke
-  `benchmark_results/native_vnni_dispatch/20260611T063908Z-cuda-m-aware-refresh-smoke/`
+  `benchmark_results/native_quantised_dispatch/20260611T063908Z-cuda-m-aware-refresh-smoke/`
   produced real Q4_1 M=1..4 rows and a validated generated include. Stratified
   CUDA/ROCm smoke refreshes
-  `benchmark_results/native_vnni_dispatch/20260611T065536Z-cuda-family-smoke-stratified/`
+  `benchmark_results/native_quantised_dispatch/20260611T065536Z-cuda-family-smoke-stratified/`
   and
-  `benchmark_results/native_vnni_dispatch/20260611T065515Z-rocm-family-smoke-stratified/`
+  `benchmark_results/native_quantised_dispatch/20260611T065515Z-rocm-family-smoke-stratified/`
   proved actual per-format partial CSV generation, CSV combine, training, and
   generated-include validation for representative simple and IQ codebook
   families. The wrapper unit test now also guards the default `family-smoke`
@@ -6179,26 +6291,26 @@ Status:
   supported quantized weight families. Project CUDA/ROCm tuning skills document
   `family-smoke` as the bounded proxy and `qwen36`/`all` plus parity/benchmarks
   as the only table-install acceptance path. Focused gates passed:
-  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_NativeQuantisedDispatchRefreshScript`,
   `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
   `V2_Unit_CUDAGemvDispatchBaseMerge`,
-  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,
-  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`, and dense CUDA Qwen3.6
+  `V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedTrainerCsvValidator`,
+  `V2_Unit_NativeQuantisedGeneratedDispatchCodebooks`, and dense CUDA Qwen3.6
   depth-3 MTP parity. The wrapper now also exposes staged strict profiles:
   `qwen36-core` for Qwen3.6 FFN/GDN projections and `qwen36-lm-head` for the
   high-cost LM-head shape. ROCm `qwen36-core` completed without installing
   tables:
-  `benchmark_results/native_vnni_dispatch/20260611T072617Z-rocm-qwen36-core-refresh/`
+  `benchmark_results/native_quantised_dispatch/20260611T072617Z-rocm-qwen36-core-refresh/`
   generated 360 entries across 15 codebook families and passed generated
   codebook validation. The post-refresh focused gate passed
-  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_NativeQuantisedDispatchRefreshScript`,
   `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
   `V2_Unit_CUDAGemvDispatchBaseMerge`,
-  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,
-  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`,
-  `V2_Integration_ROCm_NativeVNNI_GEMV`, and
+  `V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedTrainerCsvValidator`,
+  `V2_Unit_NativeQuantisedGeneratedDispatchCodebooks`,
+  `V2_Integration_ROCm_NativeQuantised_GEMV`, and
   `V2_Integration_ROCmQuantisedGemmSmallM`. A first full CUDA `qwen36-core`
   attempt was stopped after two completed cases in roughly two minutes, because
   the full strict profile is a long-running acceptance job rather than an
@@ -6208,7 +6320,7 @@ Status:
   non-blocking CUDA stream, binds it with `setGPUStream()`, records timing
   events on that stream, and unbinds/destroys it on every exit path. A bounded
   CUDA qwen36-core representative refresh,
-  `benchmark_results/native_vnni_dispatch/20260611T081007Z-cuda-qwen36-core-representative-stream-bound/`,
+  `benchmark_results/native_quantised_dispatch/20260611T081007Z-cuda-qwen36-core-representative-stream-bound/`,
   swept Q4_0, Q4_K, IQ2_XXS, and Q8_0 on the qwen36 FFN GateUp shape for
   M=1..4, generated/validated a smoke include, and proved non-null stream
   binding in the trainer log. The strict generator threshold correctly rejects
@@ -6216,36 +6328,36 @@ Status:
   only. CUDA `qwen36-lm-head`, full `qwen36`/`all`, and model-level
   parity/benchmarks remain pending before broad checked-in table replacement.
   Focused follow-up gates passed `V2_Unit_Static_NoDefaultStreamInGPUCode`,
-  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Unit_NativeQuantisedDispatchRefreshScript`,
   `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
   `V2_Unit_CUDAGemvDispatchBaseMerge`,
-  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, and
-  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`. The ROCm trainer
-  also gained an explicit `LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE` mode:
+  `V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedTrainerCsvValidator`, and
+  `V2_Unit_NativeQuantisedGeneratedDispatchCodebooks`. The ROCm trainer
+  also gained an explicit `LLAMINAR_ROCM_NATIVE_QUANTISED_DECODE_REFERENCE` mode:
   normal/core profiles keep the FP32 hipBLAS health reference, while
   `qwen36-lm-head` defaults to `native-auto` so the giant LM-head shape can
   compare candidates against a reset-AUTO native output without materializing a
   multi-GB FP32 weight mirror. A one-format LM-head smoke,
-  `benchmark_results/native_vnni_dispatch/20260611T075534Z-rocm-qwen36-lm-head-native-auto-smoke/`,
+  `benchmark_results/native_quantised_dispatch/20260611T075534Z-rocm-qwen36-lm-head-native-auto-smoke/`,
   passed for Q4_0/M=1 and generated one validated entry. The trainer now treats
   already-uploaded packed weights as valid, because first-use upload clears host
   packing buffers while keeping the device upload cache authoritative.
   CUDA LM-head smoke
-  `benchmark_results/native_vnni_dispatch/20260611T081631Z-cuda-qwen36-lm-head-smoke/`
+  `benchmark_results/native_quantised_dispatch/20260611T081631Z-cuda-qwen36-lm-head-smoke/`
   passed for Q4_0/M=1 with the stream-bound trainer and generated one
   validated entry. This proves the huge LM-head shape is tractable in the
   staged pipeline, but all-format LM-head and model-level parity still gate any
   checked-in CUDA table update. Follow-up inspection found the CUDA M=2..4
   sweep path was labelling candidates while the specialized small-M dispatcher
-  still used the current generated runtime route. `CUDANativeVNNIGemvTuned.cu`
+  still used the current generated runtime route. `CUDANativeQuantisedGemvTuned.cu`
   now consumes the sweep override for real KPAR small-M candidate launches, and
   the perf harness filters out WIDE/DIRECT/ROWPAR for M=2..4 because the
   VRAM-pool prepared harness can only execute KPAR verifier kernels today.
   The standard CUDA refresh family set is therefore `wide,kpar,direct` for M=1
   and executable KPAR rows for M=2..4; ROWPAR needs a future row-major-owner
   trainer before it can appear in production generated tables. Focused smoke
-  `benchmark_results/native_vnni_dispatch/20260611T091538Z-cuda-smallm-real-candidate-smoke/`
+  `benchmark_results/native_quantised_dispatch/20260611T091538Z-cuda-smallm-real-candidate-smoke/`
   proved the corrected path with Q4_0 Qwen3.6 GDN time projection M=2:
   648 real KPAR rows, zero small-M failure logs, generated validation passed,
   and best tile 128x1/waves4/mkg4 at 13.312 us. The CUDA sweep trainer now
@@ -6261,27 +6373,27 @@ Status:
   and an alias-conflict fixture proving Q4_1/Q4_K style source-format winners
   collapse to one codebook-level runtime dispatch row before exact thresholds.
   A strict CUDA Q4_0 LM-head refresh,
-  `benchmark_results/native_vnni_dispatch/20260611T094334Z-cuda-qwen36-lm-head-q4_0-full-candidates-maware/`,
+  `benchmark_results/native_quantised_dispatch/20260611T094334Z-cuda-qwen36-lm-head-q4_0-full-candidates-maware/`,
   swept the full candidate grid for M=1..4 in about 62 seconds, produced 2708
   rows, passed generated validation, and reported 100% overall/fallback
   family/exact hit rates. Full CUDA all-format LM-head refresh,
-  `benchmark_results/native_vnni_dispatch/20260611T094803Z-cuda-qwen36-lm-head-all-formats/`,
+  `benchmark_results/native_quantised_dispatch/20260611T094803Z-cuda-qwen36-lm-head-all-formats/`,
   completed the full M=1..4 candidate grid in about 19.5 minutes, wrote 51,452
   sweep rows, collapsed 76 source-format winners to 64 runtime dispatch keys,
   reconciled 6 alias-conflict keys, and generated a validated include with
   100% final family/exact/fallback hit rates. Full CUDA qwen36-core refresh,
-  `benchmark_results/native_vnni_dispatch/20260611T101337Z-cuda-qwen36-core-all-formats/`,
+  `benchmark_results/native_quantised_dispatch/20260611T101337Z-cuda-qwen36-core-all-formats/`,
   completed the six Qwen3.6 core FFN/GDN shapes across all CUDA decode formats
   in about 10.8 minutes, wrote 308,712 sweep rows, observed KPAR as the best
   family for all 456 source-format winners, collapsed them to 384 runtime
   dispatch keys, reconciled 64 alias-conflict keys, and generated a validated
   include with 100% final family/exact hit rates. Combined CUDA qwen36 artifact,
-  `benchmark_results/native_vnni_dispatch/20260611T102638Z-cuda-qwen36-combined-from-staged/`,
+  `benchmark_results/native_quantised_dispatch/20260611T102638Z-cuda-qwen36-combined-from-staged/`,
   was generated from the staged core plus LM-head CSVs without rerunning GPU
   sweeps. It covers 360,164 rows, 532 source-format winners, 448 runtime
   dispatch keys, 70 alias-conflict keys, and validates with 100% final
   family/exact hit rates. Full ROCm LM-head refresh
-  `benchmark_results/native_vnni_dispatch/20260611T082004Z-rocm-qwen36-lm-head-full/`
+  `benchmark_results/native_quantised_dispatch/20260611T082004Z-rocm-qwen36-lm-head-full/`
   completed without installing tables. It ran all 18 ROCm text formats across
   M=1..4, produced 72 best rows, collapsed aliases into 60 generated dispatch
   entries across 15 codebook ids, and passed generated codebook validation.
@@ -6290,7 +6402,7 @@ Status:
   speedups than the Q/K/IQ2 families, so they are follow-up tuning candidates
   after model-level parity accepts any table promotion. Combined ROCm qwen36
   artifact,
-  `benchmark_results/native_vnni_dispatch/20260611T102802Z-rocm-qwen36-combined-from-staged/`,
+  `benchmark_results/native_quantised_dispatch/20260611T102802Z-rocm-qwen36-combined-from-staged/`,
   was generated from the staged ROCm core plus LM-head CSVs without rerunning
   kernels. It covers 6048 candidate rows across 18 ROCm formats and 7 Qwen3.6
   shapes, and emits 420 generated dispatch entries across 15 codebook ids. The
@@ -6298,16 +6410,16 @@ Status:
   generated-dispatch gate passed
   `V2_Unit_Static_NoDefaultStreamInGPUCode`,
   `V2_Unit_GpuWorkspaceAllocationPolicy`,
-  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_NativeQuantisedDispatchRefreshScript`,
   `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
   `V2_Unit_CUDAGemvDispatchBaseMerge`,
-  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, and
-  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+  `V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedTrainerCsvValidator`, and
+  `V2_Unit_NativeQuantisedGeneratedDispatchCodebooks`.
   The combined CUDA and ROCm generated tables are now installed in
-  `CUDANativeVNNIGemvDispatchHeuristicGenerated.inc` and
-  `ROCmNativeVNNIDecodeDispatchGenerated.inc`. Promotion evidence passed:
-  the generated-dispatch unit/static gate, `V2_Integration_ROCm_NativeVNNI_GEMV`,
+  `CUDANativeQuantisedGemvDispatchHeuristicGenerated.inc` and
+  `ROCmNativeQuantisedDecodeDispatchGenerated.inc`. Promotion evidence passed:
+  the generated-dispatch unit/static gate, `V2_Integration_ROCm_NativeQuantised_GEMV`,
   `V2_Integration_ROCmQuantisedGemmSmallM`, and the symmetric dense Qwen3.6
   CUDA/ROCm MTP parity gate covering fixed d1/d3, dynamic depth, forward-only
   equivalence, stochastic verifier smoke, and benchmark-prompt known-window
@@ -6334,14 +6446,14 @@ Status:
   codebook inventory. The first all-format attempt exposed Q4_K/M=3 and Q2_K/M=1
   as FP32 hipBLAS health-gate false negatives rather than dispatch mismatches:
   Q4_K/M=3 is covered by an expanded Qwen3.6 GDN time-projection packed native
-  contract regression, and `V2_Integration_ROCm_NativeVNNI_GEMV` plus
+  contract regression, and `V2_Integration_ROCm_NativeQuantised_GEMV` plus
   `V2_Integration_ROCmQuantisedGemmSmallM` remain the exact dispatch-equivalence
   gates. After documenting those ROCm trainer health gates, the all-format smoke
-  `benchmark_results/native_vnni_dispatch/20260611T070818Z-rocm-family-smoke-all-formats/`
+  `benchmark_results/native_quantised_dispatch/20260611T070818Z-rocm-family-smoke-all-formats/`
   generated 60 decode entries across 15 codebooks and passed validation.
 - CUDA default `family-smoke` also runs through its full decode inventory,
   including the CUDA-only `Q8_0` codebook. The all-format smoke
-  `benchmark_results/native_vnni_dispatch/20260611T071116Z-cuda-family-smoke-all-formats/`
+  `benchmark_results/native_quantised_dispatch/20260611T071116Z-cuda-family-smoke-all-formats/`
   swept 58,235 candidate rows, trained the fallback tree, layered 76 exact
   known-shape overrides across 16 codebooks, and passed generated codebook
   validation. This exposed a policy issue rather than a kernel issue:
@@ -6349,7 +6461,7 @@ Status:
   strict CUDA fallback-family/exact thresholds for production table acceptance.
   After fixing the CUDA small-M relabel/fallthrough bug, the corrected
   all-format smoke
-  `benchmark_results/native_vnni_dispatch/20260611T091656Z-cuda-family-smoke-all-formats-corrected-smallm/`
+  `benchmark_results/native_quantised_dispatch/20260611T091656Z-cuda-family-smoke-all-formats-corrected-smallm/`
   produced 51,452 executable rows, covered 16 codebook ids, generated 76
   known-shape overrides, validated the generated include, and had zero
   small-M failure logs. This corrected artifact supersedes the earlier CUDA
@@ -7494,8 +7606,8 @@ must stay decode-equivalent, but the hot path should no longer pay row-serial
 replay, full all-position LM-head, or host transfer/sync costs where a compact
 backend-resident path can produce the same state and logits.
 
-NativeVNNI small-M retuning and promotion in this phase is governed by the
-[Cross-Backend Batch-Invariant NativeVNNI Learned Dispatch Policy](../2026-07/NATIVE_VNNI_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md):
+NativeQuantised small-M retuning and promotion in this phase is governed by the
+[Cross-Backend Batch-Invariant NativeQuantised Learned Dispatch Policy](../2026-07/NATIVE_QUANTISED_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md):
 verifier candidates require serial-M1 byte equality, and the exact frozen
 generic policy requires maximum sealed worst-surface performance regret of at
 most 3% with no post-certification refit.
@@ -7586,7 +7698,7 @@ Implementation plan:
    - Avoid full all-position LM-head and host-logit scans when the verifier only
      needs draft rows plus the bonus/correction row.
    - Avoid per-row virtual stage replay for M=2/3/4 once the grouped CPU path is
-     proven. Use cache-friendly row blocks and existing NativeVNNI/top-k CPU
+     proven. Use cache-friendly row blocks and existing NativeQuantised/top-k CPU
      fast paths where they apply.
    - CPU stochastic sampling must keep using shared `SamplingMath` semantics so
      CPU remains the readable oracle for GPU-focused failures.
@@ -7720,7 +7832,7 @@ Focused performance gate:
 ```bash
 cmake --build build_v2_release --parallel
 ctest --test-dir build_v2_release \
-  -R '^(V2_Perf_MoEVerifierPrefill|V2_Perf_GPUSpeculativeSummary|V2_Perf_CPUSamplerTopK|V2_Perf_CPUNativeVNNI_VerifierRows|V2_Perf_CPUNativeVNNI_GEMV|V2_Perf_CPUGatedDeltaNetVerifierRows|V2_Perf_.*(CUDA|ROCm|CPU).*GEMV.*M(2|3|4)|V2_Perf_.*QuantisedGemm.*VerifierM(2|3|4))$' \
+  -R '^(V2_Perf_MoEVerifierPrefill|V2_Perf_GPUSpeculativeSummary|V2_Perf_CPUSamplerTopK|V2_Perf_CPUNativeQuantised_VerifierRows|V2_Perf_CPUNativeQuantised_GEMV|V2_Perf_CPUGatedDeltaNetVerifierRows|V2_Perf_.*(CUDA|ROCm|CPU).*GEMV.*M(2|3|4)|V2_Perf_.*QuantisedGemm.*VerifierM(2|3|4))$' \
   --output-on-failure --parallel
 scripts/run_mtp_iteration_benchmark_matrix.sh \
   --models dense,moe \
@@ -7789,22 +7901,22 @@ Current status:
   batches. Focused `V2_Unit_PrefillDecodeTransition` depth-1/2/3 regressions
   pin the slot layout, and `V2_Integration_GPUSamplingKernels` proves strided
   device-output argmax on CUDA and ROCm.
-- [x] NativeVNNI trainer/generated-table guardrails are green for CUDA and
+- [x] NativeQuantised trainer/generated-table guardrails are green for CUDA and
   ROCm. Focused gate:
-  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_NativeQuantisedDispatchRefreshScript`,
   `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
   `V2_Unit_CUDAGemvDispatchBaseMerge`,
   `V2_Unit_CUDAPrefillDispatchGeneratorAliases`,
-  `V2_Unit_ROCmNativeVNNITrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator`,
-  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, and
-  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+  `V2_Unit_ROCmNativeQuantisedTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedBatchedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeQuantisedTrainerCsvValidator`, and
+  `V2_Unit_NativeQuantisedGeneratedDispatchCodebooks`.
 - [x] Focused M=2/3/4 kernel serial-equivalence proofs are green for the
-  current CPU/CUDA/ROCm NativeVNNI paths. CPU passed
+  current CPU/CUDA/ROCm NativeQuantised paths. CPU passed
   `MTP_SmallM_{FusedProjection_AllFormats,AllFormatsMatchSerialDecodeRows,Qwen36ShapesMatchSerialDecodeRows}`.
   CUDA passed `MTP_SmallM_FusedProjection_AllNativeFormats` and
-  `NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`; the CUDA
+  `NativeQuantisedSpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`; the CUDA
   assertion now keeps the strict relative-L2/cosine gates and treats sub-3e-4
   absolute KPAR reduction-order spikes as outlier diagnostics. ROCm passed
   `SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`,
@@ -7828,8 +7940,8 @@ Current status:
   consumption and the full all-codebook generated-table acceptance boxes remain
   open.
 - [x] CPU generated-table consumption is wired for verifier rows. Production
-  CPU NativeVNNI dispatch now consults
-  `CPUNativeVNNIVerifierRowsPolicyGenerated.inc` for trained M=2/3/4 verifier
+  CPU NativeQuantised dispatch now consults
+  `CPUNativeQuantisedVerifierRowsPolicyGenerated.inc` for trained M=2/3/4 verifier
   policy before falling back to the generic row policy. The CPU analyzer now
   rejects rows that pass cosine/relative-L2/symmetric-KL gates but are not
   faster than serial decode, and the refresh unit fixture proves those
@@ -7837,15 +7949,15 @@ Current status:
   family-smoke refresh across the full CPU codebook inventory for the
   Qwen3.6 GDN time-projection shape generated 47 speed-positive rows; the
   excluded rows stay unpromoted until a future sweep proves them economical.
-  The CPU verifier trainer now carries `LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME`
+  The CPU verifier trainer now carries `LLAMINAR_CPU_NATIVE_QUANTISED_VERIFIER_SHAPE_NAME`
   through CSV output, and the refresh wrapper supplies each Qwen3.6 projection
   shape name so generated policy comments no longer collapse every row to a
   generic verifier label.
-  `V2_Perf_CPUNativeVNNI_VerifierRows` is now the focused registered CTest for
-  this microbench; the older `V2_Perf_CPUNativeVNNI_GEMV` remains the broad
+  `V2_Perf_CPUNativeQuantised_VerifierRows` is now the focused registered CTest for
+  this microbench; the older `V2_Perf_CPUNativeQuantised_GEMV` remains the broad
   sweep target.
   Focused registered microbench evidence:
-  `V2_Perf_CPUNativeVNNI_VerifierRows` passed with strict cosine 1.0,
+  `V2_Perf_CPUNativeQuantised_VerifierRows` passed with strict cosine 1.0,
   relative L2 0, symmetric KL 0 and N=K=5120 speedups Q4_K M2/M3/M4
   `1.40/1.49/1.63x`, Q6_K `1.75/1.83/2.03x`, and IQ4_XS
   `1.55/1.50/1.97x`. A long-K Q4_K FFN-down probe at N=5120,K=17408
@@ -7855,7 +7967,7 @@ Current status:
   moved from weak to meaningfully economical but still below the aspirational
   M4 target. `V2_Perf_CPUGatedDeltaNetVerifierRows`,
   `V2_Perf_CPUFlashAttentionVerifierRows`, and
-  `V2_Perf_DenseVerifierRows_CPU` pass after the NativeVNNI policy wiring,
+  `V2_Perf_DenseVerifierRows_CPU` pass after the NativeQuantised policy wiring,
   direct merged-QKV CPU GDN verifier path, and grow-only overwrite verifier
   state slots. The latest registered full-pipeline M2/M3/M4 speedups are
   `1.5639/1.7712/2.1822x` with exact cosine/relative-L2/symmetric-KL; a
@@ -7880,7 +7992,7 @@ Current status:
   cosine `1.0`, relative L2 below `3e-7`, and symmetric KL `0`; CUDA routed
   M2/M3/M4 speedups were `63.1/78.5/94.2x`, shared `48.7/68.1/102.7x`; ROCm
   routed `22.4/21.8/26.2x`, shared `16.6/20.0/24.2x`. Focused gate passed:
-  `LLAMINAR_MOE_VERIFIER_PREFILL_ITERS=20 LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS=3 ctest --test-dir build_v2_release -V -R '^V2_Perf_GPUSpeculativeSummary$|^V2_Perf_MoEVerifierPrefill$|^V2_Perf_DenseVerifierRows_CUDA$|^V2_Perf_DenseVerifierRows_ROCm$|^V2_Perf_DenseVerifierRows_CPU$|^V2_Perf_CPUNativeVNNI_VerifierRows$|^V2_Perf_CPUGatedDeltaNetVerifierRows$' --output-on-failure --parallel`.
+  `LLAMINAR_MOE_VERIFIER_PREFILL_ITERS=20 LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS=3 ctest --test-dir build_v2_release -V -R '^V2_Perf_GPUSpeculativeSummary$|^V2_Perf_MoEVerifierPrefill$|^V2_Perf_DenseVerifierRows_CUDA$|^V2_Perf_DenseVerifierRows_ROCm$|^V2_Perf_DenseVerifierRows_CPU$|^V2_Perf_CPUNativeQuantised_VerifierRows$|^V2_Perf_CPUGatedDeltaNetVerifierRows$' --output-on-failure --parallel`.
 - [x] CUDA and ROCm generated-dispatch refresh now covers the real Qwen3.6 MoE
   expert verifier buckets. The `qwen36-moe` profile trains
   `35BMoE_Expert_GateUp` and `35BMoE_Expert_Down` across M=1..4 and all
@@ -7988,14 +8100,14 @@ Current status:
 	  tiny FP32 projections are now included in this contract rather than hidden
 	  behind cuBLAS batched GEMM.
 	  2026-06-18 ROCm follow-up fixed the Qwen3.6 fused QKV/GDN projection drift by
-	  grouping fused small-M batches by the serial M=1 native-VNNI split-K policy
+	  grouping fused small-M batches by the serial M=1 native-quantised split-K policy
 	  before launch. `V2_Integration_ROCmQuantisedGemmSmallM` passes 42/42,
 	  including all-codebook small-M, mixed-codebook GDN, graph-captured
 	  SwiGLU/down, strict cosine/relative-L2/symmetric-KL rows, and unsafe split-K
 	  hard-fail coverage. Real-model ROCm dense grouped verifier parity
 		  `VerifierRowsGroupedDecodeEquivalentM[2-4]` passes. Correctness is
 		  accepted; ROCm dense verifier economics remain below the hardware-ceiling
-		  target and need the next NativeVNNI/GDN/attention tuning pass. The dense
+		  target and need the next NativeQuantised/GDN/attention tuning pass. The dense
 		  verifier perf harness now prints replay-scoped restore/setup/forward/sample
 		  timing on every row, so future sweeps can identify whether a backend is
 		  losing in grouped-forward work or in shared restore overhead.
@@ -8006,7 +8118,7 @@ Current status:
   row against serial decode with cosine, relative L2, symmetric KL, and sampled
   token checks.
 - [x] CPU dense M=2/3/4 verifier economy is accepted for the current
-  SingleDevice dense proof lane. NativeVNNI now
+  SingleDevice dense proof lane. NativeQuantised now
   quantizes verifier activations once and, for long-K verifier shapes, computes
   row-shared M=2..4 K-tile partials before reducing them in the exact same
   tile order as serial M=1 decode. This replaced the safe but slow streamed
@@ -8059,7 +8171,7 @@ Current status:
   VPDPBUSD instruction-floor diagnostic reports only about `1.05x` at M=4 with
   the current packed-B layout, which makes the aspirational `3.5x` CPU M4
   target a layout/ISA project rather than a local scheduling tweak.
-  `V2_Perf_CPUNativeVNNI_GEMV.MTP_VerifierRows_GroupedVsSerial_Synthetic`
+  `V2_Perf_CPUNativeQuantised_GEMV.MTP_VerifierRows_GroupedVsSerial_Synthetic`
   exports CSV with structural packed-layout features (`is_nibble_lut`,
   `payload_bytes`, `is_asymmetric`, `is_superblock`) and strict cosine,
   relative L2, and symmetric KL checks. Long-K all-codebook sweep
@@ -8076,16 +8188,16 @@ Current status:
   verifier-policy keys now select the pairwise economy floor, not the wide-row
   candidate, and `MTP_VerifierRowsUntrainedShapeUsesPairwiseFloor` locks the
   untrained Q4_K 5120x5120 M=3 regression. Focused gates passed:
-  `V2_Integration_CPUNativeVNNI_GEMV` direct MTP subset with real
+  `V2_Integration_CPUNativeQuantised_GEMV` direct MTP subset with real
   Qwen3.6 GDN output weights, registered CTest
-  `V2_Integration_CPUNativeVNNI_GEMV`,
-  `V2_Unit_NativeVNNIDispatchRefreshScript`,
-  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`, release
-  `V2_Perf_CPUNativeVNNI_VerifierRows`, `V2_Perf_DenseVerifierRows_CPU`, the
+  `V2_Integration_CPUNativeQuantised_GEMV`,
+  `V2_Unit_NativeQuantisedDispatchRefreshScript`,
+  `V2_Unit_NativeQuantisedGeneratedDispatchCodebooks`, release
+  `V2_Perf_CPUNativeQuantised_VerifierRows`, `V2_Perf_DenseVerifierRows_CPU`, the
   qwen36-lm-head and qwen36-moe CPU refresh/profile gates, the representative
   MoE expert gate/up and down verifier perf gate with
-  `LLAMINAR_CPU_NVNNI_VERIFIER_MIN_SPEEDUP=1.0`, and the broader release
-  `V2_Perf_CPUNativeVNNI_GEMV` (`391s` wall). The aspirational CPU M4
+  `LLAMINAR_CPU_NATIVE_QUANTISED_VERIFIER_MIN_SPEEDUP=1.0`, and the broader release
+  `V2_Perf_CPUNativeQuantised_GEMV` (`391s` wall). The aspirational CPU M4
   target is now met in the dense proof lane; broader CPU MoE economics still
   need full-pipeline reduction of `gate_up_proj`, `down_proj`, GDN
   recurrence/projection, LM head, and embedding overhead.
@@ -8302,7 +8414,7 @@ Current status:
 - [x] CPU trained/generated M=2/3/4 verifier GEMV/GEMM dispatch tables cover
   all supported Q/K/IQ codebooks, pass strict serial M=1 equivalence, and are
   wired into dense/GDN/LM-head/MoE verifier paths. Dense/GDN qwen36-core,
-  LM-head, and MoE expert NativeVNNI rows are now generated and installed for
+  LM-head, and MoE expert NativeQuantised rows are now generated and installed for
   all Q/K/IQ codebooks with fail-closed required-key validation and strict
   cosine, relative L2, symmetric KL, and max-absolute proof.
 - [ ] CUDA trained/generated M=2/3/4 verifier GEMV/GEMM dispatch tables cover
@@ -8322,11 +8434,11 @@ Current status:
   Qwen3.6 fused QKV shape (`12288x5120`) is now in the turnkey ROCm/CUDA
   trainer inventory and the ROCm decode table contains M=1..4 policies for all
   runtime codebooks. Decode-equivalent ROCm batched verifier groups now use a
-  shared-row NativeVNNI kernel that decodes each packed weight block once per
+  shared-row NativeQuantised kernel that decodes each packed weight block once per
   output tile while preserving serial-M1 split-K order. The single-projection
   dense/GDN/LM-head path now uses the same shared-decode strategy rather than
   re-decoding packed weights once per verifier row. Focused gates passed:
-  `V2_Integration_ROCm_NativeVNNI_GEMV` all-codebook M=2/3/4 serial-equivalence,
+  `V2_Integration_ROCm_NativeQuantised_GEMV` all-codebook M=2/3/4 serial-equivalence,
   `V2_Integration_ROCmQuantisedGemmSmallM`,
   `Qwen36ROCmSingleDevicePrefixMTPParity.VerifierRowsGroupedDecodeEquivalentM[2-4]`,
   and `V2_Perf_DenseVerifierRows_ROCm`, with exact cosine, relative L2,
@@ -8335,7 +8447,7 @@ Current status:
   speedups of `1.62/2.31/2.68x`.
 - [x] ROCm decode dispatch generation now has a broad aspect/work fallback
   instead of exact-shape-only lookup. The checked-in
-  `ROCmNativeVNNIDecodeDispatchGenerated.inc` is regenerated from the preserved
+  `ROCmNativeQuantisedDecodeDispatchGenerated.inc` is regenerated from the preserved
   Qwen3.6 staged CSV with 420 exact overlays and fallback coverage for 420/420
   trained packed-codebook rows; exact-candidate recovery through the fallback is
   377/420 (`89.76%`). Future refreshes must preserve this generalization path.
@@ -9314,7 +9426,7 @@ Current status:
   at `49.7/72.0/88.8x`, and CUDA `SharedExpertFFNStage` at `7.45/3.80/3.93x`
   versus row-wise decode; ROCm routed is `35.5/24.7/33.0x`, ROCm shared is
   `17.5/21.9/19.8x`, and ROCm `SharedExpertFFNStage` is `23.5/7.5/8.9x`.
-  A fresh full CUDA `qwen36` NativeVNNI dispatch refresh generated
+  A fresh full CUDA `qwen36` NativeQuantised dispatch refresh generated
   `514,520` sweep rows across `760` cases with `640/640` known-shape coverage
   and `100%` fallback-family coverage. It was kept as evidence rather than
   installed because the existing checked-in broad table is still slightly better
@@ -9349,12 +9461,12 @@ Current status:
   economics are not CPU-dominant: CPU M2/M3/M4 is `1.56/1.76/2.17x`, CUDA is
   `1.50/1.98/2.40x`, and ROCm is `1.28/1.57/1.73x`, all with strict
   cosine/relative-L2/symmetric-KL checks green. CPU component probes still show
-  useful local wins, especially Q6_K NativeVNNI GEMV up to `2.42x`, but
+  useful local wins, especially Q6_K NativeQuantised GEMV up to `2.42x`, but
   attention (`1.42-1.54x`) and GDN (`1.02-1.37x`) cap full-verifier economics.
   This shifts the near-term performance target toward ROCm full-verifier graph
   economics and MoE production composition, not a CPU-only verifier rewrite.
 - A follow-up ROCm dense verifier slice promoted the decode-equivalent
-  single-projection NativeVNNI path from row-parallel packed-weight decode to a
+  single-projection NativeQuantised path from row-parallel packed-weight decode to a
   shared small-M kernel that preserves serial-M1 split-K order. The all-codebook
   ROCm GEMV integration test now forces the production decode-equivalent policy
   and gates relative L2, cosine, symmetric KL, and max-absolute error. Focused
@@ -9379,7 +9491,7 @@ Current status:
   next draft into a device slot, and treats the host shadow as optional. Focused
   `V2_Unit_PrefillDecodeTransition` coverage proves both the production fused
   chain and the non-fused device-slot chain defer draft host reads safely.
-  `V2_Integration_ROCm_NativeVNNI_GEMV` and `V2_Perf_DenseVerifierRows_ROCm`
+  `V2_Integration_ROCm_NativeQuantised_GEMV` and `V2_Perf_DenseVerifierRows_ROCm`
   remain green. The refreshed ROCm dense fixed-d3 run is
   `benchmark_results/mtp_vllm_style/20260619T165244Z_rocm_dense_greedy_fused_device_draft_retry`
   at `55.37 tok/s`, `15/18` accepted tokens. Proposal-token D2H sync is gone,
@@ -9442,19 +9554,19 @@ Current status:
 - The focused grouped-vs-serial perf pass now includes Qwen3.6 MoE Q6_K
   production projection groups in the ROCm batched decode trainer. A trainer
   partial-buffer bug was fixed by matching the 64-plane split-K cap used by the
-  ROCm NativeVNNI launcher; KB16/KB32 variants now produce rows instead of GPU
+  ROCm NativeQuantised launcher; KB16/KB32 variants now produce rows instead of GPU
   faults. `Qwen36MoE_GDN_Q6K_qkv_z` strict rows show best KB/TW wins over AUTO
   of M2/M3/M4 `1.18/1.13/1.28x` with cosine `1.0` and rel-L2 about
   `1.6e-7..2.2e-7`; MoE expert gate/up and down are already AUTO-best. The
   next backend-specific gap is giving ROCm Q8_0/direct small-M grouped rows the
   same trainer/generator coverage before any model-speed promotion.
 - ROCm Q8_0/direct small-M now has the same trainer/generator coverage as the
-  other NativeVNNI codebooks. `Perf__NativeVNNI_Throughput` can explicitly
-  materialize a codebook-19 NativeVNNI payload from `IINT8Unpackable` when the
+  other NativeQuantised codebooks. `Perf__NativeQuantised_Throughput` can explicitly
+  materialize a codebook-19 NativeQuantised payload from `IINT8Unpackable` when the
   default ROCm packer keeps Q8_0 on the INT8 scatter route. The qwen36-moe
   refresh profile now includes Q8_0 for ROCm, and the installed generated decode
   include has Q8_0 MoE projection rows for M=1..4. Focused trainer evidence:
-  per-projection Q8_0 NativeVNNI beats INT8 scatter by up to `2.31x` on M2..4,
+  per-projection Q8_0 NativeQuantised beats INT8 scatter by up to `2.31x` on M2..4,
   generated AUTO resolves the trained keys, and grouped Q8_0 rows pass cosine
   `1.0` with rel-L2 around `1e-7`. This removes Q8_0 as a pipeline gap; Phase 10
   still needs end-to-end ROCm MoE stochastic speed work in verifier/top-k/
@@ -9462,7 +9574,7 @@ Current status:
 - Shared-expert verifier rows now use a backend-neutral verifier-mode scope:
   stages request `ITensorGemm::beginVerifierDecodeEquivalentScope()` and keep one
   RAII scope per backend class while running grouped verifier publication or
-  serial replay. CUDA's scope selects canonical NativeVNNI small-M dispatch and
+  serial replay. CUDA's scope selects canonical NativeQuantised small-M dispatch and
   disables prefill/concurrent decode reordering without process-wide
   `LLAMINAR_DETERMINISTIC`; ROCm uses the same interface for its generated
   decode-equivalent policy. The serial replay oracle also bypasses the normal
@@ -9641,16 +9753,16 @@ ctest --test-dir build_v2_integration \
 
 ### Generated Dispatch Gate
 
-Run after touching NativeVNNI sweep, trainer, generated include, or CUDA/ROCm
+Run after touching NativeQuantised sweep, trainer, generated include, or CUDA/ROCm
 decode dispatch code:
 
 ```bash
 ctest --test-dir build_v2_integration \
-  -R "V2_Unit_Static_NoDefaultStreamInGPUCode|V2_Unit_GpuWorkspaceAllocationPolicy|V2_Unit_NativeVNNIDispatchRefreshScript|V2_Unit_CUDAGemvDispatchGeneratorAliases|V2_Unit_CUDAGemvDispatchBaseMerge|V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator|V2_Unit_ROCmNativeVNNITrainerCsvValidator|V2_Unit_NativeVNNIGeneratedDispatchCodebooks" \
+  -R "V2_Unit_Static_NoDefaultStreamInGPUCode|V2_Unit_GpuWorkspaceAllocationPolicy|V2_Unit_NativeQuantisedDispatchRefreshScript|V2_Unit_CUDAGemvDispatchGeneratorAliases|V2_Unit_CUDAGemvDispatchBaseMerge|V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator|V2_Unit_ROCmNativeQuantisedTrainerCsvValidator|V2_Unit_NativeQuantisedGeneratedDispatchCodebooks" \
   --output-on-failure --parallel
 ```
 
-Use `scripts/refresh_native_vnni_dispatch_tables.sh --backend both --profile qwen36`
+Use `scripts/refresh_native_quantised_dispatch_tables.sh --backend both --profile qwen36`
 for table refreshes. Install generated tables only after model-level parity and
 benchmark acceptance for the affected backend/model lanes.
 

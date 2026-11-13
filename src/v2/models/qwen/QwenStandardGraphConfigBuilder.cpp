@@ -12,6 +12,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../qwen35/Qwen35GraphConfigBuilder.h"
 #include "../qwen35moe/Qwen35MoEGraphConfigBuilder.h"
+#include "../qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -44,6 +45,8 @@ namespace llaminar2
         {
             return std::make_unique<Qwen35MoEGraphConfigBuilder>();
         }
+        if (model_type == "qwen4exp")
+            return std::make_unique<Qwen4ExpGraphConfigBuilder>();
         return nullptr;
     }
 

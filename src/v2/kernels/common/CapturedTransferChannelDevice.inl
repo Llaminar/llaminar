@@ -9,7 +9,8 @@
  * to become resident. CTA barriers and an acquire/release completion chain
  * carry all writers to one system-release publisher. Exact streams and private
  * phase claims protect replay
- * without host observation, allocation or additional physical cursor bytes.
+ * without host observation or allocation. The cursor retains the acquired
+ * source offset alongside its exact message until payload publication.
  */
 
 /** @return Fresh peer descriptor word after its release epoch has been acquired. */
@@ -42,14 +43,49 @@ __device__ __forceinline__ std::uint64_t capturedTransferWallClock()
 #endif
 }
 
+/** @return Only this physical channel's original CPU parent requested terminal drain. */
+__device__ __forceinline__ bool capturedTransferCancellationRequested(
+    CapturedTransferChannelDeviceBinding binding)
+{
+    return binding.expected.valid() && binding.control->identity.nonce == binding.expected.nonce &&
+        binding.control->identity.capacity == binding.expected.capacity &&
+        mappedSystemAcquire64(&binding.control->cancelled_nonce) == binding.expected.nonce;
+}
+
 /** @brief Publish a terminal peer-visible abort before trapping the failed device work. */
 __device__ __forceinline__ void capturedTransferFail(
     CapturedTransferChannelDeviceBinding binding, CapturedTransferStatus status)
 {
-    binding.cursor->phase = CapturedTransferPhase::Failed;
+    auto *phase = reinterpret_cast<unsigned int *>(&binding.cursor->phase);
+    bool drain = false;
+    if (status == CapturedTransferStatus::Cancelled)
+    {
+        const bool original = capturedTransferCancellationRequested(binding);
+        for (;;)
+        {
+            const auto previous = atomicCAS(phase, 0u, 0u);
+            drain = CapturedTransferChannelProtocol::drainsCancellation(
+                static_cast<CapturedTransferPhase>(previous), status, original);
+            if (!drain)
+            {
+                atomicExch(phase, static_cast<unsigned int>(CapturedTransferPhase::Failed));
+                break;
+            }
+            if (atomicCAS(phase, previous, static_cast<unsigned int>(CapturedTransferPhase::Cancelled)) == previous)
+                break;
+        }
+    }
+    else
+        atomicExch(phase, static_cast<unsigned int>(CapturedTransferPhase::Failed));
     auto *publication = binding.role == CapturedTransferEndpoint::Producer
         ? &binding.control->producer : &binding.control->consumer;
     mappedSystemRelease64(&publication->epoch, kCapturedTransferAbortEpoch);
+    if (drain)
+    {
+        if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication && binding.device_extent)
+            *binding.device_extent = 0;
+        return;
+    }
     printf("captured_transfer_channel_failure status=%u role=%u nonce=%llu key=%llu completed=%llu\n",
         static_cast<unsigned>(status), static_cast<unsigned>(binding.role),
         static_cast<unsigned long long>(binding.expected.nonce),
@@ -74,11 +110,14 @@ __device__ __forceinline__ void capturedTransferFail(
 __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelDeviceBinding binding)
 {
     auto *phase = reinterpret_cast<unsigned int *>(&binding.cursor->phase);
-    if (atomicCAS(phase, static_cast<unsigned int>(CapturedTransferPhase::Idle),
-            static_cast<unsigned int>(CapturedTransferPhase::Acquired)) !=
-        static_cast<unsigned int>(CapturedTransferPhase::Idle))
+    const auto previous = atomicCAS(phase, static_cast<unsigned int>(CapturedTransferPhase::Idle),
+        static_cast<unsigned int>(CapturedTransferPhase::Acquired));
+    if (previous != static_cast<unsigned int>(CapturedTransferPhase::Idle))
     {
-        capturedTransferFail(binding, CapturedTransferStatus::InvalidPhase);
+        if (previous == static_cast<unsigned int>(CapturedTransferPhase::Cancelled) && capturedTransferCancellationRequested(binding))
+            capturedTransferFail(binding, CapturedTransferStatus::Cancelled);
+        else
+            capturedTransferFail(binding, CapturedTransferStatus::InvalidPhase);
         return;
     }
     auto cursor = *binding.cursor;
@@ -91,8 +130,20 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
     // The graph orders the count writer before acquire. Snapshot once: a
     // producer waiting for the previous acknowledgement must not change the
     // extent of the transaction it is trying to publish.
-    const std::uint64_t producer_bytes = binding.extent_source == CapturedTransferExtentSource::ProducerDevice
-        ? *binding.device_extent : 0;
+    const auto source_slice = binding.source_slice ? *binding.source_slice : CapturedTransferSourceSlice{};
+    // The original materializer precedes acquire. Snapshot the local signed
+    // rows once; the producer's published uint64 extent remains wire authority.
+    const auto rows = binding.device_rows
+        ? capturedTransferRowBytes(*binding.device_rows, binding.row_bytes, binding.message.bytes)
+        : CapturedTransferRowBytes{true, 0};
+    if (!rows.valid)
+    {
+        capturedTransferFail(binding, CapturedTransferStatus::InvalidBinding);
+        return;
+    }
+    const std::uint64_t producer_bytes = binding.source_slice ? source_slice.live_bytes :
+        binding.extent_source == CapturedTransferExtentSource::ProducerDevice
+            ? (binding.device_rows ? rows.bytes : *binding.device_extent) : 0;
     const auto started = capturedTransferWallClock();
     for (;;)
     {
@@ -106,15 +157,23 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
         }
         const auto decision = CapturedTransferChannelProtocol::acquire(
             binding.role, binding.expected, actual, cursor, observed, binding.message,
-            binding.extent_source, producer_bytes);
+            binding.extent_source, producer_bytes, source_slice.byte_offset, binding.source_span_bytes, binding.source_offset_origin,
+            mappedSystemAcquire64(&binding.control->cancelled_nonce));
         if (decision.ready())
         {
+            if (binding.device_rows && binding.role == CapturedTransferEndpoint::Consumer &&
+                cursor.acquired_message.bytes != rows.bytes)
+            {
+                capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
+                return;
+            }
             binding.cursor->acquired_message = cursor.acquired_message;
+            binding.cursor->acquired_source_offset = cursor.acquired_source_offset;
             // Only this acquired invocation can initialize the completion
             // cohort. All copy blocks follow this write through the stream
             // dependency or the single-block barrier.
             binding.cursor->completed_payload_blocks = 0;
-            if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication)
+            if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication && binding.device_extent)
                 *binding.device_extent = cursor.acquired_message.bytes;
             return;
         }
@@ -157,17 +216,13 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
     }
     auto cursor = *binding.cursor;
     cursor.phase = CapturedTransferPhase::Acquired;
-    if (cursor.acquired_message.key != binding.message.key ||
-        (binding.extent_source == CapturedTransferExtentSource::FixedMessage
-            ? cursor.acquired_message.bytes != binding.message.bytes : cursor.acquired_message.bytes > binding.message.bytes))
-    {
-        capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
-        return;
-    }
     auto *owned = binding.role == CapturedTransferEndpoint::Producer
         ? &binding.control->producer : &binding.control->consumer;
     CapturedTransferPublication publication{.epoch = mappedSystemAcquire64(&owned->epoch)};
-    const auto decision = CapturedTransferChannelProtocol::publish(cursor, cursor.completed_epoch + 1, publication);
+    // Existing phase, message and epoch faults win before explicit cancellation.
+    // Copies have all joined this final publisher; no CTA barrier can diverge.
+    const auto decision = CapturedTransferChannelProtocol::preparePublication(cursor, publication,
+        binding.message,binding.extent_source,mappedSystemAcquire64(&binding.control->cancelled_nonce),binding.expected.nonce);
     if (!decision.ready())
     {
         capturedTransferFail(binding, decision.status);
@@ -177,6 +232,7 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
     mappedSystemRelease64(&owned->epoch, publication.epoch);
     binding.cursor->completed_epoch = cursor.completed_epoch;
     binding.cursor->acquired_message = {};
+    binding.cursor->acquired_source_offset = 0;
     __threadfence();
     atomicExch(phase, static_cast<unsigned int>(CapturedTransferPhase::Idle));
 }
@@ -187,6 +243,8 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
  * @param binding Acquired private cursor and complete message identity.
  * @param destination Stable mapped or device destination.
  * @param source Stable device or mapped source.
+ * @param copy_block Block index within this original message, independent of batch grid Y.
+ * @param copy_blocks Positive block count for this original cursor and publication.
  *
  * A CTA barrier orders every writer before its block's release/acquire RMW.
  * The RMW modification order chains all blocks to the last one, which performs
@@ -202,19 +260,35 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
  */
 template<bool VectorAligned>
 __device__ __forceinline__ void capturedTransferCopyAndPublish(
-    CapturedTransferChannelDeviceBinding binding, void *destination, const void *source)
+    CapturedTransferChannelDeviceBinding binding, void *destination, const void *source,
+    unsigned copy_block, unsigned copy_blocks)
 {
+    if (binding.cursor->phase == CapturedTransferPhase::Cancelled && capturedTransferCancellationRequested(binding))
+    {
+        if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::Cancelled);
+        return;
+    }
     const auto bytes = binding.cursor->acquired_message.bytes;
-    if (binding.cursor->phase != CapturedTransferPhase::Acquired || bytes > binding.message.bytes ||
+    if (binding.cursor->phase != CapturedTransferPhase::Acquired || bytes > binding.message.bytes || !copy_blocks || copy_block >= copy_blocks ||
         binding.cursor->acquired_message.key != binding.message.key)
     {
         if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
         return;
     }
+    const auto source_offset = binding.cursor->acquired_source_offset;
+    if (binding.source_slice ? source_offset > binding.source_span_bytes || bytes > binding.source_span_bytes - source_offset
+        : source_offset != 0)
+    {
+        if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::InvalidBinding);
+        return;
+    }
+    // Only producers have a source slice. Acquire retained this offset before
+    // any wait; copy never reloads a later descriptor or sends its source span.
+    source = static_cast<const std::uint8_t *>(source) + source_offset;
     if constexpr (VectorAligned)
-        mappedHostCopyVectorBody(static_cast<uint4 *>(destination), static_cast<const uint4 *>(source), bytes);
+        mappedHostCopyVectorBody(static_cast<uint4 *>(destination), static_cast<const uint4 *>(source), bytes, copy_block, copy_blocks);
     else
-        mappedHostCopyByteBody(static_cast<std::uint8_t *>(destination), static_cast<const std::uint8_t *>(source), bytes);
+        mappedHostCopyByteBody(static_cast<std::uint8_t *>(destination), static_cast<const std::uint8_t *>(source), bytes, copy_block, copy_blocks);
     __syncthreads();
     if (threadIdx.x == 0)
     {
@@ -222,11 +296,11 @@ __device__ __forceinline__ void capturedTransferCopyAndPublish(
         // acquire/release tickets both identify the last *completed* copy
         // block and acquire all previous blocks' payload accesses. The final
         // peer-visible release belongs to that one publisher, not each lane.
-        const auto completed = gridDim.x == 1 ? 0u
+        const auto completed = copy_blocks == 1 ? 0u
             : capturedTransferJoinBlock(&binding.cursor->completed_payload_blocks);
-        if (completed >= gridDim.x)
+        if (completed >= copy_blocks)
             capturedTransferFail(binding, CapturedTransferStatus::InvalidPhase);
-        else if (completed + 1u == gridDim.x)
+        else if (completed + 1u == copy_blocks)
             capturedTransferPublish(binding);
     }
 }
@@ -247,7 +321,7 @@ template<bool VectorAligned>
 __global__ __launch_bounds__(256) void capturedTransferCopyPublishKernel(
     CapturedTransferChannelDeviceBinding binding, void *destination, const void *source)
 {
-    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source);
+    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source, blockIdx.x, gridDim.x);
 }
 
 /** @brief Complete bounded message in one cooperative block, without a host boundary.
@@ -261,5 +335,83 @@ __global__ __launch_bounds__(256) void capturedTransferFusedKernel(
 {
     if (threadIdx.x == 0) capturedTransferAcquire(binding);
     __syncthreads();
-    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source);
+    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source, blockIdx.x, gridDim.x);
+}
+
+/**
+ * @brief Complete one independent small endpoint per CTA, preserving its original cursor.
+ * @param batch Validated by-value packet; each CTA publishes only its own message.
+ */
+__global__ __launch_bounds__(256) void capturedTransferBatchFusedKernel(CapturedTransferChannelBatch batch)
+{
+    const auto &entry = batch.entries[blockIdx.y];
+    if (threadIdx.x == 0) capturedTransferAcquire(entry.binding);
+    __syncthreads();
+    if (entry.vector_aligned)
+        capturedTransferCopyAndPublish<true>(entry.binding, entry.destination, entry.source, 0, 1);
+    else
+        capturedTransferCopyAndPublish<false>(entry.binding, entry.destination, entry.source, 0, 1);
+}
+
+/** @brief Acquire every independent large endpoint before the same-stream payload grid.
+ * @param batch Original per-endpoint identities; there is no batch cursor. */
+__global__ void capturedTransferBatchAcquireKernel(CapturedTransferChannelBatch batch)
+{
+    if (threadIdx.x == 0) capturedTransferAcquire(batch.entries[blockIdx.y].binding);
+}
+
+/**
+ * @brief Copy large messages with local block coordinates and one original publisher each.
+ * @param batch Original endpoint aliases plus immutable backend copy geometry.
+ */
+__global__ __launch_bounds__(256) void capturedTransferBatchCopyPublishKernel(CapturedTransferChannelBatch batch)
+{
+    const auto &entry = batch.entries[blockIdx.y];
+    if (blockIdx.x >= entry.copy_blocks) return;
+    if (entry.vector_aligned)
+        capturedTransferCopyAndPublish<true>(entry.binding, entry.destination, entry.source, blockIdx.x, entry.copy_blocks);
+    else
+        capturedTransferCopyAndPublish<false>(entry.binding, entry.destination, entry.source, blockIdx.x, entry.copy_blocks);
+}
+
+/** @brief Reject incomplete/mismatched native activation receipt before model roots.
+ * @param binding Immutable original geometry and participant-local native evidence.
+ * This node follows the whole completed-prefix launch, never a single channel
+ * or an enclosing timer. Failure stays sticky and traps through original GPU
+ * fatal execution; no partial payload can advance model/KV state.
+ */
+__global__ void pipelineActivationFanoutValidationKernel(PipelineActivationFanoutValidation binding)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    // Native system-scope loads exist only in the device compilation pass.
+    // The host pass emits this kernel's launch stub, not a validation path.
+    if (threadIdx.x != 0) return;
+    const auto &state = *binding.state;
+#if defined(__CUDA_ARCH__)
+    ::cuda::atomic_ref<std::uint32_t, ::cuda::thread_scope_system> original_abort(
+        *const_cast<std::uint32_t *>(binding.completion.abortAddress()));
+    const auto abort = original_abort.load(::cuda::memory_order_acquire);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    const auto abort = __hip_atomic_load(binding.completion.abortAddress(), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#endif
+    const auto error = atomicAdd(&binding.state->first_error, 0);
+    const bool original_ready = !binding.original_receive.valid() ||
+        binding.original_receive.status(state.header.message.bytes,
+            mappedSystemAcquire64(binding.original_receive.cancellationAddress()),
+            state.header.epoch, state.header.message) == CapturedTransferStatus::Ready;
+    if (original_ready && pipelineActivationFanoutHeaderMatches(*binding.rows, binding.row_bytes, binding.capacity,
+            binding.expected_key, state.header) &&
+        binding.completion.matches(binding.allocation, binding.scope, state.header.epoch,
+            state.header.message.bytes, binding.native_message, abort, error)) return;
+    atomicCAS(&binding.state->first_error, 0, 1);
+    printf("pipeline_activation_fanout_failure key=%llu epoch=%llu bytes=%llu error=%d\n",
+        static_cast<unsigned long long>(state.header.message.key),
+        static_cast<unsigned long long>(state.header.epoch),
+        static_cast<unsigned long long>(state.header.message.bytes), error);
+#if defined(__CUDA_ARCH__)
+    asm volatile("trap;");
+#elif defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
+#endif
 }

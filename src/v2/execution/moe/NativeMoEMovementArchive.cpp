@@ -146,10 +146,42 @@ namespace llaminar2
     std::size_t NativeMoEMovementArchive::observe(std::uint64_t session_epoch, std::uint64_t workspace_generation,
         const DeviceMoERebalanceMovementJournalState &state,
         std::span<const DeviceMoERebalanceMovementWave> waves,
-        std::span<const DeviceMoERebalanceMovementEdge> edges)
+        std::span<const DeviceMoERebalanceMovementEdge> edges,
+        const DeviceMoERebalanceCompletedDecision &decision)
     {
         validate(session_epoch, workspace_generation, state, waves, edges);
         const bool same_request = session_epoch == session_epoch_;
+        require(decision.valid(), "invalid completed policy receipt");
+        if (same_request)
+        {
+            require(decision.completed_windows >= previous_decision_.completed_windows &&
+                (decision.completed_windows != previous_decision_.completed_windows || decision == previous_decision_) &&
+                decision.candidate_epoch >= previous_decision_.candidate_epoch &&
+                decision.committed_decode_rounds >= previous_decision_.committed_decode_rounds,
+                "completed policy evidence reset or changed within its request");
+        }
+        else if (decision.completed_windows && last_decision_)
+            require(decision.candidate_epoch >= last_decision_->candidate_epoch,
+                "completed policy reused a stale model candidate after request reset");
+        const auto decision_delta = decision.completed_windows -
+            (same_request ? previous_decision_.completed_windows : 0u);
+        require(decision_delta <= UINT64_MAX - completed_decision_windows_,
+            "completed policy count overflow");
+        auto next_last_decision = last_decision_;
+        if (decision_delta)
+        {
+            require(decision.candidate_epoch >= state.last_candidate_epoch &&
+                (!last_decision_ || decision.candidate_epoch >= last_decision_->candidate_epoch),
+                "completed policy receipt predates its published movement or prior request");
+            // Preserve device-native units and the exact request-local ordinal.
+            // Economic fields stay unpopulated rather than guessing ns from load.
+            next_last_decision = MoEOptimizationDecisionReceipt{
+                .transaction = decision.completed_windows, .candidate_epoch = decision.candidate_epoch,
+                .snapshot_observations = decision.routed_observations, .command_count = decision.command_count,
+                .accepted_cycles = decision.accepted_cycles, .rejected_cycles = decision.rejected_cycles,
+                .source_request_epoch = session_epoch,
+                .rejected_cycles_observed = (decision.observation_flags & kNativeMoEPlannerRejectionsObserved) != 0};
+        }
         const std::size_t first_wave = same_request ? previous_waves_.size() : 0;
         const std::size_t first_public_edge = ledger_.edges.size();
         // Prepare complete values before mutating the accepted archive. An
@@ -193,12 +225,12 @@ namespace llaminar2
                     .cycle_index = i / 2, .cycle_size = 2,
                     .direction = MoEOptimizationMovementDirection::SamePriority,
                     .axis = MoEOptimizationMovementAxis::ParticipantPlacement,
-                    .source_participant = static_cast<int>(edge.source_participant),
-                    .destination_participant = static_cast<int>(edge.destination_participant),
+                    .source = MoEOptimizationMovementEndpoint::whole(static_cast<int>(edge.source_participant), source.device, (true) ? std::optional<int>{source.world_rank} : std::nullopt),
+                    .destination = MoEOptimizationMovementEndpoint::whole(static_cast<int>(edge.destination_participant), destination.device, (true) ? std::optional<int>{destination.world_rank} : std::nullopt),
                     .source_priority = source.priority, .destination_priority = destination.priority,
-                    .source_device = source.device, .destination_device = destination.device,
-                    .source_world_rank = source.world_rank, .destination_world_rank = destination.world_rank,
-                    .source_world_rank_known = true, .destination_world_rank_known = true,
+
+
+
                     .estimated_weight_bytes = edge.estimated_weight_bytes, .activation_count = edge.activation_count});
             }
         }
@@ -208,6 +240,9 @@ namespace llaminar2
             state.discarded_waves - (same_request ? previous_state_.discarded_waves : 0));
         next.discarded_device_publications = saturatingAdd(next.discarded_device_publications,
             state.discarded_waves - (same_request ? previous_state_.discarded_waves : 0));
+        completed_decision_windows_ += decision_delta;
+        last_decision_ = next_last_decision;
+        previous_decision_ = decision;
         ledger_ = std::move(next);
         totals_ = totals;
         previous_waves_ = std::move(saved_waves);

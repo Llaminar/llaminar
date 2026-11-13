@@ -43,7 +43,7 @@ struct RankHardwareLocation
  * @return Rank observation preserving GPUs on every socket without rediscovery.
  *
  * GPU visibility follows the driver's process namespace, not CPU affinity.
- * Placement chooses the nearest eligible owner later; filtering here would
+ * Placement requires an owner bound to the GPU's observed NUMA node; filtering here would
  * lose a GPU when a hostfile supplies no process on its socket.
  */
 RankInventory makeRankInventory(const HardwareInventory &hardware,
@@ -75,7 +75,9 @@ RankInventory makeRankInventory(const HardwareInventory &hardware,
  * Every member enters the first call. Repeated reads neither communicate nor
  * refresh capacity; runtime free-byte admission remains PMA's responsibility.
  * Each rank publishes all startup-policy-permitted GPUs while CPU ownership is
- * affinity-bound. Returning a mutable copy would detach planning evidence from
+ * affinity-bound even for a single-rank launch when its exact node is observed.
+ * An unqualified single-process CPU observation grants no GPU ownership.
+ * Returning a mutable copy would detach planning evidence from
  * the inventory identity authenticated by the discovery communicator.
  */
 std::shared_ptr<const ClusterInventory> gatherClusterInventory(

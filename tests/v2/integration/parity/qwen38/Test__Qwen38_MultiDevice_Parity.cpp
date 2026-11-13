@@ -6,6 +6,8 @@
  * MTP and prefix proofs. HTTP E2E projects dynamic-depth cells into automatic
  * planner constraints; no second HTTP-only topology list or runner is built.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "../qwen35/Qwen35ParityTestBase.h"
 #include "Qwen38ModelParityDefinitions.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -53,12 +55,16 @@ INSTANTIATE_TEST_SUITE_P(Qwen38Dense, Qwen38DenseMultiDeviceParityTest,
 /** @brief Retire backend contexts before MPI while preserving the test result. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     std::cout.flush();
     std::cerr.flush();

@@ -1,0 +1,24 @@
+--- a/rocclr/device/rocm/rocdevice.cpp
++++ b/rocclr/device/rocm/rocdevice.cpp
+@@ -3258,7 +3258,20 @@
+       bool preferred_excluded = excluded_ids && excluded_ids->count(preferred->id) > 0;
+       if (!preferred_excluded) {
+         auto it = queuePool_[qIndex].find(preferred);
+-        if (it != queuePool_[qIndex].end()) {
++        // A released stream's preferred queue may now belong to a different
++        // live stream, including one polling for work from this caller. Keep
++        // affinity only when it does not bypass the selector's unshared-queue
++        // progress rule. refCount excludes this caller, which has no queue.
++        const bool has_unshared_alternative = std::any_of(
++            queuePool_[qIndex].begin(), queuePool_[qIndex].end(),
++            [excluded_ids](const auto& candidate) {
++              return candidate.second.refCount == 0 &&
++                     !candidate.second.hasDedicatedQueue_ &&
++                     (!excluded_ids || excluded_ids->count(candidate.first->id) == 0);
++            });
++        if (it != queuePool_[qIndex].end() &&
++            ((it->second.refCount == 0 && !it->second.hasDedicatedQueue_) ||
++             !has_unshared_alternative)) {
+           it->second.refCount++;
+           ClPrint(amd::LOG_INFO, amd::LOG_QUEUE,
+                   "Reusing preferred queue: %p refCount: %d",

@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "GPUProjectionSubmission.h"
+
 #include "IGPUGraphCapture.h"
 #include "GPUBlasSubmission.h"
 #include <cstddef>
@@ -22,6 +24,8 @@
 
 namespace llaminar2
 {
+    class PreparedGPUContextUsePermit;
+    class GPUCaptureDependencyRoster;
 
     /**
      * @brief The semantic purpose of a persistent native GPU event.
@@ -337,9 +341,48 @@ namespace llaminar2
         }
 
         /**
-         * @brief Destroy all named auxiliary streams owned by this context.
+         * @brief Resolve one original-PMA ordinary named stream before capture.
+         * @param name Immutable purpose shared by serial graph variants.
+         * @param original Exact source-prepared worker/PMA permit.
+         * @param created True only after a new native stream was created.
+         * @return Stream retained by this actual context until native teardown.
+         * @throws std::logic_error For missing implementation or authority mismatch.
+         */
+        virtual void *getOrCreateAdmittedAuxiliaryStream(
+            const std::string &name,const PreparedGPUContextUsePermit &original,bool *created = nullptr)
+        {return getOrCreateAdmittedAuxiliaryStream(name,GPUAuxiliaryStreamSchedulingClass::Normal,original,created);}
+
+        /**
+         * @brief Resolve one original-PMA named stream with immutable native priority.
+         * @param name Stable context-owned stream purpose.
+         * @param scheduling_class Original scheduling class, unchanged on repeated lookup.
+         * @param original Exact prepared worker/PMA permit.
+         * @param created True only after a new native creator completed.
+         * @return Exact stream retained until its original context destroys the handle.
+         * @throws std::exception For unsupported implementation, class mismatch or foreign ownership.
+         */
+        virtual void *getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+            GPUAuxiliaryStreamSchedulingClass scheduling_class,const PreparedGPUContextUsePermit &original,bool *created = nullptr)
+        {throw std::logic_error("Backend lacks original-PMA scheduled auxiliary stream ownership");}
+
+        /** @brief Retain/grow the actual Batch capture-edge roster cold on its original source.
+         * @param lanes Actual simultaneous lane-admission edges, never model layers/families.
+         * @param shared_groups Actual simultaneous shared physical payload edges.
+         * @param original Exact admitted original context and PMA.
+         * @return Context-owned roster; only its scoped construction borrow permits event use.
+         */
+        virtual std::shared_ptr<GPUCaptureDependencyRoster> prepareBatchCaptureDependencies(
+            std::size_t,std::size_t,const PreparedGPUContextUsePermit&)
+        {throw std::logic_error("Backend lacks original Batch capture dependency roster");}
+
+        /**
+         * @brief Reset unadmitted named streams, or retire the full set during original context cleanup.
          *
-         * Primarily used during context cleanup and tests.
+         * An admitted stream has a context lifetime and may still be retained
+         * by lane/graph borrowers. Public reset rejects that set before mutation;
+         * actual context teardown destroys its handles under the existing guards.
+         * @throws std::logic_error For admitted streams outside native context teardown,
+         *         or retained graph/event obligations.
          * @thread_safety Thread-safe, can be called from any thread.
          */
         virtual void resetAuxiliaryStreams() = 0;
@@ -550,6 +593,37 @@ namespace llaminar2
             return GPUBlasSubmission(blas_submission_mutex_, blasHandle(), blasLtHandle());
         }
 
+        /**
+         * @brief Retain the bound pool generation or explicitly borrow a standalone context.
+         *
+         * A directly constructed context has no pool generation: its caller must
+         * outlive every capture and lease. This never looks up a replacement by
+         * ordinal. A bound but expired pool owner is always a fatal state error.
+         */
+        [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainProjectionContextOwner()
+        {
+            auto owner = projection_pool_owner_.lock();
+            if (projection_pool_bound_ && !owner)
+                throw std::logic_error("Projection context owner has already retired");
+            return owner;
+        }
+
+        /** @brief Cold-publish this exact context's complete fork/join resources. */
+        virtual void prepareProjectionResources()
+        { throw std::logic_error("This context does not implement concurrent projection resources"); }
+
+        /** @brief Lease an entire native capture or eager fork/join submission. */
+        [[nodiscard]] virtual GPUProjectionSubmission acquireProjectionSubmission(
+            void *root, GPUProjectionSubmissionKind kind, bool native_capturing = false)
+        {
+            (void)root; (void)kind; (void)native_capturing;
+            throw std::logic_error("This context does not implement concurrent projection submission");
+        }
+        /** @brief Validate liveness before removing a worker context generation. */
+        virtual void assertProjectionResourcesRetirable() {}
+        /** @brief Close projection acquisition before exclusive context retirement. */
+        virtual void beginProjectionResourcesRetirement() {}
+
         // =========================================================================
         // Collective Communicator (set by collective backend during initialization)
         // =========================================================================
@@ -728,9 +802,29 @@ namespace llaminar2
         virtual bool isDeviceGraphCaptureActive() const { return false; }
 
     protected:
+        /** @brief Bind this context's exact owner once, before publishing a lease. */
+        void retainProjectionSubmission(GPUProjectionSubmission &submission)
+        {
+            if (!submission.owner_ || submission.context_owner_bound_ ||
+                submission.owner_->context_identity_ != this)
+                throw std::logic_error("Projection submission lifetime requires its exact context owner");
+            submission.context_owner_ = retainProjectionContextOwner();
+            submission.context_owner_bound_ = true;
+        }
         IWorkerGPUContext() = default;
 
     private:
+        friend class GPUDeviceContextPool;
+        /** @brief Bind only the exact existing pool owner; never reacquire by ordinal. */
+        void bindProjectionContextOwner(const std::shared_ptr<IWorkerGPUContext> &owner)
+        {
+            if (owner.get() != this || projection_pool_bound_)
+                throw std::logic_error("Projection owner binding requires one exact context identity");
+            projection_pool_owner_ = owner;
+            projection_pool_bound_ = true;
+        }
+        std::weak_ptr<IWorkerGPUContext> projection_pool_owner_;
+        bool projection_pool_bound_ = false;
         std::mutex blas_submission_mutex_; ///< Host API state, not a GPU execution barrier.
     };
 

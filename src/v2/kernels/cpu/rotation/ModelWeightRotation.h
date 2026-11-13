@@ -3,9 +3,9 @@
  * @brief Utility to tag model GEMM weights with block-diagonal rotation metadata
  *
  * Sets rotation metadata on GEMM weight tensors so that:
- *   1. CPUNativeVNNIWeightPacker fuses the rotation into one-time weight packing
+ *   1. CPUNativeQuantisedWeightPacker fuses the rotation into one-time weight packing
  *      (dequant → rotate → requant to INT8 → pack into VNNI layout)
- *   2. CPUNativeVNNIGemmKernel rotates activations before Q8_1 quantization
+ *   2. CPUNativeQuantisedGemmKernel rotates activations before Q8_1 quantization
  *
  * The original weight tensors are NEVER modified — they stay in their native
  * quantized format (Q4_0, IQ4_NL, Q8_0, etc.). Rotation is applied only during
@@ -74,8 +74,8 @@ namespace llaminar2
          * @brief Tag a weight tensor with rotation metadata (no data copy).
          *
          * Sets setActivationRotation() on the tensor so that:
-         *   - CPUNativeVNNIWeightPacker fuses rotation into weight packing
-         *   - CPUNativeVNNIGemmKernel rotates activations at runtime
+         *   - CPUNativeQuantisedWeightPacker fuses rotation into weight packing
+         *   - CPUNativeQuantisedGemmKernel rotates activations at runtime
          *
          * @param weight_ptr  Pointer to the weight pointer
          * @param dim         Which rotation to use (HIDDEN or FFN)

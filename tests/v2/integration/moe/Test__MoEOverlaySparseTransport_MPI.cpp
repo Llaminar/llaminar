@@ -1263,6 +1263,88 @@ namespace llaminar2::test
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
+    /** @brief Replay deferred native ownership while a later ticket must make progress. */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, AsyncFollowerReceivesBeforeEarlierFenceRetiresReplay)
+    {
+        if (world_size_ != 2) GTEST_SKIP() << "Directed transaction replay requires two ranks";
+        const MoEOverlayInferenceTopologyIdentity topology{
+            .workspace_generation = 72, .topology_fingerprint_low = 123,
+            .topology_fingerprint_high = 456, .source_world_rank = 0, .target_world_rank = 1};
+        const MoEOverlayInferenceTransactionProtocol::Config protocol{
+            .topology = topology, .slot_count = 2, .max_request_count = 1,
+            .max_rows_per_request = 1, .max_mtp_draft_depth = 0};
+        auto channel = std::make_shared<MoEOverlayMPIInferenceTransactionChannel>(
+            MoEOverlayMPIInferenceTransactionChannel::Config{
+                .mpi_ctx = mpi_ctx_, .source_world_rank = 0, .target_world_rank = 1, .send_slot_count = 2});
+        /** @brief Device-free fence becomes ready only after the actual second submission. */
+        struct Fence final : IMoEOverlayInferenceCompletionFence
+        {
+            int &submissions;
+            explicit Fence(int &count) : submissions(count) {}
+            MoEOverlayInferenceCompletionFenceProgress poll(std::string *) noexcept override
+            {
+                return submissions == 2 ? MoEOverlayInferenceCompletionFenceProgress::Ready :
+                    MoEOverlayInferenceCompletionFenceProgress::Pending;
+            }
+        };
+        /** @brief A synchronous bool must never authenticate this deferred implementation. */
+        struct Executor final : IMoEOverlayInferenceTransactionExecutor
+        {
+            int submissions = 0;
+            std::shared_ptr<Fence> fence = std::make_shared<Fence>(submissions);
+            bool executeMoEOverlayInferenceTransaction(const MoEOverlayInferenceTransactionTicket &, std::string *) override
+            { return false; }
+            MoEOverlayInferenceAsyncSubmission submitMoEOverlayInferenceTransaction(
+                const MoEOverlayInferenceTransactionTicket &, std::string *) override
+            {
+                ++submissions;
+                if (submissions == 1)
+                {
+                    int entered = 1;
+                    MPI_Send(&entered, 1, MPI_INT, 0, 19003, MPI_COMM_WORLD);
+                    return {MoEOverlayInferenceCompletionFenceProgress::Pending, fence};
+                }
+                return {MoEOverlayInferenceCompletionFenceProgress::Ready, {}};
+            }
+        };
+        if (rank_ == 0)
+        {
+            MoEOverlayInferenceTransactionPublisher publisher({channel, protocol});
+            for (std::uint64_t replay = 0; replay != 3; ++replay)
+            {
+                std::string error;
+                ASSERT_TRUE(publisher.beginCommand({7, 100 + replay, 17}, &error)) << error;
+                const MoEOverlayInferenceExecutionDescriptor descriptor{
+                    .graph_role = MoEOverlayInferenceGraphRole::MainDecode, .logical_step_id = 1,
+                    .placement_epoch = 17, .request_count = 1, .logical_rows_per_request = 1,
+                    .physical_rows_per_request = 1};
+                const auto first = publisher.publish(descriptor);
+                ASSERT_TRUE(first.ok) << first.error;
+                int entered = 0;
+                MPI_Recv(&entered, 1, MPI_INT, 1, 19003, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                EXPECT_EQ(publisher.tryRetire(first, &error), MoEOverlayInferenceCompletionFenceProgress::Pending);
+                const auto second = publisher.publish(descriptor);
+                ASSERT_TRUE(second.ok) << second.error;
+                EXPECT_TRUE(publisher.retire(first, &error)) << error;
+                EXPECT_TRUE(publisher.retire(second, &error)) << error;
+                EXPECT_TRUE(publisher.complete(17, 0, &error)) << error;
+            }
+        }
+        else
+        {
+            for (int replay = 0; replay != 3; ++replay)
+            {
+                Executor executor;
+                MoEOverlayInferenceTransactionFollower follower({
+                    .channel = channel, .executor = &executor, .protocol = protocol});
+                const auto result = follower.runOneCommand();
+                EXPECT_TRUE(result.ok) << result.error;
+                EXPECT_EQ(result.executed_transactions, 2u);
+            }
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
     /**
      * @brief Completion identity and fixed storage survive out-of-order joins and reuse.
      *

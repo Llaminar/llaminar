@@ -33,6 +33,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #endif
 
 #include "kernels/attention/AttentionDeviceParams.h"
@@ -1495,9 +1496,11 @@ namespace
     class ROCmFlashAttentionContextParallelPerf : public ::testing::Test
     {
     protected:
+        /** @brief Admit immutable launch limits before direct benchmark HIP setup. */
         void SetUp() override
         {
 #ifdef HAVE_ROCM
+            llaminar2::initializeROCmHardwareMetadata();
             int device_count = 0;
             if (hipGetDeviceCount(&device_count) != hipSuccess ||
                 device_count <= 0)

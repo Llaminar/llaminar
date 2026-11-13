@@ -15,8 +15,8 @@ unrelated compute fence. Timing, IPC, callback, captured and compute frontiers
 retain their existing implementations and scopes. No queue limit, allocation
 policy, host synchronization, packet batching or stream priority is changed.
 
-Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
-             (therock-10.0, ROCm Core SDK 10.0.0)
+Pinned base: ROCm/rocm-systems 7da43026e4f2ef7600433c38c820732f7a205d22
+             (therock-10.1, ROCm Core SDK 10.1.0)
 
 diff --git a/rocclr/device/rocm/rocvirtual.hpp b/rocclr/device/rocm/rocvirtual.hpp
 --- a/rocclr/device/rocm/rocvirtual.hpp

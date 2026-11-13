@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <vector>
+#include <stdexcept>
 
 namespace llaminar2::test
 {
@@ -148,4 +149,145 @@ namespace llaminar2::test
         }
         return cases;
     }
+    /** @brief Immutable original rows, route width and active-list publication extent.
+     * @details experts bounds count/offset planes; rows and top_k determine original
+     * route slots; max_active bounds the sorted active-expert publication. */
+    struct SmallFloatGroupingGeometry
+    {
+        int experts, rows, top_k, max_active;
+    };
+
+    /**
+     * @brief Enumerate bounded dimension totality and every expert-count tail.
+     * @param max_rows Backend's actual compact admission:4 CUDA or64 ROCm.
+     * @param independent_max Independently expected policy boundary:8 CUDA or32 ROCm.
+     * @return Ordered cells, including intentional repeated boundary/model cells.
+     * @throws std::invalid_argument For a different unsupported backend extent.
+     */
+    inline std::vector<SmallFloatGroupingGeometry>
+    smallFloatGroupingPublicationGeometries(int max_rows, int independent_max)
+    {
+        if (!((max_rows == 4 && independent_max == 8) || (max_rows == 64 && independent_max == 32)))
+            throw std::invalid_argument("Unknown compact grouping backend policy");
+        std::vector<SmallFloatGroupingGeometry> result;
+        std::vector<int> boundaries = {1,
+                                       31,
+                                       32,
+                                       33,
+                                       63,
+                                       64,
+                                       65,
+                                       255,
+                                       256,
+                                       257,
+                                       511,
+                                       512,
+                                       independent_max - 1,
+                                       independent_max,
+                                       independent_max + 1};
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+        for (int e : boundaries)
+            for (int k = 1; k <= 16; ++k)
+                for (int m = 1; m <= std::min(max_rows, 64 / k); ++m)
+                {
+                    const int a = std::min(e, m * k);
+                    result.push_back({e, m, k, a});
+                    if (a > 1)
+                        result.push_back({e, m, k, 1});
+                }
+        for (int e = 1; e <= 512; ++e)
+            result.push_back({e, 1, 10, std::min(e, 10)});
+        return result;
+    }
+
+    /**
+     * @brief Author one dirty publication and independently group original slots.
+     * @param g Immutable admitted geometry, never a live route-count shadow.
+     * @param pattern Replay 0..7: full,invalid,partial,full,skew,dense,canonical,full.
+     * @return Complete metadata and literal FP32 copied weights, including signed zero.
+     * @throws std::invalid_argument For invalid geometry or replay index.
+     * @details Counts include valid zero-weight routes. Integer prefixes walk expert
+     * IDs once; stable scatter walks original row/top-k slots. No device scan or
+     * production arithmetic is mirrored. Pattern 6 preserves the original canonical
+     * fixture, while other patterns deliberately exercise high-half and empty tails.
+     */
+    inline SmallFloatGroupingCase
+    makeSmallFloatGroupingPublicationCase(SmallFloatGroupingGeometry g, int pattern)
+    {
+        const int slots = g.rows * g.top_k;
+        if (g.experts < 1 || g.experts > 512 || g.rows < 1 || g.rows > 64 || g.top_k < 1 ||
+            g.top_k > 16 || slots > 64 || g.max_active < 1 ||
+            g.max_active > std::min(g.experts, slots) || pattern < 0 || pattern > 7)
+            throw std::invalid_argument("Invalid compact grouping publication case");
+        auto result = makeSmallFloatGroupingCase(g.rows, g.top_k, g.experts);
+        result.max_active_experts = g.max_active;
+        if (pattern != 6)
+            for (int slot = 0; slot < slots; ++slot)
+            {
+                const int choices[] = {g.experts - 1,
+                                       g.experts / 2,
+                                       std::min(g.experts - 1, 255),
+                                       0,
+                                       g.experts - 1,
+                                       std::min(g.experts - 1, 300),
+                                       std::min(g.experts - 1, 1),
+                                       std::min(g.experts - 1, 400),
+                                       g.experts / 2,
+                                       std::min(g.experts - 1, 17)};
+                int expert = choices[slot % 10];
+                if (pattern == 1)
+                    expert = slot % 2 ? -1 : g.experts;
+                if (pattern == 2 && slot % 3 == 0)
+                    expert = -1;
+                if (pattern == 4)
+                    expert = g.experts - 1;
+                if (pattern == 5)
+                    expert = slot % g.experts;
+                result.routing_indices[slot] = float(expert);
+                result.routing_weights[slot] =
+                    slot % 3 == 0 ? -0.0f : (slot % 3 == 1 ? 0.0f : float(slot + 1) * 0.125f);
+            }
+        result.expert_counts.assign(g.experts, 0);
+        result.expert_offsets.assign(g.experts, 0);
+        result.grouped_token_indices.assign(slots, 0);
+        result.original_to_grouped.assign(slots, -1);
+        result.original_expert_ids.assign(slots, -1);
+        result.grouped_weights.assign(slots, 0.0f);
+        result.active_expert_ids.assign(g.max_active, -1);
+        for (int slot = 0; slot < slots; ++slot)
+        {
+            const int expert = int(result.routing_indices[slot]);
+            if (expert >= 0 && expert < g.experts)
+            {
+                ++result.expert_counts[expert];
+                result.original_expert_ids[slot] = expert;
+            }
+        }
+        int prefix = 0, active = 0;
+        for (int e = 0; e < g.experts; ++e)
+        {
+            result.expert_offsets[e] = prefix;
+            prefix += result.expert_counts[e];
+            if (result.expert_counts[e])
+            {
+                if (active < g.max_active)
+                    result.active_expert_ids[active] = e;
+                ++active;
+            }
+        }
+        auto next = result.expert_offsets;
+        for (int slot = 0; slot < slots; ++slot)
+        {
+            const int e = result.original_expert_ids[slot];
+            if (e < 0)
+                continue;
+            const int destination = next[e]++;
+            result.original_to_grouped[slot] = destination;
+            result.grouped_token_indices[destination] = slot / g.top_k;
+            result.grouped_weights[destination] = result.routing_weights[slot];
+        }
+        return result;
+    }
+
 } // namespace llaminar2::test

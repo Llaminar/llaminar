@@ -6,15 +6,26 @@
  * complete experts and gate/up owners. Projection-distributed down weights
  * instead use a model-lifetime bank: they never enter a movement epoch or
  * disappear when this participant no longer owns an expert's gate/up pair.
+ * Cold producer binding authenticates the original context/manager once;
+ * weak retained ownership avoids cycles, while scoped source uses protect only
+ * active preparation. Existing bank leases retain their own physical engines.
+ * Shadow calibration arrivals authenticate the original complete-target edge
+ * without assigning its incoming expert to the unchanged live placement.
+ * Cold diagnostics inspect the existing retired chain under its writer mutex;
+ * published-slot count is distinct from readers pinning an unpublished node.
  */
 
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayFixedDownProjectionBank.h"
+#include "MoEOverlayParticipantMigration.h"
+#include "MoEOverlayResidencyAuthority.h"
 #include "MoEExpertOverlayPreparationPlan.h"
 #include "DeviceMoEExpertDescriptorBuilder.h"
 
 #include "../../loaders/ExpertGemmRegistry.h"
-#include "../../tensors/NativeVnniFormatInfo.h"
+#include "loaders/ModelContext.h"
+#include "loaders/WeightManager.h"
+#include "../../tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <iterator>
@@ -327,16 +338,16 @@ namespace llaminar2
                     " on " + device().to_string() + ": " + reason);
             };
             auto &engine = *engines_[expert];
-            DeviceNativeVNNIMatrixDesc native{};
-            if (engine.exportNativeVNNIMatrixDesc(native))
+            DeviceNativeQuantisedMatrixDesc native{};
+            if (engine.exportNativeQuantisedMatrixDesc(native))
             {
                 if (!native.valid() || native.n != projection.rows || native.k != projection.source_columns ||
                     native.k % 32 != 0 || native.blocks_per_row != static_cast<uint32_t>(native.k / 32))
                     fail("prepared geometry differs from the fixed full-K slice");
-                NativeVnniSourceIdentity source{};
-                NativeVnniExecutionFormatEnvelope envelope;
-                if (!engine.exportNativeVNNISourceIdentity(source) || !source.present ||
-                    !addNativeVnniExecutionFormat(envelope, native.codebook_id, source, false) ||
+                NativeQuantisedSourceIdentity source{};
+                NativeQuantisedExecutionFormatEnvelope envelope;
+                if (!engine.exportNativeQuantisedSourceIdentity(source) || !source.present ||
+                    !addNativeQuantisedExecutionFormat(envelope, native.codebook_id, source, false) ||
                     (native.source_identity_present &&
                      (native.source_codebook_id != source.codebook_id ||
                       static_cast<bool>(native.source_is_superblock) != source.is_superblock)))
@@ -376,11 +387,32 @@ namespace llaminar2
         return table;
     }
 
+    bool MoEOverlayCPUFragmentFamily::accepts(const MoEOverlayPreparedCPUFragmentPayload& payload,int expert) const noexcept
+    {
+        return cohort_ && payload.valid() && payload.model()==model_ && payload.expertId()==expert &&
+            payload.cohort()==cohort_ &&
+            !payload.cohort().owner_before(cohort_) && !cohort_.owner_before(payload.cohort()) &&
+            payload.participantIndex()==member_ &&
+            payload.preparation()==preparation_ &&
+            !payload.preparation().owner_before(preparation_) && !preparation_.owner_before(payload.preparation());
+    }
+
+    void MoEOverlayParticipantLayerBank::setResidentCPUFragment(int expert,MoEOverlayPreparedCPUFragmentPayload fragment)
+    {
+        if(!cpu_fragment_family || !experts.empty() || expert<0 || size_t(expert)>=resident_mask.size() ||
+           cpu_fragments.size()!=resident_mask.size() || !cpu_fragment_family->accepts(fragment,expert))
+            throw std::invalid_argument("CPU fragment candidate requires its exact original family and closed destination payload");
+        const auto at=std::lower_bound(cpu_fragment_expert_ids.begin(),cpu_fragment_expert_ids.end(),expert);
+        if(at==cpu_fragment_expert_ids.end() || *at!=expert)cpu_fragment_expert_ids.insert(at,expert);
+        cpu_fragments[size_t(expert)]=std::move(fragment);
+        resident_mask[size_t(expert)]=true;
+    }
+
     void MoEOverlayParticipantLayerBank::setResidentExpert(
         int expert_id,
         MoEOverlayPreparedExpertPayload engines)
     {
-        if (expert_id < 0 ||
+        if (cpu_fragment_family || expert_id < 0 ||
             static_cast<std::size_t>(expert_id) >= experts.size() ||
             experts.size() != resident_mask.size())
         {
@@ -401,6 +433,14 @@ namespace llaminar2
 
     void MoEOverlayParticipantLayerBank::clearExpert(int expert_id)
     {
+        if(cpu_fragment_family) {
+            if(expert_id<0 || size_t(expert_id)>=cpu_fragments.size() || cpu_fragments.size()!=resident_mask.size() || !experts.empty())
+                throw std::out_of_range("CPU fragment candidate expert is outside original geometry");
+            const auto at=std::lower_bound(cpu_fragment_expert_ids.begin(),cpu_fragment_expert_ids.end(),expert_id);
+            if(at!=cpu_fragment_expert_ids.end() && *at==expert_id)cpu_fragment_expert_ids.erase(at);
+            resident_mask[size_t(expert_id)]=false;cpu_fragments[size_t(expert_id)]={};return;
+        }
+
         if (expert_id < 0 ||
             static_cast<std::size_t>(expert_id) >= experts.size() ||
             experts.size() != resident_mask.size())
@@ -420,6 +460,20 @@ namespace llaminar2
 
     bool MoEOverlayParticipantLayerBank::valid(int num_experts) const noexcept
     {
+        if(cpu_fragment_family) {
+            if(num_experts<=0 || movable_projections!=DeviceMoEProjectionSet::CompleteExpert || !experts.empty() ||
+               resident_mask.size()!=size_t(num_experts) || cpu_fragments.size()!=size_t(num_experts))return false;
+            size_t selected=0;
+            for(size_t expert=0;expert<cpu_fragments.size();++expert) {
+                if(resident_mask[expert]) {
+                    if(!cpu_fragment_family->accepts(cpu_fragments[expert],int(expert)) || selected>=cpu_fragment_expert_ids.size() ||
+                       cpu_fragment_expert_ids[selected++]!=int(expert))return false;
+                } else if(!cpu_fragments[expert].empty())return false;
+            }
+            return selected==cpu_fragment_expert_ids.size();
+        }
+        if(!cpu_fragments.empty() || !cpu_fragment_expert_ids.empty())return false;
+
         if ((movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
              movable_projections != DeviceMoEProjectionSet::GateUp) || num_experts <= 0 ||
             resident_mask.size() != static_cast<std::size_t>(num_experts) ||
@@ -441,6 +495,12 @@ namespace llaminar2
     bool MoEOverlayParticipantLayerBank::sameIdentity(
         const MoEOverlayParticipantLayerBank &other) const noexcept
     {
+        if(cpu_fragment_family!=other.cpu_fragment_family ||
+           cpu_fragment_family.owner_before(other.cpu_fragment_family) || other.cpu_fragment_family.owner_before(cpu_fragment_family) || cpu_fragments.size()!=other.cpu_fragments.size() ||
+           cpu_fragment_expert_ids!=other.cpu_fragment_expert_ids)return false;
+        for(size_t expert=0;expert<cpu_fragments.size();++expert)
+            if(!cpu_fragments[expert].sameIdentity(other.cpu_fragments[expert]))return false;
+
         if (movable_projections != other.movable_projections || resident_mask != other.resident_mask ||
             experts.size() != other.experts.size())
         {
@@ -638,6 +698,11 @@ namespace llaminar2
     MoEOverlayParticipantResidency::MoEOverlayParticipantResidency(Config config)
         : config_(std::move(config))
     {
+        if(!config_.cpu_fragment_families.empty() &&
+           (!config_.device.is_cpu() || config_.cpu_fragment_families.size()!=size_t(config_.num_layers) ||
+            std::any_of(config_.cpu_fragment_families.begin(),config_.cpu_fragment_families.end(),[](const auto& family){return !family;})))
+            throw std::invalid_argument("CPU fragment endpoint requires its complete original per-layer family");
+
         if (config_.participant_id < 0 || !config_.device.is_valid() ||
             config_.num_layers <= 0 || config_.num_experts <= 0 ||
             config_.first_model_layer < 0 ||
@@ -934,6 +999,15 @@ namespace llaminar2
             return std::nullopt;
         }
 
+        for(size_t row=0;row<bank.layers.size();++row) {
+            const auto expected=config_.cpu_fragment_families.empty()?nullptr:config_.cpu_fragment_families[row];
+            if(bank.layers[row].cpu_fragment_family!=expected ||
+               bank.layers[row].cpu_fragment_family.owner_before(expected) || expected.owner_before(bank.layers[row].cpu_fragment_family)) {
+                if(error)*error="CPU fragment ready bank replaced the original endpoint family";
+                return std::nullopt;
+            }
+        }
+
         try
         {
             return MoEOverlayPreparedParticipantBank(
@@ -1099,6 +1173,19 @@ namespace llaminar2
         return retained;
     }
 
+    std::optional<uint64_t>
+    MoEOverlayParticipantResidency::retiredEpochReaders(uint64_t epoch) const noexcept
+    {
+        std::lock_guard<std::mutex> lock(state_->writer_mutex_);
+        for (const auto *node = state_->retired_head_.get(); node;
+             node = node->retired_next.get())
+        {
+            if (node->bank.epoch == epoch)
+                return node->reader_count.load(std::memory_order_acquire);
+        }
+        return std::nullopt;
+    }
+
     bool MoEOverlayParticipantResidency::hasCandidateCapacity() const noexcept
     {
         for (std::size_t index = 0; index < state_->capacity_; ++index)
@@ -1110,6 +1197,12 @@ namespace llaminar2
             }
         }
         return false;
+    }
+
+    const MoEExpertOwnerMap& MoEOverlayParticipantResidencyRegistry::initialOwnerMap()const noexcept
+    {
+        const auto source=config_.projection_preparation?config_.projection_preparation->cpuJointOwnerMap():nullptr;
+        return source?*source:config_.owner_map;
     }
 
     MoEOverlayParticipantResidencyRegistry::
@@ -1126,8 +1219,20 @@ namespace llaminar2
                 "ExpertOverlay participant registry requires positive geometry, "
                 "an initial epoch, and two-bank capacity");
         }
-        config_.owner_map.requireLayerGeometry(
-            config_.num_layers, config_.num_experts, config_.first_model_layer);
+        const auto joint_map=config_.projection_preparation?config_.projection_preparation->cpuJointOwnerMap():nullptr;
+        if(joint_map) {
+            if(!config_.original_model.value || config_.collect_economy_service_measurements ||
+               !config_.owner_map.owners().empty() || !config_.owner_map.participants().empty() ||
+               joint_map->owners().size()!=size_t(config_.num_layers)*size_t(config_.num_experts))
+                throw std::invalid_argument("CPU joint registry requires its original model/source map and Static service policy");
+            for(size_t i=0;i<joint_map->owners().size();++i)
+                if(joint_map->owners()[i].layer_idx!=config_.first_model_layer+int(i/size_t(config_.num_experts)) ||
+                   joint_map->owners()[i].expert_id!=int(i%size_t(config_.num_experts)))
+                    throw std::invalid_argument("CPU joint registry source belongs to another layer/expert interval");
+        } else {
+            initialOwnerMap().requireLayerGeometry(
+                config_.num_layers,config_.num_experts,config_.first_model_layer);
+        }
 
         /*
          * A relay-only MPI rank deliberately owns no prepared expert bank.  It
@@ -1152,7 +1257,7 @@ namespace llaminar2
         for (const int participant_id : config_.local_participant_ids)
         {
             const auto *participant =
-                config_.owner_map.participantForId(participant_id);
+                initialOwnerMap().participantForId(participant_id);
             if (!participant || !participant->device.is_valid())
             {
                 throw std::invalid_argument(
@@ -1160,9 +1265,35 @@ namespace llaminar2
             }
 
             EndpointAssembly assembly;
-            const auto projections = config_.projection_preparation
+            const bool joint=joint_map && std::any_of(joint_map->owners().begin(),joint_map->owners().end(),[&](const auto& row){
+                if(!row.shard_cohort)return false;
+                const auto members=row.shard_cohort->participants();
+                return std::any_of(members.begin(),members.end(),[&](const auto& member){return member.participant_id==participant_id;});
+            });
+            std::vector<std::shared_ptr<const MoEOverlayCPUFragmentFamily>> fragment_families;
+            if(joint) {
+                if(participant->device!=DeviceId::cpu())throw std::invalid_argument("Joint registry endpoint is not its original CPU member");
+                assembly.joint_layers.emplace(size_t(config_.num_layers));
+                for(int row=0;row<config_.num_layers;++row) {
+                    const int layer=config_.first_model_layer+row;
+                    const auto ids=joint_map->expertsForParticipant(layer,participant_id);
+                    std::shared_ptr<const MoEExpertShardCohort> cohort;
+                    if(!ids.empty()) {
+                        const auto selected=config_.projection_preparation->cpuShardSourceFor(layer,*participant);
+                        if(selected->expertIds().size()!=ids.size() || !std::equal(ids.begin(),ids.end(),selected->expertIds().begin()))
+                            throw std::invalid_argument("Joint registry source selection changed original fragment IDs");
+                        cohort=selected->cohort();
+                    }
+                    // A proven original empty layer retains its closed empty
+                    // family; it cannot mint incoming engines without a cohort.
+                    fragment_families.push_back(std::shared_ptr<const MoEOverlayCPUFragmentFamily>(
+                        new MoEOverlayCPUFragmentFamily(config_.original_model,config_.projection_preparation,
+                            std::move(cohort),size_t(participant->domain_participant_index))));
+                }
+            }
+            const auto projections = config_.projection_preparation && !joint_map
                 ? DeviceMoEProjectionSet::GateUp : DeviceMoEProjectionSet::CompleteExpert;
-            if (config_.projection_preparation)
+            if (config_.projection_preparation && !joint_map)
             {
                 for (int layer = config_.first_model_layer;
                      layer < config_.first_model_layer + config_.num_layers; ++layer)
@@ -1186,6 +1317,7 @@ namespace llaminar2
                             config_.collect_economy_service_measurements,
                         .movable_projections = projections,
                         .first_model_layer = config_.first_model_layer,
+                        .cpu_fragment_families=fragment_families,
                     });
             assembly.initial_bank.epoch = config_.initial_epoch;
             assembly.initial_bank.participant_id = participant_id;
@@ -1203,12 +1335,14 @@ namespace llaminar2
                         static_cast<std::size_t>(layer)];
                 layer_bank.movable_projections = projections;
                 layer_bank.resident_mask =
-                    config_.owner_map.expertMaskForParticipant(
+                    initialOwnerMap().expertMaskForParticipant(
                         config_.first_model_layer + layer,
                         participant_id,
                         config_.num_experts);
-                layer_bank.experts.resize(
-                    static_cast<std::size_t>(config_.num_experts));
+                if(joint) {
+                    layer_bank.cpu_fragment_family=fragment_families[size_t(layer)];
+                    layer_bank.cpu_fragments.resize(size_t(config_.num_experts));
+                } else layer_bank.experts.resize(static_cast<std::size_t>(config_.num_experts));
 
                 /* No engines are needed for a layer with no local residents. */
                 assembly.registered_layers[static_cast<std::size_t>(layer)] =
@@ -1216,6 +1350,11 @@ namespace llaminar2
                         layer_bank.resident_mask.begin(),
                         layer_bank.resident_mask.end(),
                         [](bool resident) { return resident; });
+                if(joint && assembly.registered_layers[size_t(layer)])
+                    (*assembly.joint_layers)[size_t(layer)]=std::shared_ptr<const CPUJointLayer>(new CPUJointLayer(
+                        config_.initial_epoch,participant_id,config_.first_model_layer+layer,{},
+                        fragment_families[size_t(layer)],assembly.endpoint));
+
             }
 
             /*
@@ -1259,7 +1398,613 @@ namespace llaminar2
         }
     }
 
+    namespace {
+        /** @return Exact prepared/source identity, including shared allocation control blocks. */
+        bool sameJointBankSource(const MoEOverlayParticipantResidencyRegistry::CPUJointLayer& actual,
+                                 const ExpertGemmRegistry::StaticProjectionLayer& expected)
+        {
+            const auto& source=actual.sourceSelection();
+            const auto construction=actual.acquireInitialConstruction();
+            if(!source || !expected.cpu_joint_source || !construction ||
+               source!=expected.cpu_joint_source || source.owner_before(expected.cpu_joint_source) ||
+               expected.cpu_joint_source.owner_before(source))return false;
+            const auto& layer=construction->layerForModelLayer(actual.layer());
+            if(layer.cpu_fragments.size()!=expected.experts.size())return false;
+            const auto same=[](const auto& a,const auto& b){return a.get()==b.get() && !a.owner_before(b) && !b.owner_before(a);};
+            for(size_t expert=0;expert<expected.experts.size();++expert) {
+                const auto& a=layer.cpu_fragments[expert];const auto& b=expected.experts[expert];
+                if(!same(a.gate(),b.gate) || !same(a.up(),b.up) || !same(a.down(),b.down))return false;
+            }
+            return true;
+        }
+    }
+    bool MoEOverlayParticipantResidencyRegistry::isCPUJointParticipant(int id)const noexcept
+    {
+        std::shared_lock lock(mutex_);const auto found=endpoints_.find(id);
+        return found!=endpoints_.end() && bool(found->second.joint_layers);
+    }
+    std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse>
+    MoEOverlayParticipantResidencyRegistry::acquireOriginalPreparedSourceLocked(
+        std::string *error) const
+    {
+        const auto reject = [&](const char *message) -> std::optional<PreparedSourceUse>
+        {
+            if (error)
+                *error = message;
+            return std::nullopt;
+        };
+        if (!prepared_source_bound_)
+            return reject("Prepared source has no original ModelContext binding");
+        auto context = prepared_source_context_.lock();
+        auto manager = prepared_source_manager_.lock();
+        if (!context || !manager)
+            return reject(
+                "Prepared source original context/manager has expired; rebinding is forbidden");
+        const auto actual = context->concreteWeightManager();
+        if (actual.get() != manager.get() || actual.owner_before(manager) ||
+            manager.owner_before(actual) ||
+            &manager->expertGemmRegistry() != prepared_source_registry_)
+            return reject("Prepared source original manager/registry was replaced");
+        if (error)
+            error->clear();
+        return PreparedSourceUse(std::move(context), std::move(manager), prepared_source_registry_,
+                                 config_.projection_preparation);
+    }
+    std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse>
+    MoEOverlayParticipantResidencyRegistry::acquireOriginalPreparedSource(std::string *error) const
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        return acquireOriginalPreparedSourceLocked(error);
+    }
+    bool MoEOverlayParticipantResidencyRegistry::acceptsPreparedRegistryLocked(
+        const ExpertGemmRegistry &registry, std::string *error) const
+    {
+        if (prepared_source_registry_ && prepared_source_registry_ != &registry)
+        {
+            if (error)
+                *error = "Prepared source engine registry differs from its original producer";
+            return false;
+        }
+        return true;
+    }
+    bool MoEOverlayParticipantResidencyRegistry::authenticatePublishedPreparedSourceLocked(
+        const ExpertGemmRegistry &registry, std::string *error) const
+    {
+        std::shared_lock lock(mutex_);
+        for (const auto &[id, assembly] : endpoints_)
+        {
+            if (assembly.joint_layers)
+                continue; // Exact committed-source check is already in joint registration.
+            const auto *participant = initialOwnerMap().participantForId(id);
+            if (!participant)
+            {
+                if (error)
+                    *error = "Prepared source lost original participant";
+                return false;
+            }
+            for (size_t row = 0; row < assembly.registered_layers.size(); ++row)
+            {
+                if (!assembly.registered_layers[row])
+                    continue;
+                const int layer = config_.first_model_layer + int(row);
+                const auto &actual = assembly.initial_bank.layers[row];
+                const auto ownership =
+                    config_.projection_preparation &&
+                            !config_.projection_preparation->cpuJointOwnerMap()
+                        ? std::optional(
+                              config_.projection_preparation
+                                  ->requireProjectionOwnershipForParticipant(*participant, layer))
+                        : std::nullopt;
+                std::vector<MoEOverlayPreparedExpertPayload> expected;
+                if (!resolveMoEOverlayPreparedExpertPayloads(
+                        registry, *participant, layer, config_.num_experts, actual.resident_mask,
+                        expected, error, ownership))
+                    return false;
+                for (size_t expert = 0; expert < expected.size(); ++expert)
+                {
+                    if (!actual.experts[expert].sameIdentity(expected[expert]))
+                    {
+                        if (error)
+                            *error = "Published component bank differs from original model source";
+                        return false;
+                    }
+                    const auto sameOwner = [](const auto &a, const auto &b)
+                    { return !a.owner_before(b) && !b.owner_before(a); };
+                    if (!sameOwner(actual.experts[expert].gate(), expected[expert].gate()) ||
+                        !sameOwner(actual.experts[expert].up(), expected[expert].up()) ||
+                        !sameOwner(actual.experts[expert].down(), expected[expert].down()))
+                    {
+                        if (error)
+                            *error = "Published component bank has an independent engine owner";
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    bool MoEOverlayParticipantResidencyRegistry::bindOriginalPreparedContext(
+        const std::shared_ptr<ModelContext> &context,
+        const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation,
+        std::string *error)
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        const auto reject = [&](const char *message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+        if (!context || !config_.original_model.value ||
+            config_.original_model.value != reinterpret_cast<uint64_t>(context.get()))
+            return reject("Prepared source requires its actual original ModelContext identity");
+        const auto &expected = config_.projection_preparation;
+        if (preparation.get() != expected.get() || preparation.owner_before(expected) ||
+            expected.owner_before(preparation))
+            return reject(
+                "Prepared source preparation differs from its original admission control block");
+        auto manager = context->concreteWeightManager();
+        if (!manager)
+            return reject("Prepared source original ModelContext has no concrete WeightManager");
+        if (prepared_source_bound_)
+        {
+            auto original = acquireOriginalPreparedSourceLocked(error);
+            if (!original)
+                return false;
+            if (original->context_.get() != context.get() ||
+                original->context_.owner_before(context) ||
+                context.owner_before(original->context_) ||
+                original->manager_.get() != manager.get() ||
+                original->manager_.owner_before(manager) ||
+                manager.owner_before(original->manager_))
+                return reject(
+                    "Prepared source cannot replace its original shared context/manager owner");
+            if (error)
+                error->clear();
+            return true;
+        }
+        if (!acceptsPreparedRegistryLocked(manager->expertGemmRegistry(), error))
+            return false;
+        try
+        {
+            if (!authenticatePublishedPreparedSourceLocked(manager->expertGemmRegistry(), error))
+                return false;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+        prepared_source_context_ = context;
+        prepared_source_manager_ = manager;
+        prepared_source_registry_ = &manager->expertGemmRegistry();
+        prepared_source_bound_ = true;
+        if (error)
+            error->clear();
+        return true;
+    }
+    bool MoEOverlayParticipantResidencyRegistry::admitInitialCPUJointGraphSources(
+        const std::shared_ptr<ModelContext> &context, std::string *error)
+    {
+        const auto participants = localParticipantIds();
+        if (std::none_of(participants.begin(), participants.end(),
+                         [this](int id) { return isCPUJointParticipant(id); }))
+        {
+            if (error) error->clear();
+            return true;
+        }
+        // Weight preparation has completed on the original cold owner. Bind
+        // that owner before any graph consumes the immutable source declaration;
+        // maintenance finalization is later and cannot establish this dependency.
+        if (!bindOriginalPreparedContext(context, config_.projection_preparation, error))
+            return false;
+        auto source = acquireOriginalPreparedSource(error);
+        if (!source) return false;
+        for (const int id : participants)
+            if (isCPUJointParticipant(id) &&
+                !registerInitialCPUJointBank(source->registry(), config_.original_model, id, error))
+                return false;
+        return true;
+    }
+
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialCPUJointBank(
+        const ExpertGemmRegistry &registry, ModelContextId model, int id, std::string *error)
+    {
+        if (error)
+            error->clear();
+        std::lock_guard lock(prepared_source_mutex_);
+        auto source =
+            prepared_source_bound_ ? acquireOriginalPreparedSourceLocked(error) : std::nullopt;
+        if ((prepared_source_bound_ && !source) || !acceptsPreparedRegistryLocked(registry, error))
+            return false;
+        if (!registerInitialCPUJointBankImpl(registry, model, id, error))
+            return false;
+        prepared_source_registry_ = &registry;
+        return true;
+    }
+
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialCPUJointBankImpl(
+        const ExpertGemmRegistry &registry, ModelContextId model, int id, std::string *error)
+    {
+        const auto reject = [&](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+        if (!model.value || model.value != config_.original_model.value)
+            return reject("CPU joint bank requires its original model identity");
+        const auto *participant = initialOwnerMap().participantForId(id);
+        std::shared_ptr<MoEOverlayParticipantResidency> endpoint;
+        MoEOverlayParticipantResidencyBank candidate;
+        MoEOverlayParticipantResidencyBank declaration;
+        {
+            std::shared_lock lock(mutex_);
+            const auto found = endpoints_.find(id);
+            if (!participant || found == endpoints_.end() || !found->second.joint_layers ||
+                !found->second.endpoint)
+                return reject("CPU joint bank requires its exact original local member");
+            const auto &assembly = found->second;
+            endpoint = assembly.endpoint;
+            if (assembly.publication_state == InitialPublicationState::Completed)
+            {
+                // The completed state certifies the source once. The actual
+                // installed node, not mutable registry lookup entries, is the
+                // immutable engine authority for every retained graph family.
+                const auto installed = endpoint->acquire(config_.initial_epoch);
+                if (!installed || installed->participant_id != id ||
+                    installed->device != participant->device ||
+                    installed->first_model_layer != config_.first_model_layer ||
+                    installed->layers.size() != size_t(config_.num_layers))
+                    return reject("CPU joint initial bank is retired or absent; cold registration "
+                                  "cannot resurrect it");
+                return true;
+            }
+            candidate = assembly.initial_bank;
+            declaration = assembly.initial_bank;
+        }
+        std::vector<std::shared_ptr<const CPUJointLayer>> frames(size_t(config_.num_layers));
+        std::vector<bool> registered(size_t(config_.num_layers), true);
+        try
+        {
+            for (int index = 0; index < config_.num_layers; ++index)
+            {
+                const int layer = config_.first_model_layer + index;
+                auto &destination = candidate.layers.at(size_t(index));
+                const auto &family = destination.cpu_fragment_family;
+                const auto ids = initialOwnerMap().expertsForParticipant(layer, id);
+                std::shared_ptr<const CPUExpertShardSourceSelection> selection;
+                if (!ids.empty())
+                {
+                    const auto expected =
+                        config_.projection_preparation->cpuShardSourceFor(layer, *participant);
+                    auto acquired = registry.acquireCPUJointLayer(model, *participant, layer);
+                    if (!expected || !acquired || !acquired->cpu_joint_source ||
+                        *acquired->cpu_joint_source != *expected ||
+                        acquired->cpu_joint_source->cohort() != expected->cohort() ||
+                        acquired->cpu_joint_source->cohort().owner_before(expected->cohort()) ||
+                        expected->cohort().owner_before(acquired->cpu_joint_source->cohort()))
+                        return reject("CPU joint publication has no exact original source/cohort "
+                                      "lease for layer " +
+                                      std::to_string(layer));
+                    selection = acquired->cpu_joint_source;
+                    if (!family || family->cohort() != selection->cohort() ||
+                        family->cohort().owner_before(selection->cohort()) ||
+                        selection->cohort().owner_before(family->cohort()) ||
+                        family->participantIndex() != selection->participantIndex())
+                        return reject("CPU joint initial bank changed original source family");
+                    for (const int expert : ids)
+                    {
+                        const auto &actual = acquired->experts.at(size_t(expert));
+                        MoEOverlayPreparedCPUFragmentPayload payload(
+                            model, config_.projection_preparation, family->cohort(),
+                            family->participantIndex(), expert,
+                            {actual.gate, actual.up, actual.down},0);
+                        destination.setResidentCPUFragment(expert, std::move(payload));
+                    }
+                }
+                frames[size_t(index)] = std::shared_ptr<const CPUJointLayer>(new CPUJointLayer(
+                    config_.initial_epoch, id, layer, selection, family, endpoint));
+                for (auto &payload : declaration.layers[size_t(index)].cpu_fragments)
+                    payload = {};
+            }
+            // All allocations, source checks and frame construction precede
+            // the first visible store. Only this one installed bank owns the
+            // engines; setup bookkeeping retains declaration metadata alone.
+            auto ready = endpoint->prepareReadyBank(std::move(candidate), error);
+            if (!ready)
+                return false;
+            const auto status = endpoint->installReadyBank(std::move(*ready), error);
+            if (status != MoEOverlayParticipantBankInstallStatus::Installed)
+                return false;
+            std::unique_lock lock(mutex_);
+            auto &assembly = endpoints_.at(id);
+            assembly.initial_bank = std::move(declaration);
+            assembly.joint_layers = std::move(frames);
+            assembly.registered_layers = std::move(registered);
+            assembly.publication_state = InitialPublicationState::Completed;
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            return reject(exception.what());
+        }
+    }
+
+    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer>
+    MoEOverlayParticipantResidencyRegistry::initialCPUJointLayer(int id,int layer)const
+    {return cpuJointLayer(id,layer,config_.initial_epoch);}
+    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer>
+    MoEOverlayParticipantResidencyRegistry::cpuJointLayer(int id,int layer,uint64_t epoch)const
+    {
+        if(epoch<config_.initial_epoch || layer<config_.first_model_layer || layer-config_.first_model_layer>=config_.num_layers)
+            throw std::invalid_argument("CPU joint layer received an invalid epoch or foreign model layer");
+        std::shared_ptr<const CPUJointLayer> original;
+        {
+            std::shared_lock lock(mutex_);const auto found=endpoints_.find(id);
+            if(found==endpoints_.end() || !found->second.joint_layers)
+                throw std::invalid_argument("CPU joint layer requires its exact registered fragment endpoint");
+            original=found->second.joint_layers->at(size_t(layer-config_.first_model_layer));
+        }
+        if(!original)throw std::logic_error("CPU joint layer has no published original prepared source");
+        if(epoch==config_.initial_epoch)return original;
+        auto acquired=original->acquireEpoch(epoch);
+        if(!acquired)throw std::logic_error("CPU joint requested epoch is absent or has a foreign fragment family");
+        return std::shared_ptr<const CPUJointLayer>(new CPUJointLayer(std::move(*acquired)));
+    }
+
+    std::optional<MoEOverlayParticipantResidencyRegistry::CPUJointLayer>
+    MoEOverlayParticipantResidencyRegistry::CPUJointLayer::acquireEpoch(uint64_t epoch) const noexcept
+    {
+        if(!endpoint_ || !family_ || epoch==0)return std::nullopt;
+        auto bank=endpoint_->acquire(epoch);
+        if(!bank || bank->epoch!=epoch || bank->participant_id!=participant_ || !bank->containsModelLayer(layer_))return std::nullopt;
+        const auto& layer=bank->layerForModelLayer(layer_);
+        if(layer.cpu_fragment_family!=family_ || layer.cpu_fragment_family.owner_before(family_) || family_.owner_before(layer.cpu_fragment_family))return std::nullopt;
+        auto result=*this;result.epoch_=epoch;result.bank_=std::move(bank);return result;
+    }
+
+
+    std::shared_ptr<MoEOverlayPreparedExpertArrival>
+    MoEOverlayParticipantResidencyRegistry::prepareCPUJointArrival(
+        const MoEOverlayResidencySnapshot& candidate,int id,int layer,int expert,std::string* error) const
+    {
+        if(error)error->clear();
+        const auto reject=[&](const char* reason)->std::shared_ptr<MoEOverlayPreparedExpertArrival>{if(error)*error=reason;return {};};
+        // A model ID or passive source geometry alone cannot issue this arm.
+        auto original=acquireOriginalPreparedSource(error);
+        if(!original)return {};
+        if(original->preparation()!=config_.projection_preparation ||
+           candidate.originalProjectionPreparation()!=config_.projection_preparation ||
+           candidate.originalProjectionPreparation().owner_before(config_.projection_preparation) ||
+           config_.projection_preparation.owner_before(candidate.originalProjectionPreparation()) ||
+           !candidate.valid() || candidate.epoch<=config_.initial_epoch ||
+           layer<config_.first_model_layer || layer-config_.first_model_layer>=config_.num_layers || expert<0 || expert>=config_.num_experts)
+            return reject("CPU fragment arrival requires the original preparation and a later candidate epoch");
+        try {
+            const auto& owners=candidate.placementOwnerMap();
+            const auto* selected=owners.participantForId(id);
+            const auto* initial=initialOwnerMap().participantForId(id);
+            const auto* row=owners.placementFor(layer,expert);
+            if(!selected || !initial || !(*selected==*initial) || !row || !row->shard_cohort ||
+               row->layer_idx!=layer || row->expert_id!=expert)
+                return reject("CPU fragment arrival changed original participant or candidate placement");
+            std::shared_lock lock(mutex_);
+            const auto found=endpoints_.find(id);
+            if(found==endpoints_.end() || !found->second.joint_layers || !found->second.endpoint)
+                return reject("CPU fragment arrival has no original local RCU endpoint");
+            const auto& family=found->second.initial_bank.layerForModelLayer(layer).cpu_fragment_family;
+            if(!family || !family->cohort() || family->cohort()!=row->shard_cohort ||
+               family->cohort().owner_before(row->shard_cohort) || row->shard_cohort.owner_before(family->cohort()) ||
+               family->model()!=config_.original_model || family->preparation()!=original->preparation())
+                return reject("CPU fragment candidate changed original fixed cohort or model family");
+            const auto members=family->cohort()->participants();
+            if(family->participantIndex()>=members.size() || members[family->participantIndex()].participant_id!=id ||
+               members[family->participantIndex()].world_rank!=selected->world_rank ||
+               members[family->participantIndex()].address!=selected->address)
+                return reject("CPU fragment candidate has a foreign original cohort member");
+            const auto target=MoEExpertPlacementTarget::fromPlacement(*row);
+            bool receives=false;
+            if(target)for(size_t member=0;member<target->participantCount();++member)receives=receives || target->participantId(member)==id;
+            if(!receives)return reject("CPU fragment candidate does not assign this expert to the original member");
+            return std::shared_ptr<MoEOverlayPreparedExpertArrival>(new MoEOverlayPreparedExpertArrival(
+                config_.original_model,original->preparation(),family->cohort(),family->participantIndex(),candidate.epoch,expert));
+        } catch(const std::exception& exception) {if(error)*error=exception.what();return {};}
+    }
+
+    std::shared_ptr<MoEOverlayPreparedExpertArrival>
+    MoEOverlayParticipantResidencyRegistry::prepareCPUJointCalibrationArrival(
+        const MoEOverlayResidencyTransaction &transaction, std::size_t migration_index,
+        int id, std::string *error) const
+    {
+        if (error) error->clear();
+        const auto reject = [&](const char *reason) -> std::shared_ptr<MoEOverlayPreparedExpertArrival>
+        { if (error) *error = reason; return {}; };
+        // Only the closed authority-produced calibration transaction can name
+        // a nonresident shadow destination while retaining unchanged live owners.
+        if (transaction.purpose != MoEOverlayResidencyTransactionPurpose::EconomyCalibration ||
+            !transaction.valid() || migration_index >= transaction.migrations.size())
+            return reject("CPU fragment shadow arrival requires a genuine calibration transaction and edge");
+        auto original = acquireOriginalPreparedSource(error);
+        if (!original) return {};
+        const auto &preparation = config_.projection_preparation;
+        const auto same_preparation = [&](const auto &value)
+        { return value && value.get() == preparation.get() &&
+                 !value.owner_before(preparation) && !preparation.owner_before(value); };
+        if (!same_preparation(original->preparation()) ||
+            !same_preparation(transaction.previous->originalProjectionPreparation()) ||
+            !same_preparation(transaction.candidate->originalProjectionPreparation()))
+            return reject("CPU fragment calibration changed the original prepared source owner");
+        const auto &edge = transaction.migrations[migration_index];
+        const int layer = edge.layer_idx, expert = edge.expert_id;
+        if (!edge.destination.shard_cohort || layer < config_.first_model_layer ||
+            layer - config_.first_model_layer >= config_.num_layers || expert < 0 || expert >= config_.num_experts)
+            return reject("CPU fragment calibration has a foreign destination layer or expert");
+        try
+        {
+            const auto *selected = transaction.previous->placementOwnerMap().participantForId(id);
+            const auto *initial = initialOwnerMap().participantForId(id);
+            if (!selected || !initial || !(*selected == *initial))
+                return reject("CPU fragment calibration changed the original participant");
+            std::shared_lock lock(mutex_);
+            const auto found = endpoints_.find(id);
+            if (found == endpoints_.end() || !found->second.joint_layers || !found->second.endpoint)
+                return reject("CPU fragment calibration has no original local RCU endpoint");
+            auto bank = found->second.endpoint->acquire(transaction.expected_epoch);
+            if (!bank || !bank->containsModelLayer(layer))
+                return reject("CPU fragment calibration lost its original installed epoch");
+            const auto &family = bank->layerForModelLayer(layer).cpu_fragment_family;
+            const auto &cohort = edge.destination.shard_cohort;
+            if (!family || !family->cohort() || family->cohort().get() != cohort.get() ||
+                family->cohort().owner_before(cohort) || cohort.owner_before(family->cohort()) ||
+                family->model() != config_.original_model || !same_preparation(family->preparation()))
+                return reject("CPU fragment calibration changed the original fixed family or model");
+            const auto members = cohort->participants();
+            const auto member = family->participantIndex();
+            if (member >= members.size() || members[member].participant_id != id ||
+                members[member].world_rank != selected->world_rank || members[member].address != selected->address)
+                return reject("CPU fragment calibration has a foreign original cohort member");
+            // The genuine transaction validator authenticates this complete
+            // original destination target. The live bank intentionally does NOT
+            // own the incoming expert; no resident bit or source selection changes.
+            return std::shared_ptr<MoEOverlayPreparedExpertArrival>(new MoEOverlayPreparedExpertArrival(
+                config_.original_model, original->preparation(), cohort, member, transaction.candidate->epoch, expert));
+        }
+        catch (const std::exception &exception)
+        { if (error) *error = exception.what(); return {}; }
+    }
+
+    std::shared_ptr<MoEOverlayPreparedExpertArrival>
+    MoEOverlayParticipantResidencyRegistry::prepareCPUJointArrivalFromInstalledBank(
+        const MoEOverlayParticipantBankLease &bank, int id, int layer, int expert,
+        std::string *error) const
+    {
+        if (error)
+            error->clear();
+        const auto reject =
+            [&](const char *reason) -> std::shared_ptr<MoEOverlayPreparedExpertArrival>
+        {
+            if (error)
+                *error = reason;
+            return {};
+        };
+        auto original = acquireOriginalPreparedSource(error);
+        if (!original)
+            return {};
+        if (!bank || bank->participant_id != id || bank->epoch < config_.initial_epoch ||
+            layer < config_.first_model_layer ||
+            layer - config_.first_model_layer >= config_.num_layers ||
+            !bank->containsModelLayer(layer) || expert < 0 || expert >= config_.num_experts)
+            return reject("Installed CPU fragment arrival has a foreign or empty bank coordinate");
+        try
+        {
+            std::shared_lock lock(mutex_);
+            const auto found = endpoints_.find(id);
+            const auto *participant = initialOwnerMap().participantForId(id);
+            if (found == endpoints_.end() || !found->second.endpoint ||
+                !found->second.joint_layers || !participant || bank->device != participant->device)
+                return reject("Installed CPU fragment arrival has no original local endpoint");
+            // A retained retired node remains physically safe to read, but cannot mint new work.
+            const auto installed = found->second.endpoint->acquire(bank->epoch);
+            if (!installed || installed.get() != bank.get())
+                return reject(
+                    "Installed CPU fragment arrival names a foreign or retired bank node");
+            const auto &row = bank->layerForModelLayer(layer);
+            const auto &family =
+                found->second.initial_bank.layerForModelLayer(layer).cpu_fragment_family;
+            if (!family || row.cpu_fragment_family != family ||
+                row.cpu_fragment_family.owner_before(family) ||
+                family.owner_before(row.cpu_fragment_family) ||
+                family->model() != config_.original_model ||
+                family->preparation() != original->preparation() ||
+                family->preparation().owner_before(original->preparation()) ||
+                original->preparation().owner_before(family->preparation()) || !family->cohort())
+                return reject(
+                    "Installed CPU fragment arrival changed its original model/preparation/family");
+            const auto members = family->cohort()->participants();
+            if (family->participantIndex() >= members.size() ||
+                members[family->participantIndex()].participant_id != id ||
+                members[family->participantIndex()].world_rank != participant->world_rank ||
+                members[family->participantIndex()].address != participant->address ||
+                !row.resident_mask.at(size_t(expert)) ||
+                !family->accepts(row.cpu_fragments.at(size_t(expert)), expert))
+                return reject(
+                    "Installed CPU fragment arrival lost its original member or resident expert");
+            return std::shared_ptr<MoEOverlayPreparedExpertArrival>(
+                new MoEOverlayPreparedExpertArrival(config_.original_model, original->preparation(),
+                                                    family->cohort(), family->participantIndex(),
+                                                    bank->epoch, expert));
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return {};
+        }
+    }
+
     bool MoEOverlayParticipantResidencyRegistry::registerInitialLayer(
+        int participant_id, int layer_idx, const std::vector<bool> &resident_mask,
+        const std::vector<MoEOverlayPreparedExpertPayload> &experts, std::string *error)
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        std::optional<PreparedSourceUse> source;
+        if (isCPUJointParticipant(participant_id))
+            return registerInitialLayerImpl(participant_id, layer_idx, resident_mask, experts, error);
+        if (prepared_source_bound_)
+        {
+            source = acquireOriginalPreparedSourceLocked(error);
+            if (!source)
+                return false;
+            const auto *participant = initialOwnerMap().participantForId(participant_id);
+            if (!participant)
+            {
+                if (error)
+                    *error = "Prepared source lost original participant";
+                return false;
+            }
+            try
+            {
+                const auto ownership =
+                    config_.projection_preparation &&
+                            !config_.projection_preparation->cpuJointOwnerMap()
+                        ? std::optional(config_.projection_preparation
+                                            ->requireProjectionOwnershipForParticipant(*participant,
+                                                                                       layer_idx))
+                        : std::nullopt;
+                std::vector<MoEOverlayPreparedExpertPayload> expected;
+                if (!resolveMoEOverlayPreparedExpertPayloads(
+                        source->registry(), *participant, layer_idx, config_.num_experts,
+                        resident_mask, expected, error, ownership) ||
+                    expected.size() != experts.size())
+                    return false;
+                for (size_t i = 0; i < expected.size(); ++i)
+                {
+                    const auto same = [](const auto &a, const auto &b)
+                    { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
+                    if (!expected[i].sameIdentity(experts[i]) ||
+                        !same(expected[i].gate(), experts[i].gate()) ||
+                        !same(expected[i].up(), experts[i].up()) ||
+                        !same(expected[i].down(), experts[i].down()))
+                    {
+                        if (error)
+                            *error =
+                                "Initial payload differs from bound original model engines/owners";
+                        return false;
+                    }
+                }
+            }
+            catch (const std::exception &exception)
+            {
+                if (error)
+                    *error = exception.what();
+                return false;
+            }
+        }
+        return registerInitialLayerImpl(participant_id, layer_idx, resident_mask, experts, error);
+    }
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialLayerImpl(
         int participant_id,
         int layer_idx,
         const std::vector<bool> &resident_mask,
@@ -1268,6 +2013,10 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if(isCPUJointParticipant(participant_id)) {
+            if(error)*error="CPU joint fragments require source-bound publication, never whole-expert payloads";
+            return false;
+        }
         if (layer_idx < config_.first_model_layer ||
             layer_idx >= config_.first_model_layer + config_.num_layers ||
             resident_mask.size() !=
@@ -1367,25 +2116,30 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEOverlayParticipantResidencyRegistry::
-        finalizeInitialBanksFromPreparedRegistry(
-            const ExpertGemmRegistry &registry,
-            std::string *error)
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialLayerFromPreparedRegistry(
+        const ExpertGemmRegistry &registry, int layer_idx, std::string *error)
     {
-        if (error)
-            error->clear();
-
-        /*
-         * Do not hold the registry mutex while acquiring model-owned engine
-         * lifetimes or calling registerInitialLayer(). The configuration is
-         * immutable after construction, and registerInitialLayer owns the
-         * short assembly/publication critical section for each exact layer.
-         */
+        if (error) error->clear();
+        if (layer_idx < config_.first_model_layer ||
+            layer_idx - config_.first_model_layer >= config_.num_layers)
+        {
+            if (error) *error = "Prepared layer is outside the frozen residency interval: " + std::to_string(layer_idx);
+            return false;
+        }
+        std::lock_guard source_lock(prepared_source_mutex_);
+        auto source=prepared_source_bound_?acquireOriginalPreparedSourceLocked(error):std::nullopt;
+        if((prepared_source_bound_ && !source) || !acceptsPreparedRegistryLocked(registry,error))return false;
+        // Configuration is immutable; registerInitialLayer owns the publication
+        // lock. Never hold it while retaining model registry engine lifetimes.
         const auto participant_ids = localParticipantIds();
         for (const int participant_id : participant_ids)
         {
+            if(isCPUJointParticipant(participant_id)) {
+                if(!registerInitialCPUJointBankImpl(registry,config_.original_model,participant_id,error))return false;
+                continue;
+            }
             const auto *participant =
-                config_.owner_map.participantForId(participant_id);
+                initialOwnerMap().participantForId(participant_id);
             if (!participant)
             {
                 if (error)
@@ -1398,60 +2152,64 @@ namespace llaminar2
                 return false;
             }
 
-            for (int layer_idx = config_.first_model_layer;
-                 layer_idx < config_.first_model_layer + config_.num_layers;
-                 ++layer_idx)
+            const auto resident_mask =
+                initialOwnerMap().expertMaskForParticipant(
+                    layer_idx,
+                    participant_id,
+                    config_.num_experts);
+            std::vector<MoEOverlayPreparedExpertPayload> experts;
+            std::string detail;
+            const auto ownership = config_.projection_preparation && !config_.projection_preparation->cpuJointOwnerMap()
+                ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(
+                    *participant, layer_idx)) : std::nullopt;
+            if (!resolveMoEOverlayPreparedExpertPayloads(
+                    registry,
+                    *participant,
+                    layer_idx,
+                    config_.num_experts,
+                    resident_mask,
+                    experts,
+                    &detail,
+                    ownership))
             {
-                const auto resident_mask =
-                    config_.owner_map.expertMaskForParticipant(
-                        layer_idx,
-                        participant_id,
-                        config_.num_experts);
-                std::vector<MoEOverlayPreparedExpertPayload> experts;
-                std::string detail;
-                const auto ownership = config_.projection_preparation
-                    ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(
-                        *participant, layer_idx)) : std::nullopt;
-                if (!resolveMoEOverlayPreparedExpertPayloads(
-                        registry,
-                        *participant,
-                        layer_idx,
-                        config_.num_experts,
-                        resident_mask,
-                        experts,
-                        &detail,
-                        ownership))
+                if (error)
                 {
-                    if (error)
-                    {
-                        *error =
-                            "ExpertOverlay initial-bank finalization could not "
-                            "resolve participant " +
-                            std::to_string(participant_id) + " layer " +
-                            std::to_string(layer_idx) + ": " + detail;
-                    }
-                    return false;
+                    *error =
+                        "ExpertOverlay initial-bank finalization could not "
+                        "resolve participant " +
+                        std::to_string(participant_id) + " layer " +
+                        std::to_string(layer_idx) + ": " + detail;
                 }
-                if (!registerInitialLayer(
-                        participant_id,
-                        layer_idx,
-                        resident_mask,
-                        experts,
-                        &detail))
+                return false;
+            }
+            if (!registerInitialLayerImpl(
+                    participant_id,
+                    layer_idx,
+                    resident_mask,
+                    experts,
+                    &detail))
+            {
+                if (error)
                 {
-                    if (error)
-                    {
-                        *error =
-                            "ExpertOverlay initial-bank finalization rejected "
-                            "participant " +
-                            std::to_string(participant_id) + " layer " +
-                            std::to_string(layer_idx) + ": " + detail;
-                    }
-                    return false;
+                    *error =
+                        "ExpertOverlay initial-bank finalization rejected "
+                        "participant " +
+                        std::to_string(participant_id) + " layer " +
+                        std::to_string(layer_idx) + ": " + detail;
                 }
+                return false;
             }
         }
+        prepared_source_registry_=&registry;
+        return true;
+    }
 
+    bool MoEOverlayParticipantResidencyRegistry::finalizeInitialBanksFromPreparedRegistry(
+        const ExpertGemmRegistry &registry, std::string *error)
+    {
+        for (int layer = config_.first_model_layer;
+             layer < config_.first_model_layer + config_.num_layers; ++layer)
+            if (!registerInitialLayerFromPreparedRegistry(registry, layer, error)) return false;
         if (!allInitialBanksReady())
         {
             if (error)
@@ -1467,7 +2225,7 @@ namespace llaminar2
 
     std::shared_ptr<MoEOverlayParticipantResidency>
     MoEOverlayParticipantResidencyRegistry::endpoint(
-        int participant_id) const noexcept
+        int participant_id) const
     {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         const auto found = endpoints_.find(participant_id);
@@ -1506,7 +2264,22 @@ namespace llaminar2
         std::size_t authenticated = 0;
         for (const int id : localParticipantIds())
         {
-            const auto *participant = config_.owner_map.participantForId(id);
+            const auto *participant = initialOwnerMap().participantForId(id);
+            if(isCPUJointParticipant(id)) {
+                if(!participant)throw std::logic_error("Joint source verification lost its original member");
+                for(int layer=config_.first_model_layer;layer<config_.first_model_layer+config_.num_layers;++layer) {
+                    const auto actual=initialCPUJointLayer(id,layer);
+                    const auto expected=registry.acquireCPUJointLayer(config_.original_model,*participant,layer);
+                    const auto ids=initialOwnerMap().expertsForParticipant(layer,id);
+                    if(ids.empty()) {
+                        if(actual->sourceSelection() || expected)throw std::logic_error("Empty joint layer acquired foreign source storage");
+                    } else if(!expected || !sameJointBankSource(*actual,*expected)) {
+                        throw std::logic_error("Joint prepared source seal found changed source/engine ownership");
+                    }
+                    authenticated+=ids.size();
+                }
+                continue;
+            }
             const auto owner = endpoint(id);
             const auto bank = owner ? owner->acquire(config_.initial_epoch) : MoEOverlayParticipantBankLease{};
             if (!participant || !owner || !bank ||
@@ -1514,11 +2287,11 @@ namespace llaminar2
                 throw std::logic_error("Immutable prepared source seal lost its original scoped bank");
             for (int layer = config_.first_model_layer; layer < config_.first_model_layer + config_.num_layers; ++layer)
             {
-                const auto mask = config_.owner_map.expertMaskForParticipant(layer, id, config_.num_experts);
+                const auto mask = initialOwnerMap().expertMaskForParticipant(layer, id, config_.num_experts);
                 const auto &row = bank->layerForModelLayer(layer);
                 if (row.resident_mask != mask)
                     throw std::logic_error("Immutable prepared source seal changed initial ownership");
-                const auto ownership = config_.projection_preparation
+                const auto ownership = config_.projection_preparation && !config_.projection_preparation->cpuJointOwnerMap()
                     ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(*participant, layer))
                     : std::nullopt;
                 std::vector<MoEOverlayPreparedExpertPayload> expected;
@@ -1555,14 +2328,14 @@ namespace llaminar2
         for (const int participant_id : participant_ids)
         {
             const auto *const participant =
-                config_.owner_map.participantForId(participant_id);
+                initialOwnerMap().participantForId(participant_id);
             if (!participant)
             {
                 throw std::logic_error(
                     "ExpertOverlay initial-bank snapshot cannot resolve its canonical participant");
             }
             const auto tier_participants =
-                config_.owner_map.participantIdsForTier(participant->tier_idx);
+                initialOwnerMap().participantIdsForTier(participant->tier_idx);
             if (tier_participants.empty())
             {
                 throw std::logic_error(
@@ -1575,6 +2348,34 @@ namespace llaminar2
                     "ExpertOverlay initial-bank snapshot lost a registered participant");
             }
 
+            if(found->second.joint_layers) {
+                for(int layer=config_.first_model_layer;layer<config_.first_model_layer+config_.num_layers;++layer) {
+                    const auto& actual=found->second.joint_layers->at(size_t(layer-config_.first_model_layer));
+                    const auto construction = actual ? actual->acquireInitialConstruction()
+                                                     : MoEOverlayParticipantBankLease{};
+                    if(!actual || actual->epoch()!=config_.initial_epoch || !construction ||
+                       construction->participant_id!=participant_id || construction->device!=participant->device ||
+                       !construction->containsModelLayer(layer))
+                        throw std::logic_error("Joint initial selection requires its actual published source lease");
+                    InitialBankExpertSelection selection{.participant_id=participant_id,.device=participant->device,
+                        .tier_idx=participant->tier_idx,.tier_participant_count=int(tier_participants.size()),.layer_idx=layer};
+                    // Original source metadata survives retirement deliberately;
+                    // it cannot stand in for an installed bank observation.
+                    const auto& observed = construction->layerForModelLayer(layer);
+                    if(observed.cpu_fragment_family!=actual->family() || !observed.valid(config_.num_experts))
+                        throw std::logic_error("Joint initial selection lost its authenticated fragment bank");
+                    selection.expert_ids=observed.cpu_fragment_expert_ids;
+                    if(actual->sourceSelection()) {
+                        const auto ids=actual->sourceSelection()->expertIds();
+                        if(!std::equal(ids.begin(),ids.end(),selection.expert_ids.begin(),selection.expert_ids.end()))
+                            throw std::logic_error("Joint initial bank differs from its immutable source selection");
+                    }
+                    selection.matches_frozen_owner_map=selection.expert_ids==initialOwnerMap().expertsForParticipant(layer,participant_id);
+                    selection.ownership_kind=InitialOwnershipKind::CPUJointFragments;
+                    selections.push_back(std::move(selection));
+                }
+                continue;
+            }
             const auto lease = found->second.endpoint->acquire(
                 config_.initial_epoch);
             if (!lease)
@@ -1630,7 +2431,7 @@ namespace llaminar2
                 }
                 selection.matches_frozen_owner_map =
                     selection.expert_ids ==
-                    config_.owner_map.expertsForParticipant(
+                    initialOwnerMap().expertsForParticipant(
                         layer_idx, participant_id);
                 selections.push_back(std::move(selection));
             }
@@ -1653,7 +2454,8 @@ namespace llaminar2
 
             IncompleteInitialBank deficit;
             deficit.participant_id = participant_id;
-            deficit.device = assembly.initial_bank.device;
+            const auto* participant=initialOwnerMap().participantForId(participant_id);
+            deficit.device=participant?participant->device:DeviceId::invalid();
             for (std::size_t layer = 0;
                  layer < assembly.registered_layers.size();
                  ++layer)

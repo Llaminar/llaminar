@@ -12,8 +12,15 @@
  *
  * Build target (added in tests/v2/CMakeLists.txt):
  *   v2_perf_rocm_gemini_ffn_kernel_playground
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -37,6 +44,7 @@
         {                                                                       \
             std::fprintf(stderr, "HIP error %s at %s:%d\n",                   \
                          hipGetErrorString(err__), __FILE__, __LINE__);         \
+            llaminar2::GPUDeviceProcessLifetime::retireActive(); \
             std::exit(1);                                                       \
         }                                                                       \
     } while (0)
@@ -113,6 +121,7 @@ RunConfig parseArgs(int argc, char **argv)
         else if (arg == "--help")
         {
             std::printf("Usage: %s [--warmup N] [--iters N] [--split-k N] [--seed N] [--no-check] [--candidate-swizzle 0|1]\n", argv[0]);
+            llaminar2::GPUDeviceProcessLifetime::retireActive();
             std::exit(0);
         }
     }
@@ -135,6 +144,7 @@ void makeRandomBVNNI(std::vector<int8_t> &b_vnni, int N, int K, int seed)
     if ((K % 4) != 0)
     {
         std::fprintf(stderr, "K must be multiple of 4 for VNNI pack (K=%d)\n", K);
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         std::exit(1);
     }
     fillRandomInt8(b_vnni, seed);
@@ -254,19 +264,19 @@ __global__ void gridkpar_32x8_cpt4_kernel(
             {
                 const int32_t a_next = a_row[kt + kg_l + 1];
                 const int off = kg_l * 128 + n_local;
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 0], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 1], acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 2], acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 3], acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 0], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 1], acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 2], acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 3], acc[3]);
                 a_packed = a_next;
             }
             // Last k-group in tile (no prefetch)
             {
                 const int off = (KT - 1) * 128 + n_local;
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 0], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 1], acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 2], acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 3], acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 0], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 1], acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 2], acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_lds[off + 3], acc[3]);
             }
             __syncthreads(); // Ensure all done before next tile overwrites LDS
         }
@@ -282,10 +292,10 @@ __global__ void gridkpar_32x8_cpt4_kernel(
             for (int kg = k_begin; kg < k_end; ++kg)
             {
                 const int32_t a_packed = *reinterpret_cast<const int32_t *>(a_ptr);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_ptr[0], acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_ptr[1], acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_ptr[2], acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_ptr[3], acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[0], acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[1], acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[2], acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_ptr[3], acc[3]);
                 a_ptr += 4;
                 b_ptr += b_row_stride_i32;
             }
@@ -303,13 +313,13 @@ __global__ void gridkpar_32x8_cpt4_kernel(
             {
                 const int32_t a_packed = *reinterpret_cast<const int32_t *>(a_ptr);
                 if (valid > 0)
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *b0, acc[0], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b0, acc[0]);
                 if (valid > 1)
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *b1, acc[1], false);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b1, acc[1]);
                 if (valid > 2)
-                    acc[2] = __builtin_amdgcn_sdot4(a_packed, *b2, acc[2], false);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b2, acc[2]);
                 if (valid > 3)
-                    acc[3] = __builtin_amdgcn_sdot4(a_packed, *b3, acc[3], false);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, *b3, acc[3]);
                 a_ptr += 4;
                 b0 += b_row_stride_i32;
                 b1 += b_row_stride_i32;
@@ -547,6 +557,8 @@ void runOneShape(const ShapeCase &shape, const RunConfig &cfg)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     const RunConfig cfg = parseArgs(argc, argv);
 
     int device_count = 0;

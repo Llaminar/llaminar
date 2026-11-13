@@ -4,15 +4,20 @@
  *
  * The stages in this file preserve the model's routing arithmetic while
  * selecting the backend-native execution contract.  In particular, CPU
- * NativeVNNI expert projections consume the canonical Q8_1 representation of
+ * NativeQuantised expert projections consume the canonical Q8_1 representation of
  * the hidden rows.  Ordinary CPU graphs receive that representation from the
  * router stage, whereas graph-native heterogeneous ExpertOverlay participants
  * receive FP32 rows through a sparse transport boundary and must explicitly
  * publish the identical Q8_1 rows before either serial or grouped expert
- * execution begins.
+ * execution begins. Weight-service calls retain the graph's declared ownership
+ * mode so a departing shared consumer cannot invalidate sibling graph engines.
+ * Grouped CPU scratch uses one typed eight-root layout for both its admission
+ * BOM and final allocation. Each backing retains its own exact allocator and
+ * PMA lease, including the kernel's canonical router publication.
  */
 
 #include "MoEExpertComputeStage.h"
+#include "../../moe/CPUExpertShardSourceSelection.h"
 #include "MoEDeviceRebalanceStage.h"
 #include "../ComputeStageUtils.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -39,7 +44,7 @@
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/cpu/moe/CPUMoEKernel.h"
 #include "../../../kernels/cpu/moe/CPUCanonicalRouteReducer.h"
-#include "../../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "../../../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -82,7 +87,7 @@ namespace llaminar2
 {
     // Alias for fully-qualified KernelFactory access
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
-    using cpu::native_vnni::CPUNativeVNNIGemmKernel;
+    using cpu::native_quantised::CPUNativeQuantisedGemmKernel;
 
     namespace
     {
@@ -328,7 +333,7 @@ namespace llaminar2
                 hash = updateTraceHash(hash, &bank.replica_role[expert], sizeof(bank.replica_role[expert]));
                 hash = updateTraceHash(hash, &bank.resident_participant_mask[expert], sizeof(bank.resident_participant_mask[expert]));
 
-                const std::array<DeviceNativeVNNIMatrixDesc, 3> matrices = {
+                const std::array<DeviceNativeQuantisedMatrixDesc, 3> matrices = {
                     desc.gate, desc.up, desc.down};
                 for (const auto &matrix : matrices)
                 {
@@ -375,8 +380,8 @@ namespace llaminar2
                 if (!gemm)
                     return;
 
-                DeviceNativeVNNIMatrixDesc desc{};
-                const bool exported = gemm->exportNativeVNNIMatrixDesc(desc) && desc.valid();
+                DeviceNativeQuantisedMatrixDesc desc{};
+                const bool exported = gemm->exportNativeQuantisedMatrixDesc(desc) && desc.valid();
                 const uint8_t exported_byte = exported ? 1u : 0u;
                 hash = updateTraceHash(hash, &exported_byte, sizeof(exported_byte));
                 if (!exported)
@@ -1172,180 +1177,58 @@ namespace llaminar2
         owner_ = nullptr;
     }
 
+    CPUGroupedMoESerialWorkspace::StorageLayout
+    CPUGroupedMoESerialWorkspace::storageLayout(const Config &config)
+    {
+        // The admitted enclosing declaration owns physical placement and
+        // initialization. Rebuild every execution extent independently while
+        // retaining that exact policy; a default heap declaration would differ
+        // from the original NUMA fragment even when all logical widths match.
+        const auto placement = config.declared_storage
+            ? config.declared_storage->batch.placement() : CPUStoragePlacement::local();
+        const auto initialization = config.declared_storage
+            ? config.declared_storage->batch.initialization() : CPUStorageInitialization::Zero;
+        return StorageLayout::declare(config.row_capacity, config.d_model,
+            config.expert_intermediate, config.num_experts, config.routing_top_k, config.device_id,
+            placement, initialization);
+    }
+
     size_t CPUGroupedMoESerialWorkspace::plannedAllocationBytes(const Config &config)
     {
-        if (config.row_capacity == 0 || config.d_model <= 0 ||
-            config.expert_intermediate <= 0 || config.num_experts <= 0 ||
-            config.routing_top_k <= 0 || config.routing_top_k > config.num_experts)
-            throw std::invalid_argument("CPU grouped-MoE workspace requires positive geometry");
-        const auto multiply = [](size_t a, size_t b)
-        {
-            if (a && b > std::numeric_limits<size_t>::max() / a)
-                throw std::overflow_error("CPU grouped-MoE workspace byte product overflow");
-            return a * b;
-        };
-        const auto add = [](size_t a, size_t b)
-        {
-            if (b > std::numeric_limits<size_t>::max() - a)
-                throw std::overflow_error("CPU grouped-MoE workspace byte sum overflow");
-            return a + b;
-        };
-        const size_t rows = config.row_capacity;
-        const size_t routes = multiply(rows, static_cast<size_t>(config.routing_top_k));
-        if (routes > static_cast<size_t>(std::numeric_limits<int>::max()))
-            throw std::overflow_error("CPU grouped-MoE workspace route capacity exceeds int");
-        const size_t hidden = static_cast<size_t>(config.d_model);
-        const size_t intermediate = static_cast<size_t>(config.expert_intermediate);
-        const size_t hidden_blocks = (hidden + Q8_1Block::BLOCK_SIZE - 1u) / Q8_1Block::BLOCK_SIZE;
-        const size_t intermediate_blocks = (intermediate + Q8_1Block::BLOCK_SIZE - 1u) / Q8_1Block::BLOCK_SIZE;
-        // Batch input plus gate/up/out and the independent floating route output.
-        const size_t fp32_elements = add(multiply(rows, hidden),
-            multiply(routes, add(multiply(2u, hidden), multiply(2u, intermediate))));
-        // Transported router/SwiGLU rows and the kernel's own router publication.
-        const size_t q8_blocks = add(multiply(routes, add(hidden_blocks, intermediate_blocks)),
-                                    multiply(rows, hidden_blocks));
-        return add(multiply(fp32_elements, sizeof(float)), multiply(q8_blocks, sizeof(Q8_1Block)));
+        const auto authored = storageLayout(config);
+        if (config.declared_storage && *config.declared_storage != authored)
+            throw std::logic_error("CPU grouped-MoE declared storage differs from execution geometry");
+        return config.declared_storage ? config.declared_storage->physicalBytes() : authored.physicalBytes();
     }
 
     CPUGroupedMoESerialWorkspace::CPUGroupedMoESerialWorkspace(Config config)
-        : row_capacity_(config.row_capacity),
-          d_model_(config.d_model),
-          expert_intermediate_(config.expert_intermediate),
-          num_experts_(config.num_experts),
+        : row_capacity_(config.row_capacity), d_model_(config.d_model),
+          expert_intermediate_(config.expert_intermediate), num_experts_(config.num_experts),
           routing_top_k_(config.routing_top_k),
-          debug_name_(config.debug_name.empty()
-                          ? "cpu_grouped_moe_serial_workspace"
-                          : std::move(config.debug_name))
+          debug_name_(config.debug_name.empty() ? "cpu_grouped_moe_serial_workspace" : config.debug_name)
     {
-        // The allocation owner and preflight consume this same payload contract.
-        const size_t planned_bytes = plannedAllocationBytes(config);
-        if (row_capacity_ == 0 || d_model_ <= 0 ||
-            expert_intermediate_ <= 0 || num_experts_ <= 0 ||
-            routing_top_k_ <= 0 || routing_top_k_ > num_experts_)
-        {
-            throw std::invalid_argument(
-                "CPU grouped-MoE serial workspace requires complete positive geometry");
-        }
-        const auto checked_multiply = [](size_t left,
-                                         size_t right,
-                                         const char *what)
-        {
-            if (left != 0u &&
-                right > std::numeric_limits<size_t>::max() / left)
-            {
-                throw std::overflow_error(
-                    std::string("CPU grouped-MoE serial workspace overflow sizing ") +
-                    what);
-            }
-            return left * right;
-        };
-        const auto checked_add = [](size_t left,
-                                    size_t right,
-                                    const char *what)
-        {
-            if (right > std::numeric_limits<size_t>::max() - left)
-            {
-                throw std::overflow_error(
-                    std::string("CPU grouped-MoE serial workspace overflow summing ") +
-                    what);
-            }
-            return left + right;
-        };
-
-        route_capacity_ = checked_multiply(
-            row_capacity_,
-            static_cast<size_t>(routing_top_k_),
-            "route capacity");
-        if (route_capacity_ >
-            static_cast<size_t>(std::numeric_limits<int>::max()))
-        {
-            throw std::overflow_error(
-                "CPU grouped-MoE serial workspace route capacity exceeds int range");
-        }
-
-        scratch_batch_ = makeScratchFP32(
-            row_capacity_, static_cast<size_t>(d_model_), DeviceId::cpu());
-        scratch_gate_ = makeScratchFP32(
-            route_capacity_,
-            static_cast<size_t>(expert_intermediate_),
-            DeviceId::cpu());
-        scratch_up_ = makeScratchFP32(
-            route_capacity_,
-            static_cast<size_t>(expert_intermediate_),
-            DeviceId::cpu());
-        scratch_out_ = makeScratchFP32(
-            route_capacity_, static_cast<size_t>(d_model_), DeviceId::cpu());
-
-        const size_t router_blocks_per_row =
-            (static_cast<size_t>(d_model_) + Q8_1Block::BLOCK_SIZE - 1u) /
-            Q8_1Block::BLOCK_SIZE;
-        const size_t swiglu_blocks_per_row =
-            (static_cast<size_t>(expert_intermediate_) +
-             Q8_1Block::BLOCK_SIZE - 1u) /
-            Q8_1Block::BLOCK_SIZE;
-        router_q8_.resize(checked_multiply(
-            route_capacity_, router_blocks_per_row, "router Q8 blocks"));
-        swiglu_q8_.resize(checked_multiply(
-            route_capacity_, swiglu_blocks_per_row, "SwiGLU Q8 blocks"));
-        route_outputs_.resize(checked_multiply(
-            route_capacity_, static_cast<size_t>(d_model_),
-            "floating route outputs"));
-        const size_t kernel_router_publication_bytes = checked_multiply(
-            checked_multiply(
-                row_capacity_,
-                router_blocks_per_row,
-                "kernel router publication blocks"),
-            sizeof(Q8_1Block),
-            "kernel router publication bytes");
-
-        moe_kernel_ = KernelFactory::createMoEKernel(DeviceId::cpu());
-        auto *const cpu_kernel =
-            dynamic_cast<CPUMoEKernel *>(moe_kernel_.get());
-        if (!cpu_kernel ||
-            !cpu_kernel->reserveRouterQ8HiddenCapacity(
-                static_cast<int>(row_capacity_), d_model_))
-        {
-            throw std::runtime_error(
-                "CPU grouped-MoE serial workspace could not prepare its canonical router publication");
-        }
-
-        allocation_bytes_ = checked_add(
-            scratch_batch_->size_bytes(),
-            scratch_gate_->size_bytes(),
-            "FP32 scratch");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_, scratch_up_->size_bytes(), "FP32 scratch");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_, scratch_out_->size_bytes(), "FP32 scratch");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            checked_multiply(
-                router_q8_.size(), sizeof(Q8_1Block), "router Q8 bytes"),
-            "router Q8 bytes");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            checked_multiply(
-                swiglu_q8_.size(), sizeof(Q8_1Block), "SwiGLU Q8 bytes"),
-            "SwiGLU Q8 bytes");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            checked_multiply(
-                route_outputs_.size(), sizeof(float), "route output bytes"),
-            "route output bytes");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            kernel_router_publication_bytes,
-            "kernel router publication bytes");
-
-        if (allocation_bytes_ != planned_bytes)
-            throw std::logic_error("CPU grouped-MoE workspace allocation disagrees with its BOM");
+        const auto authored = storageLayout(config);
+        if (config.declared_storage && *config.declared_storage != authored)
+            throw std::logic_error("CPU grouped-MoE declared storage differs from execution geometry");
+        const auto &layout = config.declared_storage ? *config.declared_storage : authored;
+        if (!config.physical_memory_authority)
+            throw std::logic_error("CPU grouped-MoE workspace requires physical-memory admission");
+        route_capacity_ = layout.route_capacity;
+        const auto &memory = config.physical_memory_authority;
+        backing_ = std::make_shared<CPUGroupedMoEStorageBacking>(layout, memory);
+        moe_kernel_ = KernelFactory::createMoEKernel(config.device_id);
+        auto *const cpu_kernel = dynamic_cast<CPUMoEKernel *>(moe_kernel_.get());
+        if (!cpu_kernel)
+            throw std::runtime_error("CPU grouped-MoE workspace requires the CPU router kernel");
+        cpu_kernel->bindRouterQ8HiddenStorage(backing_->kernel_router_q8);
+        allocation_bytes_ = layout.physicalBytes();
 
         PerfStatsCollector::addCounter(
             "memory",
             "cpu_grouped_moe_serial_workspace_bytes",
             static_cast<double>(allocation_bytes_),
             "model_setup",
-            "CPU",
+            config.device_id.toString(),
             {{"debug_name", debug_name_},
              {"row_capacity", std::to_string(row_capacity_)},
              {"route_capacity", std::to_string(route_capacity_)},
@@ -1415,7 +1298,77 @@ namespace llaminar2
          * this scalar, but sharing the proof makes the binding API total for
          * both ownership regimes.
          */
+        if (params_.cpu_joint_layer) {
+            if(params_.prepared_engine_binding_lifecycle==MoEPreparedEngineBindingLifecycle::SparseOverlayInvocationPublished) {
+            const auto &publication=*params_.cpu_joint_layer;
+            if (publication.bankLease() || !publication.sourceSelection() || !publication.family() || publication.layer()!=params_.layer_idx ||
+                publication.family()->cohort()!=publication.sourceSelection()->cohort() ||
+                publication.family()->participantIndex()!=publication.sourceSelection()->participantIndex())
+                throw std::invalid_argument("CPU joint invocation has no original published source family");
+            if (!params_.device_id.is_cpu() ||
+                params_.expert_weight_resolution_policy!=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly ||
+                params_.prepared_engine_binding_lifecycle!=MoEPreparedEngineBindingLifecycle::SparseOverlayInvocationPublished ||
+                params_.canonical_route_arithmetic!=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA ||
+                !params_.canonical_route_contributions)
+                throw std::invalid_argument("CPU joint expert invocation requires its source-bound packet-published canonical producer");
+            const auto &source=*publication.sourceSelection();const auto &geometry=source.ownership().geometry();
+            const auto empty=[](const auto& engines){return std::all_of(engines.begin(),engines.end(),[](auto* engine){return engine==nullptr;});};
+            if(source.layer()!=params_.layer_idx || geometry.experts!=params_.num_experts || geometry.model_columns!=params_.d_model ||
+               source.ownership().projection(WeightRole::MoEExpertUp).rows!=params_.expert_intermediate ||
+               params_.expert_mask.size()!=static_cast<size_t>(params_.num_experts) ||
+               std::any_of(params_.expert_mask.begin(),params_.expert_mask.end(),[](bool active){return active;}) ||
+               !empty(params_.prepared_gate_gemm) || !empty(params_.prepared_up_gemm) || !empty(params_.prepared_down_gemm))
+                throw std::invalid_argument("CPU joint expert setup changed original source geometry or supplied epoch engine pointers");
+            } else if(params_.prepared_engine_binding_lifecycle==MoEPreparedEngineBindingLifecycle::CompleteAtConstruction) {
+                // The generic complete-bank graph remains a distinct explicit
+                // cold contract. It cannot adopt a retired bootstrap bank.
+            const auto &publication=*params_.cpu_joint_layer;
+            const auto construction=publication.acquireInitialConstruction();
+            if (!publication.sourceSelection() || !construction || publication.layer()!=params_.layer_idx)
+                throw std::invalid_argument("CPU joint invocation has no original published layer");
+            const auto &lease=construction->layerForModelLayer(params_.layer_idx);
+            if (!params_.device_id.is_cpu() ||
+                params_.expert_weight_resolution_policy!=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly ||
+                params_.canonical_route_arithmetic!=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA ||
+                !params_.canonical_route_contributions)
+                throw std::invalid_argument("CPU joint expert invocation requires its source-bound unweighted canonical producer");
+            const auto &source=*publication.sourceSelection();
+            const auto &geometry=source.ownership().geometry();
+            if (source.layer()!=params_.layer_idx || geometry.experts!=params_.num_experts ||
+                geometry.model_columns!=params_.d_model ||
+                source.ownership().projection(WeightRole::MoEExpertUp).rows!=params_.expert_intermediate ||
+                params_.expert_mask.size()!=static_cast<size_t>(params_.num_experts) ||
+                lease.cpu_fragments.size()!=static_cast<size_t>(params_.num_experts) ||
+                params_.prepared_gate_gemm.size()!=lease.cpu_fragments.size() ||
+                params_.prepared_up_gemm.size()!=lease.cpu_fragments.size() || params_.prepared_down_gemm.size()!=lease.cpu_fragments.size())
+                throw std::invalid_argument("CPU joint expert invocation changed original source/member geometry");
+            for (int expert=0;expert<params_.num_experts;++expert) {
+                const auto index=static_cast<size_t>(expert);
+                const auto &engines=lease.cpu_fragments[index];
+                if ((params_.expert_mask[index] && !source.contains(expert)) ||
+                    params_.prepared_gate_gemm[index]!=engines.gate().get() ||
+                    params_.prepared_up_gemm[index]!=engines.up().get() ||
+                    params_.prepared_down_gemm[index]!=engines.down().get() ||
+                    (source.contains(expert) && !engines.valid()))
+                    throw std::invalid_argument("CPU joint expert invocation replaced an original selected native engine");
+            }
+            } else {
+                throw std::invalid_argument("Unknown CPU joint prepared-engine binding lifecycle");
+            }
+        }
         sparse_overlay_route_width_capacity_ = params_.top_k;
+        cpu_workspace_row_capacity_ = params_.seq_len;
+        switch (params_.canonical_route_diagnostic_publication)
+        {
+        case MoECanonicalRouteDiagnosticPublication::CompleteBank:
+            break;
+        case MoECanonicalRouteDiagnosticPublication::ContinuationLocalBank:
+            if (!params_.canonical_route_contributions)
+                throw std::invalid_argument("Local canonical route diagnostics require their authored bank");
+            break;
+        default:
+            throw std::invalid_argument("Unknown canonical route diagnostic publication identity");
+        }
         if (params_.expert_weight_resolution_policy ==
                 MoEExpertWeightResolutionPolicy::PreparedRegistryOnly &&
             (params_.gate_exps || params_.up_exps || params_.down_exps))
@@ -1491,6 +1444,10 @@ namespace llaminar2
         params_.prepared_gate_gemm.resize(expert_count, nullptr);
         params_.prepared_up_gemm.resize(expert_count, nullptr);
         params_.prepared_down_gemm.resize(expert_count, nullptr);
+        // This existing CPU schedule also lends completed expert IDs to metrics.
+        // Reserve its same bounded capacity during construction, not per packet.
+        if (params_.device_id.is_cpu())
+            cpu_grouped_active_experts_.reserve(expert_count);
         const bool invocation_published_registry_bank =
             params_.prepared_engine_binding_lifecycle ==
             MoEPreparedEngineBindingLifecycle::
@@ -1614,64 +1571,12 @@ namespace llaminar2
                       overlay_service_sample_ - params_.layer_idx))}});
         }
 
-        /*
-         * A grouped CPU verifier graph has one immutable runtime-M bucket, so
-         * its maximum routed-row count is known at construction as M * top-k.
-         * Materialize that bounded scratch now, before request execution. The
-         * old first-use allocation lived inside every routed-expert layer and
-         * made the first verifier transaction pay dozens of allocator and
-         * first-touch events. It also made an otherwise steady-state CPU graph
-         * mutate its memory topology after admission.
-         *
-         * Ordinary prefill is deliberately excluded. Its much larger buckets
-         * need graph-level lifetime sharing rather than eagerly reserving one
-         * worst-case arena per model layer. M=1 uses the dedicated decode
-         * implementation and therefore does not need grouped-row scratch.
-         */
-        if (params_.device_id.is_cpu() &&
-            !params_.cpu_grouped_serial_workspace &&
-            params_.force_decode_equivalent_verifier_prefill &&
-            params_.seq_len > 1 &&
-            params_.top_k > 0 && params_.top_k <= 16 &&
-            params_.d_model > 0 && params_.expert_intermediate > 0)
-        {
-            const size_t verifier_route_capacity =
-                static_cast<size_t>(params_.seq_len) *
-                static_cast<size_t>(params_.top_k);
-            if (verifier_route_capacity >
-                static_cast<size_t>(std::numeric_limits<int>::max()))
-            {
-                throw std::overflow_error(
-                    "CPU MoE verifier routed-row capacity exceeds int range");
-            }
+        // Ordinary payloads materialize in the finalized workspace domain.
+        // Explicit serial endpoints already own the same eight-root backing.
 
-            scratch_gate_ = makeScratchFP32(
-                verifier_route_capacity,
-                static_cast<size_t>(params_.expert_intermediate),
-                params_.device_id);
-            scratch_up_ = makeScratchFP32(
-                verifier_route_capacity,
-                static_cast<size_t>(params_.expert_intermediate),
-                params_.device_id);
-            scratch_out_ = makeScratchFP32(
-                verifier_route_capacity,
-                static_cast<size_t>(params_.d_model),
-                params_.device_id);
-            scratch_capacity_ = static_cast<int>(verifier_route_capacity);
+        if (params_.cpu_grouped_serial_workspace)
+            bindCPUGroupedStorage(params_.cpu_grouped_serial_workspace->backing_);
 
-            const size_t router_blocks_per_row =
-                (static_cast<size_t>(params_.d_model) +
-                 Q8_1Block::BLOCK_SIZE - 1u) /
-                Q8_1Block::BLOCK_SIZE;
-            const size_t swiglu_blocks_per_row =
-                (static_cast<size_t>(params_.expert_intermediate) +
-                 Q8_1Block::BLOCK_SIZE - 1u) /
-                Q8_1Block::BLOCK_SIZE;
-            cpu_grouped_router_q8_.resize(
-                verifier_route_capacity * router_blocks_per_row);
-            cpu_grouped_swiglu_q8_.resize(
-                verifier_route_capacity * swiglu_blocks_per_row);
-        }
     }
 
     bool MoEExpertComputeStage::usesGraphStableRuntimeDecodePlacement() const
@@ -2192,6 +2097,7 @@ namespace llaminar2
 
     void MoEExpertComputeStage::applyExpertMask(const std::vector<bool> &new_mask)
     {
+        clearCompletedCPUActiveExpertView();
         params_.expert_mask = new_mask;
         if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
             params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask, params_.layer_idx);
@@ -2246,10 +2152,12 @@ namespace llaminar2
             params_.down_slab_ref,
             true,
             &params_.gpu_direct_slot_pool,
-            cpu_placement};
+            cpu_placement,
+            params_.expert_weight_resolution_policy,
+            params_.persistent_weight_owner};
     }
 
-    IMoEKernel *MoEExpertComputeStage::ensureMoEKernel() const
+    IMoEKernel *MoEExpertComputeStage::acquireMoEKernelObject() const
     {
         if (!moe_kernel_)
         {
@@ -2280,6 +2188,14 @@ namespace llaminar2
                 moe_kernel_ = owned_moe_kernel_.get();
             }
         }
+
+        return moe_kernel_;
+    }
+
+    IMoEKernel *MoEExpertComputeStage::ensureMoEKernel() const
+    {
+        if (!acquireMoEKernelObject())
+            return nullptr;
 
         if (params_.device_id.is_gpu() &&
             params_.routed_pipeline_kernel_owner)
@@ -2349,6 +2265,20 @@ namespace llaminar2
                 << " layer=" << params_.layer_idx
                 << " stream=" << producer_stream
                 << " expected=" << publication_stream);
+            return false;
+        }
+        // Accepted-state publication owns its table stream independently of
+        // the verifier's compute stream. Cold retained widths may never execute
+        // before this child is recorded. Acquire only object ownership here;
+        // native enqueue below receives its exact stream explicitly.
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Histogram kernel preparation must precede native capture");
+            return false;
+        }
+        if (!acquireMoEKernelObject())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Histogram publication could not prepare its graph-owned kernel");
             return false;
         }
         try
@@ -2421,7 +2351,10 @@ namespace llaminar2
                 "publication was requested from a non-verifier GPU stage");
             return false;
         }
-        if (!producer_stream ||
+        // The accepted-state graph borrows the table-owned publication stream,
+        // even when no asynchronous histogram drain is currently installed.
+        void *const publication_stream = groupedVerifierHistogramPublicationStream();
+        if (!producer_stream || !publication_stream || producer_stream != publication_stream ||
             !accepted_state_counts_device ||
             !publication_ok_flags_device ||
             request_count <= 0 ||
@@ -2446,6 +2379,19 @@ namespace llaminar2
                 << " layer=" << params_.layer_idx);
             return false;
         }
+        // Preparation established this immutable object before capture. Do not
+        // bind the verifier's compute stream or construct a kernel here: the
+        // accepted-state transaction supplies its table-owned launch stream.
+        IMoEKernel *const kernel = moe_kernel_;
+        if (!kernel)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Committed grouped-verifier histogram "
+                "publication requires its graph-owned kernel prepared before capture"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
         try
         {
             /* Capture-safe identity validation only. Persistent events and the
@@ -2461,16 +2407,6 @@ namespace llaminar2
                 "was not prepared before enqueue"
                 << " layer=" << params_.layer_idx
                 << " reason=" << error.what());
-            return false;
-        }
-
-        IMoEKernel *kernel = ensureMoEKernel();
-        if (!kernel)
-        {
-            LOG_ERROR(
-                "[MoEExpertComputeStage] Committed grouped-verifier histogram "
-                "publication could not resolve its graph-owned kernel"
-                << " layer=" << params_.layer_idx);
             return false;
         }
 
@@ -2777,10 +2713,48 @@ namespace llaminar2
                    : MoEOverlayServicePhaseHint::Prefill;
     }
 
+    void MoEExpertComputeStage::releaseCPUJointInvocation() noexcept
+    {
+        if(!params_.cpu_joint_layer)return;
+        if(params_.prepared_engine_binding_lifecycle!=MoEPreparedEngineBindingLifecycle::SparseOverlayInvocationPublished) {
+            cpu_joint_invocation_bank_.reset();
+            return;
+        }
+        // CPU prepared engines take scratch as an invocation argument and
+        // retain no stage workspace (CPUInvocationWorkspaceConsumer). Revoke
+        // only these graph-owned indexes before dropping the exact reader;
+        // later workspace inspection cannot dereference a retired engine.
+        std::fill(params_.prepared_gate_gemm.begin(),params_.prepared_gate_gemm.end(),nullptr);
+        std::fill(params_.prepared_up_gemm.begin(),params_.prepared_up_gemm.end(),nullptr);
+        std::fill(params_.prepared_down_gemm.begin(),params_.prepared_down_gemm.end(),nullptr);
+        std::fill(cached_gate_gemm_.begin(),cached_gate_gemm_.end(),nullptr);
+        std::fill(cached_up_gemm_.begin(),cached_up_gemm_.end(),nullptr);
+        std::fill(cached_down_gemm_.begin(),cached_down_gemm_.end(),nullptr);
+        std::fill(params_.expert_mask.begin(),params_.expert_mask.end(),false);
+        grouped_gateup_desc_table_dirty_=true;grouped_down_desc_table_dirty_=true;
+        runtime_grouped_decode_launch_state_prepared_=false;
+        cpu_joint_invocation_bank_.reset();
+    }
+
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
     {
+        clearCompletedCPUActiveExpertView();
+        if(params_.cpu_joint_layer && !cpu_joint_invocation_bank_) {
+            LOG_ERROR("CPU fragment execution requires its exact bound packet-epoch RCU lease");return false;
+        }
+        struct InvocationBankScope {
+            MoEExpertComputeStage &stage;
+            ~InvocationBankScope(){stage.releaseCPUJointInvocation();}
+        } release_after_gemm{*this};
         if (!overlay_service_telemetry_layer_)
-            return executeWithoutServiceTelemetry(ctx);
+        {
+            // Construction admits device service telemetry only for a complete
+            // GPU binding. Every CPU invocation necessarily completes here.
+            const bool completed = executeWithoutServiceTelemetry(ctx);
+            cpu_active_expert_view_published_ = completed && params_.device_id.is_cpu();
+            if (!completed) cpu_grouped_active_experts_.clear();
+            return completed;
+        }
         if (!ctx || !overlay_service_sample_ ||
             !overlay_service_runtime_layer_)
         {
@@ -3654,20 +3628,29 @@ namespace llaminar2
          * through one of the fused workspace-native contracts above and can
          * never reach these allocations.
          */
-        if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
+        if (params_.device_id.is_cpu())
         {
-            scratch_gate_batch_.resize(top_k);
-            scratch_up_batch_.resize(top_k);
-            for (int i = 0; i < top_k; ++i)
-            {
-                scratch_gate_batch_[i] =
-                    makeScratchFP32(1, intermediate, params_.device_id);
-                scratch_up_batch_[i] =
-                    makeScratchFP32(1, intermediate, params_.device_id);
-            }
+            if (!cpu_grouped_backing_ ||
+                static_cast<int>(scratch_gate_batch_.size()) < top_k || !scratch_out_)
+                throw std::logic_error("CPU MoE decode requires setup-bound declared storage");
         }
-        if (!scratch_out_)
-            scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+        else
+        {
+            if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
+            {
+                scratch_gate_batch_.resize(top_k);
+                scratch_up_batch_.resize(top_k);
+                for (int i = 0; i < top_k; ++i)
+                {
+                    scratch_gate_batch_[i] =
+                        makeScratchFP32(1, intermediate, params_.device_id);
+                    scratch_up_batch_[i] =
+                        makeScratchFP32(1, intermediate, params_.device_id);
+                }
+            }
+            if (!scratch_out_)
+                scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+        }
 
         if (!params_.routing_indices || !params_.routing_weights)
         {
@@ -3680,7 +3663,7 @@ namespace llaminar2
 
         // ---------------------------------------------------------------
         // Phase 1: Batch all experts' gate+up into ONE fused GEMV call.
-        // CPU NativeVNNI consumes the Q8_1 row already published by routing;
+        // CPU NativeQuantised consumes the Q8_1 row already published by routing;
         // GPU and floating CPU bundles retain their backend-native activation
         // preparation.  Every route still uses one parallel projection region.
         // ---------------------------------------------------------------
@@ -3814,7 +3797,7 @@ namespace llaminar2
             num_active++;
         }
 
-        // Single fused call: router-Q8 reuse on CPU NativeVNNI, then one
+        // Single fused call: router-Q8 reuse on CPU NativeQuantised, then one
         // projection region for every active expert's gate/up pair.
         if (num_active > 0)
         {
@@ -3826,14 +3809,14 @@ namespace llaminar2
                 for (const auto &projection : batch_projections_)
                 {
                     const bool native =
-                        dynamic_cast<CPUNativeVNNIGemmKernel *>(projection.kernel) != nullptr;
+                        dynamic_cast<CPUNativeQuantisedGemmKernel *>(projection.kernel) != nullptr;
                     any_native = any_native || native;
                     all_native = all_native && native;
                 }
                 if (any_native != all_native)
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CPU decode cannot mix "
-                              "NativeVNNI and floating gate/up projection contracts in layer "
+                              "NativeQuantised and floating gate/up projection contracts in layer "
                               << params_.layer_idx);
                     return false;
                 }
@@ -3841,13 +3824,13 @@ namespace llaminar2
                 if (all_native)
                 {
                     auto *cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
-                    auto *native_gate = dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    auto *native_gate = dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         batch_projections_[0].kernel);
                     const float *input_rows = input_tensor->data();
                     /*
                      * A graph-native ExpertOverlay participant receives this
                      * one compact row from sparse transport instead of from a
-                     * local router.  The NativeVNNI projection contract is
+                     * local router.  The NativeQuantised projection contract is
                      * still exactly the router's Q8_1 quantization, so publish
                      * it at the declared transport boundary before looking it
                      * up.  This mirrors the grouped-row path below; omitting
@@ -3889,7 +3872,7 @@ namespace llaminar2
                             : nullptr;
                     if (!native_gate || !published_router_q8)
                     {
-                        LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI decode is "
+                        LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised decode is "
                                   "missing its router Q8_1 publication for layer "
                                   << params_.layer_idx);
                         return false;
@@ -3966,7 +3949,7 @@ namespace llaminar2
                 ITensor *up_tensors[16] = {};
                 int grouped_expert_ids[16] = {};
                 float grouped_weights[16] = {};
-                DeviceNativeVNNIMatrixDesc down_descs[16] = {};
+                DeviceNativeQuantisedMatrixDesc down_descs[16] = {};
                 bool grouped_supported = true;
 
                 for (int i = 0; i < num_active; ++i)
@@ -3980,8 +3963,8 @@ namespace llaminar2
                         MPI_Abort(MPI_COMM_WORLD, 1);
                     }
 
-                    DeviceNativeVNNIMatrixDesc desc;
-                    if (!down_gemm->exportNativeVNNIMatrixDesc(desc) ||
+                    DeviceNativeQuantisedMatrixDesc desc;
+                    if (!down_gemm->exportNativeQuantisedMatrixDesc(desc) ||
                         desc.n != d_model || desc.k != intermediate)
                     {
                         grouped_supported = false;
@@ -4169,17 +4152,7 @@ namespace llaminar2
             // implementation.
             {
                 if (static_cast<int>(scratch_down_batch_.size()) < num_active)
-                {
-                    scratch_down_batch_.resize(num_active);
-                    for (int i = 0; i < num_active; ++i)
-                    {
-                        if (!scratch_down_batch_[i])
-                        {
-                            scratch_down_batch_[i] = makeScratchFP32(
-                                1, d_model, params_.device_id);
-                        }
-                    }
-                }
+                    throw std::logic_error("CPU MoE decode exceeds its declared route capacity");
 
                 // Validate down GEMM engines
                 for (int i = 0; i < num_active; ++i)
@@ -4200,15 +4173,9 @@ namespace llaminar2
                         scratch_gate_batch_[info.batch_idx]->data();
                     const float *up_fp32 =
                         scratch_up_batch_[info.batch_idx]->data();
-                    swiglu_scratch_batch_.resize(
-                        std::max(
-                            swiglu_scratch_batch_.size(),
-                            static_cast<size_t>(num_active)));
-                    if (static_cast<int>(swiglu_scratch_batch_[i].size()) <
-                        intermediate)
-                    {
-                        swiglu_scratch_batch_[i].resize(intermediate);
-                    }
+                    if (static_cast<int>(swiglu_scratch_batch_.size()) <= i ||
+                        swiglu_scratch_batch_[i].size() < static_cast<size_t>(intermediate))
+                        throw std::logic_error("CPU MoE decode exceeds declared FP32 SwiGLU storage");
 
                     /*
                      * Every CPU expert uses the GPU-aligned SwiGLU program.
@@ -4312,6 +4279,20 @@ namespace llaminar2
 
         } // end CPU Phase 2 else block
 
+        if (!is_gpu)
+        {
+            // M=1 has its own real ActiveExpert entries, not the grouped CSR
+            // schedule. Publish those completed selections into the same
+            // retained view, deduplicating at most top_k<=16 without a node set.
+            for (int active = 0; active < num_active; ++active)
+            {
+                const int expert = active_experts[active].expert_id;
+                auto position = std::lower_bound(cpu_grouped_active_experts_.begin(),
+                    cpu_grouped_active_experts_.end(), expert);
+                if (position == cpu_grouped_active_experts_.end() || *position != expert)
+                    cpu_grouped_active_experts_.insert(position, expert);
+            }
+        }
         LOG_TRACE("[MoEExpertComputeStage] Single-token decode (batched gate+up): " << num_active << " experts");
         if (is_gpu && !params_.output_registered_in_arena)
             gpuExecution().publish(params_.output);
@@ -4392,34 +4373,15 @@ namespace llaminar2
                 params_.layer_idx);
         }
 
-        auto &grouped_scratch_batch =
-            serial_workspace
-                ? serial_workspace->scratch_batch_
-                : scratch_batch_;
-        auto &grouped_scratch_gate =
-            serial_workspace
-                ? serial_workspace->scratch_gate_
-                : scratch_gate_;
-        auto &grouped_scratch_up =
-            serial_workspace
-                ? serial_workspace->scratch_up_
-                : scratch_up_;
-        auto &grouped_scratch_out =
-            serial_workspace
-                ? serial_workspace->scratch_out_
-                : scratch_out_;
-        auto &grouped_router_q8 =
-            serial_workspace
-                ? serial_workspace->router_q8_
-                : cpu_grouped_router_q8_;
-        auto &grouped_swiglu_q8 =
-            serial_workspace
-                ? serial_workspace->swiglu_q8_
-                : cpu_grouped_swiglu_q8_;
-        auto &grouped_route_outputs =
-            serial_workspace
-                ? serial_workspace->route_outputs_
-                : cpu_grouped_route_outputs_;
+        if (!cpu_grouped_backing_)
+            throw std::logic_error("CPU MoE grouped execution requires setup-bound declared storage");
+        auto &grouped_scratch_batch = cpu_grouped_backing_->batch;
+        auto &grouped_scratch_gate = cpu_grouped_backing_->gate;
+        auto &grouped_scratch_up = cpu_grouped_backing_->up;
+        auto &grouped_scratch_out = cpu_grouped_backing_->output;
+        auto &grouped_router_q8 = cpu_grouped_backing_->router_q8;
+        auto &grouped_swiglu_q8 = cpu_grouped_backing_->swiglu_q8;
+        auto &grouped_route_outputs = cpu_grouped_backing_->route_outputs;
 
         IMoEKernel *kernel = ensureMoEKernel();
         if (!kernel)
@@ -4860,25 +4822,30 @@ namespace llaminar2
                 : PerfStatsCollector::Clock::time_point{};
         if (cpu_grouped_route_slots_.empty())
         {
-            PerfStatsCollector::addCounter(
-                verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
-                verifier_rows
-                    ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
-                    : (decode_rows
-                           ? "moe_routed_grouped_decode_rows"
-                           : "moe_routed_grouped_decode_equivalent_prefill_rows"),
-                static_cast<double>(seq_len),
-                grouped_phase,
-                params_.device_id.toString(),
-                {{"stage", "routed_expert"},
-                 {"route", "cpu_expert_slot_grouped"},
-                 {"local_route_slots", "0"},
-                 {"active_experts", "0"}});
+            // Consult the original immutable domain policy BEFORE constructing
+            // counter strings/tags; the collector cannot undo argument work.
+            if (PerfStatsCollector::isDomainEnabled(verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill")))
+            {
+                PerfStatsCollector::addCounter(
+                    verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
+                    verifier_rows
+                        ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
+                        : (decode_rows
+                               ? "moe_routed_grouped_decode_rows"
+                               : "moe_routed_grouped_decode_equivalent_prefill_rows"),
+                    static_cast<double>(seq_len),
+                    grouped_phase,
+                    params_.device_id.toString(),
+                    {{"stage", "routed_expert"},
+                     {"route", "cpu_expert_slot_grouped"},
+                     {"local_route_slots", "0"},
+                     {"active_experts", "0"}});
+            }
             return true;
         }
 
         /*
-         * NativeVNNI gate/up/down projections share one activation contract.
+         * NativeQuantised gate/up/down projections share one activation contract.
          * Require the immediately preceding CPU router publication once for
          * the complete runtime batch, then gather canonical blocks for each
          * expert. Floating-point bundles retain their own grouped exact
@@ -4891,13 +4858,13 @@ namespace llaminar2
         for (int expert_id : cpu_grouped_active_experts_)
         {
             const bool native_gate =
-                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                     cached_gate_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
             const bool native_up =
-                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                     cached_up_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
             const bool native_down =
-                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                     cached_down_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
             const bool any_native = native_gate || native_up || native_down;
             const bool all_native = native_gate && native_up && native_down;
@@ -4914,7 +4881,7 @@ namespace llaminar2
         if (any_native_bundle != all_native_bundles)
         {
             LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row execution cannot mix "
-                      "NativeVNNI and floating expert bundles in layer "
+                      "NativeQuantised and floating expert bundles in layer "
                       << params_.layer_idx);
             return false;
         }
@@ -4938,7 +4905,7 @@ namespace llaminar2
                              : params_.input->data();
             if (!cpu_moe_kernel || !input_rows)
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised grouped-row execution "
                           "requires the production CPUMoEKernel router");
                 return false;
             }
@@ -4951,7 +4918,7 @@ namespace llaminar2
                         d_model);
                 if (!published_router_q8)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
+                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised grouped-row execution "
                               "is missing the matching router Q8_1 publication for layer "
                               << params_.layer_idx << " seq_len=" << seq_len
                               << " d_model=" << d_model);
@@ -5026,8 +4993,7 @@ namespace llaminar2
             if (grouped_route_outputs.size() <
                 required_route_output_elements)
             {
-                grouped_route_outputs.resize(
-                    required_route_output_elements);
+                throw std::logic_error("CPU MoE route outputs exceed declared storage");
             }
         }
 
@@ -5046,25 +5012,20 @@ namespace llaminar2
         if (!all_native_bundles &&
             !scratch_has_shape(grouped_scratch_batch, max_batch, d_model))
         {
-            grouped_scratch_batch = makeScratchFP32(
-                max_batch, d_model, params_.device_id);
+            throw std::logic_error("CPU MoE batch rows exceed declared storage");
         }
         if (!scratch_has_shape(grouped_scratch_gate, scratch_rows, intermediate))
         {
-            grouped_scratch_gate = makeScratchFP32(
-                scratch_rows, intermediate, params_.device_id);
+            throw std::logic_error("CPU MoE gate rows exceed declared storage");
         }
         if (!scratch_has_shape(grouped_scratch_up, scratch_rows, intermediate))
         {
-            grouped_scratch_up = makeScratchFP32(
-                scratch_rows, intermediate, params_.device_id);
+            throw std::logic_error("CPU MoE up rows exceed declared storage");
         }
         if (!scratch_has_shape(grouped_scratch_out, scratch_rows, d_model))
         {
-            grouped_scratch_out = makeScratchFP32(
-                scratch_rows, d_model, params_.device_id);
+            throw std::logic_error("CPU MoE out rows exceed declared storage");
         }
-        scratch_capacity_ = std::max(scratch_capacity_, scratch_rows);
         if ((!all_native_bundles && !grouped_scratch_batch) ||
             !grouped_scratch_gate || !grouped_scratch_up ||
             !grouped_scratch_out)
@@ -5079,7 +5040,7 @@ namespace llaminar2
                 static_cast<size_t>(local_route_rows) *
                 static_cast<size_t>(router_q8_blocks_per_row);
             if (grouped_router_q8.size() < required_router_q8_blocks)
-                grouped_router_q8.resize(required_router_q8_blocks);
+                throw std::logic_error("CPU MoE router rows exceed declared storage");
             const int swiglu_q8_blocks_per_row =
                 (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
                 Q8_1Block::BLOCK_SIZE;
@@ -5087,7 +5048,7 @@ namespace llaminar2
                 static_cast<size_t>(local_route_rows) *
                 static_cast<size_t>(swiglu_q8_blocks_per_row);
             if (grouped_swiglu_q8.size() < required_swiglu_q8_blocks)
-                grouped_swiglu_q8.resize(required_swiglu_q8_blocks);
+                throw std::logic_error("CPU MoE SwiGLU rows exceed declared storage");
         }
         else
         {
@@ -5112,7 +5073,7 @@ namespace llaminar2
              * An ordinary CPU graph instead consumes the row-major Q8_1 bytes
              * published by its router and performs the required permutation.
              * Both branches use the same source-row schedule and therefore
-             * produce byte-identical NativeVNNI inputs.
+             * produce byte-identical NativeQuantised inputs.
              */
             const auto router_q8_prepare_start =
                 record_cpu_moe_phase_timings
@@ -5123,6 +5084,30 @@ namespace llaminar2
                 const size_t required_router_q8_blocks =
                     static_cast<size_t>(local_route_rows) *
                     static_cast<size_t>(router_q8_blocks_per_row);
+                /*
+                 * Native descriptors consume expert offsets and the separate
+                 * local-to-expert map, never expert_local_slots_. Its last
+                 * native consumer was source-index materialization above.
+                 * The checked builder retires that permutation into unique
+                 * representatives using the original row/top-k route authority.
+                 * Floating bundles retain their permutation unchanged.
+                 */
+                const auto publication_schedule =
+                    CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
+                        {cpu_grouped_token_indices_.data(), static_cast<size_t>(local_route_rows)},
+                        {cpu_grouped_expert_local_slots_.data(), static_cast<size_t>(local_route_rows)},
+                        {cpu_grouped_original_to_local_.data(), route_slot_capacity},
+                        {cpu_grouped_local_to_expert_position_.data(), static_cast<size_t>(local_route_rows)},
+                        top_k,
+                        borrowed_transport_hidden
+                            ? std::optional{std::span<const int>{
+                                  sparse_overlay_cpu_compact_to_source_row_.data(),
+                                  static_cast<size_t>(seq_len)}}
+                            : std::nullopt,
+                        borrowed_transport_hidden
+                            ? sparse_overlay_cpu_hidden_source_row_capacity_ : seq_len);
+                if (!publication_schedule)
+                    throw std::logic_error("CPU transported Q8 publication lost its original route/source authority");
                 if (!cpu_moe_kernel->
                         publishTransportedRouterQ8HiddenExpertMajor(
                             input_rows,
@@ -5130,9 +5115,7 @@ namespace llaminar2
                                 ? sparse_overlay_cpu_hidden_source_row_capacity_
                                 : seq_len,
                             d_model,
-                            std::span<const int>(
-                                cpu_grouped_token_indices_.data(),
-                                static_cast<size_t>(local_route_rows)),
+                            *publication_schedule,
                             std::span<Q8_1Block>(
                                 grouped_router_q8.data(),
                                 required_router_q8_blocks)))
@@ -5145,20 +5128,23 @@ namespace llaminar2
                         << " d_model=" << d_model);
                     return false;
                 }
-                PerfStatsCollector::addCounter(
-                    "moe_overlay",
-                    "cpu_transport_router_q8_publications",
-                    1.0,
-                    grouped_phase,
-                    params_.device_id.toString(),
-                    {{"layer", std::to_string(params_.layer_idx)},
-                     {"source_rows",
-                      std::to_string(
-                          sparse_overlay_cpu_hidden_source_row_capacity_)},
-                     {"route_rows", std::to_string(local_route_rows)},
-                     {"d_model", std::to_string(d_model)},
-                     {"layout", "expert_major"},
-                     {"source", "fixed_capacity_ticket"}});
+                if (PerfStatsCollector::isDomainEnabled("moe_overlay"))
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_overlay",
+                        "cpu_transport_router_q8_publications",
+                        1.0,
+                        grouped_phase,
+                        params_.device_id.toString(),
+                        {{"layer", std::to_string(params_.layer_idx)},
+                         {"source_rows",
+                          std::to_string(
+                              sparse_overlay_cpu_hidden_source_row_capacity_)},
+                         {"route_rows", std::to_string(local_route_rows)},
+                         {"d_model", std::to_string(d_model)},
+                         {"layout", "expert_major"},
+                         {"source", "fixed_capacity_ticket"}});
+                }
                 record_cpu_moe_phase(
                     "transported_router_q8_expert_major_publication",
                     router_q8_prepare_start);
@@ -5196,23 +5182,31 @@ namespace llaminar2
             }
 
             using BatchedProjection =
-                CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc;
+                CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc;
             std::array<
                 BatchedProjection,
-                CPUNativeVNNIGemmKernel::kMaxBatchedPrequantizedProjections>
+                CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections>
                 gate_up_projection_descriptors = {};
             std::array<
                 BatchedProjection,
-                CPUNativeVNNIGemmKernel::kMaxBatchedPrequantizedProjections>
+                CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections>
                 down_projection_descriptors = {};
             int gate_up_projection_count = 0;
             int down_projection_count = 0;
             // Routing may make a prompt batch as small as one row or an MTP
             // verifier batch unusually large. Carry the graph's typed purpose
             // rather than guessing scheduling intent from the expert's M.
-            const auto projection_purpose = purpose == CPUGroupedRowsPurpose::OrdinaryPrefill
-                ? cpu::native_vnni::ProjectionRowsPurpose::Prefill
-                : cpu::native_vnni::ProjectionRowsPurpose::Decode;
+            const auto projection_purpose = [&]()
+            {
+                using ProjectionPurpose = cpu::native_quantised::ProjectionRowsPurpose;
+                switch (purpose)
+                {
+                case CPUGroupedRowsPurpose::Decode: return ProjectionPurpose::Decode;
+                case CPUGroupedRowsPurpose::OrdinaryPrefill: return ProjectionPurpose::Prefill;
+                case CPUGroupedRowsPurpose::MTPVerifier: return ProjectionPurpose::MTPVerifier;
+                }
+                throw std::logic_error("CPU grouped expert execution has an unknown typed purpose");
+            }();
             float *gate_rows = grouped_scratch_gate->mutable_data();
             float *up_rows = grouped_scratch_up->mutable_data();
             float *down_rows = grouped_scratch_out->mutable_data();
@@ -5231,23 +5225,23 @@ namespace llaminar2
                         static_cast<size_t>(expert_id) + 1u];
                 const int expert_rows = expert_end - expert_begin;
                 auto *native_gate =
-                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         cached_gate_gemm_[static_cast<size_t>(expert_id)]);
                 auto *native_up =
-                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         cached_up_gemm_[static_cast<size_t>(expert_id)]);
                 auto *native_down =
-                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         cached_down_gemm_[static_cast<size_t>(expert_id)]);
                 if (!native_gate || !native_up || !native_down ||
                     gate_up_projection_count + 2 >
-                        CPUNativeVNNIGemmKernel::
+                        CPUNativeQuantisedGemmKernel::
                             kMaxBatchedPrequantizedProjections ||
                     down_projection_count >=
-                        CPUNativeVNNIGemmKernel::
+                        CPUNativeQuantisedGemmKernel::
                             kMaxBatchedPrequantizedProjections)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI batched "
+                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised batched "
                               "FFN descriptor capacity exceeded in layer "
                               << params_.layer_idx);
                     return false;
@@ -5303,7 +5297,7 @@ namespace llaminar2
             const auto grouped_ffn_start = record_cpu_moe_phase_timings
                                                ? PerfStatsCollector::Clock::now()
                                                : PerfStatsCollector::Clock::time_point{};
-            if (!CPUNativeVNNIGemmKernel::
+            if (!CPUNativeQuantisedGemmKernel::
                     execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
                         gate_up_projection_descriptors.data(),
                         gate_up_projection_count,
@@ -5318,26 +5312,29 @@ namespace llaminar2
                         down_projection_count, CPUInvocationWorkspace::available<float>(
                             bound_workspace_, kCPUProjectionPartials)))
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI layer-batched "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised layer-batched "
                           "grouped FFN transaction failed in layer "
                           << params_.layer_idx);
                 return false;
             }
             record_cpu_moe_phase(
-                "native_vnni_grouped_ffn_transaction",
+                "native_quantised_grouped_ffn_transaction",
                 grouped_ffn_start);
 
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cpu_moe_native_vnni_layer_batched_expert_calls",
-                1.0,
-                grouped_phase,
-                "cpu",
-                {{"layer", std::to_string(params_.layer_idx)},
-                 {"active_experts",
-                  std::to_string(cpu_grouped_active_experts_.size())},
-                 {"local_route_rows", std::to_string(local_route_rows)},
-                 {"team_lifetime", "complete_moe_ffn"}});
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_moe_native_quantised_layer_batched_expert_calls",
+                    1.0,
+                    grouped_phase,
+                    "cpu",
+                    {{"layer", std::to_string(params_.layer_idx)},
+                     {"active_experts",
+                      std::to_string(cpu_grouped_active_experts_.size())},
+                     {"local_route_rows", std::to_string(local_route_rows)},
+                     {"team_lifetime", "complete_moe_ffn"}});
+            }
         }
         else
         {
@@ -5571,39 +5568,45 @@ namespace llaminar2
                 : "ordered_topk_accumulation",
             accumulate_start);
 
-        PerfStatsCollector::addCounter(
-            verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
-            verifier_rows
-                ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
-                : (decode_rows
-                       ? "moe_routed_grouped_decode_rows"
-                       : "moe_routed_grouped_decode_equivalent_prefill_rows"),
-            static_cast<double>(seq_len),
-            grouped_phase,
-            params_.device_id.toString(),
-            {{"stage", "routed_expert"},
-             {"route", "cpu_expert_slot_grouped"},
-             {"local_route_slots", std::to_string(cpu_grouped_route_slots_.size())},
-             {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
-             {"seq_len", std::to_string(seq_len)},
-             {"top_k", std::to_string(top_k)}});
-        if (all_native_bundles)
+        if (PerfStatsCollector::isDomainEnabled(verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill")))
         {
             PerfStatsCollector::addCounter(
-                "kernel",
+                verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
                 verifier_rows
-                    ? "cpu_moe_grouped_verifier_router_q8_reuse_calls"
+                    ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
                     : (decode_rows
-                           ? "cpu_moe_grouped_decode_router_q8_reuse_calls"
-                           : "cpu_moe_prefill_router_q8_reuse_calls"),
-                1.0,
-                "moe",
-                "cpu",
-                {{"seq_len", std::to_string(seq_len)},
-                 {"top_k", std::to_string(top_k)},
-                 {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                           ? "moe_routed_grouped_decode_rows"
+                           : "moe_routed_grouped_decode_equivalent_prefill_rows"),
+                static_cast<double>(seq_len),
+                grouped_phase,
+                params_.device_id.toString(),
+                {{"stage", "routed_expert"},
                  {"route", "cpu_expert_slot_grouped"},
-                 {"purpose", grouped_phase}});
+                 {"local_route_slots", std::to_string(cpu_grouped_route_slots_.size())},
+                 {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                 {"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)}});
+        }
+        if (all_native_bundles)
+        {
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    verifier_rows
+                        ? "cpu_moe_grouped_verifier_router_q8_reuse_calls"
+                        : (decode_rows
+                               ? "cpu_moe_grouped_decode_router_q8_reuse_calls"
+                               : "cpu_moe_prefill_router_q8_reuse_calls"),
+                    1.0,
+                    "moe",
+                    "cpu",
+                    {{"seq_len", std::to_string(seq_len)},
+                     {"top_k", std::to_string(top_k)},
+                     {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                     {"route", "cpu_expert_slot_grouped"},
+                     {"purpose", grouped_phase}});
+            }
         }
         return true;
     }
@@ -5638,21 +5641,24 @@ namespace llaminar2
             LOG_ERROR("[MoEExpertComputeStage] Decode-equivalent verifier prefill requires prepared expert engines");
             return false;
         }
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "moe_decode_equivalent_verifier_prefill_runs",
-            1.0,
-            "verifier",
-            params_.device_id.toString(),
-            {{"stage", "routed_expert"},
-             {"route", seq_len == 1
-                           ? (is_gpu ? "grouped_prefill"
-                                     : "single_row_decode")
-                           : (is_gpu ? "grouped_prefill"
-                                     : "cpu_expert_slot_grouped")},
-             {"layer", std::to_string(params_.layer_idx)},
-             {"seq_len", std::to_string(params_.seq_len)},
-             {"top_k", std::to_string(params_.top_k)}});
+        if (PerfStatsCollector::isDomainEnabled("mtp"))
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "moe_decode_equivalent_verifier_prefill_runs",
+                1.0,
+                "verifier",
+                params_.device_id.toString(),
+                {{"stage", "routed_expert"},
+                 {"route", seq_len == 1
+                               ? (is_gpu ? "grouped_prefill"
+                                         : "single_row_decode")
+                               : (is_gpu ? "grouped_prefill"
+                                         : "cpu_expert_slot_grouped")},
+                 {"layer", std::to_string(params_.layer_idx)},
+                 {"seq_len", std::to_string(params_.seq_len)},
+                 {"top_k", std::to_string(params_.top_k)}});
+        }
         if (top_k > 16)
         {
             LOG_ERROR("[MoEExpertComputeStage] Decode-equivalent verifier prefill top_k="
@@ -5958,9 +5964,9 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(
+        std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(
             static_cast<size_t>(params_.num_experts));
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(
+        std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(
             static_cast<size_t>(params_.num_experts));
         std::vector<DeviceMoEFloatingMatrixDesc> floating_gate_descs(
             static_cast<size_t>(params_.num_experts));
@@ -6001,7 +6007,7 @@ namespace llaminar2
             }
             table_format = exported.weight_format;
 
-            if (exported.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+            if (exported.weight_format == DeviceMoEWeightFormat::NativeQuantised)
             {
                 gate_descs[static_cast<size_t>(expert_id)] = exported.gate;
                 up_descs[static_cast<size_t>(expert_id)] = exported.up;
@@ -6027,7 +6033,7 @@ namespace llaminar2
             grouped_gateup_desc_table_weight_format_ == *table_format)
         {
             const bool updated =
-                *table_format == DeviceMoEWeightFormat::NativeVNNI
+                *table_format == DeviceMoEWeightFormat::NativeQuantised
                     ? kernel->updateGroupedExpertGateUpDescriptorTables(
                           table_id,
                           gate_descs.data(),
@@ -6051,7 +6057,7 @@ namespace llaminar2
             return true;
         }
 
-        table_id = *table_format == DeviceMoEWeightFormat::NativeVNNI
+        table_id = *table_format == DeviceMoEWeightFormat::NativeQuantised
                        ? kernel->uploadGroupedExpertGateUpDescriptorTables(
                              gate_descs.data(),
                              up_descs.data(),
@@ -6101,7 +6107,7 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(
+        std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(
             static_cast<size_t>(params_.num_experts));
         std::vector<DeviceMoEFloatingMatrixDesc> floating_down_descs(
             static_cast<size_t>(params_.num_experts));
@@ -6140,7 +6146,7 @@ namespace llaminar2
             }
             table_format = exported.weight_format;
 
-            if (exported.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+            if (exported.weight_format == DeviceMoEWeightFormat::NativeQuantised)
             {
                 down_descs[static_cast<size_t>(expert_id)] = exported.down;
             }
@@ -6163,7 +6169,7 @@ namespace llaminar2
             grouped_down_desc_table_weight_format_ == *table_format)
         {
             const bool updated =
-                *table_format == DeviceMoEWeightFormat::NativeVNNI
+                *table_format == DeviceMoEWeightFormat::NativeQuantised
                     ? kernel->updateGroupedExpertDownDescriptorTable(
                           table_id,
                           down_descs.data(),
@@ -6185,7 +6191,7 @@ namespace llaminar2
             return true;
         }
 
-        table_id = *table_format == DeviceMoEWeightFormat::NativeVNNI
+        table_id = *table_format == DeviceMoEWeightFormat::NativeQuantised
                        ? kernel->uploadGroupedExpertDownDescriptorTable(
                              down_descs.data(),
                              params_.num_experts,
@@ -6273,12 +6279,12 @@ namespace llaminar2
         bind_if_needed(shared_up);
         bind_if_needed(shared_down);
 
-        DeviceNativeVNNIMatrixDesc gate_desc;
-        DeviceNativeVNNIMatrixDesc up_desc;
-        DeviceNativeVNNIMatrixDesc down_desc;
-        if (!shared_gate->exportNativeVNNIMatrixDesc(gate_desc) ||
-            !shared_up->exportNativeVNNIMatrixDesc(up_desc) ||
-            !shared_down->exportNativeVNNIMatrixDesc(down_desc) ||
+        DeviceNativeQuantisedMatrixDesc gate_desc;
+        DeviceNativeQuantisedMatrixDesc up_desc;
+        DeviceNativeQuantisedMatrixDesc down_desc;
+        if (!shared_gate->exportNativeQuantisedMatrixDesc(gate_desc) ||
+            !shared_up->exportNativeQuantisedMatrixDesc(up_desc) ||
+            !shared_down->exportNativeQuantisedMatrixDesc(down_desc) ||
             gate_desc.n != intermediate || gate_desc.k != d_model ||
             up_desc.n != intermediate || up_desc.k != d_model ||
             down_desc.n != d_model || down_desc.k != intermediate)
@@ -6465,7 +6471,7 @@ namespace llaminar2
                     LOG_DEBUG("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
                               << params_.layer_idx << " expert " << expert_id
                               << ": prepared GEMM engines did not export a uniform "
-                                 "NativeVNNI/FP16/BF16/FP32 descriptor family");
+                                 "NativeQuantised/FP16/BF16/FP32 descriptor family");
                     return false;
                 }
 
@@ -8560,6 +8566,63 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::extractExpertViews(Params &params)
     {
+        if (params.device_id.is_cpu() && params.prepared_store)
+        {
+            // Model CPU population has already committed exact final engines.
+            // Graph wiring borrows that bank; a raw parent (including a cached
+            // GGUF view) can never trigger another allocation/preparation path.
+            if (!params.prepared_store->physicalMemoryAuthority() || !params.expert_registry ||
+                params.num_experts <= 0 || params.d_model <= 0 || params.expert_intermediate <= 0 || params.layer_idx < 0 ||
+                (!params.expert_mask.empty() && params.expert_mask.size() != size_t(params.num_experts)))
+                throw std::invalid_argument("CPU model experts require their original admitted complete registry and geometry");
+            const int first = params.local_expert_start;
+            const int count = params.local_expert_count < 0 ? params.num_experts : params.local_expert_count;
+            if (first < 0 || first > params.num_experts || count < 0 || count > params.num_experts-first)
+                throw std::invalid_argument("CPU model expert bank has a foreign original ownership interval");
+            std::vector<ITensorGemm *> gate(size_t(params.num_experts),nullptr), up(gate), down(gate);
+            std::vector<std::shared_ptr<ITensorGemm>> owners;
+            for (int expert = 0; expert < params.num_experts; ++expert)
+            {
+                const bool active = !params.expert_mask.empty() ? params.expert_mask[size_t(expert)] :
+                    expert >= first && expert < first+count;
+                if (!active) continue;
+                for (const auto role : {ExpertGemmRegistry::WeightRole::GATE,ExpertGemmRegistry::WeightRole::UP,
+                                       ExpertGemmRegistry::WeightRole::DOWN})
+                {
+                    auto owner = params.expert_registry->getEngineLifetime(params.device_id,params.layer_idx,expert,role);
+                    const bool is_down = role == ExpertGemmRegistry::WeightRole::DOWN;
+                    if (!owner || !owner->weights_converted() ||
+                        owner->get_n() != (is_down ? params.d_model : params.expert_intermediate) ||
+                        owner->get_k() != (is_down ? params.expert_intermediate : params.d_model))
+                        throw std::invalid_argument("CPU model expert registry is missing or replaced an original prepared projection");
+                    auto &target = role == ExpertGemmRegistry::WeightRole::GATE ? gate :
+                        role == ExpertGemmRegistry::WeightRole::UP ? up : down;
+                    target[size_t(expert)] = owner.get();
+                    owners.push_back(std::move(owner));
+                }
+            }
+            if ((!params.prepared_gate_gemm.empty() && params.prepared_gate_gemm != gate) ||
+                (!params.prepared_up_gemm.empty() && params.prepared_up_gemm != up) ||
+                (!params.prepared_down_gemm.empty() && params.prepared_down_gemm != down))
+                throw std::invalid_argument("CPU model expert parameters replaced the original prepared registry bank");
+            if (!params.moe_owned_kernels.empty()) {
+                if (params.moe_owned_kernels.size() != owners.size())
+                    throw std::invalid_argument("CPU model expert parameters changed original bank ownership");
+                for (size_t index = 0; index < owners.size(); ++index)
+                    if (params.moe_owned_kernels[index].get() != owners[index].get() ||
+                        params.moe_owned_kernels[index].owner_before(owners[index]) ||
+                        owners[index].owner_before(params.moe_owned_kernels[index]))
+                        throw std::invalid_argument("CPU model expert parameters borrowed another prepared owner");
+            }
+            params.prepared_gate_gemm = std::move(gate);
+            params.prepared_up_gemm = std::move(up);
+            params.prepared_down_gemm = std::move(down);
+            params.moe_owned_kernels = std::move(owners);
+            params.expert_gate_views.clear(); params.expert_up_views.clear(); params.expert_down_views.clear();
+            params.gate_exps = nullptr; params.up_exps = nullptr; params.down_exps = nullptr;
+            params.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+            return true;
+        }
         MoEWeightContext ctx{
             params.device_id,
             params.num_experts,
@@ -8590,12 +8653,24 @@ namespace llaminar2
             {},
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params.device_id),
+            params.expert_weight_resolution_policy,
+            params.persistent_weight_owner};
         return MoEExpertWeightService::extractExpertViews(ctx);
     }
 
     bool MoEExpertComputeStage::prepareExpertGemmEngines(Params &params)
     {
+        if (params.device_id.is_cpu() && params.expert_weight_resolution_policy == MoEExpertWeightResolutionPolicy::PreparedRegistryOnly)
+        {
+            if (!params.prepared_store)
+                throw std::invalid_argument("CPU prepared-registry preparation lost its original model store");
+            return extractExpertViews(params); // Authenticate only; never extract/read/pack a source parent.
+        }
+        if (params.device_id.is_cpu() &&
+            params.expert_weight_resolution_policy == MoEExpertWeightResolutionPolicy::RawOrPrepared &&
+            (!params.prepared_store || !params.prepared_store->physicalMemoryAuthority()))
+            throw std::logic_error("CPU MoE preparation requires physical-memory admission");
         MoEWeightContext ctx{
             params.device_id,
             params.num_experts,
@@ -8626,7 +8701,9 @@ namespace llaminar2
             params.down_slab_ref,
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params.device_id),
+            params.expert_weight_resolution_policy,
+            params.persistent_weight_owner};
         bool ok = MoEExpertWeightService::prepareGemmEngines(ctx);
         // Phase C: Copy slab refs back to params for rebalance reuse
         params.gate_slab_ref = ctx.gate_slab_ref;
@@ -9046,7 +9123,9 @@ namespace llaminar2
              * a stale alias from a previous request.
              */
             info.addOutput(
-                "canonical_route_contributions",
+                params_.canonical_route_diagnostic_publication ==
+                        MoECanonicalRouteDiagnosticPublication::ContinuationLocalBank
+                    ? "local_canonical_route_contributions" : "canonical_route_contributions",
                 params_.canonical_route_contributions,
                 static_cast<size_t>(params_.seq_len) *
                     static_cast<size_t>(params_.top_k),
@@ -9094,9 +9173,17 @@ namespace llaminar2
          * graph has already captured the published address.
          */
         const int workspace_rows =
-            std::max({1, m, params_.seq_len});
+            std::max({1, m, cpu_workspace_row_capacity_});
         const int workspace_experts = params_.num_experts;
         const int workspace_top_k = params_.top_k;
+        if (params_.device_id.is_cpu() && !params_.cpu_grouped_serial_workspace)
+        {
+            combined.cpu_grouped_moe_storage =
+                std::make_shared<const CPUGroupedMoEStorageLayout>(
+                    CPUGroupedMoEStorageLayout::declare(
+                        workspace_rows, params_.d_model, params_.expert_intermediate,
+                        params_.num_experts, sparse_overlay_route_width_capacity_, params_.device_id));
+        }
         if (params_.device_id.is_cuda())
         {
             combined.merge(MoEWorkspaceBuffers::cudaMoE(
@@ -9328,13 +9415,69 @@ namespace llaminar2
         return combined;
     }
 
+    void MoEExpertComputeStage::bindCPUGroupedStorage(
+        std::shared_ptr<CPUGroupedMoEStorageBacking> backing)
+    {
+        // Logical invocation extents are independently checked against the
+        // original backing. Its NUMA placement and initialization policy remain
+        // authoritative: rebuilding an implicit heap layout would reject a
+        // correctly admitted socket-local fragment without changing any bytes.
+        if (!backing || !backing->layout().contains(
+                CPUGroupedMoEStorageLayout::declare(
+                    std::max(1, cpu_workspace_row_capacity_), params_.d_model,
+                    params_.expert_intermediate, params_.num_experts,
+                    sparse_overlay_route_width_capacity_, params_.device_id,
+                    backing->layout().batch.placement(),
+                    backing->layout().batch.initialization())))
+            throw std::logic_error("CPU MoE stage requires compatible declared workspace roots");
+        if (backing != cpu_grouped_backing_)
+        {
+            cpu_grouped_backing_ = std::move(backing);
+            scratch_gate_batch_.clear();
+            scratch_up_batch_.clear();
+            scratch_down_batch_.clear();
+            swiglu_scratch_batch_.clear();
+            for (int route = 0; route < sparse_overlay_route_width_capacity_; ++route)
+            {
+                const size_t f = static_cast<size_t>(params_.expert_intermediate);
+                const size_t d = static_cast<size_t>(params_.d_model);
+                scratch_gate_batch_.push_back(std::dynamic_pointer_cast<FP32Tensor>(
+                    cpu_grouped_backing_->gate->create_view({1, f}, route * f)));
+                scratch_up_batch_.push_back(std::dynamic_pointer_cast<FP32Tensor>(
+                    cpu_grouped_backing_->up->create_view({1, f}, route * f)));
+                scratch_down_batch_.push_back(std::dynamic_pointer_cast<FP32Tensor>(
+                    cpu_grouped_backing_->output->create_view({1, d}, route * d)));
+                swiglu_scratch_batch_.emplace_back(
+                    cpu_grouped_backing_->route_outputs.data() + route * f, f);
+            }
+            scratch_out_ = scratch_down_batch_.front();
+        }
+        auto *kernel = dynamic_cast<CPUMoEKernel *>(acquireMoEKernelObject());
+        if (!kernel)
+            throw std::logic_error("CPU MoE stage has no CPU kernel");
+        kernel->bindRouterQ8HiddenStorage(cpu_grouped_backing_->kernel_router_q8);
+    }
+
     void MoEExpertComputeStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        clearCompletedCPUActiveExpertView();
+        // Allocator rebuilds revoke borrows through the public null binding.
+        // The graph-local kernel and its backing retain their own lifetimes.
+        if (!workspace)
+        {
+            unbindWorkspace();
+            return;
+        }
         if (workspace != bound_workspace_)
         {
             runtime_grouped_decode_launch_state_prepared_ = false;
             invalidateFixedTopologyMaskPublication();
         }
+
+        if (params_.device_id.is_cpu())
+            bindCPUGroupedStorage(params_.cpu_grouped_serial_workspace
+                ? params_.cpu_grouped_serial_workspace->backing_
+                : (workspace ? workspace->cpuGroupedMoEStorage() : nullptr));
 
         // Bind workspace to ALL expert GEMM engines (gate, up, down for each expert)
         auto bindAll = [workspace](const std::vector<ITensorGemm *> &engines)
@@ -9420,6 +9563,7 @@ namespace llaminar2
 
     void MoEExpertComputeStage::unbindWorkspace()
     {
+        clearCompletedCPUActiveExpertView();
         auto unbindAll = [](const std::vector<ITensorGemm *> &engines)
         {
             for (auto *gemm : engines)
@@ -9472,6 +9616,36 @@ namespace llaminar2
     bool MoEExpertComputeStage::bindSparseOverlayInvocation(
         const SparseOverlayInvocation &invocation)
     {
+        // A rejected packet cannot lend a prior observation or execution lease.
+        clearCompletedCPUActiveExpertView();
+        releaseCPUJointInvocation();
+        MoEOverlayParticipantBankLease joint_bank;
+        if(params_.cpu_joint_layer) {
+            if(invocation.binding_kind==SparseOverlayBindingKind::SetupPriming) {
+                if(invocation.cpu_joint_epoch)return false;
+            } else {
+                const auto* epoch=invocation.cpu_joint_epoch;
+                if(!epoch || !epoch->bankLease() || epoch->family()!=params_.cpu_joint_layer->family() ||
+                   epoch->family().owner_before(params_.cpu_joint_layer->family()) ||
+                   params_.cpu_joint_layer->family().owner_before(epoch->family()) ||
+                   epoch->epoch()!=invocation.engine_binding_generation || epoch->layer()!=params_.layer_idx ||
+                   epoch->participantId()!=params_.cpu_joint_layer->participantId()) {
+                    LOG_ERROR("CPU fragment invocation has a foreign or absent original epoch family");return false;
+                }
+                joint_bank=epoch->bankLease();
+                const auto& layer=joint_bank->layerForModelLayer(params_.layer_idx);
+                if(!invocation.expert_mask || *invocation.expert_mask!=layer.resident_mask ||
+                   invocation.gate_engines.size()!=layer.cpu_fragments.size() ||
+                   invocation.up_engines.size()!=layer.cpu_fragments.size() || invocation.down_engines.size()!=layer.cpu_fragments.size())return false;
+                for(size_t expert=0;expert<layer.cpu_fragments.size();++expert) {
+                    const auto& actual=layer.cpu_fragments[expert];
+                    if(invocation.gate_engines[expert]!=actual.gate().get() || invocation.up_engines[expert]!=actual.up().get() ||
+                       invocation.down_engines[expert]!=actual.down().get()) {
+                        LOG_ERROR("CPU fragment invocation replaced a candidate bank engine");return false;
+                    }
+                }
+            }
+        } else if(invocation.cpu_joint_epoch)return false;
         const size_t expert_count =
             static_cast<size_t>(std::max(params_.num_experts, 0));
         const bool host_packet_binding =
@@ -9714,6 +9888,7 @@ namespace llaminar2
             sparse_overlay_launch_metadata_dirty_ =
                 !host_packet_binding;
         }
+        cpu_joint_invocation_bank_=std::move(joint_bank);
         return true;
     }
 
@@ -9945,7 +10120,7 @@ namespace llaminar2
          * A shared expert is simply an always-selected one-entry expert table.
          * Export the complete projection triple through the same typed boundary
          * as routed experts so floating model weights do not get mistaken for
-         * failed NativeVNNI preparation.  Validating down here as part of the
+         * failed NativeQuantised preparation.  Validating down here as part of the
          * triple also prevents gate/up and down tables from recording different
          * precision families in one captured launch.
          */
@@ -9973,7 +10148,7 @@ namespace llaminar2
         }
 
         const int table_id =
-            exported.weight_format == DeviceMoEWeightFormat::NativeVNNI
+            exported.weight_format == DeviceMoEWeightFormat::NativeQuantised
                 ? kernel->uploadGroupedExpertGateUpDescriptorTables(
                       &exported.gate,
                       &exported.up,
@@ -10051,7 +10226,7 @@ namespace llaminar2
         }
 
         const int table_id =
-            exported.weight_format == DeviceMoEWeightFormat::NativeVNNI
+            exported.weight_format == DeviceMoEWeightFormat::NativeQuantised
                 ? kernel->uploadGroupedExpertDownDescriptorTable(
                       &exported.down,
                       1,
@@ -10590,14 +10765,17 @@ namespace llaminar2
 
         if (shouldUseGroupedVerifierPrefillRoute())
         {
+            // Cold preparation owns fixed launch metadata only. The retained
+            // verifier's controller has not published a live row count yet
+            // (and its reused allocation may contain arbitrary prior bytes).
+            // Captured tryGroupedVerifierPrefill() republishes this metadata
+            // from the device-owned count before performing any model math.
             if (!ensureSharedGroupedGateUpDescriptorTable(
                     kernel, params_.d_model, params_.intermediate) ||
                 !ensureSharedGroupedDownDescriptorTable(
                     kernel, params_.d_model, params_.intermediate) ||
                 !kernel->prepareSharedExpertPrefillGroup(
-                    params_.active_row_count_device
-                        ? DeviceRowRange::deviceCounted(params_.seq_len, params_.active_row_count_device)
-                        : DeviceRowRange::fullyActive(params_.seq_len)))
+                    DeviceRowRange::fullyActive(params_.seq_len)))
             {
                 LOG_ERROR("[SharedExpertFFNStage] Failed to prepare the fixed "
                           "grouped verifier launch state before graph capture");

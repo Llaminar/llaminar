@@ -18,6 +18,7 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../kernels/common/GatedNormActivation.h"
 
 #include <optional>
 
@@ -53,9 +54,9 @@ namespace llaminar2
             /// normalizes over the full model dimension (d_model).
             int norm_dim = 0;
 
-            /// Apply SiLU activation to gate before multiplying.
-            /// Required for GDN layers: output = RMSNorm(input) * SiLU(gate).
-            bool gate_silu = false;
+            /// Model-declared activation applied after normalization and gain.
+            /// Ordinary GDN uses SiLU; Flash Next uses sigmoid.
+            GatedNormActivation gate_activation = GatedNormActivation::Identity;
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> input_buffer_id;

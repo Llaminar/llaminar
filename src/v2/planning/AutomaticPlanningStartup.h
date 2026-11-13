@@ -84,17 +84,26 @@ namespace llaminar2
         /** @return Common startup preparation policy; never chosen privately by a frontend. */
         static Prepare preparation();
 
+        /** @brief Original-rank class collection; the callback obeys the same collective lifecycle as Prepare. */
+        using PrepareNativeContexts=std::function<PlanningNativeContextBudgets(const AutomaticPlanningPreparation&)>;
+
+        using PrepareHostServices = std::function<PlanningHostServiceBudgets(const AutomaticPlanningPreparation&)>;
+
         /**
          * @brief Publish intent/metadata, prepare evidence, select once, then publish apply.
          * @param request Root's parsed intent; follower paths need not be locally readable.
          * @param inventory Canonical inventory from this discovery communicator.
          * @param mpi Discovery context, before execution rank admission; null is process-local.
          * @param prepare Common evidence policy, injectable without bypassing production admission.
+         * @param prepare_host_services Original-rank CPU service class collection, before execution membership narrows.
+         * @param prepare_native_contexts Original-rank stack/object declarations with installed family limits.
          * @return Complete apply config everywhere; winning BOM/cost only on root.
          * @throws std::runtime_error for publication, evidence or selection failure on any rank.
          */
         static AutomaticPlanningStartupResult run(const OrchestrationConfig &request,
             const ClusterInventory &inventory, const std::shared_ptr<IMPIContext> &mpi,
-            const Prepare &prepare = preparation());
+            const Prepare &prepare = preparation(),
+            const PrepareHostServices &prepare_host_services = collectPlanningHostServiceBudgets,
+            const PrepareNativeContexts &prepare_native_contexts=collectPlanningNativeContextBudgets);
     };
 }

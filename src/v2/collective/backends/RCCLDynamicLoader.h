@@ -11,12 +11,16 @@
  * other's symbols, causing NVIDIA code to call AMD's RCCL or vice versa.
  * Dependency selection belongs to CMake's RCCL_LIBRARY; runtime loading never
  * searches for a substitute if that configured installation is unavailable.
+ * The selected path remains owned with its callbacks until explicit unload;
+ * a live handle cannot certify a different or empty requested selection.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #pragma once
+
+#include "collective/NativeCollectiveBytes.h"
 
 #include <cstddef>
 #include "../NativeCollectiveRows.h"
@@ -28,10 +32,14 @@ namespace llaminar2
     namespace rccl_dynamic
     {
         /**
-         * @brief Load RCCL library dynamically with isolated symbols
+         * @brief Load the exact selected RCCL dependency with isolated symbols.
          * @param library_path Explicit diagnostic DSO path, or nullptr for the
          *        exact RCCL_LIBRARY selected by CMake. No alternate DSO is tried.
-         * @return true if loaded successfully
+         * @return True for the same retained path or complete required-symbol
+         *         admission; false for invalid/different selection or load failure.
+         * Empty explicit paths always reject, including after successful loading.
+         * Repeated identical selection retains the handle; different paths reject
+         * until unload retires both selection identity and borrowed callbacks.
          *
          * The library is loaded with RTLD_NOW | RTLD_LOCAL to:
          * - RTLD_NOW: Resolve all symbols immediately (fail fast on missing symbols)
@@ -40,7 +48,9 @@ namespace llaminar2
         bool load(const char *library_path = nullptr);
 
         /**
-         * @brief Unload RCCL library
+         * @brief Retire the selected path and all callbacks before closing its DSO.
+         * Native operations must have retired before this call. Callback clearing
+         * preserves failed-partial-load safety; a later load can bind a new path.
          */
         void unload();
 
@@ -102,13 +112,15 @@ namespace llaminar2
             ncclNumTypes = 10
         };
 
+        // Native reduction ordinals, independently compiler-checked against the configured vendor header.
+        // Internal backend wrapper op codes are translated separately and are not these ABI values.
         // Reduction operations (same as NCCL)
         enum ncclRedOp_t
         {
             ncclSum = 0,
             ncclProd = 1,
-            ncclMin = 2,
-            ncclMax = 3,
+            ncclMax = 2,
+            ncclMin = 3,
             ncclAvg = 4,
             ncclNumOps = 5
         };
@@ -118,6 +130,9 @@ namespace llaminar2
         // =========================================================================
 
         // Unique ID management
+        /** @return True only from the compiler/header-checked native reduction ABI TU. */
+        bool configuredReductionABIContract() noexcept;
+
         ncclResult_t ncclGetUniqueId(ncclUniqueId *uniqueId);
 
         // Communicator management
@@ -197,6 +212,57 @@ namespace llaminar2
         ncclResult_t ncclReduceScatter(const void *sendbuff, void *recvbuff, size_t recvcount,
                                        ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
                                        void *stream);
+
+        /** @brief Publish only original native abort words; no destruction or reset.
+         * @param comm Original retained communicator.
+         * @return Native status; missing completed-family signal is a hard rejection.
+         */
+        ncclResult_t signalNativeCompletionAbort(ncclComm_t comm);
+
+        /** @brief Borrow immutable pointers from the exact original native communicator.
+         * @param comm Original retained communicator, not a device ordinal.
+         * @param original Host output for immutable device pointer identity; no value is read.
+         * @return Explicit native status; missing completed ABI never falls back.
+         */
+        ncclResult_t nativeCompletionAuthority(ncclComm_t comm, ncclLlaminarCompletionAuthority* original);
+
+        /** @brief Query immutable observation storage from the already admitted native library.
+         * @param shape Host geometry output; contains no live device state.
+         * @return Native status; missing original diagnostic symbol fails closed.
+         */
+        ncclResult_t nativeP2pProgressGeometry(ncclLlaminarP2pProgressShape* shape);
+
+        /** @brief Observe existing original connector progress on its ordered explicit stream.
+         * @param original Immutable identity borrowed from the strongly retained actual cohort.
+         * @param peer Actual distinct original coordinate.
+         * @param snapshot Persistent PMA-admitted output, retained until terminal completion.
+         * @param bytes Exact native geometry from nativeP2pProgressGeometry.
+         * @param stream Exact original stream ordered after observed work.
+         * @return Native launch status. The terminal test readout never controls inference.
+         */
+        ncclResult_t nativeP2pProgressSnapshot(ncclLlaminarCompletionAuthority original,
+            int peer,ncclLlaminarP2pProgress* snapshot,std::size_t bytes,void* stream);
+
+        /** @brief Submit only the named original communicator edge with device-owned live bytes.
+         * @param payload Exact local bank. @param bytes Original count/slice descriptor.
+         * @param edge Original endpoints. @param participant Actual local coordinate.
+         * @param comm Same admitted original communicator. @param stream Exact non-null stream.
+         * @return Original native status; no route search or count read occurs. */
+        ncclResult_t nativeTransferBytes(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,ncclComm_t comm,void* stream);
+
+        /**
+         * @brief Enqueue one typed original fixed/prefix/slice native Broadcast.
+         * @param send Original source bank; only root contributes payload.
+         * @param receive Original local destination bank.
+         * @param bytes Checked borrowed communication metadata and bounds.
+         * @param root Original native communicator root.
+         * @param comm Original retained native communicator.
+         * @param stream Exact original CUDA/HIP stream.
+         * @return Native status; an absent selected counted ABI fails explicitly.
+         */
+        ncclResult_t nativeBroadcastBytes(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, ncclComm_t comm, void* stream);
 
         /**
          * @brief Record exact live rows through the canonical native dependency ABI.

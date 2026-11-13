@@ -1048,3 +1048,5 @@ TEST_F(Test__GlobalTPContext_MPI, MoveAssignment)
     fillTensor(tensor.get(), {5.0f, 6.0f});
     EXPECT_TRUE(ctx2->allreduce(tensor.get()));
 }
+
+#include "CPUShardRootedRecordReplay.inc"

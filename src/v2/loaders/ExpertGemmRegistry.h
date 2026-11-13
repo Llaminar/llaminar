@@ -5,12 +5,15 @@
  * Weight preparation publishes device-, domain-, or participant-scoped
  * engines here. Graph construction may borrow raw pointers for fixed model
  * lifetime execution, while epoch-indexed ExpertOverlay residency explicitly
- * acquires shared ownership so old banks survive concurrent migration.
+ * acquires shared ownership so old banks survive concurrent migration. Static
+ * within-expert matrices additionally retain exact frozen source identities and
+ * are available only through complete participant-scoped acquisition.
  */
 
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "WeightPlan.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 
 #include <memory>
@@ -23,8 +26,16 @@
 
 namespace llaminar2
 {
+    class PreparedWeightStore;
+    struct MoEOverlayReusableContextSeal;
+    class MoEOverlayParticipantResidencyRegistry;
+    struct MoEOverlayParticipantResidencyBank;
+    namespace test { struct ExpertGemmRegistryResidencyTestAccess; }
+
 
     class ITensorGemm;
+
+    struct MoEExpertOwnerParticipant;
 
     /// Registry for pre-prepared MoE expert GEMM engines.
     /// Populated by the unified GPU weight pipeline, queried by graph builders.
@@ -80,6 +91,80 @@ namespace llaminar2
                 return gate != nullptr && up != nullptr && down != nullptr;
             }
         };
+
+        /** @brief One acquired static layer; exact source and GEMM owners survive registry retirement. */
+        struct StaticProjectionLayer
+        {
+            ParticipantLayerScope scope;
+            MoEExpertProjectionOwnership projection;
+            std::vector<ParticipantExpertBinding> experts; ///< Original ordinal E order; CPU unselected entries remain empty.
+            std::vector<WeightBinding> sources; ///< Original frozen views, in selected expert-major G/U/D order.
+            std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed CPU fragment selection; dense experts has empty unselected entries.
+        };
+
+        /**
+         * @brief Resolve an explicitly declared static source participant; never infer a domain.
+         * @param source Original marked immutable parent or matrix binding.
+         * @return Existing participant/layer key, including actual target device.
+         * @throws std::invalid_argument for absent/foreign scope or non-static source ownership.
+         */
+        /** @brief Check exact original native source/window geometry, including retired metadata.
+         * @param source Original frozen static matrix binding.
+         * @note This validates source identity only; it grants no prepared-engine readiness.
+         */
+        static void validateStaticProjectionSource(const WeightBinding &source);
+        [[nodiscard]] static ParticipantLayerScope staticProjectionScope(const WeightBinding &source);
+
+        /**
+         * @brief Register one original static matrix without publishing domain/device aliases.
+         * @param source Exact frozen native 2D source with original N/K/E coordinates and scope.
+         * @param engine Actual locally prepared engine, whose N/K must match the source contract.
+         * @param owner Exact shared engine owner retaining its canonical packed pool.
+         * @throws std::invalid_argument for invalid source, geometry or engine ownership.
+         * @throws std::logic_error for any duplicate key or replacement by another source.
+         */
+        /**
+         * @brief Publish a streamed CPU fragment only from its actual committed model store.
+         * @param source Original retained identity/cohort and committed final binding.
+         * @param store Same original model/PMA store issuing the completed binding/ref.
+         * @throws std::invalid_argument For passive metadata, foreign source or another engine owner.
+         * @note GPU registration retains its readable original-parent law below.
+         */
+        void registerCommittedCPUProjection(const WeightBinding &source, const PreparedWeightStore &store);
+
+        void registerStaticProjection(const WeightBinding &source, ITensorGemm *engine,
+                                      std::shared_ptr<ITensorGemm> owner);
+
+        /**
+         * @brief Acquire the exact full-E GPU or closed selected-ID CPU triplets from original frozen declarations.
+         * @param scope Explicit original domain/device/rank/participant/layer.
+         * @param projection Complete expected original F partition, not just local dimensions.
+         * @param sources Exact frozen matrices: 3E for GPU or three per originally selected CPU expert.
+         * @return Owned source-bound layer, or nullopt when no engine has been registered.
+         * @throws std::invalid_argument for duplicate/incomplete/foreign source declarations.
+         * @throws std::logic_error for a stale source owner, different partition or partial published layer.
+         *
+         * No unscoped or overlay alias is consulted. A failed query publishes no partial result.
+         */
+        [[nodiscard]] std::optional<StaticProjectionLayer> acquireStaticProjectionLayer(
+            const ParticipantLayerScope &scope, const MoEExpertProjectionOwnership &projection,
+            std::span<const WeightBinding> sources) const;
+
+        /**
+         * @brief Borrow only already-prepared CPU fragments from their retained original source declarations.
+         * @param original_model Original model store lifetime, never an unscoped engine lookup.
+         * @param original_participant Exact original rank/NUMA/domain/tier/member descriptor.
+         * @param layer Original model layer, not a compact source index.
+         * @return Source-bound selected layer lease, or nullopt when wholly absent.
+         * @throws std::invalid_argument For invalid model/member or foreign/whole-owner sources.
+         * @throws std::logic_error For an incomplete/stale prepared layer.
+         *
+         * Graph callers have no frozen tensor inventory of their own. This reads
+         * the SAME declarations retained at registration and delegates complete
+         * acquisition; it never reconstructs IDs from compact tensor geometry.
+         */
+        [[nodiscard]] std::optional<StaticProjectionLayer> acquireCPUJointLayer(
+            ModelContextId original_model,const MoEExpertOwnerParticipant& original_participant,int layer) const;
 
         ExpertGemmRegistry() = default;
         ~ExpertGemmRegistry() = default;
@@ -162,7 +247,7 @@ namespace llaminar2
          * @param role Gate, up or down projection.
          * @param projection Expected source/partition identity; absent means a whole expert.
          * @return Borrowed handle, or null only when the key is absent.
-         * @throws std::logic_error if an existing key has another physical layout.
+         * @throws std::logic_error if an existing key has another physical layout or requires static full-source acquisition.
          */
         ITensorGemm *getEngineForDomain(const std::string &domain_name,
                         DeviceId device, int layer, int expert, WeightRole role,
@@ -209,7 +294,7 @@ namespace llaminar2
          * @param role Gate, up, or down projection.
          * @param projection Exact expected layout; absent requires a complete expert.
          * @return Exact engine lifetime, or null when absent or not owned.
-         * @throws std::logic_error if an existing key has a different layout.
+         * @throws std::logic_error if an existing key has a different layout or requires static full-source acquisition.
          */
         [[nodiscard]] std::shared_ptr<ITensorGemm>
         getEngineLifetimeForDomain(
@@ -231,7 +316,7 @@ namespace llaminar2
          * @param role Gate, up, or down projection.
          * @param projection Exact expected layout; absent requires a complete expert.
          * @return Exact engine lifetime, or null when absent or not owned.
-         * @throws std::logic_error if an existing key has a different layout.
+         * @throws std::logic_error if an existing key has a different layout or requires static full-source acquisition.
          */
         [[nodiscard]] std::shared_ptr<ITensorGemm>
         getEngineLifetimeForParticipant(
@@ -311,29 +396,22 @@ namespace llaminar2
                             std::vector<ITensorGemm *> &down_out) const;
 
         /**
-         * @brief Atomically replace process-local ExpertOverlay residency keys.
+         * @brief Atomically rebind original prepared identities from their actual terminal seal.
+         * @param seal Complete physically canonicalized initial-placement banks.
+         * @param residency Same original participant/fixed-cohort declaration authority.
+         * @param error Receives a precise failure; validation publishes no partial map.
+         * @return True only after one atomic publication of all process-local scopes.
          *
-         * Every supplied scope is first removed from a private copy of the
-         * registry, then rebuilt from @p bindings. Domain aliases are rebuilt
-         * from the same triplets so setup-time format discovery and
-         * participant graph lowering observe one identity. The live map is
-         * swapped only after complete validation and allocation succeed; a
-         * caller can never observe a partially rebound model context.
-         * Projection-partitioned banks are rejected unchanged: a triplet-only
-         * replacement cannot retire their fixed all-expert down slices safely.
-         *
-         * This is a terminal model-lifecycle operation. Inference and graph
-         * construction must already be quiescent, although ordinary readers
-         * remain protected by the registry mutex.
-         *
-         * @param scopes Complete local participant/layer replacement surface.
-         * @param bindings Exact resident triplets contained by those scopes.
-         * @param error Optional precise validation/allocation diagnostic.
-         * @return True after one atomic replacement, false without mutation.
+         * Whole payloads keep their original domain aliases. CPU fragments keep
+         * exact participant keys and original source/Store/layout declarations;
+         * only their actual sealed engine owners change. No whole-expert alias
+         * or source identity is manufactured from a fragment triplet. Other
+         * fixed GPU projection slices remain unsupported and reject unchanged.
+         * This terminal operation requires original inference/graph quiescence.
          */
-        [[nodiscard]] bool replaceParticipantResidency(
-            std::span<const ParticipantLayerScope> scopes,
-            std::span<const ParticipantExpertBinding> bindings,
+        [[nodiscard]] bool replaceParticipantResidencyFromSeal(
+            const MoEOverlayReusableContextSeal &seal,
+            const MoEOverlayParticipantResidencyRegistry &residency,
             std::string *error = nullptr) noexcept;
 
         /// Replace an existing engine (for dynamic rebalancing arrival).
@@ -361,6 +439,23 @@ namespace llaminar2
         void clear();
 
     private:
+        friend struct test::ExpertGemmRegistryResidencyTestAccess;
+        /**
+         * @brief Stage the single registry replacement; unsealed inputs are test-only.
+         * @param scopes Complete checked participant/layer surface.
+         * @param bindings Checked whole payloads; never CPU fragment adapters.
+         * @param banks Canonical banks already authorized by the public seal; component tests may corrupt this input.
+         * @param residency Original declaration authority paired with the banks, null only for untyped corruption tests.
+         * @param error Receives validation/allocation failure before atomic swap.
+         * @return Whether one complete replacement was published.
+         */
+        bool replaceParticipantResidencyImpl(
+            std::span<const ParticipantLayerScope> scopes,
+            std::span<const ParticipantExpertBinding> bindings,
+            std::span<const MoEOverlayParticipantResidencyBank> banks,
+            const MoEOverlayParticipantResidencyRegistry *residency,
+            std::string *error) noexcept;
+
         struct Key
         {
             std::string domain_name;
@@ -384,6 +479,7 @@ namespace llaminar2
             ITensorGemm *engine = nullptr;
             std::shared_ptr<ITensorGemm> ownership;
             std::optional<MoEExpertProjectionOwnership> projection_ownership;
+            std::shared_ptr<const WeightBinding> static_source = {}; ///< Exact original frozen source, absent for old modes.
         };
 
         mutable std::shared_mutex mutex_;

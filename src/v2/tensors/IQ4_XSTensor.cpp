@@ -2,11 +2,13 @@
  * @file IQ4_XSTensor.cpp
  * @brief IQ4_XS quantized tensor implementation (4-bit extra-small IQ, 32-element blocks)
  * @author David Sanftenberg
+ * Aligned final storage keeps its original CPU allocator identity and lease;
+ * row views inherit that endpoint without copying native blocks.
  */
 
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
-#include "NativeVnniIQ4XSScale.h"
+#include "NativeQuantisedIQ4XSScale.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -43,10 +45,12 @@ namespace llaminar2
 
     IQ4_XSTensor::IQ4_XSTensor(
         const std::vector<size_t> &shape,
-        AlignedVector<uint8_t> raw_data)
+        AlignedVector<uint8_t> raw_data, DeviceId device)
         : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
+          view_byte_offset_(0), parent_(nullptr), device_(device), device_blocks_(nullptr)
     {
+        if (!device.is_valid() || !device.is_cpu())
+            throw std::invalid_argument("IQ4_XSTensor owned native storage requires its exact CPU allocator");
         if (shape.empty())
         {
             throw std::invalid_argument("IQ4_XSTensor: shape cannot be empty");
@@ -71,7 +75,7 @@ namespace llaminar2
     IQ4_XSTensor::IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                                size_t view_byte_offset, std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(raw_data_ptr),
-          view_byte_offset_(view_byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr)
+          view_byte_offset_(view_byte_offset), parent_(parent), device_(parent ? parent->home_device() : DeviceId::cpu()), device_blocks_(nullptr)
     {
     }
     // Zero-copy constructor for mmap-backed data
@@ -503,7 +507,7 @@ namespace llaminar2
         const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) |
                        (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
         ctx.scales_array[linear] = blk->d;
-        ctx.mins_array[linear] = native_vnni_iq4xs_scale::encodeSourceCoefficient(
+        ctx.mins_array[linear] = native_quantised_iq4xs_scale::encodeSourceCoefficient(
             static_cast<uint8_t>(ls));
     }
 

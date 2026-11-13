@@ -9,7 +9,7 @@
  *
  * ── Format Conversion Note (CPU ↔ GPU) ──────────────────────────────
  *
- * CPU (CPUNativeVNNIPackedWeights) and GPU (MoEBatchPackedWeightsROCm/CUDA)
+ * CPU (CPUNativeQuantisedPackedWeights) and GPU (MoEBatchPackedWeightsROCm/CUDA)
  * use DIFFERENT memory layouts for the same underlying quantized bytes:
  *
  *   CPU interleaved:
@@ -19,7 +19,7 @@
  *     - stride = 1280B (symmetric) or 1408B (asymmetric)
  *
  *   GPU separated:
- *     Flat arrays: all_native_vnni[linear_block * payload_bytes], one scale per block,
+ *     Flat arrays: all_native_quantised[linear_block * payload_bytes], one scale per block,
  *     one min per block. Payload bytes are in per-row linear order.
  *
  * Metadata granularity is IDENTICAL (1 FP16 scale, 1 FP16 min per 32-element block).
@@ -54,7 +54,7 @@ struct GPUExpertPointers {
 };
 
 /// Backend-neutral descriptor for one GPU-resident expert projection in the
-/// separated NativeVNNI layout consumed by both CUDA and ROCm kernels.
+/// separated NativeQuantised layout consumed by both CUDA and ROCm kernels.
 struct GpuExpertPackedDescriptor {
     GPUExpertPointers ptrs;
     int n = 0;
@@ -138,7 +138,7 @@ struct GpuExpertStagedActivation
 };
 
 inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     uint8_t payload_bytes_per_block,
     bool is_asymmetric,
     bool has_emins)
@@ -190,7 +190,7 @@ inline bool gpuExpertPackedDescriptorsCompatible(
 
 /// Transfer expert weights between same-backend GPU devices on an explicit stream.
 ///
-/// Both source and destination must use the same packed NativeVNNI layout.
+/// Both source and destination must use the same packed NativeQuantised layout.
 class GPUExpertTransfer {
 public:
     /// Transfer one expert's packed weights from src to dst device.

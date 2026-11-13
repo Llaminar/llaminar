@@ -42,10 +42,18 @@ namespace llaminar2
             return bind(1, rows, nullptr);
         }
 
+        /** @brief Admit independently full request intervals without a count array.
+         * @param requests Positive independent request count.
+         * @param rows_per_request Positive fixed physical stride for each request.
+         * @return Explicit full request-major geometry; request boundaries remain intact.
+         */
+        [[nodiscard]] static DeviceRequestRowRanges fullyActiveRequests(int requests,int rows_per_request)
+        { return bind(requests,rows_per_request,nullptr); }
+
         /** @brief Bind request-local live prefixes without reading device data.
          * @param requests Positive request count.
          * @param rows_per_request Positive captured request stride.
-         * @param lengths Stable device INT32 array with one length per request.
+         * @param lengths Stable execution-owned native INT32 array with one length per request; host-owned for CPU consumers.
          * @return A trivially copyable, immutable launch descriptor.
          * @throws std::invalid_argument For absent metadata or invalid geometry. */
         [[nodiscard]] static DeviceRequestRowRanges deviceCounted(
@@ -69,7 +77,7 @@ namespace llaminar2
         { return requests_ * rows_per_request_; }
 
         /** @return Borrowed length-array identity, or null for explicitly full work. */
-        [[nodiscard]] constexpr const std::int32_t *lengthOwner() const noexcept
+        [[nodiscard]] LLAMINAR_REQUEST_ROWS_HD constexpr const std::int32_t *lengthOwner() const noexcept
         { return lengths_; }
 
         /** @brief Validate one publication without accessing its device owner.

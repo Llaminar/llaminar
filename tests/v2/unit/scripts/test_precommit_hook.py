@@ -3,7 +3,9 @@
 
 The hook runs exactly two CTest suites or authenticates their explicitly
 selected prior receipt. It builds only their canonical targets, resolves the
-workspace Ninja, and stops at the first failed phase. Temporary
+workspace Ninja, and stops at the first failed phase. Explicit receipt reuse
+lets the canonical validator own its build without a forced reconfigure that
+would invalidate unchanged timestamp-bound evidence. Temporary
 repositories and executable shims keep these tests out of real builds, model
 loading, Git registration, and accelerator execution.
 """
@@ -209,21 +211,20 @@ class PreCommitHookTests(unittest.TestCase):
                 self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
 
     def test_selected_build_reuses_only_authenticated_complete_evidence(self):
-        """An explicit receipt uses the canonical validator after the ordinary build."""
+        """The validator owns reuse without an inventory-invalidating reconfigure."""
         result, calls, root, _ = self.run_hook(reuse=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([c["tool"] for c in calls], ["git", "git", "cmake", "cmake", "python3"])
+        self.assertEqual([c["tool"] for c in calls], ["git", "git", "python3"])
         build = str(root / "selected integration build")
-        self.assertEqual(calls[2]["args"][1], build)
-        self.assertEqual(calls[3]["args"][1], build)
-        self.assertEqual(calls[4]["args"], [str(root / "scripts/ci/run_production_prerequisites.py"),
+        self.assertEqual(calls[2]["args"], [str(root / "scripts/ci/run_production_prerequisites.py"),
             "--build-dir", build, "--reuse-report", str(root / "evidence directory/prerequisites.json")])
+        self.assertEqual(calls[2]["cwd"], str(root))
 
     def test_rejected_receipt_blocks_commit_without_another_test_path(self):
         """A stale or invalid explicit receipt cannot succeed or start an alternate gate."""
         result, calls, _, _ = self.run_hook(reuse=True, fail="reuse")
         self.assertEqual(result.returncode, 17)
-        self.assertEqual(len(calls), 5)
+        self.assertEqual([c["tool"] for c in calls], ["git", "git", "python3"])
         self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
 
 

@@ -13,8 +13,12 @@
 #include <optional>
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "execution/local_execution/graph/ReadAheadScheduling.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/GDNRecurrenceStatePolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "collective/AllreducePrecisionPolicy.h"
 
@@ -87,6 +91,7 @@ namespace llaminar2
                 "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
                 "LLAMINAR_PREFILL_GRAPH_REQUIRED",
                 "LLAMINAR_GPU_GRAPHS",
+                "LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE",
                 "LLAMINAR_ALLREDUCE_PRECISION",
                 "LLAMINAR_MOE_REBALANCE",
                 "LLAMINAR_MOE_REBALANCE_WINDOW",
@@ -125,6 +130,7 @@ namespace llaminar2
         bool benchmark_memory_log = false;    ///< Emit benchmark GPU memory snapshots when LLAMINAR_BENCH_MEM_LOG is present.
         int benchmark_iterations = 3;         ///< Measured benchmark iterations (LLAMINAR_BENCHMARK_ITERATIONS, default 3).
         int benchmark_warmup_iterations = 1;  ///< Benchmark warmup iterations (LLAMINAR_BENCHMARK_WARMUP_ITERATIONS, default 1).
+        bool benchmark_iteration_overrides_valid = true; ///< Raw benchmark integer declarations passed parsing/range checks before legacy normalization.
         bool profiler_normal_exit = false;    ///< Permit profiler finalizers instead of `_exit(0)` when LLAMINAR_PROFILER_NORMAL_EXIT is truthy.
         bool rope_on_read = true;             ///< Enable RoPE-on-read unless LLAMINAR_ROPE_ON_READ parses to 0.
         bool sync_after_stage = false;        ///< Synchronize GPU after every stage when LLAMINAR_SYNC_AFTER_STAGE is present.
@@ -134,6 +140,7 @@ namespace llaminar2
         bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
         bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
         bool mtp_publication_diagnostics = false; ///< Emit opt-in device-owned MTP/KV publication diagnostics.
+        bool mtp_depth_transaction_trace = false; ///< Explicit finite untimed benchmark transaction trace; conflicts with first-transaction diagnostics.
         bool mtp_device_phase_snapshots = false; ///< Preserve device-only logical-state phase snapshots until a fatal diagnostic boundary.
         bool mtp_condition_graph_contract_trace = false; ///< Trace only the participant/cache/graph lifecycle of resident MTP condition advances.
         bool gpu_graph_kernel_inventory = false; ///< Export captured kernel names/geometries to PerfStats during graph setup.
@@ -155,8 +162,11 @@ namespace llaminar2
             no_color_output = isPresent("NO_COLOR") || isPresent("LLAMINAR_NO_COLOR");
             assert_thread_affinity = isExactlyOne("LLAMINAR_ASSERT_THREAD_AFFINITY");
             benchmark_memory_log = isPresent("LLAMINAR_BENCH_MEM_LOG");
-            benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100);
-            benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100);
+            bool measured_valid = true;
+            bool warmup_valid = true;
+            benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100, measured_valid);
+            benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100, warmup_valid);
+            benchmark_iteration_overrides_valid = measured_valid && warmup_valid;
             profiler_normal_exit = readTruthy("LLAMINAR_PROFILER_NORMAL_EXIT");
             rope_on_read = readBoolDefaultTrue("LLAMINAR_ROPE_ON_READ");
             sync_after_stage = isPresent("LLAMINAR_SYNC_AFTER_STAGE");
@@ -170,6 +180,9 @@ namespace llaminar2
                 readTruthy("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS");
             mtp_device_phase_snapshots =
                 readTruthy("LLAMINAR_MTP_DEVICE_PHASE_SNAPSHOTS");
+            if (readTruthy("LLAMINAR_MTP_DEPTH_WINDOW_JOURNAL"))
+                throw std::invalid_argument("LLAMINAR_MTP_DEPTH_WINDOW_JOURNAL was retired; use LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE");
+            mtp_depth_transaction_trace = readTruthy("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE");
             mtp_condition_graph_contract_trace =
                 readTruthy(
                     "LLAMINAR_MTP_CONDITION_GRAPH_CONTRACT_TRACE");
@@ -234,18 +247,35 @@ namespace llaminar2
             return std::string(value);
         }
 
-        /// @brief Read an integer environment override and clamp to a conservative range.
-        static int readIntClamped(const char *name, int default_value, int min_value, int max_value)
+        /** @brief Parse a count once and retain validity before legacy normalization.
+         * @param name Environment declaration. @param default_value Unset default.
+         * @param min_value Inclusive supported lower bound. @param max_value Upper bound.
+         * @param declaration_valid False for malformed, empty or out-of-range overrides.
+         * @return Existing normalized count; strict diagnostics additionally require validity.
+         */
+        static int readIntClamped(const char *name, int default_value, int min_value,
+            int max_value, bool &declaration_valid)
         {
             const char *value = std::getenv(name);
-            if (!value || value[0] == '\0')
+            declaration_valid = true;
+            if (!value)
                 return default_value;
+            if (value[0] == '\0')
+            {
+                declaration_valid = false;
+                return default_value;
+            }
             char *end = nullptr;
             const long parsed = std::strtol(value, &end, 10);
             if (end == value)
+            {
+                declaration_valid = false;
                 return default_value;
-            return std::clamp(static_cast<int>(parsed), min_value, max_value);
+            }
+            declaration_valid = *end == '\0' && parsed >= min_value && parsed <= max_value;
+            return static_cast<int>(std::clamp(parsed, static_cast<long>(min_value), static_cast<long>(max_value)));
         }
+
     };
 
     /**
@@ -382,11 +412,45 @@ namespace llaminar2
          * with FP32 accumulation/output. Decode and verifier use one fixed
          * reduction tree; ordinary GPU prefill uses floating GEMM.
          * The default FP16MoEAlphaBeta applies half operands only to original floating
-         * qwen35moe alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
+         * qwen35moe and qwen4exp alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
          * selects alpha/beta for both dense and MoE models. Experts, routers and full-attention keep their own policy.
          */
         GDNProjectionArithmetic gdn_projection_arithmetic = kDefaultGDNProjectionArithmetic;
-        MoERouterArithmetic moe_router_arithmetic = MoERouterArithmetic::Native; ///< Setup-only LLAMINAR_MOE_ROUTER_ARITHMETIC=native|fp16|native_hadamard32; rotation applies only to existing Q8 router paths.
+        /**
+         * @brief Setup-only LLAMINAR_QFN_HC_UP_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Applies only to Flash Next HC-up projections. The graph copies this
+         * policy before workspace preparation; execution never rereads it.
+         * TwoTermQ8 is the QFN HC-up default; single_q8 remains an explicit opt-out.
+         */
+        QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+        /**
+         * @brief Setup-only LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Selects only original Flash Next GDN output projections. Setup freezes
+         * this value into graph and admission configuration; kernels never read
+         * the environment. HC-up, alpha/beta, routers and other models retain
+         * their independent policies. SingleQ8 remains the default.
+         */
+        QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /**
+         * @brief Setup-only LLAMINAR_QFN_FA_OUTPUT_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Explicit correction requires the original complete Q8_0 main FA output
+         * and existing prepared/query owners. Predictor, HC and GDN keep their
+         * independent arithmetic; SingleQ8 remains the serving default.
+         */
+        QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /**
+         * @brief Setup-only LLAMINAR_QFN_GDN_QKV_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Selects only full original native main-GDN mixed-QKV sources. Z,
+         * alpha/beta and the other QFN projection selectors stay independent.
+         * Graph, workspace and prefix identities retain this parsed value;
+         * kernels never read the environment. SingleQ8 remains the default.
+         */
+        QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        MoERouterArithmetic moe_router_arithmetic = MoERouterArithmetic::ModelDefault; ///< Omitted selection resolves from the registered model schema; explicit native|fp16|native_hadamard32 remains authoritative.
 
         // Q8_1 GEMM compensation strategy
         bool use_sa_compensation = false; ///< Use sA-based compensation (vs sum_qs-based, experimental)
@@ -418,8 +482,8 @@ namespace llaminar2
         int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
 
         bool deterministic = false;               ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
-        int cuda_bk256_mode = 0;                  ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
-        int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
+        int cuda_bk256_mode = 0;                  ///< CUDA native-quantised BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
+        int cuda_force_prefill_tile = -1;         ///< CUDA native-quantised prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
         int cuda_moe_gateup_ordered_kpart_tile_n = 128; ///< Warp-aligned output columns per ordered split-K CUDA gate/up producer block (LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
         bool cuda_moe_gateup_ordered_kpart_tile_n_override_active = false; ///< True only when an explicit environment or trainer override must supersede generated capture-time dispatch.
         int cuda_moe_down_ordered_kpart_tile_n = 128;   ///< Warp-aligned output columns per ordered split-K CUDA down producer block used for canonical route publication (LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
@@ -443,9 +507,22 @@ namespace llaminar2
             const char *gdn_arithmetic = std::getenv("LLAMINAR_GDN_PROJECTION_ARITHMETIC");
             gdn_projection_arithmetic = gdn_arithmetic ? parseGDNProjectionArithmetic(gdn_arithmetic) :
                 kDefaultGDNProjectionArithmetic;
+            const char *qfn_hc_up = std::getenv("LLAMINAR_QFN_HC_UP_ACTIVATION");
+            qfn_hc_up_activation = qfn_hc_up ? parseQuantizedActivationOperandPrecision(qfn_hc_up) :
+                kDefaultQwen4ExpHCUpActivation;
+            const char *qfn_gdn_output = std::getenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION");
+            qfn_gdn_output_activation = qfn_gdn_output ? parseQuantizedActivationOperandPrecision(qfn_gdn_output) :
+                QuantizedActivationOperandPrecision::SingleQ8;
+            // Setup parses once; graph/planner records carry the frozen policy.
+            const char *qfn_fa_output = std::getenv("LLAMINAR_QFN_FA_OUTPUT_ACTIVATION");
+            qfn_fa_output_activation = qfn_fa_output ? parseQuantizedActivationOperandPrecision(qfn_fa_output) :
+                QuantizedActivationOperandPrecision::SingleQ8;
+            const char *qfn_gdn_qkv = std::getenv("LLAMINAR_QFN_GDN_QKV_ACTIVATION");
+            qfn_gdn_qkv_activation = qfn_gdn_qkv ? parseQuantizedActivationOperandPrecision(qfn_gdn_qkv) :
+                QuantizedActivationOperandPrecision::SingleQ8;
             const char *router_arithmetic = std::getenv("LLAMINAR_MOE_ROUTER_ARITHMETIC");
-            moe_router_arithmetic = parseMoERouterArithmetic(
-                router_arithmetic ? router_arithmetic : "native");
+            moe_router_arithmetic = router_arithmetic ? parseMoERouterArithmetic(router_arithmetic) :
+                MoERouterArithmetic::ModelDefault;
             const char *sa_comp_env = std::getenv("LLAMINAR_USE_SA_COMPENSATION");
             if (sa_comp_env)
             {
@@ -805,6 +882,20 @@ namespace llaminar2
      */
     struct AttentionConfig
     {
+        /**
+         * @brief Setup-only LLAMINAR_QFN_SPARSE_ATTENTION=fp32|fp16_tile.
+         * QFN graph construction freezes this explicit arithmetic before capture.
+         * The FP16 tile experiment admits ROCm attention with native FP16 KV;
+         * CPU/CUDA reject it. Unset remains absent until actual participant admission resolves the
+         * installed default.
+         */
+        std::optional<qwen4exp::QwenSparseAttentionArithmetic> qfn_sparse_attention;
+        /** @brief Explicit setup schedule, snapshotted into RuntimeConfig before planning.
+         * LLAMINAR_QFN_SPARSE_ATTENTION_PHASE_SCHEDULE=uniform|prefill8_decode33.
+         * Split schedule requires a resolved FP16 program and ROCm/native FP16; its
+         * immutable copy, never a later environment read, owns arena geometry. */
+        std::optional<qwen4exp::QwenSparseAttentionPhaseSchedule>
+            qfn_sparse_attention_phase_schedule;
         bool fp32_scores = false; ///< Use FP32 for Q·K score computation (default: integer)
 
         bool debug_effective_kv_snapshot = false;             ///< Capture effective K/V tensors when LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is non-zero.
@@ -854,6 +945,15 @@ namespace llaminar2
 
         void reload()
         {
+            const char *qfn_sparse = std::getenv("LLAMINAR_QFN_SPARSE_ATTENTION");
+            qfn_sparse_attention =
+                qfn_sparse ? std::optional{qwen4exp::parseQwenSparseAttentionArithmetic(qfn_sparse)}
+                           : std::nullopt;
+            const char *qfn_schedule=std::getenv("LLAMINAR_QFN_SPARSE_ATTENTION_PHASE_SCHEDULE");
+            qfn_sparse_attention_phase_schedule =
+                qfn_schedule
+                    ? std::optional{qwen4exp::parseQwenSparseAttentionPhaseSchedule(qfn_schedule)}
+                    : std::nullopt;
             const char *fp32_scores_env = std::getenv("LLAMINAR_Q8_ATTENTION_FP32_SCORES");
             if (fp32_scores_env)
             {
@@ -1049,6 +1149,17 @@ namespace llaminar2
      */
     struct ExecutionConfig
     {
+        /** @brief Cold diagnostic policy, snapshotted into RuntimeConfig before admission.
+         * LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE accepts only consumer_scheduled,
+         * early_current_hosted_candidate or early_current_resident_decode_gpu_candidate.
+         * Absence does not enable a candidate. Models never read this environment.
+         */
+        std::optional<ImmutableLookupSchedule> qfn_ngram_lookup_schedule;
+
+        /** @brief Cold LLAMINAR_CUDA_GDN_STATE_LAYOUT physical-format override; copied into the cache owner. */
+        GDNRecurrenceStateLayout cuda_gdn_state_layout = kDefaultCUDAGDNStateLayout;
+        /** @brief Cold LLAMINAR_ROCM_GDN_STATE_LAYOUT override of the ValueMajor default; never changes a live bank. */
+        GDNRecurrenceStateLayout rocm_gdn_state_layout = kDefaultROCmGDNStateLayout;
         bool use_layer_executor = true;                                        ///< Master switch for LayerExecutor (default: ON)
         std::string execution_mode = "sequential";                             ///< Execution mode
         bool executor_profiling = false;                                       ///< Enable stage profiling
@@ -1077,6 +1188,7 @@ namespace llaminar2
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
         bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
         std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bounded serving ladder; --prefill-max-bucket-size publishes an explicit LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES override here.
+        bool prefill_graph_max_cached_buckets_explicit = false; ///< Whether the user authored a cache ceiling.
         int prefill_graph_max_cached_buckets = static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);                                                                 ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
@@ -1162,6 +1274,15 @@ namespace llaminar2
         /** @brief Reload execution controls without performing device work. */
         void reload()
         {
+            const char* lookup_schedule=std::getenv("LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE");
+            qfn_ngram_lookup_schedule=lookup_schedule?std::optional{parseImmutableLookupSchedule(lookup_schedule)}:std::nullopt;
+
+            const char *cuda_gdn_layout = std::getenv("LLAMINAR_CUDA_GDN_STATE_LAYOUT");
+            const char *rocm_gdn_layout = std::getenv("LLAMINAR_ROCM_GDN_STATE_LAYOUT");
+            cuda_gdn_state_layout = cuda_gdn_layout
+                ? parseGDNRecurrenceStateLayout(cuda_gdn_layout) : kDefaultCUDAGDNStateLayout;
+            rocm_gdn_state_layout = rocm_gdn_layout
+                ? parseGDNRecurrenceStateLayout(rocm_gdn_layout) : kDefaultROCmGDNStateLayout;
             fast_decode = true;
             executor_profiling = false;
             gpu_graphs = true;
@@ -1362,6 +1483,7 @@ namespace llaminar2
             prefill_graph_max_cached_buckets =
                 static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);
             const char *prefill_graph_max_buckets_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
+            prefill_graph_max_cached_buckets_explicit = prefill_graph_max_buckets_env != nullptr;
             if (prefill_graph_max_buckets_env)
             {
                 prefill_graph_max_cached_buckets = std::max(0, std::atoi(prefill_graph_max_buckets_env));
@@ -2815,16 +2937,16 @@ namespace llaminar2
      * - `LLAMINAR_GPU_LOAD_STAGING_MB=<mb>` - Per-GPU pinned-host startup staging cap, mirrored by per-GPU device scratch (default 512 MiB, 0=unlimited)
      * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - Legacy alias for the startup staging cap
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
-     * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
-     * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
-     * - `LLAMINAR_ROCM_NVNNI_FULL_TILES=<-1|0|1>` - Select automatic, checked, or divisibility-proven full-tile NativeVNNI GEMM specialization
-     * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB=<n>` - Force native-quantised GEMV K partitions (`-1` = auto)
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES=<n>` - Force native-quantised GEMV target waves per CU (`-1` = auto)
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_FULL_TILES=<-1|0|1>` - Select automatic, checked, or divisibility-proven full-tile NativeQuantised GEMM specialization
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_DISABLE_GENERATED=1` - Disable generated ROCm NativeQuantised dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
-     * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=512 experts (default: on)
      * - `LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN=0` - Disable router Q8 hidden/scales reuse for grouped gate/up decode when the hidden row pointer matches (default: on)
      * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M=<4|8|12|16>` - Force expert-row tile for grouped gate/up prefill training (`-1` = generated policy)
      * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N=<64|128|256>` - Force output-column tile for grouped gate/up prefill training (`-1` = generated policy)
@@ -2876,15 +2998,15 @@ namespace llaminar2
         bool blockwise_force_v3 = false;           ///< Force V3 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V3)
         bool blockwise_force_v7 = false;           ///< Force V7 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V7)
         int blockwise_quant_variant = 0;           ///< Blockwise quant kernel variant (0=auto, 1-5=manual) (LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT)
-        int nvnni_mt = -1;                         ///< Native-VNNI M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NVNNI_MT)
-        int nvnni_unroll = -1;                     ///< Native-VNNI UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NVNNI_UNROLL)
-        int nvnni_min_blocks = -1;                 ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
-        bool nvnni_force_n64 = false;              ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
-        bool nvnni_force_n128 = false;             ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
-        int nvnni_full_tiles = -1;                 ///< Native-VNNI edge specialization (-1=auto, 0=checked, 1=full tiles) (LLAMINAR_ROCM_NVNNI_FULL_TILES)
-        int nvnni_gemv_kb = -1;                    ///< Native-VNNI GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NVNNI_GEMV_KB)
-        int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
-        bool nvnni_disable_generated = false;      ///< Disable generated ROCm NativeVNNI dispatch tables for trainer sweeps (LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED)
+        int native_quantised_mt = -1;                         ///< NativeQuantised M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NATIVE_QUANTISED_MT)
+        int native_quantised_unroll = -1;                     ///< NativeQuantised UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NATIVE_QUANTISED_UNROLL)
+        int native_quantised_min_blocks = -1;                 ///< NativeQuantised MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NATIVE_QUANTISED_MIN_BLOCKS)
+        bool native_quantised_force_n64 = false;              ///< Force N64 for all native-quantised shapes (LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N64)
+        bool native_quantised_force_n128 = false;             ///< Force N128 for all native-quantised shapes (LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N128)
+        int native_quantised_full_tiles = -1;                 ///< NativeQuantised edge specialization (-1=auto, 0=checked, 1=full tiles) (LLAMINAR_ROCM_NATIVE_QUANTISED_FULL_TILES)
+        int native_quantised_gemv_kb = -1;                    ///< NativeQuantised GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB)
+        int native_quantised_gemv_target_waves = -1;          ///< NativeQuantised GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES)
+        bool native_quantised_disable_generated = false;      ///< Disable generated ROCm NativeQuantised dispatch tables for trainer sweeps (LLAMINAR_ROCM_NATIVE_QUANTISED_DISABLE_GENERATED)
         int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;                  ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1;     ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2899,7 +3021,7 @@ namespace llaminar2
         bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8)
         bool moe_router_kpart_decode = false;      ///< Enable K-partitioned FP32 router logits for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
-        bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
+        bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=512 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
         bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN)
         int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
         int moe_prefill_gateup_tile_n = -1;        ///< Grouped prefill gate/up output-column tile override (-1=generated policy; 64/128/256 valid)
@@ -2910,7 +3032,7 @@ namespace llaminar2
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
         int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
-        int repack_budget_mb = 512; ///< Per-GPU pinned-host startup staging cap in MiB, mirrored by per-GPU device scratch; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
+        int repack_budget_mb = 512; ///< Shared startup limit in MiB: each GPU pinned-host/device staging ring and each rank's bounded CPU-joint native source window. These concurrent roots are admitted separately; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
         int repack_streams = 3;   ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
 
         ROCmConfig()
@@ -2957,15 +3079,15 @@ namespace llaminar2
             blockwise_force_v3 = false;
             blockwise_force_v7 = false;
             blockwise_quant_variant = 0;
-            nvnni_mt = -1;
-            nvnni_unroll = -1;
-            nvnni_min_blocks = -1;
-            nvnni_force_n64 = false;
-            nvnni_force_n128 = false;
-            nvnni_full_tiles = -1;
-            nvnni_gemv_kb = -1;
-            nvnni_gemv_target_waves = -1;
-            nvnni_disable_generated = false;
+            native_quantised_mt = -1;
+            native_quantised_unroll = -1;
+            native_quantised_min_blocks = -1;
+            native_quantised_force_n64 = false;
+            native_quantised_force_n128 = false;
+            native_quantised_full_tiles = -1;
+            native_quantised_gemv_kb = -1;
+            native_quantised_gemv_target_waves = -1;
+            native_quantised_disable_generated = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -3212,58 +3334,58 @@ namespace llaminar2
                 blockwise_quant_variant = std::clamp(std::atoi(bw_quant_var_env), 0, 5);
             }
 
-            const char *nvnni_mt_env = std::getenv("LLAMINAR_ROCM_NVNNI_MT");
-            if (nvnni_mt_env)
+            const char *native_quantised_mt_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_MT");
+            if (native_quantised_mt_env)
             {
-                nvnni_mt = std::atoi(nvnni_mt_env);
+                native_quantised_mt = std::atoi(native_quantised_mt_env);
             }
 
-            const char *nvnni_unroll_env = std::getenv("LLAMINAR_ROCM_NVNNI_UNROLL");
-            if (nvnni_unroll_env)
+            const char *native_quantised_unroll_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_UNROLL");
+            if (native_quantised_unroll_env)
             {
-                nvnni_unroll = std::clamp(std::atoi(nvnni_unroll_env), -1, 8);
+                native_quantised_unroll = std::clamp(std::atoi(native_quantised_unroll_env), -1, 8);
             }
 
-            const char *nvnni_min_blocks_env = std::getenv("LLAMINAR_ROCM_NVNNI_MIN_BLOCKS");
-            if (nvnni_min_blocks_env)
+            const char *native_quantised_min_blocks_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_MIN_BLOCKS");
+            if (native_quantised_min_blocks_env)
             {
-                nvnni_min_blocks = std::clamp(std::atoi(nvnni_min_blocks_env), -1, 3);
+                native_quantised_min_blocks = std::clamp(std::atoi(native_quantised_min_blocks_env), -1, 3);
             }
 
-            const char *nvnni_force_n64_env = std::getenv("LLAMINAR_ROCM_NVNNI_FORCE_N64");
-            if (nvnni_force_n64_env)
+            const char *native_quantised_force_n64_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N64");
+            if (native_quantised_force_n64_env)
             {
-                nvnni_force_n64 = (std::atoi(nvnni_force_n64_env) != 0);
+                native_quantised_force_n64 = (std::atoi(native_quantised_force_n64_env) != 0);
             }
 
-            const char *nvnni_force_n128_env = std::getenv("LLAMINAR_ROCM_NVNNI_FORCE_N128");
-            if (nvnni_force_n128_env)
+            const char *native_quantised_force_n128_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N128");
+            if (native_quantised_force_n128_env)
             {
-                nvnni_force_n128 = (std::atoi(nvnni_force_n128_env) != 0);
+                native_quantised_force_n128 = (std::atoi(native_quantised_force_n128_env) != 0);
             }
 
-            const char *nvnni_full_tiles_env = std::getenv("LLAMINAR_ROCM_NVNNI_FULL_TILES");
-            if (nvnni_full_tiles_env)
+            const char *native_quantised_full_tiles_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_FULL_TILES");
+            if (native_quantised_full_tiles_env)
             {
-                nvnni_full_tiles = std::clamp(std::atoi(nvnni_full_tiles_env), -1, 1);
+                native_quantised_full_tiles = std::clamp(std::atoi(native_quantised_full_tiles_env), -1, 1);
             }
 
-            const char *nvnni_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_KB");
-            if (nvnni_gemv_kb_env)
+            const char *native_quantised_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB");
+            if (native_quantised_gemv_kb_env)
             {
-                nvnni_gemv_kb = std::clamp(std::atoi(nvnni_gemv_kb_env), -1, 64);
+                native_quantised_gemv_kb = std::clamp(std::atoi(native_quantised_gemv_kb_env), -1, 64);
             }
 
-            const char *nvnni_gemv_target_waves_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES");
-            if (nvnni_gemv_target_waves_env)
+            const char *native_quantised_gemv_target_waves_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES");
+            if (native_quantised_gemv_target_waves_env)
             {
-                nvnni_gemv_target_waves = std::clamp(std::atoi(nvnni_gemv_target_waves_env), -1, 64);
+                native_quantised_gemv_target_waves = std::clamp(std::atoi(native_quantised_gemv_target_waves_env), -1, 64);
             }
 
-            const char *nvnni_disable_generated_env = std::getenv("LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED");
-            if (nvnni_disable_generated_env)
+            const char *native_quantised_disable_generated_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_DISABLE_GENERATED");
+            if (native_quantised_disable_generated_env)
             {
-                nvnni_disable_generated = (std::atoi(nvnni_disable_generated_env) != 0);
+                native_quantised_disable_generated = (std::atoi(native_quantised_disable_generated_env) != 0);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");
@@ -3456,10 +3578,10 @@ namespace llaminar2
     };
 
     /**
-     * @brief CPU NativeVNNI tile dispatch configuration
+     * @brief CPU NativeQuantised tile dispatch configuration
      *
-     * Override the auto-tuned tile parameters for the CPU NativeVNNI GEMV/GEMM
-     * kernel (CPUNativeVNNIGemv.h / CPUNativeVNNITileConfig.h).
+     * Override the auto-tuned tile parameters for the CPU NativeQuantised GEMV/GEMM
+     * kernel (CPUNativeQuantisedGemv.h / CPUNativeQuantisedTileConfig.h).
      * All values default to 0 (= auto, use heuristic).
      *
      * Environment Variables:
@@ -3506,7 +3628,7 @@ namespace llaminar2
         RuntimeDebugConfig runtime_debug; ///< Miscellaneous app/runtime debug environment switches.
         DequantConfig dequant;
         GemmConfig gemm;
-        CPUVNNIConfig cpu_vnni; ///< CPU NativeVNNI tile dispatch overrides
+        CPUVNNIConfig cpu_vnni; ///< CPU NativeQuantised tile dispatch overrides
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
         AttentionConfig attention; ///< Q8_1 attention precision configuration

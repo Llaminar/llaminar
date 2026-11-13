@@ -231,7 +231,7 @@ This is a candidate for further launch/publication fusion, not a guaranteed
 91.89% DRAM utilization (837.19 GB/s) in an isolated NCU launch, so removing
 scalar decoder instructions alone is unlikely to recover the whole gap.
 
-Prefill is different: the dominant `nativeVnniTC_BK64<4,128,128,4,4,2>` has
+Prefill is different: the dominant `nativeQuantisedTC_BK64<4,128,128,4,4,2>` has
 128 registers/thread, one resident block per SM, and approximately 33%
 occupancy. It is not DRAM-bandwidth-limited. Its inner partition publication
 previously tested a runtime integer remainder after every 32-value block.
@@ -948,7 +948,7 @@ metadata-only audit of quantized two-dimensional matrices in the 64 main
 blocks plus the output head, excluding token embedding and the disabled
 sidecar, finds:
 
-| Format | GGUF bytes | Canonical NativeVNNI logical bytes |
+| Format | GGUF bytes | Canonical NativeQuantised logical bytes |
 | --- | ---: | ---: |
 | IQ4_XS | 10,740,039,680 | 11,371,806,720 |
 | Q5_K | 2,825,912,320 | 3,082,813,440 |
@@ -956,7 +956,7 @@ sidecar, finds:
 | Total | 14,608,896,000 | 15,567,093,760 |
 
 Native lengths are obtained by invoking the production
-`nativeVnniPackedRegionSizes` helper on each GGUF shape and format; no parallel
+`nativeQuantisedPackedRegionSizes` helper on each GGUF shape and format; no parallel
 allocation ledger is introduced. The expanded FP16 scale/minimum metadata
 adds 958,197,760 logical bytes, or 6.559%, to this matrix set. These are
 representation sizes, **not a measured DRAM trace or the physical memory

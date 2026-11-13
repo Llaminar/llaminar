@@ -18,6 +18,8 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <memory>
@@ -528,9 +530,14 @@ TEST_F(Test__HeterogeneousPipelineMPI, ActivationDataConsistentAfterAllReduce)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

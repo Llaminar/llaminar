@@ -229,6 +229,50 @@ namespace llaminar2
             return "ATTENTION_COMPUTE";
         case ComputeStageType::QUANTIZE_Q16_1:
             return "QUANTIZE_Q16_1";
+        case ComputeStageType::QWEN4EXP_BRANCH_RMS_NORM:
+            return "QWEN4EXP_BRANCH_RMS_NORM";
+        case ComputeStageType::QWEN4EXP_RESIDUAL_EXPAND:
+            return "QWEN4EXP_RESIDUAL_EXPAND";
+        case ComputeStageType::QWEN4EXP_RESIDUAL_DOWN:
+            return "QWEN4EXP_RESIDUAL_DOWN";
+        case ComputeStageType::QWEN4EXP_RESIDUAL_READ:
+            return "QWEN4EXP_RESIDUAL_READ";
+        case ComputeStageType::QWEN4EXP_RESIDUAL_WRITE:
+            return "QWEN4EXP_RESIDUAL_WRITE";
+        case ComputeStageType::QWEN4EXP_NGRAM_HASH:
+            return "QWEN4EXP_NGRAM_HASH";
+        case ComputeStageType::QWEN4EXP_PLE_GATE:
+            return "QWEN4EXP_PLE_GATE";
+        case ComputeStageType::QWEN4EXP_PLE_CONV:
+            return "QWEN4EXP_PLE_CONV";
+        case ComputeStageType::QWEN4EXP_COMMIT_CONV_HISTORY:
+            return "QWEN4EXP_COMMIT_CONV_HISTORY";
+        case ComputeStageType::QWEN4EXP_COMMIT_TOKEN_HISTORY:
+            return "QWEN4EXP_COMMIT_TOKEN_HISTORY";
+        case ComputeStageType::QWEN4EXP_QSA_INDEXER:
+            return "QWEN4EXP_QSA_INDEXER";
+        case ComputeStageType::QWEN4EXP_QSA_ATTENTION:
+            return "QWEN4EXP_QSA_ATTENTION";
+        case ComputeStageType::QWEN4EXP_PLE_SNAPSHOT_PRIOR:
+            return "QWEN4EXP_PLE_SNAPSHOT_PRIOR";
+        case ComputeStageType::QWEN4EXP_PLE_RETAIN_CANDIDATES:
+            return "QWEN4EXP_PLE_RETAIN_CANDIDATES";
+        case ComputeStageType::QWEN4EXP_BRANCH_CONCAT:
+            return "QWEN4EXP_BRANCH_CONCAT";
+        case ComputeStageType::QWEN4EXP_QSA_SNAPSHOT_PRIOR:
+            return "QWEN4EXP_QSA_SNAPSHOT_PRIOR";
+        case ComputeStageType::QWEN4EXP_QSA_RETAIN_CANDIDATES:
+            return "QWEN4EXP_QSA_RETAIN_CANDIDATES";
+        case ComputeStageType::QWEN4EXP_QSA_COMMIT_PARTIAL:
+            return "QWEN4EXP_QSA_COMMIT_PARTIAL";
+        case ComputeStageType::QWEN4EXP_POOLED_NATIVE_PHASE:
+            return "QWEN4EXP_POOLED_NATIVE_PHASE";
+        case ComputeStageType::QWEN4EXP_POOLED_SOURCE_PHASE:return "QWEN4EXP_POOLED_SOURCE_PHASE";
+        case ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER:return "QWEN4EXP_POOLED_DIRECTED_TRANSFER";
+        case ComputeStageType::QWEN4EXP_NGRAM_LOOKUP:
+            return "QWEN4EXP_NGRAM_LOOKUP";
+        case ComputeStageType::QWEN4EXP_QSA_PREPARE_REPLAY:
+            return "QWEN4EXP_QSA_PREPARE_REPLAY";
         case ComputeStageType::ATTENTION_OUTPUT_GATE:
             return "ATTENTION_OUTPUT_GATE";
         case ComputeStageType::GATED_RMS_NORM:
@@ -249,6 +293,8 @@ namespace llaminar2
             return "MTP_CONCAT";
         case ComputeStageType::MTP_DRAFT_TOKEN_PUBLICATION:
             return "MTP_DRAFT_TOKEN_PUBLICATION";
+        case ComputeStageType::MTP_DIRECT_TOKEN_HISTORY_PUBLICATION:
+            return "MTP_DIRECT_TOKEN_HISTORY_PUBLICATION";
         case ComputeStageType::MOE_OVERLAY_EPOCH_BOUNDARY:
             return "MOE_OVERLAY_EPOCH_BOUNDARY";
         case ComputeStageType::MOE_OVERLAY_DEVICE_CONTROLLER:
@@ -806,7 +852,11 @@ namespace llaminar2
                         LOG_TRACE("[StageDumpInfo::ensureOutputsOnHost] '" << output.name << "' took " << elapsed_ms << " ms");
                     }
                     // Update data pointer after sync (may have changed)
-                    output.data = cpu_tensor->raw_data();
+                    if (output.tensor_byte_offset > cpu_tensor->size_bytes() ||
+                        output.byte_size > cpu_tensor->size_bytes() - output.tensor_byte_offset)
+                        throw std::runtime_error("Stage dump output byte view exceeds its tensor capacity");
+                    const auto *raw = static_cast<const std::byte *>(cpu_tensor->raw_data());
+                    output.data = raw ? raw + output.tensor_byte_offset : nullptr;
 
                     // DIAGNOSTIC: Check host data after ensureOnHost
                     if (diag)

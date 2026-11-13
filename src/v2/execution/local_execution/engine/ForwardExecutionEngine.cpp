@@ -19,6 +19,8 @@
  */
 
 #include "ForwardExecutionEngine.h"
+#include "kernels/qwen4exp/QwenSparseAttention.h"
+#include "execution/local_execution/graph/GraphCaptureStageActivity.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "PrefillBucketUtils.h"
 #include "../graph/DeviceGraphCaptureController.h"
@@ -41,11 +43,49 @@ namespace llaminar2
 {
     namespace
     {
+        /** @brief Clone the original native budget recording before a follower's complete verifier parent.
+         * Existing ExpertOverlay composition remains the body authority. The
+         * temporary graph is a cold compiler definition, never an executable
+         * or an independently submitted transaction. */
+        bool composePipelineMaintenanceAdmission(DeviceGraphExecutor::DecodeCapturePolicy &policy,
+            const PipelineForwardGraphEdges *edges, ForwardExecutionRole role,
+            IWorkerGPUContext *gpu, void *stream)
+        {
+            if (!edges || !edges->requiresMaintenanceAdmission(role)) return false;
+            if (!gpu || !stream || !policy.allow_cached_graph_replay)
+                throw std::logic_error("Pipeline maintenance admission requires its original complete native graph compiler");
+            const auto owner = edges->maintenanceAdmission();
+            const auto member = edges->maintenanceParticipant();
+            auto prior = std::move(policy.retained_parent_composer);
+            policy.retained_parent_composer = [owner, member, prior = std::move(prior), gpu, stream](IGPUGraphCapture &destination,
+                const ComputeGraph &graph, std::span<const DeviceGraphExecutor::GraphSegmentCache::RetainedCaptureUnitTemplateView> units) {
+                std::unique_ptr<IGPUGraphCapture> body;
+                std::vector<GPUOrderedTimelineStep> steps{{.name = "original pipeline maintenance budget", .capture = owner->recording(member)}};
+                if (prior) {
+                    body = gpu->createGraphCapture(stream);
+                    if (!body || !prior(*body, graph, units)) return false;
+                    steps.push_back({.name = "original complete verifier body", .capture = body.get()});
+                } else {
+                    for (const auto &unit : units) {
+                        if (!unit.capture) return false;
+                        steps.push_back({.name = "original verifier capture unit", .capture = unit.capture});
+                    }
+                }
+                return !units.empty() && destination.buildOrderedTimelineTransaction(steps);
+            };
+            // A native minimum is inside this complete participant-local parent;
+            // no eager prefix or host-count phase may substitute for it.
+            policy.graph_replay_plan_policy = DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentComposition;
+            policy.defer_final_sync = true;
+            return true;
+        }
+
         /// @brief Build a prefill graph-cache config from the cached debug environment.
         PrefillGraphConfig makePrefillGraphConfigFromEnv(
-            int resident_graph_rows)
+            const IForwardExecutionHost &host)
         {
             const auto &env = debugEnv();
+            const auto resident_graph_rows = host.residentGraphRows();
             PrefillGraphConfig config;
             config.enabled = env.execution.gpu_graphs;
             config.minimum_padded_bucket_seq_len =
@@ -55,8 +95,24 @@ namespace llaminar2
             config.trace = env.execution.prefill_graph_trace;
             config.buckets_enabled = env.execution.prefill_graph_buckets;
             config.bucket_sizes = env.execution.prefill_graph_bucket_sizes;
-            config.max_cached_entries = static_cast<size_t>(env.execution.prefill_graph_max_cached_buckets);
+            config.max_cached_entries = host.retainedExactPrefillCacheEntries().value_or(
+                static_cast<size_t>(env.execution.prefill_graph_max_cached_buckets));
             return config;
+        }
+
+        /** @brief Select the common capture-cache stream from the actual graph execution policy.
+         * @param envelope Graph-owned native transaction boundary.
+         * @param policy Envelope-constrained host replay policy, including any installed retained parent.
+         * @return True when prefill executes through the common native transaction cache.
+         * Preparation and submission must use this same decision: an indivisible
+         * device timeline does not require a heterogeneous-segmentation flag.
+         */
+        bool prefillUsesCommonGraphCache(GraphNativeCaptureEnvelope envelope,
+            const DeviceGraphExecutor::DecodeCapturePolicy &policy)
+        {
+            return policy.heterogeneous_segmented_enabled ||
+                DeviceGraphExecutor::isRetainedParentPlanPolicy(policy.graph_replay_plan_policy) ||
+                requiresSingleNativeExecutable(envelope) || requiresHeterogeneousTicketSegmentation(envelope);
         }
 
         /// @brief Return the real-token count for an input, falling back to its execution length.
@@ -491,6 +547,12 @@ namespace llaminar2
             chunk_input.token_offset = plan.chunk.token_offset;
             chunk_input.position_offset = plan.chunk.token_offset;
             chunk_input.prefill_chunk_index = plan.chunk_index;
+            if (base_input.sparse_query_prefill_proof) {
+                chunk_input.sparse_query_prefill_proof = base_input.sparse_query_prefill_proof->chunk(
+                    plan.chunk.token_offset, plan.chunk.real_count);
+                chunk_input.sparse_query_execution_program = chunk_input.sparse_query_prefill_proof->program(
+                    qwen4exp::QwenSparseFirstRankingLogicalRow);
+            }
             /*
              * Sparse MoE packets carry only live rows, but the matching root
              * and participant graphs must still name this padded bucket by its
@@ -1088,6 +1150,30 @@ namespace llaminar2
         }
     }
 
+    namespace {
+    /**
+     * @brief Lower the declared source association through the existing cold host boundary.
+     * @param host Original graph execution host; retained callbacks never outlive this cold call.
+     * @param input Original prefill/decode input naming the existing boundary geometry.
+     * @param device Actual participant, without changing TP arithmetic membership order.
+     * @param decode Select the existing decode or prefill boundary operation.
+     * @param cache Original final-address graph/cache; ready replay creates no new callback.
+     * @return Original branch factory with an optional cold-only metadata callback.
+     */
+    GraphCaptureAuxiliaryBranchFactory sourceDefinitionBoundaryFactory(IForwardExecutionHost& host,
+        const ForwardInput& input,DeviceId device,bool decode,const ForwardGraphCache& cache){
+        auto factory=host.forwardGraphAuxiliaryBranchFactory(device);
+        // No new callback allocation or graph scan belongs to steady replay.
+        if(!cache.graph || !cache.graph->retainedParticipantDefinitionDomain() || cache.segment_cache.initialized)return factory;
+        factory.source_definition_boundary=[&host,&input,device,decode](const std::string& name,void* stream,
+            LocalTPCaptureSourceDefinition& handoff){
+            return decode?host.waitAtDecodeGraphCaptureBoundary(input,device,name,stream,handoff):
+                host.waitAtPrefillGraphCaptureBoundary(input,device,name,stream,handoff);
+        };
+        return factory;
+    }
+    }
+
     // =========================================================================
     // Construction
     // =========================================================================
@@ -1095,6 +1181,8 @@ namespace llaminar2
     ForwardExecutionEngine::ForwardExecutionEngine(Config config, DeviceGraphExecutor &executor)
         : config_(std::move(config)), executor_(executor)
     {
+        if (config_.sparse_query_program_count == 0u || config_.sparse_query_program_count > kSparseQueryExecutionProgramCount)
+            throw std::invalid_argument("Forward engine requires the original model's closed sparse-query owner roster");
     }
 
     // =========================================================================
@@ -1446,10 +1534,37 @@ namespace llaminar2
         // each captured materializer still reads the very same device KV count.
         for (size_t index = 0; index < schedule.chunks.size(); ++index)
         {
+            const auto &declaration = chunk_inputs.empty() ? base_input : chunk_inputs[index];
+            // Validate every request-derived choice before the first chunk can
+            // append KV/state. A later foreign declaration must not partially
+            // execute the original accepted request.
+            if (declaration.sparse_query_prefill_proof != base_input.sparse_query_prefill_proof ||
+                declaration.sparse_query_execution_program != base_input.sparse_query_execution_program)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill family changed its original admitted query proof/program");
+                return false;
+            }
+            if (base_input.sparse_query_prefill_proof) {
+                const auto &proof = *base_input.sparse_query_prefill_proof;
+                if (proof.isMaterialization() || base_input.execution_phase != ForwardExecutionPhase::Prefill ||
+                    proof.program(qwen4exp::QwenSparseFirstRankingLogicalRow) != base_input.sparse_query_execution_program)
+                    return false;
+                try {
+                    const auto chunk_proof = proof.chunk(schedule.chunks[index].chunk.token_offset,
+                        schedule.chunks[index].chunk.real_count);
+                    if (sparseQueryExecutionProgramIndex(chunk_proof.program(qwen4exp::QwenSparseFirstRankingLogicalRow)) >=
+                        config_.sparse_query_program_count) return false;
+                } catch (const std::invalid_argument &error) {
+                    LOG_ERROR("[ForwardExecutionEngine] Invalid admitted prefill chunk: " << error.what());
+                    return false;
+                }
+            } else if (base_input.sparse_query_execution_program != SparseQueryExecutionProgram::RankingPossible) {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill family omitted the required original query proof");
+                return false;
+            }
             if (!base_input.device_prefill_chunk)
                 continue;
             const auto &owner = *base_input.device_prefill_chunk;
-            const auto &declaration = chunk_inputs.empty() ? base_input : chunk_inputs[index];
             if (!declaration.device_prefill_chunk ||
                 declaration.device != base_input.device ||
                 declaration.batch_size != base_input.batch_size ||
@@ -1472,7 +1587,9 @@ namespace llaminar2
                 binding.chunk_real_rows_device != owner.chunk_real_rows_device ||
                 binding.chunk_row_stride_device != owner.chunk_row_stride_device ||
                 binding.request_row_capacity != owner.request_row_capacity ||
-                binding.pad_token_id != owner.pad_token_id)
+                binding.pad_token_id != owner.pad_token_id ||
+                binding.require_exact_rows != owner.require_exact_rows ||
+                (binding.require_exact_rows && schedule.chunks[index].chunk.real_count != binding.bucket_seq_len))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill bucket family changes request ownership or lacks the exact physical graph identity at chunk " << index);
                 return false;
@@ -1518,7 +1635,8 @@ namespace llaminar2
         cache_.clear();
     }
 
-    size_t ForwardExecutionEngine::invalidateMoEPlacementSensitiveGraphsForStablePlacement()
+    size_t ForwardExecutionEngine::invalidateMoEPlacementSensitiveGraphsForStablePlacement(
+        const std::function<void()> &before_invalidation)
     {
         size_t invalidated = 0;
         for (auto &[signature, cache] : cache_)
@@ -1536,6 +1654,7 @@ namespace llaminar2
                 continue;
             }
 
+            if (invalidated == 0 && before_invalidation) before_invalidation();
             cache.invalidate();
             ++invalidated;
         }
@@ -1735,13 +1854,16 @@ namespace llaminar2
     }
 
     void ForwardExecutionEngine::enforcePrefillForwardCapacity(
-        const ForwardGraphSignature *active_signature)
+        const IForwardExecutionHost &host, const ForwardGraphSignature *active_signature)
     {
-        const int configured_cap = debugEnv().execution.prefill_graph_max_cached_buckets;
-        if (configured_cap <= 0)
+        const auto configured_cap = host.retainedExactPrefillCacheEntries().value_or(
+            static_cast<std::size_t>(debugEnv().execution.prefill_graph_max_cached_buckets));
+        if (configured_cap == 0)
             return;
 
-        const size_t cap = static_cast<size_t>(configured_cap);
+        // The option bounds admitted physical bucket owners; the closed QSA
+        // programs retain distinct complete executables for each such bucket.
+        const size_t cap = static_cast<size_t>(configured_cap) * config_.sparse_query_program_count;
         while (prefillForwardCacheSize() > cap)
         {
             auto victim = cache_.end();
@@ -1797,6 +1919,37 @@ namespace llaminar2
         IForwardExecutionHost &host,
         std::optional<ForwardGraphSignature> *materialized_signature)
     {
+        // Geometry manifests and unknown values cannot resolve a GPU context,
+        // consult an executable cache, resize workspace, or submit any graph.
+        if(!executableForwardSubmissionIntent(input.graph_submission_intent))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Workspace declaration or unknown submission intent is not executable");
+            return false;
+        }
+        (void)sparseQueryExecutionProgramIndex(input.sparse_query_execution_program);
+        if (input.sparse_query_prefill_proof)
+        {
+            const auto &proof = *input.sparse_query_prefill_proof;
+            const bool materializing = input.graph_submission_intent ==
+                ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            const int rows = input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
+            if (input.execution_phase != ForwardExecutionPhase::Prefill || input.batch_size != 1 ||
+                sparseQueryExecutionProgramIndex(input.sparse_query_execution_program) >= config_.sparse_query_program_count ||
+                (proof.isMaterialization() ? !materializing : !proof.namesRange(effectiveTokenOffset(input), rows)) ||
+                proof.program(qwen4exp::QwenSparseFirstRankingLogicalRow) != input.sparse_query_execution_program)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill query topology lacks its exact original admitted range or cold materialization");
+                return false;
+            }
+        }
+        if (input.sparse_query_execution_program == SparseQueryExecutionProgram::ProvenNoRanking &&
+            input.execution_phase != ForwardExecutionPhase::Decode &&
+            !(input.execution_phase == ForwardExecutionPhase::Prefill && input.sparse_query_prefill_proof))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] No-ranking topology requires explicit Decode or proved Prefill admission");
+            return false;
+        }
+        if(input.device_request_query)requireDeviceRequestQueryOwnsInput(input);
         if (materialized_signature)
             materialized_signature->reset();
         last_executed_forward_graph_ = {};
@@ -1811,6 +1964,12 @@ namespace llaminar2
              input.position_policy != ForwardPositionPolicy::ExplicitRows))
         {
             LOG_ERROR("[ForwardExecutionEngine] Invalid graph-owned decode position binding");
+            return false;
+        }
+        if (input.pipeline_activation_ownership != ForwardPipelineActivationOwnership::ForwardGraph &&
+            (!config_.pipeline_forward_edges || config_.pipeline_forward_edges->encloses(input)))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Parent-owned activation input lacks its exact native pipeline setup owner");
             return false;
         }
         ScopedWorkerGPUContextResolver worker_resolver_scope(
@@ -1829,6 +1988,16 @@ namespace llaminar2
                 "[ForwardExecutionEngine] Setup-only forward graph "
                 "materialization requires a GPU input with no request-scoped "
                 "launch dependency");
+            return false;
+        }
+
+        if (input.state_transaction == ForwardStateTransaction::ForwardOnlyCondition &&
+            (!setup_materialization || !config_.pipeline_forward_edges ||
+             input.execution_role != ForwardExecutionRole::MainInference ||
+             input.execution_phase != ForwardExecutionPhase::Decode ||
+             input.batch_size != 1 || input.seq_len != 1 || !input.device_decode_position))
+        {
+            LOG_ERROR("ForwardOnly condition requires its original retained pipeline one-row source owner");
             return false;
         }
 
@@ -1856,11 +2025,21 @@ namespace llaminar2
                 "incomplete shifted-MTP prefill binding");
             return false;
         }
+        if (input.mtp_main_terminal_logits &&
+            (input.mtp_main_terminal_logits->declaration_only ||
+             !input.mtp_main_terminal_logits->validForRequestCount(input.batch_size)))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] MTP terminal-logit execution requires original finalized bindings");
+            return false;
+        }
         if (input.mtp_main_terminal_hidden &&
             (!input.mtp_main_terminal_hidden->executableForRequestCount(
                  input.batch_size) ||
              input.shifted_mtp_prefill.has_value() ||
              (input.state_transaction != ForwardStateTransaction::Ordinary &&
+              !(input.state_transaction == ForwardStateTransaction::ForwardOnlyCondition &&
+                input.execution_role == ForwardExecutionRole::MainInference &&
+                input.batch_size == 1 && input.seq_len == 1) &&
               !(input.state_transaction == ForwardStateTransaction::CommittedMTPCondition &&
                 input.execution_role == ForwardExecutionRole::MTPCondition &&
                 input.batch_size == 1 && input.seq_len == 1)) ||
@@ -2114,6 +2293,7 @@ namespace llaminar2
                 .execution_role = effective_input.execution_role,
                 .state_transaction = effective_input.state_transaction,
                 .decode = is_decode,
+                .sparse_query_execution_program = effective_input.sparse_query_execution_program,
                 .decode_has_history = decode_has_history,
                 .all_position_logits = all_position_logits,
                 .live_mtp_request_batch_condition =
@@ -2129,16 +2309,23 @@ namespace llaminar2
                 .position_policy = effective_input.position_policy,
                 .device_sequence_lengths = effective_input.sequence_lengths_device,
                 .device_decode_position = effective_input.device_decode_position,
+                .device_request_query_capture_identity = effective_input.device_request_query
+                    ? effective_input.device_request_query->captureIdentity() : uint64_t{0},
                 .device_prefill_chunk_capture_identity =
                     effective_input.device_prefill_chunk
                         ? effective_input.device_prefill_chunk->capture_identity
                         : uint64_t{0},
-                .pipeline_forward_edges = config_.pipeline_forward_edges && config_.pipeline_forward_edges->encloses(effective_input)
+                .pipeline_forward_edges = config_.pipeline_forward_edges &&
+                    (config_.pipeline_forward_edges->encloses(effective_input) ||
+                     effective_input.pipeline_activation_ownership == ForwardPipelineActivationOwnership::NativeGenerationParent)
                     ? config_.pipeline_forward_edges : nullptr,
+                .pipeline_activation_ownership = effective_input.pipeline_activation_ownership,
                 .shifted_mtp_prefill_capture_identity =
                     effective_input.shifted_mtp_prefill
                         ? effective_input.shifted_mtp_prefill->capture_identity
                         : uint64_t{0},
+                .mtp_main_terminal_logits_capture_identity = effective_input.mtp_main_terminal_logits
+                    ? effective_input.mtp_main_terminal_logits->capture_identity : uint64_t{0},
                 .mtp_main_terminal_hidden_capture_identity =
                     effective_input.mtp_main_terminal_hidden
                         ? effective_input.mtp_main_terminal_hidden
@@ -2323,7 +2510,7 @@ namespace llaminar2
             if (setup_materialization)
             {
                 if (success && !forward_signature.decode)
-                    enforcePrefillForwardCapacity(&forward_signature);
+                    enforcePrefillForwardCapacity(host, &forward_signature);
                 return success;
             }
             if (live_mtp_request_batch_condition &&
@@ -2343,7 +2530,7 @@ namespace llaminar2
                     output.execution.stream);
             }
             if (success && !forward_signature.decode)
-                enforcePrefillForwardCapacity(&forward_signature);
+                enforcePrefillForwardCapacity(host, &forward_signature);
             if (success)
                 host.commitSuccessfulForwardOutput(output);
             return success;
@@ -2422,7 +2609,7 @@ namespace llaminar2
         if (setup_materialization)
         {
             if (success && !forward_signature.decode)
-                enforcePrefillForwardCapacity(&forward_signature);
+                enforcePrefillForwardCapacity(host, &forward_signature);
             return success;
         }
         if (success && !output.execution.valid)
@@ -2544,6 +2731,8 @@ namespace llaminar2
         view.stream = template_view->stream;
         view.stage_count = template_view->stage_count;
         view.captured_node_count = template_view->captured_node_count;
+        view.storage_boundary=template_view->storage_boundary;
+        view.read_ahead_resources=template_view->read_ahead_resources;
         return view;
     }
 
@@ -2581,6 +2770,77 @@ namespace llaminar2
                 {{"context", forwardGraphPerfContext(signature)}, {"phase", "replay"},
                  {"source", "captured_generation_parent"}, {"observation", "authenticated_terminal"}});
         return true;
+    }
+
+    bool ForwardExecutionEngine::publishComposedForwardSnapshots(
+        const ForwardGraphSignature &signature,
+        const IGPUGraphCapture *source_capture,
+        void *producer_stream,
+        std::string *error)
+    {
+        const auto reject = [&](const char *reason) {
+            if (error) *error = reason;
+            return false;
+        };
+        if (error) error->clear();
+        if (reinterpret_cast<std::uintptr_t>(producer_stream) <= 2)
+            return reject("Composed forward diagnostics require the exact non-default parent stream");
+        if (!observeComposedForwardCompletion(signature, source_capture, 0, error))
+            return false;
+        auto &original = cache_.at(signature);
+        if (original.snapshot_configuration_epoch != executor_.snapshotConfigurationEpoch())
+            return reject("Composed forward diagnostics have a stale original snapshot configuration");
+        // The captured child already wrote this manifest's D2D slots. Use the
+        // ordinary bulk diagnostic acquisition and callbacks on the actual
+        // parent stream, never the stages' retained capture-time stream guesses.
+        if (!executor_.publishSnapshotsAfterGraphExecution(*original.graph, producer_stream,
+                "completed_composed_forward", &original.segment_cache.snapshot_manifest))
+            return reject("Composed forward could not publish its original captured snapshot manifest");
+        recordLastExecutedForwardGraph(signature, true, producer_stream);
+        return true;
+    }
+
+    std::vector<RetainedForwardSourceDefinition>
+    ForwardExecutionEngine::retainedSourceGraphDefinitions(uint64_t snapshot_identity) const
+    {
+        if (!snapshot_identity)
+            throw std::invalid_argument("Finite source family requires its original snapshot topology");
+        std::vector<RetainedForwardSourceDefinition> result;
+        for (const auto& [signature, cache] : cache_)
+        {
+            if (signature.snapshot_configuration_identity != snapshot_identity ||
+                !cache.valid || !cache.graph || !cache.segment_cache.initialized)
+                continue;
+            const auto& native = cache.segment_cache;
+            if (native.needs_capture || !native.successful_capture_count ||
+                !native.capture_variant_signature)
+                throw std::logic_error("Finite source family contains an incomplete captured graph");
+            const auto& declaration = cache.graph->retainedParticipantSourcePlan();
+            const auto& preparation = native.participant_preparation_stream;
+            if (static_cast<bool>(declaration) != static_cast<bool>(preparation))
+                throw std::logic_error("Finite source family lost its exact optional source preparation");
+            if (preparation)
+            {
+                preparation->requireCurrentDefinition();
+                const auto& definition = preparation->definition();
+                if (definition.graph != cache.graph.get() || definition.plan != declaration ||
+                    definition.topology_generation != cache.graph->topologyGeneration() ||
+                    definition.variant != native.capture_variant_signature)
+                    throw std::logic_error("Finite source family substituted its original graph definition");
+            }
+            const auto role = signature.execution_role == ForwardExecutionRole::GroupedMTPVerifier
+                ? MoEOverlayInferenceGraphRole::MTPGroupedVerifier
+                : signature.decode ? MoEOverlayInferenceGraphRole::MainDecode
+                                   : MoEOverlayInferenceGraphRole::MainPrefill;
+            const auto rows = static_cast<int64_t>(signature.batch_size) * signature.seq_len;
+            if (rows <= 0 || rows > std::numeric_limits<int>::max())
+                throw std::logic_error("Finite source family has no original physical row geometry");
+            auto owned=RetainedForwardSourceDefinition::projectOwned(signature,role,static_cast<int>(rows),
+                *cache.graph,native.capture_variant_signature,preparation,native.recorded_source_definition,
+                native.participant_auxiliary_preparation,native.original_storage_attachment.get());
+            if(owned)result.push_back(std::move(*owned));
+        }
+        return result;
     }
 
     std::optional<ForwardExecutionEngine::RetainedDecodeGraphView>
@@ -2632,6 +2892,12 @@ namespace llaminar2
         view.signature = signature;
         view.device = signature.device;
         view.stream = cache.segment_cache.capture_stream;
+        view.graph_owner = cache.graph.get();
+        view.topology_generation = cache.graph->topologyGeneration();
+        view.workspace_generation = cache.workspace_generation;
+        view.capture_variant_signature = cache.segment_cache.capture_variant_signature;
+        view.capture_generation = cache.segment_cache.successful_capture_count;
+        view.read_ahead_resources=cache.graph->readAheadBranch()?cache.graph->readAheadBranch()->resources:nullptr;
         const auto &parent_plan =
             cache.segment_cache.retained_composed_parent_replay;
         if (parent_plan.valid())
@@ -2765,13 +3031,18 @@ namespace llaminar2
             {
                 auto parent_plan =
                     makeMoEOverlayRetainedParentPlan(*cache.graph);
-                if (!parent_plan ||
-                    parent_plan->replay_policy != plan_policy)
-                {
-                    return fail(
-                        "retained parent graph no longer declares the sealed typed packet lifecycle");
-                }
-                parent_composer = std::move(parent_plan->composer);
+                const bool pipeline_budget = config_.pipeline_forward_edges &&
+                    config_.pipeline_forward_edges->requiresMaintenanceAdmission(signature.execution_role);
+                if ((!parent_plan && !pipeline_budget) ||
+                    (parent_plan && parent_plan->replay_policy != plan_policy && !pipeline_budget))
+                    return fail("retained parent graph no longer declares its sealed packet/budget lifecycle");
+                if (parent_plan) parent_composer = std::move(parent_plan->composer);
+                DeviceGraphExecutor::DecodeCapturePolicy composition;
+                composition.allow_cached_graph_replay = true;
+                composition.retained_parent_composer = std::move(parent_composer);
+                (void)composePipelineMaintenanceAdmission(composition, config_.pipeline_forward_edges,
+                    signature.execution_role, cache.gpu_ctx, cache.segment_cache.capture_stream);
+                parent_composer = std::move(composition.retained_parent_composer);
             }
             catch (const std::exception &ex)
             {
@@ -2839,7 +3110,10 @@ namespace llaminar2
              {"composed_parent",
               retained->composed_parent ? "true" : "false"},
              {"role", std::to_string(static_cast<int>(
-                          signature.execution_role))}});
+                          signature.execution_role))},
+             {"physical_rows", std::to_string(signature.seq_len)},
+             {"sparse_query_program", std::to_string(sparseQueryExecutionProgramIndex(signature.sparse_query_execution_program))},
+             {"capture_family", std::to_string(cache.segment_cache.evidence_family)}});
         return true;
     }
 
@@ -3120,8 +3394,7 @@ namespace llaminar2
         try
         {
             capture_policy.auxiliary_branch_factory =
-                host.forwardGraphAuxiliaryBranchFactory(
-                    ctx->deviceId());
+                sourceDefinitionBoundaryFactory(host,input,ctx->deviceId(),true,forward_cache);
             const GraphNativeCaptureEnvelope native_capture_envelope =
                 forward_cache.graph->nativeCaptureEnvelope();
             std::string envelope_error;
@@ -3148,6 +3421,8 @@ namespace llaminar2
                     std::move(sparse_parent_plan->composer);
                 capture_policy.defer_final_sync = true;
             }
+            (void)composePipelineMaintenanceAdmission(capture_policy, config_.pipeline_forward_edges,
+                input.execution_role, gpu_ctx, forward_cache.segment_cache.capture_stream);
         }
         catch (const std::exception &error)
         {
@@ -3199,7 +3474,8 @@ namespace llaminar2
         ForwardGraphCache &forward_cache,
         IForwardExecutionHost &host,
         const ForwardGraphSignature &signature,
-        std::chrono::high_resolution_clock::time_point start)
+        std::chrono::high_resolution_clock::time_point start,
+        HostPipelineBoundarySubmission pp_submission)
     {
         const bool is_decode = signature.decode;
         // ===== CACHE HIT: Reuse cached decode graph =====
@@ -3306,51 +3582,21 @@ namespace llaminar2
             }
         }
 
-        // PP hidden state copy: for non-embedding PP stages, copy the
-        // external hidden state (from previous PP stage) to the working
-        // buffer before executing the cached graph.
-        if (forward_cache.pp_needs_copy &&
-            forward_cache.pp_external_hidden_state &&
-            forward_cache.pp_working_buffer)
-        {
-            // PP hidden-state handoff. copyActivation picks the cheapest transport
-            // for the (source authoritative device -> pp_device) pair:
-            //   - same physical GPU   -> intra-VRAM device-to-device memcpy
-            //   - same-vendor diff GPU -> peer copy (NCCL/RCCL or peer DMA)
-            //   - cross-vendor / host  -> single host-staged bounce
-            // and leaves the destination DEVICE_AUTHORITATIVE on pp_device.
-            //
-            // In the steady-state heterogeneous CUDA->ROCm case the producing
-            // stage's transferActivation() has already moved the external hidden
-            // state onto pp_device (rocm:0), so this resolves to an intra-GPU D2D
-            // copy. This replaces the old data()/memcpy/ensureOnDevice host
-            // round-trip that cost ~30ms/token.
-            const bool pp_time = is_decode && debugEnv().tp_timing;
-            auto pp_t0 = pp_time ? Clock::now() : Clock::time_point{};
-
-            auto pp_result = TransferEngine::instance().copyActivation(
-                forward_cache.pp_external_hidden_state, forward_cache.pp_working_buffer,
-                forward_cache.pp_device, forward_cache.pp_copy_bytes);
-
-            // Fail loud: a failed hidden-state handoff corrupts the entire
-            // downstream pipeline stage, so there is no safe fallback.
-            if (!pp_result.success)
-            {
-                LOG_ERROR("[PP_COPY] copyActivation failed on "
-                          << forward_cache.pp_device << ": " << pp_result.error);
-                throw std::runtime_error("PP hidden-state copy failed: " + pp_result.error);
-            }
-
-            if (pp_time)
-            {
-                auto pp_t1 = Clock::now();
-                double total_us =
-                    std::chrono::duration<double, std::micro>(pp_t1 - pp_t0).count();
-                LOG_DEBUG("[PP_COPY] dev=" << forward_cache.pp_device << " method="
-                          << to_string(pp_result.method_used) << " total=" << total_us
-                          << "us bytes=" << forward_cache.pp_copy_bytes);
-            }
-        }
+        // The explicit host boundary owns this invocation's live rows. Resolve
+        // again on every replay; graph-cache capacity is never a transfer extent.
+        const auto current_pp_copy = host.resolvePPCopyInfo(input);
+        consumeHostPipelineActivationBoundary(
+            input.graph_submission_intent == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch
+                ? HostPipelineBoundaryExecution::MaterializeOnly : HostPipelineBoundaryExecution::Execute,
+            pp_submission,
+            [&] { return current_pp_copy; },
+            [&](const auto &pp_copy) {
+                auto result = TransferEngine::instance().copyActivation(
+                    pp_copy.external_hidden, pp_copy.working_buffer,
+                    pp_copy.device, pp_copy.copy_bytes);
+                if (!result.success)
+                    throw std::runtime_error("PP hidden-state copy failed: " + result.error);
+            });
 
         if (profiling_setup)
         {
@@ -3455,18 +3701,25 @@ namespace llaminar2
             }
         }
 
-        bool heterogeneous_prefill_segmented = false;
+        bool prefill_uses_common_cache_stream = false;
         if ((decode_capture_allowed || !is_decode) &&
             stream_ctx && stream_ctx->deviceId().is_gpu() && stream_gpu_ctx)
         {
-            const auto early_capture_policy = host.buildDecodeCapturePolicy(
+            auto early_capture_policy = host.buildDecodeCapturePolicy(
                 !forward_cache.collective_nodes.empty(),
                 stream_ctx);
-
-            const bool use_segment_cache_stream =
-                decode_capture_allowed ||
-                (!is_decode &&
-                 early_capture_policy.heterogeneous_segmented_enabled);
+            const auto stream_capture_envelope = forward_cache.graph->nativeCaptureEnvelope();
+            std::string envelope_error;
+            if (!DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
+                    stream_capture_envelope, early_capture_policy, &envelope_error))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Cached graph stream prelude rejected its native capture envelope: "
+                    << envelope_error);
+                return false;
+            }
+            const bool native_prefill_uses_common_cache = !is_decode &&
+                prefillUsesCommonGraphCache(stream_capture_envelope, early_capture_policy);
+            const bool use_segment_cache_stream = decode_capture_allowed || native_prefill_uses_common_cache;
             if (early_capture_policy.allow_cached_graph_replay &&
                 use_segment_cache_stream)
             {
@@ -3479,10 +3732,9 @@ namespace llaminar2
                         stream_gpu_ctx))
                 {
                     replay_stream = forward_cache.segment_cache.capture_stream;
+                    executor_.bindRetainedParticipantPreparationStream(*forward_cache.graph,forward_cache.segment_cache,stream_gpu_ctx);
                     dynamic_param_stream = replay_stream;
-                    heterogeneous_prefill_segmented =
-                        !is_decode &&
-                        early_capture_policy.heterogeneous_segmented_enabled;
+                    prefill_uses_common_cache_stream = native_prefill_uses_common_cache;
                 }
                 else
                 {
@@ -3493,7 +3745,7 @@ namespace llaminar2
             }
         }
 
-        if (!is_decode && stream_gpu_ctx && !heterogeneous_prefill_segmented)
+        if (!is_decode && stream_gpu_ctx && !prefill_uses_common_cache_stream)
         {
             if (forward_cache.prefill_capture_stream.ensure(stream_gpu_ctx))
             {
@@ -3528,7 +3780,8 @@ namespace llaminar2
                       << " applied_stream=" << forward_cache.applied_stream);
         }
 
-        if (forward_cache.pp_needs_copy && forward_cache.pp_working_buffer &&
+        if (current_pp_copy.needs_copy && current_pp_copy.copy_bytes > 0 &&
+            input.graph_submission_intent == ForwardGraphSubmissionIntent::Execute &&
             stream_device.is_gpu())
         {
             // Retained replay deliberately skips the full stage-input walk.
@@ -3537,7 +3790,7 @@ namespace llaminar2
             // stream; residency and cached pointer identity do not imply that
             // an asynchronous transfer has finished writing the bytes.
             TransferEngine::requireDeviceInput(
-                forward_cache.pp_working_buffer, stream_device,
+                current_pp_copy.working_buffer, stream_device,
                 dynamic_param_stream);
         }
 
@@ -3795,8 +4048,7 @@ namespace llaminar2
             try
             {
                 capture_policy.auxiliary_branch_factory =
-                    host.forwardGraphAuxiliaryBranchFactory(
-                        ctx->deviceId());
+                    sourceDefinitionBoundaryFactory(host,input,ctx->deviceId(),true,forward_cache);
                 std::string envelope_error;
                 if (!DeviceGraphCaptureController::
                         constrainReplayPolicyToNativeEnvelope(
@@ -3827,6 +4079,8 @@ namespace llaminar2
                         std::move(sparse_parent_plan->composer);
                     uses_retained_sparse_parent = true;
                 }
+                (void)composePipelineMaintenanceAdmission(capture_policy, config_.pipeline_forward_edges,
+                    input.execution_role, forward_cache.gpu_ctx, forward_cache.segment_cache.capture_stream);
             }
             catch (const std::exception &ex)
             {
@@ -4345,7 +4599,7 @@ namespace llaminar2
         {
             forward_cache.prefill_graph_cache =
                 std::make_unique<PrefillGraphCache>(
-                    makePrefillGraphConfigFromEnv(host.residentGraphRows()));
+                    makePrefillGraphConfigFromEnv(host));
         }
 
         auto &cache = *forward_cache.prefill_graph_cache;
@@ -4490,15 +4744,11 @@ namespace llaminar2
             forward_cache.graph->nativeCaptureEnvelope();
         const bool uses_device_timeline_transaction =
             requiresSingleNativeExecutable(native_capture_envelope);
-        const bool uses_heterogeneous_ticket_transaction =
-            requiresHeterogeneousTicketSegmentation(
-                native_capture_envelope);
         bool uses_retained_sparse_parent = false;
         try
         {
             prefill_capture_policy.auxiliary_branch_factory =
-                host.forwardGraphAuxiliaryBranchFactory(
-                    ctx->deviceId());
+                sourceDefinitionBoundaryFactory(host,input,ctx->deviceId(),false,forward_cache);
             std::string envelope_error;
             if (!DeviceGraphCaptureController::
                     constrainReplayPolicyToNativeEnvelope(
@@ -4547,10 +4797,7 @@ namespace llaminar2
             !forward_cache.collective_nodes.empty() &&
             prefill_capture_policy.collectives_graph_capturable;
         const bool prefill_heterogeneous_segmentation_admitted =
-            prefill_capture_policy.heterogeneous_segmented_enabled ||
-            uses_retained_sparse_parent ||
-            uses_device_timeline_transaction ||
-            uses_heterogeneous_ticket_transaction;
+            prefillUsesCommonGraphCache(native_capture_envelope, prefill_capture_policy);
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
         std::string padded_reject_stage_name;
@@ -5289,6 +5536,19 @@ namespace llaminar2
              * callback cannot strand the native stream in capture mode, and a
              * failed graph body cannot enter eager recovery.
              */
+            // Match decode's stage-owned capture lifecycle. Completed is emitted
+            // only after this exact prefill unit has successfully instantiated;
+            // the RAII owner aborts every entered stage on failures/exceptions.
+            std::vector<IComputeStage *> capture_stages;
+            for (const auto &name : forward_cache.graph->getExecutionOrder())
+            {
+                const auto *node = forward_cache.graph->getNode(name);
+                if (!node || !node->stage) return false;
+                capture_stages.push_back(node->stage.get());
+            }
+            ScopedGraphCaptureStageActivity stage_capture_activity(
+                capture_stages, ctx, stream, "monolithic prefill capture");
+            if (!stage_capture_activity.begin()) return false;
             if (!cache.captureAndInstantiate(
                     key,
                     gpu_ctx,
@@ -5314,6 +5574,12 @@ namespace llaminar2
                 LOG_ERROR(
                     "[ForwardExecutionEngine] Mandatory prefill graph capture transaction failed for seq_len="
                     << input.seq_len);
+                return false;
+            }
+
+            if (!stage_capture_activity.finish(GraphCaptureActivityTransition::Completed))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill stage capture terminal publication failed");
                 return false;
             }
 
@@ -5591,6 +5857,13 @@ namespace llaminar2
 
         if (should_cache && build_cache)
         {
+            // Retire every previous capture/auxiliary/source borrower BEFORE
+            // replacing its graph or stable inputs. An invalid cache entry can
+            // still own a failed cold attempt's native objects. Reapply only
+            // immutable signature metadata after this original-owner teardown.
+            build_cache->invalidate();
+            bindGraphSnapshotArenaReusePolicy(*build_cache, signature);
+            build_cache->segment_cache.replay_workload = replayWorkloadGeometryForSignature(signature);
             const int total_tokens = effective_input.batch_size * effective_input.seq_len;
             if (effective_input.token_ids)
             {
@@ -5616,20 +5889,18 @@ namespace llaminar2
          * peer transport, or the explicitly designed heterogeneous host-staged
          * boundary and publishes destination authority as one operation.
          */
-        const auto initial_pp_copy = host.resolvePPCopyInfo(effective_input);
-        if (initial_pp_copy.needs_copy)
-        {
-            auto pp_result = TransferEngine::instance().copyActivation(
-                initial_pp_copy.external_hidden,
-                initial_pp_copy.working_buffer,
-                initial_pp_copy.device,
-                initial_pp_copy.copy_bytes);
-            if (!pp_result.success)
-            {
-                throw std::runtime_error(
-                    "Initial PP hidden-state copy failed: " + pp_result.error);
-            }
-        }
+        consumeHostPipelineActivationBoundary(
+            effective_input.graph_submission_intent == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch
+                ? HostPipelineBoundaryExecution::MaterializeOnly : HostPipelineBoundaryExecution::Execute,
+            HostPipelineBoundarySubmission::Current,
+            [&] { return host.resolvePPCopyInfo(effective_input); },
+            [&](const auto &pp_copy) {
+                auto result = TransferEngine::instance().copyActivation(
+                    pp_copy.external_hidden, pp_copy.working_buffer,
+                    pp_copy.device, pp_copy.copy_bytes);
+                if (!result.success)
+                    throw std::runtime_error("Initial PP hidden-state copy failed: " + result.error);
+            });
 
         // Build forward graph via host callback
         GraphBuildResult build_result = host.buildForwardGraph(effective_input);
@@ -5641,7 +5912,18 @@ namespace llaminar2
         }
 
         output = build_result.output();
-        ComputeGraph graph = build_result.takeGraph();
+        // Capture seals retain the ComputeGraph address, not just its stages.
+        // The existing INVALID entry owns its graph at the final heap address
+        // before workspace/capture callbacks. Only the original success boundary
+        // publishes validity. Failure erasure retires segment/source borrowers
+        // before graph destruction (ForwardGraphCache declaration order).
+        // Uncached execution retains its original stack allocation/lifetime.
+        std::optional<ComputeGraph> uncached_graph;
+        if (should_cache && build_cache)
+            build_cache->graph = std::make_unique<ComputeGraph>(build_result.takeGraph());
+        else
+            uncached_graph.emplace(build_result.takeGraph());
+        ComputeGraph &graph = should_cache && build_cache ? *build_cache->graph : *uncached_graph;
 
         // Native pipeline transport is an explicit graph operation. The
         // surrounding chunk/verifier prelude still owns local positions/real lengths;
@@ -5709,6 +5991,7 @@ namespace llaminar2
                     .request_row_capacity = binding.request_row_capacity,
                     .bucket_seq_len = binding.bucket_seq_len,
                     .pad_token_id = binding.pad_token_id,
+                    .require_exact_rows = binding.require_exact_rows,
                     .capture_identity = binding.capture_identity,
                     .stage_name = kChunkMaterializationNode,
                 }),
@@ -5759,7 +6042,7 @@ namespace llaminar2
         if (bucketed_prefill_miss)
         {
             PrefillGraphCache preflight_cache(
-                makePrefillGraphConfigFromEnv(host.residentGraphRows()));
+                makePrefillGraphConfigFromEnv(host));
             PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
             /*
              * Reject graph-intrinsic violations before asking the host for a
@@ -5830,8 +6113,7 @@ namespace llaminar2
                 {
                     build_cache->prefill_graph_cache =
                         std::make_unique<PrefillGraphCache>(
-                            makePrefillGraphConfigFromEnv(
-                                host.residentGraphRows()));
+                            makePrefillGraphConfigFromEnv(host));
                 }
                 if (build_cache && build_cache->prefill_graph_cache)
                 {
@@ -5949,8 +6231,7 @@ namespace llaminar2
         if (should_cache && build_cache && atomic_gpu_graph_first_use &&
             effective_input.device.is_gpu())
         {
-            build_cache->graph =
-                std::make_unique<ComputeGraph>(std::move(graph));
+            // The original graph already occupies its final cache-owned address.
             build_cache->output = output;
             build_cache->workspace_generation = workspace_generation;
             build_cache->snapshot_configuration_epoch =
@@ -5964,36 +6245,21 @@ namespace llaminar2
             build_cache->moe_overlay_collective_runtime_stages_cached = true;
             build_cache->valid = true;
 
-            /*
-             * The initial PP handoff already ran before graph construction.
-             * Publish its immutable cache bindings now, but arm repetition only
-             * after first-use execution so that invocation does not copy the
-             * same activation twice.
-             */
-            if (initial_pp_copy.needs_copy)
-            {
-                build_cache->pp_external_hidden_state =
-                    initial_pp_copy.external_hidden;
-                build_cache->pp_working_buffer =
-                    initial_pp_copy.working_buffer;
-                build_cache->pp_copy_bytes = initial_pp_copy.copy_bytes;
-                build_cache->pp_device = initial_pp_copy.device;
-            }
-
+            // The current boundary was already consumed above, including the
+            // setup-only no-copy decision. First-use routing must not repeat it.
             const bool first_use_success = executeCacheHit(
                 effective_input,
                 output,
                 *build_cache,
                 host,
                 signature,
-                start);
+                start, HostPipelineBoundarySubmission::AlreadySubmitted);
             if (!first_use_success)
             {
                 build_cache->invalidate();
                 return false;
             }
 
-            build_cache->pp_needs_copy = initial_pp_copy.needs_copy;
             LOG_DEBUG(
                 "[ForwardExecutionEngine] Atomically materialized first-use "
                 "GPU graph [kind="
@@ -6313,7 +6579,7 @@ namespace llaminar2
         // Cache the graph for future matching forward signatures
         if (should_cache && build_cache && success)
         {
-            build_cache->graph = std::make_unique<ComputeGraph>(std::move(graph));
+            // The original graph already occupies its final cache-owned address.
             build_cache->output = output;
             build_cache->workspace_generation = workspace_generation;
             build_cache->snapshot_configuration_epoch =
@@ -6332,21 +6598,7 @@ namespace llaminar2
             build_cache->valid = true;
             touchPrefillForwardCache(signature, *build_cache);
 
-            // Store PP hidden state copy info for cache HIT replay
-            if (initial_pp_copy.needs_copy)
-            {
-                build_cache->pp_external_hidden_state =
-                    initial_pp_copy.external_hidden;
-                build_cache->pp_working_buffer =
-                    initial_pp_copy.working_buffer;
-                build_cache->pp_copy_bytes = initial_pp_copy.copy_bytes;
-                build_cache->pp_device = initial_pp_copy.device;
-                build_cache->pp_needs_copy = true;
-
-                LOG_DEBUG("[ForwardExecutionEngine] Stored PP copy info: "
-                          << initial_pp_copy.copy_bytes << " bytes on "
-                          << initial_pp_copy.device.toString());
-            }
+            // PP live rows belong to each subsequent host boundary, not this cache.
 
             LOG_DEBUG("[ForwardExecutionEngine] Cached forward graph for signature "
                       << "[seq_len=" << signature.seq_len
@@ -6362,8 +6614,7 @@ namespace llaminar2
                 {
                     build_cache->prefill_graph_cache =
                         std::make_unique<PrefillGraphCache>(
-                            makePrefillGraphConfigFromEnv(
-                                host.residentGraphRows()));
+                            makePrefillGraphConfigFromEnv(host));
                 }
 
                 PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
@@ -6397,7 +6648,7 @@ namespace llaminar2
                 }
             }
             if (!signature.decode)
-                enforcePrefillForwardCapacity(&signature);
+                enforcePrefillForwardCapacity(host, &signature);
         }
 
         auto end = std::chrono::high_resolution_clock::now();

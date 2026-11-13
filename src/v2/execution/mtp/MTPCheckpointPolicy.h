@@ -12,9 +12,30 @@
 #pragma once
 
 #include <cstddef>
+#include "execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 
 namespace llaminar2
 {
+    /**
+     * @brief Require complete MTP graph bindings for execution or retained setup.
+     * @param execution_enabled Logical request policy; retained capacity never enables execution.
+     * @param retains_capacity Original model-lifetime MTP graph/state envelope.
+     * @param submission Explicit forward lifecycle, shared by capture and execution.
+     * @return Whether this lifecycle needs MTP transaction topology.
+     *
+     * Materialization captures the complete future transaction without launching
+     * it. An Off request still binds no shifted state during ordinary execution.
+     * Workspace declarations retain their separate nonexecutable binding purpose.
+     */
+    [[nodiscard]] constexpr bool requiresMTPGraphTransactionBinding(
+        bool execution_enabled, bool retains_capacity,
+        ForwardGraphSubmissionIntent submission) noexcept
+    {
+        return execution_enabled || (retains_capacity &&
+            (submission == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch ||
+             submission == ForwardGraphSubmissionIntent::WorkspaceDeclaration));
+    }
+
     /** @brief State owned by a participant, independently of the current draft depth. */
     enum class MTPStateRole
     {

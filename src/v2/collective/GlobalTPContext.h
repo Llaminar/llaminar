@@ -4,6 +4,8 @@
  *
  * Provides concrete implementation of IGlobalTPContext for managing
  * tensor parallelism across multiple MPI ranks using UPI/MPI.
+ * Original CPU shard packets may select parallel shared gathering from their
+ * replicated live extent; arbitrary variable-count callers retain fixed policy.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -12,6 +14,7 @@
 #pragma once
 
 #include "IGlobalTPContext.h"
+#include "NativeCPUCollectiveProgram.h"
 #include "ICollectiveBackend.h"
 #include "backends/UPIBackend.h"
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
@@ -21,10 +24,15 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <variant>
 #include <mpi.h>
 
 namespace llaminar2
 {
+    namespace test { struct CPURootedPublicationTransportReplayAccess; }
+    class MoECPUExpertShardRouteStage;
+    class CPUExpertShardSourceSelection;
+    struct MoEOverlaySparseRows;
 
     /** Communication operation governed by the same-node rooted policy. */
     enum class CPURootedPublicationOperation : uint8_t
@@ -38,19 +46,24 @@ namespace llaminar2
     {
         SharedMemoryLatency,
         MPIBandwidth,
+        SharedMemoryParallel,
     };
 
     /**
      * @brief Measured transport policy for exact same-node CPU MoE publication.
      *
      * `V2_Perf_CPURootedPublicationTransport` sweeps both protocols from 8 KiB
-     * through 32 MiB. On the supported dual-socket topology, shared memory wins
-     * the decode-sized latency regime while MPI wins once copy bandwidth
-     * dominates. The operation-specific boundaries deliberately leave margin
+     * through 32 MiB. The original scalar shared path wins the decode-sized
+     * latency regime while MPI wins over its serial large copies. Parallel
+     * shared copies have a separately measured full-chunk regime. Boundaries leave margin
      * around the measured crossover instead of dispatching on a noisy tie.
      *
      * Selection is total over payload size and happens before communication;
-     * runtime failure never changes transport.
+     * runtime failure never changes transport. Original CPU tensor-shard prefill
+     * may additionally use parallel shared copies once every remote participant
+     * has one complete physical arena chunk of live records. Its packet contract
+     * guarantees identical per-member live counts without a count collective;
+     * generic variable-count and broadcast selection remain unchanged.
      */
     struct CPURootedPublicationTransportPolicy
     {
@@ -60,6 +73,38 @@ namespace llaminar2
         /** Includes compact d=2048 verifier groups through M=4. */
         static constexpr size_t kBroadcastSharedMemoryMaxBytes =
             32u * 1024u;
+
+        /** One physical FP32 participant chunk; statically bound to the arena in the implementation. */
+        static constexpr size_t kReplicatedParallelGatherMinMemberBytes = 4u * 1024u * 1024u;
+
+        /**
+         * @brief Select from proven replicated live bytes, excluding root's aliased block.
+         * @param declared_bytes Common receive declaration used by the original latency policy.
+         * @param per_member_live_bytes Exact replicated record prefix of ONE remote member.
+         * @return Parallel shared copies only for at least one full remote chunk;
+         *         otherwise the unchanged original declared-extent selection.
+         * @note Degree does not amplify tiny contributions across this threshold.
+         * Geometry checks and replicated-count authority belong to the private native API.
+         */
+        [[nodiscard]] static constexpr CPURootedPublicationTransport selectReplicatedPrefillGather(
+            size_t declared_bytes, size_t per_member_live_bytes) noexcept
+        {
+            return per_member_live_bytes >= kReplicatedParallelGatherMinMemberBytes
+                ? CPURootedPublicationTransport::SharedMemoryParallel
+                : select(CPURootedPublicationOperation::PackedRecordGather,declared_bytes);
+        }
+
+        /** @return Stable observation name for the exact selected native protocol. */
+        [[nodiscard]] static constexpr const char* name(CPURootedPublicationTransport transport) noexcept
+        {
+            switch(transport)
+            {
+            case CPURootedPublicationTransport::SharedMemoryLatency: return "shared_memory_latency";
+            case CPURootedPublicationTransport::MPIBandwidth: return "mpi_bandwidth";
+            case CPURootedPublicationTransport::SharedMemoryParallel: return "shared_memory_parallel";
+            }
+            return "invalid";
+        }
 
         /** Select the first-class transport for one common payload size. */
         [[nodiscard]] static constexpr CPURootedPublicationTransport select(
@@ -112,6 +157,35 @@ namespace llaminar2
          * @param backend_type Explicit collective policy for this domain.
          * @return Unique pointer to GlobalTPContext, or nullptr on error
          */
+        /**
+         * @brief Create the original declared CPU expert domain under its same-PMA runtime commitment.
+         * @param base_comm Existing original parent communicator; every rank enters the same split.
+         * @param program Immutable ordered expert partial-routing domain.
+         * @param use Exact member-domain or excluded-parent process scope, never fabricated membership.
+         * @return Original retained context, or null only for an excluded rank.
+         * @throws std::invalid_argument Collectively before native entry for foreign/missing tokens.
+         */
+        static std::shared_ptr<GlobalTPContext> createAdmittedCPUExpertDomain(
+            MPI_Comm base_comm,const NativeCPUCollectiveProgram &program,
+            std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse> use);
+        /**
+         * @brief Retire the original domain after all local graph/worker borrowers have stopped.
+         * @return True after local unmap, original all-member terminal acknowledgement,
+         *         creator-only backing release and actual communicator destruction.
+         * @note Explicit shutdown only. Destruction never enters a collective.
+         */
+        bool retireOriginalCPUExpertDomain();
+        /** @return Whether a borrower shares this still-live admitted native domain's original control block. */
+        bool authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower) const noexcept;
+        /**
+         * @brief Authenticate an original CPU stage borrow in its parent rank namespace.
+         * @param borrower Shared handle to this native owner and its original control block.
+         * @param parent Exact live parent communicator used for this domain's original split.
+         * @return True only while both the original domain and parent identity match.
+         */
+        bool authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower,
+            MPI_Comm parent) const noexcept;
+
         static std::unique_ptr<GlobalTPContext> createWithSplit(
             MPI_Comm base_comm,
             int domain_id,
@@ -194,6 +268,10 @@ namespace llaminar2
             int root_index,
             size_t &gathered_record_count,
             const std::string &stage_name) override;
+        /** @copydoc IGlobalTPContext::gatherVariableFloatRecordsToRoot */
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &, std::span<RootedFloatRecordRange>) override;
         bool broadcastFloatElements(
             TensorBase *tensor,
             size_t element_count,
@@ -254,6 +332,41 @@ namespace llaminar2
         std::string collectiveBackendNameForDiagnostics() const;
 
     private:
+        /** @brief The named Perf fixture may invoke the retained SharedSpin gather.
+         * No public transport override or independent backend lifetime is exposed;
+         * the admitted original context still owns allocation and retirement.
+         */
+        friend struct test::CPURootedPublicationTransportReplayAccess;
+        friend class MoECPUExpertShardRouteStage;
+        /**
+         * @brief Gather the original ordinary-prefill CPU cohort's replicated route set.
+         * @param source Original immutable cohort/member/source selection, never a shape guess.
+         * @param packet Original acquired sparse packet; it alone supplies live count and phase.
+         * @param owner Exact retained native domain borrower authenticated for this call.
+         * @param local Original packed partial prefix, validated against packet before entry.
+         * @param root Original root receive allocation; aliases local on root.
+         * @param capacity Original common admitted receive capacity in records.
+         * @param root_index Original cohort gather root.
+         * @param gathered Completed live records on root, zero elsewhere.
+         * @param stage Original stage identity for observations/errors.
+         * @param ranges Original root-only participant provenance scratch.
+         * @param selected Receives actual native policy, including explicit MPI domains.
+         * @return Native result; no alternate protocol is attempted after failure.
+         * @note Private: arbitrary callers cannot assert replication or pass a count.
+         * The stage authenticates the original prepared bank and packet epoch first.
+         */
+        bool gatherReplicatedCPUExpertPrefillRoutesToRoot(
+            const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+            const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
+            size_t capacity,int root_index,size_t& gathered,const std::string& stage,
+            std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected);
+
+        /** @brief Shared original gather body; ranges never alter the wire protocol. */
+        bool gatherVariableFloatRecordsToRootImpl(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &, std::span<RootedFloatRecordRange>,
+            std::optional<CPURootedPublicationTransport> original_selection=std::nullopt);
+
         // Private constructor - use factory methods
         GlobalTPContext(
             MPI_Comm domain_comm,
@@ -264,11 +377,20 @@ namespace llaminar2
             bool owns_communicator,
             CollectiveBackendType backend_type = CollectiveBackendType::UPI,
             std::vector<int> node_ids = {},
-            std::optional<GlobalDeviceAddress> local_device = std::nullopt);
+            std::optional<GlobalDeviceAddress> local_device = std::nullopt,
+            std::shared_ptr<PhysicalMemoryAuthority> original_memory = {});
+        /** @brief Shared native constructor path; only the closed admitted factory supplies a PMA. */
+        static std::unique_ptr<GlobalTPContext> createWithSplitImpl(MPI_Comm base_comm,int domain_id,
+            int color,int key,std::optional<GlobalDeviceAddress> local_device,const std::string& hostfile,
+            CollectiveBackendType backend,std::shared_ptr<PhysicalMemoryAuthority> original_memory);
 
         /// Auto-detect node IDs by gathering hostnames over domain_comm_
         void detectNodeIds();
 
+        std::optional<NativeCPUCollectiveProgram::DomainUse> cpu_program_use_; ///< Original native duty, released only at explicit shutdown.
+        bool cpu_program_retired_=false;
+        MPI_Comm original_cpu_parent_ = MPI_COMM_NULL; ///< Borrowed identity of the admitted CPU split parent.
+        std::weak_ptr<GlobalTPContext> original_cpu_owner_; ///< Original shared control block counts retained graph/worker borrowers.
         MPI_Comm domain_comm_;                        ///< Domain-specific MPI communicator
         /**
          * @brief Private point-to-point lane for rooted canonical publication.

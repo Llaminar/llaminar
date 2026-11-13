@@ -9,7 +9,10 @@
  * their own explicit batched/pool scratch and must not reuse this serial buffer.
  *
  * These tests verify the structural workspace contract without CUDA hardware.
- * The kernel constructor and getWorkspaceRequirements() are pure host work.
+ * The kernel constructor and fact-bound projectionRequirements() are pure host work;
+ * hardware-dependent policy receives an explicit recorded participant observation.
+ * Their definitions still require a compiled CUDA backend. CPU-only builds
+ * retain the backend-independent side-stream declaration helper regression.
  */
 
 #include <gtest/gtest.h>
@@ -22,6 +25,7 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CUDAQuantisedGemmWorkspaceContract.h"
 #include "tensors/Tensors.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -95,6 +99,7 @@ protected:
     static constexpr int kFakeCudaDeviceId = 0;
 };
 
+#ifdef HAVE_CUDA
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        TwoInstances_DeclareSharedStableTempCFp32BufferName)
 {
@@ -199,7 +204,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     const WorkspaceDescriptor *sums_a =
         reqs.find(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE);
     ASSERT_NE(sums_a, nullptr)
-        << "Asymmetric NativeVNNI prefill consumes precomputed activation block sums "
+        << "Asymmetric NativeQuantised prefill consumes precomputed activation block sums "
            "from declared workspace, not ad hoc scratch.";
 
     constexpr int kBlocksPerRow = kK / 32;
@@ -237,12 +242,18 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        Qwen36LargeMDeclaresBoundedGroupedParticipantForMTPTotality)
 {
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/150);
-    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
 
     constexpr int kM = 595;
     constexpr int kN = 17408;
     constexpr int kK = 5120;
-    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+    const auto *source = dynamic_cast<const IINT8Unpackable *>(weights.get());
+    ASSERT_NE(source, nullptr);
+    const auto *format = source->vnniFormatInfo();
+    ASSERT_NE(format, nullptr);
+    auto reqs = cuda::quantized_gemm_workspace::projectionRequirements(kM, kN, kK,
+        cuda::NativeQuantisedWorkspaceHardware::checked(kFakeCudaDeviceId, 60),
+        cuda::quantized_gemm_workspace::NativeCodebooks{
+            canonicalDeviceVnniCodebookId(*format), canonicalDeviceVnniCodebookId(format->codebook_id)});
 
     const WorkspaceDescriptor *grouped =
         reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
@@ -256,7 +267,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
            "or verifier execution, must remove this descriptor from prefill.";
 
     const size_t expected_rows = static_cast<size_t>(
-        nativeVNNIPersistentVerifierWorkspaceRows(kM, kN, kK));
+        nativeQuantisedPersistentVerifierWorkspaceRows(kM, kN, kK));
     const size_t k_groups = static_cast<size_t>((kK + 31) / 32);
     EXPECT_EQ(
         grouped->size_bytes,
@@ -388,6 +399,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
            "required.";
 }
 
+#endif
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        ConcurrentDecodeGemvPartials_HelperNoOpsForNonCudaAndSingleProjection)
 {
@@ -418,8 +430,9 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
         << "A single projection has no side stream and should not reserve side slots.";
 }
 
+#ifdef HAVE_CUDA
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillGenericDirectScheduleDeclaresNoKpartScratch)
+       NativeQuantisedPrefillGenericDirectScheduleDeclaresNoKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/10);
@@ -434,14 +447,14 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
     EXPECT_EQ(
         reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr)
         << "The direct output-owner schedule folds public-M=1 partitions inside "
            "each tile and must not reserve a global partial arena.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillConcurrentGenericDirectScheduleDoesNotInventKpartScratch)
+       NativeQuantisedPrefillConcurrentGenericDirectScheduleDoesNotInventKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/1010);
@@ -455,21 +468,21 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     const auto serial_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
     EXPECT_EQ(
         serial_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr);
 
     concurrent_prefill.set(/*enabled=*/true);
     const auto concurrent_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
     EXPECT_EQ(
         concurrent_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr)
         << "Projection concurrency must not allocate K-partition scratch unless "
            "the selected launch family actually publishes partition partials.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillGenericDirectPromptAndExpertSchedulesNeedNoKpartScratch)
+       NativeQuantisedPrefillGenericDirectPromptAndExpertSchedulesNeedNoKpartScratch)
 {
     auto weights = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/1011);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
@@ -484,11 +497,11 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
     EXPECT_EQ(
         prompt_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr);
     EXPECT_EQ(
         expert_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr);
 }
 
@@ -553,3 +566,101 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     ASSERT_NE(merged, nullptr);
     EXPECT_EQ(merged->size_bytes, large->size_bytes);
 }
+
+/**
+ * @brief Count-owned M1 fused callers declare every concurrent reduction slot.
+ * The public prepared-engine boundary cannot depend on a graph-stage helper
+ * having added the ordinary M1 envelope. Existing model-stage composition is
+ * already larger, so merging this precise requirement must not grow that BOM.
+ */
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       CountedM1FusedRequirementsDeclareExactSideSlots)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, 104);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+    const std::vector<int> columns{10240, 6144, 48, 48};
+    constexpr int k = 2560;
+    WorkspaceRequirements direct;
+    kernel.appendFusedProjectionWorkspaceRequirements(direct, 1, columns, k);
+    const auto *side = direct.find(
+        GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(side, nullptr);
+    // Stream zero uses the original serial arena. Each of the other three
+    // streams owns its exact width; these extents are already 256-byte aligned.
+    constexpr size_t expected = size_t(80) * (6144 + 48 + 48) * sizeof(float);
+    EXPECT_EQ(side->size_bytes, expected);
+    EXPECT_EQ(side->alignment, 256u);
+    EXPECT_EQ(side->regime, WorkspaceExecutionRegime::CompactDecodeOnly);
+
+    auto stage = kernel.getWorkspaceRequirements(1, columns.front(), k);
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        stage, DeviceId::cuda(kFakeCudaDeviceId), 1, columns.size());
+    const size_t original_stage_bytes = stage.find(
+        GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)->size_bytes;
+    kernel.appendFusedProjectionWorkspaceRequirements(stage, 1, columns, k);
+    EXPECT_EQ(stage.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)
+                  ->size_bytes, original_stage_bytes);
+
+    WorkspaceRequirements prefill;
+    kernel.appendFusedProjectionWorkspaceRequirements(prefill, 512, columns, k);
+    ASSERT_NE(prefill.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS), nullptr);
+    EXPECT_GE(prefill.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)
+                  ->size_bytes, expected);
+}
+/** @test Fact-bound planning never discovers hardware and its actual cache key retains complete SM identity. */
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       ExplicitPlanningHardwareKeepsUnobservedPoliciesPureAndSMCacheIdentityExact)
+{
+    ScopedCudaConcurrentPrefillSetting serial_scratch(false);
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, 151);
+    const auto *source = dynamic_cast<const IINT8Unpackable *>(weights.get());
+    ASSERT_NE(source, nullptr);
+    const auto *format = source->vnniFormatInfo();
+    ASSERT_NE(format, nullptr);
+    const cuda::quantized_gemm_workspace::NativeCodebooks codebooks{
+        canonicalDeviceVnniCodebookId(*format), canonicalDeviceVnniCodebookId(format->codebook_id)};
+    const auto missing = cuda::NativeQuantisedWorkspaceHardware::withoutSMObservation(128);
+    EXPECT_NO_THROW((void)cuda::quantized_gemm_workspace::projectionRequirements(1, 64, 256, missing, codebooks));
+    EXPECT_THROW((void)missing.smCount(), std::invalid_argument);
+    EXPECT_THROW((void)cuda::NativeQuantisedWorkspaceHardware::checked(128, 0), std::invalid_argument);
+    EXPECT_THROW((void)cuda::NativeQuantisedWorkspaceHardware::checked(128, -1), std::invalid_argument);
+    EXPECT_THROW((void)cuda::quantized_gemm_workspace::projectionRequirements(595, 17408, 5120, missing, codebooks),
+        std::invalid_argument);
+    // This exact typed value is also the production derived-plan cache subkey;
+    // runtime binding (null), explicit-unobserved and each observed SM count differ.
+    EXPECT_NE(missing, cuda::NativeQuantisedWorkspaceHardware::checked(128, 60));
+    EXPECT_NE(cuda::NativeQuantisedWorkspaceHardware::checked(128, 24),
+              cuda::NativeQuantisedWorkspaceHardware::checked(128, 60));
+    EXPECT_NE(cuda::NativeQuantisedWorkspaceHardware::checked(0, 60),
+              cuda::NativeQuantisedWorkspaceHardware::checked(128, 60));
+    unsigned admitted_policies = 0;
+    for (const int sm_count : {24, 60, 82, 132, 82, 60, 24})
+    {
+        const auto hardware = cuda::NativeQuantisedWorkspaceHardware::checked(128, sm_count);
+        std::size_t bytes = 0;
+        int partitions = 0, rows = 0;
+        const bool admitted = cuda::nativeQuantisedPrefillWorkspaceEnvelopeForHardware(codebooks.execution, codebooks.arithmetic,
+            595, 17408, 5120, hardware, &bytes, &partitions, &rows);
+        if (!admitted)
+        {
+            EXPECT_THROW((void)cuda::quantized_gemm_workspace::projectionRequirements(
+                595, 17408, 5120, hardware, codebooks), std::runtime_error);
+            continue; // Independent synthetic input rejected by the original arithmetic policy.
+        }
+        ++admitted_policies;
+        ASSERT_GT(rows, 0);
+        ASSERT_GT(partitions, 1);
+        const auto requirements = cuda::quantized_gemm_workspace::projectionRequirements(
+            595, 17408, 5120, hardware, codebooks);
+        const auto *scratch = requirements.find(GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS);
+        ASSERT_NE(scratch, nullptr);
+        const std::size_t padded = std::size_t(partitions) * std::size_t((rows + 127) & ~127) * 17408 * sizeof(float);
+        EXPECT_EQ(scratch->size_bytes, std::max(bytes, padded));
+        // An observed cache entry cannot manufacture facts for the same ordinal.
+        EXPECT_THROW((void)cuda::quantized_gemm_workspace::projectionRequirements(595, 17408, 5120, missing, codebooks),
+            std::invalid_argument);
+    }
+    EXPECT_GT(admitted_policies, 0u);
+}
+
+#endif

@@ -14,9 +14,12 @@
  * where an open-ended maintenance wait can starve independent inference.
  * No-movement decisions retain bounded numeric telemetry so idle placement
  * checks cannot grow process memory across a long serving lifetime.
+ * The independent phase submitter inherits the admitted OpenMP partition only
+ * during construction; cold capture and activation retain caller placement.
  */
 
 #include "MoEOverlayDeviceControllerGraphService.h"
+#include "MoEOverlayRuntimeReaderDeadline.h"
 #include "MoEOverlayWorkerDrainProtocol.h"
 #include "MoEOverlayControllerPerfStats.h"
 #include "MoEControllerMovementPerfStats.h"
@@ -40,6 +43,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/Logger.h"
 #include "utils/Assertions.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1001,11 +1005,24 @@ namespace llaminar2
         {
             if (dynamic_worker_)
             {
-                dynamic_worker_->thread = std::jthread(
-                    [worker = dynamic_worker_.get()](std::stop_token token)
-                    {
-                        worker->run(token);
-                    });
+                // Cold capture only: the ordinary serving family is sealed,
+                // and no background submitter or child may race native capture.
+                if(config_.mpi_ctx->world_size()==1)
+                    for(const auto &endpoint:endpoints_)
+                        if(!endpoint || !endpoint->runtime_binding.inference_boundary ||
+                           !endpoint->runtime_binding.inference_boundary->prepareMoEOverlayFinitePlacementGraphs())
+                            throw std::logic_error("Device finite placement lacks an original cold inference-owner graph");
+                {
+                    // Preserve cold capture placement and restore the creator
+                    // before activation bookkeeping. The submitter alone needs
+                    // independent progress across the original rank partition.
+                    const ScopedOpenMPPartitionAffinity control_affinity;
+                    dynamic_worker_->thread = std::jthread(
+                        [worker = dynamic_worker_.get()](std::stop_token token)
+                        {
+                            worker->run(token);
+                        });
+                }
 
                 /*
                  * The worker can report a fatal setup/protocol error as soon
@@ -1044,6 +1061,24 @@ namespace llaminar2
                 std::memory_order_release);
             throw;
         }
+    }
+
+    void MoEOverlayDeviceControllerGraphService::runFinitePlacementBoundary(
+        DeviceMoEOverlayEpochParentAction action)
+    {
+        if(config_.execution_mode!=ExecutionMode::Dynamic || !config_.mpi_ctx ||
+           config_.mpi_ctx->world_size()!=1 || endpoints_.empty() ||
+           state()!=MoEOverlayDeviceControllerActivationState::Running || !healthy())
+            throw std::logic_error("Device finite placement requires its running rank-local original authority");
+        if(action!=DeviceMoEOverlayEpochParentAction::Arm &&
+           action!=DeviceMoEOverlayEpochParentAction::Close)
+            throw std::invalid_argument("Device finite placement received an invalid boundary");
+        // No service/worker mutex is held here. In particular a background
+        // reader-retirement wait must not own the queue which submits End.
+        for(const auto &endpoint:endpoints_)
+            if(!endpoint || !endpoint->runtime_binding.inference_boundary ||
+               !endpoint->runtime_binding.inference_boundary->runMoEOverlayFinitePlacementBoundary(action))
+                throw std::logic_error("Device finite placement original owner did not complete its captured boundary");
     }
 
     MoEOverlayDeviceControllerActivationState
@@ -3589,8 +3624,9 @@ namespace llaminar2
     {
         for (auto &migration : prepared.migrations)
         {
-            for (auto &projection : migration.projections)
+            for (auto &piece : migration.operations)
             {
+                auto &projection = piece.operation;
                 if (projection)
                     projection->abort();
             }
@@ -3620,8 +3656,9 @@ namespace llaminar2
             bool complete = true;
             for (auto &migration : prepared.migrations)
             {
-                for (auto &projection : migration.projections)
+                for (auto &piece : migration.operations)
                 {
+                    auto &projection = piece.operation;
                     if (!projection)
                         continue;
                     std::string ignored;
@@ -4197,17 +4234,18 @@ namespace llaminar2
             return true;
         };
 
-        const std::size_t operation_count =
-            prepared.migrations.size() * kMoEOverlayExpertProjectionCount;
+        // Index only actual submitted physical operations, including source-only
+        // protocol work; logical migration count is not a transfer extent.
+        std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation> *> operations;
+        for (auto &migration : prepared.migrations)
+            for (auto &piece : migration.operations)
+                operations.push_back(&piece.operation);
+        const std::size_t operation_count = operations.size();
         std::vector<std::uint8_t> projection_ready(operation_count, 0u);
         const auto operationAt = [&](std::size_t operation)
             -> std::unique_ptr<IMoEOverlayTierTransferOperation> &
         {
-            const std::size_t migration =
-                operation / kMoEOverlayExpertProjectionCount;
-            const std::size_t projection =
-                operation % kMoEOverlayExpertProjectionCount;
-            return prepared.migrations[migration].projections[projection];
+            return *operations.at(operation);
         };
         const auto pollOperation = [&](std::size_t operation,
                                        std::string *poll_error)
@@ -4603,17 +4641,37 @@ namespace llaminar2
                     : "device runtime-retirement readiness epoch did not terminate");
         }
 
-        if (!wait_protocol(
-                [&]
-                {
-                    return std::all_of(
-                        protocols.begin(), protocols.end(),
-                        [&](const auto &protocol)
-                        {
-                            return protocol->runtimeReadersReady(command);
-                        });
-                },
-                "device controller timed out awaiting the topology-wide reader receipt"))
+        // One original binding exposes the complete authenticated topology.
+        // Only terminal progress from that SAME peer may extend its deadline.
+        // This host wait holds no inference worker or callback mutex; bounded
+        // native readiness kernels have already returned, so child/End graphs
+        // remain independently runnable on their original owner streams.
+        std::vector<MoEOverlayRuntimeReaderObservation> reader_observations(
+            protocols.front()->runtimeReaderObservationCount());
+        MoEOverlayRuntimeReaderDeadline reader_deadlines(
+            reader_observations.size(),std::chrono::steady_clock::now());
+        const auto wait_readers=[&]() {
+            using Result=MoEOverlayRuntimeReaderDeadline::Result;
+            for(;;) {
+                if(!protocols.front()->observeRuntimeReaders(command,reader_observations)) {
+                    if(error)*error="device retirement received a foreign, missing or failed original participant";
+                    return false;
+                }
+                const auto observation=reader_deadlines.observe(
+                    reader_observations,std::chrono::steady_clock::now());
+                if(observation==Result::Ready)
+                    return std::all_of(protocols.begin(),protocols.end(),
+                        [&](const auto &protocol){return protocol->runtimeReadersReady(command);});
+                if(observation==Result::Invalid || observation==Result::Expired) {
+                    if(error)*error=observation==Result::Expired
+                        ? "device controller timed out awaiting original reader progress"
+                        : "device retirement finite-parent receipt regressed";
+                    return false;
+                }
+                pollPause();
+            }
+        };
+        if (!wait_readers())
         {
             return unwind(error && !error->empty()
                               ? *error
@@ -4816,21 +4874,10 @@ namespace llaminar2
                 .cycle_size = cycle_size_by_migration[migration_index],
                 .direction = direction,
                 .axis = migration.axis,
-                .source_participant =
-                    migration.source.owner_participant,
-                .destination_participant =
-                    migration.destination.owner_participant,
+                .source = MoEOptimizationMovementEndpoint::whole(migration.source.owner_participant, migration.source.device, (migration.source.owner_world_rank_known) ? std::optional<int>{migration.source.owner_world_rank} : std::nullopt),
+                .destination = MoEOptimizationMovementEndpoint::whole(migration.destination.owner_participant, migration.destination.device, (migration.destination.owner_world_rank_known) ? std::optional<int>{migration.destination.owner_world_rank} : std::nullopt),
                 .source_priority = source_group->tier_priority,
                 .destination_priority = destination_group->tier_priority,
-                .source_device = migration.source.device,
-                .destination_device = migration.destination.device,
-                .source_world_rank = migration.source.owner_world_rank,
-                .destination_world_rank =
-                    migration.destination.owner_world_rank,
-                .source_world_rank_known =
-                    migration.source.owner_world_rank_known,
-                .destination_world_rank_known =
-                    migration.destination.owner_world_rank_known,
                 .estimated_weight_bytes =
                     static_cast<std::uint64_t>(
                         migration.estimated_weight_bytes),

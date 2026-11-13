@@ -13,11 +13,12 @@
 
 #include "ExpertTierWeightDeviceLayout.h"
 #include "GPUExpertTransfer.h"
-#include "../../kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "../../kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,8 @@ namespace llaminar2
     /** Packed representation named by one stream endpoint. */
     enum class ExpertTierWeightPacking : uint8_t
     {
-        GpuSeparatedNativeVnni = 1,
-        CpuNativeVnniInterleaved = 2,
+        GpuSeparatedNativeQuantised = 1,
+        CpuNativeQuantisedInterleaved = 2,
     };
 
     /** Projection identity carried independently for gate, up, and down. */
@@ -42,23 +43,24 @@ namespace llaminar2
      * @brief Immutable description of one cross-backend projection stream.
      *
      * `unit_count` units are transmitted in monotonically increasing order.
-     * Every unit is exactly one CPU interleaved block and can therefore be
-     * copied directly to its final CPU address or converted independently by a
-     * destination GPU. `manifest_hash` authenticates every field preceding it.
+     * Each unit indexes one64-column tile/32-K block, but its payload contains
+     * only live encoded columns and required metadata. Aligned full units keep
+     * direct copies; origins/tails scatter into independent final local strides.
+     * `manifest_hash` authenticates all semantic fields, including original ownership.
      */
     struct ExpertTierWeightStreamManifest
     {
         // Wire discriminator: receivers reject unknown layouts before parsing.
         static constexpr uint32_t kMagic = 0x45545753u; // "ETWS"
-        static constexpr uint16_t kVersion = 2;
+        static constexpr uint16_t kVersion = 3;
 
         // Direction is explicit so CPU bytes cannot be replayed as GPU bytes.
         uint32_t magic = kMagic;
         uint16_t version = kVersion;
         ExpertTierWeightPacking source_packing =
-            ExpertTierWeightPacking::CpuNativeVnniInterleaved;
+            ExpertTierWeightPacking::CpuNativeQuantisedInterleaved;
         ExpertTierWeightPacking destination_packing =
-            ExpertTierWeightPacking::GpuSeparatedNativeVnni;
+            ExpertTierWeightPacking::GpuSeparatedNativeQuantised;
 
         // Logical identity binds late chunks to one immutable placement epoch.
         uint64_t residency_epoch = 0;
@@ -85,8 +87,8 @@ namespace llaminar2
         uint8_t cpu_is_superblock = 0;
         uint8_t gpu_is_asymmetric = 0;
         uint8_t gpu_has_emins = 0;
-        cpu::native_vnni::CPUNativeVNNIEncoding cpu_encoding =
-            cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8;
+        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
+            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
 
         // Allocation and ordered-chunk geometry derived from endpoint formats.
         uint32_t cpu_data_stride = 0;
@@ -95,6 +97,18 @@ namespace llaminar2
         uint32_t maximum_units_per_chunk = 0;
         uint64_t total_stream_bytes = 0;
         uint64_t manifest_hash = 0;
+        /** Original source and destination ownership; physical shapes alone are insufficient. */
+        MoEExpertProjectionOwnership::Projection source_projection{};
+        MoEExpertProjectionOwnership::Projection destination_projection{};
+
+        /**
+         * @brief Bind this format/provenance stream to an actual ownership intersection.
+         * @param intersection Checked original source/destination geometry.
+         * @return Resealed stream with local strides and compact live-column bytes.
+         * @throws std::invalid_argument If source allocation geometry differs or overlap is empty.
+         */
+        [[nodiscard]] ExpertTierWeightStreamManifest forIntersection(
+            const ExpertTierWeightProjectionIntersection& intersection) const;
 
         /**
          * @brief Recompute the canonical hash over all semantic fields.
@@ -115,6 +129,50 @@ namespace llaminar2
          */
         [[nodiscard]] ExpertTierWeightDeviceLayout deviceLayout() const noexcept;
     };
+
+    /**
+     * @brief Bind canonical native physical traits to one original CPU root/intersection.
+     * @param native_format Existing CPU layout's native format fields; dimensions are derived afresh.
+     * @param owned Exact original source or destination local rectangle.
+     * @param intersection Same checked source/destination overlap used by every consumer.
+     * @param maximum_chunk_bytes Existing admitted bounded lane capacity.
+     * @return Checked CPU-only storage/wire geometry, without a GPU or remote identity.
+     * @throws std::invalid_argument For foreign rectangles, native traits or insufficient capacity.
+     */
+    [[nodiscard]] ExpertTierWeightCPUStorageLayout cpuExpertTierStorageLayoutForIntersection(
+        ExpertTierWeightCPUStorageLayout native_format,
+        MoEExpertProjectionOwnership::Projection owned,
+        const ExpertTierWeightProjectionIntersection &intersection,
+        std::uint32_t maximum_chunk_bytes);
+
+    /**
+     * @brief Copy exact live native columns directly between existing CPU roots.
+     * @param source_layout Checked original source/root geometry.
+     * @param source Immutable whole original local source allocation.
+     * @param destination_layout Same wire intersection and native encoding, independent root stride.
+     * @param destination Existing final destination root, never a temporary parent.
+     * @param first_unit First actual intersection-relative unit.
+     * @param units Actual bounded units, excluding all resident padding.
+     * @param encoded_write_mutex Shared destination-role authority for Q6 nibble RMW; null only for an exclusive writer.
+     * @return False before mutation for incompatible geometry, ranges or aliases.
+     * @note Scalar encoded fields are copied exactly; no decode/requantization or payload scratch exists.
+     */
+    bool copyExpertTierCPUWeightChunk(
+        const ExpertTierWeightCPUStorageLayout &source_layout,
+        std::span<const std::uint8_t> source,
+        const ExpertTierWeightCPUStorageLayout &destination_layout,
+        std::span<std::uint8_t> destination,
+        std::uint32_t first_unit, std::uint32_t units,
+        std::mutex *encoded_write_mutex = nullptr) noexcept;
+
+    /** @brief Scatter live planes under the SAME destination-role Q6 word-write authority. */
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightDeviceLayout &layout,
+        std::span<const std::uint8_t> compact_chunk, std::uint32_t first_unit, std::uint32_t units,
+        std::span<std::uint8_t> cpu_root, std::mutex *encoded_write_mutex) noexcept;
+    /** @brief CPU-only form of the same shared encoded-word writer. */
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightCPUStorageLayout &layout,
+        std::span<const std::uint8_t> compact_chunk, std::uint32_t first_unit, std::uint32_t units,
+        std::span<std::uint8_t> cpu_root, std::mutex *encoded_write_mutex) noexcept;
 
     /** Header for one monotonically ordered stream chunk. */
     struct ExpertTierWeightStreamChunkHeader
@@ -256,11 +314,11 @@ namespace llaminar2
      * @param maximum_units_per_chunk Persistent staging capacity in units.
      * @return Complete authenticated stream manifest.
      * @throws std::invalid_argument when the source identity or geometry is
-     *         not part of the exhaustive NativeVNNI catalog.
+     *         not part of the exhaustive NativeQuantised catalog.
      */
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
-        const NativeVnniFormatInfo &source_format,
+        const NativeQuantisedFormatInfo &source_format,
         int N,
         int K,
         uint64_t residency_epoch,
@@ -291,7 +349,7 @@ namespace llaminar2
      */
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
-        const NativeVnniFormatInfo &source_format,
+        const NativeQuantisedFormatInfo &source_format,
         const GpuExpertPackedDescriptor &gpu_source,
         uint64_t residency_epoch,
         int layer_idx,
@@ -314,7 +372,7 @@ namespace llaminar2
      */
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeCpuToGpuExpertTierWeightStreamManifest(
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         uint64_t residency_epoch,
         int layer_idx,
         int expert_id,
@@ -333,7 +391,7 @@ namespace llaminar2
      * @return `true` when the conversion completed byte-exactly.
      */
     [[nodiscard]] bool cpuToGpuExpertPackedReference(
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         HostGpuExpertPackedProjection &gpu_weights,
         std::string *error = nullptr) noexcept;
 
@@ -351,7 +409,7 @@ namespace llaminar2
      */
     [[nodiscard]] bool gpuToCpuExpertPackedReference(
         const HostGpuExpertPackedProjection &gpu_weights,
-        cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         std::string *error = nullptr) noexcept;
 
 } // namespace llaminar2

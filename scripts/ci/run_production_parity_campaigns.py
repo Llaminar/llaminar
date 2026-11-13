@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_production_parity_campaigns.py
+#  @brief Own complete prerequisites, production parity scheduling and exact evidence.
 """Run the complete real-weight production parity matrix and measure its SLA.
 
 The C++ `ProductionParity` case is the atomic matrix cell: it constructs one
@@ -47,9 +49,23 @@ Individual fixup invocations may reuse a passed preflight report only while the
 Ninja build log and CTest registration remain older than that report. This
 amortizes the integration gate across unchanged exact cells without creating an
 unchecked skip path; any rebuild or reconfiguration invalidates the evidence.
+
+An explicit --history-replay FILE is a diagnostic projection for one exact QFN
+cell only. It binds original corpus/source/tokens and a regenerated full-stage
+pack before admission, preserving this driver's staging and prerequisite path.
+The fixture keeps its original topology, prefix checks, math limits and CSVs;
+a partial ambient locator or an LM-only reference cannot select another history.
 """
 
 from __future__ import annotations
+
+from production_artifacts import (artifact_identity_path, validate_preflight_qualification,
+    optional_native_cohort_absence, validate_optional_native_cohort_requirement)
+from generation_movement_ledger import validate_cohort_parity_documents
+from run_qfn_source_admission import (
+    registrations as source_admission_registrations,
+    source_hardware_devices,
+)
 
 import argparse
 import csv
@@ -67,8 +83,10 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, replace
+from model_kld_history_replay import HANDOFF_FIELDS, prepare_history_replay
+from mpi_session_retirement import owned_session_bases, require_retired, retirement_scope
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -132,7 +150,13 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_mean,pytorch_stddev,pytorch_kurtosis,pytorch_skewness,"
         "pytorch_p95,pytorch_p99,pytorch_outlier_frac,pytorch_dynamic_range,"
         "pytorch_sparsity,pytorch_zero_frac,pytorch_nan_count,"
-        "pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER + ",passed"
+        "pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER
+        + ",scalar_type,integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,"
+          "history_prompt_rows,history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,"
+          "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
+          "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
+          "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
+          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row,query_program_observation"
     ),
     "decode_steps.csv": (
         "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
@@ -153,7 +177,13 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_max,pytorch_mean,pytorch_stddev,pytorch_kurtosis,"
         "pytorch_skewness,pytorch_p95,pytorch_p99,pytorch_outlier_frac,"
         "pytorch_dynamic_range,pytorch_sparsity,pytorch_zero_frac,"
-        "pytorch_nan_count,pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER + ",passed"
+        "pytorch_nan_count,pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER
+        + ",scalar_type,integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,"
+          "history_prompt_rows,history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,"
+          "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
+          "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
+          "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
+          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row,query_program_observation"
     ),
     "prefix_restore.csv": (
         "backend,phase,cache_config_enabled,cache_ready,cache_bypassed,"
@@ -202,7 +232,9 @@ REQUIRED_CSV_HEADERS = {
         "shifted_mtp_kv_numerically_compared,shifted_mtp_kv_exact_prefix_segments,"
         "shifted_mtp_kv_numerical_suffix_payloads,shifted_mtp_kv_numerical_elements,"
         "shifted_mtp_kv_minimum_cosine,shifted_mtp_kv_maximum_relative_l2,"
-        "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed"
+        "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed,"
+        "partial_checkpoint_policy,partial_checkpoint_rows,"
+        "partial_checkpoint_maximum_kl,partial_checkpoint_kl_limit"
     ),
     "production_path.csv": (
         "backend,device,execution_path,execution_topology,graph_contract,"
@@ -241,6 +273,12 @@ MTP_TRANSACTIONS_HEADER = (
     "dynamic_policy_witness_emitted_tokens,"
     "dynamic_policy_witness_serial_oracle_tokens"
 )
+MTP_ACCEPTANCE_WITNESS_HEADER = (
+    "reference_step,condition_token,authenticated_first_draft,"
+    "admitted_depth,attempted_drafts,verifier_transactions,accepted_drafts,"
+    "emitted_tokens,serial_tokens,continuation_tokens,state_byte_exact,"
+    "observed_depth,prefix_restored,adaptive_enabled"
+)
 NATIVE_VERIFIER_ROWS_HEADER = (
     "reference_step,condition_position,stage,physical_rows,row,row_elements,"
     "status,first_mismatch,grouped_bits,serial_bits,max_abs_diff,passed"
@@ -254,6 +292,7 @@ CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
         "prefix_restore.csv",
         "production_path.csv",
         "mtp_native_verifier_rows.csv",
+        "mtp_acceptance_witness.csv",
     }
 )
 REQUIRED_CAMPAIGN_LABELS = {
@@ -307,6 +346,7 @@ class CampaignCell:
     command: tuple[str, ...] = ()
     environment: tuple[str, ...] = ()
     working_directory: str = ""
+    cohort_movement_cases: tuple[str, ...] = ()  # Source-owned typed qualification obligations.
 
     @property
     def test_type(self) -> str:
@@ -536,6 +576,7 @@ class CampaignMatrixResult:
     preflight_elapsed_seconds: float
     preflight_test_count: int
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     fixture_return_code: int
     fixture_elapsed_seconds: float
     model_staging_return_code: int
@@ -612,6 +653,7 @@ class IndividualProgressReport:
     preflight_return_code: int
     preflight_test_count: int
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     fixture_return_code: int
     model_staging_return_code: int
     artifact_root: str
@@ -637,6 +679,7 @@ class FocusedExactCellReport:
     preflight_return_code: int
     preflight_test_count: int
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     fixture_return_code: int
     model_staging_return_code: int
     model_staging_root: str
@@ -788,21 +831,41 @@ class PreflightRegistration:
         mpi_ranks: Explicit ``mpirun -np`` width, or ``None`` if no MPI
             launcher was declared. Only a width of one can enter a socket lane.
         lane: Typed scheduling ownership derived from the checked registration.
+        ctest_index: Positive 1-based position in the UNFILTERED CTest JSON inventory.
+            Labels and alphabetical receipt order never change this native index.
     """
 
     name: str
     labels: frozenset[str]
     mpi_ranks: int | None
     lane: PreflightExecutionLane
+    ctest_index: int
+
+    def __post_init__(self) -> None:
+        """Reject malformed indices before CTest can interpret a range/default selection."""
+        if type(self.ctest_index) is not int or self.ctest_index <= 0:
+            raise ValueError("preflight CTest index must be a positive integer")
 
 
 def _preflight_mpi_ranks(name: str, command: list[str]) -> int | None:
     """Extract one explicit MPI width without guessing a launcher contract."""
 
+    if command and Path(command[0]).name == "llaminar_mpi_session":
+        if len(command) < 5 or command[1] != "--session-base" or command[3] != "--":
+            raise RuntimeError(f"preflight process owner has malformed argv: {name}")
+        command = command[4:]
+        # A Python diagnostic may accept an mpirun pathname as data. Only the
+        # actual wrapped native launcher declares this test's rank geometry.
+        if Path(command[0]).name not in {"mpirun", "mpiexec"}:
+            return None
+        if "--" not in command:
+            raise RuntimeError(f"preflight MPI launcher lacks application boundary: {name}")
+        command = command[:command.index("--")]
+
     launchers = [
         index
         for index, argument in enumerate(command)
-        if Path(argument).name == "mpirun"
+        if Path(argument).name in {"mpirun", "mpiexec"}
     ]
     if not launchers:
         return None
@@ -886,8 +949,6 @@ def discover_production_test_preflight_registrations(
             "--test-dir",
             str(build_dir),
             "--show-only=json-v1",
-            "-L",
-            f"^{PRODUCTION_TEST_PREFLIGHT_LABEL}$",
         ],
         check=False,
         capture_output=True,
@@ -901,7 +962,9 @@ def discover_production_test_preflight_registrations(
 
     document = json.loads(completed.stdout)
     registrations: list[PreflightRegistration] = []
-    for test in document.get("tests", []):
+    # CTest -I addresses the complete native inventory. Filtering before this
+    # enumeration would silently redirect indices into excluded/model tests.
+    for ctest_index, test in enumerate(document.get("tests", []), start=1):
         name = str(test.get("name", ""))
         properties = _property_map(test)
         labels = frozenset(_as_string_list(properties.get("LABELS", [])))
@@ -943,8 +1006,12 @@ def discover_production_test_preflight_registrations(
             command,
             _as_string_list(properties.get("RESOURCE_LOCK", [])),
         )
-        registrations.append(PreflightRegistration(name, labels, ranks, lane))
+        if "HardwareOptional" in labels and any(properties.get(key) for key in (
+                "DISABLED", "SKIP_RETURN_CODE", "SKIP_REGULAR_EXPRESSION")):
+            raise RuntimeError("optional hardware native body must remain strict: " + name)
+        registrations.append(PreflightRegistration(name, labels, ranks, lane, ctest_index))
 
+    preflight_optional_hardware_requirements(registrations)
     registrations.sort(key=lambda registration: registration.name)
     names = tuple(registration.name for registration in registrations)
     if not registrations:
@@ -958,6 +1025,127 @@ def discover_production_test_preflight_registrations(
     return tuple(registrations)
 
 
+def preflight_optional_hardware_requirements(
+    registrations: Iterable[PreflightRegistration],
+) -> dict[str, dict]:
+    """Compile declared optional geometry from the original CMake labels and MPI command."""
+    requirements = {}
+    for row in registrations:
+        isa_labels = sorted(label for label in row.labels if label.startswith("NativeISA"))
+        stage_labels = sorted(label for label in row.labels if label.startswith("StageSizes"))
+        rank_labels = sorted(label for label in row.labels if label.startswith("RankSizes"))
+        if "HardwareOptional" not in row.labels:
+            if row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+                raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
+            continue
+        device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
+        if (any(not re.fullmatch(r"Devices[1-9][0-9]*", label) for label in device_labels)
+                or any(not re.fullmatch(r"NativeISA-[a-z][a-z0-9_]*", label) for label in isa_labels)
+                or any(not re.fullmatch(r"StageSizes[1-9][0-9]*(?:x[1-9][0-9]*)+", label) for label in stage_labels)
+                or any(not re.fullmatch(r"RankSizes[1-9][0-9]*x[1-9][0-9]*", label) for label in rank_labels)):
+            raise RuntimeError("malformed optional native geometry: " + row.name)
+        backends = row.labels & {"CUDA", "ROCm"}
+        family_labels = sorted(label for label in row.labels
+                               if label.startswith(("CUDADevices", "ROCmDevices")))
+        if family_labels:
+            if (backends != {"CUDA", "ROCm"} or len(family_labels) != 2
+                    or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+                    or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
+                raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
+            degrees = {label.split("Devices")[0].lower(): int(label.split("Devices")[1])
+                       for label in family_labels}
+            if set(degrees) != {"cuda", "rocm"} or sum(degrees.values()) != int(device_labels[0][7:]):
+                raise RuntimeError("inconsistent optional mixed-family geometry: " + row.name)
+            requirement = {"backend_degrees": degrees, "mpi_ranks": row.mpi_ranks,
+                "locality": "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
+                            else "original-numa-local-rank"}
+            try:
+                validate_optional_native_cohort_requirement(requirement)
+            except ValueError as error:
+                raise RuntimeError(f"unsupported optional native geometry: {row.name}: {error}") from error
+            requirements[row.name] = requirement
+            continue
+        if len(backends) != 1 or len(device_labels) != 1 or len(isa_labels) > 1 or len(stage_labels) > 1 or len(rank_labels) > 1 or (rank_labels and stage_labels):
+            raise RuntimeError("ambiguous optional native geometry: " + row.name)
+        distinct_ranks = "DistinctNUMARanks" in row.labels
+        if distinct_ranks and row.mpi_ranks != 2:
+            raise RuntimeError("unsupported optional native geometry: " + row.name)
+        try:
+            requirement = {"backend": next(iter(backends)).lower(), "degree": int(device_labels[0][7:]),
+                "locality": "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
+            peer_labels = row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+            if len(peer_labels) > 1:
+                raise ValueError("conflicting optional directed peer geometry")
+            if peer_labels:
+                requirement["peer_access"] = "directed-edge" if "DirectedPeerEdge" in peer_labels else "no-directed-pair"
+                requirement["mpi_ranks"] = row.mpi_ranks
+            if isa_labels:
+                requirement["native_isa"] = isa_labels[0].removeprefix("NativeISA-")
+            if stage_labels:
+                requirement["stage_sizes"] = [int(size) for size in stage_labels[0][10:].split("x")]
+                requirement["mpi_ranks"] = row.mpi_ranks
+            if rank_labels:
+                requirement["rank_sizes"] = [int(size) for size in rank_labels[0][9:].split("x")]
+                requirement["mpi_ranks"] = row.mpi_ranks
+            validate_optional_native_cohort_requirement(requirement)
+        except ValueError as error:
+            raise RuntimeError(f"unsupported optional native geometry: {row.name}: {error}") from error
+        requirements[row.name] = requirement
+    return requirements
+
+
+def preflight_hardware_qualification(
+    tests: tuple[str, ...], requirements: dict[str, dict], hardware: dict | None,
+) -> dict:
+    """Derive the full selected/unqualified partition without changing any test body."""
+    observed = source_hardware_devices(hardware) if requirements else {}
+    unavailable = {}
+    for name, requirement in requirements.items():
+        absence = optional_native_cohort_absence(requirement, hardware)
+        if absence is not None:
+            unavailable[name] = absence
+    result = {"schema": 1, "registered": list(tests),
+        "selected": [name for name in tests if name not in unavailable],
+        "requirements": requirements, "hardware": hardware, "unqualified": unavailable}
+    validate_preflight_qualification(list(tests), result)
+    return result
+
+
+def observe_preflight_hardware(build_dir: Path, timeout: float | None) -> dict:
+    """Reuse the original native exporter, including its MPI and backend retirement.
+
+    Native/query/parse failure is fatal, never an empty physical inventory.
+    Temporary output is fresh; the complete document travels in the gate receipt.
+    No model fixtures or files are read by this original executable mode.
+    """
+    limit = 30 if timeout is None else min(30, timeout)
+    listing = json.loads(subprocess.check_output(
+        ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
+        text=True, timeout=limit))
+    registered = source_admission_registrations(listing)
+    binaries = {row["binary"] for row in registered.values()}
+    if len(binaries) != 1:
+        raise ValueError("source inventory belongs to more than one executable")
+    # CMake owns executable placement in source builds and installed runners.
+    # The original source-admission parser validates its complete registration;
+    # neither a guessed build-root path nor another installation may replace it.
+    binary = Path(binaries.pop()).resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix="preflight-native-hardware-") as directory:
+        path = Path(directory).resolve() / "hardware.json"
+        completed = subprocess.run([str(binary.resolve(strict=True)),
+            f"--qfn-source-hardware-inventory={path}"], check=True,
+            env={**os.environ, "HWLOC_COMPONENTS": "-gl,-opencl",
+                "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "0", "LLAMINAR_SKIP_CUDA_STARTUP": "0",
+                "LLAMINAR_SKIP_ROCM_STARTUP": "0"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=limit)
+        if completed.stdout:
+            print(completed.stdout, end="", flush=True)
+        hardware = json.loads(path.read_text(encoding="utf-8"))
+    source_hardware_devices(hardware)
+    return hardware
+
+
 def preflight_execution_plan(
     registrations: Iterable[PreflightRegistration],
 ) -> dict[PreflightExecutionLane, tuple[str, ...]]:
@@ -965,11 +1153,15 @@ def preflight_execution_plan(
 
     plan = {lane: [] for lane in PreflightExecutionLane}
     seen: set[str] = set()
+    indices: set[int] = set()
     for registration in registrations:
         if not isinstance(registration, PreflightRegistration):
             raise TypeError("preflight execution plan requires typed registrations")
         if registration.name in seen:
             raise RuntimeError(f"preflight execution plan has duplicate test: {registration.name}")
+        if registration.ctest_index in indices:
+            raise RuntimeError(f"preflight execution plan has duplicate CTest index: {registration.ctest_index}")
+        indices.add(registration.ctest_index)
         seen.add(registration.name)
         plan[registration.lane].append(registration.name)
     return {lane: tuple(sorted(names)) for lane, names in plan.items()}
@@ -1117,8 +1309,18 @@ def _validate_campaign_registration(
         raise ValueError(
             "campaign WORKING_DIRECTORY must be an absolute path"
         )
+    exact_cases = _exact_gtest_cases(test)
+    if any(case.startswith("Qwen4ExpMain/") for case in exact_cases):
+        # Query producers may legitimately be absent. The parity consumer must
+        # observe the actual selected program as well as independent history;
+        # authenticate the final registered environment, including overrides.
+        filters = [entry.split("=", 1)[1]
+                   for entry in _as_string_list(properties.get("ENVIRONMENT", []))
+                   if entry.startswith("LLAMINAR_PERF_STATS_FILTER=")]
+        if len(filters) != 1 or "qsa" not in filters[0].split(","):
+            raise ValueError("QFN campaign does not collect required qsa query-program PerfStats")
     return (
-        _exact_gtest_cases(test),
+        exact_cases,
         model_files,
         command,
         tuple(_as_string_list(properties.get("ENVIRONMENT", []))),
@@ -2159,6 +2361,7 @@ def _single_exact_cell(
         command=_exact_registered_command(cell, gtest_case),
         environment=cell.environment,
         working_directory=cell.working_directory,
+        cohort_movement_cases=tuple(case for case in cell.cohort_movement_cases if case == gtest_case),
     )
 
 
@@ -2232,7 +2435,8 @@ def _gtest_artifact_directory_name(gtest_case: str) -> str:
     if not separator or not suite or not test:
         raise ValueError(f"invalid exact GTest case identity: {gtest_case}")
     raw_name = f"{suite}/{test}"
-    return re.sub(r'[/\\:*?"<>|]', "_", raw_name)
+    return artifact_identity_path(raw_name)
+
 
 
 def _exact_cell_timeout_watch(
@@ -2273,7 +2477,251 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     ):
         headers["mtp_transactions.csv"] = MTP_TRANSACTIONS_HEADER
         headers["mtp_native_verifier_rows.csv"] = NATIVE_VERIFIER_ROWS_HEADER
+    if re.search(r"(?:^|_)MTPDynamicDepth(?:_|$)", gtest_case):
+        headers["mtp_acceptance_witness.csv"] = MTP_ACCEPTANCE_WITNESS_HEADER
     return headers
+
+
+def expected_query_snapshot_interval(prompt, decode_rows_before, live, capacity, *, decode=True):
+    """Derive original query coordinates from independent request history."""
+    if (any(type(value) is not int for value in (prompt, decode_rows_before, live, capacity)) or
+            prompt <= 0 or decode_rows_before < 0 or live < 0 or
+            type(decode) is not bool or not 0 < capacity <= 2147483647):
+        raise ValueError("invalid original query history")
+    if not decode and (decode_rows_before != 0 or live != prompt):
+        raise ValueError("prefill query history must cover the original complete prompt")
+    prefix = prompt + decode_rows_before if decode else 0
+    if prefix + live > capacity:
+        raise ValueError("invalid original query history")
+    # Independent complete-pool demand: floor((prefix+row+1)/4)>512.
+    first = min(live, max(0, 4 * (512 + 1) - 1 - prefix))
+    return prefix, first, live
+
+
+def validate_query_program_omission(text, *, decode=True, live_rows=1):
+    """Independently authenticate native path metadata; original history remains separate authority."""
+    import json
+    import re
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate program-observation key")
+            result[key] = value
+        return result
+    try:
+        if (type(decode) is not bool or type(live_rows) is not int or
+                not 0 < live_rows <= 2147483647 or (decode and live_rows != 1)):
+            return "invalid original query program phase or live width"
+        witness = json.loads(text, object_pairs_hook=unique_object)
+        if (type(witness) is not dict or set(witness) !=
+                {"schema", "participant_source", "expected_devices", "before", "after"} or
+                witness["schema"] != "qsa.program_omission.v1" or
+                witness["participant_source"] != "admitted_rank_local_model_devices"):
+            return "invalid query program observation schema"
+        devices = witness["expected_devices"]
+        if (type(devices) is not list or not devices or
+                any(type(device) is not str or re.fullmatch(r"CPU|CUDA:[0-9]+|ROCm:[0-9]+", device) is None
+                    for device in devices) or len(set(devices)) != len(devices)):
+            return "invalid admitted query participant witness"
+        def counts(rows):
+            if type(rows) is not list:
+                raise ValueError("program records must be an array")
+            result = {}
+            for record in rows:
+                if (type(record) is not dict or set(record) != {"device", "phase", "kind", "count", "tags"} or
+                        type(record["device"]) is not str or type(record["phase"]) is not str or
+                        type(record["kind"]) is not int or type(record["count"]) is not int or
+                        not 0 <= record["count"] <= 18446744073709551615 or type(record["tags"]) is not dict or
+                        any(type(k) is not str or type(v) is not str for k, v in record["tags"].items())):
+                    raise ValueError("invalid query submission record")
+                key = (record["device"], record["phase"], record["kind"], tuple(sorted(record["tags"].items())))
+                result[key] = result.get(key, 0) + record["count"]
+                if result[key] > 18446744073709551615:
+                    raise ValueError("query counter overflow")
+            return result
+        before, after = counts(witness["before"]), counts(witness["after"])
+        if any(key not in after or after[key] < value for key, value in before.items()):
+            return "query counters reset or disappeared"
+        expected_tags = {"program": "proven_no_ranking", "role": "0", "physical_rows": str(live_rows),
+            "observation": "successful_forward_submission_not_native_replay_count"}
+        if not decode:
+            expected_tags.update(logical_rows=str(live_rows), logical_begin="0", width_policy="exact_retained")
+        expected_tags = tuple(sorted(expected_tags.items()))
+        expected_phase = "decode" if decode else "prefill"
+        submitted = set()
+        for key, value in after.items():
+            prior = before.get(key, 0)
+            if value == prior:
+                continue
+            device, phase, kind, tags = key
+            if (value - prior != 1 or device not in devices or device in submitted or
+                    phase != expected_phase or kind != 0 or tags != expected_tags):
+                return "incompatible or non-fresh query program submission"
+            submitted.add(device)
+        if submitted != set(devices):
+            return "missing actual query participant submission"
+    except (ValueError, KeyError, TypeError, OverflowError) as error:
+        return f"malformed query program observation: {error}"
+    return None
+
+
+def validate_stage_checkpoint_evidence(rows, *, decode):
+    """Authenticate query intervals while preserving numerical comparison authority.
+
+    The canonical route submits one complete prompt or one live Decode row.
+    It supplies prompt/submitted-row history independently of native acquisition.
+    Structural records keep required identity with no invented numerical metrics.
+    Every other stage retains its prior comparison policy and blank query proof.
+    """
+    query_stages = {"QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY"}
+    proof_fields = (
+        "structural_valid", "query_empty_reason", "history_prompt_rows",
+        "history_decode_rows_before", "history_live_rows", "history_source_capacity",
+        "observed_request_count", "observed_prefix_rows", "observed_live_rows",
+        "observed_row_capacity", "observed_source_capacity", "observed_first_required_logical_row",
+        "observed_row_offset", "observed_first_row", "observed_end_row", "observed_payload_row_offset",
+        "observed_physical_rows", "observed_repeats_per_row", "observed_slice_first_row",
+        "observed_payload_rows", "observed_payload_columns", "observed_payload_elements",
+        "reference_rows", "reference_first_row", "query_program_observation",
+    )
+    metrics = ("cosine", "cosine_drop", "rel_l2", "max_abs_diff", "snr_db", "rmse",
+               "error_entropy", "routing_overlap", "routing_top1_match", "routing_weight_l1")
+    seen = set()
+    cohorts = {}
+    try:
+        for values in rows[1:]:
+            row = dict(zip(rows[0], values, strict=True))
+            query = row["stage"] in query_stages
+            identity = tuple(row[key] for key in (("backend", "step", "layer", "stage") if decode
+                                                 else ("backend", "layer", "stage")))
+            if query:
+                if identity in seen:
+                    return "duplicate original query checkpoint"
+                seen.add(identity)
+                cohorts.setdefault(identity[:-1], set()).add(row["stage"])
+            kind = row["checkpoint_evidence_kind"]
+            if kind == "compared_values":
+                if any(row[field] for field in proof_fields) or (decode and query):
+                    return "query evidence missing from numerical Decode checkpoint"
+                continue
+            if not query or kind not in ("authored_query", "unauthored_query"):
+                return "unsupported query evidence kind or phase"
+            if (row["structural_valid"] != "1" or row["scalar_type"] != "FP32" or
+                    row["integer_mismatch_count"] or row["is_routing"] != "0" or
+                    row["route_conditioned_evaluated"] != "0"):
+                return "invalid typed query checkpoint evidence"
+            prompt = int(row["history_prompt_rows"])
+            before = int(row["history_decode_rows_before"])
+            live = int(row["history_live_rows"])
+            capacity = int(row["history_source_capacity"])
+            prefix, first, end = expected_query_snapshot_interval(prompt, before, live, capacity, decode=decode)
+            # This is the actual detailed canonical M1 route. Grouped metadata
+            # requires its own immutable transaction history, never M1 extrapolation.
+            if decode and (live != 1 or before != int(row["step"])):
+                return "query checkpoint has no canonical submitted-row history"
+            omitted = row["query_empty_reason"] == "program_omitted_ranking_not_required"
+            if omitted:
+                if first != end or kind != "unauthored_query":
+                    return "program omission contradicts independent ranking history"
+                native_fields = [field for field in proof_fields if field.startswith("observed_")]
+                if any(row[field] for field in native_fields):
+                    return "omitted query fabricates native snapshot fields"
+                program_error = validate_query_program_omission(row.get("query_program_observation", ""),
+                    decode=decode, live_rows=live)
+                if program_error:
+                    return program_error
+                reference_rows = int(row["reference_rows"])
+                if reference_rows not in (live, prefix + live):
+                    return "omitted query reference extent is not original history"
+                expected_reference = first if reference_rows == live else prefix + first
+                if int(row["reference_first_row"]) != expected_reference:
+                    return "omitted query reference coordinates disagree with history"
+            else:
+                if row.get("query_program_observation", ""):
+                    return "snapshot-backed query has unexpected program witness"
+                integers = {field: int(row[field]) for field in proof_fields
+                            if field not in ("structural_valid", "query_empty_reason", "query_program_observation")}
+                row_capacity = integers["observed_row_capacity"]
+                expected = {
+                    "observed_request_count": 1, "observed_prefix_rows": prefix,
+                    "observed_live_rows": live, "observed_source_capacity": capacity,
+                    "observed_first_required_logical_row": 2051, "observed_row_offset": 0,
+                    "observed_first_row": first, "observed_end_row": end,
+                    "observed_payload_row_offset": 0, "observed_physical_rows": row_capacity,
+                    "observed_repeats_per_row": 1, "observed_slice_first_row": 0,
+                    "observed_payload_rows": end-first, "observed_payload_columns": 512,
+                    "observed_payload_elements": (end-first)*512,
+                }
+                if not live <= row_capacity <= capacity or any(integers[key] != value for key, value in expected.items()):
+                    return "query snapshot disagrees with independent original history or coordinates"
+                reference_rows = integers["reference_rows"]
+                if reference_rows not in (live, prefix+live):
+                    return "query reference extent is not original live/history rows"
+                reference_first = first if reference_rows == live else prefix+first
+                if integers["reference_first_row"] != reference_first:
+                    return "query reference crop lost original row coordinates"
+
+            empty = first == end
+            expected_reason = "program_omitted_ranking_not_required" if omitted else ("ranking_not_required" if empty else "none")
+            if row["query_empty_reason"] != expected_reason or (kind == "unauthored_query") != empty:
+                return "wrong query empty reason or authored suffix"
+            if empty:
+                if (row["passed"] != "0" or row["canonical_passed"] != "0" or
+                        row["proof_authority"] != "structural_query_interval"):
+                    return "uncomputed query masquerades as numerical equality"
+                if any(row[field] for field in metrics) or any(
+                        value for key, value in row.items() if key.startswith(("llaminar_", "pytorch_")) or
+                        (key.startswith("route_conditioned_") and key != "route_conditioned_evaluated") or
+                        key in ("route_weights_max_error", "hf_reconstruction_rel_l2")):
+                    return "uncomputed query contains fabricated numerical values"
+            else:
+                if (row["proof_authority"] != "canonical_hf" or
+                        int(row["llaminar_elements"]) != (end-first)*512 or
+                        int(row["pytorch_elements"]) != (end-first)*512 or
+                        any(int(row[field]) != 0 for field in ("llaminar_nan_count", "llaminar_inf_count",
+                                                             "pytorch_nan_count", "pytorch_inf_count")) or
+                        any(not math.isfinite(float(row[field])) for field in ("cosine", "rel_l2", "max_abs_diff"))):
+                    return "authored useful query lost its original finite numerical comparison"
+        if any(stages != query_stages for stages in cohorts.values()):
+            return "missing required raw or prepared query checkpoint"
+    except (ValueError, KeyError, TypeError, OverflowError) as error:
+        return f"malformed query checkpoint evidence: {error}"
+    return None
+
+
+def validate_mtp_acceptance_witness(rows: list[list[str]]) -> str | None:
+    """Authenticate one full-width accepting transaction and exact continuation.
+
+    Adaptive policy can legitimately reject every proposal at its original
+    workload edge. The independent positive checkpoint must still prove native
+    accepting tokens, full-depth real work and complete main-state byte parity.
+    """
+    if len(rows) != 2:
+        return "acceptance witness requires exactly one evidence row"
+    try:
+        row = dict(zip(rows[0], rows[1], strict=True))
+        emitted = [int(token) for token in row["emitted_tokens"].split(";")]
+        serial = [int(token) for token in row["serial_tokens"].split(";")]
+        condition = int(row["condition_token"])
+        draft = int(row["authenticated_first_draft"])
+        depth = int(row["admitted_depth"])
+        attempts = int(row["attempted_drafts"])
+        accepted = int(row["accepted_drafts"])
+        if (int(row["reference_step"]) < 0 or min(condition, draft) < 0 or
+                depth != 15 or int(row["observed_depth"]) != depth or
+                attempts < depth or accepted <= 0 or
+                accepted > attempts or int(row["verifier_transactions"]) <= 0):
+            return "acceptance witness has invalid checkpoint, depth or work counters"
+        if (len(emitted) < 2 or emitted != serial or min(emitted) < 0 or
+                emitted[0] != condition or emitted[1] != draft):
+            return "acceptance witness lacks authenticated serial-exact accepting tokens"
+        if (int(row["continuation_tokens"]) < 2 or row["state_byte_exact"] != "true" or
+                row["prefix_restored"] != "true" or row["adaptive_enabled"] != "true"):
+            return "acceptance witness lacks exact complete-state continuation"
+    except (ValueError, KeyError):
+        return "malformed acceptance witness evidence"
+    return None
 
 
 def validate_native_verifier_rows(rows: list[list[str]]) -> str | None:
@@ -2413,6 +2861,39 @@ def prior_evidence_campaign_counts(
     return counts
 
 
+def bind_canonical_movement_obligations(cells: list[CampaignCell], parameters: dict[str, dict]) -> list[CampaignCell]:
+    """Retain only obligations declared by the original typed metadata, without another axis table."""
+    result=[]
+    for cell in cells:
+        required=[]
+        for case in cell.gtest_cases:
+            record=parameters.get(case)
+            if not isinstance(record,dict) or record.get("model_parity_schema") != 1 or not isinstance(record.get("runtime"),dict):
+                raise ValueError(f"canonical movement obligation lost original typed metadata: {case}")
+            runtime=record["runtime"]
+            if "cohort_publication_inference" in runtime:
+                if runtime["cohort_publication_inference"] is not True or runtime.get("movement_evidence") != "required":
+                    raise ValueError(f"incompatible canonical cohort movement obligation: {case}")
+                if _preflight_mpi_ranks(cell.name,list(cell.command)) is None:
+                    raise ValueError(f"cohort movement requires its original registered MPI population: {case}")
+                required.append(case)
+        result.append(replace(cell,cohort_movement_cases=tuple(required)))
+    return result
+
+
+def validate_cpu_joint_movement_artifacts(directory: Path, gtest_case: str, started_ns: int, *, world_size: int) -> None:
+    """Validate the canonical CPU-joint Dynamic family's complete rank evidence through the shared ledger audit."""
+    # Population is the already registered native process contract, never a
+    # document claim or a parsed topology/test name.
+    documents = []
+    for rank in range(world_size):
+        path = directory / f"cohort_movement_rank_{rank}.json"
+        if not path.is_file() or path.is_symlink() or path.stat().st_mtime_ns < started_ns:
+            raise ValueError(f"missing, foreign or stale original cohort movement evidence: {path.name}")
+        documents.append(json.loads(path.read_text(encoding="utf-8")))
+    validate_cohort_parity_documents(documents, case=gtest_case, world_size=world_size)
+
+
 def validate_campaign_artifacts(
     cell: CampaignCell,
     campaign_started_wall_time_ns: int,
@@ -2444,6 +2925,14 @@ def validate_campaign_artifacts(
             errors.append(str(error))
             continue
         directories.append(str(directory))
+
+        if gtest_case in cell.cohort_movement_cases:
+            try:
+                world_size=_preflight_mpi_ranks(cell.name,list(cell.command))
+                if world_size is None: raise ValueError("canonical cohort lost its original MPI population")
+                validate_cpu_joint_movement_artifacts(directory,gtest_case,campaign_started_wall_time_ns,world_size=world_size)
+            except (OSError,ValueError,TypeError,KeyError) as error:
+                errors.append(f"{gtest_case}: Dynamic cohort movement proof: {error}")
 
         required_headers = _required_csv_headers_for_case(gtest_case)
         for filename, expected_header in required_headers.items():
@@ -2505,6 +2994,16 @@ def validate_campaign_artifacts(
             if requires_data and len(rows) < 2:
                 errors.append(f"{gtest_case}: {filename} has no evidence row")
                 continue
+            if filename in ("prefill_stages.csv", "decode_stages.csv"):
+                stage_error = validate_stage_checkpoint_evidence(rows, decode=filename == "decode_stages.csv")
+                if stage_error:
+                    errors.append(f"{gtest_case}: {filename}: {stage_error}")
+                    continue
+            if filename == "mtp_acceptance_witness.csv":
+                acceptance_error = validate_mtp_acceptance_witness(rows)
+                if acceptance_error:
+                    errors.append(f"{gtest_case}: {filename}: {acceptance_error}")
+                    continue
             if filename == "mtp_native_verifier_rows.csv":
                 native_error = validate_native_verifier_rows(rows)
                 if native_error:
@@ -3065,10 +3564,12 @@ def _run_process(
             )
         return 130
 
-    environment = None
+    # The registered native workload must observe real hardware ISA identity,
+    # including when a developer shell inherited an old homogeneous-host spoof.
+    environment = os.environ.copy()
     if environment_overrides:
-        environment = os.environ.copy()
         environment.update(environment_overrides)
+    environment.pop("HSA_OVERRIDE_GFX_VERSION", None)
     process = subprocess.Popen(
         command,
         start_new_session=True,
@@ -3224,37 +3725,83 @@ def _run_process(
             pass
 
 
-def _preflight_name_regex(names: tuple[str, ...]) -> str:
-    """Produce one portable exact CTest selector from trusted names.
+def _validate_preflight_index_selection(
+    build_dir: Path, selector: Path, names: tuple[str, ...],
+) -> None:
+    """Authenticate native indices against CTest before launching any selected tests.
 
-    CTest's legacy regex engine accepts ordinary grouping but not Python's
-    non-capturing group extension, so this must remain syntax compatible with
-    the CTest versions supported by the installed runner image.
+    A rebuilt or externally changed inventory can shift a valid integer onto a
+    model/excluded sentinel. CTest's own numeric-selection preview must return
+    exactly the intended names; no name regex or newer CTest option is involved.
     """
+    result = subprocess.run(
+        ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1", "-I", str(selector)],
+        check=False, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("CTest preflight index validation failed:\n" + (result.stderr or result.stdout))
+    selected = tuple(test.get("name") for test in json.loads(result.stdout).get("tests", []))
+    if len(selected) != len(names) or set(selected) != set(names):
+        raise RuntimeError("stale or foreign preflight CTest indices do not select the exact intended names")
 
-    if not names:
-        raise ValueError("preflight CTest selector requires at least one test")
-    if len(set(names)) != len(names):
-        raise ValueError("preflight CTest selector contains duplicate tests")
-    # CTest uses the legacy POSIX-like ``kwsys`` regular-expression engine,
-    # not Python's ``re`` engine. It supports a normal grouping expression but
-    # not Python's ``(?:...)`` non-capturing extension; using the latter makes
-    # the entire lane select zero tests at runtime. Capturing is immaterial to
-    # selection, so use the portable spelling required by every supported CTest.
-    return "^(" + "|".join(re.escape(name) for name in names) + ")$"
+
+@contextmanager
+def _preflight_index_selection(
+    build_dir: Path, registrations: tuple[PreflightRegistration, ...], names: tuple[str, ...],
+) -> Iterator[Path]:
+    """Own one portable CTest numeric-selector file through every child using it.
+
+    The historical -I file grammar starts with start,end,stride. The empty range
+    1,0,1 selects nothing; only the following explicit positive indices execute.
+    This avoids both CTest's regex-size limit and the newer --tests-from-file ABI.
+    ExitStack at the gate retains both socket selectors until every parallel
+    child has exited/retired, including exceptions and infrastructure failures.
+    """
+    if not names or len(set(names)) != len(names):
+        raise ValueError("preflight CTest index selector needs nonempty unique names")
+    preflight_execution_plan(registrations)  # Also rejects duplicate native indices.
+    by_name = {registration.name: registration for registration in registrations}
+    try:
+        indices = tuple(by_name[name].ctest_index for name in names)
+    except KeyError as error:
+        raise ValueError("foreign preflight name is absent from the current CTest inventory") from error
+    with tempfile.TemporaryDirectory(prefix="llaminar-preflight-indices-") as directory:
+        selector = Path(directory) / "selection.txt"
+        selector.write_text("1,0,1," + ",".join(str(index) for index in sorted(indices)) + "\n", encoding="utf-8")
+        _validate_preflight_index_selection(build_dir, selector, names)
+        yield selector
+
+
+def _preflight_test_phase_completed(return_code: int) -> bool:
+    """Distinguish completed CTest failures from unsafe infrastructure exits.
+
+    CTest's dedicated test-failure exit8 still represents a completed test
+    command. It must not hide later independent failures. Timeout/cancellation,
+    signals, launch exceptions and other error codes stop ownership admission.
+    This helper is never used to forgive a prerequisite build failure.
+    """
+    return return_code in (0, 8)
+
+
+def _preflight_merge_test_phase_return_codes(prior: int, observed: int) -> int:
+    """Keep the first observed fatal; later cancellation cannot hide its cause."""
+    if not _preflight_test_phase_completed(prior):
+        return prior
+    if not _preflight_test_phase_completed(observed):
+        return observed
+    return prior if prior != 0 else observed
 
 
 def _run_preflight_parallel_processes(
     commands: dict[PreflightExecutionLane, list[str]],
     timeout_seconds: float | None,
 ) -> dict[PreflightExecutionLane, int]:
-    """Run disjoint preflight lanes and retire sibling MPI trees on failure.
+    """Collect both completed test lanes; retire siblings on infrastructure failure.
 
-    This is intentionally narrower than the campaign scheduler: it admits only
-    the two single-rank accelerator lanes after their typed planner assigned
-    disjoint CPU packages. A red or transaction deadline tears down both exact
-    process groups immediately, so a failed CUDA test cannot leave ROCm work
-    running past the gate's terminal transition.
+    Only the two typed single-rank lanes may overlap on disjoint CPU packages.
+    Ordinary CTest8 retains the peer's independent failure evidence. Launch or
+    ownership exceptions, abnormal exits and transaction deadlines still retire
+    the exact process groups before another ownership lane can start.
     """
 
     if set(commands) != {
@@ -3264,14 +3811,15 @@ def _run_preflight_parallel_processes(
         raise ValueError("parallel preflight requires exactly CUDA and ROCm socket lanes")
     if timeout_seconds is not None and timeout_seconds <= 0.0:
         return {lane: 124 for lane in commands}
-    processes = {
-        lane: subprocess.Popen(command, start_new_session=True)
-        for lane, command in commands.items()
-    }
+    # Publish each owner inside the retirement scope: a second launch failure
+    # must not strand the already started first process group.
+    processes = {}
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     results: dict[PreflightExecutionLane, int] = {}
     failed = False
     try:
+        for lane, command in commands.items():
+            processes[lane] = subprocess.Popen(command, start_new_session=True)
         while len(results) != len(processes):
             for lane, process in processes.items():
                 if lane in results:
@@ -3280,7 +3828,7 @@ def _run_preflight_parallel_processes(
                 if return_code is None:
                     continue
                 results[lane] = return_code
-                failed = failed or return_code != 0
+                failed = failed or not _preflight_test_phase_completed(return_code)
             if failed:
                 for lane, process in processes.items():
                     if lane not in results and process.poll() is None:
@@ -3305,6 +3853,15 @@ def _run_preflight_parallel_processes(
 
 
 @dataclass(frozen=True)
+class PreflightResult:
+    """One canonical result; qualification cannot be lost by tuple unpacking."""
+    return_code: int
+    elapsed_seconds: float
+    tests: tuple[str, ...]
+    qualification: dict | None
+
+
+@dataclass(frozen=True)
 class PrerequisiteReport:
     """Standalone model-free gate evidence, never a model/image certificate.
 
@@ -3316,6 +3873,7 @@ class PrerequisiteReport:
     preflight_return_code: int
     preflight_elapsed_seconds: float
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     preflight_build_directory: str
     preflight_completed_ns: int
     preflight_test_count: int
@@ -3329,19 +3887,22 @@ def run_production_test_preflight(
     timeout_seconds: float | None,
     installed_build_receipt: Path | None = None,
     artifact_directory: Path | None = None,
-) -> tuple[int, float, tuple[str, ...]]:
+) -> PreflightResult:
     """Build and run every model-free prerequisite before model staging.
 
     The phases deliberately have separate, source-owned inventories: CTest's
     complete Unit namespace and the Integration-only preflight label.  Their
-    concatenated identities remain the existing report receipt, so a green
-    campaign proves both without adding a parallel manifest.
+    concatenated identities remain the full registered report inventory. Only
+    explicitly optional physical geometries can remain hardware-unqualified;
+    their exact requirements, observation and absence survive in the same result.
+    Eligible original native bodies remain strict and execute unchanged.
     """
 
-    unit_tests = discover_production_parity_unit_tests(build_dir)
-    integration_registrations = discover_production_test_preflight_registrations(build_dir)
-    integration_tests = tuple(registration.name for registration in integration_registrations)
-    tests = unit_tests + integration_tests
+    # CTest omits command metadata for executables not built yet. Authenticate
+    # the complete runnable inventory only after this owner builds its gates
+    # (or validates the installed image receipt); never weaken discovery itself.
+    tests: tuple[str, ...] = ()
+    qualification: dict | None = None
     timeout_text = (
         "disabled" if timeout_seconds is None else f"{timeout_seconds:.3f}"
     )
@@ -3357,24 +3918,23 @@ def run_production_test_preflight(
             return None
         return max(deadline - time.monotonic(), 0.001)
 
-    def complete(return_code: int, elapsed: float) -> tuple[int, float, tuple[str, ...]]:
+    def complete(return_code: int, elapsed: float) -> PreflightResult:
         """Publish this gate's own receipt without requiring a model run."""
         if artifact_directory is not None:
             write_report(artifact_directory / "prerequisites.json", PrerequisiteReport(
                 preflight_return_code=return_code,
                 preflight_elapsed_seconds=elapsed,
                 preflight_tests=tests,
+                preflight_qualification=qualification,
                 preflight_build_directory=str(build_dir.expanduser().resolve()),
                 preflight_completed_ns=time.time_ns(),
                 preflight_test_count=len(tests),
             ))
-        return return_code, elapsed, tests
+        return PreflightResult(return_code, elapsed, tests, qualification)
 
     print(
         "[production-parity] preflight_status=RUNNING "
-        f"unit_test_count={len(unit_tests)} "
-        f"integration_test_count={len(integration_tests)} "
-        f"test_count={len(tests)} "
+        "inventory_status=PENDING_BUILD "
         f"completion_timeout_remaining_seconds={timeout_text}",
         flush=True,
     )
@@ -3422,18 +3982,56 @@ def run_production_test_preflight(
         )
         return complete(return_code, elapsed)
 
-    # Ninja can regenerate CMake while building the gate, adding or removing
-    # registrations. CTest below consumes that regenerated inventory, so its
-    # receipt must name those exact tests rather than the pre-build snapshot.
+    # Ninja can regenerate CMake and CTest can now resolve the built binaries.
+    # Validate every command, label, timeout and lane before executing any test;
+    # the receipt names this exact complete inventory, never a pre-build view.
     unit_tests = discover_production_parity_unit_tests(build_dir)
     integration_registrations = discover_production_test_preflight_registrations(build_dir)
     integration_tests = tuple(registration.name for registration in integration_registrations)
     tests = unit_tests + integration_tests
+    print(
+        "[production-parity] prerequisite_inventory_status=PASS "
+        f"unit_test_count={len(unit_tests)} "
+        f"integration_test_count={len(integration_tests)} "
+        f"test_count={len(tests)}",
+        flush=True,
+    )
+
 
     # CTest before 3.29 requires an explicit parallel level. Use the kernel's
     # full affinity mask on every supported CTest version, not a fixed worker
     # cap. CMake's per-test PROCESSORS weights still own physical-core budgets.
     test_parallelism = str(len(os.sched_getaffinity(0)))
+    native_session_bases: dict[str, Path] = {}
+    if any("ProcessOwned" in registration.labels for registration in integration_registrations):
+        inventory = subprocess.run(
+            ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
+            check=True, text=True, capture_output=True)
+        native_session_bases = owned_session_bases(json.loads(inventory.stdout))
+
+    # Authenticate the WHOLE selected transaction before spending time in Unit.
+    # A dirty later/exclusive lane is still an unretired predecessor, not work
+    # this campaign may clean or defer discovering until its lane is reached.
+    require_retired((native_session_bases[name] for name in tests
+                     if name in native_session_bases), timeout_seconds=0)
+
+    requirements = preflight_optional_hardware_requirements(integration_registrations)
+    hardware = observe_preflight_hardware(build_dir, remaining_timeout()) if requirements else None
+    qualification = preflight_hardware_qualification(tests, requirements, hardware)
+    selected_integration = tuple(row for row in integration_registrations
+        if row.name in qualification["selected"])
+    print("[production-parity] hardware_qualification_status=PASS "
+        f"registered={len(integration_registrations)} selected={len(selected_integration)} "
+        f"hardware_ineligible_unqualified={len(qualification['unqualified'])}", flush=True)
+    for name, reason in qualification["unqualified"].items():
+        print("[production-parity] hardware-ineligible-unqualified " + name + " " +
+            json.dumps(reason, sort_keys=True), flush=True)
+
+    def process_scope(names: tuple[str, ...]):
+        """Keep this lane closed until its original native owners remove backing."""
+        return retirement_scope(native_session_bases[name] for name in names
+                                if name in native_session_bases)
+
     def evidence_arguments(phase: str) -> list[str]:
         """Retain CTest's own complete evidence beyond Docker console delivery."""
         if artifact_directory is None:
@@ -3460,7 +4058,8 @@ def run_production_test_preflight(
         flush=True,
     )
     unit_started = time.monotonic()
-    return_code = _run_process(unit_command, remaining_timeout())
+    with process_scope(unit_tests):
+        return_code = _run_process(unit_command, remaining_timeout())
     unit_elapsed = time.monotonic() - unit_started
     print(
         "[production-parity] unit_test_status="
@@ -3468,7 +4067,7 @@ def run_production_test_preflight(
         f"test_count={len(unit_tests)} elapsed_seconds={unit_elapsed:.3f}",
         flush=True,
     )
-    if return_code != 0:
+    if not _preflight_test_phase_completed(return_code):
         elapsed = time.monotonic() - started
         print(
             "[production-parity] preflight_status=FAIL "
@@ -3478,172 +4077,180 @@ def run_production_test_preflight(
         )
         return complete(return_code, elapsed)
 
-    execution_plan = preflight_execution_plan(integration_registrations)
-    planned_names = tuple(
-        name
-        for lane in PreflightExecutionLane
-        for name in execution_plan[lane]
-    )
-    if set(planned_names) != set(integration_tests) or len(planned_names) != len(integration_tests):
-        raise RuntimeError("preflight execution plan does not cover its exact CTest inventory")
+    unit_return_code = return_code
 
-    def integration_command(
-        lane: PreflightExecutionLane,
-        names: tuple[str, ...],
-        cpu_set: str | None = None,
-    ) -> list[str]:
-        """Build one sealed CTest lane command with optional CPU-package affinity."""
-
-        command = [
-            "ctest",
-            "--test-dir",
-            str(build_dir),
-            "--output-on-failure",
-            # The lane owns its device/resource class serially.  This prevents
-            # manually registered tests without Integration_Serial from racing
-            # their backend peers after the historical global lock is split.
-            "--parallel",
-            "1",
-            "--no-tests=error",
-            "-R",
-            _preflight_name_regex(names),
-            *evidence_arguments(f"integration-{lane.value}"),
-        ]
-        return (["taskset", "--cpu-list", cpu_set, *command]
-                if cpu_set is not None else command)
-
-    def run_integration_lane(
-        lane: PreflightExecutionLane,
-        names: tuple[str, ...],
-        cpu_set: str | None = None,
-    ) -> tuple[int, float]:
-        """Run one exclusive lane and publish a compact timing transition."""
-
-        if not names:
-            return 0, 0.0
-        print(
-            "[production-parity] integration_preflight_lane_status=RUNNING "
-            f"lane={lane.value} test_count={len(names)} "
-            f"cpu_package={'bound' if cpu_set is not None else 'unbound'}",
-            flush=True,
+    with ExitStack() as selector_owners:
+        execution_plan = preflight_execution_plan(selected_integration)
+        planned_names = tuple(
+            name
+            for lane in PreflightExecutionLane
+            for name in execution_plan[lane]
         )
-        lane_started = time.monotonic()
-        lane_return_code = _run_process(
-            integration_command(lane, names, cpu_set),
-            remaining_timeout(),
-        )
-        lane_elapsed = time.monotonic() - lane_started
-        print(
-            "[production-parity] integration_preflight_lane_status="
-            f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
-            f"test_count={len(names)} elapsed_seconds={lane_elapsed:.3f}",
-            flush=True,
-        )
-        return lane_return_code, lane_elapsed
+        selected_names = tuple(row.name for row in selected_integration)
+        if set(planned_names) != set(selected_names) or len(planned_names) != len(selected_names):
+            raise RuntimeError("preflight execution plan does not cover its exact CTest inventory")
 
-    print(
-        "[production-parity] integration_preflight_status=RUNNING "
-        f"test_count={len(integration_tests)} "
-        f"host_test_count={len(execution_plan[PreflightExecutionLane.HOST])} "
-        f"cuda_socket_test_count={len(execution_plan[PreflightExecutionLane.CUDA_SOCKET])} "
-        f"rocm_socket_test_count={len(execution_plan[PreflightExecutionLane.ROCM_SOCKET])} "
-        f"exclusive_test_count={len(execution_plan[PreflightExecutionLane.EXCLUSIVE])}",
-        flush=True,
-    )
-    integration_started = time.monotonic()
-    return_code, _ = run_integration_lane(
-        PreflightExecutionLane.HOST,
-        execution_plan[PreflightExecutionLane.HOST],
-    )
-    if return_code == 0:
-        cuda_names = execution_plan[PreflightExecutionLane.CUDA_SOCKET]
-        rocm_names = execution_plan[PreflightExecutionLane.ROCM_SOCKET]
-        cpu_sets = preflight_accelerator_cpu_sets()
-        if cuda_names and rocm_names and cpu_sets is not None:
-            cuda_command = integration_command(
-                PreflightExecutionLane.CUDA_SOCKET,
-                cuda_names,
-                cpu_sets[0],
-            )
-            rocm_command = integration_command(
-                PreflightExecutionLane.ROCM_SOCKET,
-                rocm_names,
-                cpu_sets[1],
-            )
+        def integration_command(
+            lane: PreflightExecutionLane,
+            names: tuple[str, ...],
+            cpu_set: str | None = None,
+        ) -> list[str]:
+            """Build one sealed CTest lane command with optional CPU-package affinity."""
+
+            command = [
+                "ctest",
+                "--test-dir",
+                str(build_dir),
+                "--output-on-failure",
+                # The lane owns its device/resource class serially.  This prevents
+                # manually registered tests without Integration_Serial from racing
+                # their backend peers after the historical global lock is split.
+                "--parallel",
+                "1",
+                "--no-tests=error",
+                "-I",
+                str(selector_owners.enter_context(_preflight_index_selection(
+                    build_dir, integration_registrations, names))),
+                *evidence_arguments(f"integration-{lane.value}"),
+            ]
+            return (["taskset", "--cpu-list", cpu_set, *command]
+                    if cpu_set is not None else command)
+
+        def run_integration_lane(
+            lane: PreflightExecutionLane,
+            names: tuple[str, ...],
+            cpu_set: str | None = None,
+        ) -> tuple[int, float]:
+            """Run one exclusive lane and publish a compact timing transition."""
+
+            if not names:
+                return 0, 0.0
             print(
                 "[production-parity] integration_preflight_lane_status=RUNNING "
-                f"lane={PreflightExecutionLane.CUDA_SOCKET.value} "
-                f"test_count={len(cuda_names)} cpu_package=bound",
+                f"lane={lane.value} test_count={len(names)} "
+                f"cpu_package={'bound' if cpu_set is not None else 'unbound'}",
                 flush=True,
             )
+            lane_started = time.monotonic()
+            with process_scope(names):
+                lane_return_code = _run_process(
+                    integration_command(lane, names, cpu_set),
+                    remaining_timeout(),
+                )
+            lane_elapsed = time.monotonic() - lane_started
             print(
-                "[production-parity] integration_preflight_lane_status=RUNNING "
-                f"lane={PreflightExecutionLane.ROCM_SOCKET.value} "
-                f"test_count={len(rocm_names)} cpu_package=bound",
+                "[production-parity] integration_preflight_lane_status="
+                f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
+                f"test_count={len(names)} elapsed_seconds={lane_elapsed:.3f}",
                 flush=True,
             )
-            parallel_started = time.monotonic()
-            parallel_results = _run_preflight_parallel_processes(
-                {
-                    PreflightExecutionLane.CUDA_SOCKET: cuda_command,
-                    PreflightExecutionLane.ROCM_SOCKET: rocm_command,
-                },
-                remaining_timeout(),
-            )
-            parallel_elapsed = time.monotonic() - parallel_started
-            for lane in (
-                PreflightExecutionLane.CUDA_SOCKET,
-                PreflightExecutionLane.ROCM_SOCKET,
-            ):
-                lane_return_code = parallel_results[lane]
+            return lane_return_code, lane_elapsed
+
+        print(
+            "[production-parity] integration_preflight_status=RUNNING "
+            f"test_count={len(integration_tests)} "
+            f"host_test_count={len(execution_plan[PreflightExecutionLane.HOST])} "
+            f"cuda_socket_test_count={len(execution_plan[PreflightExecutionLane.CUDA_SOCKET])} "
+            f"rocm_socket_test_count={len(execution_plan[PreflightExecutionLane.ROCM_SOCKET])} "
+            f"exclusive_test_count={len(execution_plan[PreflightExecutionLane.EXCLUSIVE])}",
+            flush=True,
+        )
+        integration_started = time.monotonic()
+        return_code, _ = run_integration_lane(
+            PreflightExecutionLane.HOST,
+            execution_plan[PreflightExecutionLane.HOST],
+        )
+        if _preflight_test_phase_completed(return_code):
+            cuda_names = execution_plan[PreflightExecutionLane.CUDA_SOCKET]
+            rocm_names = execution_plan[PreflightExecutionLane.ROCM_SOCKET]
+            cpu_sets = preflight_accelerator_cpu_sets()
+            if cuda_names and rocm_names and cpu_sets is not None:
+                cuda_command = integration_command(
+                    PreflightExecutionLane.CUDA_SOCKET,
+                    cuda_names,
+                    cpu_sets[0],
+                )
+                rocm_command = integration_command(
+                    PreflightExecutionLane.ROCM_SOCKET,
+                    rocm_names,
+                    cpu_sets[1],
+                )
                 print(
-                    "[production-parity] integration_preflight_lane_status="
-                    f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
-                    f"test_count={len(execution_plan[lane])} "
-                    f"elapsed_seconds={parallel_elapsed:.3f}",
+                    "[production-parity] integration_preflight_lane_status=RUNNING "
+                    f"lane={PreflightExecutionLane.CUDA_SOCKET.value} "
+                    f"test_count={len(cuda_names)} cpu_package=bound",
                     flush=True,
                 )
-            return_code = next(
-                (code for code in parallel_results.values() if code != 0),
-                0,
+                print(
+                    "[production-parity] integration_preflight_lane_status=RUNNING "
+                    f"lane={PreflightExecutionLane.ROCM_SOCKET.value} "
+                    f"test_count={len(rocm_names)} cpu_package=bound",
+                    flush=True,
+                )
+                parallel_started = time.monotonic()
+                with process_scope(cuda_names + rocm_names):
+                    parallel_results = _run_preflight_parallel_processes(
+                        {
+                            PreflightExecutionLane.CUDA_SOCKET: cuda_command,
+                            PreflightExecutionLane.ROCM_SOCKET: rocm_command,
+                        },
+                        remaining_timeout(),
+                    )
+                parallel_elapsed = time.monotonic() - parallel_started
+                for lane in (
+                    PreflightExecutionLane.CUDA_SOCKET,
+                    PreflightExecutionLane.ROCM_SOCKET,
+                ):
+                    lane_return_code = parallel_results[lane]
+                    print(
+                        "[production-parity] integration_preflight_lane_status="
+                        f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
+                        f"test_count={len(execution_plan[lane])} "
+                        f"elapsed_seconds={parallel_elapsed:.3f}",
+                        flush=True,
+                    )
+                for lane_code in parallel_results.values():
+                    return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
+            else:
+                # A one-package host cannot safely give two MPI launchers
+                # disjoint worker capacity. The complete typed plan is still
+                # executed; only its CUDA/ROCm overlap is unavailable.
+                for lane in (
+                    PreflightExecutionLane.CUDA_SOCKET,
+                    PreflightExecutionLane.ROCM_SOCKET,
+                ):
+                    lane_code, _ = run_integration_lane(lane, execution_plan[lane])
+                    return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
+                    if not _preflight_test_phase_completed(lane_code):
+                        break
+        if _preflight_test_phase_completed(return_code):
+            exclusive_code, _ = run_integration_lane(
+                PreflightExecutionLane.EXCLUSIVE,
+                execution_plan[PreflightExecutionLane.EXCLUSIVE],
             )
-        else:
-            # A one-package host cannot safely give two MPI launchers
-            # disjoint worker capacity. The complete typed plan is still
-            # executed; only its CUDA/ROCm overlap is unavailable.
-            for lane in (
-                PreflightExecutionLane.CUDA_SOCKET,
-                PreflightExecutionLane.ROCM_SOCKET,
-            ):
-                return_code, _ = run_integration_lane(lane, execution_plan[lane])
-                if return_code != 0:
-                    break
-    if return_code == 0:
-        return_code, _ = run_integration_lane(
-            PreflightExecutionLane.EXCLUSIVE,
-            execution_plan[PreflightExecutionLane.EXCLUSIVE],
+            return_code = _preflight_merge_test_phase_return_codes(return_code, exclusive_code)
+        integration_elapsed = time.monotonic() - integration_started
+        elapsed = time.monotonic() - started
+        print(
+            "[production-parity] integration_preflight_status="
+            f"{'PASS' if return_code == 0 else 'FAIL'} "
+            f"test_count={len(integration_tests)} elapsed_seconds={integration_elapsed:.3f}",
+            flush=True,
         )
-    integration_elapsed = time.monotonic() - integration_started
-    elapsed = time.monotonic() - started
-    print(
-        "[production-parity] integration_preflight_status="
-        f"{'PASS' if return_code == 0 else 'FAIL'} "
-        f"test_count={len(integration_tests)} elapsed_seconds={integration_elapsed:.3f}",
-        flush=True,
-    )
-    print(
-        "[production-parity] preflight_status="
-        f"{'PASS' if return_code == 0 else 'FAIL'} "
-        f"test_count={len(tests)} elapsed_seconds={elapsed:.3f}",
-        flush=True,
-    )
-    return complete(return_code, elapsed)
+        return_code = _preflight_merge_test_phase_return_codes(unit_return_code, return_code)
+        print(
+            "[production-parity] preflight_status="
+            f"{'PASS' if return_code == 0 else 'FAIL'} "
+            f"test_count={len(tests)} elapsed_seconds={elapsed:.3f}",
+            flush=True,
+        )
+        return complete(return_code, elapsed)
 
 
 def reuse_unchanged_production_test_preflight(
     build_dir: Path,
     report_path: Path,
-) -> tuple[int, float, tuple[str, ...]]:
+) -> PreflightResult:
     """Reuse canonical prerequisite evidence only for an unchanged build tree.
 
     Numerical and generation runners share this admission authority. The prior
@@ -3714,10 +4321,9 @@ def reuse_unchanged_production_test_preflight(
                 f"registration changed afterward: {boundary}"
             )
 
-    tests = (
-        discover_production_parity_unit_tests(resolved_build)
-        + discover_production_test_preflight_tests(resolved_build)
-    )
+    registrations = discover_production_test_preflight_registrations(resolved_build)
+    tests = (discover_production_parity_unit_tests(resolved_build)
+        + tuple(row.name for row in registrations))
     reported_tests = tuple(document.get("preflight_tests", ()))
     if (
         document.get("preflight_test_count") != len(tests)
@@ -3727,13 +4333,20 @@ def reuse_unchanged_production_test_preflight(
             "reusable preflight report does not prove the current complete "
             "unit and integration prerequisite inventory"
         )
+    requirements = preflight_optional_hardware_requirements(registrations)
+    qualification = document.get("preflight_qualification")
+    validate_preflight_qualification(list(tests), qualification)
+    hardware = observe_preflight_hardware(resolved_build, None) if requirements else None
+    current = preflight_hardware_qualification(tests, requirements, hardware)
+    if current != qualification:
+        raise ValueError("reusable preflight hardware qualification changed")
     print(
         "[production-parity] preflight_status=REUSED "
         f"test_count={len(tests)} evidence_report={resolved_report} "
         "build_identity=unchanged",
         flush=True,
     )
-    return 0, 0.0, tests
+    return PreflightResult(0, 0.0, tests, qualification)
 
 
 def prepare_model_fixture(
@@ -4477,6 +5090,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--history-replay",
+        type=_existing_file,
+        default=None,
+        metavar="FILE",
+        help=(
+            "diagnostic-only frozen QFN history descriptor for --exact-cell; "
+            "requires an already regenerated full-stage reference and preserves "
+            "the original topology, arithmetic, numerical contract and six CSVs"
+        ),
+    )
+    parser.add_argument(
         "--max-unseen-cells",
         type=_positive_integer,
         default=None,
@@ -4552,6 +5176,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or "?" in arguments.exact_cell
     ):
         parser.error("--exact-cell requires one nonempty wildcard-free GTest identity")
+    if arguments.history_replay is not None and arguments.exact_cell is None:
+        parser.error("--history-replay requires one original --exact-cell")
+    if any(os.environ.get(key) for key in HANDOFF_FIELDS):
+        parser.error("history replay handoff is driver-owned; use explicit --history-replay FILE")
     arguments.prior_artifact_roots = tuple(
         dict.fromkeys(arguments.prior_artifact_roots)
     )
@@ -4691,6 +5319,7 @@ def run_unseen_cells_individually(
             preflight_return_code=125,
             preflight_test_count=0,
             preflight_tests=(),
+            preflight_qualification=None,
             fixture_return_code=0,
             model_staging_return_code=0,
             artifact_root="",
@@ -4711,6 +5340,7 @@ def run_unseen_cells_individually(
     completion_deadline = started + args.completion_timeout_seconds
     results: list[CampaignResult] = []
     preflight_return_code = 125
+    preflight_qualification = None
     preflight_tests: tuple[str, ...] = ()
     fixture_return_code = 125
     model_staging_return_code = 125
@@ -4725,23 +5355,21 @@ def run_unseen_cells_individually(
         flush=True,
     )
     if args.reuse_passed_preflight_report is None:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = run_production_test_preflight(
+        preflight_result = run_production_test_preflight(
             args.build_dir,
             max(completion_deadline - time.monotonic(), 0.001),
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     else:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = reuse_unchanged_production_test_preflight(
+        preflight_result = reuse_unchanged_production_test_preflight(
             args.build_dir,
             args.reuse_passed_preflight_report,
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     if preflight_return_code != 0:
         exit_code = preflight_return_code
         stopped_on_failure = True
@@ -4856,6 +5484,7 @@ def run_unseen_cells_individually(
         preflight_return_code=preflight_return_code,
         preflight_test_count=len(preflight_tests),
         preflight_tests=preflight_tests,
+        preflight_qualification=preflight_qualification,
         fixture_return_code=fixture_return_code,
         model_staging_return_code=model_staging_return_code,
         artifact_root=str(artifact_root),
@@ -4894,6 +5523,7 @@ def run_unseen_cells_individually(
 def run_focused_exact_cell(
     args: argparse.Namespace,
     selected: tuple[CampaignCell, ...],
+    declaration: dict | None = None,
 ) -> int:
     """Run one CTest-registered production cell through the full lifecycle.
 
@@ -4906,6 +5536,7 @@ def run_focused_exact_cell(
     Args:
         args: Parsed driver arguments containing one exact GTest identity.
         selected: CTest-discovered campaign aggregates after ordinary filters.
+        declaration: Original exact-cell metadata from model-free discovery.
 
     Returns:
         The focused cell's process/artifact result, or its prerequisite error.
@@ -4914,10 +5545,23 @@ def run_focused_exact_cell(
     if args.exact_cell is None:
         raise ValueError("focused exact-cell execution requires an exact GTest case")
     owner = select_focused_exact_cell(selected, args.exact_cell)
+    history = None
+    if getattr(args, "history_replay", None) is not None:
+        # Preserve the registered owner/transport while binding this explicit
+        # history to its authenticated single exact case before projection.
+        owner = _single_exact_cell(owner, args.exact_cell)
+        declared_sources = tuple(member for model in owner.model_files
+                                 for member in _split_gguf_members(Path(model)))
+        history = prepare_history_replay(args.history_replay, args.exact_cell, declared_sources)
+        command, environment = history.launch(owner.command, _registered_environment(owner))
+        owner = replace(owner, command=command,
+                        environment=tuple(f"{key}={value}" for key, value in environment.items()))
     artifact_root = create_campaign_artifact_root(args.report)
+    history_environment = history.bind(artifact_root) if history is not None else {}
     started = time.monotonic()
     completion_deadline = started + args.completion_timeout_seconds
     preflight_return_code = 125
+    preflight_qualification = None
     preflight_tests: tuple[str, ...] = ()
     fixture_return_code = 125
     model_staging_return_code = 125
@@ -4932,23 +5576,21 @@ def run_focused_exact_cell(
         flush=True,
     )
     if args.reuse_passed_preflight_report is None:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = run_production_test_preflight(
+        preflight_result = run_production_test_preflight(
             args.build_dir,
             max(completion_deadline - time.monotonic(), 0.001),
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     else:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = reuse_unchanged_production_test_preflight(
+        preflight_result = reuse_unchanged_production_test_preflight(
             args.build_dir,
             args.reuse_passed_preflight_report,
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     if preflight_return_code != 0:
         exit_code = preflight_return_code
     else:
@@ -4986,9 +5628,20 @@ def run_focused_exact_cell(
                     environment_overrides={
                         MODEL_RAMDISK_ENV: str(staged_directory),
                         ARTIFACT_ROOT_ENV: str(artifact_root),
+                        **history_environment,
                     },
                     artifact_results_root=artifact_root,
                 )
+                if history is not None:
+                    try:
+                        history.verify_unchanged()
+                        history.require_binding(result.artifact_directories, declaration)
+                    except (OSError, ValueError, json.JSONDecodeError) as error:
+                        result = replace(result,
+                            return_code=result.return_code or 126,
+                            outcome="artifact_contract_failed",
+                            artifact_contract_passed=False,
+                            artifact_errors=result.artifact_errors + (f"Frozen history binding failed: {error}",))
                 exit_code = result.return_code
         except TimeoutError as error:
             model_staging_return_code = 124
@@ -5016,6 +5669,7 @@ def run_focused_exact_cell(
         preflight_return_code=preflight_return_code,
         preflight_test_count=len(preflight_tests),
         preflight_tests=preflight_tests,
+        preflight_qualification=preflight_qualification,
         fixture_return_code=fixture_return_code,
         model_staging_return_code=model_staging_return_code,
         model_staging_root=model_staging_root,
@@ -5045,6 +5699,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.exact_cell is not None:
             selected = [select_focused_exact_cell(selected, args.exact_cell)]
+        # Reuse the same model-free typed metadata reader as inventory/E2E;
+        # no model samefile/shard projection or isolated runtime is entered.
+        from model_parity_inventory import discover_parameters
+        parameters=discover_parameters(discover_campaigns(args.build_dir),selected)
+        selected=bind_canonical_movement_obligations(selected,parameters)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"production parity campaign error: {error}", file=sys.stderr)
         return 2
@@ -5094,7 +5753,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.exact_cell is not None:
         try:
-            return run_focused_exact_cell(args, tuple(selected))
+            return run_focused_exact_cell(args, tuple(selected), parameters.get(args.exact_cell))
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
             print(
                 f"production parity focused exact-cell error: {error}",
@@ -5133,12 +5792,9 @@ def main(argv: list[str] | None = None) -> int:
         f"exact_cell_timeout_seconds={EXACT_CELL_TIMEOUT_SECONDS:.3f}",
         flush=True,
     )
+    preflight_qualification = None
     try:
-        (
-            preflight_return_code,
-            preflight_elapsed,
-            preflight_tests,
-        ) = (reuse_unchanged_production_test_preflight(
+        preflight_result = reuse_unchanged_production_test_preflight(
             args.build_dir, args.reuse_passed_preflight_report,
         ) if args.reuse_passed_preflight_report is not None else run_production_test_preflight(
             args.build_dir,
@@ -5146,7 +5802,11 @@ def main(argv: list[str] | None = None) -> int:
             artifact_directory=args.report.resolve().parent / "prerequisites",
             **({"installed_build_receipt": args.installed_build_receipt}
                if args.installed_build_receipt else {}),
-        ))
+        )
+        preflight_return_code = preflight_result.return_code
+        preflight_elapsed = preflight_result.elapsed_seconds
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(
             f"production test preflight error: {error}",
@@ -5306,6 +5966,7 @@ def main(argv: list[str] | None = None) -> int:
         preflight_elapsed_seconds=preflight_elapsed,
         preflight_test_count=len(preflight_tests),
         preflight_tests=preflight_tests,
+        preflight_qualification=preflight_qualification,
         fixture_return_code=fixture_return_code,
         fixture_elapsed_seconds=fixture_elapsed,
         model_staging_return_code=model_staging_return_code,

@@ -102,6 +102,154 @@ namespace llaminar2
     {
     }
 
+    bool MoEOverlayDeviceEpochProtocol::armFiniteParent(
+        DeviceMoEOverlayEpochParent &parent) noexcept
+    {
+        using State = DeviceMoEOverlayEpochParentState;
+        if (!control_ || parent.control != control_ || control_->finite_parent != &parent || parent.version != kDeviceMoEOverlayEpochParentVersion) return false;
+        auto state = atomic32(parent.state);
+        std::uint32_t expected = static_cast<std::uint32_t>(State::Idle);
+        if (!state.compare_exchange_strong(expected, static_cast<std::uint32_t>(State::Arming)))
+            return false;
+        // Claim before checking original readers: an overlapping admission is
+        // either already guarded or observes Arming and cannot enter this scope.
+        const bool pristine = !parent.ticket.valid() && parent.ticket.epoch == 0u &&
+            parent.ticket.selector == 0u && parent.ticket.parent_generation == 0u && parent.ticket.parent_sequence == 0u &&
+            atomic64(parent.children).load() == 0u &&
+            atomic64(parent.generation).load() != std::numeric_limits<std::uint64_t>::max() &&
+            atomic64(parent.progress).load() != std::numeric_limits<std::uint64_t>::max() &&
+            atomic64(parent.child_sequence).load() != std::numeric_limits<std::uint64_t>::max();
+        if (!pristine) { state.store(static_cast<std::uint32_t>(State::Idle)); return false; }
+        const auto prior = atomic64(control_->acquisitions_in_flight).fetch_add(1u);
+        const auto selected=publishedBank();
+        const auto selected_state=bankState(selected);
+        // Arm selects no epoch. A publication may already have marked this
+        // selected bank Retiring; the original guard still prevents reuse.
+        bool idle = prior == 0u && publicationGeneration()!=0u &&
+            bankEpoch(selected)!=0u &&
+            (selected_state==DeviceMoEOverlayEpochBankState::Published ||
+             selected_state==DeviceMoEOverlayEpochBankState::Retiring);
+        for (std::uint32_t bank=0u;bank<kDeviceMoEOverlayEpochBankCount;++bank)
+            idle = idle && atomic64(control_->bank_readers[bank]).load() == 0u;
+        if (!idle) {
+            atomic64(control_->acquisitions_in_flight).fetch_sub(1u);
+            state.store(static_cast<std::uint32_t>(State::Idle)); return false;
+        }
+        atomic64(parent.generation).fetch_add(1u);
+        atomic64(parent.progress).fetch_add(1u);
+        state.store(static_cast<std::uint32_t>(State::Armed));
+        return true;
+    }
+
+    std::optional<DeviceMoEOverlayEpochTicket>
+    MoEOverlayDeviceEpochProtocol::tryAcquireFiniteChild(
+        DeviceMoEOverlayEpochParent &parent, std::uint64_t admission_epoch,
+        DeviceMoEOverlayEpochChildAdmission admission) noexcept
+    {
+        using State = DeviceMoEOverlayEpochParentState;
+        if(admission!=DeviceMoEOverlayEpochChildAdmission::Published &&
+           admission!=DeviceMoEOverlayEpochChildAdmission::PreparedPeer)return std::nullopt;
+        const bool prepared_peer=admission==DeviceMoEOverlayEpochChildAdmission::PreparedPeer;
+        if (!control_ || parent.control != control_ || control_->finite_parent != &parent || parent.version != kDeviceMoEOverlayEpochParentVersion) return std::nullopt;
+        // This is the SAME canonical reuse guard as ordinary admission. It
+        // also prevents End/rearm from crossing a partially admitted child.
+        auto guard = atomic64(control_->acquisitions_in_flight);
+        guard.fetch_add(1u);
+        auto state = atomic32(parent.state);
+        auto observed = state.load();
+        if (observed == static_cast<std::uint32_t>(State::Armed)) {
+            auto expected = observed;
+            if (!state.compare_exchange_strong(expected, static_cast<std::uint32_t>(State::Activating))) {
+                guard.fetch_sub(1u); return std::nullopt;
+            }
+            auto ticket = prepared_peer ? tryAcquirePreparedExact(admission_epoch) : tryAcquireAdmitted(admission_epoch);
+            if (!ticket) {
+                state.store(static_cast<std::uint32_t>(State::Armed));
+                guard.fetch_sub(1u); return std::nullopt;
+            }
+            parent.ticket = *ticket;
+            // Parent reader is installed before retiring its long-lived Armed
+            // acquisition guard. The current child still owns its own guard.
+            guard.fetch_sub(1u);
+            state.store(static_cast<std::uint32_t>(State::Active));
+            observed = static_cast<std::uint32_t>(State::Active);
+        }
+        if (observed != static_cast<std::uint32_t>(State::Active)) {
+            guard.fetch_sub(1u); return std::nullopt;
+        }
+        const auto generation = atomic64(parent.generation).load();
+        std::uint64_t empty=0u;
+        if(!atomic64(parent.children).compare_exchange_strong(empty,1u)) {
+            guard.fetch_sub(1u);return std::nullopt; // Finite comparisons admit serial child transactions.
+        }
+        if (generation == 0u || state.load() != static_cast<std::uint32_t>(State::Active) ||
+            atomic64(parent.generation).load() != generation || !parent.ticket.valid() ||
+            (admission_epoch != 0u && admission_epoch != parent.ticket.epoch)) {
+            atomic64(parent.children).fetch_sub(1u); guard.fetch_sub(1u); return std::nullopt;
+        }
+        auto child = tryAcquire(parent.ticket.epoch,
+            prepared_peer ? AdmissionPolicy::ExactPreparedPeer : AdmissionPolicy::PublishedFloor);
+        if (!child || child->bank() != parent.ticket.bank()) {
+            if (child && !release(*child)) {
+                // Failed physical release is not a completed descendant: keep
+                // its child obligation so End cannot certify retirement.
+                guard.fetch_sub(1u);return std::nullopt;
+            }
+            atomic64(parent.children).fetch_sub(1u); guard.fetch_sub(1u); return std::nullopt;
+        }
+        const auto sequence=atomic64(parent.child_sequence).load();
+        if(sequence==std::numeric_limits<std::uint64_t>::max()) {
+            if(!release(*child)){guard.fetch_sub(1u);return std::nullopt;}
+            atomic64(parent.children).fetch_sub(1u);guard.fetch_sub(1u);return std::nullopt;
+        }
+        child->parent_generation = generation;
+        child->parent_sequence = atomic64(parent.child_sequence).fetch_add(1u)+1u;
+        guard.fetch_sub(1u);
+        return child;
+    }
+
+    bool MoEOverlayDeviceEpochProtocol::releaseFiniteChild(
+        DeviceMoEOverlayEpochParent &parent, DeviceMoEOverlayEpochTicket &child) noexcept
+    {
+        using State = DeviceMoEOverlayEpochParentState;
+        if (!control_ || parent.control != control_ || control_->finite_parent != &parent || parent.version != kDeviceMoEOverlayEpochParentVersion || !child.valid() || child.parent_generation == 0u ||
+            child.parent_generation != atomic64(parent.generation).load() ||
+            child.parent_sequence == 0u || child.parent_sequence != atomic64(parent.child_sequence).load() ||
+            atomic64(parent.progress).load() == std::numeric_limits<std::uint64_t>::max() ||
+            atomic32(parent.state).load() != static_cast<std::uint32_t>(State::Active) ||
+            child.epoch != parent.ticket.epoch || child.bank() != parent.ticket.bank())
+            return false;
+        // Claim the existing child obligation before releasing the original
+        // bank reader; End remains excluded by this canonical acquisition guard.
+        auto guard=atomic64(control_->acquisitions_in_flight);guard.fetch_add(1u);
+        auto children=atomic64(parent.children);std::uint64_t count=1u;
+        if(!children.compare_exchange_strong(count,0u)) { guard.fetch_sub(1u);return false; }
+        if (!release(child)) { children.fetch_add(1u); guard.fetch_sub(1u); return false; }
+        child={};atomic64(parent.progress).fetch_add(1u);guard.fetch_sub(1u);return true;
+    }
+
+    bool MoEOverlayDeviceEpochProtocol::closeFiniteParent(
+        DeviceMoEOverlayEpochParent &parent) noexcept
+    {
+        using State = DeviceMoEOverlayEpochParentState;
+        if (!control_ || parent.control != control_ || control_->finite_parent != &parent || parent.version != kDeviceMoEOverlayEpochParentVersion ||
+            atomic64(parent.progress).load()==std::numeric_limits<std::uint64_t>::max()) return false;
+        auto state=atomic32(parent.state);auto prior=state.load();
+        if (prior != static_cast<std::uint32_t>(State::Armed) &&
+            prior != static_cast<std::uint32_t>(State::Active)) return false;
+        if (!state.compare_exchange_strong(prior,static_cast<std::uint32_t>(State::Closing))) return false;
+        const bool armed=prior==static_cast<std::uint32_t>(State::Armed);
+        if (atomic64(parent.children).load()!=0u ||
+            atomic64(control_->acquisitions_in_flight).load()!=(armed?1u:0u)) {
+            state.store(prior);return false;
+        }
+        if (armed) {
+            if (parent.ticket.epoch!=0u || parent.ticket.selector!=0u || parent.ticket.parent_generation!=0u || parent.ticket.parent_sequence!=0u) { state.store(prior);return false; }
+            atomic64(control_->acquisitions_in_flight).fetch_sub(1u);
+        } else if (parent.ticket.parent_generation!=0u || parent.ticket.parent_sequence!=0u || !release(parent.ticket)) { state.store(prior);return false; }
+        parent.ticket={};atomic64(parent.progress).fetch_add(1u);state.store(static_cast<std::uint32_t>(State::Idle));return true;
+    }
+
     std::optional<DeviceMoEOverlayEpochTicket>
     MoEOverlayDeviceEpochProtocol::tryAcquirePublished() noexcept
     {

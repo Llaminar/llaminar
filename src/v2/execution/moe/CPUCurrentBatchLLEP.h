@@ -15,6 +15,7 @@
 #pragma once
 
 #include "ExpertWeightTransfer.h"
+#include "memory/CPUWeightStoragePlacement.h"
 #include "LeastLoadedExpertAssignment.h"
 #include "MoEOverlayResidencyAuthority.h"
 
@@ -124,12 +125,14 @@ namespace llaminar2
          * @brief Clone one packed expert from an immutable durable parent bank.
          * @param expert_id Global expert id within the layer.
          * @param durable_parent_epoch Exact authority epoch pinned by the child.
+         * @param destination Admitted staging placement for the independent packed clone.
          * @return Three complete packed CPU projections owned by the caller.
          */
         [[nodiscard]] virtual ExpertPackedWeights
         cloneCPUCurrentBatchLLEPPreparedExpert(
             int expert_id,
-            uint64_t durable_parent_epoch) const = 0;
+            uint64_t durable_parent_epoch,
+            CPUWeightStoragePlacement destination) const = 0;
 
         /**
          * @brief Install every arrival needed by the already-planned child.

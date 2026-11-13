@@ -12,11 +12,12 @@
 #include <hip/hip_runtime.h>
 
 #include "backends/rocm/HIPGraphCapture.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "transfer/TransferEngine.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -124,8 +125,8 @@ static void proveDeviceCountedRows(
         kernel->bindWorkspace(workspace.get());
         ASSERT_TRUE(kernel->prepareFusedProjectionGraphCapture(projection_count));
         ASSERT_NE(workspace, nullptr);
-        DeviceNativeVNNIMatrixDesc matrix;
-        ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(matrix));
+        DeviceNativeQuantisedMatrixDesc matrix;
+        ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(matrix));
 
         auto input = TestTensorFactory::createFP32Random({matrix_rows, matrix_width}, -0.75f, 0.75f, 72042);
         auto output = TestTensorFactory::createFP32({static_cast<size_t>(projection_count) * matrix_rows, matrix_columns});
@@ -187,7 +188,7 @@ static void proveDeviceCountedRows(
         TransferEngine::requireDeviceInput(input.get(), device, stream);
         const auto rows = DeviceRowRange::deviceCounted(
             M, static_cast<const int32_t *>(count->gpu_data_ptr()));
-        auto graph = std::make_unique<HIPGraphCapture>(stream, 0);
+        auto graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
         {
             auto arithmetic = kernel->beginVerifierDecodeEquivalentScope(rows);
             ScopedBackendGraphCapture capture(*graph, "device_counted_verifier_rows");
@@ -201,7 +202,7 @@ static void proveDeviceCountedRows(
                     input.get(), input.get(), output.get(), M, N, K);
             else if (bundle == VerifierProjectionBundle::Single)
             {
-                launched = rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+                launched = rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                     quant, matrix.payload, matrix.scales, matrix.mins, matrix.emins,
                     static_cast<float *>(output->gpu_data_ptr()), scales, sums, partials,
                     M, N, K, matrix.codebook_id,
@@ -234,11 +235,11 @@ static void proveDeviceCountedRows(
                 const auto launch_fused = [&](const int32_t *activation_sums)
                 {
                     if (bundle == VerifierProjectionBundle::Homogeneous)
-                        return rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy(
+                        return rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
                             quant, payloads.data(), weight_scales.data(), mins.data(), emins.data(),
                             biases.data(), outputs.data(), scales, activation_sums, scratch.data(), columns.data(),
                             projection_count, M, K, matrix.codebook_id, 0, stream, -1, -1, &rows);
-                    return rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy(
+                    return rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
                             quant, payloads.data(), weight_scales.data(), mins.data(), emins.data(),
                             biases.data(), outputs.data(), scales, activation_sums, scratch.data(), columns.data(),
                             codebooks.data(), projection_count, M, K, 0, stream, -1, -1, &rows);
@@ -262,7 +263,7 @@ static void proveDeviceCountedRows(
                     << inspection_error;
                 const auto producer = std::find_if(nodes.begin(), nodes.end(), [](const auto &node)
                 {
-                    return node.name.find("gemv_native_vnni_small_m_kernel_t") != std::string::npos;
+                    return node.name.find("gemv_native_quantised_small_m_kernel_t") != std::string::npos;
                 });
                 ASSERT_NE(producer, nodes.end());
                 ASSERT_TRUE(producer->valid());
@@ -271,7 +272,7 @@ static void proveDeviceCountedRows(
                 // depth-15 capacity must not schedule every physical row tile.
                 EXPECT_LT(producer->grid_z, static_cast<uint32_t>((M + 3) / 4));
                 for (const auto &node : nodes)
-                    if (node.name.find("gemv_native_vnni_reduce_small_m_kernel_t") != std::string::npos)
+                    if (node.name.find("gemv_native_quantised_reduce_small_m_kernel_t") != std::string::npos)
                     {
                         ASSERT_TRUE(node.valid());
                         EXPECT_LT(node.grid_y, static_cast<uint32_t>(M));

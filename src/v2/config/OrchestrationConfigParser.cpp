@@ -120,6 +120,7 @@ namespace llaminar2
             if (key == "mode") config.planning_mode = parsePlanningMode(value);
             else if (key == "only_backends") config.automatic_planning.only_backends = parseOrchestrationBackendList(value);
             else if (key == "only_strategies") config.automatic_planning.only_strategies = parseOrchestrationStrategyList(value);
+            else if (key == "pipeline_stage_widths") config.automatic_planning.pipeline_stage_widths = parseAutomaticPipelineStageWidths(value);
             else if (key == "device_counts") config.automatic_planning.device_counts = parseAutomaticDeviceCounts(value);
             else if (key == "hosts") config.automatic_planning.host_participation = parseAutomaticHostParticipation(value);
             else if (key == "workload") config.automatic_planning.workload = parseOrchestrationPlanningWorkload(value);
@@ -610,6 +611,102 @@ namespace llaminar2
             }
         }
 
+        /** @brief Parse setup preference; automatic selection remains exclusively in PMA planning. */
+        ImmutableRowStoragePreference parseNgramStorage(const std::string &value)
+        {
+            if (value == "auto") return ImmutableRowStoragePreference::Automatic;
+            if (value == "vram") return ImmutableRowStoragePreference::VRAM;
+            if (value == "ram") return ImmutableRowStoragePreference::RAM;
+            if (value == "mmap") return ImmutableRowStoragePreference::MemoryMapped;
+            if (value == "host-adaptive-ram-ssd") return ImmutableRowStoragePreference::HostAdaptiveRAMSSD;
+            if (value == "gpu-adaptive-vram-ram-ssd") return ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+            throw std::invalid_argument("ngram storage requires auto, vram, ram, mmap, host-adaptive-ram-ssd or gpu-adaptive-vram-ram-ssd, got '" + value + "'");
+        }
+
+        /** @return Exact explicit distribution, without mode inference or topology substitution. */
+        ImmutableRowTableDistribution parseNgramDistribution(const std::string &value)
+        {
+            if(value=="replicated")return ImmutableRowTableDistribution::Replicated;
+            if(value=="fixed-head-sharded")return ImmutableRowTableDistribution::FixedHeadSharded;
+            throw std::invalid_argument("ngram distribution requires replicated or fixed-head-sharded");
+        }
+        /** @brief Carry YAML row-store policy through the same typed fields as public CLI. */
+        void applyNgramYamlKey(OrchestrationConfig &config, const std::string &key,
+                              const std::string &value)
+        {
+            if (key == "distribution") config.ngram_table_policy.distribution = parseNgramDistribution(value);
+            else if (key == "storage") config.ngram_table_policy.storage = parseNgramStorage(value);
+            else if (key == "mmap_window_bytes")
+                config.ngram_table_policy.window_bytes = parseNonNegativeSizeTValue(value, "ngram.mmap_window_bytes");
+            else if (key == "mmap_window_count")
+                config.ngram_table_policy.window_count = parseNonNegativeSizeTValue(value, "ngram.mmap_window_count");
+            else if (key == "ram_cache_max_rows")
+                config.ngram_table_policy.host_adaptive.maximum_cache_rows = parseNonNegativeSizeTValue(value, "ngram.ram_cache_max_rows");
+            else if (key == "ram_cache_bytes")
+                config.ngram_table_policy.host_adaptive.cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "ngram.ram_cache_bytes");
+            else if (key == "aging_accesses")
+                config.ngram_table_policy.host_adaptive.policy.aging_accesses = parseNonNegativeSizeTValue(value, "ngram.aging_accesses");
+            else if (key == "protected_numerator")
+                config.ngram_table_policy.host_adaptive.policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.protected_numerator");
+            else if (key == "protected_denominator")
+                config.ngram_table_policy.host_adaptive.policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.protected_denominator");
+            else if (key == "local_cache_max_rows")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->maximum_cache_rows = parseNonNegativeSizeTValue(value, "ngram.local_cache_max_rows");
+            }
+            else if (key == "local_cache_bytes")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "ngram.local_cache_bytes");
+            }
+            else if (key == "local_cache_aging_accesses")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->policy.aging_accesses = parseNonNegativeSizeTValue(value, "ngram.local_cache_aging_accesses");
+            }
+            else if (key == "local_cache_protected_numerator")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.local_cache_protected_numerator");
+            }
+            else if (key == "local_cache_protected_denominator")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.local_cache_protected_denominator");
+            }
+            else if (key == "gpu_cache_placement")
+                config.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(value);
+            else if (key == "gpu_cache_max_rows")
+                config.ngram_table_policy.gpu_adaptive.maximum_gpu_cache_rows = parseNonNegativeSizeTValue(value, "ngram.gpu_cache_max_rows");
+            else if (key == "gpu_cache_bytes")
+                config.ngram_table_policy.gpu_adaptive.gpu_cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "ngram.gpu_cache_bytes");
+            else if (key == "gpu_aging_accesses")
+                config.ngram_table_policy.gpu_adaptive.gpu_policy.aging_accesses = parseNonNegativeSizeTValue(value, "ngram.gpu_aging_accesses");
+            else if (key == "gpu_protected_numerator")
+                config.ngram_table_policy.gpu_adaptive.gpu_policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.gpu_protected_numerator");
+            else if (key == "gpu_protected_denominator")
+                config.ngram_table_policy.gpu_adaptive.gpu_policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.gpu_protected_denominator");
+            else if (key == "source_backing")
+                config.ngram_table_policy.gpu_adaptive.source_backing = value=="ssd"?AdaptiveImmutableRowBacking::SSD:value=="ram"?AdaptiveImmutableRowBacking::RAM:throw std::invalid_argument("ngram.source_backing requires ssd or ram");
+            else if (key == "source_cache_max_rows")
+                config.ngram_table_policy.gpu_adaptive.host.maximum_cache_rows = parseNonNegativeSizeTValue(value, "ngram.source_cache_max_rows");
+            else if (key == "source_cache_bytes")
+                config.ngram_table_policy.gpu_adaptive.host.cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "ngram.source_cache_bytes");
+            else if (key == "source_aging_accesses")
+                config.ngram_table_policy.gpu_adaptive.host.policy.aging_accesses = parseNonNegativeSizeTValue(value, "ngram.source_aging_accesses");
+            else if (key == "source_protected_numerator")
+                config.ngram_table_policy.gpu_adaptive.host.policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.source_protected_numerator");
+            else if (key == "source_protected_denominator")
+                config.ngram_table_policy.gpu_adaptive.host.policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.source_protected_denominator");
+            else throw std::invalid_argument("unknown ngram storage field '" + key + "'");
+        }
+
         void applyPrefixCacheYamlKey(OrchestrationConfig &config,
                                      const std::string &key,
                                      const std::string &value)
@@ -667,7 +764,11 @@ namespace llaminar2
                              const std::string &key,
                              const std::string &value)
         {
-            if (key == "enabled" || key == "mtp")
+            if (key == "model")
+            {
+                config.shared_predictor.emplace(value);
+            }
+            else if (key == "enabled" || key == "mtp")
             {
                 config.mtp_activation_policy = value == "auto"
                     ? MTPActivationPolicy::Automatic
@@ -1277,6 +1378,15 @@ namespace llaminar2
             }),
         });
         spec.add({
+            .long_name = "--auto-pipeline-stage-widths",
+            .category = "Automatic Planning",
+            .value_label = "<width,...>",
+            .description = "Require ordered positive PP stage device counts; identities and layer cuts remain automatic",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.pipeline_stage_widths = parseAutomaticPipelineStageWidths(v);
+            }),
+        });
+        spec.add({
             .long_name = "--prefer-backend",
             .category = "Automatic Planning",
             .value_label = "<cpu|cuda|rocm>",
@@ -1474,6 +1584,17 @@ namespace llaminar2
             .category = "Benchmark Configuration",
             .description = "(deprecated) Use 'llaminar2 benchmark' subcommand instead",
             .setter = setters::assignBoolTrue(&OrchestrationConfig::benchmark_mode),
+        });
+        spec.add({
+            .long_name = "--benchmark-campaign",
+            .category = "Benchmark Configuration",
+            .value_label = "<json-path>",
+            .description = "Run validated off/fixed/observe/dynamic MTP cells under one admitted runtime and immutable sampling cohort",
+            .setter = [](OrchestrationConfig &config, const std::string &value)
+            {
+                config.benchmark_campaign_path = value;
+                config.benchmark_campaign_was_provided = true;
+            },
         });
         spec.add({
             .long_name = "--benchmark-json-output",
@@ -2397,14 +2518,14 @@ namespace llaminar2
             .long_name = "--expert-tier",
             .category = "MoE Configuration",
             .value_label = "<declaration>",
-            .description = "Expert tier: name=devices;priority=N[;memory-mb=N|auto]. Enables overlay; smallest priority is the default continuation. Scope, ranks, collective and capacity resolve automatically; domain policy overrides remain available.",
+            .description = "Expert tier: name=devices;priority=N[;memory-mb=N|auto][;expert_compute=policy]. Enables overlay; smallest priority is the default continuation. Scope, ranks, collective and capacity resolve automatically. expert_compute=apportioned distributes whole experts; tensor-sharded splits each expert's matrices across participants.",
             .setter = setters::custom<OrchestrationConfig>(appendExpertTier),
         });
         spec.add({
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define routed hardware: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;routed_compute=auto|apportioned|replicated|tensor-sharded|gate-up-owned-down-columns][;owner=N][;ranks=0,0,1]. Defaults: inventory-bound scope/collective, inherited automatic compute and static row assignment. Prefer --expert-tier to also declare priority.",
+            .description = "Define an expert compute domain: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;expert_compute=auto|apportioned|replicated|tensor-sharded|gate-up-owned-down-columns][;expert_phase=uniform|prefill-apportioned-decode-replicated][;expert_decode_assignment=policy][;expert_prefill_assignment=policy][;owner=N][;ranks=0,0,1]. apportioned distributes whole experts; tensor-sharded splits each expert's matrices across participants. Defaults: inventory-bound scope/collective, inherited automatic compute and static row assignment. Prefer --expert-tier to also declare priority.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2421,6 +2542,241 @@ namespace llaminar2
                 {
                     ensureMoERoutedExpertPlacementPlan(c)->routed_tiers.push_back(parseMoERoutedExpertTierSpec(v));
                 }),
+        });
+
+        // --- Native ngram storage --------------------------------------------
+        spec.add({
+            .long_name = "--ngram-distribution",
+            .category = "Ngram Storage",
+            .value_label = "<replicated|fixed-head-sharded>",
+            .description = "Explicit native ngram distribution; fixed-head-sharded requires --ngram-storage vram and an original homogeneous rank-local GPU topology with admitted fixed PLE ranges; no automatic entry",
+            .valid_values = {"replicated", "fixed-head-sharded"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c,const std::string &v) { c.ngram_table_policy.distribution=parseNgramDistribution(v); }),
+        });
+        spec.add({
+            .long_name = "--ngram-storage",
+            .category = "Ngram Storage",
+            .value_label = "<auto|vram|ram|mmap|host-adaptive-ram-ssd|gpu-adaptive-vram-ram-ssd>",
+            .description = "Ngram storage: auto (unchanged VRAM/RAM/mmap order), explicit whole-tier vram/ram/mmap, host-adaptive-ram-ssd (CPU-owned cache), or gpu-adaptive-vram-ram-ssd (full-main GPU/R1 or homogeneous ConsumerLocal TP2/4/8 with shared local subordinate RAM/SSD; no PP; explicit full-RAM source via --ngram-source-backing ram); host adaptive retains SSD; GPU adaptive retains its declared original source/request scratch and explicit optional ceilings; no runtime fallback",
+            .valid_values = {"auto", "vram", "ram", "mmap", "host-adaptive-ram-ssd", "gpu-adaptive-vram-ram-ssd"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.storage = parseNgramStorage(value); }),
+        });
+        spec.add({
+            .long_name = "--ngram-mmap-window-bytes",
+            .category = "Ngram Storage",
+            .value_label = "<bytes>",
+            .description = "Page-aligned bytes per retained ngram SSD mapping (default: 65536)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.window_bytes = parseNonNegativeSizeTValue(value, "--ngram-mmap-window-bytes"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-mmap-window-count",
+            .category = "Ngram Storage",
+            .value_label = "<count>",
+            .description = "Maximum retained ngram SSD mappings (default: 1024); bounds resident cache with window bytes",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.window_count = parseNonNegativeSizeTValue(value, "--ngram-mmap-window-count"); }),
+        });
+
+        spec.add({
+            .long_name = "--ngram-cache-max-rows",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Maximum optional native RAM cache rows for explicit host-adaptive-ram-ssd; zero permits no RAM slots",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.host_adaptive.maximum_cache_rows = parseNonNegativeSizeTValue(value, "--ngram-cache-max-rows"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-cache-bytes",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Full optional RAM cache payload and metadata byte ceiling; mandatory SSD/request arrays are separate",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.host_adaptive.cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "--ngram-cache-bytes"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-cache-aging-accesses",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Explicit experimental host-cache logical frequency aging interval",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.host_adaptive.policy.aging_accesses = parseNonNegativeSizeTValue(value, "--ngram-cache-aging-accesses"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-cache-protected-numerator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Experimental protected-recency fraction numerator; frequency controls admission only",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.host_adaptive.policy.protected_numerator = parseNonNegativeUint32Value(value, "--ngram-cache-protected-numerator"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-cache-protected-denominator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Positive experimental protected-recency fraction denominator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.host_adaptive.policy.protected_denominator = parseNonNegativeUint32Value(value, "--ngram-cache-protected-denominator"); }),
+        });
+
+        // Disjoint fields are independent of option order. Existing host-only
+        // --ngram-cache-* never writes the subordinate GPU source arm.
+        spec.add({
+            .long_name = "--ngram-local-cache-max-rows",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Maximum per-consumer local native hot rows before the declared shared GPU pool; zero explicitly selects combined C0",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->maximum_cache_rows = parseNonNegativeSizeTValue(value, "--ngram-local-cache-max-rows");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-bytes",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Per-consumer local hot payload plus metadata byte ceiling, below frozen model/expert/KV obligations",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "--ngram-local-cache-bytes");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-aging-accesses",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Local hot cache logical-frequency aging interval",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->policy.aging_accesses = parseNonNegativeSizeTValue(value, "--ngram-local-cache-aging-accesses");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-protected-numerator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Local hot cache protected-recency fraction numerator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->policy.protected_numerator = parseNonNegativeUint32Value(value, "--ngram-local-cache-protected-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-protected-denominator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Positive local hot cache protected-recency fraction denominator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->policy.protected_denominator = parseNonNegativeUint32Value(value, "--ngram-local-cache-protected-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-gpu-cache-placement",
+            .category = "Ngram Storage", .value_label = "<owners@coordinator>",
+            .description = "Storage-only placement: consumer-local or rank:cuda|rocm:ordinal/rows/bytes,...@rank:cuda|rocm:ordinal",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(value); }),
+        });
+        spec.add({
+            .long_name = "--ngram-gpu-cache-max-rows",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Maximum optional native GPU cache rows; zero retains the same explicit GPU/source mode",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.maximum_gpu_cache_rows = parseNonNegativeSizeTValue(value, "--ngram-gpu-cache-max-rows"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-gpu-cache-bytes",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Full optional GPU cache payload and metadata byte ceiling after frozen weights/expert/KV grants",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.gpu_cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "--ngram-gpu-cache-bytes"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-gpu-cache-aging-accesses",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Experimental GPU admission frequency aging interval in original logical-ID order",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.gpu_policy.aging_accesses = parseNonNegativeSizeTValue(value, "--ngram-gpu-cache-aging-accesses"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-gpu-cache-protected-numerator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Experimental GPU protected-recency fraction numerator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.gpu_policy.protected_numerator = parseNonNegativeUint32Value(value, "--ngram-gpu-cache-protected-numerator"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-gpu-cache-protected-denominator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Positive experimental GPU protected-recency fraction denominator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.gpu_policy.protected_denominator = parseNonNegativeUint32Value(value, "--ngram-gpu-cache-protected-denominator"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-backing",
+            .category = "Ngram Storage", .value_label = "<ssd|ram>",
+            .description = "GPU-adaptive original source: ssd uses bounded mappings and optional RAM cache; ram owns the complete native table once and forbids redundant RAM cache ceilings; no fallback",
+            .valid_values = {"ssd", "ram"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.source_backing = value=="ssd"?AdaptiveImmutableRowBacking::SSD:value=="ram"?AdaptiveImmutableRowBacking::RAM:throw std::invalid_argument("--ngram-source-backing requires ssd or ram"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-cache-max-rows",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Maximum optional subordinate CPU RAM cache rows for explicit gpu-adaptive-vram-ram-ssd",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.host.maximum_cache_rows = parseNonNegativeSizeTValue(value, "--ngram-source-cache-max-rows"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-cache-bytes",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Full optional subordinate CPU cache payload and metadata ceiling; mandatory SSD/channel/request scratch is separate",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.host.cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "--ngram-source-cache-bytes"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-cache-aging-accesses",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Experimental subordinate CPU admission frequency aging interval",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.host.policy.aging_accesses = parseNonNegativeSizeTValue(value, "--ngram-source-cache-aging-accesses"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-cache-protected-numerator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Experimental subordinate CPU protected-recency fraction numerator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.host.policy.protected_numerator = parseNonNegativeUint32Value(value, "--ngram-source-cache-protected-numerator"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-cache-protected-denominator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Positive experimental subordinate CPU protected-recency fraction denominator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.host.policy.protected_denominator = parseNonNegativeUint32Value(value, "--ngram-source-cache-protected-denominator"); }),
         });
 
         // --- Precision -------------------------------------------------------
@@ -2629,6 +2985,14 @@ namespace llaminar2
         });
 
         // --- MTP -------------------------------------------------------------
+        spec.add({
+            .long_name = "--mtp-model",
+            .category = "MTP",
+            .value_label = "<GGUF>",
+            .description = "Explicit shared predictor GGUF paired with --model; validated even with --no-mtp",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &path) { c.shared_predictor.emplace(path); }),
+        });
         spec.add({
             .long_name = "--mtp",
             .category = "MTP",
@@ -3158,6 +3522,7 @@ namespace llaminar2
 
         // Second pass: apply every flag through the structured spec.
         spec.parse(args, config);
+        config.ngram_table_policy.validate();
 
         // Cross-flag validation that doesn't fit cleanly into per-option setters.
         if (config.heterogeneous_mode && config.disable_gpu_tp && config.disable_cpu_tp)
@@ -3341,6 +3706,11 @@ namespace llaminar2
             if (normalized_section == "moe")
             {
                 applyMoEYamlKey(config, normalized_key, value);
+                continue;
+            }
+            if (normalized_section == "ngram")
+            {
+                applyNgramYamlKey(config, normalized_key, value);
                 continue;
             }
             if (normalized_section == "prefix_cache")
@@ -3539,6 +3909,10 @@ namespace llaminar2
             else if (normalized_key == "prefix_cache")
             {
                 applyPrefixCacheYamlKey(config, normalized_key, value);
+            }
+            else if (normalized_key.rfind("ngram_", 0) == 0)
+            {
+                applyNgramYamlKey(config, normalized_key.substr(std::string("ngram_").size()), value);
             }
             else if (normalized_key.rfind("prefix_cache_", 0) == 0)
             {
@@ -3784,6 +4158,7 @@ namespace llaminar2
             throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(normalize_errors));
         }
 
+        config.ngram_table_policy.validate();
         publishOrchestrationStartupPolicy(config);
         return config;
     }

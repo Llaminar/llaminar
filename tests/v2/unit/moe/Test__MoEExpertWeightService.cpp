@@ -12,6 +12,8 @@
 #include <omp.h>
 
 #include "execution/moe/MoEExpertWeightService.h"
+#include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/GpuExpertSlotPool.h"
 #include "execution/moe/GpuExpertTransferStagingPool.h"
 #include "loaders/ExpertGemmRegistry.h"
@@ -23,6 +25,10 @@
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUPreparedStoreTestAdmission.h"
+#include "utils/GpuPreparedGemmHarness.h"
+#include "backends/GPUDeviceContextPool.h"
+#include <array>
 
 #include <algorithm>
 #include <cstdint>
@@ -126,6 +132,35 @@ namespace
         std::shared_ptr<void> moe_packed_up_lifetime;
         std::shared_ptr<void> moe_packed_down_lifetime;
         PreparedWeightStore *prepared_store = nullptr;
+        std::unique_ptr<PreparedWeightStore> fixture_prepared_store;
+
+        /** @brief Install a real admitted owner for fixture paths that allocate packed/staging storage. */
+        void admitPhysicalPreparation()
+        {
+            if (!prepared_store)
+            {
+                fixture_prepared_store = std::make_unique<PreparedWeightStore>();
+                prepared_store = fixture_prepared_store.get();
+            }
+            if (prepared_store->physicalMemoryAuthority())
+                return;
+            PhysicalMemoryPlanBuilder plan;
+            const PhysicalMemoryResource host{0, device_id, 1u << 25, 1u << 25};
+            plan.add(host, PhysicalMemoryOwner::PrimaryModelWeights, 1u << 22);
+            plan.add(host, PhysicalMemoryOwner::ExpertMigrationStaging, 1u << 22);
+            // Same canonical immediate-packer quote; one PMA source transaction
+            // serializes these setup workers, so only its actual maximum lives.
+            size_t staging=0;
+            for(const auto& parent:{gate_3d,up_3d,down_3d})for(size_t expert=0;expert<kNumExperts;++expert) {
+                const auto matrix=parent->create_view({parent->shape()[1],parent->shape()[0]},
+                    expert*parent->shape()[0]*parent->shape()[1]);
+                staging=std::max(staging,cpuPreparedStoreTestStagingBytes(*matrix));
+            }
+            plan.add(host,PhysicalMemoryOwner::WeightLoadStaging,staging);
+            prepared_store->installPhysicalMemoryAuthority(
+                std::make_shared<PhysicalMemoryAuthority>(
+                    std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0));
+        }
         ExpertGemmRegistry *expert_registry = nullptr;
         std::optional<ExpertSlabRef> gate_slab_ref;
         std::optional<ExpertSlabRef> up_slab_ref;
@@ -148,6 +183,10 @@ namespace
 
         MoEWeightContext buildContext()
         {
+            // Store-backed CPU fixtures allocate through the real authority.
+            // A null store remains explicit for borrowed/no-admission tests.
+            if (device_id.is_cpu() && prepared_store)
+                admitPhysicalPreparation();
             return MoEWeightContext{
                 device_id,
                 kNumExperts,
@@ -178,23 +217,11 @@ namespace
                 down_slab_ref,
                 true,
                 &gpu_direct_slot_pool,
-                CPUExpertNUMAPlacement::aggregateDomain()};
+                CPUExpertNUMAPlacement::aggregateDomain(),
+                MoEExpertWeightResolutionPolicy::RawOrPrepared,
+                PhysicalMemoryOwner::PrimaryModelWeights};
         }
     };
-
-    bool hasGPU()
-    {
-        return hasROCmBackend() || hasCUDABackend();
-    }
-
-    DeviceId firstGPU()
-    {
-        if (hasROCmBackend())
-            return DeviceId(DeviceType::ROCm, 0);
-        if (hasCUDABackend())
-            return DeviceId(DeviceType::CUDA, 0);
-        return DeviceId::cpu();
-    }
 
     /**
      * @brief Build a rank-bound authority for a cache-only GPU lifecycle test.
@@ -279,9 +306,9 @@ namespace
         projection.is_asymmetric = projection.staged.is_asymmetric;
         projection.has_emins = projection.staged.has_emins;
         projection.codebook_id = projection.staged.codebook_id;
-        projection.source_identity = NativeVnniSourceIdentity{
-            .codebook_id = native_vnni_formats::IQ4_NL.codebook_id,
-            .is_superblock = native_vnni_formats::IQ4_NL.is_superblock,
+        projection.source_identity = NativeQuantisedSourceIdentity{
+            .codebook_id = native_quantised_formats::IQ4_NL.codebook_id,
+            .is_superblock = native_quantised_formats::IQ4_NL.is_superblock,
             .present = true,
         };
         projection.transfer_slot_lifetime = lifetime;
@@ -517,6 +544,135 @@ TEST(Test__MoEExpertWeightService, ExtractExpertViews_PackedMaskCardinalityMisma
 // ─────────────────────────────────────────────────────────────────────────────
 // prepareGemmEngines (CPU path)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @test Retained source-48 warmup borrows canonical packs without new claims.
+ *
+ * Full PP-tail and apportioned TP ownership use exact source-native backing.
+ * Missing/foreign registry entries fail instead of repacking into dense slack;
+ * initial banks retain the same engines after their preparation store retires.
+ */
+TEST(Test__MoEExpertWeightService, CPUPredictorWarmupReusesCanonicalResidencyBank)
+{
+    const auto gate = CPUWeightPreparationMemory::sourceNative("Q4_0", kExpertIntermediate, kDModel);
+    const auto down = CPUWeightPreparationMemory::sourceNative("Q4_0", kDModel, kExpertIntermediate);
+    for (const bool apportioned : {false, true})
+    {
+        SCOPED_TRACE(apportioned);
+        const auto count = apportioned ? kNumExperts / 2 : kNumExperts;
+        const auto exact = static_cast<std::size_t>(count) * (2u * gate.persistent_bytes + down.persistent_bytes);
+        const auto staging=std::max(gate.temporary_bytes,down.temporary_bytes);
+        const PhysicalMemoryResource resource{0, DeviceId::cpu(), exact+staging, exact+staging};
+        PhysicalMemoryPlanBuilder bill;
+        bill.add(resource, PhysicalMemoryOwner::RoutedExpertWeights, exact);
+        // Synchronous source preparation shares the original PMA transaction.
+        bill.add(resource, PhysicalMemoryOwner::WeightLoadStaging, staging);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(bill.build()), 0);
+        {
+            PreparedWeightStore store(ModelContextId{48});
+            store.installPhysicalMemoryAuthority(authority);
+            TestWeightContextOwner owner;
+            owner.prepared_store = &store;
+            if (apportioned) owner.expert_mask = {true, false, true, false};
+            auto ctx = owner.buildContext();
+            ctx.layer_idx = 48;
+            ctx.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
+            ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+            ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+            ASSERT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::RoutedExpertWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), exact);
+
+            RoutedExpertDomain domain;
+            domain.name = "predictor";
+            domain.scope = ExecutionDomainScope::SINGLE;
+            domain.backend = CollectiveBackendType::HOST;
+            domain.participants = {GlobalDeviceAddress::cpu(0)};
+            domain.world_ranks = {0};
+            domain.owner_rank = 0;
+            RoutedExpertTier tier;
+            tier.name = "local";
+            tier.domain = domain.name;
+            tier.priority = 0;
+            tier.fallback = !apportioned;
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan.continuation_domain = domain.name;
+            plan.shared_expert_domain = domain.name;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            plan.domains = {domain};
+            plan.routed_tiers = {tier};
+            if (apportioned)
+            {
+                auto peer = domain;
+                peer.name = "peer";
+                peer.participants = {GlobalDeviceAddress::cpu(1)};
+                auto peer_tier = tier;
+                peer_tier.name = "peer";
+                peer_tier.domain = peer.name;
+                peer_tier.priority = 1;
+                peer_tier.fallback = true;
+                plan.domains.push_back(peer);
+                plan.routed_tiers.push_back(peer_tier);
+            }
+            plan.first_model_layer = 48;
+            plan.placements.push_back({.layer = 48,
+                .routed_expert_tier = apportioned ? std::vector<int>{0, 1, 0, 1} : std::vector<int>{0, 0, 0, 0}});
+            const auto owners = MoEExpertOwnerMap::build(plan);
+            const auto *participant = owners.participantForId(0);
+            ASSERT_NE(participant, nullptr);
+            MoEOverlayParticipantResidencyRegistry residency({
+                .owner_map = owners, .local_participant_ids = {0},
+                .num_layers = 1, .num_experts = kNumExperts, .initial_epoch = 1,
+                .first_model_layer = 48});
+            ExpertGemmRegistry prepared;
+            std::string error;
+            EXPECT_FALSE(residency.registerInitialLayerFromPreparedRegistry(prepared, 48, &error));
+            EXPECT_FALSE(error.empty());
+            const auto publish = [&](ExpertGemmRegistry &registry, const std::string &domain_name)
+            {
+                for (int expert = 0; expert < kNumExperts; ++expert)
+                {
+                    if (apportioned && expert % 2) continue;
+                    for (const auto &[role, slab] : {
+                        std::pair{ExpertGemmRegistry::WeightRole::GATE, *ctx.gate_slab_ref},
+                        std::pair{ExpertGemmRegistry::WeightRole::UP, *ctx.up_slab_ref},
+                        std::pair{ExpertGemmRegistry::WeightRole::DOWN, *ctx.down_slab_ref}})
+                    {
+                        auto engine = store.expertGemmKernelLifetime(slab, expert);
+                        registry.registerEngineForParticipant(domain_name, participant->device,
+                            participant->world_rank, participant->domain_participant_index,
+                            48, expert, role, engine.get(), engine);
+                    }
+                }
+            };
+            {
+                ExpertGemmRegistry foreign;
+                publish(foreign, "foreign");
+                EXPECT_FALSE(residency.registerInitialLayerFromPreparedRegistry(foreign, 48, &error));
+            }
+            publish(prepared, participant->domain_name);
+            EXPECT_FALSE(residency.registerInitialLayerFromPreparedRegistry(prepared, 47, &error));
+            for (int replay = 0; replay < 3; ++replay)
+            {
+                ASSERT_TRUE(residency.registerInitialLayerFromPreparedRegistry(prepared, 48, &error)) << error;
+                EXPECT_TRUE(residency.allInitialBanksReady());
+                EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::RoutedExpertWeights,
+                    PhysicalMemoryMaterializationKind::NewAllocation), exact);
+            }
+            store.clear();
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::RoutedExpertWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), exact);
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::AdditionalModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        }
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::RoutedExpertWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
+}
 
 TEST(Test__MoEExpertWeightService, PrepareGemmEngines_CPU_AllExperts)
 {
@@ -1248,10 +1404,10 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
         spec.payload_bytes_per_block = 16;
         spec.is_asymmetric = true;
         spec.has_emins = false;
-        spec.codebook_id = native_vnni_formats::Q4_1.codebook_id;
-        spec.format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+        spec.codebook_id = native_quantised_formats::Q4_1.codebook_id;
+        spec.format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_1.is_superblock,
             .present = true,
         });
         specs.push_back(std::move(spec));
@@ -1299,10 +1455,10 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RetainsSameExpertAcrossRcuE
             .payload_bytes_per_block = 16,
             .is_asymmetric = true,
             .has_emins = false,
-            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-            .format = ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+            .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+            .format = ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_1.is_superblock,
                 .present = true,
             }),
         });
@@ -1351,10 +1507,10 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndR
         spec.payload_bytes_per_block = 16;
         spec.is_asymmetric = true;
         spec.has_emins = false;
-        spec.codebook_id = native_vnni_formats::Q4_1.codebook_id;
-        spec.format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+        spec.codebook_id = native_quantised_formats::Q4_1.codebook_id;
+        spec.format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_1.is_superblock,
             .present = true,
         });
         specs.push_back(std::move(spec));
@@ -1996,6 +2152,7 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_StoreEngineReuse
 TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_DirectPreparedArrivalIsShared)
 {
     TestWeightContextOwner source;
+    source.admitPhysicalPreparation();
     source.expert_mask = {true, true, true, true};
     {
         auto ctx = source.buildContext();
@@ -2045,6 +2202,7 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_DirectPreparedAr
 TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_SerializedCPUArrivalIsAccepted)
 {
     TestWeightContextOwner source;
+    source.admitPhysicalPreparation();
     source.expert_mask = {true, true, true, true};
     ExpertWeightBlobs serialized;
     {
@@ -2056,6 +2214,7 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_SerializedCPUArr
     ASSERT_FALSE(serialized.empty());
 
     TestWeightContextOwner owner;
+    owner.admitPhysicalPreparation();
     owner.expert_mask = {true, false, true, false};
 
     {
@@ -2104,15 +2263,12 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_NoNewExperts)
     }
 }
 
-TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing)
+/** @brief Cold backend-tagged cache/ownership contracts; no native allocation or execution occurs. */
+class MoEExpertWeightServiceGPUCacheContract:public ::testing::TestWithParam<DeviceType>{};
+TEST_P(MoEExpertWeightServiceGPUCacheContract, GPURebalanceRequiresPayloadWhenCacheMissing)
 {
-    if (!hasGPU())
-    {
-        GTEST_SKIP() << "No GPU backend available";
-    }
-
     TestWeightContextOwner owner;
-    owner.device_id = firstGPU();
+    owner.device_id=GetParam()==DeviceType::CUDA?DeviceId::cuda(0):DeviceId::rocm(0);
     owner.expert_mask = {true, false, false, false};
     owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
     owner.prepared_up_gemm.assign(kNumExperts, nullptr);
@@ -2139,49 +2295,65 @@ TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing)
     EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
 }
 
-TEST(Test__MoEExpertWeightService, GPURebalanceResolvesStoreSlabsWhenCachedRefsMissing)
+/** @test Backend-tagged original slab identity resolves without native engine fabrication. */
+TEST_P(MoEExpertWeightServiceGPUCacheContract, OriginalSlabMetadataResolvesWithoutCachedRefs)
 {
-    if (!hasGPU())
-    {
-        GTEST_SKIP() << "No GPU backend available";
-    }
-
-    TestWeightContextOwner owner;
-    owner.device_id = firstGPU();
-    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
-    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
-    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
-
+    const auto device=GetParam()==DeviceType::CUDA?DeviceId::cuda(0):DeviceId::rocm(0);
     PreparedWeightStore store(ModelContextId{10});
-    store.installPhysicalMemoryAuthority(
-        noAllocationAuthority(owner.device_id));
-    owner.prepared_store = &store;
-
-    auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
-    auto up_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
-    auto down_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
-    populateOneExpert(store, gate_ref, 1, fakeGemm(1));
-    populateOneExpert(store, up_ref, 1, fakeGemm(101));
-    populateOneExpert(store, down_ref, 1, fakeGemm(201));
-
-    std::vector<bool> new_mask = {false, true, false, false};
-    auto ctx = owner.buildContext();
-    ASSERT_FALSE(ctx.gate_slab_ref.has_value());
-    ASSERT_FALSE(ctx.up_slab_ref.has_value());
-    ASSERT_FALSE(ctx.down_slab_ref.has_value());
-
-    ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, nullptr));
-
-    EXPECT_EQ(owner.prepared_gate_gemm[1], fakeGemm(1));
-    EXPECT_EQ(owner.prepared_up_gemm[1], fakeGemm(101));
-    EXPECT_EQ(owner.prepared_down_gemm[1], fakeGemm(201));
-    ASSERT_TRUE(ctx.gate_slab_ref.has_value());
-    ASSERT_TRUE(ctx.up_slab_ref.has_value());
-    ASSERT_TRUE(ctx.down_slab_ref.has_value());
-    EXPECT_EQ(ctx.gate_slab_ref->slab_id, gate_ref.slab_id);
-    EXPECT_EQ(ctx.up_slab_ref->slab_id, up_ref.slab_id);
-    EXPECT_EQ(ctx.down_slab_ref->slab_id, down_ref.slab_id);
+    store.installPhysicalMemoryAuthority(noAllocationAuthority(device));
+    for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown}) {
+        const auto descriptor=makeGpuStoreDesc(device,role);
+        const auto original=store.registerExpertSlab(descriptor);
+        const auto found=store.findExpertSlab(descriptor);
+        ASSERT_TRUE(found);EXPECT_EQ(*found,original);
+        EXPECT_EQ(store.expertGemmKernel(*found,1),nullptr);
+        auto foreign=descriptor;foreign.layer_idx=1;
+        EXPECT_FALSE(store.findExpertSlab(foreign));
+    }
 }
+
+/** @brief Explicit native-only actual pipeline coverage; excluded from the Unit registration. */
+class MoEExpertWeightServiceNativeCacheContract:public ::testing::TestWithParam<DeviceType>{};
+/** @test Actual GPU-owned engines reuse exact original Store slots without a second source/allocation. */
+TEST_P(MoEExpertWeightServiceNativeCacheContract, GPURebalanceResolvesStoreSlabsWhenCachedRefsMissing)
+{
+    const auto device=GetParam()==DeviceType::CUDA?DeviceId::cuda(0):DeviceId::rocm(0);
+    auto& native=GPUDeviceContextPool::instance().getContext(device);
+    native.submitAndWait([&] {
+        TestWeightContextOwner owner;owner.device_id=device;
+        owner.prepared_gate_gemm.assign(kNumExperts,nullptr);
+        owner.prepared_up_gemm.assign(kNumExperts,nullptr);
+        owner.prepared_down_gemm.assign(kNumExperts,nullptr);
+        std::vector<GpuPreparedGemm> actual;actual.reserve(3);
+        PreparedWeightStore store(ModelContextId{10});
+        const auto authority=noAllocationAuthority(device);store.installPhysicalMemoryAuthority(authority);
+        owner.prepared_store=&store;
+        auto ctx=owner.buildContext();ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        const std::array<WeightRole,3> roles{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown};
+        const std::array<std::shared_ptr<TensorBase>,3> source{owner.expert_gate_views[1],owner.expert_up_views[1],owner.expert_down_views[1]};
+        std::array<ExpertSlabRef,3> original;
+        for(size_t i=0;i<roles.size();++i) {
+            actual.push_back(makeGpuPreparedGemm(source[i].get(),device,"test.service.cache."+std::to_string(i),ModelContextId{9900+i}));
+            ASSERT_NE(actual.back().kernel,nullptr);
+            original[i]=store.registerExpertSlab(makeGpuStoreDesc(device,roles[i]));
+            ExpertArrival arrival;arrival.expert_id=1;arrival.engine=actual.back().kernel;
+            arrival.engine_lifetime=actual.back().store->gemmKernelLifetime(actual.back().ref);
+            ASSERT_TRUE(arrival.engine_lifetime);arrival.derivation=WeightDerivationKind::RebalancedExpertReplica;
+            store.registerArrivedExperts(original[i],{arrival});
+        }
+        ASSERT_FALSE(ctx.gate_slab_ref);ASSERT_FALSE(ctx.up_slab_ref);ASSERT_FALSE(ctx.down_slab_ref);
+        const std::vector<bool> new_mask{false,true,false,false};
+        ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx,new_mask,nullptr));
+        EXPECT_EQ(owner.prepared_gate_gemm[1],actual[0].kernel);
+        EXPECT_EQ(owner.prepared_up_gemm[1],actual[1].kernel);
+        EXPECT_EQ(owner.prepared_down_gemm[1],actual[2].kernel);
+        ASSERT_TRUE(ctx.gate_slab_ref);ASSERT_TRUE(ctx.up_slab_ref);ASSERT_TRUE(ctx.down_slab_ref);
+        EXPECT_EQ(*ctx.gate_slab_ref,original[0]);EXPECT_EQ(*ctx.up_slab_ref,original[1]);EXPECT_EQ(*ctx.down_slab_ref,original[2]);
+        for(const auto& line:authority->rankAttestation())EXPECT_EQ(line.materialized_new_bytes,0u);
+    });
+}
+INSTANTIATE_TEST_SUITE_P(CUDAAndROCm,MoEExpertWeightServiceNativeCacheContract,
+    ::testing::Values(DeviceType::CUDA,DeviceType::ROCm));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Full lifecycle: extract → prepare → release → rebalance
@@ -2253,8 +2425,8 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingUsesSourceDescrip
     const std::string admission_block =
         source.substr(experts_to_copy, make_specs - experts_to_copy);
     EXPECT_NE(admission_block.find("deviceMoEProjectionFormat"), std::string::npos)
-        << "inactive destination expert views may not carry NativeVNNI metadata";
-    EXPECT_EQ(admission_block.find("has no NativeVNNI format info"), std::string::npos)
+        << "inactive destination expert views may not carry NativeQuantised metadata";
+    EXPECT_EQ(admission_block.find("has no NativeQuantised format info"), std::string::npos)
         << "GPU-direct arrivals must not require destination VNNI format metadata";
     EXPECT_EQ(admission_block.find("grp.dst_views[expert_id]->rows()"), std::string::npos)
         << "inactive destination expert views may be absent during transfer-slot staging";
@@ -2290,3 +2462,102 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingUsesSourceDescrip
     EXPECT_EQ(copy_block.find("grp.dst_views[expert_id]->rows()"), std::string::npos)
         << "async transfer-slot enqueue must not dereference absent destination views";
 }
+
+/**
+ * @test Borrowed arrivals keep their source leases; archive arrivals require
+ * exact destination admission before allocating any packed bytes.
+ */
+TEST(Test__MoEExpertWeightService, BorrowedArrivalReusesPhysicalOwnerAndArchiveRequiresAdmission)
+{
+    auto make_authority = [](size_t persistent, size_t staging, size_t source_staging=0)
+    {
+        PhysicalMemoryPlanBuilder plan;
+        const PhysicalMemoryResource host{0, DeviceId::cpu(), 1u << 25, 1u << 25};
+        plan.add(host, PhysicalMemoryOwner::PrimaryModelWeights, persistent);
+        plan.add(host, PhysicalMemoryOwner::ExpertMigrationStaging, staging);
+        plan.add(host, PhysicalMemoryOwner::WeightLoadStaging, source_staging);
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    };
+    auto live = [](const PhysicalMemoryAuthority &authority)
+    {
+        size_t bytes = 0;
+        for (const auto &line : authority.rankAttestation())
+            bytes += line.materialized_new_bytes;
+        return bytes;
+    };
+    const auto source_staging=std::max(
+        CPUWeightPreparationMemory::sourceNative("Q4_0",kExpertIntermediate,kDModel).temporary_bytes,
+        CPUWeightPreparationMemory::sourceNative("Q4_0",kDModel,kExpertIntermediate).temporary_bytes);
+    const auto authority = make_authority(1u << 22, 1u << 22,source_staging);
+    PreparedWeightStore source_store;
+    source_store.installPhysicalMemoryAuthority(authority);
+    TestWeightContextOwner source;
+    source.prepared_store = &source_store;
+    auto source_ctx = source.buildContext();
+    source_ctx.persistent_weight_owner = PhysicalMemoryOwner::PrimaryModelWeights;
+    ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(source_ctx));
+    ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(source_ctx));
+    ASSERT_TRUE(source_ctx.gate_slab_ref);
+    ASSERT_TRUE(source_ctx.up_slab_ref);
+    ASSERT_TRUE(source_ctx.down_slab_ref);
+    const size_t original_live = live(*authority);
+    ASSERT_GT(original_live, 0u);
+    PreparedExpertEngines arrival;
+    arrival.gate = source_store.expertGemmKernelLifetime(*source_ctx.gate_slab_ref, 1);
+    arrival.up = source_store.expertGemmKernelLifetime(*source_ctx.up_slab_ref, 1);
+    arrival.down = source_store.expertGemmKernelLifetime(*source_ctx.down_slab_ref, 1);
+    ASSERT_TRUE(arrival.complete());
+    std::unordered_map<int, PreparedExpertEngines> prepared;
+    prepared.emplace(1, arrival);
+    const std::vector<bool> mask{false, true, false, false};
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        TestWeightContextOwner destination;
+        destination.expert_mask.assign(kNumExperts, false);
+        destination.prepared_gate_gemm.resize(kNumExperts, nullptr);
+        destination.prepared_up_gemm.resize(kNumExperts, nullptr);
+        destination.prepared_down_gemm.resize(kNumExperts, nullptr);
+        auto ctx = destination.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        // This destination has neither a store nor an allocation owner: it
+        // borrows an already claimed physical engine rather than allocating.
+        ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, mask, nullptr, &prepared));
+        EXPECT_EQ(destination.prepared_gate_gemm[1], arrival.gate.get());
+        EXPECT_EQ(destination.prepared_up_gemm[1], arrival.up.get());
+        EXPECT_EQ(destination.prepared_down_gemm[1], arrival.down.get());
+        EXPECT_EQ(live(*authority), original_live);
+    }
+    std::unordered_map<int, ExpertWeightBlobs> wire;
+    wire.emplace(1, MoEExpertWeightService::serializeExpert(source_ctx, 1));
+    ASSERT_FALSE(wire.at(1).empty());
+    TestWeightContextOwner missing;
+    missing.expert_mask.assign(kNumExperts, false);
+    missing.prepared_gate_gemm.resize(kNumExperts, nullptr);
+    missing.prepared_up_gemm.resize(kNumExperts, nullptr);
+    missing.prepared_down_gemm.resize(kNumExperts, nullptr);
+    auto missing_ctx = missing.buildContext();
+    ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(missing_ctx));
+    EXPECT_THROW(MoEExpertWeightService::registerAndPrepareNewExperts(missing_ctx, mask, &wire), std::logic_error);
+    EXPECT_EQ(missing.prepared_gate_gemm[1], nullptr);
+    const auto insufficient = make_authority(1, 0);
+    PreparedWeightStore destination_store;
+    destination_store.installPhysicalMemoryAuthority(insufficient);
+    TestWeightContextOwner destination;
+    destination.prepared_store = &destination_store;
+    destination.expert_mask.assign(kNumExperts, false);
+    destination.prepared_gate_gemm.resize(kNumExperts, nullptr);
+    destination.prepared_up_gemm.resize(kNumExperts, nullptr);
+    destination.prepared_down_gemm.resize(kNumExperts, nullptr);
+    auto ctx = destination.buildContext();
+    ctx.persistent_weight_owner = PhysicalMemoryOwner::PrimaryModelWeights;
+    ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+    EXPECT_THROW(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, mask, &wire), std::logic_error);
+    EXPECT_EQ(live(*insufficient), 0u);
+    EXPECT_EQ(destination.prepared_gate_gemm[1], nullptr);
+    EXPECT_EQ(destination.prepared_up_gemm[1], nullptr);
+    EXPECT_EQ(destination.prepared_down_gemm[1], nullptr);
+}
+
+INSTANTIATE_TEST_SUITE_P(CUDAAndROCm,MoEExpertWeightServiceGPUCacheContract,
+    ::testing::Values(DeviceType::CUDA,DeviceType::ROCm));

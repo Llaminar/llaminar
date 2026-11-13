@@ -4,7 +4,7 @@
 # MODE=build supplies the compiler and headers for HIP/RCCL/BLAS builds;
 # MODE=full additionally supplies the developer debugger/profiler tools;
 # MODE=runtime installs only host libraries. No mode installs a kernel driver.
-# The compiler modes build the repaired HIP runtime and matching gfx906 BLAS
+# The compiler modes build the repaired HIP runtime and matching shipping-target BLAS
 # kernels. Runtime images copy those exact artifacts from their tested builder;
 # they must never graft kernels from another distribution or release.
 set -euo pipefail
@@ -34,7 +34,7 @@ case "${MODE}" in
         # HIP ROCclr's headless build still compiles GL interop. Tensile's host
         # library needs MessagePack C++ headers; none may be accidental extras
         # inherited only by a full development image.
-        rocm_system_packages+=(libdrm-dev libglvnd-dev libmsgpack-cxx-dev)
+        rocm_system_packages+=(libdrm-dev libglvnd-dev libmsgpack-cxx-dev libelf-dev libnuma-dev pkg-config xxd)
         if [[ "${MODE}" == full ]]; then rocm_packages+=(debugger profiler); fi
         ;;
     runtime) ;;
@@ -55,13 +55,21 @@ apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-
 # compiler/library root without independently spelling a release version.
 test "$(<"${LLAMINAR_ROCM_SDK_PREFIX}/.info/version")" = "${LLAMINAR_ROCM_VERSION}"
 ln -sfn "${LLAMINAR_ROCM_SDK_PREFIX}" "${LLAMINAR_ROCM_ACTIVE_PREFIX}"
+# Core SDK packages trigger ldconfig but do not register their versioned root.
+# Only the canonical public library directory belongs in the process loader
+# cache: compiler-private LLVM paths could replace the selected OpenMP ABI.
+printf '%s/lib\n' "${LLAMINAR_ROCM_ACTIVE_PREFIX}" > /etc/ld.so.conf.d/llaminar-rocm-sdk.conf
+ldconfig
 export ROCM_PATH="${LLAMINAR_ROCM_ACTIVE_PREFIX}" HIP_PATH="${LLAMINAR_ROCM_ACTIVE_PREFIX}"
 export PATH="${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}"
 export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 if [[ "${MODE}" != runtime ]]; then
+    bash "${rocm_script_dir}/install-rocm-lto-linker.sh"
+    bash "${rocm_script_dir}/install-rocm-smi-compat.sh"
+    bash "${rocm_script_dir}/install-rocr-helper-numa.sh"
     bash "${rocm_script_dir}/install-hip-graph-runtime.sh"
-    bash "${rocm_script_dir}/install-rocblas-gfx906.sh"
+    bash "${rocm_script_dir}/install-rocblas.sh"
 fi
 
 # The caller owns unrelated packages; never autoremove them during SDK setup.

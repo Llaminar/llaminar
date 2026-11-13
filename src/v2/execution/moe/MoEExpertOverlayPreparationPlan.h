@@ -10,7 +10,9 @@
 #pragma once
 
 #include "MoEExpertOverlayRuntimePlan.h"
+#include "MoEExpertOverlayGraphScope.h"
 #include "MoEExpertProjectionOwnership.h"
+#include "CPUExpertShardSourceSelection.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/WeightIdentity.h"
 #include "loaders/WeightPlan.h"
@@ -48,6 +50,7 @@ namespace llaminar2
         bool fallback = false;
         /** Exact source/partition identity; absence means an ordinary complete expert. */
         std::optional<MoEExpertProjectionOwnership> projection_ownership;
+        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Original source/cohort/member/selected IDs for CPU joint fragments.
     };
 
     /** @brief Passive preparation counts for one exact rank/device/domain endpoint. */
@@ -93,6 +96,21 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Borrow the original CPU joint source authority across setup/load/graph phases.
+         * @param runtime_plan Original rank-local runtime definition.
+         * @param loader Same native source directory used by admission.
+         * @param original Retained preparation from the original residency setup.
+         * @param routed_expert_bytes_per_expert Existing ordinary-mode diagnostic estimate.
+         * @return Original CPU requests/cohorts unchanged; ordinary modes use their existing builder.
+         * @throws std::invalid_argument For missing/foreign CPU source, members or placement metadata.
+         * @note This performs no owner-map reconstruction and grants no engine readiness.
+         */
+        static MoEExpertOverlayPreparationPlan forOriginalSource(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,const IModelLoader &loader,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> original,
+            size_t routed_expert_bytes_per_expert = 0);
+
+        /**
          * @brief Compile ordinary complete-expert preparation from the existing owner map.
          * @param runtime_plan Frozen topology and initial global expert ownership.
          * @param routed_expert_bytes_per_expert Optional diagnostic whole-expert estimate.
@@ -107,7 +125,7 @@ namespace llaminar2
          * @param runtime_plan Canonical topology, ownership and compute-mode choice.
          * @param loader Authoritative source directory for projection geometry.
          * @param routed_expert_bytes_per_expert Optional whole-expert diagnostic estimate.
-         * @return Whole-expert or gate/up-owned requests without changing policy.
+         * @return Whole-expert, gate/up-owned or source-authenticated CPU joint requests without changing policy.
          * @throws std::invalid_argument For inconsistent or unsupported geometry.
          *
          * The mode is part of the plan, not a debug flag or a caller-selected
@@ -129,7 +147,10 @@ namespace llaminar2
          * Callers first filter this immutable plan to their graph's endpoints.
          * Loading and packing then consume the same requests, including down
          * slices on endpoints that own no gate/up experts. Expert-axis loading
-         * retains full N/K on the host; MoEExpertSourceView selects the exact
+         * retains full N/K on the host for legacy GPU projection pools; closed
+         * CPU joint sources instead request their actual original N/K rectangle
+         * and selected expert IDs through CPUExpertShardSourceSelection.
+         * MoEExpertSourceView selects the exact
          * output interval before GPU preparation. The source slice must never
          * claim an N partition that the loader has not physically performed.
          */
@@ -140,6 +161,24 @@ namespace llaminar2
         {
             return requests_;
         }
+
+        /**
+         * @brief Retain the exact source recipe for a declared CPU joint member.
+         * @param layer Original model layer, including routed sidecars.
+         * @param participant Complete original descriptor; CPU device0 alone is ambiguous across NUMA/ranks.
+         * @return Same immutable selection retained by all this member's preparation requests.
+         * @throws std::invalid_argument For absent, whole-owner or inconsistent requests.
+         */
+        std::shared_ptr<const CPUExpertShardSourceSelection> cpuShardSourceFor(
+            int layer,const MoEExpertOwnerParticipant& participant) const;
+
+        /**
+         * @return The SAME original source-authenticated joint placement map,
+         *         retained unchanged through rank/device/graph filtering, or null
+         *         for ordinary modes. This owns no live capacity ledger.
+         */
+        const std::shared_ptr<const MoEExpertOwnerMap>& cpuJointOwnerMap() const noexcept
+        { return cpu_joint_owners_; }
 
         /** @return Passive summaries rebuilt after every filtering operation. */
         const MoEExpertOverlayPreparationDiagnostics &diagnostics() const
@@ -191,6 +230,16 @@ namespace llaminar2
          */
         MoEExpertOverlayPreparationPlan filteredForDevices(
             const std::vector<DeviceId> &devices) const;
+
+        /**
+         * @brief Retain exact logical graph participants before source loading or preparation.
+         * @param runtime Original immutable source authenticated by the scope.
+         * @param scope Shared source-bound domain/device/rank/index selection.
+         * @return Exact requests with rebuilt diagnostics; projection identity is unchanged.
+         * @throws std::invalid_argument For a scope belonging to another runtime.
+         */
+        MoEExpertOverlayPreparationPlan filteredForGraphScope(
+            const MoEExpertOverlayRuntimePlan &runtime, const MoEExpertOverlayGraphScope &scope) const;
 
         /** @return Whether this exact local expert projection is requested. */
         bool shouldPrepare(
@@ -276,8 +325,11 @@ namespace llaminar2
         static MoEExpertOverlayPreparationPlan compile(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
             size_t routed_expert_bytes_per_expert,
-            const std::map<int, MoEExpertProjectionOwnership::Geometry> &projection_geometries);
+            const std::map<int, MoEExpertProjectionOwnership::Geometry> &projection_geometries,
+            std::shared_ptr<const MoEExpertOwnerMap> joint_sources = {});
 
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> original_source_plan_; ///< Immutable authored source definition retained through graph/rank filters.
+        std::shared_ptr<const MoEExpertOwnerMap> cpu_joint_owners_; ///< Original immutable source placement, never rebuilt by a graph filter.
         std::vector<MoEExpertOverlayPreparationRequest> requests_;
         MoEExpertOverlayPreparationDiagnostics diagnostics_;
     };

@@ -93,7 +93,7 @@ We're 10× slower than the I/O floor. The gap is dominated by:
 │  ┌──────────────────────────────────────────────────────┐      │
 │  │  VNNI Payload Region                                  │      │
 │  │  [weight0_payload | weight1_payload | ... | weightN]  │      │
-│  │  Total: sum of all weight native_vnni sizes           │      │
+│  │  Total: sum of all weight native_quantised sizes           │      │
 │  └──────────────────────────────────────────────────────┘      │
 │  ┌──────────────────────────────────────────────────────┐      │
 │  │  Scales Region                                        │      │
@@ -120,17 +120,17 @@ We're 10× slower than the I/O floor. The gap is dominated by:
 class WeightVRAMPool {
 public:
     struct WeightSlot {
-        uint8_t* d_native_vnni_payload;   // Offset into payload region
-        uint16_t* d_native_vnni_scales;   // Offset into scales region
-        uint16_t* d_native_vnni_mins;     // Offset into mins region (or nullptr)
-        uint32_t* d_native_vnni_emins;    // Offset into emins region (or nullptr)
+        uint8_t* d_native_quantised_payload;   // Offset into payload region
+        uint16_t* d_native_quantised_scales;   // Offset into scales region
+        uint16_t* d_native_quantised_mins;     // Offset into mins region (or nullptr)
+        uint32_t* d_native_quantised_emins;    // Offset into emins region (or nullptr)
         float* d_int8_scales;             // Per-row scales for INT8 path
         uint8_t* d_staging;               // Temporary: raw GGUF blocks on device
         size_t staging_bytes;             // Size of staging region for this weight
     };
 
     // Phase 1: Plan (calculate sizes, no allocation)
-    void planWeight(const std::string& name, const NativeVnniFormatInfo& info,
+    void planWeight(const std::string& name, const NativeQuantisedFormatInfo& info,
                     int N, int K, bool needs_int8_scales);
     
     // Phase 2: Allocate (single hipMalloc)
@@ -199,7 +199,7 @@ private:
 
 **Replaces**: CPU-side `packVnniBlock()` per-block per-row loop.
 
-**Core insight**: The VNNI repack is a pure data layout transformation — no floating-point computation for native VNNI formats. The GPU kernel reads raw GGUF blocks from a staging area and writes the interleaved VNNI layout to the final destination.
+**Core insight**: The VNNI repack is a pure data layout transformation — no floating-point computation for native quantised formats. The GPU kernel reads raw GGUF blocks from a staging area and writes the interleaved VNNI layout to the final destination.
 
 #### Kernel Design (Q4_K example)
 
@@ -314,7 +314,7 @@ public:
         const void* host_raw_data;        // mmap'd GGUF pointer
         size_t raw_bytes;
         WeightVRAMPool::WeightSlot slot;  // Pre-assigned device offsets
-        NativeVnniFormatInfo format;
+        NativeQuantisedFormatInfo format;
         int N, K;
     };
     
@@ -433,7 +433,7 @@ void LoadOrchestrator::warmPageCache(const void* mmap_base, size_t file_size) {
 
 ## 5. INT8 VNNI Path: GPU-Side Requantization
 
-The native VNNI path (§3.3) handles formats like Q4_K directly. But the INT8 VNNI path (`int8_data_vnni`) requires actual requantization: Q4_K → dequant → find max_abs → requant to INT8 → interleave.
+The native quantised path (§3.3) handles formats like Q4_K directly. But the INT8 VNNI path (`int8_data_vnni`) requires actual requantization: Q4_K → dequant → find max_abs → requant to INT8 → interleave.
 
 This is more compute-intensive and benefits even more from GPU execution:
 
@@ -515,13 +515,13 @@ ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(
       N_(N), K_(K), weights_converted_(true)  // Already on device!
 {
     impl_ = std::make_unique<Impl>();
-    impl_->d_weights_native_vnni = slot.d_native_vnni_payload;
-    impl_->d_weights_native_scales = slot.d_native_vnni_scales;
-    impl_->d_weights_native_mins = slot.d_native_vnni_mins;
+    impl_->d_weights_native_quantised = slot.d_native_quantised_payload;
+    impl_->d_weights_native_scales = slot.d_native_quantised_scales;
+    impl_->d_weights_native_mins = slot.d_native_quantised_mins;
     impl_->d_scales_B = reinterpret_cast<float*>(slot.d_int8_scales);
-    impl_->has_native_vnni = true;
-    impl_->native_vnni_codebook_id = codebook_id;
-    impl_->native_vnni_blocks_per_row = blocks_per_row;
+    impl_->has_native_quantised = true;
+    impl_->native_quantised_codebook_id = codebook_id;
+    impl_->native_quantised_blocks_per_row = blocks_per_row;
 }
 ```
 
@@ -651,7 +651,7 @@ tests/v2/integration/
 
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| GPU repack kernel correctness | Wrong weights → garbage inference | Bit-exact parity tests (native VNNI path), tolerance tests (INT8 path) |
+| GPU repack kernel correctness | Wrong weights → garbage inference | Bit-exact parity tests (native quantised path), tolerance tests (INT8 path) |
 | VRAM fragmentation from staging region | OOM for weights after staging freed | Staging region at end of pool allocation; `hipFree` + re-`hipMalloc` if needed |
 | FP16 scale precision on GPU vs CPU | Numerical divergence | Use `__float2half_rn` (round-to-nearest) matching CPU `fp32_to_fp16` |
 | `madvise(MADV_SEQUENTIAL)` not available | Slower page warming | Graceful fallback to simple sequential read |

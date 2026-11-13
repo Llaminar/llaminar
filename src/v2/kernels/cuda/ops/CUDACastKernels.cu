@@ -6,8 +6,13 @@
  * on-device for bandwidth optimization in TP allreduce.
  * Captured device-prefix conversions leave every inactive FP32 value unchanged;
  * their borrowed row authority is consumed on the exact collective stream.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -69,13 +74,14 @@ static __global__ void fp16_to_fp32_kernel(const __half *__restrict__ input,
  * @note Inactive inputs are neither read nor converted; allocation capacity is
  *       launch geometry only. The existing conversion arithmetic is unchanged.
  */
+template<class Rows>
 static __global__ void fp32_to_fp16_live_rows_kernel(
     const float *__restrict__ input, __half *__restrict__ output,
-    llaminar2::DeviceRowRange rows, size_t columns)
+    Rows rows, size_t columns)
 {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t live_elements = static_cast<size_t>(rows.activeRows()) * columns;
-    if (index < live_elements) output[index] = __float2half(input[index]);
+    const size_t physical_elements = static_cast<size_t>(rows.physicalRows()) * columns;
+    if (index < physical_elements && llaminar2::projectionRowIsActive(rows,int(index / columns))) output[index] = __float2half(input[index]);
 }
 
 /**
@@ -85,13 +91,14 @@ static __global__ void fp32_to_fp16_live_rows_kernel(
  * @param rows Same immutable borrowed prefix used by conversion and transport.
  * @param columns Exact scalar row width.
  */
+template<class Rows>
 static __global__ void fp16_to_fp32_live_rows_kernel(
     const __half *__restrict__ input, float *__restrict__ output,
-    llaminar2::DeviceRowRange rows, size_t columns)
+    Rows rows, size_t columns)
 {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t live_elements = static_cast<size_t>(rows.activeRows()) * columns;
-    if (index < live_elements) output[index] = __half2float(input[index]);
+    const size_t physical_elements = static_cast<size_t>(rows.physicalRows()) * columns;
+    if (index < physical_elements && llaminar2::projectionRowIsActive(rows,int(index / columns))) output[index] = __half2float(input[index]);
 }
 
 /**
@@ -200,8 +207,15 @@ extern "C"
         const cudaError_t bound = cudaSetDevice(ordinal);
         if (bound != cudaSuccess) return bound;
         (void)cudaGetLastError();
-        fp32_to_fp16_live_rows_kernel<<<grid_size, 256, 0, stream>>>(
+        if(llaminar2::currentProjectionRowWork(rows.physicalRows())) {
+        llaminar2::dispatchProjectionRows(rows.physicalRows(),rows.countOwner()?&rows:nullptr,[&](auto authority) {
+        fp32_to_fp16_live_rows_kernel<decltype(authority)><<<grid_size, 256, 0, stream>>>(
+            fp32_input, static_cast<__half *>(fp16_output), authority, columns);
+        });
+        } else {
+        fp32_to_fp16_live_rows_kernel<decltype(rows)><<<grid_size, 256, 0, stream>>>(
             fp32_input, static_cast<__half *>(fp16_output), rows, columns);
+        }
         return cudaGetLastError();
     }
 
@@ -225,8 +239,15 @@ extern "C"
         const cudaError_t bound = cudaSetDevice(ordinal);
         if (bound != cudaSuccess) return bound;
         (void)cudaGetLastError();
-        fp16_to_fp32_live_rows_kernel<<<grid_size, 256, 0, stream>>>(
+        if(llaminar2::currentProjectionRowWork(rows.physicalRows())) {
+        llaminar2::dispatchProjectionRows(rows.physicalRows(),rows.countOwner()?&rows:nullptr,[&](auto authority) {
+        fp16_to_fp32_live_rows_kernel<decltype(authority)><<<grid_size, 256, 0, stream>>>(
+            static_cast<const __half *>(fp16_input), fp32_output, authority, columns);
+        });
+        } else {
+        fp16_to_fp32_live_rows_kernel<decltype(rows)><<<grid_size, 256, 0, stream>>>(
             static_cast<const __half *>(fp16_input), fp32_output, rows, columns);
+        }
         return cudaGetLastError();
     }
 

@@ -4,6 +4,7 @@
  *
  * BufferArena owns all activation/scratch/workspace buffers and provides:
  *   - Typed registration with BufferId keys
+ *   - Preclaimed CPU physical storage retained by each canonical root
  *   - External buffer registration (for weights)
  *   - Coherence tracking (host vs. device authoritative)
  *   - Borrow tracking with aliasing validation (debug builds)
@@ -36,6 +37,7 @@ namespace llaminar2
     class ITensor;
     class TensorBase;
     class TensorFactory;
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Configuration for BufferArena allocation behavior.
@@ -47,8 +49,11 @@ namespace llaminar2
      */
     struct ArenaConfig
     {
-        /// TensorFactory for NUMA-aware allocation (required for allocate())
+        /// Optional TensorFactory whose NUMA binding precedes CPU first touch.
         TensorFactory *factory = nullptr;
+
+        /// Existing admitted model authority; required for owned CPU roots.
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
 
     };
 
@@ -162,9 +167,22 @@ namespace llaminar2
         bool registerExternalBuffer(BufferId id, ITensor *tensor);
 
         /**
+         * @brief Register one canonical external root with its original shared physical owner retained by this arena.
+         * @param id Unused canonical arena role.
+         * @param tensor Original nonempty canonical root, including an aliasing pointer to its actual PMA owner.
+         * @return False for absent/noncanonical roots, invalid roles or an existing registration, without mutating the slot.
+         * @note This retains ownership only; it creates no allocation or PMA claim. Metadata validation precedes commit.
+         * Retained roots cannot be rebound, and remain alive through final arena destruction even after stages retire.
+         * Their metadata is projected from canonical tensor coherence/device before commit; no second live authority is created.
+         */
+        bool registerExternalBuffer(BufferId id, std::shared_ptr<TensorBase> tensor);
+
+
+        /**
          * @brief Bind or replace an externally-owned scratch/output buffer.
          *
-         * Unlike registerExternalBuffer(), this may be called at runtime for
+         * Retained shared external roots reject this operation, including same-pointer binds.
+         * Unlike raw registerExternalBuffer(), this may be called at runtime for
          * dynamic-shape activations such as all-position verifier logits. The
          * buffer slot must not be arena-owned. Rebinding resets coherence to
          * UNINITIALIZED so the next stage write establishes authority through
@@ -217,7 +235,14 @@ namespace llaminar2
          * Must be called after all registerBuffer() calls and before
          * any prepareForRead/Write calls.
          *
-         * @return true on success
+         * CPU roots preclaim their exact allocator-rounded extent using the
+         * configured admitted authority. Views and external tensors add no
+         * storage claims; retained shared roots preserve their own lease.
+         *
+         * @return true on success, false when already allocated or construction returns null.
+         * @throws std::logic_error for missing authority or exhausted owner admission.
+         * @throws std::overflow_error for an unrepresentable physical extent.
+         * @throws std::bad_alloc when native root construction fails; its preclaim retires.
          */
         bool allocate();
 
@@ -356,11 +381,11 @@ namespace llaminar2
         ITensor *getTensor(BufferId id) const;
 
         /**
-         * @brief Get shared ownership of an arena-owned tensor.
+         * @brief Get original shared ownership of an arena-owned or retained external root.
          *
          * Returns the shared_ptr for arena-owned buffers, enabling callers
          * (e.g., InferenceState) to hold a reference beyond the arena's
-         * lifetime. Returns nullptr for external (non-owned) buffers.
+         * lifetime. Returns nullptr for raw external registrations without retained ownership.
          *
          * @param id Buffer to query
          * @return shared_ptr<TensorBase>, or nullptr if not arena-owned
@@ -394,7 +419,8 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Get the current coherence state of a buffer.
+         * @brief Get current arena history, or a canonical tensor projection for a retained external root.
+         * @return Compatibility metadata only; transfer/publication decisions remain with the tensor/TransferEngine.
          */
         CoherenceState getCoherenceState(BufferId id) const;
 
@@ -443,6 +469,7 @@ namespace llaminar2
             // Ownership
             std::shared_ptr<TensorBase> owned_tensor; ///< Arena-owned
             ITensor *external_tensor = nullptr;       ///< Externally owned
+            std::shared_ptr<TensorBase> retained_external; ///< Original external physical owner; no second allocation/claim.
 
             // Registration info (for deferred allocation)
             size_t rows = 0;
@@ -492,8 +519,14 @@ namespace llaminar2
         /// Check if any buffer in the same alias group has an active borrow
         bool aliasGroupHasAnyBorrow(int group, BufferId exclude) const;
 
-        /// Create a tensor for a registered buffer using TensorFactory
-        std::shared_ptr<TensorBase> createTensorForBuffer(const ManagedBuffer &b, BufferId id) const;
+        /**
+         * @brief Construct a unique root before publishing shared physical ownership.
+         * @param b Registered buffer geometry, dtype and home device.
+         * @param id Buffer identity used in allocation diagnostics.
+         * @return Unpublished tensor; CPU storage uses the common admitted native declaration.
+         * @throws std::bad_alloc when the underlying storage allocation fails.
+         */
+        std::unique_ptr<TensorBase> createTensorForBuffer(const ManagedBuffer &b, BufferId id) const;
     };
 
 } // namespace llaminar2

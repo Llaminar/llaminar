@@ -2,7 +2,7 @@
  * @file Test__CUDAWorkspaceMemoryEstimator.cpp
  * @brief Device-backed regressions for CUDA graph-family memory admission.
  *
- * CUDA NativeVNNI prefill scratch is selected from the concrete device launch
+ * CUDA NativeQuantised prefill scratch is selected from the concrete device launch
  * policy, so its final admission contract cannot be certified by a device-free
  * Unit test.  These focused tests use only synthetic tensor metadata: they do
  * not load a model or allocate model weights, but they query the same CUDA
@@ -15,7 +15,7 @@
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmWorkspaceContract.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/TensorType.h"
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 
@@ -152,12 +152,12 @@ TEST(Test__CUDAWorkspaceMemoryEstimator, ContinuationIncludesCompactQuantizedPro
     for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
-        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+        if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
             continue;
         const auto format = tensorTypeName(type);
         for (auto &tensor : value.tensors)
             tensor.quant_type = format;
-        const auto *native = native_vnni_formats::forQuantType(format);
+        const auto *native = native_quantised_formats::forQuantType(format);
         ASSERT_NE(native, nullptr);
         const auto codebook = canonicalDeviceVnniCodebookId(native->codebook_id);
         const cuda::quantized_gemm_workspace::NativeCodebooks codebooks{codebook, codebook};

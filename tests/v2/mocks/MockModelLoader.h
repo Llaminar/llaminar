@@ -15,6 +15,11 @@
 #pragma once
 
 #include "loaders/IModelLoader.h"
+#include "kernels/common/NativeEmbeddingLayout.h"
+#include "tensors/NativeTensorExtent.h"
+#include <cstring>
+#include <algorithm>
+#include <limits>
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include <vector>
@@ -120,6 +125,17 @@ namespace llaminar2::test
         // =========================================================================
 
         bool isLoaded() const override { return loaded_; }
+
+        /** @return Original fixture allocation policy; no socket/worker readiness is implied. */
+        CPUStoragePlacement nativeWeightSourcePlacement() const override { return CPUStoragePlacement::local(); }
+        /** @brief Describe original coordinates independently of transient payload lifetime. */
+        NativeWeightSourceGeometry nativeWeightSourceGeometry(const std::string& name) override;
+        /** @brief Read an exact original rectangle into the caller's actual storage, without allocating payload. */
+        void readNativeWeightSourceWindow(const std::string& name,const NativeWeightSourceWindow& window,
+            std::span<std::byte> destination) override;
+        /** @return Actual typed source reads, distinct from legacy whole tensor API calls. */
+        size_t nativeSourceReadCallCount() const noexcept { return native_source_read_calls_; }
+
 
         std::shared_ptr<TensorBase> loadTensor(
             const std::string &name,
@@ -297,6 +313,7 @@ namespace llaminar2::test
 
         // Call tracking
         mutable size_t load_tensor_calls_ = 0;
+        size_t native_source_read_calls_ = 0; ///< Actual successful native window reads only.
         mutable std::vector<std::string> missing_requests_;
 
         // Helper for creating slices
@@ -763,6 +780,78 @@ namespace llaminar2::test
         addTensor(name, tensor);
     }
 
+    inline NativeWeightSourceGeometry MockModelLoader::nativeWeightSourceGeometry(const std::string& name)
+    {
+        const auto found=tensors_.find(name);
+        if(found==tensors_.end() || !found->second)
+            throw std::invalid_argument("Mock native source requires its original tensor metadata: "+name);
+        const auto& tensor=*found->second;
+        auto original=tensor.shape();
+        if(original.empty() || std::any_of(original.begin(),original.end(),[](size_t n){return n==0;}))
+            throw std::invalid_argument("Mock native source has empty original geometry");
+        // Ordinary tensors use normalized [N,K]. Existing expert fixtures
+        // already retain GGUF [K,N,E] with original expert-major raw bytes.
+        if(original.size()==2)std::swap(original[0],original[1]);
+        size_t group=1,bytes=0;
+        if(NativeEmbeddingLayout::supports(tensor.native_type())) {
+            if(original.front()>size_t(std::numeric_limits<int>::max()))
+                throw std::overflow_error("Mock native source K exceeds canonical format geometry");
+            const auto layout=NativeEmbeddingLayout::forSource(tensor.native_type(),1,static_cast<int>(original.front()));
+            group=layout.block_elements;bytes=layout.block_bytes;
+        } else {
+            switch(tensor.native_type()) {
+                case TensorType::FP32: bytes=sizeof(float);break;
+                case TensorType::FP16:
+                case TensorType::BF16: bytes=sizeof(uint16_t);break;
+                case TensorType::INT32: bytes=sizeof(int32_t);break;
+                case TensorType::INT8: bytes=sizeof(int8_t);break;
+                default: throw std::invalid_argument("Mock native source has unsupported original format");
+            }
+        }
+        // A real loader's directory survives source retirement. Preserve that
+        // contract here without retaining or reconstructing the released bytes.
+        if(!bytes || original.front()%group || (!tensor.is_raw_data_released() &&
+           nativeTensorExtent(original,group,bytes)!=tensor.size_bytes()))
+            throw std::invalid_argument("Mock native source cuts an encoded group or replaced its original bytes");
+        return {std::move(original),tensor.native_type(),group,bytes};
+    }
+
+    inline void MockModelLoader::readNativeWeightSourceWindow(const std::string& name,
+        const NativeWeightSourceWindow& window,std::span<std::byte> destination)
+    {
+        const auto source=nativeWeightSourceGeometry(name);
+        const auto multiply=[](size_t a,size_t b) {
+            if(b && a>std::numeric_limits<size_t>::max()/b)throw std::overflow_error("Mock native source extent overflows");
+            return a*b;
+        };
+        const size_t columns=source.original_shape[0],rows=source.original_shape.size()>1?source.original_shape[1]:1;
+        size_t outer=1;for(size_t axis=2;axis<source.original_shape.size();++axis)outer=multiply(outer,source.original_shape[axis]);
+        if(!window.rows || !window.columns || window.original_expert>=outer || window.first_row>rows ||
+           window.rows>rows-window.first_row || window.first_column>columns || window.columns>columns-window.first_column ||
+           window.first_column%source.native_group_elements || window.columns%source.native_group_elements ||
+           window.native_row_bytes!=multiply(window.columns/source.native_group_elements,source.native_group_bytes) ||
+           !destination.data() || destination.size()!=window.nativeBytes())
+            throw std::invalid_argument("Mock native window disagrees with its original tensor");
+        const auto& tensor=*tensors_.at(name);
+        if(tensor.is_raw_data_released() || !tensor.raw_data())
+            throw std::invalid_argument("Mock native read requires its original live tensor: "+name);
+        const auto* raw=static_cast<const std::byte*>(tensor.raw_data());
+        const auto source_begin=reinterpret_cast<uintptr_t>(raw),target_begin=reinterpret_cast<uintptr_t>(destination.data());
+        if(source_begin>std::numeric_limits<uintptr_t>::max()-tensor.size_bytes() ||
+           target_begin>std::numeric_limits<uintptr_t>::max()-destination.size() ||
+           (target_begin<source_begin+tensor.size_bytes() && source_begin<target_begin+destination.size()))
+            throw std::invalid_argument("Mock native destination aliases its original tensor");
+        const size_t row_bytes=multiply(columns/source.native_group_elements,source.native_group_bytes);
+        const size_t outer_offset=multiply(multiply(window.original_expert,rows),row_bytes);
+        const size_t column_offset=multiply(window.first_column/source.native_group_elements,source.native_group_bytes);
+        // Complete source/window validation above precedes every destination
+        // write. The original tensor remains the only fixture source owner.
+        for(size_t row=0;row<window.rows;++row)
+            std::memcpy(destination.data()+row*window.native_row_bytes,
+                raw+outer_offset+(window.first_row+row)*row_bytes+column_offset,window.native_row_bytes);
+        ++native_source_read_calls_;
+    }
+
     inline std::shared_ptr<TensorBase> MockModelLoader::loadTensor(
         const std::string &name,
         DeviceId /*device*/,
@@ -967,6 +1056,7 @@ namespace llaminar2::test
     inline void MockModelLoader::resetCounters()
     {
         load_tensor_calls_ = 0;
+        native_source_read_calls_ = 0;
         missing_requests_.clear();
     }
 

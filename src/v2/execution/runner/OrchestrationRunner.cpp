@@ -13,6 +13,8 @@
  * in an unmatched collective.
  * Seeded CPU sampling uses the same logical-position draw identity for ordinary
  * outputs, batched prefill and MTP verification; RNG call order is not authority.
+ * Optional finite benchmark traces export every actual host controller observation;
+ * they neither mirror GPU control nor retain unbounded serving chronology.
  * CPU stochastic sampling owns penalties inside its host distribution builder;
  * it never pre-mutates the model row through a backend sampling operation.
  * Planning metadata is read once by the admission root and published through
@@ -21,7 +23,9 @@
  * Admission-only completion remains distinct from inference readiness, so dry
  * runs neither enter inference shutdown collectives nor seal unprepared weights.
  * Model-aware topology is resolved by ResolvedRankOrchestration; this runner
- * installs that result without a second overlay-binding or role-selection path.
+ * installs that result and its requested weight identity together, before any
+ * capacity-frozen placement replaces the declarative request. There is no second
+ * overlay-binding or role-selection path.
  * Overlay candidates use the shared BOM adapter inside the common typed rank
  * initialization lifecycle. Capture-policy errors reach consensus before any
  * peer may enter the physical-budget collective.
@@ -29,12 +33,44 @@
  * expert-only followers receive command metadata and sparse tickets, not tokens.
  * Admission publishes the already resolved stochastic request seeds. Sampling
  * and verification share that entropy across response windows and graph reuse.
+ * Forced MTP output preserves an already-returned resident carry before
+ * replacing the next condition; unreturned bonus replacement stays distinct.
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Physical TP validation borrows the already-resolved LocalTP endpoint order;
+ * early structural validation never manufactures physical participant IDs.
+ * CPU serial storage declarations survive admission and runtime projection.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
+ * Global pipeline graph completion belongs to the original rank's parent:
+ * nested TP children retain shared sources until its complete serving family
+ * and every stage ownership proof succeed, including terminal MTP operands.
  */
 
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
+#include "execution/moe/MoEOverlayRestorationGeometry.h"
+#include "execution/moe/MoEOverlayRowCandidateFinalization.h"
+#include "execution/diagnostics/QueryKVGeometryObservation.h"
+#include "planning/TensorParallelSourceDeclaration.h"
+#include "planning/OriginalRankCapacityExchange.h"
+#include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "loaders/ImmutableRowTable.h"
+#include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "OrchestrationRunner.h"
+#include "PreparedPipelineGraphMaterialization.h"
+#include "execution/global/GlobalOrchestrator.h"
+#include "execution/global/GlobalStageTPValidation.h"
+#include "transfer/CapturedTransferChannel.h"
+#include "collective/GlobalTPContext.h"
+#include "collective/NativeCPUCollectiveProgram.h"
+#include <variant>
+#include "execution/moe/MoEOverlayCPUHostMaintenance.h"
+#include "execution/moe/ExpertHistogramServingRegime.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "IOrchestrationRunnerFactory.h"
@@ -51,6 +87,7 @@
 #include "../mtp/MTPStateTransaction.h"
 #include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPDeviceGenerationPolicy.h"
+#include "../mtp/HostSparseQueryResponseScope.h"
 #include "../mtp/MTPRequestSamplingPolicy.h"
 #include "../mtp/MTPRejectionSampler.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
@@ -73,7 +110,9 @@
 #include "../moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "../moe/MoEOverlayMPIResidencyConsensus.h"
 #include "../moe/MoEOverlayCapacityAdmission.h"
+#include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 #include "../moe/MoEOverlayActivationChannelPlan.h"
+#include "../moe/MoEOverlayRankBatchPreparation.h"
 #include "../moe/MoEOverlayEconomyCalibrationController.h"
 #include "../moe/MoEOverlayEconomyCertificationController.h"
 #include "../moe/MoEOverlayDeviceServiceTelemetryPublisher.h"
@@ -91,6 +130,8 @@
 #include "../moe/MoEOverlayInferenceInterferenceProbe.h"
 #include "../moe/MoEOverlayTierMigrationTransport.h"
 #include "../../kernels/common/SamplingMath.h"
+#include "utils/MTPDepthTransactionTraceCPU.h"
+#include "utils/MTPDepthTransactionTracePerfStats.h"
 #include "../parallelism_tree/ParallelismTree.h"
 #include "../parallelism_tree/TreeToRunnerCompiler.h"
 #include "../../collective/LocalTPContext.h"
@@ -98,6 +139,9 @@
 #include "../../collective/BackendRouter.h"
 #include "../../backends/BackendManager.h"
 #include "../../backends/GPUDeviceContextPool.h"
+#include "../mtp/MTPModelClassPolicy.h"
+#include "../mtp/MTPDepthPolicyScopeProjection.h"
+#include "../mtp/MTPServingForwardCaptureGeometry.h"
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
@@ -110,8 +154,11 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../planning/ClusterInventoryGatherer.h"
 #include "../../planning/ModelMemoryProfile.h"
+#include "../../config/OrchestrationStartupPolicy.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../planning/RankMemoryPlanInputs.h"
+#include "../../planning/RankHardwareOwnership.h"
+#include "../../backends/NativeContextPreparation.h"
 #include "../../planning/MoEOverlayPlanningInputs.h"
 #include "../../planning/MoEOverlayMemoryPlanInputs.h"
 #include "../../backends/DeviceAddressAdapter.h"
@@ -137,6 +184,7 @@
 #include "../../execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "../../execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "../../execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "../../execution/moe/MoEOverlayHostServiceContract.h"
 #include "../../execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "../../execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "../../execution/moe/RoutedExpertOwnerAssignment.h"
@@ -487,29 +535,6 @@ namespace llaminar2
             return out.str();
         }
 
-        /**
-         * @brief Infer the coarse model class used by generated MTP depth rules.
-         *
-         * The controller should not depend on exact GGUF architecture strings,
-         * but MoE and dense models have different speculative-depth economics.
-         * Collapse the metadata string into the smallest useful policy key.
-         */
-        MTPDepthPolicyModelClass inferMTPDepthPolicyModelClass(
-            const std::shared_ptr<ModelContext> &model_ctx)
-        {
-            if (!model_ctx)
-                return MTPDepthPolicyModelClass::Any;
-
-            const auto &architecture = model_ctx->architecture();
-            if (architecture.empty())
-                return MTPDepthPolicyModelClass::Any;
-            constexpr std::string_view marker = "moe";
-            if (std::search(architecture.begin(), architecture.end(), marker.begin(), marker.end(),
-                    [](unsigned char left, char right) { return std::tolower(left) == right; }) != architecture.end())
-                return MTPDepthPolicyModelClass::MoE;
-            return MTPDepthPolicyModelClass::Dense;
-        }
-
         bool samplingParamsEqual(const SamplingParams &a, const SamplingParams &b)
         {
             return a.temperature == b.temperature &&
@@ -680,6 +705,25 @@ namespace llaminar2
             return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
         }
 
+        /**
+         * @brief Format existing immutable GDN diagnostic protocol metadata.
+         * @param layer Complete copied probe, never a live state owner.
+         * @return Storage-format id and every exact CPU phase word, without payload reads.
+         */
+        std::string gdnDiagnosticStorageSuffix(const PrefixGDNLayerProbe &layer)
+        {
+            std::ostringstream out;
+            out << "/storage=" << static_cast<unsigned>(layer.recurrence_storage)
+                << "/epoch_phase_words=[";
+            for (size_t head = 0; head < layer.recurrence_epoch_phase_words.size(); ++head)
+            {
+                if (head > 0) out << ',';
+                out << layer.recurrence_epoch_phase_words[head];
+            }
+            out << ']';
+            return out.str();
+        }
+
         std::string summarizePrefixProbeForTrace(const PrefixRuntimeStateSnapshot &probe)
         {
             /*
@@ -767,6 +811,11 @@ namespace llaminar2
             for (const PrefixGDNLayerProbe &layer : probe.gdn_layers)
             {
                 fold_u64(gdn_digest, static_cast<uint64_t>(layer.global_layer));
+                fold_u64(gdn_digest, static_cast<uint64_t>(layer.recurrence_layout));
+                fold_u64(gdn_digest, static_cast<uint64_t>(layer.recurrence_storage));
+                fold_u64(gdn_digest, layer.recurrence_epoch_phase_words.size());
+                for (uint32_t phase_word : layer.recurrence_epoch_phase_words)
+                    fold_u64(gdn_digest, phase_word);
                 fold_u64(gdn_digest, layer.recurrence_hash);
                 fold_u64(gdn_digest, layer.conv_hash);
                 if (layer.device_state_hash_available)
@@ -825,8 +874,9 @@ namespace llaminar2
             {
                 const auto &layer = probe.gdn_layers[i];
                 oss << " L" << layer.global_layer
-                    << "/rh=" << layer.recurrence_hash
-                    << "/ch=" << layer.conv_hash;
+                    << "/layout=" << gdnRecurrenceStateLayoutName(layer.recurrence_layout)
+                    << gdnDiagnosticStorageSuffix(layer)
+                    << "/rh=" << layer.recurrence_hash << "/ch=" << layer.conv_hash;
                 if (layer.device_state_hash_available)
                     oss << "/rdh=" << layer.recurrence_device_hash
                         << "/cdh=" << layer.conv_device_hash;
@@ -1072,11 +1122,13 @@ namespace llaminar2
 
             /**
              * @brief Open the exact outer command on every remote follower lane.
-             * @param command Root-owned request, command, and placement identity.
+             * @param world_rank Actual original overlay communicator rank.
+             * @param command Root-owned request, command, and placement-floor identity.
              * @param error Optional stable failure diagnostic.
              * @return True for an inert local scope or a successfully opened lane.
              */
             bool begin(
+                int world_rank,
                 const MoEOverlayInferenceCommandIdentity &command,
                 std::string *error)
             {
@@ -1088,7 +1140,7 @@ namespace llaminar2
                         *error = "ExpertOverlay decode command began twice";
                     return false;
                 }
-                begun_ = coordinator_->beginCommand(command, error);
+                begun_ = coordinator_->beginRootCommand(world_rank, command, error);
                 return begun_;
             }
 
@@ -1102,6 +1154,32 @@ namespace llaminar2
                 return !coordinator_ ||
                        (begun_ && coordinator_->beginGraphSequence(
                                       draft_depth, error));
+            }
+
+            /**
+             * @brief Admit a restored-prefix suffix after any completed prefill.
+             * @param error Optional stable lifecycle rejection diagnostic.
+             * @return True for an inert local scope or an admitted decode bridge.
+             */
+            bool beginRestoredPrefixDecodeSequence(std::string *error)
+            {
+                return !coordinator_ ||
+                       (begun_ && coordinator_->beginRestoredPrefixDecodeSequence(error));
+            }
+
+            /**
+             * @brief Retire one completed sequence before another row uses this command.
+             * @param error Optional stable failure diagnostic.
+             * @return True for an inert local scope or a retired graph sequence.
+             *
+             * A forced output may first owe a previously emitted condition row.
+             * Both rows share the outer command, but each has its own exact
+             * participant graph schedule and cannot overlap the other's sequence.
+             */
+            bool retireGraphSequence(std::string *error)
+            {
+                return !coordinator_ ||
+                       (begun_ && coordinator_->retireCompletedGraphSequence(error));
             }
 
             /**
@@ -1453,7 +1531,7 @@ namespace llaminar2
             if (tokens >= 0)
                 return tokens;
 
-            return expectedShiftedMTPTokens(snapshot.cached_tokens);
+            return expectedShiftedMTPTokens(snapshot.cached_tokens,snapshot.mtp_shifted_origin);
         }
 
         MTPDecodeStateStamp makeMTPStateStamp(
@@ -1468,6 +1546,7 @@ namespace llaminar2
             stamp.logical_tokens = snapshot.cached_tokens;
             stamp.main_kv_tokens = snapshot.cached_tokens;
             stamp.shifted_mtp_kv_tokens = snapshotShiftedMTPTokens(snapshot);
+            stamp.shifted_origin=snapshot.mtp_shifted_origin;
             stamp.position = snapshot.cached_tokens;
             stamp.has_terminal_hidden = has_terminal_hidden;
             stamp.has_terminal_logits = has_terminal_logits;
@@ -1527,6 +1606,12 @@ namespace llaminar2
             };
             if (pipeline)
             {
+                if (const auto &global = pipeline->admission()->globalPipeline(); global)
+                {
+                    if (global->world_size != context->world_size())
+                        throw std::logic_error("Pipeline request publication crossed its original global communicator");
+                    return global->embeddingPublisherRank();
+                }
                 if (pipeline->stages().empty())
                     throw std::logic_error("MoE pipeline request publication has no admitted stages");
                 for (const auto &stage : pipeline->stages())
@@ -1546,6 +1631,8 @@ namespace llaminar2
          * endpoints, not the synthetic primary.  Ordinary LocalTP resolves the
          * same authority set from the rank plan. PP includes every inner TP
          * participant, not merely the primary device of each pipeline stage.
+         * Frozen-zero routed-only endpoints retain their runtime/storage life,
+         * but cannot be required to own prepared weight records they never load.
          */
         std::vector<DeviceId> rankLocalPreparedWeightAuthorityDevices(
             const RankExecutionPlan &rank_plan,
@@ -1568,12 +1655,7 @@ namespace llaminar2
                 resolveOverlayExecutionPlanForRunner(overlay_plan, mpi_ctx);
             if (overlay_execution)
             {
-                for (const DeviceId device :
-                     overlay_execution->currentRankPlan().local_devices)
-                {
-                    append_unique(device);
-                }
-                return devices;
+                return admittedOverlayPreparedWeightDevices(*overlay_plan, *overlay_execution);
             }
 
             if (rank_plan.usesLocalPP())
@@ -1762,377 +1844,6 @@ namespace llaminar2
             }
             return std::nullopt;
         }
-
-
-        /**
-         * @brief Resolve which retained routed phases belong to service economy.
-         *
-         * Positive-depth MTP retains serial decode only for terminal catch-up
-         * and short tails.  Those legal exceptional graphs remain reachable,
-         * but waiting for every sparse participant to execute one would make
-         * movement readiness traffic-dependent and potentially unbounded.
-         * Depth-zero adaptive policy makes serial decode recurring again and
-         * therefore requires its measured cost.
-         */
-        ExpertHistogramServingRegime expertHistogramServingRegime(
-            const MTPRuntimeConfig &mtp) noexcept
-        {
-            if (!mtp.enabled)
-                return ExpertHistogramServingRegime::Serial;
-            if (mtp.depth_policy.mode != MTPDepthPolicyMode::Fixed &&
-                mtp.depth_policy.min_depth == 0)
-            {
-                return ExpertHistogramServingRegime::AdaptiveSerialOrMTP;
-            }
-            return ExpertHistogramServingRegime::PositiveDepthMTP;
-        }
-
-        /** @brief Append one unsigned scalar in a host-independent wire order. */
-        template <typename UInt>
-        void appendCapacityWireScalar(
-            std::vector<std::uint8_t> &bytes,
-            UInt value)
-        {
-            static_assert(std::is_unsigned_v<UInt>);
-            for (std::size_t offset = 0; offset < sizeof(UInt); ++offset)
-            {
-                bytes.push_back(static_cast<std::uint8_t>(
-                    value >> (offset * 8u)));
-            }
-        }
-
-        /** @brief Read one bounds-checked unsigned little-endian scalar. */
-        template <typename UInt>
-        UInt readCapacityWireScalar(
-            const std::vector<std::uint8_t> &bytes,
-            std::size_t &cursor,
-            std::size_t end)
-        {
-            static_assert(std::is_unsigned_v<UInt>);
-            if (cursor > end || sizeof(UInt) > end - cursor)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity wire record is truncated");
-            }
-            UInt value = 0;
-            for (std::size_t offset = 0; offset < sizeof(UInt); ++offset)
-            {
-                value |= static_cast<UInt>(bytes[cursor++]) <<
-                         (offset * 8u);
-            }
-            return value;
-        }
-
-        /** @brief Serialize rank-local capacity records without ABI padding. */
-        std::vector<std::uint8_t> serializeOverlayCapacityBudgets(
-            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &budgets)
-        {
-            constexpr std::uint32_t kMagic = 0x43415034u; // "CAP4"
-            constexpr std::uint32_t kVersion = 4;
-            constexpr std::size_t kHeaderBytes = 40;
-            constexpr std::size_t kOwnerBytes = 16;
-            constexpr std::size_t kRecordBytes =
-                kHeaderBytes +
-                PhysicalMemoryBOM::ownerCount() * kOwnerBytes;
-            std::vector<std::uint8_t> bytes;
-            if (budgets.size() >
-                std::numeric_limits<std::size_t>::max() / kRecordBytes)
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay capacity wire record count overflows size_t");
-            }
-            bytes.reserve(budgets.size() * kRecordBytes);
-            for (const auto &budget : budgets)
-            {
-                appendCapacityWireScalar(bytes, kMagic);
-                appendCapacityWireScalar(bytes, kVersion);
-                appendCapacityWireScalar(
-                    bytes, static_cast<std::uint32_t>(budget.worldRank()));
-                appendCapacityWireScalar(
-                    bytes, static_cast<std::uint32_t>(budget.device().type));
-                appendCapacityWireScalar(
-                    bytes, static_cast<std::uint32_t>(budget.device().ordinal));
-                appendCapacityWireScalar(
-                    bytes,
-                    static_cast<std::uint32_t>(
-                        PhysicalMemoryBOM::ownerCount()));
-                const auto &bom = budget.bom();
-                appendCapacityWireScalar(
-                    bytes,
-                    static_cast<std::uint64_t>(
-                        bom.resource().total_bytes));
-                appendCapacityWireScalar(
-                    bytes,
-                    static_cast<std::uint64_t>(
-                        bom.resource().admission_available_bytes));
-                for (std::size_t owner_index = 0;
-                     owner_index < PhysicalMemoryBOM::ownerCount();
-                     ++owner_index)
-                {
-                    const auto &charge = bom.charge(
-                        PhysicalMemoryBOM::ownerAt(owner_index));
-                    appendCapacityWireScalar(
-                        bytes,
-                        static_cast<std::uint64_t>(
-                            charge.planned_bytes));
-                    appendCapacityWireScalar(
-                        bytes,
-                        static_cast<std::uint64_t>(
-                            charge.already_resident_bytes));
-                }
-            }
-            return bytes;
-        }
-
-        /** @brief Parse and authenticate one rank segment of capacity records. */
-        void parseOverlayCapacityBudgetSegment(
-            const std::vector<std::uint8_t> &bytes,
-            std::size_t begin,
-            std::size_t end,
-            int contributing_rank,
-            std::vector<MoEOverlayBoundPhysicalMemoryBudget> &output)
-        {
-            constexpr std::uint32_t kMagic = 0x43415034u;
-            constexpr std::uint32_t kVersion = 4;
-            constexpr std::size_t kHeaderBytes = 40;
-            constexpr std::size_t kOwnerBytes = 16;
-            constexpr std::size_t kRecordBytes =
-                kHeaderBytes +
-                PhysicalMemoryBOM::ownerCount() * kOwnerBytes;
-            if (begin > end || end > bytes.size() ||
-                (end - begin) % kRecordBytes != 0)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity rank segment has invalid framing");
-            }
-            std::size_t cursor = begin;
-            while (cursor < end)
-            {
-                const auto magic = readCapacityWireScalar<std::uint32_t>(
-                    bytes, cursor, end);
-                const auto version = readCapacityWireScalar<std::uint32_t>(
-                    bytes, cursor, end);
-                const int world_rank = static_cast<int>(
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end));
-                const auto device_type = static_cast<DeviceType>(
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end));
-                const int ordinal = static_cast<int>(
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end));
-                const auto owner_count =
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end);
-                const auto total_bytes =
-                    readCapacityWireScalar<std::uint64_t>(
-                        bytes, cursor, end);
-                const auto available_bytes =
-                    readCapacityWireScalar<std::uint64_t>(
-                        bytes, cursor, end);
-                const DeviceId device(device_type, ordinal);
-                if (magic != kMagic || version != kVersion ||
-                    world_rank != contributing_rank ||
-                    owner_count != PhysicalMemoryBOM::ownerCount() ||
-                    !device.is_valid() ||
-                    (!device.is_cpu() && !device.is_gpu()) ||
-                    total_bytes > std::numeric_limits<std::size_t>::max() ||
-                    available_bytes >
-                        std::numeric_limits<std::size_t>::max())
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay capacity wire record failed identity or range validation");
-                }
-                PhysicalMemoryBOMBuilder builder({
-                    .world_rank = world_rank,
-                    .device = device,
-                    .total_bytes = static_cast<std::size_t>(total_bytes),
-                    .admission_available_bytes =
-                        static_cast<std::size_t>(available_bytes),
-                });
-                for (std::size_t owner_index = 0;
-                     owner_index < PhysicalMemoryBOM::ownerCount();
-                     ++owner_index)
-                {
-                    const auto planned =
-                        readCapacityWireScalar<std::uint64_t>(
-                            bytes, cursor, end);
-                    const auto resident =
-                        readCapacityWireScalar<std::uint64_t>(
-                            bytes, cursor, end);
-                    if (planned >
-                            std::numeric_limits<std::size_t>::max() ||
-                        resident >
-                            std::numeric_limits<std::size_t>::max())
-                    {
-                        throw std::invalid_argument(
-                            "ExpertOverlay capacity wire owner charge exceeds size_t");
-                    }
-                    builder.add(
-                        PhysicalMemoryBOM::ownerAt(owner_index),
-                        static_cast<std::size_t>(planned),
-                        static_cast<std::size_t>(resident));
-                }
-                output.emplace_back(
-                    MoEOverlayLocalCapacityPlanner::physicalResourceId(
-                        world_rank, device),
-                    PhysicalMemoryAdmissionCertificate(builder.build()));
-            }
-        }
-
-        /** @brief All-gather variable rank-local physical BOMs in rank order. */
-        std::vector<MoEOverlayBoundPhysicalMemoryBudget>
-        gatherOverlayCapacityBudgets(
-            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &local,
-            const std::shared_ptr<IMPIContext> &mpi_context)
-        {
-            if (!mpi_context || mpi_context->world_size() <= 1)
-                return local;
-
-            const auto send = serializeOverlayCapacityBudgets(local);
-            if (send.size() > static_cast<std::size_t>(INT_MAX))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay rank-local capacity wire payload exceeds MPI int count");
-            }
-            const int world_size = mpi_context->world_size();
-            const int send_count = static_cast<int>(send.size());
-            std::vector<int> counts(static_cast<std::size_t>(world_size), 0);
-            mpi_context->allgather_bytes(
-                &send_count, counts.data(), sizeof(send_count));
-
-            std::vector<int> displacements(
-                static_cast<std::size_t>(world_size), 0);
-            std::size_t total = 0;
-            for (int rank = 0; rank < world_size; ++rank)
-            {
-                if (counts[static_cast<std::size_t>(rank)] < 0 ||
-                    total > static_cast<std::size_t>(INT_MAX))
-                {
-                    throw std::overflow_error(
-                        "ExpertOverlay global capacity wire payload exceeds MPI int displacement");
-                }
-                displacements[static_cast<std::size_t>(rank)] =
-                    static_cast<int>(total);
-                total += static_cast<std::size_t>(
-                    counts[static_cast<std::size_t>(rank)]);
-            }
-            if (total > static_cast<std::size_t>(INT_MAX))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay global capacity wire payload exceeds MPI int count");
-            }
-
-            std::vector<std::uint8_t> received(total);
-            mpi_context->allgatherv_bytes(
-                send.empty() ? nullptr : send.data(),
-                send_count,
-                received.empty() ? nullptr : received.data(),
-                counts.data(),
-                displacements.data());
-
-            std::vector<MoEOverlayBoundPhysicalMemoryBudget> result;
-            for (int rank = 0; rank < world_size; ++rank)
-            {
-                const std::size_t begin = static_cast<std::size_t>(
-                    displacements[static_cast<std::size_t>(rank)]);
-                const std::size_t end = begin + static_cast<std::size_t>(
-                    counts[static_cast<std::size_t>(rank)]);
-                parseOverlayCapacityBudgetSegment(
-                    received, begin, end, rank, result);
-            }
-            return result;
-        }
-
-        /**
-         * @brief Prove every overlay rank will execute the same admission loop.
-         *
-         * Capacity admission performs collectives once per candidate. A rank
-         * with a different configured bucket ladder would otherwise leave its
-         * peers inside an unmatched collective. First gathering the count gives
-         * every rank the same safe exit point; only equal counts permit the
-         * second, fixed-width gather of the exact candidate values.
-         */
-        void requireIdenticalOverlayGraphRowCandidates(
-            const std::vector<int> &local_candidates,
-            const std::shared_ptr<IMPIContext> &mpi_context)
-        {
-            if (local_candidates.empty())
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity admission requires at least one graph-row candidate");
-            }
-            const bool uncaptured_contract =
-                local_candidates.size() == 1u &&
-                local_candidates.front() == 0;
-            if (!uncaptured_contract &&
-                (std::any_of(
-                     local_candidates.begin(),
-                     local_candidates.end(),
-                     [](int rows) { return rows <= 0; }) ||
-                 !std::is_sorted(
-                     local_candidates.begin(),
-                     local_candidates.end(),
-                     std::greater<int>{})))
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay graph-row candidates must be positive and descending");
-            }
-            if (!mpi_context || mpi_context->world_size() <= 1)
-                return;
-            if (local_candidates.size() >
-                static_cast<std::size_t>(INT_MAX) / sizeof(int))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay graph-row candidate payload exceeds MPI int count");
-            }
-
-            const int world_size = mpi_context->world_size();
-            const int local_count = static_cast<int>(local_candidates.size());
-            std::vector<int> counts(
-                static_cast<std::size_t>(world_size), 0);
-            mpi_context->allgather_bytes(
-                &local_count, counts.data(), sizeof(local_count));
-            if (!std::all_of(
-                    counts.begin(), counts.end(),
-                    [&](int count) { return count == local_count; }))
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay ranks disagree on the captured-prefill candidate count");
-            }
-
-            const auto candidate_count =
-                static_cast<std::size_t>(local_count);
-            if (candidate_count >
-                std::numeric_limits<std::size_t>::max() /
-                    static_cast<std::size_t>(world_size))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay gathered graph-row candidates overflow size_t");
-            }
-            std::vector<int> gathered(
-                candidate_count * static_cast<std::size_t>(world_size));
-            mpi_context->allgather_bytes(
-                local_candidates.data(),
-                gathered.data(),
-                candidate_count * sizeof(int));
-            for (int rank = 0; rank < world_size; ++rank)
-            {
-                const auto begin = gathered.begin() +
-                                   static_cast<std::ptrdiff_t>(
-                                       candidate_count *
-                                       static_cast<std::size_t>(rank));
-                if (!std::equal(
-                        local_candidates.begin(),
-                        local_candidates.end(),
-                        begin))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay ranks disagree on the captured-prefill candidate ladder");
-                }
-            }
-        }
-
     }
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> freezeMoEExpertOverlayPlanForModel(
@@ -2345,6 +2056,26 @@ namespace llaminar2
             throw std::invalid_argument(
                 "OrchestrationRunner reuse contract has malformed or unscoped ExpertOverlay migration-profile evidence");
         }
+        // Reject a foreign or differently prepared predictor before consuming
+        // the original reusable lease/retention receipt. Such rejection has no
+        // runtime owner to seal and must leave the model reusable by its owner.
+        const auto& original_loader=model_ctx_->concreteLoader();
+        original_loader.requireSharedPredictorSource(config_.shared_predictor,
+            original_loader.predictorMaterialization());
+        if(config_.shared_predictor){
+            // Automatic intent is resolved by the SAME metadata-only startup
+            // authority used during planning, against this retained source inventory.
+            auto predictor_request=config_;
+            resolveMTPStartupPolicy(predictor_request,ModelMemoryProfile::fromLoader(original_loader));
+            original_loader.requireSharedPredictorSource(config_.shared_predictor,
+                retainsMTPGraphCapacity(predictor_request.mtp)?SharedPredictorMaterialization::Active:
+                    SharedPredictorMaterialization::Inactive);
+            // Carry the canonical startup result forward; later planning applies
+            // the same idempotent resolver instead of reconstructing another policy.
+            config_=std::move(predictor_request);
+            requested_routed_weight_authority_identity_=routedWeightAuthorityRequestIdentity(
+                config_.moe_routed_expert_plan,config_);
+        }
         std::string reuse_error;
         if (!model_context_reuse_authority_->acquireRunnerExclusive(
                 &reuse_error))
@@ -2513,6 +2244,34 @@ namespace llaminar2
 
     bool OrchestrationRunner::initialize()
     {
+        // Direct API callers share the public startup authority boundary.
+        // Reject authored scope before MPI, planning, model or graph work.
+        if (config_.mtp.depth_policy.scope != MTPDepthPolicyScope{})
+            return setError("MTP learned-policy scope is runtime-derived and cannot be authored in startup configuration");
+        if (debugEnv().runtime_debug.mtp_depth_transaction_trace)
+        {
+            try
+            {
+                (void)sampling_math::resolveMTPDiagnosticRecordMode(
+                    debugEnv().runtime_debug.mtp_device_phase_snapshots,
+                    DebugEnv::isTruthyEnv("LLAMINAR_MTP_MIRROR_LAYER_DIAGNOSTICS"), true);
+            }
+            catch (const std::invalid_argument &error) { return setError(error.what()); }
+            const auto scope = config_.benchmark_mode && !config_.serve_mode
+                ? sampling_math::MTPDepthTransactionTraceScope::BoundedBenchmark
+                : sampling_math::MTPDepthTransactionTraceScope::Other;
+            if (!debugEnv().runtime_debug.benchmark_iteration_overrides_valid ||
+                !validMTPDepthTransactionTracePolicy(config_.mtp) ||
+                !sampling_math::validMTPDepthTransactionTraceScope(scope,
+                    debugEnv().runtime_debug.benchmark_warmup_iterations,
+                    debugEnv().runtime_debug.benchmark_iterations) ||
+                !sampling_math::validMTPDepthTransactionTraceAdmission(
+                    sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                    config_.batch_size, config_.n_predict < 0 ? 128 : config_.n_predict))
+                return setError("MTP depth-transaction trace requires a fresh scalar bounded benchmark with enabled positive-depth MTP (CPU bypass unsupported), warmup0/measure1, tokens1..256");
+            if (!PerfStatsCollector::isDomainEnabled("mtp"))
+                return setError("MTP depth-transaction trace requires enabled PerfStats collection of the mtp domain");
+        }
         if (initialization_lifecycle_.readyForInference())
         {
             return true;
@@ -2712,6 +2471,43 @@ namespace llaminar2
                 return false;
             }
 
+            // Graph construction has completed its original all-rank phase.
+            // Validate every local alias in a separate phase before session
+            // topology discovery can enter any original WORLD collective.
+            if (!run_phase("validateOriginalRankPipelineTransportContext", [&] {
+                    const auto *global = dynamic_cast<const GlobalOrchestrator *>(runner_.get());
+                    if (global && global->requiresOriginalRankGPUTransport())
+                        global->validateOriginalRankGPUTransportContext(mpi_ctx_);
+                    return true;
+                })) return false;
+            if (!run_phase("createOriginalRankPipelineTransportSession", [&] {
+                    auto *global = dynamic_cast<GlobalOrchestrator *>(runner_.get());
+                    if (global && global->requiresOriginalRankGPUTransport())
+                    {
+                        if (rank_pipeline_transfer_session_)
+                            return setError("Original rank pipeline session was already constructed");
+                        rank_pipeline_transfer_session_ = CapturedTransferRankSession::create(mpi_ctx_);
+                        global->bindOriginalRankGPUTransportSession(mpi_ctx_, rank_pipeline_transfer_session_);
+                    }
+                    return true;
+                })) return false;
+
+            // Bind immutable economics once, before serving capture or warmup.
+            // No model directory scan or geometry allocation enters decode.
+            if (!run_phase("bindMTPDepthPolicyScopeGeometry", [&]
+                {
+                    if (model_ctx_ && model_ctx_->ggufDirectory())
+                    {
+                        const auto projection = projectMTPDepthPolicyScopeGeometry(
+                            plan_, planningModelMetadata().memoryProfile(),
+                            resolveMTPRetainedDraftCapacity(retainedMTPConfig()), cluster_inventory_);
+                        mtp_depth_policy_scope_geometry_ = projection.scope;
+                        mtp_depth_policy_scope_generic_reason_ = projection.generic_reason;
+                    }
+                    return true;
+                }))
+                return false;
+
             /*
              * Diagnostic D2D copies are part of native graph topology. Apply
              * the complete caller policy after participant graph construction
@@ -2907,6 +2703,19 @@ namespace llaminar2
                 return false;
             }
 
+            if (!run_phase("requireImmutableRowTablePlacementComplete", [&] {
+                    if (plan_.runtime.ngram_table_placement)
+                    {
+                        plan_.runtime.ngram_table_placement->requireRequestedPolicy(config_.ngram_table_policy);
+                        if (!model_ctx_ || !physical_memory_authority_)
+                            return setError("Ngram completion lost its admitted model or physical authority");
+                        model_ctx_->requireImmutableRowTablePlacementComplete(
+                            *plan_.runtime.ngram_table_placement, physical_memory_authority_);
+                    }
+                    return true;
+                }))
+                return false;
+
             /*
              * Capture one coherent owner-by-owner ledger view at the exact
              * ready-for-inference boundary. This is diagnostic only: admission
@@ -2968,6 +2777,10 @@ namespace llaminar2
 
     bool OrchestrationRunner::initializeForDryRun()
     {
+        // Direct API callers share the public startup authority boundary.
+        // Reject authored scope before MPI, planning, model or graph work.
+        if (config_.mtp.depth_policy.scope != MTPDepthPolicyScope{})
+            return setError("MTP learned-policy scope is runtime-derived and cannot be authored in startup configuration");
         if (initialization_lifecycle_.admissionComplete())
         {
             return true;
@@ -3071,9 +2884,13 @@ namespace llaminar2
 
     void OrchestrationRunner::shutdown()
     {
+        if(finite_device_placement_submission_!=FiniteDevicePlacementSubmission::Inactive)
+            throw std::logic_error("Runner shutdown cannot withdraw an active original device placement parent");
+        std::string retired_storage_request_failure;
         const bool was_inference_ready = initialization_lifecycle_.readyForInference();
         const bool has_live_resources =
-            runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
+            created_native_context_source_ || plan_.runtime.native_context_preparation || runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
+            rank_pipeline_transfer_session_ ||
             moe_overlay_inference_transaction_coordinator_ ||
             moe_overlay_inference_transaction_follower_ ||
             moe_overlay_rank_batch_transport_registry_ ||
@@ -3142,6 +2959,13 @@ namespace llaminar2
                         terminal_moe_optimization_movement_ledger_ = runner_->moeOptimizationMovementLedger();
                     }
                 }
+                catch (const RetiredStorageRequestFailure &error)
+                {
+                    // Every original native/adopted duty retired, but the request
+                    // failed. Destroy owners safely and forbid prepared reuse.
+                    retired_storage_request_failure = error.what();
+                    LOG_ERROR("[OrchestrationRunner] Retired failed storage request: " << error.what());
+                }
                 catch (const std::exception &e)
                 {
                     // A failed terminal reset leaves producer ownership unproven.
@@ -3183,7 +3007,24 @@ namespace llaminar2
         moe_overlay_inference_transaction_follower_.reset();
         moe_overlay_inference_transaction_coordinator_.reset();
         runner_.reset();
-        if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources)
+        if (rank_pipeline_transfer_session_)
+        {
+            // Every original local graph/cursor/registration is gone. Existing
+            // session consensus now proves all remote mappings/FDs gone BEFORE
+            // the sole host allocator drops the actual backing charge.
+            try { rank_pipeline_transfer_session_->retireAfterOriginalGraphRelease(); }
+            catch (...) { std::terminate(); }
+            rank_pipeline_transfer_session_.reset();
+        }
+        if(cpu_expert_shard_ctx_) {
+            // SHUTDOWN has stopped the original workers and runner destruction
+            // released every stage/cache borrow. The still-live domain now
+            // proves actual all-member unmap before creator backing retirement.
+            if(!cpu_expert_shard_ctx_->retireOriginalCPUExpertDomain())std::terminate();
+            cpu_expert_shard_ctx_.reset();
+        }
+        if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources ||
+            (moe_pipeline_prepared_plan_ && preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::LiveMutableResidency))
         {
             std::string error;
             if (!sealReusableModelContextPhysicalState(&error))
@@ -3195,6 +3036,7 @@ namespace llaminar2
             }
         }
         moe_pipeline_stage_bindings_.clear();
+        model_context_pipeline_host_restored_ = false;
         if (reusable_execution_workspaces_ &&
             !reusable_execution_workspaces_->valid())
         {
@@ -3273,6 +3115,17 @@ namespace llaminar2
             model_ctx_ && reusable_workspace_complete &&
             model_ctx_.use_count() == 1u &&
             reusable_execution_workspaces_.use_count() == 1u;
+        // A failed fresh initialization has no ready model-retention contract.
+        // Keep its exact original source alive until every partial owner below
+        // is gone. Successful exclusive teardown instead borrows the final
+        // model owner's source, including storage-only native participants.
+        const bool exclusive_failed_source = !was_inference_ready &&
+            !exports_reusable_model_context && created_native_context_source_ &&
+            (!model_ctx_ || model_ctx_.use_count()==1u) &&
+            (!reusable_execution_workspaces_ || reusable_execution_workspaces_.use_count()==1u);
+        auto final_native_source = retires_exclusive_model_context
+            ? model_ctx_->nativeContextPreparation()
+            : (exclusive_failed_source ? created_native_context_source_ : nullptr);
         const bool needs_retention_seal =
             exports_reusable_model_context ||
             retires_exclusive_model_context;
@@ -3322,6 +3175,10 @@ namespace llaminar2
 
         if (exports_reusable_model_context)
         {
+            if (!retired_storage_request_failure.empty()) {
+                model_context_reuse_seal_succeeded_ = false;
+                model_context_reuse_seal_error_ = retired_storage_request_failure;
+            }
             if (model_context_reuse_seal_succeeded_)
             {
                 std::string publication_error;
@@ -3358,7 +3215,7 @@ namespace llaminar2
                         throw std::logic_error(
                             "exclusive final model retirement lost its typed pending plan");
                     }
-                    (void)pending_exclusive_model_retirement->complete();
+                    (void)pending_exclusive_model_retirement->complete(final_native_source);
                 }
                 catch (const std::exception &error)
                 {
@@ -3373,6 +3230,51 @@ namespace llaminar2
             }
         }
 
+        if(final_native_source &&
+            (exclusive_failed_source || model_context_reuse_seal_succeeded_)){
+            // All graphs, weights and execution buffers must be gone before
+            // native-only zero-allocation validation. Existing positive model
+            // BOM retirement above remains authoritative; this final source
+            // pass covers residual storage-only births as well as failed setup.
+            reusable_execution_workspaces_.reset();
+            final_native_source->retireReleasedContexts();
+            if(plan_.runtime.native_context_preparation==final_native_source)
+                plan_.runtime.native_context_preparation.reset();
+            if(created_native_context_source_==final_native_source)
+                created_native_context_source_.reset();
+        }
+
+        // Quota/planner failure may precede ModelContext publication entirely.
+        // Retire only this original Preparing source's installed births after
+        // all possible runner/model owners have gone. The source-owned final
+        // cleanup above also handles admitted fresh failures. Borrowed/exported
+        // admitted contexts retain their existing model-retirement/reuse path.
+        if (plan_.runtime.native_context_preparation &&
+            plan_.runtime.native_context_preparation->memory()->phase() ==
+                PhysicalMemoryAuthorityPhase::Preparing)
+        {
+            plan_.runtime.native_context_preparation->retireUnadmitted();
+            if(created_native_context_source_==plan_.runtime.native_context_preparation)
+                created_native_context_source_.reset();
+            plan_.runtime.native_context_preparation.reset();
+        }
+
+        // Exported/shared ModelContext and reuse-contract owners keep the SAME
+        // source/PMA. Relinquish this retired runner's plan borrow as well as its
+        // creation handle: otherwise a destructor's second shutdown mistakes
+        // that borrow for live runner state and tries to seal a Reusable (or
+        // successor-owned) authority again. Actual source retirement above is
+        // unchanged; dropping a borrow never retires the external model owner.
+        plan_.runtime.native_context_preparation.reset();
+        created_native_context_source_.reset();
+        mtp_depth_policy_scope_geometry_ = {};
+        mtp_depth_policy_scope_generic_reason_ = "model_free";
+        // Failed request data is never reusable. Exclusive physical retirement
+        // above still used its original positive BOM and native-zero proof.
+        if (!retired_storage_request_failure.empty()) {
+            model_context_reuse_seal_succeeded_ = false;
+            model_context_reuse_seal_error_ = retired_storage_request_failure;
+        }
         initialization_lifecycle_.retire();
         LOG_DEBUG("OrchestrationRunner shut down");
     }
@@ -3433,6 +3335,10 @@ namespace llaminar2
         MoEOverlayInferenceProgressPhase phase,
         std::uint64_t completed_logical_tokens) noexcept
     {
+        if (completed_logical_tokens == 0u) return;
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+                owner->notify({.phase = phase, .completed_logical_tokens = completed_logical_tokens});
         if (!moe_expert_overlay_maintenance_service_ ||
             completed_logical_tokens == 0u)
         {
@@ -3525,7 +3431,9 @@ namespace llaminar2
             // For example, 448 live rows under a 384-row cap require 384+64,
             // not 384+384. This changes neither row authority nor KV extent.
             const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
-                buckets, runner_->get_position(), token_count);
+                buckets, runner_->get_position(), token_count,
+                plan_.runtime.ngram_table_placement && plan_.runtime.ngram_table_placement->fixedHeadPipeline()
+                    ? PrefillChunkWidthPolicy::ExactRetained : PrefillChunkWidthPolicy::RetainedPadding);
 
             PrefillChunkSchedule chunk_schedule = planPrefillChunkSchedule(policy);
             if (!chunk_schedule)
@@ -3721,11 +3629,12 @@ namespace llaminar2
 
     bool OrchestrationRunner::activateMoEOverlayDemandAtRequestBoundary()
     {
-        if (!moe_expert_overlay_residency_authority_)
-            return true;
-
         try
         {
+            for (const auto &binding : moe_pipeline_stage_bindings_)
+                if (binding->owners().host_maintenance)
+                    (void)binding->owners().authority->activateOptimizationDemandAtRequestBoundary();
+            if (!moe_expert_overlay_residency_authority_) return true;
             /*
              * The authority transition is deliberately idempotent. A normal
              * remote rank reaches this helper from its typed command handler
@@ -3761,6 +3670,13 @@ namespace llaminar2
             return false;
         }
 
+        if (debugEnv().runtime_debug.mtp_depth_transaction_trace &&
+            (!validMTPDepthTransactionTracePolicy(activeMTPRequestConfig()) ||
+            !sampling_math::validMTPDepthTransactionTraceAdmission(
+                sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                config_.batch_size, config_.n_predict < 0 ? 128 : config_.n_predict)))
+            return setError("MTP depth-transaction trace rejected a disabled, zero-depth, unsupported or unbounded request policy");
+
         /*
          * Delayed ExpertOverlay economy certification may finish while the
          * preceding request still owns decode transactions. Installation
@@ -3782,6 +3698,7 @@ namespace llaminar2
             mpi_root_command,
             "PREFILL",
             &last_error_);
+        ensureFiniteDevicePlacementArmed();
         ScopedMoEOverlayRootCommand overlay_prefill_command(
             moe_overlay_inference_transaction_coordinator_);
 
@@ -3898,7 +3815,8 @@ namespace llaminar2
 
         if (overlay_prefill_command.active())
         {
-            if (!mpi_root_command ||
+            const auto command_context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!command_context ||
                 moe_overlay_collective_generation_id_ == 0 ||
                 !moe_expert_overlay_residency_authority_)
             {
@@ -3921,11 +3839,13 @@ namespace llaminar2
                     moe_overlay_collective_generation_id_,
                 .command_id =
                     ++moe_overlay_inference_command_sequence_,
+                // Initial admitted lower bound only: mapped device packet kernels
+                // authenticate their actual current placement ticket and bank.
                 .initial_placement_epoch = snapshot->epoch,
             };
             std::string command_error;
             if (!overlay_prefill_command.begin(
-                    command_identity, &command_error))
+                    command_context->rank(), command_identity, &command_error))
             {
                 return setError(
                     "ExpertOverlay remote prefill command admission failed: " +
@@ -3964,23 +3884,30 @@ namespace llaminar2
         const auto &config_prefix = config_.prefix_cache;
         const MTPRuntimeConfig active_mtp = activeMTPRequestConfig();
         /*
-         * The remote expert rank retains MTP-draft and grouped-verifier graph
-         * families, but it does not own a sidecar head, sampler, KV state, or
-         * depth controller.  Its follower consumes those graph families only
-         * after the continuation rank publishes an authenticated transaction
-         * ticket.  Treating it as an ordinary MTP decoder here would reject a
-         * perfectly complete follower merely because supportsChainedMTPDrafts()
-         * correctly reports false.
+         * The installed transaction role determines continuation ownership.
+         * Expert followers and original layer-stage followers retain their
+         * participant-local graph/state families, but only the vocabulary tail
+         * owns the sampler and depth controller. Prefix admission still spans
+         * every original pipeline rank because all stages must submit the same
+         * restored frontier and suffix graph sequence.
          */
+        const auto mtp_participation = mtpRankParticipation();
+        const auto *original_pipeline =
+            dynamic_cast<const GlobalOrchestrator *>(runner_.get());
+        const bool coordinates_original_pipeline_prefix =
+            original_pipeline && original_pipeline->originalRankPipelineReady();
+        if (coordinates_original_pipeline_prefix && !mpi_ctx_)
+            return setError("Original pipeline prefix admission has no original MPI context");
         const bool owns_mtp_continuation_authority =
             active_mtp.enabled &&
-            !moe_overlay_inference_transaction_follower_;
+            mtp_participation != MTPRankParticipation::ExpertTransactionFollower &&
+            mtp_participation != MTPRankParticipation::OriginalPipelineFollower;
         const bool prefix_cache_enabled =
             (plan_prefix.enabled || config_prefix.enabled) &&
             plan_prefix.storage_mode != PrefixCacheStorageMode::Disabled &&
             config_prefix.storage_mode != PrefixCacheStorageMode::Disabled;
         const bool mtp_full_hit_requires_terminal_hidden =
-            owns_mtp_continuation_authority &&
+            active_mtp.enabled &&
             active_mtp.require_terminal_hidden_for_full_hit;
         prefix_request_summary_ = {};
         prefix_request_summary_.enabled = prefix_cache_enabled;
@@ -4049,9 +3976,11 @@ namespace llaminar2
 
                 PrefixCoordinationResult coordination;
                 const MPI_Comm prefix_coordination_comm =
-                    continuation_request_group_
-                        ? continuation_request_group_->coordinationCommunicator()
-                        : MPI_COMM_NULL;
+                    coordinates_original_pipeline_prefix
+                        ? mpi_ctx_->communicator()
+                        : (continuation_request_group_
+                               ? continuation_request_group_->coordinationCommunicator()
+                               : MPI_COMM_NULL);
                 if (prefix_coordination_comm != MPI_COMM_NULL)
                 {
                     MPIPrefixCollectiveCoordinator domain_coordinator(
@@ -4135,10 +4064,9 @@ namespace llaminar2
                                               : hit.fingerprint_key;
                     hit.placement_epochs = coordinated_hit.placement_epochs;
                     hit.bypass_reason = coordinated_hit.bypass_reason;
-                    hit.has_terminal_logits =
-                        hit.has_terminal_logits && coordinated_hit.has_terminal_logits;
-                    hit.has_terminal_hidden =
-                        hit.has_terminal_hidden && coordinated_hit.has_terminal_hidden;
+                    // Payload availability remains participant-local. Shared
+                    // terminal requirements select the boundary below; they
+                    // must never manufacture a terminal row on a PP follower.
                     hit.restore_model_runtime_state = matched_tokens > 0;
                     hit.restore_hybrid_state_for_suffix_prefill =
                         matched_tokens > 0 &&
@@ -4151,10 +4079,11 @@ namespace llaminar2
                 prefix_request_summary_.bypass_reason = coordinated_hit.bypass_reason;
                 prefix_request_summary_.admission_placement_epochs =
                     coordinated_hit.placement_epochs;
-                if (owns_mtp_continuation_authority &&
+                if (active_mtp.enabled &&
+                    coordinated_hit.requires_terminal_hidden &&
                     matched_tokens > 0 &&
                     matched_tokens < static_cast<int>(prompt_tokens.size()) &&
-                    !common_hit.has_terminal_hidden)
+                    !coordinated_hit.has_terminal_hidden)
                 {
                     const int block_size =
                         common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
@@ -4163,10 +4092,11 @@ namespace llaminar2
                 }
 
                 if (matched_tokens == static_cast<int>(prompt_tokens.size()) &&
-                    !((!common_hit.requires_terminal_logits ||
-                       common_hit.has_terminal_logits) &&
+                    !((!coordinated_hit.requires_terminal_logits ||
+                       coordinated_hit.has_terminal_logits) &&
                       (!mtp_full_hit_requires_terminal_hidden ||
-                       common_hit.has_terminal_hidden)))
+                       !coordinated_hit.requires_terminal_hidden ||
+                       coordinated_hit.has_terminal_hidden)))
                 {
                     /*
                      * A full prefix hit can serve decode directly only when the
@@ -4192,6 +4122,7 @@ namespace llaminar2
                         (common_hit.requires_terminal_logits &&
                          !common_hit.has_terminal_logits) ||
                         (mtp_full_hit_requires_terminal_hidden &&
+                         common_hit.requires_terminal_hidden &&
                          !common_hit.has_terminal_hidden) ||
                         common_hit.blocks.empty())
                     {
@@ -4203,9 +4134,29 @@ namespace llaminar2
                            terminal_block.total_bytes > terminal_block.layout.totalBytes();
                 };
 
+                bool full_terminal_runtime_restorable =
+                    full_terminal_hit_has_restorable_runtime();
+                if (coordinates_original_pipeline_prefix)
+                {
+                    // A full-hit exemption from stable-window alignment needs
+                    // every original stage's own immutable runtime image. A
+                    // tail image cannot authenticate an upstream stage image.
+                    MPIPrefixCollectiveCoordinator domain_coordinator(
+                        prefix_coordination_comm);
+                    bool all_runtime_restorable = false;
+                    if (!domain_coordinator.allAndBool(
+                            full_terminal_runtime_restorable,
+                            &all_runtime_restorable))
+                    {
+                        return setError(
+                            "Original pipeline prefix runtime restore coordination failed");
+                    }
+                    full_terminal_runtime_restorable = all_runtime_restorable;
+                }
+
                 if (stable_prefix_prefill_segment_tokens > 0 &&
                     matched_tokens % stable_prefix_prefill_segment_tokens != 0 &&
-                    !full_terminal_hit_has_restorable_runtime())
+                    !full_terminal_runtime_restorable)
                 {
                     const int original_matched_tokens = matched_tokens;
                     matched_tokens =
@@ -4219,6 +4170,35 @@ namespace llaminar2
                              << " (stable_block="
                              << stable_prefix_prefill_segment_tokens
                              << "); suffix prefill will recompute the remainder");
+                }
+
+                if (coordinates_original_pipeline_prefix)
+                {
+                    // Lookup already clamped every original stage to one
+                    // frontier. Shared terminal/runtime obligations above and
+                    // the admitted routing-window policy must preserve that
+                    // agreement before any restore or suffix graph is submitted.
+                    MPIPrefixCollectiveCoordinator domain_coordinator(
+                        prefix_coordination_comm);
+                    int common_restore_tokens = 0;
+                    if (!domain_coordinator.allMinInt(
+                            matched_tokens, &common_restore_tokens))
+                    {
+                        return setError(
+                            "Original pipeline prefix restore frontier coordination failed");
+                    }
+                    const bool local_frontier_admitted =
+                        common_restore_tokens >= 0 &&
+                        common_restore_tokens == matched_tokens &&
+                        common_hit.cached_tokens == matched_tokens;
+                    bool all_frontiers_admitted = false;
+                    if (!domain_coordinator.allAndBool(
+                            local_frontier_admitted, &all_frontiers_admitted) ||
+                        !all_frontiers_admitted)
+                    {
+                        return setError(
+                            "Original pipeline prefix restore frontier disagrees with a stage admission");
+                    }
                 }
 
                 if (matched_tokens == 0 && stable_prefix_prefill_segment_tokens > 0)
@@ -4331,8 +4311,7 @@ namespace llaminar2
                         const int suffix_token = prompt_tokens[
                             static_cast<size_t>(suffix_start)];
                         std::string sequence_error;
-                        if (!overlay_prefill_command.beginGraphSequence(
-                                /*draft_depth=*/0,
+                        if (!overlay_prefill_command.beginRestoredPrefixDecodeSequence(
                                 &sequence_error))
                         {
                             return setError(
@@ -4340,7 +4319,9 @@ namespace llaminar2
                                 sequence_error);
                         }
                         const bool suffix_ok =
-                            owns_mtp_continuation_authority
+                            (owns_mtp_continuation_authority ||
+                             (dynamic_cast<GlobalOrchestrator *>(runner_.get()) &&
+                              static_cast<GlobalOrchestrator *>(runner_.get())->originalRankPipelineReady()))
                                 ? runner_->forwardRestoredPrefixMTPDecodeBridge(
                                       {.token_id = suffix_token,
                                        .restored_prefix_tokens =
@@ -4407,6 +4388,7 @@ namespace llaminar2
                 else if ((!common_hit.requires_terminal_logits ||
                           common_hit.has_terminal_logits) &&
                          (!mtp_full_hit_requires_terminal_hidden ||
+                          !common_hit.requires_terminal_hidden ||
                           common_hit.has_terminal_hidden) &&
                          runner_->restorePrefixTerminalState(common_hit))
                 {
@@ -4590,6 +4572,8 @@ namespace llaminar2
     bool OrchestrationRunner::prefillBatch(
         const std::vector<std::vector<int32_t>> &token_batches)
     {
+        if (debugEnv().runtime_debug.mtp_depth_transaction_trace)
+            return setError("MTP depth-transaction trace requires exactly one logical request");
         if (!initialization_lifecycle_.readyForInference())
             return setError("Runner not initialized");
         if (!runner_)
@@ -7081,6 +7065,26 @@ namespace llaminar2
         return batch_result;
     }
 
+    MTPRankParticipation OrchestrationRunner::mtpRankParticipation() const
+    {
+        // The actual installed outer pipeline service owns stage scheduling.
+        // Its follower can also host local expert machinery; that does not make
+        // the original layer stage a vocabulary or dynamic-depth participant.
+        if (const auto *original = dynamic_cast<const GlobalOrchestrator *>(runner_.get()))
+        {
+            if (original->originalRankGenerationFollower())
+                return MTPRankParticipation::OriginalPipelineFollower;
+            if (original->originalRankGenerationSource())
+                return MTPRankParticipation::OriginalPipelineContinuation;
+        }
+        if (moe_overlay_inference_transaction_coordinator_)
+            return MTPRankParticipation::ExpertTransactionContinuation;
+        if (moe_overlay_inference_transaction_follower_)
+            return MTPRankParticipation::ExpertTransactionFollower;
+        return mpi_ctx_ && mpi_ctx_->world_size() > 1 ?
+            MTPRankParticipation::ModelCollectivePeer : MTPRankParticipation::SingleRank;
+    }
+
     bool OrchestrationRunner::shouldUseMTPDecode() const
     {
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
@@ -7113,17 +7117,10 @@ namespace llaminar2
         if (mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy())
         {
-            // The installed coordinator, not the number of MPI ranks or a
-            // requested topology flag, identifies the sole continuation owner.
-            const auto participation = moe_overlay_inference_transaction_coordinator_
-                ? MTPRankParticipation::ExpertTransactionContinuation
-                : moe_overlay_inference_transaction_follower_
-                    ? MTPRankParticipation::ExpertTransactionFollower
-                    : mpi_ctx_ && mpi_ctx_->world_size() > 1
-                        ? MTPRankParticipation::ModelCollectivePeer
-                        : MTPRankParticipation::SingleRank;
+            // Actual original pipeline/expert transaction owners distinguish
+            // layer/expert followers from full-model vocabulary peers.
             if (const auto failure = mtpStochasticVerificationOwnerFailure(
-                    plan_, *runner_, participation); !failure.empty())
+                    plan_, *runner_, mtpRankParticipation()); !failure.empty())
                 return std::string(failure);
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
@@ -7151,13 +7148,11 @@ namespace llaminar2
         }
         /*
          * Generic MPI worlds still need an explicit token-coordination
-         * contract.  Heterogeneous ExpertOverlay is different: the
-         * continuation rank remains the sole token/MTP authority and the
-         * remote rank follows immutable retained-graph tickets, so it neither
-         * samples nor participates in a token collective.
+         * contract. Original pipeline and ExpertOverlay transaction services
+         * retain one continuation token/MTP authority. Followers execute their
+         * immutable retained-graph tickets without a token collective.
          */
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
-            !moe_overlay_inference_transaction_coordinator_ &&
+        if (mtpRankRequiresModelCollectives(mtpRankParticipation()) &&
             !runner_->supportsMTPTokenCoordination())
         {
             return "MTP decode is not enabled for MPI world_size > 1";
@@ -7230,10 +7225,7 @@ namespace llaminar2
          * while tensor data still moves through the graph and collective layers.
          */
         if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
-            mpi_ctx_ &&
-            mpi_ctx_->world_size() > 1 &&
-            !moe_overlay_inference_transaction_coordinator_ &&
-            !moe_overlay_inference_transaction_follower_)
+            mtpRankRequiresModelCollectives(mtpRankParticipation()))
         {
             int32_t coordinated_depth =
                 mpi_ctx_->rank() == mpi_coordinated_root_rank_
@@ -7255,6 +7247,19 @@ namespace llaminar2
         }
 
         return depth;
+    }
+
+    bool OrchestrationRunner::isHostedDynamicMTPContinuation(
+        const MTPRuntimeConfig &mtp) const
+    {
+        return runner_ && runner_->primaryDeviceId().is_gpu() &&
+            mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
+            device_generation_admission_.awaitsAdmission() &&
+            device_generation_admission_.admissionKind() ==
+                sampling_math::DeviceGenerationAdmissionKind::ContinueResponse &&
+            runner_->deviceGenerationExecutionPolicy(
+                DeviceGenerationLoopTopology::DynamicDepth) ==
+                DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
     }
 
     bool OrchestrationRunner::initializeDecodeTransactionPlanningPositionAfterPrefill(
@@ -7352,6 +7357,8 @@ namespace llaminar2
             .initial_leading_row_disposition =
                 initial_leading_row_disposition,
             .sampling_seeds = generation_request_seeds_,
+            .initial_target_counts = DeviceGenerationInitialTargetCounts(
+                std::vector<int>{*decode_transaction_planning_position_}),
         };
         if (!runner_->beginDeviceResidentGeneration(admission))
         {
@@ -7398,6 +7405,10 @@ namespace llaminar2
         }
 
         int maximum_committed_tokens = 0;
+        // These completed-prefill origins include every request's restored
+        // history; no live device counter is copied into admission metadata.
+        std::vector<int> initial_target_counts;
+        initial_target_counts.reserve(static_cast<size_t>(request_count));
         std::vector<uint64_t> position_seeds;
         if (!active_sampling_params_.is_greedy())
             position_seeds.reserve(static_cast<size_t>(request_count));
@@ -7411,6 +7422,7 @@ namespace llaminar2
             }
             maximum_committed_tokens =
                 std::max(maximum_committed_tokens, state.logical_tokens);
+            initial_target_counts.push_back(state.logical_tokens);
             if (!active_sampling_params_.is_greedy())
                 position_seeds.push_back(state.stochastic_position_seed);
         }
@@ -7448,6 +7460,8 @@ namespace llaminar2
                             DeviceGenerationLeadingRowDisposition::
                                 PendingResponse,
                     .sampling_seeds = std::move(sampling_seeds),
+                    .initial_target_counts = DeviceGenerationInitialTargetCounts(
+                        std::move(initial_target_counts)),
                 }))
         {
             return setError(
@@ -7634,21 +7648,29 @@ namespace llaminar2
         int effective_depth,
         int accepted_speculative_prefix,
         bool budget_limited,
-        bool rollback)
+        bool rollback,
+        const MTPPublicationWitness &publication)
     {
         if (!mtp_depth_controller_)
         {
             return;
         }
         const auto before = mtp_depth_controller_->stats();
-        const MTPDepthDecision decision = mtp_depth_controller_->recordStep(
-            MTPDepthObservation{
-                .requested_depth = requested_depth,
-                .effective_depth = effective_depth,
-                .accepted_speculative_prefix = accepted_speculative_prefix,
-                .budget_limited = budget_limited,
-                .rollback = rollback,
-            });
+        const bool trace = debugEnv().runtime_debug.mtp_depth_transaction_trace;
+        const MTPDepthObservation observation{
+            .requested_depth = requested_depth,
+            .effective_depth = effective_depth,
+            .accepted_speculative_prefix = accepted_speculative_prefix,
+            .budget_limited = budget_limited,
+            .rollback = rollback,
+            .newly_emitted_tokens = publication.newlyEmittedTokens(),
+            .publication = publication,
+        };
+        if (trace && mtp_stats_.verifier_runs == 1)
+            publishCPUDepthTransactionTraceInitial(*mtp_depth_controller_,
+                activeMTPRequestConfig().draft_tokens, publication, runner_->primaryDeviceId().toString(),
+                "benchmark_single_request");
+        const MTPDepthDecision decision = mtp_depth_controller_->recordStep(observation);
         const auto after = mtp_depth_controller_->stats();
 
         mtp_stats_.depth_policy_windows += after.windows - before.windows;
@@ -7657,10 +7679,22 @@ namespace llaminar2
         mtp_stats_.depth_policy_demotions += after.demotions - before.demotions;
         mtp_stats_.depth_policy_observe_recommendations +=
             after.observe_recommendations - before.observe_recommendations;
+        mtp_stats_.depth_policy_utility_probes += after.utility_probes - before.utility_probes;
+        mtp_stats_.depth_policy_utility_keeps += after.utility_keeps - before.utility_keeps;
+        mtp_stats_.depth_policy_utility_returns += after.utility_returns - before.utility_returns;
         mtp_stats_.current_depth = mtp_depth_controller_->currentDepth();
         mtp_stats_.min_depth = mtp_depth_controller_->minDepth();
         mtp_stats_.max_depth = mtp_depth_controller_->maxDepth();
 
+        if (trace)
+        {
+            const auto record = makeCPUDepthTransactionTraceRecord(observation, decision,
+                mtp_stats_.verifier_runs, after.windows);
+            // Physical verifier count is the sole ordinal. A benchmark case
+            // owns exactly one fresh measured request before collector reset.
+            publishMTPDepthTransactionRecord(record, static_cast<int>(mtp_stats_.verifier_runs),
+                runner_->primaryDeviceId().toString(), "benchmark_single_request", "cpu_host");
+        }
         if (decision.evaluated)
         {
             PerfStatsCollector::addCounter(
@@ -7830,6 +7864,9 @@ namespace llaminar2
         uint64_t total_depth_windows = 0;
         uint64_t total_depth_updates = 0;
         uint64_t total_depth_promotions = 0;
+        uint64_t total_depth_utility_probes = 0;
+        uint64_t total_depth_utility_keeps = 0;
+        uint64_t total_depth_utility_returns = 0;
         uint64_t total_depth_demotions = 0;
         int final_depth = 0;
 
@@ -7885,6 +7922,9 @@ namespace llaminar2
                 request.depth_promotion_count);
             total_depth_demotions += static_cast<uint64_t>(
                 request.depth_demotion_count);
+            total_depth_utility_returns += static_cast<uint64_t>(request.depth_utility_return_count);
+            total_depth_utility_keeps += static_cast<uint64_t>(request.depth_utility_keep_count);
+            total_depth_utility_probes += static_cast<uint64_t>(request.depth_utility_probe_count);
             final_depth = std::max(final_depth, request.final_draft_depth);
         }
 
@@ -7900,6 +7940,9 @@ namespace llaminar2
         mtp_stats_.depth_policy_updates += total_depth_updates;
         mtp_stats_.depth_policy_promotions += total_depth_promotions;
         mtp_stats_.depth_policy_demotions += total_depth_demotions;
+        mtp_stats_.depth_policy_utility_returns += total_depth_utility_returns;
+        mtp_stats_.depth_policy_utility_keeps += total_depth_utility_keeps;
+        mtp_stats_.depth_policy_utility_probes += total_depth_utility_probes;
         mtp_stats_.current_depth = final_depth;
         if (stochastic)
         {
@@ -7968,7 +8011,7 @@ namespace llaminar2
         DeviceGenerationSamplingMode sampling_mode,
         int transaction_base_cached_tokens,
         int requested_draft_depth,
-        int capture_draft_depth,
+        int initial_transaction_draft_depth,
         GenerationResult result)
     {
         const auto fail = [&](const std::string &message) -> GenerationResult
@@ -7986,8 +8029,6 @@ namespace llaminar2
 
         const char *const sampling_name =
             deviceGenerationSamplingModeName(sampling_mode);
-        const bool stochastic =
-            sampling_mode == DeviceGenerationSamplingMode::Stochastic;
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
         const DeviceGenerationLoopTopology loop_topology =
             mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
@@ -8003,10 +8044,15 @@ namespace llaminar2
                 " MTP has no complete generation-loop execution policy");
         }
 
-        const int parent_draft_depth =
-            publication_request.logicalVerifierRowsPerRequest() - 1;
-        if (parent_draft_depth <= 0 || capture_draft_depth <= 0 ||
-            parent_draft_depth != capture_draft_depth ||
+        const int first_transaction_depth = publication_request.logicalVerifierRowsPerRequest() - 1;
+        const int parent_draft_depth = mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
+            ? effectiveMTPMaxDraftDepth(mtp) : initial_transaction_draft_depth;
+        const bool hosted_exact = execution_policy == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
+        if (first_transaction_depth <= 0 || initial_transaction_draft_depth <= 0 ||
+            first_transaction_depth != initial_transaction_draft_depth ||
+            first_transaction_depth > parent_draft_depth ||
+            (hosted_exact && first_transaction_depth != requested_draft_depth) ||
+            (!hosted_exact && first_transaction_depth != parent_draft_depth) ||
             !runner_->materializeDeviceResidentGeneration(
                 publication_request.requestCount(),
                 parent_draft_depth,
@@ -8024,6 +8070,50 @@ namespace llaminar2
                 std::string("Device-resident ") + sampling_name +
                 " MTP could not launch its device-generation graph");
         }
+
+        return finishScalarDeviceResidentGeneration(
+            sampling_mode, transaction_base_cached_tokens,
+            DeviceGenerationFirstTransaction::External,
+            requested_draft_depth, initial_transaction_draft_depth,
+            std::move(result));
+    }
+
+    GenerationResult OrchestrationRunner::finishScalarDeviceResidentGeneration(
+        DeviceGenerationSamplingMode sampling_mode,
+        int transaction_base_cached_tokens,
+        DeviceGenerationFirstTransaction first_transaction,
+        int requested_draft_depth,
+        int initial_transaction_draft_depth,
+        GenerationResult result)
+    {
+        const auto fail = [&](const std::string &message) -> GenerationResult
+        {
+            result.error = message;
+            return result;
+        };
+        const bool external_first =
+            first_transaction == DeviceGenerationFirstTransaction::External;
+        const bool retained_first =
+            first_transaction == DeviceGenerationFirstTransaction::AdmissionTicket;
+        const MTPRuntimeConfig mtp = activeMTPRequestConfig();
+        const auto execution_policy = runner_->deviceGenerationExecutionPolicy(
+            mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
+                ? DeviceGenerationLoopTopology::DynamicDepth
+                : DeviceGenerationLoopTopology::FixedDepth);
+        if (!isValidDeviceGenerationSamplingMode(sampling_mode) ||
+            !device_generation_admission_.controllerActive() ||
+            (!external_first && !retained_first) ||
+            (external_first && (requested_draft_depth <= 0 ||
+                                initial_transaction_draft_depth <= 0)) ||
+            (retained_first && (requested_draft_depth != 0 ||
+                                initial_transaction_draft_depth != 0 ||
+                mtp.depth_policy.mode != MTPDepthPolicyMode::Dynamic ||
+                execution_policy != DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions)))
+            return fail("Device-resident MTP terminal completion has an invalid first-transaction authority");
+        const char *const sampling_name = deviceGenerationSamplingModeName(sampling_mode);
+        const bool stochastic = sampling_mode == DeviceGenerationSamplingMode::Stochastic;
+        const int parent_draft_depth = mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
+            ? effectiveMTPMaxDraftDepth(mtp) : initial_transaction_draft_depth;
 
         DeviceGenerationTerminalResult terminal;
         if (!runner_->finishDeviceResidentGeneration(&terminal) ||
@@ -8156,8 +8246,8 @@ namespace llaminar2
             request_result.verifier_token_count !=
                 request_result.attempted_draft_token_count +
                     request_result.transaction_count ||
-            mtp_stats_.draft_steps <
-                static_cast<uint64_t>(capture_draft_depth))
+            (external_first && mtp_stats_.draft_steps <
+                static_cast<uint64_t>(initial_transaction_draft_depth)))
         {
             return fail(
                 std::string("Device-resident ") + sampling_name +
@@ -8165,13 +8255,14 @@ namespace llaminar2
         }
 
         /*
-         * Dynamic first-use capture physically warms every capacity slot. Its
-         * host-side setup counter therefore describes graph construction, not
-         * selected work. Replace that setup width with the exact cumulative
-         * widths recorded by the sole device controller.
+         * Only a fresh externally submitted first transaction contributed host
+         * draft submissions. A retained continuation starts from native ticket
+         * zero and contributes no such work to subtract. In both cases the sole
+         * controller's terminal totals account for every useful draft once.
          */
-        mtp_stats_.draft_steps -=
-            static_cast<uint64_t>(capture_draft_depth);
+        if (external_first)
+            mtp_stats_.draft_steps -=
+                static_cast<uint64_t>(initial_transaction_draft_depth);
         mtp_stats_.draft_steps += static_cast<uint64_t>(
             request_result.attempted_draft_token_count);
         mtp_stats_.verifier_runs += transactions;
@@ -8200,6 +8291,9 @@ namespace llaminar2
             request_result.depth_promotion_count);
         mtp_stats_.depth_policy_demotions += static_cast<uint64_t>(
             request_result.depth_demotion_count);
+        mtp_stats_.depth_policy_utility_returns += static_cast<uint64_t>(request_result.depth_utility_return_count);
+        mtp_stats_.depth_policy_utility_keeps += static_cast<uint64_t>(request_result.depth_utility_keep_count);
+        mtp_stats_.depth_policy_utility_probes += static_cast<uint64_t>(request_result.depth_utility_probe_count);
         mtp_stats_.current_depth = request_result.final_draft_depth;
         if (!device_generation_admission_.retireController(
                 request_result.model_stopped))
@@ -8209,13 +8303,13 @@ namespace llaminar2
                 " MTP could not retire its controller into the next explicit request phase");
         }
 
-        const PerfStatsCollector::Tags terminal_tags{
+        PerfStatsCollector::Tags terminal_tags{
             {"path", "device_resident_generation_loop"},
             {"execution_policy",
              deviceGenerationExecutionPolicyName(execution_policy)},
             {"sampling", sampling_name},
-            {"depth", std::to_string(requested_draft_depth)},
-            {"capture_depth", std::to_string(capture_draft_depth)},
+            {"first_transaction_source", external_first ? "external" : "admission_ticket"},
+            {"capture_depth", std::to_string(parent_draft_depth)},
             {"final_depth",
              std::to_string(request_result.final_draft_depth)},
             {"depth_evaluated_windows",
@@ -8226,10 +8320,22 @@ namespace llaminar2
              std::to_string(request_result.depth_promotion_count)},
             {"depth_demotions",
              std::to_string(request_result.depth_demotion_count)},
+            {"depth_policy_utility_returns", std::to_string(request_result.depth_utility_return_count)},
+            {"depth_policy_utility_keeps", std::to_string(request_result.depth_utility_keep_count)},
+            {"depth_policy_utility_probes", std::to_string(request_result.depth_utility_probe_count)},
             {"transactions",
              std::to_string(request_result.transaction_count)},
             {"state_commits",
              std::to_string(request_result.published_state_commit_count)}};
+        if (external_first)
+        {
+            terminal_tags.emplace("depth", std::to_string(requested_draft_depth));
+            terminal_tags.emplace("initial_transaction_depth", std::to_string(initial_transaction_draft_depth));
+        }
+        if (retained_first)
+            PerfStatsCollector::addCounter(
+                "mtp", "device_generation_retained_continuation_requests", 1.0,
+                "decode", {}, terminal_tags);
         PerfStatsCollector::addCounter(
             "mtp",
             "device_resident_generation_requests",
@@ -8267,23 +8373,19 @@ namespace llaminar2
             stochastic
                 ? "grouped_decode_equivalent_stochastic"
                 : "grouped_decode_equivalent_greedy";
+        PerfStatsCollector::Tags grouped_tags{
+            {"execution", deviceGenerationExecutionPolicyName(execution_policy)},
+            {"sampling", sampling_name},
+            {"first_transaction_source", external_first ? "external" : "admission_ticket"},
+            {"verifier_forward_tokens", std::to_string(request_result.verifier_token_count)},
+            {"replay_forward_tokens", "0"},
+            {"accepted_tokens", std::to_string(accepted)},
+            {"state_publication", "device_resident"}};
+        if (external_first)
+            grouped_tags.emplace("verifier_rows", std::to_string(initial_transaction_draft_depth + 1));
         PerfStatsCollector::addCounter(
-            "mtp",
-            grouped_route_counter,
-            static_cast<double>(transactions),
-            "decode",
-            {},
-            {{"execution",
-              deviceGenerationExecutionPolicyName(execution_policy)},
-             {"sampling", sampling_name},
-             {"verifier_forward_tokens",
-              std::to_string(request_result.verifier_token_count)},
-             {"verifier_rows",
-              std::to_string(
-                  publication_request.logicalVerifierRowsPerRequest())},
-             {"replay_forward_tokens", "0"},
-             {"accepted_tokens", std::to_string(accepted)},
-             {"state_publication", "device_resident"}});
+            "mtp", grouped_route_counter, static_cast<double>(transactions),
+            "decode", {}, grouped_tags);
 
         if (stochastic)
         {
@@ -8567,9 +8669,7 @@ namespace llaminar2
         };
 
         const bool needs_mpi_mtp_boundary_fence =
-            mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
-            !moe_overlay_inference_transaction_coordinator_ &&
-            !moe_overlay_inference_transaction_follower_;
+            mtpRankRequiresModelCollectives(mtpRankParticipation());
         auto fence_mpi_mtp_boundary =
             [&](const char *boundary) -> std::optional<std::string>
         {
@@ -8691,7 +8791,7 @@ namespace llaminar2
                 "GPU MTP requires device-resident sidecar stream handoff");
         }
         const MTPDepthPolicyModelClass verifier_model_class =
-            inferMTPDepthPolicyModelClass(model_ctx_);
+            resolveMTPDepthPolicyModelClass(model_ctx_.get());
         const int verifier_policy_probe_rows =
             std::max(1, effectiveMTPMaxDraftDepth(mtp));
         const MTPVerifierPolicyDecision verifier_policy =
@@ -8834,9 +8934,16 @@ namespace llaminar2
         // Seal the transaction width before checkpointing or mutating caches.
         // Graph capacity, admitted drafts, and response publication are distinct:
         // use this same admitted width below instead of resolving it twice.
-        const int requested_speculative_draft_count = currentMTPDraftDepth(mtp);
-        const int transaction_draft_capacity =
-            materialize_dynamic_generation_loop_this_step
+        const bool hosted_dynamic_continuation = isHostedDynamicMTPContinuation(mtp);
+        const int requested_speculative_draft_count = hosted_dynamic_continuation
+            ? 0 : currentMTPDraftDepth(mtp);
+        // Capacity here admits the response/first scalar only. A continuation's
+        // actual model geometry comes exclusively from native admission ticket
+        // zero, after initialization preserves the device-owned learner.
+        const int transaction_draft_capacity = hosted_dynamic_continuation
+            ? effectiveMTPMaxDraftDepth(mtp)
+            : materialize_dynamic_generation_loop_this_step &&
+                    generation_execution_policy == DeviceGenerationExecutionPolicy::NativeConditionalGraph
                 ? effectiveMTPMaxDraftDepth(mtp)
                 : requested_speculative_draft_count;
         if (transaction_draft_capacity < requested_speculative_draft_count)
@@ -8948,23 +9055,32 @@ namespace llaminar2
          * so a token-count-only logical checkpoint is not a valid base for this
          * lane even though the accepted-state publication itself is resident.
          */
+        if (hosted_dynamic_continuation &&
+            (verify_sidecar_preserves_main_state || verify_commit_replay_check))
+            return fail_without_checkpoint(
+                "Hosted dynamic MTP continuation does not support host checkpoint/replay diagnostics");
+        // The retained family commits accepted state atomically. There is no
+        // external first verifier to snapshot, and admitted capacity is never
+        // used as a snapshot copy or communication extent on this path.
         const bool use_device_publication_without_rollback_checkpoint =
-            use_grouped_outcome_device_resident_publication_verifier &&
+            hosted_dynamic_continuation ||
+            (use_grouped_outcome_device_resident_publication_verifier &&
             (!stochastic_verify || stochastic_device_verify) &&
             runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsDeviceResidentMTPSpecStatePublication() &&
             runner_->supportsMTPSidecarPreservesMainState() &&
             !grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint &&
             !verify_sidecar_preserves_main_state &&
-            !verify_commit_replay_check;
+            !verify_commit_replay_check);
         const bool can_synthesize_verifier_base_checkpoint =
-            use_grouped_outcome_device_resident_publication_verifier &&
+            hosted_dynamic_continuation ||
+            (use_grouped_outcome_device_resident_publication_verifier &&
             runner_->supportsMTPSidecarPreservesMainState() &&
             (runner_->supportsLogicalMTPVerifierBaseCheckpoint() ||
              use_device_publication_without_rollback_checkpoint) &&
             !grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint &&
             !verify_sidecar_preserves_main_state &&
-            !verify_commit_replay_check;
+            !verify_commit_replay_check);
 
         if (use_device_publication_without_rollback_checkpoint)
         {
@@ -8978,7 +9094,7 @@ namespace llaminar2
 
             transaction_base_cached_tokens = *base_position;
             verifier_base_checkpoint =
-                makeLogicalMTPVerifierBaseSnapshot(transaction_base_cached_tokens);
+                makeLogicalMTPVerifierBaseSnapshot(transaction_base_cached_tokens,architecture()=="qwen4exp" ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly);
             PerfStatsCollector::addCounterWithSequence(
                 "mtp",
                 "live_prefix_checkpoint_skipped_direct_publication",
@@ -9110,7 +9226,8 @@ namespace llaminar2
                 base.cached_tokens + state_advanced_tokens;
             committed_stamp.main_kv_tokens = committed_stamp.logical_tokens;
             committed_stamp.shifted_mtp_kv_tokens =
-                expectedShiftedMTPTokens(committed_stamp.logical_tokens);
+                expectedShiftedMTPTokens(committed_stamp.logical_tokens,base.mtp_shifted_origin);
+            committed_stamp.shifted_origin=base.mtp_shifted_origin;
             committed_stamp.position = committed_stamp.logical_tokens;
             committed_stamp.has_terminal_hidden = true;
             committed_stamp.has_terminal_logits = has_terminal_logits;
@@ -9705,7 +9822,7 @@ namespace llaminar2
                 if (!verifier_base_position)
                     return fail_after_checkpoint(position_error);
                 verifier_base_checkpoint =
-                    makeLogicalMTPVerifierBaseSnapshot(*verifier_base_position);
+                    makeLogicalMTPVerifierBaseSnapshot(*verifier_base_position,architecture()=="qwen4exp" ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly);
                 PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "capture_verifier_base_prefix_state_skipped_all_position_publication",
@@ -9766,31 +9883,35 @@ namespace llaminar2
          * separately by verifier counters, so this record cannot certify a
          * transaction that selected a depth and then failed before execution.
          */
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "decode_transaction_depth_selections",
-            1.0,
-            "decode",
-            runner_->primaryDeviceId().toString(),
-            {{"depth_policy",
-              mtpDepthPolicyModeToString(mtp.depth_policy.mode)},
-             {"requested_depth",
-              std::to_string(requested_speculative_draft_count)},
-             {"capture_depth",
-              std::to_string(transaction_draft_capacity)}});
-        if (materialize_dynamic_generation_loop_this_step)
+        if (!hosted_dynamic_continuation)
         {
             PerfStatsCollector::addCounter(
                 "mtp",
-                "dynamic_device_generation_capacity_capture_transactions",
+                "decode_transaction_depth_selections",
                 1.0,
-                "graph_setup",
-                {},
-                {{"selected_depth",
+                "decode",
+                runner_->primaryDeviceId().toString(),
+                {{"depth_policy",
+                  mtpDepthPolicyModeToString(mtp.depth_policy.mode)},
+                 {"requested_depth",
                   std::to_string(requested_speculative_draft_count)},
                  {"capture_depth",
-                  std::to_string(transaction_draft_capacity)},
-                 {"authority", "device_generation_controller"}});
+                  std::to_string(transaction_draft_capacity)}});
+            if (materialize_dynamic_generation_loop_this_step)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "dynamic_device_generation_capacity_capture_transactions",
+                    1.0,
+                    "graph_setup",
+                    {},
+                    {{"selected_depth",
+                      std::to_string(requested_speculative_draft_count)},
+                     {"capture_depth",
+                      std::to_string(effectiveMTPMaxDraftDepth(mtp))},
+                     {"initial_transaction_depth", std::to_string(transaction_draft_capacity)},
+                     {"authority", "device_generation_controller"}});
+            }
         }
         /*
          * Admit only a transaction that can actually reach grouped verification.
@@ -9878,6 +9999,12 @@ namespace llaminar2
              * vectors; every production sidecar/verifier consumer below reads
              * the authenticated device sources.
              */
+            if (hosted_dynamic_continuation &&
+                !runner_->publishDeviceResidentConditionTokenToTargetSampleSlot(
+                    *ready_condition->resident_state,
+                    /*request_index=*/0, /*target_sample_slot=*/0))
+                return fail_after_checkpoint(
+                    "Hosted dynamic MTP continuation could not stage its resident condition in the canonical target slot");
             first_token = kDeferredMTPFirstTokenShadow;
             first_token_device_target_slot_available = true;
             PerfStatsCollector::addCounterWithSequence(
@@ -10298,6 +10425,28 @@ namespace llaminar2
             }
         }
 
+        // The compact grouped publisher owns its own history. These direct
+        // outputs have no compact outcome, so publish the original resident
+        // scalar once before returning it. A carried token explicitly takes
+        // the no-write disposition; no response shadow is uploaded or used.
+        const auto publish_direct_output_history = [&]() -> bool
+        {
+            if (!runner_->primaryDeviceId().is_gpu()) return true;
+            if (first_token_is_already_emitted_condition)
+                return runner_->publishMTPDirectTokenHistory(0,
+                    MTPDirectTokenHistoryDisposition::AlreadyPublished);
+            if (!first_token_device_target_slot_available)
+            {
+                if (!first_token_resident_state.has_value() ||
+                    !runner_->publishDeviceResidentConditionTokenToTargetSampleSlot(
+                        *first_token_resident_state, 0, 0))
+                    return false;
+                first_token_device_target_slot_available = true;
+            }
+            return runner_->publishMTPDirectTokenHistory(0,
+                MTPDirectTokenHistoryDisposition::NewlyEmitted);
+        };
+
         if (speculative_draft_count == 0)
         {
             PerfStatsCollector::addCounter("mtp", "budget_limited_direct_emits", 1.0, "decode");
@@ -10337,6 +10486,8 @@ namespace llaminar2
 
             const bool first_token_is_stop =
                 std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end();
+            if (!publish_direct_output_history())
+                return fail_after_checkpoint("Direct MTP output could not publish its original device-token history");
             if (!first_token_is_stop)
             {
                 if (auto sequence_error = begin_overlay_graph_sequence(
@@ -10353,13 +10504,11 @@ namespace llaminar2
                  * head, so the precondition must be anchored to the snapshot
                  * that owns the terminal hidden row we are about to publish.
                  *
-                 * snapshotShiftedMTPTokens() returns the shifted sidecar count
-                 * represented by that checkpoint.  The sequential shifted-row
-                 * committer expects position_offset - 1 rows to be resident
-                 * when already_appended_tokens is zero, hence the +1 below.
+                 * CPU coordinates derive from the checkpoint's model-owned
+                 * origin: QFN includes token zero, while successor-only caches
+                 * omit it. GPU publication continues to consume only its
+                 * device-owned token/position transaction below.
                  */
-                const int base_sidecar_position =
-                    snapshotShiftedMTPTokens(verifier_base_checkpoint) + 1;
                 bool shifted_commit_ok = false;
                 {
                     PerfStatsCollector::ScopedTimer timer(
@@ -10376,7 +10525,8 @@ namespace llaminar2
                          * one-shot mailbox. This is an event-ordered
                          * D2D handoff; the host scalar is never uploaded.
                          */
-                        if (first_token_resident_state.has_value())
+                        if (first_token_resident_state.has_value() &&
+                            !first_token_device_target_slot_available)
                         {
                             if (!runner_
                                      ->publishDeviceResidentConditionTokenToTargetSampleSlot(
@@ -10421,6 +10571,9 @@ namespace llaminar2
                     }
                     else
                     {
+                        const int base_sidecar_position = mtpShiftedAppendPosition(
+                            snapshotShiftedMTPTokens(verifier_base_checkpoint),
+                            verifier_base_checkpoint.mtp_shifted_origin);
                         shifted_commit_ok =
                             runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
                                 first_token,
@@ -10514,6 +10667,43 @@ namespace llaminar2
             return result;
         }
 
+        if (hosted_dynamic_continuation)
+        {
+            const auto mode = stochastic_verify
+                ? DeviceGenerationSamplingMode::Stochastic
+                : DeviceGenerationSamplingMode::Greedy;
+            // The first target scalar above is device-owned in both cases:
+            // a carried resident condition or a new sample from ready logits.
+            // Preparation binds that source to the retained Full sidecar and
+            // authenticates the original native admission ticket (transaction
+            // zero). Only its selector may submit the first complete branch.
+            if (!first_token_device_target_slot_available)
+            {
+                // A pending correction may still be owned only by its exact
+                // event-published resident handle. Stage that scalar once; a
+                // host token shadow is never an admitted execution source.
+                if (!first_token_resident_state.has_value() ||
+                    !first_token_resident_state->coversRequest(0) ||
+                    !runner_->publishDeviceResidentConditionTokenToTargetSampleSlot(
+                        *first_token_resident_state,
+                        /*request_index=*/0, /*target_sample_slot=*/0))
+                    return fail_after_checkpoint(
+                        "Hosted dynamic MTP continuation has no device-owned first target scalar");
+                first_token_device_target_slot_available = true;
+            }
+            if (!runner_->prepareDeviceResidentGenerationContinuation(mode) ||
+                !runner_->launchDeviceResidentGeneration())
+                return fail_after_checkpoint(
+                    "Hosted dynamic MTP continuation could not launch its admission-ticket-selected retained family");
+            GenerationResult resident_result = finishScalarDeviceResidentGeneration(
+                mode, transaction_base_cached_tokens,
+                DeviceGenerationFirstTransaction::AdmissionTicket,
+                0, 0, std::move(result));
+            if (!resident_result.success())
+                return fail_after_checkpoint(resident_result.error);
+            return resident_result;
+        }
+
         std::optional<PrefixStateSnapshot> verifier_replay_base_checkpoint;
         if (verify_commit_replay_check)
         {
@@ -10560,6 +10750,8 @@ namespace llaminar2
                 "output_tokens",
                 1.0,
                 "decode");
+            if (!publish_direct_output_history())
+                return fail_after_checkpoint("Sampled MTP stop could not publish its original device-token history");
             if (auto commit_error = commit_mtp_transaction_outputs(
                     "first_token_stop_direct",
                     verifier_base_checkpoint,
@@ -10707,7 +10899,11 @@ namespace llaminar2
                 return token;
             }
 
-            if (use_sampling_penalties)
+            // Resident greedy slots publish through the captured stage that
+            // applies this branch policy before argmax. A separate transform
+            // here would double-penalize the first transaction, while its later
+            // retained parents see only the captured publication stage.
+            if (use_sampling_penalties && !use_greedy_device_draft_slots)
             {
                 const bool penalty_ok =
                     runner_->primaryDeviceId().is_gpu()
@@ -11649,6 +11845,7 @@ namespace llaminar2
                         gdn += ",";
                     const auto &layer = probe.gdn_layers[i];
                     gdn += "L" + std::to_string(layer.global_layer) +
+                           gdnDiagnosticStorageSuffix(layer) +
                            "/r=" + std::to_string(layer.recurrence_hash) +
                            "/c=" + std::to_string(layer.conv_hash);
                     if (layer.device_state_hash_available)
@@ -11769,6 +11966,9 @@ namespace llaminar2
                         b.device_state_hash_available;
                     const bool mismatch =
                         a.global_layer != b.global_layer ||
+                        a.recurrence_layout != b.recurrence_layout ||
+                        a.recurrence_storage != b.recurrence_storage ||
+                        a.recurrence_epoch_phase_words != b.recurrence_epoch_phase_words ||
                         (both_have_device_state
                              ? (a.recurrence_device_bytes != b.recurrence_device_bytes ||
                                 a.conv_device_bytes != b.conv_device_bytes ||
@@ -11782,31 +11982,25 @@ namespace llaminar2
                     if (mismatch)
                     {
                         std::ostringstream oss;
-                        oss << "layer=" << a.global_layer
-                            << " " << lhs_name << "_rec="
-                            << a.recurrence_hash
-                            << " " << rhs_name << "_rec="
-                            << b.recurrence_hash
-                            << " " << lhs_name << "_conv="
-                            << a.conv_hash
-                            << " " << rhs_name << "_conv="
-                            << b.conv_hash
-                            << " " << lhs_name << "_dev_rec="
-                            << a.recurrence_device_hash
-                            << " " << rhs_name << "_dev_rec="
-                            << b.recurrence_device_hash
-                            << " " << lhs_name << "_dev_conv="
-                            << a.conv_device_hash
-                            << " " << rhs_name << "_dev_conv="
-                            << b.conv_device_hash
-                            << " " << lhs_name << "_rec_zero="
-                            << (a.recurrence_all_zero ? "true" : "false")
-                            << " " << rhs_name << "_rec_zero="
-                            << (b.recurrence_all_zero ? "true" : "false")
-                            << " " << lhs_name << "_conv_zero="
-                            << (a.conv_all_zero ? "true" : "false")
-                            << " " << rhs_name << "_conv_zero="
-                            << (b.conv_all_zero ? "true" : "false");
+                        oss << "layer=" << a.global_layer << " " << lhs_name
+                            << "_layout=" << gdnRecurrenceStateLayoutName(a.recurrence_layout)
+                            << gdnDiagnosticStorageSuffix(a)
+                            << " " << rhs_name
+                            << "_layout=" << gdnRecurrenceStateLayoutName(b.recurrence_layout)
+                            << gdnDiagnosticStorageSuffix(b)
+                            << " " << lhs_name << "_rec=" << a.recurrence_hash << " " << rhs_name
+                            << "_rec=" << b.recurrence_hash << " " << lhs_name
+                            << "_conv=" << a.conv_hash << " " << rhs_name << "_conv=" << b.conv_hash
+                            << " " << lhs_name << "_dev_rec=" << a.recurrence_device_hash << " "
+                            << rhs_name << "_dev_rec=" << b.recurrence_device_hash << " "
+                            << lhs_name << "_dev_conv=" << a.conv_device_hash << " " << rhs_name
+                            << "_dev_conv=" << b.conv_device_hash << " " << lhs_name
+                            << "_rec_zero=" << (a.recurrence_all_zero ? "true" : "false") << " "
+                            << rhs_name
+                            << "_rec_zero=" << (b.recurrence_all_zero ? "true" : "false") << " "
+                            << lhs_name << "_conv_zero=" << (a.conv_all_zero ? "true" : "false")
+                            << " " << rhs_name
+                            << "_conv_zero=" << (b.conv_all_zero ? "true" : "false");
                         return oss.str();
                     }
                 }
@@ -11905,7 +12099,8 @@ namespace llaminar2
                 const MTPShiftedReplayRowPlan shifted_plan =
                     planMTPShiftedReplayRow(
                         cache_counts.main,
-                        cache_counts.shifted);
+                        cache_counts.shifted,
+                        architecture()=="qwen4exp" ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly);
                 if (!shifted_plan)
                 {
                     continuation_failure_detail =
@@ -13303,8 +13498,11 @@ namespace llaminar2
                      * reusable sidecars own one skipped shifted row; restored
                      * MoE/TP verifier-base paths own zero skipped verifier
                      * rows and must be anchored to the verifier-base cached
-                     * token count so the pre-commit expectation is
-                     * `verifier_base - 1`.
+                     * token count. The DGO projects that absolute condition
+                     * position using its cache's immutable model origin:
+                     * ordinary pre-commit is max(0,verifier_base-1), while
+                     * QFN retains its visible position-zero seed and expects
+                     * verifier_base before any additional resident rows.
                      */
                     const int shifted_commit_position_offset =
                         first_shifted_row_available_from_sidecar
@@ -13356,7 +13554,8 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"request_count", std::to_string(step_plans.request_count)},
-                     {"accepted_state_count", std::to_string(accepted_state_count)}});
+                     {"accepted_state_count", std::to_string(accepted_state_count)},
+                     {"stopped_on_output", catchup.stopped_on_output ? "true" : "false"}});
             }
 
             int correction_forward_count = 0;
@@ -13571,13 +13770,6 @@ namespace llaminar2
                      {"state_publication", "grouped_host"}});
             }
 
-            recordMTPDepthObservation(
-                requested_speculative_draft_count,
-                speculative_draft_count,
-                accepted_speculative_prefix,
-                draft_count_budget_limited,
-                /*rollback=*/false);
-
             if (!all_speculative_accepted && !commit_boundary_clipped)
             {
                 ++mtp_stats_.rejected_tokens;
@@ -13599,11 +13791,6 @@ namespace llaminar2
                     accepted_speculative_prefix > 0 ? 1.0 : 0.0,
                     "decode");
             }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "output_tokens",
-                static_cast<double>(newly_emitted_token_count),
-                "decode");
             PerfStatsCollector::addCounter(
                 "mtp",
                 "acceptance_trace",
@@ -13665,6 +13852,11 @@ namespace llaminar2
                     return fail_after_checkpoint(*mismatch);
                 }
             }
+            // Validate the actual publication counts before committing output.
+            MTPPublicationWitness publication;
+            if (!MTPPublicationWitness::fromCounts(static_cast<int>(accepted_tokens.size()),
+                    emitted_token_start_index, accepted_state_count, stopped_on_output, &publication))
+                return fail_after_checkpoint("Host MTP committed publication witness is outside its one-row debt contract");
             if (auto commit_error = commit_mtp_transaction_outputs(
                     "grouped_decode_equivalent_host_verifier",
                     verifier_base_checkpoint,
@@ -13684,6 +13876,20 @@ namespace llaminar2
             {
                 return fail_after_checkpoint(*commit_error);
             }
+
+            // Main-state publication and response output commit both succeeded.
+            // The same source counts author the learner and diagnostic; no
+            // acceptance/rollback arithmetic invents either publication debt.
+            recordMTPDepthObservation(
+                requested_speculative_draft_count, speculative_draft_count, accepted_speculative_prefix,
+                draft_count_budget_limited, /*rollback=*/false, publication);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "output_tokens",
+                static_cast<double>(newly_emitted_token_count),
+                "decode",
+                {},
+                {{"source", "committed_host_mtp_transaction"}});
 
             return result;
         }
@@ -14734,6 +14940,7 @@ namespace llaminar2
             .initial_leading_row_disposition = leading,
             .sampling_seeds = generation_request_seeds_,
             .ordinary_sampling = active_sampling_params_,
+            .initial_target_counts = DeviceGenerationInitialTargetCounts(std::vector<int>{base}),
         };
         if (!admission.valid())
             return fail("sampling law is not implemented by the captured ordinary sampler (bounded top-k and presence/frequency penalties are supported; DRY is not)");
@@ -14802,6 +15009,14 @@ namespace llaminar2
     {
         GenerationResult result;
 
+        if (debugEnv().runtime_debug.mtp_depth_transaction_trace &&
+            (decode_step_token_budget_ <= 0 ||
+             decode_step_token_budget_ > sampling_math::kMTPDepthTransactionTraceCapacity))
+        {
+            result.error = "MTP depth-transaction trace requires an explicit remaining token budget1..256";
+            return result;
+        }
+
         if (!initialization_lifecycle_.readyForInference())
         {
             result.error = "Runner not initialized";
@@ -14824,9 +15039,14 @@ namespace llaminar2
             mpi_root_command,
             "DECODE_STEP",
             &result.error);
+        ensureFiniteDevicePlacementArmed();
         ScopedMoEOverlayRootCommand overlay_decode_command(
             moe_overlay_inference_transaction_coordinator_);
 
+        // Keep the diagnostic catch inside both command guards. Catching after
+        // their destruction is too late: a live MPI world has already aborted.
+        try
+        {
         const std::uint64_t retired_prefill_tokens =
             moe_overlay_pending_prefill_progress_tokens_.exchange(
                 0u, std::memory_order_acq_rel);
@@ -14893,7 +15113,8 @@ namespace llaminar2
 
         if (overlay_decode_command.active())
         {
-            if (!mpi_root_command ||
+            const auto command_context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!command_context ||
                 moe_overlay_collective_generation_id_ == 0 ||
                 !moe_expert_overlay_residency_authority_)
             {
@@ -14916,11 +15137,13 @@ namespace llaminar2
                     moe_overlay_collective_generation_id_,
                 .command_id =
                     ++moe_overlay_inference_command_sequence_,
+                // Initial admitted lower bound only: mapped device packet kernels
+                // authenticate their actual current placement ticket and bank.
                 .initial_placement_epoch = snapshot->epoch,
             };
             std::string command_error;
             if (!overlay_decode_command.begin(
-                    command_identity, &command_error))
+                    command_context->rank(), command_identity, &command_error))
             {
                 result.error =
                     "ExpertOverlay remote decode command admission failed: " +
@@ -14928,6 +15151,73 @@ namespace llaminar2
                 return result;
             }
         }
+
+        auto *const original_global = dynamic_cast<GlobalOrchestrator *>(runner_.get());
+        if (original_global && original_global->originalRankGenerationFollower())
+        {
+            // This original stage process has no sampler/outcome authority.
+            // The actual tail publishes immutable scheduling identities; local
+            // model/KV/publication work stays in its original DGO graphs.
+            GlobalOrchestrator::OriginalRankGenerationTerminal terminal;
+            if (!original_global->serviceOriginalRankGenerationCommand(&terminal, &result.error))
+            {
+                original_global->abortOriginalRankGenerationCommand();
+                if (result.error.empty()) result.error = "Original rank generation follower failed";
+                return result;
+            }
+            if (!decode_transaction_planning_position_ ||
+                *decode_transaction_planning_position_ != terminal.admission_base ||
+                !sampling_math::valid_device_generation_leading_row_disposition(terminal.next_leading_row_disposition) ||
+                !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
+                    terminal.published_state_commit_count, "original_rank_generation_terminal"))
+            {
+                result.error = "Original rank generation terminal differs from its admitted scheduler boundary";
+                return result;
+            }
+            // Keep only completed scheduler/accounting observations. No source
+            // outcome or remote logical-state handle becomes execution input.
+            ready_mtp_condition_.reset();
+            pending_mtp_condition_token_.reset();
+            pending_mtp_condition_params_.reset();
+            pending_mtp_condition_resident_state_.reset();
+            prefill_logits_ready_ = !terminal.model_stopped;
+            result.is_complete = terminal.model_stopped;
+            decode_command_failure_abort.markCompleted();
+            return result;
+        }
+        /** @brief Cancel original directed transport before the outer MPI failure guard can abort the world. */
+        struct OriginalRankCommandGuard
+        {
+            GlobalOrchestrator *owner = nullptr; ///< Real source only; no remote runner alias.
+            bool completed = false; ///< True only after actual terminal publication.
+            /** @brief Keep failed original admissions absorbing while their native owners remain alive. */
+            ~OriginalRankCommandGuard() { if (owner && !completed) owner->abortOriginalRankGenerationCommand(); }
+            /** @brief Complete using actual terminal ledger and its original leading-row disposition. */
+            bool finish(bool stopped, sampling_math::DeviceGenerationLeadingRowDisposition leading)
+            {
+                if (!owner) return true;
+                completed = owner->completeOriginalRankGenerationCommand(stopped, leading);
+                return completed;
+            }
+        } original_command{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
+        if (original_command.owner)
+        {
+            if (!decode_transaction_planning_position_ ||
+                moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
+                !original_command.owner->beginOriginalRankGenerationCommand(
+                    original_command.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
+                    *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                        DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic))
+            {
+                result.error = "Original rank generation source could not admit its exact request/command/placement identity";
+                return result;
+            }
+        }
+        const auto terminal_leading = [&] {
+            return ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+                sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
+                sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+        };
 
         const bool mpi_worker_rank =
             mpi_coordinated_world &&
@@ -14947,8 +15237,27 @@ namespace llaminar2
                      << " position=" << trace_position("trace_decode_step_begin"));
         }
 
+        std::optional<HostSparseQueryResponseScope> query_response_scope;
+        try
+        {
+            query_response_scope.emplace(*runner_, host_sparse_query_admission_,
+                hostSparseQueryAdmission(decode_step_token_budget_));
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = result.error = error.what();
+            return result;
+        }
+
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
-        if (!mtp.enabled && runner_->primaryDeviceId().is_gpu())
+        // A heterogeneous hosted pipeline has one tail-owned sampler across
+        // the original MPI ranks. Its GPU follower's local primary device is
+        // not generation authority: all ranks must enter the declared hosted
+        // forward/sampling protocol together. Complete GPU pipelines instead
+        // retain their original captured generation service on every rank.
+        const bool hosted_pipeline_generation = original_global &&
+            !original_global->requiresOriginalRankGPUTransport();
+        if (!mtp.enabled && runner_->primaryDeviceId().is_gpu() && !hosted_pipeline_generation)
         {
             result = decodeOrdinaryDeviceResidentGeneration();
             if (result.success())
@@ -14956,6 +15265,8 @@ namespace llaminar2
                 std::string error;
                 if (!overlay_decode_command.complete(&error))
                     result.error = "Ordinary generation command completion failed: " + error;
+                else if (!original_command.finish(result.is_complete, terminal_leading()))
+                    result.error = "Original rank ordinary generation command could not retire its actual terminal";
                 else
                     decode_command_failure_abort.markCompleted();
             }
@@ -14981,23 +15292,30 @@ namespace llaminar2
                                        : last_error_;
                     return result;
                 }
-                const int selected_draft_depth =
-                    currentMTPDraftDepth(mtp);
-                if (selected_draft_depth > 0)
+                const bool retained_continuation = isHostedDynamicMTPContinuation(mtp);
+                const int selected_draft_depth = retained_continuation
+                    ? 0 : currentMTPDraftDepth(mtp);
+                if (retained_continuation || selected_draft_depth > 0)
                 {
                     const std::uint64_t verifier_runs_before =
                         mtp_stats_.verifier_runs;
-                    MoEOverlayInferenceInterferenceScope interference_scope(
-                        moe_expert_overlay_interference_probe_.get(),
-                        makeMoEOverlayInferenceWorkloadIdentity(
-                            ExpertHistogramSource::GroupedVerifier,
-                            selected_draft_depth + 1,
-                            effectiveMTPMaxDraftDepth(mtp) + 1,
-                            1,
-                            selected_draft_depth));
+                    std::optional<MoEOverlayInferenceInterferenceScope> interference_scope;
+                    // A continuation may select several widths on device, so
+                    // this fixed-shape calibration scope cannot describe it.
+                    // Native branch PerfStats retain the actual geometry; the
+                    // dormant host selector must not label the whole response.
+                    if (!retained_continuation)
+                        interference_scope.emplace(
+                            moe_expert_overlay_interference_probe_.get(),
+                            makeMoEOverlayInferenceWorkloadIdentity(
+                                ExpertHistogramSource::GroupedVerifier,
+                                selected_draft_depth + 1,
+                                effectiveMTPMaxDraftDepth(mtp) + 1,
+                                1,
+                                selected_draft_depth));
                     GenerationResult mtp_result = decodeStepMTP();
-                    if (mtp_stats_.verifier_runs == verifier_runs_before)
-                        interference_scope.discard();
+                    if (interference_scope && mtp_stats_.verifier_runs == verifier_runs_before)
+                        interference_scope->discard();
                     if (!mtp_result.success())
                     {
                         /*
@@ -15021,10 +15339,14 @@ namespace llaminar2
                             mtp_result.error =
                                 "ExpertOverlay MTP command completion failed: " +
                                 command_error;
+                            LOG_ERROR("[OrchestrationRunner] " << mtp_result.error);
                             result = std::move(mtp_result);
                             return result;
                         }
-                        decode_command_failure_abort.markCompleted();
+                        if (!original_command.finish(mtp_result.is_complete, terminal_leading()))
+                            mtp_result.error = "Original rank MTP generation command could not retire its actual terminal";
+                        else
+                            decode_command_failure_abort.markCompleted();
                     }
                     result = std::move(mtp_result);
                     return result;
@@ -15475,14 +15797,38 @@ namespace llaminar2
                 overlay_completion_error;
             return result;
         }
+        if (!original_command.finish(result.is_complete, terminal_leading()))
+        {
+            result.error = "Original rank serial generation command could not retire its actual terminal";
+            return result;
+        }
         decode_command_failure_abort.markCompleted();
         return result;
+        }
+        catch (const std::exception &error)
+        {
+            if (result.error.empty()) result.error = error.what();
+            LOG_ERROR("[OrchestrationRunner] DECODE_STEP threw before its command terminal: "
+                      << error.what());
+            throw; // Preserve the original exception in scripted/local callers.
+        }
+        catch (...)
+        {
+            if (result.error.empty()) result.error = "DECODE_STEP threw a non-standard exception";
+            LOG_ERROR("[OrchestrationRunner] DECODE_STEP threw before its command terminal: non-standard exception");
+            throw;
+        }
     }
 
     GenerationResult OrchestrationRunner::forceDecodeToken(int32_t token)
     {
         GenerationResult result;
 
+        if (host_sparse_query_admission_)
+        {
+            result.error = "Forced decode cannot nest inside an admitted host response";
+            return result;
+        }
         if (!initialization_lifecycle_.readyForInference())
         {
             result.error = "Runner not initialized";
@@ -15509,6 +15855,7 @@ namespace llaminar2
             mpi_root_command,
             "FORCE_DECODE_TOKEN",
             &result.error);
+        ensureFiniteDevicePlacementArmed();
         ScopedMoEOverlayRootCommand overlay_force_command(
             moe_overlay_inference_transaction_coordinator_);
 
@@ -15587,7 +15934,8 @@ namespace llaminar2
 
         if (overlay_force_command.active())
         {
-            if (!mpi_root_command ||
+            const auto command_context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!command_context ||
                 moe_overlay_collective_generation_id_ == 0 ||
                 !moe_expert_overlay_residency_authority_)
             {
@@ -15610,17 +15958,66 @@ namespace llaminar2
                     moe_overlay_collective_generation_id_,
                 .command_id =
                     ++moe_overlay_inference_command_sequence_,
+                // Initial admitted lower bound only: mapped device packet kernels
+                // authenticate their actual current placement ticket and bank.
                 .initial_placement_epoch = snapshot->epoch,
             };
             std::string command_error;
             if (!overlay_force_command.begin(
-                    command_identity, &command_error))
+                    command_context->rank(), command_identity, &command_error))
             {
                 result.error =
                     "ExpertOverlay forced-token command admission failed: " +
                     command_error;
                 return result;
             }
+        }
+
+        auto *const original_global = dynamic_cast<GlobalOrchestrator *>(runner_.get());
+        if (original_global && original_global->originalRankGenerationFollower())
+        {
+            GlobalOrchestrator::OriginalRankGenerationTerminal terminal;
+            if (!original_global->serviceOriginalRankGenerationCommand(&terminal, &result.error))
+            {
+                original_global->abortOriginalRankGenerationCommand();
+                if (result.error.empty()) result.error = "Original forced-command follower failed";
+                return result;
+            }
+            if (!decode_transaction_planning_position_ ||
+                *decode_transaction_planning_position_ != terminal.admission_base ||
+                !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
+                    terminal.published_state_commit_count, "original_rank_forced_terminal"))
+            {
+                result.error = "Original forced terminal differs from its admitted scheduler boundary";
+                return result;
+            }
+            ready_mtp_condition_.reset();
+            pending_mtp_condition_token_.reset();
+            pending_mtp_condition_params_.reset();
+            pending_mtp_condition_resident_state_.reset();
+            prefill_logits_ready_ = !terminal.model_stopped;
+            result.is_complete = terminal.model_stopped;
+            result.returned_token_commit = terminal.model_stopped ? ReturnedTokenCommitState::NoModelRow : ReturnedTokenCommitState::Pending;
+            force_command_failure_abort.markCompleted();
+            return result;
+        }
+        /** @brief Keep original FORCE transport and transaction ownership absorbing on failure. */
+        struct OriginalRankForceCommandGuard
+        {
+            GlobalOrchestrator *owner = nullptr; ///< Actual original vocabulary-tail source only.
+            bool completed = false; ///< Set only after native terminal and channel retirement.
+            /** @brief Cancel original directions before the outer MPI abort fence destroys owners. */
+            ~OriginalRankForceCommandGuard() { if (owner && !completed) owner->abortOriginalRankGenerationCommand(); }
+        } original_force{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
+        if (original_force.owner && (!decode_transaction_planning_position_ ||
+            moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
+            !original_force.owner->beginOriginalRankGenerationCommand(
+                original_force.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
+                *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                    DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic)))
+        {
+            result.error = "Original forced-command source lost its exact request/command admission";
+            return result;
         }
 
         const auto begin_serial_overlay_graph = [&]() -> bool
@@ -15639,6 +16036,17 @@ namespace llaminar2
 
         const bool token_is_stop =
             std::find(stop_tokens_.begin(), stop_tokens_.end(), token) != stop_tokens_.end();
+        std::optional<HostSparseQueryResponseScope> forced_query_scope;
+        try
+        {
+            forced_query_scope.emplace(*runner_, host_sparse_query_admission_,
+                token_is_stop ? std::nullopt : hostSparseQueryAdmission(0, true));
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = result.error = error.what();
+            return result;
+        }
         const bool gpu_mtp_force =
             shouldUseMTPDecode() &&
             runner_->primaryDeviceId().is_gpu();
@@ -15673,12 +16081,12 @@ namespace llaminar2
         {
             /*
              * A forced policy token replaces the sample selected from an already
-             * materialized terminal-logits boundary. Requiring that boundary
-             * makes the state transition unambiguous: the old ready token has
-             * never entered main KV/GDN state, and the forced token can become
-             * the sole owner of the next row. Every forced token is forwarded
-             * immediately below, which recreates the same boundary for the next
-             * token in a multi-token stop-thinking sequence.
+             * materialized terminal-logits boundary. An unreturned bonus can
+             * be replaced; an AlreadyEmitted condition is part of the public
+             * response and must first enter shifted/main state exactly once.
+             * Neither case samples or replays a host token. The forced token
+             * then becomes the next row and recreates terminal logits for a
+             * following policy token in a multi-token stop-thinking sequence.
              */
             if (!prefill_logits_ready_)
             {
@@ -15687,6 +16095,83 @@ namespace llaminar2
                 return result;
             }
 
+            if (ready_mtp_condition_)
+            {
+                if (!ready_mtp_condition_->valid() ||
+                    !ready_mtp_condition_->isDeviceResidentOnly() ||
+                    !samplingParamsEqual(
+                        ready_mtp_condition_->sampling_params,
+                        active_sampling_params_))
+                {
+                    result.error =
+                        "GPU MTP forced decode received a stale or foreign resident condition";
+                    return result;
+                }
+                if (ready_mtp_condition_->wasAlreadyEmitted())
+                {
+                    const auto resident = *ready_mtp_condition_->resident_state;
+                    // Preserve the original token before shifted commit consumes
+                    // its one-shot mailbox/lease. AlreadyPublished closes this
+                    // target event's history right without incrementing counts or
+                    // changing the grouped carry's penalty-frontier policy bit.
+                    if (!runner_->publishDeviceResidentConditionTokenToTargetSampleSlot(
+                            resident, /*request_index=*/0, /*target_sample_slot=*/0) ||
+                        !runner_->publishMTPDirectTokenHistory(
+                            0, MTPDirectTokenHistoryDisposition::AlreadyPublished) ||
+                        !runner_->commitMTPShiftedRowFromDeviceResidentLogicalState(
+                            resident, /*request_index=*/0,
+                            /*already_appended_tokens=*/0,
+                            /*allow_speculative_discard=*/true))
+                    {
+                        result.error =
+                            "GPU MTP forced decode could not preserve its previously emitted resident condition";
+                        return result;
+                    }
+                    runner_->setMTPMainDecodeSyncDeferralEnabled(true);
+                    if (!begin_serial_overlay_graph())
+                    {
+                        runner_->setMTPMainDecodeSyncDeferralEnabled(false);
+                        return result;
+                    }
+                    if (!runner_->advanceMTPMainConditionFromDeviceTargetSample(
+                            last_token_, /*target_sample_slot=*/0,
+                            MTPConditionForwardPurpose::CommittedSerialToken))
+                    {
+                        runner_->setMTPMainDecodeSyncDeferralEnabled(false);
+                        result.error =
+                            "GPU MTP forced decode could not commit its previously emitted resident condition";
+                        return result;
+                    }
+                    if (!advanceDecodeTransactionPlanningPositionAfterForward(
+                            "forced_mtp_resident_condition_forward"))
+                    {
+                        result.error = last_error_;
+                        return result;
+                    }
+                    std::string sequence_error;
+                    if (!overlay_force_command.retireGraphSequence(&sequence_error))
+                    {
+                        result.error =
+                            "ExpertOverlay forced-token prior-condition graph retirement failed: " +
+                            sequence_error;
+                        return result;
+                    }
+                    // Sparse-query admission is immutable and proved for one
+                    // forward at its initial target position. Close that row's
+                    // policy before admitting the actual forced row at P+1.
+                    forced_query_scope.reset();
+                    try
+                    {
+                        forced_query_scope.emplace(*runner_, host_sparse_query_admission_,
+                            hostSparseQueryAdmission(0, true));
+                    }
+                    catch (const std::exception &error)
+                    {
+                        last_error_ = result.error = error.what();
+                        return result;
+                    }
+                }
+            }
             prefill_logits_ready_ = false;
             ready_mtp_condition_.reset();
 
@@ -15703,6 +16188,13 @@ namespace llaminar2
             {
                 result.error =
                     "GPU MTP forced decode could not publish its control token to device state";
+                return result;
+            }
+
+            if (!runner_->publishMTPDirectTokenHistory(0,
+                    MTPDirectTokenHistoryDisposition::NewlyEmitted))
+            {
+                result.error = "GPU MTP forced output could not publish its original device-token history";
                 return result;
             }
 
@@ -15819,6 +16311,16 @@ namespace llaminar2
                         "forced_ordinary_resident_condition_forward"))
                 {
                     result.error = last_error_;
+                    return result;
+                }
+                // The sampler-free forward has retired its actual device
+                // transaction. A future ordinary response cannot continue a
+                // ForwardOnly policy row. Preserve live model/history state
+                // while opening the typed fresh-response admission edge.
+                if (!device_generation_admission_.reopenAfterOrdinaryForwardOnly())
+                {
+                    result.error =
+                        "GPU ordinary forced decode could not retire its completed ForwardOnly response boundary";
                     return result;
                 }
                 ready_mtp_condition_.reset();
@@ -15988,8 +16490,66 @@ namespace llaminar2
                 overlay_completion_error;
             return result;
         }
+        if (original_force.owner)
+        {
+            const auto leading = ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+                sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
+                sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+            if (!original_force.owner->completeOriginalRankGenerationCommand(token_is_stop, leading))
+            {
+                result.error = "Original forced-command terminal or transport retirement failed";
+                return result;
+            }
+            original_force.completed = true;
+        }
         force_command_failure_abort.markCompleted();
         return result;
+    }
+
+    std::optional<DeviceGenerationAdmissionRequest>
+    OrchestrationRunner::hostSparseQueryAdmission(int budget, bool forward_only) const
+    {
+        if (!runner_ || (!forward_only && runner_->primaryDeviceId().is_gpu()) || host_sparse_query_admission_)
+            return std::nullopt;
+        std::string error;
+        const auto initial = currentDecodeTransactionPositionForPlanning("host_response_admission", &error);
+        if (!initial) throw std::invalid_argument(error);
+        if (*initial < 0)
+            throw std::invalid_argument("Host response initial target count is negative");
+        if (forward_only)
+        {
+            DeviceGenerationAdmissionRequest request{
+                .request_count = 1,
+                .max_new_tokens = 0,
+                .depth_policy = sampling_math::DeviceGenerationPolicy::forwardOnly(),
+                .initial_leading_row_disposition =
+                    sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted,
+            };
+            request.initial_target_counts.emplace(std::vector<int>{*initial});
+            if (!request.valid()) throw std::invalid_argument("Invalid forced sparse-query admission");
+            return request;
+        }
+        if (budget == 0)
+        {
+            const int capacity = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len : config_.max_seq_len;
+            const int64_t remaining = static_cast<int64_t>(capacity) - *initial;
+            if (remaining <= 0 || remaining > std::numeric_limits<int>::max())
+                throw std::invalid_argument("Host response has no valid context-derived budget");
+            budget = static_cast<int>(remaining);
+        }
+        if (budget <= 0)
+            throw std::invalid_argument("Host response budget is not positive");
+        // Positive caller budgets retain their existing semantics; the shared
+        // visibility resolver checks overflow without adding a context ceiling.
+        const auto mtp = activeMTPRequestConfig();
+        DeviceGenerationAdmissionRequest request{
+            .request_count = 1,
+            .max_new_tokens = budget,
+            .depth_policy = resolveSparseQueryHostDepthEnvelope(mtp),
+        };
+        request.initial_target_counts.emplace(std::vector<int>{*initial});
+        if (!request.valid()) throw std::invalid_argument("Invalid immutable host response admission");
+        return request;
     }
 
     void OrchestrationRunner::setDecodeStepTokenBudget(int max_tokens)
@@ -16027,6 +16587,18 @@ namespace llaminar2
         if (!prefill(prompt_tokens))
         {
             result.error = last_error_;
+            return result;
+        }
+
+        std::optional<HostSparseQueryResponseScope> query_response_scope;
+        try
+        {
+            query_response_scope.emplace(*runner_, host_sparse_query_admission_,
+                max_new_tokens > 0 ? hostSparseQueryAdmission(max_new_tokens) : std::nullopt);
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = result.error = error.what();
             return result;
         }
 
@@ -16130,11 +16702,28 @@ namespace llaminar2
         {
             const auto &scope = admitted.at(i).topology().scope();
             const auto &metadata = prepared[i].metadata;
+            // The admitted continuation domain owns the participant identity
+            // for both singleton and TP stages. A singleton's rank projection
+            // deliberately has no local_tp_devices and cannot supply this view.
+            const auto &placement = *prepared[i].placement;
+            const auto continuation = std::find_if(placement.domains.begin(), placement.domains.end(),
+                [&](const auto &domain) { return domain.name == placement.effectiveBaseModelDomain(); });
+            if (continuation == placement.domains.end())
+                throw std::logic_error("Pipeline movement topology lost its admitted continuation domain");
             stages.push_back({MoEOptimizationStageIdentity{i, scope.first_layer, scope.last_layer,
-                metadata.first_model_layer + metadata.num_layers, admitted[i].rankPlan().local_tp_devices, scope.has_lm_head},
+                metadata.first_model_layer + metadata.num_layers, continuation->participants, scope.has_lm_head},
                 describeMoEOptimizationMovementTopology(prepared[i].placement.get())});
         }
         return composeMoEOptimizationMovementTopology(MoEOptimizationStages<MoEOptimizationMovementTopology>::seal(std::move(stages)));
+    }
+
+    std::optional<MoEOptimizationStatus>
+    OrchestrationRunner::localPipelineStageOptimizationStatus(int stage_id) const
+    {
+        const auto *pipeline = dynamic_cast<const GlobalOrchestrator *>(runner_.get());
+        const auto *stage = pipeline ? pipeline->stageRunnerForStage(stage_id) : nullptr;
+        if (!stage) return std::nullopt;
+        return stage->moeOptimizationStatus();
     }
 
     MoEOptimizationStatus OrchestrationRunner::moeOptimizationStatus() const
@@ -16271,6 +16860,12 @@ namespace llaminar2
                 ? runner_->primaryDeviceId().toString()
                 : std::string{};
 
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+            {
+                if (!owner->ready()) return setError("CPU pipeline host maintenance is not healthy/prepared");
+                owner->notify({.phase = MoEOverlayInferenceProgressPhase::Decode, .completed_logical_tokens = committed_tokens});
+            }
         if (device_generation_embedded_moe_maintenance_pending_ack_)
         {
             if (!runner_ ||
@@ -16381,6 +16976,23 @@ namespace llaminar2
                  {"extra_mpi_command", "false"},
                  {"physical_follower", "host_byte_transport_only"}});
             return true;
+        }
+
+        if (moe_pipeline_prepared_plan_)
+        {
+            if (config_.moe_rebalance.mode != MoERebalanceRuntimeMode::Dynamic)
+                return true;
+            if (!runner_ || moe_pipeline_stage_bindings_.empty() ||
+                moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                return setError("MoE pipeline progress lost its complete stage ownership");
+            const bool all_no_peer = std::all_of(moe_pipeline_stage_bindings_.begin(),
+                moe_pipeline_stage_bindings_.end(), [](const auto &binding) {
+                    return binding && binding->owners().authority->noPeerResidency().has_value();
+                });
+            // All-zero topology work needs no participant fan-out, scheduler
+            // ticket, host mirror, or per-token evidence publication.
+            if (all_no_peer) return true;
+            return runner_ && runner_->maybeApplyDecodeBoundaryMaintenance(committed_tokens);
         }
 
         if (usesNativeGpuStageMoEOverlayAuthority())
@@ -16524,13 +17136,35 @@ namespace llaminar2
         // leaving the GPU ABI on a different, untrained initial-depth policy.
         if (runner_)
         {
-            const auto device = runner_->primaryDeviceId();
-            active.depth_policy.backend = device.is_cuda() ? MTPDepthPolicyBackend::CUDA
-                : device.is_rocm() ? MTPDepthPolicyBackend::ROCm
-                : device.is_cpu() ? MTPDepthPolicyBackend::CPU : MTPDepthPolicyBackend::Any;
-            active.depth_policy.model_class = inferMTPDepthPolicyModelClass(model_ctx_);
+            active = resolveMTPRequestDepthPolicyContext(
+                std::move(active), runner_->primaryDeviceId(), model_ctx_.get());
+            active.depth_policy.scope = mtpDepthPolicyScope();
         }
         return active;
+    }
+
+    MTPDepthPolicyScope OrchestrationRunner::mtpDepthPolicyScope() const
+    {
+        auto scope = mtp_depth_policy_scope_geometry_;
+        if (!scope.specified() || !runner_)
+            return {};
+        const auto request = mtp_request_policy_.value_or(makeMTPRequestPolicy(retainedMTPConfig()));
+        const auto topology = request.depth_policy.mode == MTPDepthPolicyMode::Dynamic
+            ? DeviceGenerationLoopTopology::DynamicDepth : DeviceGenerationLoopTopology::FixedDepth;
+        const auto policy = runner_->deviceGenerationExecutionPolicy(topology);
+        if (policy == DeviceGenerationExecutionPolicy::Unsupported && runner_->primaryDeviceId().is_gpu())
+            return {};
+        const auto role = runner_->primaryDeviceId().is_cpu() ? MTPVerifierExecutionRole::Standalone
+            : mtpVerifierExecutionRole(policy);
+        scope.verifier_width_policy = resolveMTPVerifierPhysicalWidthPolicy(role, request.depth_policy.mode);
+        return scope;
+    }
+
+    const char *OrchestrationRunner::mtpDepthPolicyScopeGenericReason() const
+    {
+        if (mtp_depth_policy_scope_geometry_.specified() && !mtpDepthPolicyScope().specified())
+            return "unsupported_generation_policy";
+        return mtp_depth_policy_scope_generic_reason_;
     }
 
     bool OrchestrationRunner::mtpRequestPolicyTransitionIsIdle() const noexcept
@@ -16643,6 +17277,96 @@ namespace llaminar2
             return 0;
         }
         return runner_->get_position();
+    }
+
+    void OrchestrationRunner::ensureFiniteDevicePlacementArmed()
+    {
+        if(finite_device_placement_submission_!=FiniteDevicePlacementSubmission::PendingArm)return;
+        if(!moe_overlay_device_controller_graph_service_)
+            throw std::logic_error("Device finite placement lost its original controller owner");
+        // Public clearCache has already retired the previous source producer.
+        // Every original owner Arm terminal precedes any new source or follower.
+        try {
+            moe_overlay_device_controller_graph_service_->runFinitePlacementBoundary(
+                DeviceMoEOverlayEpochParentAction::Arm);
+        } catch(const std::exception &error) {
+            // Some original owners may already be Armed. Without the failed
+            // owner's native proof no host flag may certify rollback/reuse.
+            LOG_ERROR("Device finite placement Arm lost original native proof: " << error.what());
+            std::terminate();
+        } catch(...) {
+            LOG_ERROR("Device finite placement Arm lost original native proof through a nonstandard exception");
+            std::terminate();
+        }
+        finite_device_placement_submission_=FiniteDevicePlacementSubmission::Armed;
+    }
+
+    void OrchestrationRunner::withMoEOverlayDevicePlacementScope(const std::function<void()> &body)
+    {
+        if(!body || !initialization_lifecycle_.readyForInference() || !runner_ || !model_ctx_ ||
+           !physical_memory_authority_ || !moe_overlay_device_controller_graph_service_ ||
+           runner_->moeOverlayAuthorityExecution()!=MoEOverlayAuthorityExecutionKind::DeviceResident ||
+           !config_.moe_routed_expert_plan ||
+           MoEExpertOwnerMap::usesCPUJointFragments(*config_.moe_routed_expert_plan) ||
+           config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Dynamic ||
+           (mpi_ctx_ && mpi_ctx_->world_size()!=1) ||
+           finite_device_placement_submission_!=FiniteDevicePlacementSubmission::Inactive)
+            throw std::logic_error("Finite device placement requires its ready original rank-local device authority");
+        finite_device_placement_submission_=FiniteDevicePlacementSubmission::PendingArm;
+        std::exception_ptr failure;
+        try { body(); } catch(...) { failure=std::current_exception(); }
+        if(finite_device_placement_submission_==FiniteDevicePlacementSubmission::Armed) {
+            try {
+                // The device rejects End if any actual child still owns a bank.
+                // Missing native proof is fatal, never a successful scope close.
+                moe_overlay_device_controller_graph_service_->runFinitePlacementBoundary(
+                    DeviceMoEOverlayEpochParentAction::Close);
+            } catch(const std::exception &error) {
+                if(failure) {
+                    try {std::rethrow_exception(failure);}
+                    catch(const std::exception &original) {
+                        LOG_ERROR("Original finite device request failed: " << original.what());
+                    } catch(...) {
+                        LOG_ERROR("Original finite device request failed with a nonstandard exception");
+                    }
+                }
+                LOG_ERROR("Device finite placement cannot retire its original parent: " << error.what());
+                std::terminate();
+            } catch(...) {
+                if(failure) {
+                    try {std::rethrow_exception(failure);}
+                    catch(const std::exception &original) {
+                        LOG_ERROR("Original finite device request failed: " << original.what());
+                    } catch(...) {
+                        LOG_ERROR("Original finite device request failed with a nonstandard exception");
+                    }
+                }
+                LOG_ERROR("Device finite placement closure lost original native proof through a nonstandard exception");
+                std::terminate();
+            }
+        } else if(!failure) {
+            failure=std::make_exception_ptr(std::logic_error(
+                "Finite device placement callback executed no original request"));
+        }
+        finite_device_placement_submission_=FiniteDevicePlacementSubmission::Inactive;
+        if(failure)std::rethrow_exception(failure);
+    }
+
+    MoEOverlayInferencePlacementScopeObservation
+    OrchestrationRunner::withMoEOverlayInferencePlacementScope(const std::function<void()> &body)
+    {
+        if (!initialization_lifecycle_.readyForInference() || !runner_ || !model_ctx_ ||
+            !physical_memory_authority_ || !moe_expert_overlay_residency_authority_ ||
+            !moe_overlay_inference_transaction_coordinator_ ||
+            !config_.moe_routed_expert_plan ||
+            !MoEExpertOwnerMap::usesCPUJointFragments(*config_.moe_routed_expert_plan) ||
+            (mpi_ctx_ && mpi_ctx_->rank() != mpi_coordinated_root_rank_))
+            throw std::logic_error("Finite placement scope requires its ready original host-coordinated model/source/PMA root");
+        // Retain the original coordinator (and its original shared authority)
+        // across synchronous public reset/request calls. No replacement runner,
+        // source, physical byte authority, or follower admission is created.
+        const auto coordinator = moe_overlay_inference_transaction_coordinator_;
+        return coordinator->withMoEOverlayInferencePlacementScope(body);
     }
 
     void OrchestrationRunner::clearCache()
@@ -16790,10 +17514,11 @@ namespace llaminar2
         summary.mtp_request.accepted_tokens = mtp_stats_.accepted_tokens;
         summary.mtp_request.rejected_tokens = mtp_stats_.rejected_tokens;
         summary.mtp_request.rollbacks = mtp_stats_.rollbacks;
-        const uint64_t mtp_total_tokens = mtp_stats_.accepted_tokens + mtp_stats_.rejected_tokens;
+        // Rejections count transactions, not all unaccepted draft suffixes.
+        // The attempted-draft ledger is the token denominator at every depth.
         summary.mtp_request.acceptance_rate =
-            mtp_total_tokens > 0
-                ? static_cast<double>(mtp_stats_.accepted_tokens) / static_cast<double>(mtp_total_tokens)
+            mtp_stats_.draft_steps > 0
+                ? static_cast<double>(mtp_stats_.accepted_tokens) / static_cast<double>(mtp_stats_.draft_steps)
                 : 0.0;
         summary.mtp_request.stochastic_accept_tests = mtp_stats_.stochastic_accept_tests;
         summary.mtp_request.stochastic_accepts = mtp_stats_.stochastic_accepts;
@@ -16818,6 +17543,20 @@ namespace llaminar2
                                                       : PrefixRuntimeStateSnapshot{};
         snapshot.initialized = initialization_lifecycle_.readyForInference();
         snapshot.prefill_logits_ready = prefill_logits_ready_;
+        if (capture_policy.capture_device_logical_state && snapshot.resident_condition &&
+            ready_mtp_condition_ && ready_mtp_condition_->isDeviceResidentOnly())
+        {
+            const auto current = runner_->deviceResidentLogicalSequenceState();
+            const auto &observed = *snapshot.resident_condition;
+            if (!ready_mtp_condition_->valid() ||
+                !samplingParamsEqual(ready_mtp_condition_->sampling_params, active_sampling_params_) ||
+                !ready_mtp_condition_->resident_state->sameMailboxAs(current) ||
+                observed.device != current.device ||
+                observed.publication_generation != current.publication_generation ||
+                observed.live_state_epoch != current.live_state_epoch)
+                throw std::logic_error("Continuation diagnostics rejected a stale or foreign original ready condition");
+            snapshot.resident_condition->response_disposition = ready_mtp_condition_->response_disposition;
+        }
         /*
          * The heterogeneous controller's mapped durable word is the only
          * movement authority for this regime. The narrow epoch accessor also
@@ -16877,6 +17616,9 @@ namespace llaminar2
         snapshot.mtp_depth_policy_updates = mtp_stats_.depth_policy_updates;
         snapshot.mtp_depth_policy_promotions = mtp_stats_.depth_policy_promotions;
         snapshot.mtp_depth_policy_demotions = mtp_stats_.depth_policy_demotions;
+        snapshot.mtp_depth_policy_utility_returns = mtp_stats_.depth_policy_utility_returns;
+        snapshot.mtp_depth_policy_utility_keeps = mtp_stats_.depth_policy_utility_keeps;
+        snapshot.mtp_depth_policy_utility_probes = mtp_stats_.depth_policy_utility_probes;
         snapshot.mtp_depth_policy_observe_recommendations =
             mtp_stats_.depth_policy_observe_recommendations;
         const auto request_summary = requestRuntimeSummary();
@@ -17012,6 +17754,26 @@ namespace llaminar2
         return true;
     }
 
+    void OrchestrationRunner::installResolvedExecutionPlan(
+        const ResolvedRankOrchestration &resolved)
+    {
+        // Prepare all owning values before publishing any part of the result.
+        // Deriving this later from config_ would encode capacity-frozen placements
+        // rather than the user's exact requested reuse/migration authority.
+        auto config = resolved.config();
+        auto plan = resolved.rankPlan();
+        auto topology = resolved.pipelineStages().empty()
+            ? std::shared_ptr<const ResolvedRankOrchestration>{}
+            : std::make_shared<const ResolvedRankOrchestration>(resolved);
+        auto identity = topology
+            ? pipelineRoutedWeightAuthorityRequestIdentity(resolved)
+            : routedWeightAuthorityRequestIdentity(config.moe_routed_expert_plan, config);
+        config_ = std::move(config);
+        plan_ = std::move(plan);
+        moe_pipeline_topology_ = std::move(topology);
+        requested_routed_weight_authority_identity_ = std::move(identity);
+    }
+
     bool OrchestrationRunner::buildExecutionPlan()
     {
         if (plan_built_)
@@ -17025,7 +17787,7 @@ namespace llaminar2
         try
         {
             planning_model_metadata_.emplace(exchangePlanningModelMetadata(mpi_ctx_, [&] {
-                return readPlanningModelMetadata(config_.model_path);
+                return readPlanningModelMetadata(config_.model_path, config_.shared_predictor);
             }));
         }
         catch (const std::exception &error)
@@ -17037,21 +17799,31 @@ namespace llaminar2
         {
             const int rank = mpi_ctx_->rank();
             const auto resolved = ResolvedRankOrchestration::resolve(
-                config_, *planning_model_metadata_, cluster_inventory_, *plan_builder_, rank);
+                config_, *planning_model_metadata_, cluster_inventory_, *plan_builder_, rank,
+                ordinary_terminal_projection_setup_);
             if (!resolved.pipelineStages().empty())
             {
-                // Each native GPU stage owns its own controller and native
-                // collective. A host maintenance composer is not substituted.
+                // Movement storage is not the authority locus. Singleton
+                // domains retain their host/device owner and Dynamic intent;
+                // a complete no-peer residency proof is sealed after quotas.
+                // Movable domains still require their real native controller.
                 for (const auto &stage : resolved.pipelineStages())
-                    if (MoEOverlayCapacityAdmission::selectMigrationStorage(
-                            *stage.config().moe_routed_expert_plan, MoERebalanceRuntimeMode::Dynamic) !=
-                        MoEOverlayMigrationStorageKind::DeviceTransferDirectory)
-                        return setError("Local MoE pipeline stages require native GPU controller domains");
-                moe_pipeline_topology_ = std::make_shared<const ResolvedRankOrchestration>(resolved);
-                requested_routed_weight_authority_identity_ = pipelineRoutedWeightAuthorityRequestIdentity(resolved);
+                {
+                    const auto storage = MoEOverlayCapacityAdmission::selectMigrationStorage(
+                        *stage.config().moe_routed_expert_plan, config_.moe_rebalance.mode);
+                    if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                        storage != MoEOverlayMigrationStorageKind::NoPeer &&
+                        storage != MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
+                        !(storage == MoEOverlayMigrationStorageKind::PhysicalResidencyFabric &&
+                          std::all_of(stage.config().moe_routed_expert_plan->domains.begin(),
+                              stage.config().moe_routed_expert_plan->domains.end(), [](const auto &domain) {
+                                  return std::all_of(domain.participants.begin(), domain.participants.end(),
+                                      [](const auto &participant) { return participant.toLocalDeviceId().is_cpu(); });
+                              })))
+                        return setError("Movable local MoE pipeline stages require an admitted native maintenance domain");
+                }
             }
-            config_ = resolved.config();
-            plan_ = resolved.rankPlan();
+            installResolvedExecutionPlan(resolved);
             mpi_coordinated_root_rank_ = resolved.overlayExecution()
                 ? resolved.overlayExecution()->continuation_root_rank : 0;
             if (mpi_coordinated_root_rank_ < 0 || mpi_coordinated_root_rank_ >= mpi_ctx_->world_size())
@@ -17219,6 +17991,9 @@ namespace llaminar2
         weight_config.mpi_ctx = mpi_ctx_;
         weight_config.weight_precision = WeightPrecision::NATIVE;
         weight_config.use_mmap = config_.use_mmap;
+        weight_config.shared_predictor = config_.shared_predictor;
+        weight_config.predictor_materialization = retainsMTPGraphCapacity(config_.mtp)
+            ? SharedPredictorMaterialization::Active : SharedPredictorMaterialization::Inactive;
 
         /*
          * A process-resident parity campaign may retain the immutable model and
@@ -17236,6 +18011,12 @@ namespace llaminar2
                     model_ctx_->path() + " != " + model_path);
             }
 
+            try {
+                model_ctx_->concreteLoader().requireSharedPredictorSource(config_.shared_predictor,
+                    weight_config.predictor_materialization);
+            } catch(const std::invalid_argument& error) {
+                return setError(error.what());
+            }
             const auto weight_manager = model_ctx_->concreteWeightManager();
             if (!weight_manager)
             {
@@ -17335,6 +18116,13 @@ namespace llaminar2
              */
             retained_prepared_weight_plan_validated_ =
                 retained_prepared_weight_plan_.has_value();
+            if(retained_prepared_weight_plan_validated_)
+            {
+                // Every reuse path consumes the same complete immutable
+                // admission before graph/memory factories run. Keep active
+                // request policy fresh; never replan the retained physical bytes.
+                restoreRetainedAdmittedRuntime(plan_.runtime,retained_prepared_weight_plan_->runtime,plan_.rank);
+            }
 
             /*
              * A preloaded context can either be a freshly parsed model handed
@@ -17432,6 +18220,14 @@ namespace llaminar2
             weight_config.payload_access_pattern =
                 ModelPayloadAccessPattern::DenseCpuResident;
         }
+
+        // Resolve from authenticated planning metadata before either local or
+        // node-leader warmup. Low-level ModelLoader applies the same semantic
+        // resolver after parsing, so direct and orchestrated callers cannot
+        // accidentally pre-read a separately admitted immutable row table.
+        for (const auto &tensor : planningModelMetadata().memoryProfile().tensors)
+            weight_config.payload_access_pattern = resolveModelPayloadAccessPattern(
+                weight_config.payload_access_pattern, inferWeightRole(tensor.name));
 
         // Multi-rank page cache pre-population:
         // In multi-rank mode, each rank independently mmaps and first-touches the
@@ -17574,8 +18370,8 @@ namespace llaminar2
                      ModelPayloadAccessPattern::SparseSelection)
         {
             LOG_DEBUG(
-                "Sparse ExpertOverlay weight loading: skipping whole-file "
-                "page-cache prepopulation; only selected expert slices will "
+                "Selected-source weight loading: skipping whole-file "
+                "page-cache prepopulation; only explicitly selected payloads will "
                 "fault source pages");
             PerfStatsCollector::addCounter(
                 "weight_loading",
@@ -17765,11 +18561,6 @@ namespace llaminar2
                     }
                 }
             }
-            plan_.runtime.resident_graph_rows =
-                retained_prepared_weight_plan_->runtime.resident_graph_rows;
-            plan_.runtime.moe_routed_prefill.overlay_segment_rows =
-                retained_prepared_weight_plan_
-                    ->runtime.moe_routed_prefill.overlay_segment_rows;
             PerfStatsCollector::addCounter(
                 "weight_loading",
                 "retained_overlay_physical_plan_reuses",
@@ -17813,8 +18604,7 @@ namespace llaminar2
                     resolveMoERoutedExpertModelMetadataForModel(
                         *model_ctx_, mtp);
                 const auto layer_weight_manifest =
-                    buildMoEOverlayLayerWeightManifestFromGGUF(
-                        model_ctx_->concreteLoader().getModel(),
+                    buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                         metadata.num_layers,
                         metadata.num_experts);
                 const auto execution_plan =
@@ -17825,7 +18615,7 @@ namespace llaminar2
                             .world_size = world_size,
                         });
 
-                if (!refreshRankLocalGPUCapacityObservations(
+                if (!prepareRankLocalGPUContexts(
                         execution_plan.currentRankPlan().local_devices,
                         "physical_capacity_resolution"))
                 {
@@ -17939,7 +18729,10 @@ namespace llaminar2
                     .gpu_weight_load = gpu_weight_load,
                     .snapshot_capacity = snapshot_capture_setup_.enabled()
                         ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
-                    .model_graph_topology_variant_count = model_graph_topology_variant_count};
+                    .model_graph_topology_variant_count = model_graph_topology_variant_count,
+                    .original_expert_manifest=layer_weight_manifest,
+                    .weight_precision=WeightPrecision::NATIVE,
+                    .native_source_placement=model_ctx_->concreteLoader().nativeWeightSourcePlacement()};
 
                 /** A successful local admission retains the exact inputs it priced. */
                 struct LocalCapacityCandidate
@@ -17977,11 +18770,12 @@ namespace llaminar2
 
                 std::optional<MoEOverlayLocalCapacityPlannerResult>
                     selected_local_capacity;
-                std::optional<MoEOverlayResolvedCapacityPlan>
-                    selected_capacity;
+                std::optional<MoEOverlayCapacityDraft> selected_capacity_draft;
+                std::optional<MoEOverlayResolvedCapacityPlan> selected_capacity;
                 std::size_t selected_model_graph_identity_count = 0u;
                 int selected_prefill_segment_rows = 0;
                 std::string last_capacity_error;
+                const auto host_service_projection=RetainedHostServiceBudgetProjection::original();
                 for (const int candidate_rows : graph_row_candidates)
                 {
                     const int candidate_resident_rows =
@@ -17999,6 +18793,7 @@ namespace llaminar2
                         // while another rank enters its budget collective.
                         auto inputs = buildMoEOverlayMemoryPlanInputs(
                             memory_request, candidate_resident_rows);
+                        inputs.local_capacity.retained_host_services=host_service_projection;
                         auto capacity = MoEOverlayLocalCapacityPlanner::plan(inputs.local_capacity);
                         local_candidate.emplace(LocalCapacityCandidate{
                             std::move(inputs), std::move(capacity)});
@@ -18015,8 +18810,7 @@ namespace llaminar2
                         continue;
                     }
 
-                    std::optional<MoEOverlayResolvedCapacityPlan>
-                        candidate_capacity;
+                    std::optional<MoEOverlayCapacityDraft> candidate_capacity;
                     const auto complete_result = capacity_phase(
                         {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.complete-bom"}, [&]
                     {
@@ -18025,7 +18819,7 @@ namespace llaminar2
                                 local_candidate->capacity.physical_budgets,
                                 overlay_world);
                         candidate_capacity =
-                            MoEOverlayCapacityAdmission::resolveCapacity(
+                            MoEOverlayCapacityAdmission::resolveCapacityDraft(
                                 *config_.moe_routed_expert_plan,
                                 metadata.num_experts,
                                 layer_weight_manifest,
@@ -18044,8 +18838,79 @@ namespace llaminar2
                         continue;
                     }
 
+                    // Explicit native head ranges are mandatory storage, so a
+                    // row candidate is complete only when those same ranges fit.
+                    // Automatic placement remains below frozen rows and quotas.
+                    if (plan_.runtime.ngram_table_policy.isFixedHeadSharded())
+                    {
+                        std::optional<ImmutableRowTableAdmissionSendFrame> local_frame;
+                        const auto inputs_result = capacity_phase(
+                            {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.fixed-head-inputs"}, [&]
+                        {
+                            const std::vector<std::vector<DevicePlanConfig>> groups{local_candidate->capacity.device_inputs};
+                            const auto upload = MemoryPlanner::immutableRowTableUploadBindings(profile, groups);
+                            const auto request = MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                                plan_.runtime.ngram_table_policy, groups, upload,
+                                ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+                            std::vector<ImmutableRowTableAdmissionRequest> local_requests;
+                            if (request) local_requests.push_back(*request);
+                            local_frame.emplace(ImmutableRowTableAdmissionSendFrame::prepare(local_requests,
+                                overlay_world ? overlay_world->rank() : plan_.rank, &profile));
+                            return true;
+                        });
+                        if (!inputs_result.succeeded())
+                            throw std::runtime_error(inputs_result.diagnostic("Fixed-head row candidate metadata"));
+
+                        std::optional<MoEOverlayResolvedCapacityPlan> complete_candidate;
+                        std::string table_capacity_error;
+                        const auto table_result = capacity_phase(
+                            {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.fixed-head-complete-bom"}, [&]
+                        {
+                            const auto requests = gatherOverlayImmutableTableRequests(*local_frame, overlay_world, profile);
+                            auto finalized = finalizeMoEOverlayRowCandidate(
+                                plan_.runtime.ngram_table_policy, [&]
+                            {
+                                auto admitted = candidate_capacity->admit(requests);
+                                if (admitted.size() != 1u)
+                                    throw std::logic_error("Fixed-head row candidate lost its exact stage");
+                                return std::move(admitted.front());
+                            });
+                            if (auto *rejected = std::get_if<MoEOverlayRowCapacityRejected>(&finalized))
+                            {
+                                table_capacity_error = std::move(rejected->diagnostic);
+                                return false;
+                            }
+                            auto *admitted = std::get_if<MoEOverlayRowAdmitted<MoEOverlayResolvedCapacityPlan>>(&finalized);
+                            if (!admitted)
+                                throw std::logic_error("Mandatory fixed-head row finalization was deferred");
+                            complete_candidate = std::move(admitted->value);
+                            return true;
+                        });
+                        // Capacity rejection is a valid search outcome. Vote
+                        // separately on structural errors so every peer fails
+                        // fatally rather than advancing to another row epoch.
+                        const auto validity = capacity_phase(
+                            {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.fixed-head-validity"}, [&]
+                        {
+                            return table_result.status != RankInitializationPhaseStatus::LocalStepThrewException;
+                        });
+                        if (!validity.succeeded())
+                            throw std::runtime_error(table_result.diagnostic("Invalid fixed-head row candidate"));
+                        if (!table_result.succeeded())
+                        {
+                            last_capacity_error = table_result.diagnostic("Fixed-head complete row BOM");
+                            if (!table_capacity_error.empty()) last_capacity_error += ": " + table_capacity_error;
+                            LOG_DEBUG("[MoEOverlayCapacity] Rejected fixed-head resident graph candidate "
+                                << candidate_rows << " rows: " << last_capacity_error);
+                            continue;
+                        }
+                        // Reuse this one final certificate; no authority or
+                        // physical backing was created for rejected candidates.
+                        selected_capacity = std::move(complete_candidate);
+                    }
+
                     selected_local_capacity = std::move(local_candidate->capacity);
-                    selected_capacity = std::move(candidate_capacity);
+                    selected_capacity_draft = std::move(candidate_capacity);
                     selected_model_graph_identity_count =
                         local_candidate->inputs.model_graph_identity_count;
                     selected_prefill_segment_rows =
@@ -18055,7 +18920,7 @@ namespace llaminar2
                     break;
                 }
 
-                if (!selected_local_capacity || !selected_capacity)
+                if (!selected_local_capacity || !selected_capacity_draft)
                 {
                     throw std::runtime_error(
                         "ExpertOverlay has no resident captured-prefill shape with complete expert coverage under the physical BOM" +
@@ -18063,6 +18928,38 @@ namespace llaminar2
                              ? std::string{}
                              : ": " + last_capacity_error));
                 }
+
+                if (!selected_capacity)
+                {
+                    std::optional<ImmutableRowTableAdmissionSendFrame> local_table_frame;
+                    const auto table_inputs=capacity_phase({0,"overlay.final-ngram-local-inputs"},[&] {
+                        const std::vector<std::vector<DevicePlanConfig>> groups{selected_local_capacity->device_inputs};
+                        const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+                        const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                            plan_.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+                        std::vector<ImmutableRowTableAdmissionRequest> local_table_requests;
+                        if(request)local_table_requests.push_back(*request);
+                        local_table_frame.emplace(ImmutableRowTableAdmissionSendFrame::prepare(local_table_requests,
+                            overlay_world ? overlay_world->rank() : plan_.rank, &profile));
+                        return true;
+                    });
+                    if(!table_inputs.succeeded())
+                        throw std::runtime_error(table_inputs.diagnostic("Final ngram local metadata admission"));
+                    const auto table_result=capacity_phase({0,"overlay.final-ngram-admission"},[&] {
+                        const auto complete_requests=gatherOverlayImmutableTableRequests(*local_table_frame,overlay_world,profile);
+                        auto admitted=selected_capacity_draft->admit(complete_requests);
+                        if(admitted.size()!=1u)throw std::logic_error("Standalone overlay finalization lost its exact stage");
+                        selected_capacity=std::move(admitted.front());
+                        return true;
+                    });
+                    if(!table_result.succeeded())
+                        throw std::runtime_error(table_result.diagnostic("Final ngram admission after frozen rows and quotas"));
+                }
+                plan_.runtime.attention_participants = projectAdmittedQwenSparseAttentionPrograms(
+                    profile, selected_local_capacity->device_inputs, plan_.rank);
+                for (const auto &placement : selected_capacity->ngram_table_placements)
+                    if (placement->worldRank() == plan_.rank)
+                        plan_.runtime.ngram_table_placement = placement;
 
                 if (selected_prefill_segment_rows <= 0)
                 {
@@ -18082,10 +18979,28 @@ namespace llaminar2
                 // setup must not reconstruct a different host trace bound.
                 selected_capacity->host_demand_memory =
                     selected_local_capacity->host_demand_memory;
-                const auto &capacity = *selected_capacity;
-                moe_expert_overlay_memory_admission_ =
-                    std::make_shared<const MoEOverlayResolvedCapacityPlan>(
-                        capacity);
+                selected_capacity->cpu_serial_expert_storage =
+                    MemoryPlanner::cpuSerialExpertStorageAdmissions(selected_local_capacity->device_inputs);
+                plan_.runtime.cpu_serial_expert_storage = selected_capacity->cpu_serial_expert_storage;
+                if(selected_local_capacity->device_inputs.empty())throw std::logic_error("Selected CPU service admission lost its original device inputs");
+                plan_.runtime.retained_host_services=selected_local_capacity->device_inputs.front().retained_host_services;
+                if(!plan_.runtime.retained_host_services)throw std::logic_error("Selected CPU service admission lost its original declaration");
+                for(const auto& input:selected_local_capacity->device_inputs)
+                    if(input.retained_host_services!=plan_.runtime.retained_host_services)throw std::logic_error("Selected CPU service admission mixed declaration sessions");
+                {
+                    auto publication = *selected_capacity;
+                    publication.activation_batch_inventory =
+                        selected_local_capacity->activation_batch_inventory;
+                    publication.physical_gpu_lane_demand =
+                        selected_local_capacity->physical_gpu_lane_demand;
+                    moe_expert_overlay_memory_admission_ =
+                        std::make_shared<const MoEOverlayResolvedCapacityPlan>(
+                            std::move(publication));
+                }
+                // Publication owns the complete admitted geometry and physical
+                // ledger. Quota installation and evidence must borrow that
+                // immutable authority, never its moved-from setup envelope.
+                const auto &capacity = *moe_expert_overlay_memory_admission_;
                 physical_memory_admission_ =
                     moe_expert_overlay_memory_admission_
                         ->physical_memory_admission;
@@ -18093,6 +19008,28 @@ namespace llaminar2
                 {
                     throw std::logic_error(
                         "ExpertOverlay capacity resolution returned no topology-wide physical-memory authority");
+                }
+                // Publish only the selected successful admission's actual inputs,
+                // never speculative candidate BOMs or reconstructed intervals.
+                if (profile.architecture == "qwen4exp" &&
+                    PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
+                {
+                    std::vector<DeviceId> members;
+                    for (const auto &address : plan_.local_tp_devices)
+                        members.push_back(address.toLocalDeviceId());
+                    if (!members.empty())
+                    {
+                        const auto source = resolveProfileTPDeclaration(profile,
+                            config_.moe_routed_expert_plan->domains.size() == 1 &&
+                                plan_.usesLocalTP() && !plan_.usesLocalPP() && !plan_.usesGlobalTP() &&
+                                !plan_.prev_rank && !plan_.next_rank && plan_.first_layer == 0 &&
+                                (plan_.last_layer < 0 || plan_.last_layer == profile.mainLayerCount() - 1)
+                                ? TensorParallelMainPlacement::FullMainRankLocal : TensorParallelMainPlacement::OtherDeclared,
+                            plan_.runtime.mtp, config_.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy(), members);
+                        if (source.coverage() == KVHeadCoveragePolicy::QueryInterval)
+                            query_kv_geometry::recordInstalledAssignments(profile,
+                                selected_local_capacity->device_inputs, *physical_memory_admission_);
+                    }
                 }
                 LOG_DEBUG(
                     "[MoEOverlayCapacity] Selected rank-local fixed BOM at "
@@ -18226,7 +19163,9 @@ namespace llaminar2
         try
         {
             if (!model_ctx_ || !moe_pipeline_topology_ || config_.moe_routed_expert_plan ||
-                !mpi_ctx_ || mpi_ctx_->rank() != 0 || mpi_ctx_->world_size() != 1)
+                !mpi_ctx_ || mpi_ctx_->rank() != moe_pipeline_topology_->rankPlan().rank ||
+                mpi_ctx_->world_size() != (moe_pipeline_topology_->globalPipeline()
+                    ? moe_pipeline_topology_->globalPipeline()->world_size : 1))
                 throw std::invalid_argument("MoE pipeline admission requires the exact local model and compiled stage topology");
             if (snapshot_capture_setup_.enabled() && !snapshot_capture_setup_.memory_capacity.valid())
                 throw std::invalid_argument("MoE pipeline snapshots require admitted setup capacity");
@@ -18245,7 +19184,7 @@ namespace llaminar2
             else
             {
                 const auto devices = rankLocalGPUExecutionDevices(plan_, nullptr, mpi_ctx_);
-                if (!refreshRankLocalGPUCapacityObservations(devices, "pipeline_physical_capacity_resolution"))
+                if (!prepareRankLocalGPUContexts(devices, "pipeline_physical_capacity_resolution"))
                     return false;
                 const auto &execution = debugEnv().execution;
                 if (!execution.gpu_graphs || !execution.prefill_graph_buckets)
@@ -18254,18 +19193,21 @@ namespace llaminar2
                     *moe_pipeline_topology_, planningModelMetadata(), model_ctx_->concreteLoader(), cluster_inventory_,
                     {.prefill = {.bucket_rows = execution.prefill_graph_bucket_sizes,
                          .minimum_sequence_rows = execution.prefill_graph_min_seq,
-                         .maximum_cached_buckets = execution.prefill_graph_max_cached_buckets},
+                         .maximum_cached_buckets = execution.prefill_graph_max_cached_buckets,
+                         .maximum_cached_buckets_explicit = execution.prefill_graph_max_cached_buckets_explicit},
                      .gpu_weight_load = {.policy = configuredGPUWeightLoadMemoryPolicy(),
                          .maximum_source_bytes = maximumGGUFTensorPayloadBytes(model_ctx_->concreteLoader().getModel())},
                      .snapshot_capacity = snapshot_capture_setup_.enabled()
                          ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
-                     .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount()}));
+                     .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount(),
+                     .retained_host_services = RetainedHostServiceBudgetProjection::original(),
+                     .native_context_preparation = plan_.runtime.native_context_preparation,
+                     .original_parent = mpi_ctx_}));
                 moe_pipeline_prepared_plan_ = MoEPipelinePreparedPlan::create(std::move(admission), model_ctx_);
             }
             const auto &admission = *moe_pipeline_prepared_plan_->admission();
             physical_memory_admission_ = admission.physicalAdmission();
-            plan_.runtime.resident_graph_rows = admission.rankPlan().runtime.resident_graph_rows;
-            plan_.runtime.moe_routed_prefill.overlay_segment_rows = admission.rankPlan().runtime.moe_routed_prefill.overlay_segment_rows;
+            admission.publishRuntimeCapacity(plan_.runtime);
             if (!publishPhysicalMemoryAuthority()) return false;
             PerfStatsCollector::addCounter("moe_overlay_capacity", "pipeline_capacity_plan_installed", 1.0,
                 "model_setup", {}, {{"stages", std::to_string(admission.stages().size())},
@@ -18332,6 +19274,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::initializeMoEExpertOverlayResidencyAuthority()
     {
+        if(cpu_expert_shard_ctx_)return setError("CPU expert domain requires original terminal shutdown before replacement");
         shutdownMoEExpertOverlayResidencyMaintenance(
             MoEOverlayMaintenanceDrainIntent::ResetComposition);
         moe_overlay_device_controller_graph_service_.reset();
@@ -18386,9 +19329,10 @@ namespace llaminar2
                 .plan = *plan, .metadata = metadata, .loader = model_ctx_->concreteLoader(),
                 .rebalance = config_.moe_rebalance, .storage_policy = capacity_policy,
                 .capacity = *moe_expert_overlay_memory_admission_,
-                .memory = physical_memory_authority_, .world_rank = current_rank, .world_size = world_size});
+                .memory = physical_memory_authority_, .world_rank = current_rank, .world_size = world_size,
+                .original_model=ModelContextId{reinterpret_cast<uint64_t>(model_ctx_.get())}});
             const auto &economy_layer_catalog = setup.authority()->economyLayerCatalog();
-            const auto &owner_map = setup.authority()->snapshot()->owner_map;
+            const auto &owner_map = setup.authority()->snapshot()->originalOwnerMap();
             if (plan->authority_execution ==
                 MoEOverlayAuthorityExecutionKind::DeviceResident)
             {
@@ -18625,6 +19569,7 @@ namespace llaminar2
             moe_expert_overlay_residency_authority_ = setup.authority();
             moe_expert_overlay_participant_residency_ = setup.residency();
             moe_expert_overlay_interference_probe_ = setup.interference();
+            if(!initializeCPUExpertShardDomain())return false;
         }
         catch (const std::exception &error)
         {
@@ -18635,6 +19580,70 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool OrchestrationRunner::initializeCPUExpertShardDomain()
+    {
+        const auto snapshot=moe_expert_overlay_residency_authority_->snapshot();
+        if(!snapshot || !snapshot->jointOwnerMap())return true;
+        const auto &plan=*snapshot->placement_plan;
+        if(plan.authority_execution!=MoEOverlayAuthorityExecutionKind::HostResident)
+            return setError("CPU expert domain requires its original declared host residency authority");
+        const auto world=moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_;
+        if(!world || !physical_memory_authority_)return setError("CPU expert domain lost original world/PMA authority");
+        std::optional<NativeCPUCollectiveProgram> program;
+        std::optional<std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse>> use;
+        const auto prepare=runRankSynchronizedInitializationPhase("CPU expert original domain geometry",
+            {0,"cpu_expert_original_domain_geometry"},InitializationConsensusScope::ExpertOverlayContext,[&] {
+                int domain_ordinal=-1;
+                for(size_t d=0;d<plan.domains.size();++d) {
+                    const auto &candidate=plan.domains[d];
+                    if(candidate.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded || candidate.participants.size()<=1 ||
+                       !std::all_of(candidate.participants.begin(),candidate.participants.end(),[](const auto& p){return p.isCPU();}))continue;
+                    if(domain_ordinal!=-1)throw std::invalid_argument("CPU joint serving currently requires one original expert domain");
+                    domain_ordinal=static_cast<int>(d);
+                }
+                if(domain_ordinal<0)throw std::logic_error("Original CPU joint source has no declared domain");
+                const auto &domain=plan.domains[static_cast<size_t>(domain_ordinal)];
+                std::shared_ptr<const MoEExpertShardCohort> cohort;
+                for(const auto &row:snapshot->originalOwnerMap().owners())if(row.domain_name==domain.name && row.shard_cohort) {
+                    if(!cohort)cohort=row.shard_cohort;
+                    else if(cohort->participants().size()!=row.shard_cohort->participants().size() ||
+                        !std::equal(cohort->participants().begin(),cohort->participants().end(),row.shard_cohort->participants().begin()))
+                        throw std::invalid_argument("CPU expert source layers changed original domain membership");
+                }
+                if(!cohort || domain.scope!=ExecutionDomainScope::NODE_LOCAL)
+                    throw std::invalid_argument("CPU joint serving requires positive original native fragments and NODE_LOCAL membership");
+                std::vector<NativeCPUCollectiveProgram::Participant> members;
+                int original_node=-1;
+                for(const auto &member:cohort->participants()) {
+                    if(member.world_rank<0 || static_cast<size_t>(member.world_rank)>=cluster_inventory_.ranks.size())
+                        throw std::invalid_argument("CPU expert source contains foreign original rank");
+                    const auto &rank=cluster_inventory_.ranks[static_cast<size_t>(member.world_rank)];
+                    if(rank.rank!=member.world_rank || rank.cpu.numa_node!=member.address.numa_node ||
+                       (original_node>=0 && rank.node_id!=original_node))
+                        throw std::invalid_argument("CPU expert source does not match original physical NODE_LOCAL/NUMA inventory");
+                    original_node=rank.node_id;members.push_back({member.world_rank,member.address});
+                }
+                program.emplace(NativeCPUCollectiveProgram::expertShardRoutePartials(domain_ordinal,domain.backend,std::move(members)));
+                return true;
+            });
+        if(!prepare)return false;
+        if(!runRankSynchronizedInitializationPhase("CPU expert original domain commitment",
+            {1,"cpu_expert_original_domain_commitment"},InitializationConsensusScope::ExpertOverlayContext,[&] {
+                const bool included=std::any_of(program->participants().begin(),program->participants().end(),
+                    [&](const auto& member){return member.world_rank==world->rank();});
+                if(included)use.emplace(std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,
+                    program->admit(physical_memory_authority_,world->rank()));
+                else use.emplace(std::in_place_type<NativeCPUCollectiveProgram::ProcessUse>,
+                    program->admitExcludedParent(physical_memory_authority_,world->rank()));
+                return true;
+            }))return false;
+        return runRankSynchronizedInitializationPhase("CPU expert native original domain",
+            {2,"cpu_expert_native_original_domain"},InitializationConsensusScope::ExpertOverlayContext,[&] {
+                cpu_expert_shard_ctx_=GlobalTPContext::createAdmittedCPUExpertDomain(world->communicator(),*program,std::move(*use));
+                return true;
+            });
     }
 
     bool OrchestrationRunner::
@@ -18677,17 +19686,19 @@ namespace llaminar2
         };
         if (moe_pipeline_prepared_plan_)
         {
-            if (!runner_ || moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size() ||
-                !usesNativeGpuStageMoEOverlayAuthority() ||
-                runner_->moeOverlayAuthorityExecution() != MoEOverlayAuthorityExecutionKind::DeviceResident)
-                return setError("MoE pipeline maintenance lost its complete native stage ownership");
+            if (!runner_ || moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                return setError("MoE pipeline maintenance lost its complete stage ownership");
+            runner_->requireMoEPipelineRuntimeOwnership(
+                IInferenceRunner::MoEPipelineOwnershipValidation::OwnersBound);
             if (!run_maintenance_phase("finalizePipelinePreparedResidencyBanks", [&] {
                     const auto weights = model_ctx_->concreteWeightManager();
                     if (!weights) return setError("MoE pipeline has no prepared-engine registry");
                     for (const auto &binding : moe_pipeline_stage_bindings_)
                     {
                         std::string error;
-                        if (!binding->owners().residency->finalizeInitialBanksFromPreparedRegistry(weights->expertGemmRegistry(), &error))
+                        if (!binding->owners().residency->bindOriginalPreparedContext(model_ctx_,
+                                binding->owners().residency->projectionPreparation(),&error) ||
+                            !binding->owners().residency->finalizeInitialBanksFromPreparedRegistry(weights->expertGemmRegistry(), &error))
                             return setError("MoE pipeline prepared banks are incomplete: " + error);
                         recordInitialMoEOverlayBankSelections(*binding->owners().residency,
                             binding->plan()->owner_order, binding->metadata().main_inference_layer_count);
@@ -18695,6 +19706,12 @@ namespace llaminar2
                     return true;
                 }))
                 return false;
+            if (!run_maintenance_phase("preparePipelineCPUHostMaintenance", [&] {
+                    for (const auto &binding : moe_pipeline_stage_bindings_)
+                        if (const auto &owner = binding->owners().host_maintenance; owner)
+                            owner->prepare();
+                    return true;
+                })) return false;
             // Nested TP-in-PP construction prepares weights and persistent
             // state, but deliberately leaves the graph family unmaterialized.
             // Finalized expert banks must precede capture; readiness can only
@@ -18702,12 +19719,21 @@ namespace llaminar2
             if (!run_maintenance_phase("materializePipelineServingGraphs",
                     [&] { return materializeCurrentServingGraphFamilyVariantWithoutLaunch(); }))
                 return false;
-            if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
-                !runner_->deviceResidentMoEOverlayMaintenanceReady())
-                return setError("MoE pipeline did not materialize every native maintenance family");
+            runner_->requireMoEPipelineRuntimeOwnership(
+                IInferenceRunner::MoEPipelineOwnershipValidation::ServingMaterialized);
+            for (const auto &binding : moe_pipeline_stage_bindings_)
+                if (const auto &proof = binding->owners().authority->noPeerResidency(); proof)
+                    PerfStatsCollector::addCounter("moe_overlay_residency", "pipeline_no_peer_ownership_sealed", 1.0,
+                        "model_setup", proof->device().toString(),
+                        {{"first_layer", std::to_string(binding->metadata().first_model_layer)},
+                         {"authority_execution", toString(proof->authorityExecution())},
+                         {"maintenance_mode", moeRebalanceRuntimeModeToString(config_.moe_rebalance.mode)},
+                         {"migration_payload_bytes", "0"}, {"movement_collectives", "0"}});
             PerfStatsCollector::addCounter("moe_overlay_residency", "pipeline_maintenance_composed", 1.0,
                 "model_setup", {}, {{"stages", std::to_string(moe_pipeline_stage_bindings_.size())},
-                    {"authority_execution", "device_resident"}, {"host_maintenance_service", "false"}});
+                    {"authority_execution", "stage_owned"}, {"host_maintenance_service",
+                        std::any_of(moe_pipeline_stage_bindings_.begin(), moe_pipeline_stage_bindings_.end(),
+                            [](const auto &binding) { return bool(binding->owners().host_maintenance); }) ? "true" : "false"}});
             return true;
         }
         if (!moe_expert_overlay_residency_authority_)
@@ -18733,7 +19759,9 @@ namespace llaminar2
                     }
 
                     std::string error;
-                    if (!moe_expert_overlay_participant_residency_
+                    if (!moe_expert_overlay_participant_residency_->bindOriginalPreparedContext(model_ctx_,
+                            moe_expert_overlay_participant_residency_->projectionPreparation(),&error) ||
+                        !moe_expert_overlay_participant_residency_
                              ->finalizeInitialBanksFromPreparedRegistry(
                                  weight_manager->expertGemmRegistry(),
                                  &error))
@@ -18787,10 +19815,48 @@ namespace llaminar2
                 "ExpertOverlay authority maintenance mode disagrees with the frozen runtime configuration");
         }
 
-        std::vector<MoEOverlayParticipantLayerServiceTotals>
-            prepared_cpu_service_measurements;
+        if (const auto &proof = moe_expert_overlay_residency_authority_->noPeerResidency(); proof)
+        {
+            // The identity is frozen against every resident payload, not an
+            // unmaterialized capability. No movement service or fake controller
+            // is constructed for a topology with no alternative owner.
+            if (!run_maintenance_phase("sealNoPeerServingGraphs", [&] {
+                    return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+                }))
+                return false;
+            PerfStatsCollector::addCounter("moe_overlay_residency", "no_peer_ownership_sealed", 1.0,
+                "model_setup", proof->device().toString(),
+                {{"authority_execution", toString(proof->authorityExecution())},
+                 {"maintenance_mode", moeRebalanceRuntimeModeToString(config_.moe_rebalance.mode)},
+                 {"migration_payload_bytes", "0"}, {"movement_collectives", "0"}});
+            return true;
+        }
+
+        if(initial_snapshot->jointOwnerMap() && config_.moe_rebalance.mode==MoERebalanceRuntimeMode::Off) {
+            if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
+               moe_expert_overlay_residency_authority_->migrationEnabled() ||
+               !moe_expert_overlay_participant_residency_->projectionPreparation() ||
+               moe_expert_overlay_participant_residency_->projectionPreparation()->cpuJointOwnerMap().get()!=
+                   initial_snapshot->jointOwnerMap().get())
+                return setError("Static CPU joint startup lost its original immutable fragment authority");
+            if(!run_maintenance_phase("bindStaticJointTransferAndServingGraphs",[&] {
+                return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+            }))return false;
+            PerfStatsCollector::addCounter("moe_overlay_residency","maintenance_not_started",1.0,
+                "model_setup",perf_device,{{"runtime_mode","off"},{"reason","static_joint_native_source"},{"movement","false"}});
+            return true;
+        }
+        const auto maintenance_world = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        const bool local_cpu_host_maintenance = maintenance_world && maintenance_world->world_size() == 1 &&
+            initial_snapshot->placement_plan->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
+            config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+            std::all_of(initial_snapshot->originalOwnerMap().participants().begin(), initial_snapshot->originalOwnerMap().participants().end(),
+                [](const auto &participant) { return participant.device.is_cpu(); });
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> prepared_target_service_plan;
+        std::vector<MoEOverlayPreparedTargetServiceTotals> prepared_target_service_measurements;
         if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
-            !run_maintenance_phase("measurePreparedCPUExpertService", [&]
+            !local_cpu_host_maintenance &&
+            !run_maintenance_phase("measurePreparedExpertService", [&]
             {
                 // This setup thread has the same MPI/NUMA/OpenMP placement as
                 // CPU serving. Finish private observations before maintenance
@@ -18801,15 +19867,51 @@ namespace llaminar2
                 if (!catalog) return setError("Dynamic overlay lost its prepared-service catalog");
                 const auto topology = ExpertHistogramProductionTopology::forRetainedExecution(
                     metadata.num_layers, metadata.main_inference_layer_count,
-                    expertHistogramServingRegime(mtp));
-                prepared_cpu_service_measurements = MoEOverlayCPUServiceMeasurement::measure(
-                    *moe_expert_overlay_participant_residency_, initial_snapshot->epoch,
-                    *catalog, topology,
+                    expertHistogramServingRegime(mtp), metadata.first_model_layer);
+                prepared_target_service_plan = MoEOverlayPreparedTargetServicePlan::checked(
+                    initial_snapshot, catalog, topology);
+                // Graph construction transferred the original TP context to
+                // the rank runner. Borrow that live owner for dispatch policy;
+                // the setup member is now empty and cannot describe the domain.
+                const auto* rank_runner = dynamic_cast<const RankOrchestrator*>(runner_.get());
+                const auto& profile = planningModelMetadata().memoryProfile();
+                prepared_target_service_measurements = MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
+                    *moe_expert_overlay_participant_residency_, *prepared_target_service_plan,
                     {.d_model = metadata.d_model, .intermediate = metadata.routed_intermediate_size},
-                    physical_memory_authority_);
+                    cpu_expert_shard_ctx_, physical_memory_authority_,
+                    &profile, &cluster_inventory_.ranks.at(plan_.rank),
+                    rank_runner ? rank_runner->localTPContext() : nullptr, profile.expert_used_count);
                 return true;
             }))
             return false;
+
+        if (local_cpu_host_maintenance)
+        {
+            if (!run_maintenance_phase("prepareCPUHostMaintenance", [&] {
+                    const auto metadata = resolveMoERoutedExpertModelMetadataForModel(*model_ctx_, retainedMTPConfig());
+                    const auto storage = resolveMoEOverlayCapacityAdmissionPolicy(*initial_snapshot->placement_plan,
+                        config_, 1, metadata.num_layers, metadata.num_experts);
+                    const auto profile_identity = expertOverlayMigrationProfileReuseIdentity(
+                        requested_routed_weight_authority_identity_, *moe_expert_overlay_residency_authority_->economyLayerCatalog());
+                    auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(MoEOverlayCPUHostMaintenance::Config{
+                        .metadata = metadata, .storage = storage, .rebalance = config_.moe_rebalance,
+                        .topology = ExpertHistogramProductionTopology::forRetainedExecution(metadata.num_layers,
+                            metadata.main_inference_layer_count, expertHistogramServingRegime(retainedMTPConfig()), metadata.first_model_layer),
+                        .memory = physical_memory_authority_, .admission = physical_memory_authority_->admission(),
+                        .authority = moe_expert_overlay_residency_authority_, .residency = moe_expert_overlay_participant_residency_,
+                        .histogram = moe_expert_overlay_decode_histogram_,
+                        .presealed_measurements = retained_expert_overlay_migration_profile_identity_ == profile_identity
+                            ? retained_expert_overlay_migration_profile_ : nullptr,
+                        .perf_device = perf_device});
+                    owner->prepare();
+                    moe_expert_overlay_economy_calibration_ = std::shared_ptr<MoEOverlayEconomyCalibrationController>(owner, owner->calibration());
+                    moe_expert_overlay_migration_profile_identity_ = profile_identity;
+                    moe_expert_overlay_maintenance_service_ = std::shared_ptr<MoEOverlayResidencyMaintenanceService>(owner, owner->service());
+                    moe_cpu_host_maintenance_ = std::move(owner);
+                    return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+                })) return false;
+            return true;
+        }
 
         const bool mapped_device_authority =
             initial_snapshot->placement_plan->authority_execution ==
@@ -18855,8 +19957,7 @@ namespace llaminar2
                             "Mapped Dynamic controller disagrees with setup-time physical capacity admission");
                     }
                     auto layer_weight_manifest =
-                        buildMoEOverlayLayerWeightManifestFromGGUF(
-                            model_ctx_->concreteLoader().getModel(),
+                        buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                             metadata.num_layers,
                             metadata.num_experts);
                     const auto calibration_layer_catalog =
@@ -18889,17 +19990,9 @@ namespace llaminar2
                      */
                     if (world_size > 1)
                     {
-                        const MoEOverlayRemoteProjectionLaneBudget lane_budget{
-                            .maximum_participants_per_cycle =
-                                std::max<std::size_t>(
-                                    1u,
-                                    initial_snapshot->owner_map
-                                        .participants().size()),
-                            .maximum_concurrent_cycles =
-                                capacity_policy.maximum_concurrent_cycles,
-                            .projections_per_expert =
-                                kMoEOverlayExpertProjectionCount,
-                        };
+                        const auto lane_budget=remoteMoEOverlayProjectionLaneBudget(
+                        configuredMoEOverlayLaneDemand(*initial_snapshot->placement_plan,layer_weight_manifest,
+                            metadata.num_experts,world_size,capacity_policy.maximum_concurrent_cycles,capacity_policy.maximum_cycles_per_layer));
                         moe_expert_overlay_remote_projection_transport_ =
                             std::make_shared<
                                 MoEOverlayMPIRemoteProjectionTransport>(
@@ -18922,7 +20015,7 @@ namespace llaminar2
                             MoEOverlayMPIEconomyEvidenceExchange>(
                             MoEOverlayMPIEconomyEvidenceExchange::Config{
                                 .mpi_context = overlay_world,
-                                .owner_map = initial_snapshot->owner_map,
+                                .owner_map = initial_snapshot->originalOwnerMap(),
                                 .production_topology = production_topology,
                                 .perf_device = perf_device,
                             });
@@ -18941,6 +20034,8 @@ namespace llaminar2
                                             .registry =
                                                 moe_expert_overlay_participant_residency_,
                                             .initial_snapshot = initial_snapshot,
+                                            .physical_gpu_lane_demand = moe_expert_overlay_memory_admission_
+                                                ? moe_expert_overlay_memory_admission_->physical_gpu_lane_demand : nullptr,
                                             .inventory_authority =
                                                 MoEOverlayPhysicalInventoryAuthority::
                                                     DeviceSlotLedger,
@@ -18960,6 +20055,8 @@ namespace llaminar2
                                             .maximum_execution_streams =
                                                 capacity_policy
                                                     .maximum_execution_streams,
+                                    .maximum_cycles_per_layer = capacity_policy
+                                                    .maximum_cycles_per_layer,
                                             .collect_economy_measurements = true,
                                             .perf_device = perf_device,
                                         });
@@ -18993,16 +20090,7 @@ namespace llaminar2
                                 .perf_device = perf_device,
                             });
                     const auto maximum_migrations_per_wave =
-                        MoEOverlayRemoteProjectionLaneBudget{
-                            .maximum_participants_per_cycle =
-                                std::max<std::size_t>(
-                                    1u,
-                                    initial_snapshot->owner_map
-                                        .participants().size()),
-                            .maximum_concurrent_cycles =
-                                capacity_policy.maximum_concurrent_cycles,
-                            .projections_per_expert = 1u,
-                        }
+                        MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(std::max<std::size_t>( 1u, initial_snapshot->originalOwnerMap() .participants().size()), capacity_policy.maximum_concurrent_cycles, 1u)
                             .projectionOperationCount();
                     if (!maximum_migrations_per_wave)
                     {
@@ -19125,7 +20213,9 @@ namespace llaminar2
                                             .migration_payoff_horizon_tokens,
                                 },
                             .production_topology = production_topology,
-                            .prepared_service_measurements = prepared_cpu_service_measurements,
+                            .prepared_target_service_plan = prepared_target_service_plan,
+                            .prepared_target_service_measurements = prepared_target_service_measurements,
+                            .prepared_service_world_rank = physical_memory_authority_->worldRank(),
                             .evidence_exchange =
                                 std::move(economy_evidence_exchange),
                             .perf_device = perf_device,
@@ -19354,14 +20444,13 @@ namespace llaminar2
                 ExpertHistogramProductionTopology::forRetainedExecution(
                     metadata.num_layers,
                     metadata.main_inference_layer_count,
-                    expertHistogramServingRegime(mtp));
+                    expertHistogramServingRegime(mtp), metadata.first_model_layer);
             const auto economy_sources =
                 production_topology.economyActiveSources();
-            auto layer_weight_manifest =
-                buildMoEOverlayLayerWeightManifestFromGGUF(
-                    model_ctx_->concreteLoader().getModel(),
+            const auto layer_weight_manifest =
+                buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                     metadata.num_layers,
-                    metadata.num_experts);
+                    metadata.num_experts, metadata.first_model_layer);
             const auto calibration_layer_catalog =
                 moe_expert_overlay_residency_authority_
                     ->economyLayerCatalog();
@@ -19405,18 +20494,9 @@ namespace llaminar2
                  * and receive staging buffer is materialized now, never on
                  * maintenance or inference paths.
                  */
-                const MoEOverlayRemoteProjectionLaneBudget lane_budget{
-                    .maximum_participants_per_cycle =
-                        std::max<std::size_t>(
-                            1,
-                            initial_snapshot->owner_map
-                                .participants().size()),
-                    .maximum_concurrent_cycles =
-                        config_.moe_rebalance
-                            .migration_transfer_slots,
-                    .projections_per_expert =
-                        kMoEOverlayExpertProjectionCount,
-                };
+                const auto lane_budget=remoteMoEOverlayProjectionLaneBudget(
+                        configuredMoEOverlayLaneDemand(*initial_snapshot->placement_plan,layer_weight_manifest,
+                            metadata.num_experts,world_size,capacity_policy.maximum_concurrent_cycles,capacity_policy.maximum_cycles_per_layer));
                 /*
                  * Duplicate every private communicator in one invariant order
                  * on every rank before fallible rank-local slot construction.
@@ -19460,7 +20540,7 @@ namespace llaminar2
                     MoEOverlayMPIEconomyEvidenceExchange>(
                     MoEOverlayMPIEconomyEvidenceExchange::Config{
                         .mpi_context = overlay_world,
-                        .owner_map = initial_snapshot->owner_map,
+                        .owner_map = initial_snapshot->originalOwnerMap(),
                         .production_topology = production_topology,
                         .perf_device = perf_device,
                     });
@@ -19485,11 +20565,15 @@ namespace llaminar2
                                     .registry =
                                         moe_expert_overlay_participant_residency_,
                                     .initial_snapshot = initial_snapshot,
+                                    .physical_gpu_lane_demand = moe_expert_overlay_memory_admission_
+                                        ? moe_expert_overlay_memory_admission_->physical_gpu_lane_demand : nullptr,
                                     .inventory_authority =
                                         MoEOverlayPhysicalInventoryAuthority::
                                             ParticipantRegistry,
+                                    // Calibration subsequently authenticates the same
+                                    // immutable complete source descriptors.
                                     .layer_weight_manifest =
-                                        std::move(layer_weight_manifest),
+                                        layer_weight_manifest,
                                     .remote_projection_transport =
                                         moe_expert_overlay_remote_projection_transport_,
                                     .shadow_slots_per_endpoint_layer =
@@ -19503,6 +20587,8 @@ namespace llaminar2
                                     .maximum_execution_streams =
                                         capacity_policy
                                             .maximum_execution_streams,
+                                    .maximum_cycles_per_layer = capacity_policy
+                                            .maximum_cycles_per_layer,
                                     .collect_economy_measurements = true,
                                     .perf_device = perf_device,
                                 });
@@ -19581,7 +20667,7 @@ namespace llaminar2
 
                 std::vector<int> expected_local_gpu_participants;
                 for (const auto &participant :
-                     initial_snapshot->owner_map.participants())
+                     initial_snapshot->originalOwnerMap().participants())
                 {
                     if (participant.device.is_gpu() &&
                         (!participant.world_rank_known ||
@@ -19662,16 +20748,7 @@ namespace llaminar2
                             .perf_device = perf_device,
                         });
                 const auto maximum_migrations_per_wave =
-                    MoEOverlayRemoteProjectionLaneBudget{
-                        .maximum_participants_per_cycle =
-                            std::max<std::size_t>(
-                                1,
-                                initial_snapshot->owner_map
-                                    .participants().size()),
-                        .maximum_concurrent_cycles =
-                            capacity_policy.maximum_concurrent_cycles,
-                        .projections_per_expert = 1,
-                    }
+                    MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(std::max<std::size_t>( 1, initial_snapshot->originalOwnerMap() .participants().size()), capacity_policy.maximum_concurrent_cycles, 1)
                         .projectionOperationCount();
                 if (!maximum_migrations_per_wave)
                 {
@@ -19760,8 +20837,12 @@ namespace llaminar2
                 auto calibration_ledger = std::make_shared<
                     MoEOverlayMigrationMeasurementLedger>(
                     MoEOverlayMigrationMeasurementLedger::Config{
-                        .required_coordinates =
-                            calibration_planner->requiredCoordinates(),
+                        .required_target_measurements = initial_snapshot->jointOwnerMap()
+                            ? calibration_planner->requiredTargetMeasurements(layer_weight_manifest)
+                            : std::vector<MoEOverlayRequiredTargetMigrationMeasurement>{},
+                        .required_coordinates = initial_snapshot->jointOwnerMap()
+                            ? std::vector<MoEOverlayMigrationMeasurementCoordinate>{}
+                            : calibration_planner->requiredCoordinates(),
                         .warmup_samples_per_coordinate = 0,
                         .measured_samples_per_coordinate =
                             MoEOverlayEconomyProfileComposer::
@@ -19812,7 +20893,9 @@ namespace llaminar2
                                         .migration_payoff_horizon_tokens,
                             },
                         .production_topology = production_topology,
-                        .prepared_service_measurements = prepared_cpu_service_measurements,
+                        .prepared_target_service_plan = prepared_target_service_plan,
+                            .prepared_target_service_measurements = prepared_target_service_measurements,
+                            .prepared_service_world_rank = physical_memory_authority_->worldRank(),
                         .evidence_exchange =
                             economy_evidence_exchange,
                         .perf_device = perf_device,
@@ -19821,7 +20904,7 @@ namespace llaminar2
 
             std::shared_ptr<MoEOverlayDeviceServiceTelemetryPublisher>
                 local_device_service_telemetry_publisher;
-            if (local_economy_certification)
+            if (local_economy_certification && !initial_snapshot->jointOwnerMap())
             {
                 for (const auto &binding :
                      host_authority_runtime_bindings)
@@ -19897,7 +20980,7 @@ namespace llaminar2
                   std::to_string(local_ids.size())},
                  {"global_participants",
                   std::to_string(
-                      initial_snapshot->owner_map.participants().size())},
+                      initial_snapshot->originalOwnerMap().participants().size())},
                  {"world_rank", std::to_string(world_rank)},
                  {"world_size", std::to_string(world_size)},
                  {"distributed", distributed ? "true" : "false"},
@@ -19920,6 +21003,12 @@ namespace llaminar2
     bool OrchestrationRunner::
         startMoEExpertOverlayResidencyMaintenance()
     {
+        try
+        {
+            for (const auto &binding : moe_pipeline_stage_bindings_)
+                if (const auto &owner = binding->owners().host_maintenance; owner) owner->start();
+        }
+        catch (const std::exception &error) { return setError("CPU pipeline maintenance activation failed: " + std::string(error.what())); }
         if (moe_overlay_device_controller_graph_service_ &&
             moe_expert_overlay_maintenance_service_)
         {
@@ -19998,6 +21087,17 @@ namespace llaminar2
             terminal_moe_device_controller_drain_result_.reset();
         }
 
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+            {
+                try { owner->stopAndDrain(); }
+                catch (const std::exception &error)
+                {
+                    model_context_reuse_seal_succeeded_ = false;
+                    model_context_reuse_seal_error_ = "CPU pipeline maintenance drain failed: " + std::string(error.what());
+                    LOG_ERROR(model_context_reuse_seal_error_);
+                }
+            }
         /*
          * The topology-wide device service owns the only thread that may touch
          * descriptor inboxes or the physical slot ledger. Stop and join it
@@ -20155,6 +21255,7 @@ namespace llaminar2
         moe_expert_overlay_wave_factory_.reset();
         moe_expert_overlay_device_bank_publisher_.reset();
         moe_expert_overlay_physical_residency_fabric_.reset();
+        moe_cpu_host_maintenance_.reset();
         moe_expert_overlay_remote_projection_transport_.reset();
         moe_expert_overlay_residency_consensus_.reset();
     }
@@ -20208,14 +21309,15 @@ namespace llaminar2
 
     bool OrchestrationRunner::rebindModelRegistryFromReusableContextSeal(
         const MoEOverlayReusableContextSeal &seal,
-        std::string *error) noexcept
+        std::string *error,
+        const std::shared_ptr<MoEOverlayParticipantResidencyRegistry> &residency) noexcept
     {
         if (error)
             error->clear();
         try
         {
             if (!seal.valid() || !model_ctx_ ||
-                !moe_expert_overlay_participant_residency_)
+                !residency)
             {
                 if (error)
                 {
@@ -20242,130 +21344,17 @@ namespace llaminar2
              * placement, so consulting one here would recreate a host shadow and
              * compare its initial epoch with the device's restored durable epoch.
              */
-            const auto &canonical_owner_map = seal.canonical_owner_map;
-
-            std::vector<ExpertGemmRegistry::ParticipantLayerScope> scopes;
-            std::vector<ExpertGemmRegistry::ParticipantExpertBinding>
-                bindings;
-            const auto participant_ids =
-                moe_expert_overlay_participant_residency_
-                    ->localParticipantIds();
-            if (seal.local_banks.size() != participant_ids.size())
+            const auto participant_ids = residency->localParticipantIds();
+            std::size_t scope_count = 0, resident_count = 0;
+            for (const auto &bank : seal.local_banks)
             {
-                if (error)
-                {
-                    *error =
-                        "prepared model context seal does not cover every process-local participant";
-                }
-                return false;
+                scope_count += bank.layers.size();
+                for (const auto &layer : bank.layers)
+                    resident_count += std::count(layer.resident_mask.begin(), layer.resident_mask.end(), true);
             }
-            for (const int participant_id : participant_ids)
-            {
-                const auto *participant =
-                    canonical_owner_map.participantForId(participant_id);
-                const auto endpoint =
-                    moe_expert_overlay_participant_residency_->endpoint(
-                        participant_id);
-                if (!participant || !endpoint)
-                {
-                    if (error)
-                    {
-                        *error =
-                            "prepared model context rebind cannot resolve local participant " +
-                            std::to_string(participant_id);
-                    }
-                    return false;
-                }
-                const auto bank = std::find_if(
-                    seal.local_banks.begin(),
-                    seal.local_banks.end(),
-                    [participant_id](
-                        const MoEOverlayParticipantResidencyBank &candidate)
-                    { return candidate.participant_id == participant_id; });
-                if (bank == seal.local_banks.end() ||
-                    !bank->valid(
-                        participant_id,
-                        participant->device,
-                        endpoint->numLayers(),
-                        endpoint->numExperts(),
-                        endpoint->firstModelLayer()))
-                {
-                    if (error)
-                    {
-                        *error =
-                            "prepared model context rebind cannot acquire the complete canonical bank for participant " +
-                            std::to_string(participant_id);
-                    }
-                    return false;
-                }
-
-                const int world_rank = participant->world_rank_known
-                                           ? participant->world_rank
-                                           : -1;
-                for (int layer = endpoint->firstModelLayer(); layer < endpoint->endModelLayer(); ++layer)
-                {
-                    const auto &layer_bank = bank->layerForModelLayer(layer);
-                    const auto expected_mask =
-                        canonical_owner_map.expertMaskForParticipant(
-                            layer,
-                            participant_id,
-                            endpoint->numExperts());
-                    if (layer_bank.resident_mask != expected_mask)
-                    {
-                        if (error)
-                        {
-                            *error =
-                                "prepared model context rebind found a participant bank that disagrees with the published owner map";
-                        }
-                        return false;
-                    }
-
-                    ExpertGemmRegistry::ParticipantLayerScope scope{
-                        .domain_name = participant->domain_name,
-                        .device = participant->device,
-                        .participant_world_rank = world_rank,
-                        .participant_index =
-                            participant->domain_participant_index,
-                        .layer = layer,
-                    };
-                    scopes.push_back(scope);
-                    for (int expert = 0;
-                         expert < endpoint->numExperts();
-                         ++expert)
-                    {
-                        if (!layer_bank.resident_mask[
-                                static_cast<std::size_t>(expert)])
-                        {
-                            continue;
-                        }
-                        const auto &triplet = layer_bank.experts.at(
-                            static_cast<std::size_t>(expert));
-                        if (!triplet.complete())
-                        {
-                            if (error)
-                            {
-                                *error =
-                                    "prepared model context rebind found an incomplete resident expert triplet";
-                            }
-                            return false;
-                        }
-                        bindings.push_back({
-                            .scope = scope,
-                            .expert = expert,
-                            .gate = triplet.gate(),
-                            .up = triplet.up(),
-                            .down = triplet.down(),
-                        });
-                    }
-                }
-            }
-
             std::string registry_error;
             if (!weight_manager->expertGemmRegistry()
-                     .replaceParticipantResidency(
-                         scopes,
-                         bindings,
-                         &registry_error))
+                     .replaceParticipantResidencyFromSeal(seal, *residency, &registry_error))
             {
                 if (error)
                 {
@@ -20385,9 +21374,9 @@ namespace llaminar2
                  {"local_participants",
                   std::to_string(participant_ids.size())},
                  {"participant_layer_scopes",
-                  std::to_string(scopes.size())},
+                  std::to_string(scope_count)},
                  {"resident_experts",
-                  std::to_string(bindings.size())},
+                  std::to_string(resident_count)},
                  {"compacted_shadow_experts",
                   std::to_string(seal.compacted_shadow_experts)}});
             return true;
@@ -20472,7 +21461,38 @@ namespace llaminar2
                 return true;
             }
             if (moe_pipeline_prepared_plan_)
-                throw std::logic_error("Pipeline prepared-context sealing requires immutable native source storage");
+            {
+                if (moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                    throw std::logic_error("Mutable pipeline sealing lost exact stage ownership");
+                if (!model_context_pipeline_host_restored_)
+                {
+                    for (const auto &binding : moe_pipeline_stage_bindings_)
+                        if (const auto &owner = binding->owners().host_maintenance; owner)
+                        {
+                            owner->stopAndDrain();
+                            const auto seal = owner->restorePreparedPlacement();
+                            if (!rebindModelRegistryFromReusableContextSeal(seal, error, binding->owners().residency)) return false;
+                        }
+                    model_context_pipeline_host_restored_ = true;
+                }
+                // Native directory sources remain immutable but may be bound by
+                // captured children. Their final proof follows child retirement.
+                if (runner_) return true;
+                const auto weights = model_ctx_->concreteWeightManager();
+                if (!weights) throw std::logic_error("Mutable pipeline seal lost its model weight registry");
+                for (const auto &binding : moe_pipeline_stage_bindings_)
+                {
+                    if (binding->owners().host_maintenance)
+                    {
+                        if (!binding->owners().authority->initialPreparedPlacementPublished() ||
+                            binding->owners().authority->activeTicketCount() != 0)
+                            throw std::logic_error("CPU pipeline prepared placement changed after terminal restoration");
+                    }
+                    else (void)binding->owners().residency->verifyImmutablePreparedSources(weights->expertGemmRegistry());
+                }
+                model_context_physical_state_sealed_ = true;
+                return true;
+            }
             if (!moe_expert_overlay_residency_authority_)
             {
                 const bool requires_dynamic_overlay_seal =
@@ -20490,6 +21510,14 @@ namespace llaminar2
                     }
                     return false;
                 }
+                model_context_physical_state_sealed_ = true;
+                return true;
+            }
+            if (moe_cpu_host_maintenance_)
+            {
+                moe_cpu_host_maintenance_->stopAndDrain();
+                const auto seal = moe_cpu_host_maintenance_->restorePreparedPlacement();
+                if (!rebindModelRegistryFromReusableContextSeal(seal, error, moe_expert_overlay_participant_residency_)) return false;
                 model_context_physical_state_sealed_ = true;
                 return true;
             }
@@ -20551,7 +21579,7 @@ namespace llaminar2
                             error);
                 if (!physical_seal ||
                     !rebindModelRegistryFromReusableContextSeal(
-                        *physical_seal, error))
+                        *physical_seal, error, moe_expert_overlay_participant_residency_))
                 {
                     return false;
                 }
@@ -20667,9 +21695,7 @@ namespace llaminar2
             const auto current =
                 moe_expert_overlay_residency_authority_->snapshot();
             const std::size_t maximum_waves = current
-                ? current->layered_ownership.layerCount() *
-                      current->layered_ownership.expertCount() +
-                      1u
+                ? preparedPlacementRestorationWaveLimit(*current)
                 : 0u;
             while (!moe_expert_overlay_residency_authority_
                         ->initialPreparedPlacementPublished())
@@ -20725,7 +21751,7 @@ namespace llaminar2
                         published->epoch, error);
             if (!physical_seal ||
                 !rebindModelRegistryFromReusableContextSeal(
-                    *physical_seal, error))
+                    *physical_seal, error, moe_expert_overlay_participant_residency_))
                 return false;
             model_context_physical_state_sealed_ = true;
             PerfStatsCollector::addCounter(
@@ -20825,11 +21851,35 @@ namespace llaminar2
                 const size_t reusable_workspace_bytes =
                     reusable_execution_workspaces_->retainedPrimaryBytes(
                         device);
+                size_t immutable_table_bytes=model_ctx_->residentImmutableRowTableBytes(device);
+                size_t immutable_lookup_staging_bytes=0;
+                // Physical roots survive execution-reader teardown. A shared
+                // reader may own remote cache roots, or no immutable roots at
+                // all; neither case creates a source boundary on that device.
+                const auto actual=model_ctx_->retainedAdaptiveImmutableLookupOwners({plan_.rank,device});
+                if(!actual.empty() && immutable_table_bytes)
+                    throw std::logic_error("Resident and adaptive immutable table ownership cannot overlap");
+                for(const auto& owner:actual)
+                {
+                    if(owner.authority().get()!=physical_memory_authority_.get() ||
+                       owner.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(owner.authority()) ||
+                       owner.allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
+                        throw std::invalid_argument("Adaptive retention must observe its exact original GPU/PMA root claims");
+                    // Only actual disjoint surviving owners author these bytes.
+                    // This projects their claims for retention; it never chooses
+                    // capacity, reserves memory or copies cache occupancy.
+                    if(owner.tableStorageBytes()>std::numeric_limits<std::size_t>::max()-immutable_table_bytes ||
+                       owner.lookupStagingBytes()>std::numeric_limits<std::size_t>::max()-immutable_lookup_staging_bytes)
+                        throw std::overflow_error("Adaptive immutable retention byte total overflowed");
+                    immutable_table_bytes+=owner.tableStorageBytes();
+                    immutable_lookup_staging_bytes+=owner.lookupStagingBytes();
+                }
                 ModelDeviceMemoryRetention row{
                     .device = device,
                     .prepared_weight_bytes = prepared_weight_bytes,
-                    .reusable_workspace_bytes =
-                        reusable_workspace_bytes,
+                    .reusable_workspace_bytes = reusable_workspace_bytes,
+                    .immutable_table_bytes = immutable_table_bytes,
+                    .immutable_lookup_staging_bytes = immutable_lookup_staging_bytes,
                 };
                 /*
                  * A participant that owns only model weights is a complete
@@ -20837,7 +21887,7 @@ namespace llaminar2
                  * execute entirely from participant-local graph workspaces,
                  * leaving this runner's reusable primary-workspace registry
                  * empty.  ModelDeviceMemoryRetention deliberately models the
-                 * two disjoint allocation classes independently, so requiring
+                 * four disjoint allocation classes independently, so requiring
                  * both to be positive would invalidate a real weights-only
                  * owner and make the next collective admission asymmetric.
                  */
@@ -20851,7 +21901,8 @@ namespace llaminar2
                             ": prepared_weight_bytes=" +
                             std::to_string(prepared_weight_bytes) +
                             " reusable_workspace_bytes=" +
-                            std::to_string(reusable_workspace_bytes);
+                            std::to_string(reusable_workspace_bytes) +
+                            " immutable_table_bytes=" + std::to_string(immutable_table_bytes);
                     }
                     return false;
                 }
@@ -20863,6 +21914,7 @@ namespace llaminar2
                     << prepared_weight_bytes
                     << " reusable_workspace_bytes="
                     << reusable_workspace_bytes
+                    << " immutable_table_bytes=" << immutable_table_bytes
                     << " total_bytes=" << row.totalBytes());
             }
             return true;
@@ -20893,8 +21945,25 @@ namespace llaminar2
             return true;
         }
 
-        // Run validation
-        auto result = TPPPValidator::validate(config_, *model_ctx_);
+        TPPPValidationResult result;
+        if (moe_pipeline_topology_ && moe_pipeline_topology_->globalPipeline())
+        {
+            // setupLocalTPContext deliberately creates no enclosing context:
+            // the graph factory later gives every original stage its sole TP
+            // owner. Validate the same sealed stage declarations before PMA or
+            // native graph construction, rather than inventing another owner.
+            if (local_tp_ctx_ || !mpi_ctx_)
+                return setError("Global stage TP validation found a duplicate rank context or missing original MPI owner");
+            result = validateResolvedGlobalStageTP(*moe_pipeline_topology_, *model_ctx_, mpi_ctx_->rank());
+        }
+        else
+        {
+            if(plan_.usesLocalTP() && !plan_.usesLocalPP() && !local_tp_ctx_)
+                return setError("TP validation lacks the already-resolved LocalTP context");
+            const auto membership=local_tp_ctx_
+                ?TPPPAssignmentMembership::resolved(local_tp_ctx_->devices()):TPPPAssignmentMembership::structural();
+            result = TPPPValidator::validate(config_, *model_ctx_,membership);
+        }
 
         // Log warnings (but don't fail)
         for (const auto &warning : result.warnings)
@@ -20944,7 +22013,7 @@ namespace llaminar2
         return true;
     }
 
-    bool OrchestrationRunner::refreshRankLocalGPUCapacityObservations(
+    bool OrchestrationRunner::prepareRankLocalGPUContexts(
         const std::vector<DeviceId> &devices,
         std::string_view purpose)
     {
@@ -20957,14 +22026,6 @@ namespace llaminar2
             const int world_rank = overlay_world
                                        ? overlay_world->rank()
                                        : plan_.rank;
-            if (world_rank < 0 ||
-                world_rank >=
-                    static_cast<int>(cluster_inventory_.ranks.size()))
-            {
-                return setError(
-                    "Runtime GPU capacity observation has no rank inventory");
-            }
-
             std::vector<DeviceId> unique_gpus;
             unique_gpus.reserve(devices.size());
             for (const DeviceId device : devices)
@@ -20980,74 +22041,91 @@ namespace llaminar2
                 unique_gpus.push_back(device);
             }
 
-            /*
-             * Finish every lazy backend/context allocation before observing
-             * any participant. Sampling one GPU while another context is
-             * still being initialized would give the rank a mixed lifecycle
-             * inventory and make automatic capacity order-dependent.
-             */
-            for (const DeviceId device : unique_gpus)
-                (void)GPUDeviceContextPool::instance().getContext(device);
-
-            auto &rank_inventory =
-                cluster_inventory_.ranks[static_cast<std::size_t>(world_rank)];
-            for (const DeviceId device : unique_gpus)
-            {
-                IBackend *const backend = getBackendFor(device);
-                if (!backend)
-                {
-                    return setError(
-                        "Runtime GPU capacity observation has no backend for " +
-                        device.toString());
+            const auto computeWorkerCount = unique_gpus.size();
+            const auto storageParticipants = plan_.runtime.ngram_table_policy.isGPUAdaptive()
+                ? plan_.runtime.ngram_table_policy.gpu_adaptive.placement.declaredParticipants()
+                : std::vector<AdaptiveGPUCacheParticipant>{};
+            if (!unique_gpus.empty() || !storageParticipants.empty()) {
+                if (world_rank < 0 || world_rank >= static_cast<int>(cluster_inventory_.ranks.size()))
+                    return setError("Native GPU preparation has no original rank inventory");
+                // Every GPU graph can own native event/graph resources. Their
+                // typed BOM requires the same original prepared worker whether
+                // ngrams use RAM, SSD, VRAM or adaptive caches. Storage policy
+                // contributes endpoints; it never selects another birth path.
+                // Storage endpoints are mandatory source-worker births, not
+                // extra compute/expert participants. Preserve authored ordering
+                // while deduplicating coordinator/consumer aliases exactly.
+                for(const auto& endpoint:storageParticipants){
+                    if(endpoint.world_rank!=world_rank || !endpoint.device().is_gpu())
+                        throw std::invalid_argument("Declared immutable source worker must be an exact rank-local native GPU");
+                    if(std::find(unique_gpus.begin(),unique_gpus.end(),endpoint.device())==unique_gpus.end())
+                        unique_gpus.push_back(endpoint.device());
                 }
-
-                const auto prior = std::find_if(
-                    rank_inventory.gpus.begin(),
-                    rank_inventory.gpus.end(),
-                    [&](const DeviceInfo &gpu)
-                    {
-                        return gpu.type == device.type &&
-                               gpu.local_device_id == device.ordinal;
-                    });
-                const std::size_t discovery_free_bytes =
-                    prior == rank_inventory.gpus.end()
-                        ? 0u
-                        : prior->free_memory_bytes;
-                const std::size_t total_bytes =
-                    backend->deviceMemoryTotal(device.ordinal);
-                const std::size_t free_bytes =
-                    backend->deviceMemoryFree(device.ordinal);
-                installMoEOverlayRuntimeGPUCapacityObservation(
-                    rank_inventory,
-                    device,
-                    total_bytes,
-                    free_bytes);
-                const std::size_t newly_owned_bytes =
-                    discovery_free_bytes > free_bytes
-                        ? discovery_free_bytes - free_bytes
-                        : 0u;
-
-                LOG_DEBUG(
-                    "[MoEOverlayCapacity] Runtime-stable GPU observation device="
-                    << device.toString()
-                    << " purpose=" << purpose
-                    << " prior_free=" << discovery_free_bytes
-                    << " runtime_free=" << free_bytes
-                    << " newly_owned=" << newly_owned_bytes);
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_capacity",
-                    "runtime_stable_gpu_memory_observation",
-                    1.0,
-                    "model_setup",
-                    device.toString(),
-                    {{"backend", backend->backendName()},
-                     {"purpose", std::string(purpose)},
-                     {"prior_free_bytes",
-                      std::to_string(discovery_free_bytes)},
-                     {"runtime_free_bytes", std::to_string(free_bytes)},
-                     {"newly_owned_bytes",
-                      std::to_string(newly_owned_bytes)}});
+                // Validate every selected role even when borrowing an existing
+                // source. Storage-only/coordinator workers are not represented
+                // by the plan's primary/TP devices and cannot borrow visibility
+                // as permission to execute on another NUMA node.
+                const auto &owner_inventory = cluster_inventory_.ranks.at(static_cast<std::size_t>(world_rank));
+                for (const auto device : unique_gpus)
+                    requireRankLocalGPUOwnership(owner_inventory, device,
+                        "Native GPU preparation (" + std::string(purpose) + ")");
+                // Immutable inventory startup is a separately measured baseline.
+                // These ORIGINAL observations precede selected worker birth; no
+                // later free-memory sample may adopt that birth after growth.
+                auto source=plan_.runtime.native_context_preparation;
+                if(!source && model_ctx_)source=model_ctx_->nativeContextPreparation();
+                if(!source){
+                    if(unique_gpus.empty())throw std::invalid_argument("Native source has no selected GPU participants");
+                    const auto& observed=cluster_inventory_.ranks.at(static_cast<std::size_t>(world_rank));
+                    std::vector<PhysicalMemoryResource> resources;
+                    resources.push_back({world_rank,DeviceId::cpu(),observed.cpu.memory_bytes?observed.cpu.memory_bytes:observed.cpu_memory_bytes,
+                        PhysicalMemoryAuthority::admissionCapacity(observed.cpu.free_memory_bytes,config_.memoryLimitBytes(DeviceType::CPU))});
+                    for(const auto device:unique_gpus){
+                        const auto found=std::find_if(observed.gpus.begin(),observed.gpus.end(),[&](const auto& gpu){return gpu.type==device.type && gpu.local_device_id==device.ordinal;});
+                        if(found==observed.gpus.end())throw std::invalid_argument("Selected source worker is absent from original rank inventory");
+                        resources.push_back({world_rank,device,found->memory_bytes,
+                            PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))});
+                    }
+                    if(config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesExpertOverlayAuthority()){
+                        // The one source PMA must retain the SAME topology-wide
+                        // registry later frozen by global capacity admission.
+                        // Only its explicit local devices below create workers.
+                        const int world_size=overlay_world?overlay_world->world_size():1;
+                        const auto execution=resolveMoEExpertOverlayExecutionPlan(config_.moe_routed_expert_plan,
+                            {.current_world_rank=world_rank,.world_size=world_size});
+                        const auto metadata=resolveMoERoutedExpertModelMetadataForModel(*model_ctx_,retainedMTPConfig());
+                        const auto policy=resolveMoEOverlayCapacityAdmissionPolicy(*config_.moe_routed_expert_plan,
+                            config_,world_size,metadata.num_layers,metadata.num_experts);
+                        resources=originalMoEOverlayNativePreparationResources(execution,cluster_inventory_,config_,policy,
+                            plan_.runtime.ngram_table_policy);
+                    }
+                    source=NativeContextPreparation::create(resources,world_rank,unique_gpus);
+                    try {
+                        std::vector<PreparedGPUContextUsePermit> creation;
+                        for(const auto device:unique_gpus)creation.push_back(source->acquire(device));
+                        source->freezeForPlanning();
+                    }catch(...){
+                        // Actual created/failed births only. Foreign legacy workers
+                        // must never be reset merely because this source rejected them.
+                        source->retireUnadmitted();throw;
+                    }
+                    created_native_context_source_=source;
+                    plan_.runtime.native_context_preparation=source;
+                }else{
+                    if(source->memory()->worldRank()!=world_rank)throw std::logic_error("Source worker plan crossed original physical ranks");
+                    for(const auto device:unique_gpus){source->requireSelectedDevice(device);
+                        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory());
+                        if(original.device()!=device)throw std::logic_error("Original source worker device identity changed");}
+                    plan_.runtime.native_context_preparation=source;
+                }
+                PerfStatsCollector::addCounter("native_context_source","original_prequota_source",1.0,"model_setup",{},
+                    {{"selected_workers",std::to_string(unique_gpus.size())},{"compute_workers",std::to_string(computeWorkerCount)},{"declared_storage_workers",std::to_string(storageParticipants.size())},{"runtime_startup_population","separate_baseline"},{"purpose",std::string(purpose)}});
+                return true;
             }
+
+            // A CPU-only rank has no native worker birth. Do not resample
+            // physical capacity after setup: the original source PMA retains
+            // its observations and accounts every original context commitment.
             return true;
         }
         catch (const std::exception &error)
@@ -21069,6 +22147,15 @@ namespace llaminar2
         try
         {
             const int current_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            if(plan_.runtime.native_context_preparation){
+                const auto& source=plan_.runtime.native_context_preparation;
+                source->admitFinal(physical_memory_admission_);
+                if(physical_memory_authority_ && physical_memory_authority_!=source->memory())
+                    throw std::logic_error("Canonical publication cannot replace original source PMA");
+                physical_memory_authority_=source->memory();
+                if(!model_ctx_->nativeContextPreparation())model_ctx_->bindNativeContextPreparation(source);
+                else if(model_ctx_->nativeContextPreparation()!=source)throw std::logic_error("Model source differs from original native admission");
+            }
             if (!physical_memory_authority_)
             {
                 physical_memory_authority_ = std::make_shared<
@@ -21092,6 +22179,9 @@ namespace llaminar2
             }
             weight_manager->installPhysicalMemoryAuthority(
                 physical_memory_authority_);
+            // Ngram storage is selected in the final immutable plan. Materialization
+            // occurs at each participant factory after its ordinary upload drains;
+            // publishing PMA must not consume that lower-priority allocation early.
             return true;
         }
         catch (const std::exception &error)
@@ -21108,6 +22198,11 @@ namespace llaminar2
         {
             LOG_WARN("[MemoryPlanner] No model context — skipping memory validation");
             return true;
+        }
+
+        if(!plan_.runtime.native_context_preparation){
+            if(!prepareRankLocalGPUContexts(rankLocalGPUExecutionDevices(plan_,config_.moe_routed_expert_plan,
+                moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_),"source_prequota_birth"))return false;
         }
 
         if (snapshot_capture_setup_.enabled() &&
@@ -21235,7 +22330,7 @@ namespace llaminar2
              * would otherwise reject valid reuse or admit against bytes owned
              * by a now-retired external process.
              */
-            if (!refreshRankLocalGPUCapacityObservations(
+            if (!prepareRankLocalGPUContexts(
                     rankLocalGPUExecutionDevices(
                         plan_,
                         config_.moe_routed_expert_plan,
@@ -21277,12 +22372,109 @@ namespace llaminar2
             .plan = plan_,
             .inventory = cluster_inventory_.ranks.at(plan_.rank),
             .weight_load_geometry = fresh_gpu_weight_load_geometry,
+            .native_weight_source_policy = retained_prepared_weight_plan_validated_
+                ? std::nullopt : std::optional{configuredGPUWeightLoadMemoryPolicy()},
+            .weight_precision = WeightPrecision::NATIVE,
+            .native_source_placement = retained_prepared_weight_plan_validated_
+                ? std::nullopt : std::optional{model_ctx_->concreteLoader().nativeWeightSourcePlacement()},
             .snapshot_capacity = snapshot_capture_setup_.enabled()
                 ? std::optional{snapshot_capture_setup_.memory_capacity} : std::nullopt,
             .captured_prefill_buckets = std::move(captured_prefill_buckets),
             .max_gpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CUDA),
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
         });
+
+        // CPU threads are not needed to observe GPUs. Only immutable role/BOM
+        // declarations precede quotas; actual CPU0 map/object/pthread birth is
+        // normal final-Admitted materialization before source/graph capture.
+        if(!plan_.runtime.retained_host_services)
+            plan_.runtime.retained_host_services=MemoryPlanner::declareRetainedHostServices(profile,device_configs,plan_.rank,
+                config_.moe_routed_expert_plan.get(),(moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_).get());
+        else {
+            if(plan_.runtime.retained_host_services->worldRank()!=plan_.rank)throw std::logic_error("Runner CPU declarations crossed physical ranks");
+            for(auto& cfg:device_configs)cfg.retained_host_services=plan_.runtime.retained_host_services;
+        }
+
+        const auto retained_table=imported_model_context_reuse_authority_
+            ? model_ctx_->resolvedImmutableRowTablePlacement() : nullptr;
+        if(retained_table)
+        {
+            if(!plan_.runtime.ngram_table_placement || *retained_table!=*plan_.runtime.ngram_table_placement)
+                throw std::invalid_argument("Retained model and execution plan have different resolved ngram placements");
+            for(auto &cfg:device_configs)
+                if(cfg.ngram_table_placement)
+                {
+                    const auto execution=retained_table->lookupForConsumer({cfg.world_rank,cfg.device});
+                    if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
+                    {
+                        const auto& layout=retained_table->gpuAdaptiveLayout();
+                        const auto& request=retained_table->gpuAdaptiveRequest();
+                        const bool independent=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
+                        const auto sourceAllocator=independent?PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device}:
+                            AdaptiveImmutableLookupGeometry::sourceLayout(layout,request).consumers().front();
+                        const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(sourceAllocator.device);
+                        if(!boundary)throw std::invalid_argument("Retained mixed ngrams lost their original source boundary");
+                        const auto source=boundary->retainedSourceOwnerObservation();
+                        if(source.authority().get()!=physical_memory_authority_.get() ||
+                           source.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(source.authority()) ||
+                           source.allocator()!=layout.sourceServices().front().allocator ||
+                           source.hostPlacement()!=retained_table->hostPlacement())
+                            throw std::invalid_argument("Retained mixed source changed its exact allocator, locality or canonical authority");
+                        const auto checkedAdd=[](std::size_t& total,std::size_t bytes) {
+                            if(bytes>std::numeric_limits<std::size_t>::max()-total)
+                                throw std::overflow_error("Retained immutable lookup byte observation overflowed");
+                            total+=bytes;
+                        };
+                        for(const auto& gpu:model_ctx_->retainedAdaptiveImmutableLookupOwners({cfg.world_rank,cfg.device})) {
+                            if(gpu.authority().get()!=physical_memory_authority_.get() ||
+                               gpu.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(gpu.authority()) ||
+                               gpu.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device})
+                                throw std::invalid_argument("Retained mixed native roots changed their exact GPU/PMA authority");
+                            checkedAdd(cfg.retained_immutable_table_bytes,gpu.tableStorageBytes());
+                            checkedAdd(cfg.retained_immutable_lookup_staging_bytes,gpu.lookupStagingBytes());
+                        }
+                        // The shared source and local ready pages are distinct
+                        // CPU owners. Only the authored coordinator imports
+                        // their rank-wide credit; a reader's local GPU roots
+                        // never manufacture an independent host source.
+                        if(cfg.device==sourceAllocator.device) {
+                            cfg.retained_immutable_source_table_bytes=source.tableStorageBytes();
+                            cfg.retained_immutable_source_lookup_staging_bytes=source.lookupStagingBytes();
+                            for(const auto& ready:model_ctx_->retainedAdaptiveImmutableLookupLocalReadyOwners()) {
+                                if(ready.authority().get()!=physical_memory_authority_.get() ||
+                                   ready.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(ready.authority()) ||
+                                   ready.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,DeviceId::cpu()} || ready.tableStorageBytes())
+                                    throw std::invalid_argument("Retained local ready page changed its original CPU/PMA owner");
+                                checkedAdd(cfg.retained_immutable_local_ready_staging_bytes,ready.lookupStagingBytes());
+                            }
+                            if(!cfg.retained_immutable_lookup_staging_bytes || !cfg.retained_immutable_source_lookup_staging_bytes ||
+                               !cfg.retained_immutable_source_table_bytes)
+                                throw std::invalid_argument("Retained mixed C0 still requires its complete original frame/source/channel leases");
+                        }
+                    }
+                    else if(immutableRowLookupUsesNativeDeviceStorage(execution))
+                        cfg.retained_immutable_table_bytes=model_ctx_->residentImmutableRowTableBytes(cfg.device);
+                    else
+                    {
+                        const auto table=model_ctx_->hostImmutableRowProvider();
+                        if(!table)throw std::invalid_argument("Retained hosted ngrams lost their actual provider");
+                        const auto owner=table->retainedOwnerObservation();
+                        if(!retained_table->containsAllocator(owner.allocator()) || owner.hostPlacement()!=retained_table->hostPlacement() ||
+                            owner.authority().get()!=physical_memory_authority_.get())
+                            throw std::invalid_argument("Retained hosted ngram owner does not match its exact admitted placement/PMA");
+                        cfg.retained_immutable_table_bytes=owner.tableStorageBytes();
+                        cfg.retained_immutable_lookup_staging_bytes=owner.lookupStagingBytes();
+                    }
+                    if(execution!=ImmutableRowLookupExecution::AdaptiveGPUCache && !cfg.retained_immutable_table_bytes)
+                        throw std::invalid_argument("Retained ngram placement has no complete physical allocation");
+                    if(cfg.device.is_gpu())
+                    {
+                        if(plan_.runtime.resident_graph_rows<=0)
+                            throw std::invalid_argument("Retained ngram graph has no original frozen row capacity");
+                        cfg.activation_seq_len=plan_.runtime.resident_graph_rows;
+                    }
+                }
+        }
 
         // Retained credits require the existing live owner attestations. The
         // shared metadata builder cannot manufacture this lifecycle evidence.
@@ -21353,7 +22545,7 @@ namespace llaminar2
             });
 
         MemoryPlan plan;
-        if (has_resident_graph_participant &&
+        if (!retained_table && has_resident_graph_participant &&
             debugEnv().execution.gpu_graphs &&
             debugEnv().execution.prefill_graph_buckets)
         {
@@ -21367,6 +22559,7 @@ namespace llaminar2
             plan_.runtime.resident_graph_rows =
                 resident_plan.resident_graph_rows;
             plan = std::move(resident_plan.memory_plan);
+            device_configs=std::move(resident_plan.device_inputs);
 
             if (plan.fits())
             {
@@ -21397,6 +22590,23 @@ namespace llaminar2
             return setError(msg);
         }
 
+        PhysicalMemoryPlan final_plan=plan.physicalPlan();
+        if(!retained_table)
+        {
+            const std::vector<std::vector<DevicePlanConfig>> groups{device_configs};
+            const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+            const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                plan_.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+            if(request)
+            {
+                if(imported_model_context_reuse_authority_)
+                    throw std::invalid_argument("Retained model context has no exact complete ngram placement");
+                auto selected=ImmutableRowTablePlacementPlanner::select(*request,final_plan);
+                plan_.runtime.ngram_table_placement=std::move(selected.placement);
+                final_plan=std::move(selected.physical_plan);
+            }
+        }
+
         if (imported_model_context_reuse_authority_)
         {
             if (!physical_memory_admission_ ||
@@ -21410,7 +22620,7 @@ namespace llaminar2
             if (const auto mismatch =
                     physical_memory_admission_->plan()
                         .requiredFootprintMismatch(
-                            plan.physicalPlan()))
+                            final_plan))
             {
                 return setError(
                     "Prepared-model reuse exceeds its admitted physical-memory envelope: " +
@@ -21419,6 +22629,9 @@ namespace llaminar2
             if (!publishPhysicalMemoryAuthority())
                 return false;
 
+            // The validated reuse handoff already retained the original
+            // attention admission. This footprint check cannot resolve new
+            // defaults or replace that immutable policy object.
             LOG_DEBUG(
                 "[MemoryPlanner] Retained physical-memory authority accepts "
                 "the current runner footprint:\n"
@@ -21432,9 +22645,11 @@ namespace llaminar2
                 "Ordinary memory validation encountered an already-installed physical-memory authority");
         }
         physical_memory_admission_ = std::make_shared<
-            const PhysicalMemoryPlanAdmissionCertificate>(plan.admit());
+            const PhysicalMemoryPlanAdmissionCertificate>(final_plan);
         if (!publishPhysicalMemoryAuthority())
             return false;
+        plan_.runtime.attention_participants =
+            projectAdmittedQwenSparseAttentionPrograms(profile, device_configs, plan_.rank);
 
         LOG_DEBUG("[MemoryPlanner] Memory validation passed:\n"
                   << plan.renderTable());
@@ -21505,7 +22720,8 @@ namespace llaminar2
         }
 
         const int continuation_root_rank =
-            overlay_execution ? overlay_execution->continuation_root_rank : plan_.rank;
+            overlay_execution ? overlay_execution->continuation_root_rank :
+            resolveMoEOverlayRequestAuthorityRank(nullptr, moe_pipeline_prepared_plan_, overlay_context).value_or(plan_.rank);
         if (continuation_root_rank < 0 ||
             continuation_root_rank >= overlay_context->world_size())
         {
@@ -21521,14 +22737,20 @@ namespace llaminar2
         {
             const int configured_cache_entries =
                 debugEnv().execution.prefill_graph_max_cached_buckets;
-            if (configured_cache_entries <=
+            const bool exact = plan_.runtime.ngram_table_placement && plan_.runtime.ngram_table_placement->fixedHeadPipeline();
+            if (!exact && configured_cache_entries <=
                 static_cast<int>(
                     kExpertOverlayPrefillGraphIdentityReserve))
             {
                 return setError(
                     "MoE ExpertOverlay prefill graph cache cannot retain its runtime identities and one bucket");
             }
-            bucket_rows = retainedRawPrefillGraphBucketLadder(
+            if (exact) {
+                (void)exactPrefillGraphCacheEntries(common_capacity,
+                    debugEnv().execution.prefill_graph_max_cached_buckets_explicit
+                        ? std::optional{configured_cache_entries} : std::nullopt);
+                bucket_rows = exactPrefillGraphWidths(common_capacity);
+            } else bucket_rows = retainedRawPrefillGraphBucketLadder(
                 debugEnv().execution.prefill_graph_bucket_sizes,
                 common_capacity,
                 debugEnv().execution.prefill_graph_min_seq,
@@ -21627,18 +22849,34 @@ namespace llaminar2
     bool OrchestrationRunner::initializeMoEOverlayRankBatchTransports()
     {
         moe_overlay_rank_batch_transport_registry_.reset();
+        if(moe_pipeline_prepared_plan_) {
+            try {
+                moe_pipeline_stage_bindings_=moe_pipeline_prepared_plan_->prepareOriginalCPUStageTransports(
+                    model_ctx_->concreteLoader(),mpi_ctx_,cluster_inventory_,plan_.runtime,moe_pipeline_stage_bindings_);
+                return true;
+            }
+            catch(const std::exception& error) {
+                return setError(std::string("Original CPU pipeline stage transport setup failed: ")+error.what());
+            }
+        }
+
 
         const auto overlay_context =
             moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
         const auto overlay_execution = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan,
             overlay_context);
-        if (!overlay_execution || !overlay_context ||
-            overlay_context->world_size() <= 1)
+        if (!overlay_execution || !overlay_context)
         {
             return true;
         }
-        if (overlay_context->communicator() == MPI_COMM_NULL)
+        // Preserve the existing no-channel lifecycle for continuation-local
+        // GPUs and a same-rank CPU tier. The one typed planner predicate adds
+        // channels only for genuine off-continuation GPU/rank endpoints.
+        if (config_.moe_routed_expert_plan &&
+            !MoEOverlayActivationChannelPlanner::requiresActivationChannels(*config_.moe_routed_expert_plan))
+            return true;
+        if (overlay_context->world_size() > 1 && overlay_context->communicator() == MPI_COMM_NULL)
         {
             return setError(
                 "Distributed MoE ExpertOverlay cannot pre-create node-local "
@@ -21664,40 +22902,7 @@ namespace llaminar2
                     "received no valid frozen owner-map snapshot");
             }
             const auto &placement = *snapshot->placement_plan;
-            const auto &owner_map = snapshot->owner_map;
-            const int source_participant_id =
-                placement.continuation_domain_spec.logical_root_participant;
-            const auto *const source =
-                owner_map.participantForId(source_participant_id);
-            if (source_participant_id < 0 || !source ||
-                !source->world_rank_known || !source->device.is_valid() ||
-                source->world_rank != overlay_execution->continuation_root_rank ||
-                source->tier_idx < 0 ||
-                static_cast<std::size_t>(source->tier_idx) >=
-                    placement.routed_tiers.size())
-            {
-                return setError(
-                    "Distributed MoE ExpertOverlay activation-channel preflight "
-                    "could not resolve its continuation endpoint");
-            }
-
-            const auto domain_ordinal =
-                [&](const std::string &domain_name)
-            {
-                for (std::size_t index = 0;
-                     index < placement.domains.size();
-                     ++index)
-                {
-                    if (placement.domains[index].name == domain_name)
-                        return static_cast<int>(index);
-                }
-                throw std::logic_error(
-                    "MoE activation-channel domain is absent from the frozen placement: " +
-                    domain_name);
-            };
-            const int source_domain_ordinal =
-                domain_ordinal(source->domain_name);
-
+            const auto &owner_map = snapshot->originalOwnerMap();
             const MTPRuntimeConfig &active_mtp = retainedMTPConfig();
             const bool retains_mtp_capacity =
                 retainsMTPGraphCapacity(active_mtp);
@@ -21740,215 +22945,12 @@ namespace llaminar2
                     max_mtp_draft_depth).forRoutedLayerInterval(
                         placement.first_model_layer,
                         placement.placementLayerCapacity());
-            const auto activation_graph_families =
-                makeMoEOverlayActivationGraphFamilyManifests(graph_family);
-            const MoEOverlayActivationLaneEndpoint source_endpoint{
-                .world_rank = source->world_rank,
-                .participant_id = source_participant_id,
-                .tier_priority =
-                    placement.routed_tiers[static_cast<std::size_t>(
-                        source->tier_idx)]
-                        .priority,
-                .domain_ordinal = source_domain_ordinal,
-            };
-
-            auto registry =
-                std::make_shared<MoEOverlayRankBatchTransportRegistry>();
-            const std::size_t row_capacity =
-                static_cast<std::size_t>(max_graph_rows);
-            const std::size_t top_k_size = static_cast<std::size_t>(top_k);
-            if (row_capacity >
-                std::numeric_limits<std::size_t>::max() / top_k_size)
-            {
-                throw std::overflow_error(
-                    "MoE activation-channel entry capacity overflows size_t");
-            }
-            const std::size_t max_total_entries = row_capacity * top_k_size;
-            const auto activation_channel_plan =
-                MoEOverlayActivationChannelPlanner::plan({
-                    .placement_plan = &placement,
-                    .cluster_inventory = &cluster_inventory_,
-                    .row_capacity = row_capacity,
-                    .d_model = metadata.d_model,
-                    .top_k = top_k,
-                    .graph_family_count =
-                        activation_graph_families.size(),
-                });
-
-            for (const auto &channel : activation_channel_plan.channels)
-            {
-                const int tier_index = channel.tier_index;
-                const int target_domain_ordinal = channel.domain_ordinal;
-                const int target_world_rank = channel.target_world_rank;
-                const auto participant_ids = channel.targetParticipantIds();
-                if (channel.source_world_rank != source->world_rank ||
-                    channel.source_device != source->device ||
-                    resolveMoEOverlayRankBatchTransportKind(
-                        *overlay_context,
-                        channel.source_world_rank,
-                        target_world_rank) !=
-                        MoEOverlayRankBatchTransportKind::
-                            NodeLocalSharedRows)
-                {
-                    throw std::logic_error(
-                        "MoE activation capacity and MPI topology authorities disagree about a node-local channel");
-                }
-                for (const auto &lane : channel.target_lanes)
-                {
-                    const auto *const participant =
-                        owner_map.participantForId(lane.participant_id);
-                    if (!participant || !participant->world_rank_known ||
-                        participant->world_rank != target_world_rank ||
-                        participant->tier_idx != tier_index ||
-                        participant->device != lane.device ||
-                        domain_ordinal(participant->domain_name) !=
-                            target_domain_ordinal)
-                    {
-                        throw std::logic_error(
-                            "MoE activation capacity topology diverged from the frozen owner map");
-                    }
-                }
-                const std::string channel_identity =
-                    makeMoEOverlayRankBatchChannelIdentity(
-                        tier_index,
-                        target_domain_ordinal,
-                        source->world_rank,
-                        target_world_rank,
-                        participant_ids);
-
-                bool local_ok = true;
-                std::string local_error;
-                const int local_world_rank = overlay_context->rank();
-                if (local_world_rank == source->world_rank ||
-                    local_world_rank == target_world_rank)
-                {
-                    try
-                    {
-                        const std::size_t row_multiplier = std::min(
-                            top_k_size, participant_ids.size());
-                        if (row_capacity >
-                            std::numeric_limits<std::size_t>::max() /
-                                row_multiplier)
-                        {
-                            throw std::overflow_error(
-                                "MoE activation-channel aggregate row capacity overflows size_t");
-                        }
-                        auto workspace = std::make_shared<
-                            MoEOverlayRankBatchWireWorkspace>(
-                            MoEOverlayRankBatchWireWorkspace::Config{
-                                .participant_ids = participant_ids,
-                                .max_total_rows =
-                                    row_capacity * row_multiplier,
-                                .max_total_entries = max_total_entries,
-                                .d_model = metadata.d_model,
-                                .top_k = top_k,
-                                .return_layout = channel.mapping_layout.geometry.return_layout,
-                            });
-
-                        const auto &local_lanes =
-                            channel.localLanes(local_world_rank);
-
-                        auto transport = createMoEOverlayRankBatchTransport(
-                            MoEOverlayRankBatchTransportConfig{
-                                .mpi_ctx = overlay_context,
-                                .source_world_rank = source->world_rank,
-                                .target_world_rank = target_world_rank,
-                                .workspace = std::move(workspace),
-                                .max_rows_per_participant = row_capacity,
-                                .max_entries_per_participant =
-                                    max_total_entries,
-                                .d_model = metadata.d_model,
-                                .top_k = top_k,
-                                .tier_index = tier_index,
-                                .domain_ordinal = target_domain_ordinal,
-                                .channel_identity = channel_identity,
-                                .transaction_slot_count = 4096,
-                                .transaction_topology =
-                                    makeMoEOverlayInferenceTopologyIdentity(
-                                        owner_map,
-                                        graph_family,
-                                        source->world_rank,
-                                        target_world_rank),
-                                .source_endpoint = source_endpoint,
-                                .target_tier_priority =
-                                    placement.routed_tiers[
-                                        static_cast<std::size_t>(tier_index)]
-                                        .priority,
-                                .activation_graph_families =
-                                    activation_graph_families,
-                                .activation_layout =
-                                    channel.mapping_layout,
-                                .local_lanes = local_lanes,
-                            });
-                        if (!transport ||
-                            transport->kind() !=
-                                MoEOverlayRankBatchTransportKind::
-                                    NodeLocalSharedRows)
-                        {
-                            throw std::logic_error(
-                                "MoE activation-channel preflight selected a non-node-local transport");
-                        }
-                        registry->install(
-                            channel_identity, std::move(transport));
-                    }
-                    catch (const std::exception &error)
-                    {
-                        local_ok = false;
-                        local_error = error.what();
-                    }
-                    catch (...)
-                    {
-                        local_ok = false;
-                        local_error =
-                            "non-standard exception during node-local channel setup";
-                    }
-                }
-
-                /*
-                 * Every rank visits every group. Non-endpoint ranks wait in
-                 * this setup-only reduction while the named pair performs
-                 * concurrent first-touch, preventing a later target from
-                 * starting its timeout before the source reaches that group.
-                 */
-                int group_ok = local_ok ? 1 : 0;
-                int global_group_ok = 0;
-                if (MPI_Allreduce(
-                        &group_ok,
-                        &global_group_ok,
-                        1,
-                        MPI_INT,
-                        MPI_MIN,
-                        overlay_context->communicator()) != MPI_SUCCESS)
-                {
-                    return setError(
-                        "Distributed MoE ExpertOverlay failed to publish "
-                        "node-local activation-channel setup status");
-                }
-                if (global_group_ok == 0)
-                {
-                    return setError(
-                        "Distributed MoE ExpertOverlay could not pre-create " +
-                        channel_identity +
-                        (local_error.empty()
-                             ? " on another rank"
-                             : ": " + local_error));
-                }
-            }
-
-            moe_overlay_rank_batch_transport_registry_ = std::move(registry);
-            PerfStatsCollector::addCounter(
-                "moe_overlay_transport",
-                "node_local_activation_channels_precreated",
-                static_cast<double>(
-                    moe_overlay_rank_batch_transport_registry_->size()),
-                "model_setup",
-                {},
-                {
-                    {"first_touch", "consumer_rank"},
-                    {"phase", "pre_graph"},
-                    {"scope", "node_local"},
-                    {"source_rank", std::to_string(source->world_rank)},
-                });
+            moe_overlay_rank_batch_transport_registry_=prepareOriginalMoEOverlayRankBatchTransports({
+                .placement=placement,.owner_map=owner_map,.inventory=cluster_inventory_,.graph_family=graph_family,
+                .original_context=overlay_context,.physical_memory_authority=physical_memory_authority_,
+                .activation_batch_inventory=moe_expert_overlay_memory_admission_?moe_expert_overlay_memory_admission_->activation_batch_inventory:nullptr,
+                .original_cpu_joint_owners=snapshot->jointOwnerMap(),
+                .d_model=metadata.d_model,.top_k=top_k});
             return true;
         }
         catch (const std::exception &error)
@@ -22194,52 +23196,16 @@ namespace llaminar2
         }
     }
 
-    bool OrchestrationRunner::buildComputeGraph()
+    MoEOverlayParticipantGraphRunnerConfig OrchestrationRunner::makeMoEOverlayParticipantConfig(
+        MoEOverlayParticipantGraphOwnership ownership) const
     {
-        ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
-
-        // Cross-rank topology changes physical graph construction only. It must
-        // not bypass model admission, snapshot installation, or readiness.
-        if (requiresNamedDomainGlobalGraph(config_))
-        {
-            if (!plan_builder_)
-                return setError("Named-domain graph has no topology builder");
-            runner_ = buildNamedDomainGlobalGraph(
-                config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_);
-            // Resolve before readiness, while every rank still follows the
-            // common initialization schedule. The public frontend then runs
-            // on the same tail that owns logits, with no vocabulary transfer.
-            mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
-                config_.moe_routed_expert_plan, mpi_ctx_, runner_.get());
-            return static_cast<bool>(runner_);
-        }
-
-        auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
-            config_.moe_routed_expert_plan,
-            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
-        if (overlay_execution_plan)
-        {
-            const auto execution_kind =
-                overlay_execution_plan->currentRankPlan().execution_kind;
-            if (execution_kind ==
-                OverlayRankExecutionKind::RelayOnly)
-            {
-                return setError(
-                    "ExpertOverlay relay-only ranks cannot enter model graph construction");
-            }
-            if (execution_kind ==
-                OverlayRankExecutionKind::ExpertOnlyFollower)
-            {
-                auto overlay_ctx =
-                    moe_expert_overlay_mpi_ctx_
-                        ? moe_expert_overlay_mpi_ctx_
-                        : mpi_ctx_;
-                const MTPRuntimeConfig &active_mtp = retainedMTPConfig();
-                const bool retains_mtp_capacity =
-                    retainsMTPGraphCapacity(active_mtp);
-                runner_ = createMoEOverlayParticipantGraphRunner(
-                    MoEOverlayParticipantGraphRunnerConfig{
+        auto overlay_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        const auto &active_mtp = retainedMTPConfig();
+        const bool retains_mtp_capacity = retainsMTPGraphCapacity(active_mtp);
+        return MoEOverlayParticipantGraphRunnerConfig{
                         .model_context = model_ctx_,
+                        .ownership = ownership,
+                        .cpu_serial_expert_storage = plan_.runtime.cpu_serial_expert_storage,
                         .prepared_weight_admission =
                             retained_prepared_weight_plan_validated_
                                 ? PreparedWeightAdmission::
@@ -22279,6 +23245,7 @@ namespace llaminar2
                                     ? resolveMTPRetainedTargetQueryRows(
                                           active_mtp)
                                     : 1),
+                        .prefill_graph_row_capacity = plan_.runtime.overlay_prefill_schedule.graph_row_capacity,
                         .prefill_graph_row_shapes =
                             plan_.runtime.overlay_prefill_schedule.bucket_rows,
                         .max_decode_activation_rows =
@@ -22294,7 +23261,69 @@ namespace llaminar2
                             resolveMTPRetainedDraftCapacity(active_mtp),
                         .max_request_count =
                             std::max(1, plan_.runtime.batch_size),
-                    });
+                        .cpu_joint_context=cpu_expert_shard_ctx_,
+                    };
+    }
+
+    bool OrchestrationRunner::buildComputeGraph()
+    {
+        ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
+
+        if (config_.moe_routed_expert_plan && moe_expert_overlay_residency_authority_)
+        {
+            const auto snapshot = moe_expert_overlay_residency_authority_->snapshot();
+            const auto context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!snapshot || !snapshot->valid() || !context)
+                return setError("Expert endpoint construction lost original admitted ownership");
+            const auto endpoints = MoEOverlayHostServiceContract::resolveAdmitted(
+                *config_.moe_routed_expert_plan, snapshot->originalOwnerMap(), *context);
+            if (endpoints.requiresRankLocalInferencePublisher() &&
+                (!hasLocalTP() || plan_.usesLocalPP() || requiresNamedDomainGlobalGraph(config_)))
+                return setError("Same-rank cross-vendor expert endpoints require their original flat LocalTP parent; other enclosing graph roles are not implemented");
+        }
+
+        // Cross-rank topology changes physical graph construction only. It must
+        // not bypass model admission, snapshot installation, or readiness.
+        if (requiresNamedDomainGlobalGraph(config_))
+        {
+            if (!plan_builder_)
+                return setError("Named-domain graph has no topology builder");
+            runner_ = buildNamedDomainGlobalGraph(
+                config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_,
+                moe_pipeline_stage_bindings_);
+            // Resolve before readiness, while every rank still follows the
+            // common initialization schedule. The public frontend then runs
+            // on the same tail that owns logits, with no vocabulary transfer.
+            mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
+                config_.moe_routed_expert_plan, mpi_ctx_, runner_.get());
+            return static_cast<bool>(runner_);
+        }
+
+        auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
+            config_.moe_routed_expert_plan,
+            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+        if (overlay_execution_plan)
+        {
+            const auto execution_kind =
+                overlay_execution_plan->currentRankPlan().execution_kind;
+            if (execution_kind ==
+                OverlayRankExecutionKind::RelayOnly)
+            {
+                return setError(
+                    "ExpertOverlay relay-only ranks cannot enter model graph construction");
+            }
+            if (execution_kind ==
+                OverlayRankExecutionKind::ExpertOnlyFollower)
+            {
+                auto overlay_ctx =
+                    moe_expert_overlay_mpi_ctx_
+                        ? moe_expert_overlay_mpi_ctx_
+                        : mpi_ctx_;
+                const MTPRuntimeConfig &active_mtp = retainedMTPConfig();
+                const bool retains_mtp_capacity =
+                    retainsMTPGraphCapacity(active_mtp);
+                runner_ = createMoEOverlayParticipantGraphRunner(
+                    makeMoEOverlayParticipantConfig(MoEOverlayParticipantGraphOwnership::ExpertOnlyRank));
                 if (!runner_)
                 {
                     return setError(
@@ -22514,7 +23543,19 @@ namespace llaminar2
             return setError(
                 "ExpertOverlay diagnostic graph variant disagrees with the frozen prefill schedule");
         }
-        if (!runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))
+        bool materialized = false;
+        if (moe_pipeline_topology_ && moe_pipeline_topology_->globalPipeline())
+        {
+            const auto weights = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+            if (!weights)
+                return setError("Global pipeline serving graph has no original WeightManager authority");
+            // Nested TP children deliberately retain shared sources. Only
+            // this original rank's complete global parent may close that gate.
+            materialized = materializePreparedPipelineGraphFamily(*runner_, *weights, family_plan);
+        }
+        else
+            materialized = runner_->materializeServingGraphFamilyWithoutLaunch(family_plan);
+        if (!materialized)
         {
             return setError(
                 "ExpertOverlay runner could not materialize the selected serving graph variant");
@@ -22715,8 +23756,10 @@ namespace llaminar2
                                         : mpi_ctx_;
         const auto execution = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan, overlay_context);
+        auto *rank_runner = dynamic_cast<RankOrchestrator *>(runner_.get());
+        const auto local_endpoints = rank_runner ? rank_runner->rankLocalExpertEndpoints() : nullptr;
         if (!execution || !overlay_context ||
-            overlay_context->world_size() <= 1)
+            (overlay_context->world_size() <= 1 && !local_endpoints))
         {
             return true;
         }
@@ -22730,7 +23773,7 @@ namespace llaminar2
                 [](const OverlayRankPlan &rank_plan)
                 {
                     return rank_plan.usesExpertTransactionFollower();
-                }));
+                })) + (local_endpoints ? 1u : 0u);
         if (source_rank < 0 ||
             source_rank >= overlay_context->world_size() ||
             (local_rank == source_rank) !=
@@ -22994,6 +24037,12 @@ namespace llaminar2
                         {
                             *error =
                                 "Hosted ExpertOverlay decode progress could not wake the device controller";
+                            // Preserve the background authority's first fault.
+                            // A failed wake is only its terminal propagation
+                            // boundary, not the failed transfer/publication edge.
+                            const auto cause = moe_overlay_device_controller_graph_service_->failureMessage();
+                            if (!cause.empty())
+                                *error += ": " + cause;
                         }
                         return false;
                     }
@@ -23058,7 +24107,7 @@ namespace llaminar2
 
                     const auto topology =
                         makeMoEOverlayInferenceTopologyIdentity(
-                            snapshot->owner_map,
+                            snapshot->originalOwnerMap(),
                             graph_family,
                             source_rank,
                             rank_plan.world_rank);
@@ -23084,6 +24133,13 @@ namespace llaminar2
                             },
                         }));
                 }
+                if (local_endpoints)
+                {
+                    if (local_rank != source_rank)
+                        return setError("Original same-rank experts have no continuation command authority");
+                    publishers.push_back(MoEOverlayParticipantGraphRunner::createRankLocalInferencePublisher(
+                        local_endpoints));
+                }
                 if (publishers.empty())
                 {
                     return setError(
@@ -23101,7 +24157,7 @@ namespace llaminar2
                     snapshot->placement_plan->continuation_domain_spec
                         .logical_root_participant;
                 const auto *const ticket_authority =
-                    snapshot->owner_map.participantForId(
+                    snapshot->originalOwnerMap().participantForId(
                         logical_root_participant);
                 if (!ticket_authority ||
                     ticket_authority->domain_name !=
@@ -23123,7 +24179,7 @@ namespace llaminar2
                         static_cast<std::size_t>(continuation_participants),
                         MoEOverlayInferenceCompletionBoundaryKind::Unspecified);
                 for (const auto &participant :
-                     snapshot->owner_map.participants())
+                     snapshot->originalOwnerMap().participants())
                 {
                     if (participant.domain_name !=
                             execution->continuation_domain ||
@@ -23243,6 +24299,15 @@ namespace llaminar2
                     .local_participant_count =
                         static_cast<std::size_t>(continuation_participants),
                 });
+                if (local_endpoints)
+                {
+                    coordinator_segments.push_back({
+                        .role = MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower,
+                        .materialization = MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable,
+                        .world_rank = local_rank,
+                        .local_participant_count = local_endpoints->participantIds().size(),
+                    });
+                }
                 for (const auto &rank_plan : execution->rank_plans)
                 {
                     if (!rank_plan.usesExpertTransactionFollower())
@@ -23676,6 +24741,7 @@ namespace llaminar2
             moe_expert_overlay_residency_authority_;
         mdo_config.moe_expert_overlay_participant_residency =
             moe_expert_overlay_participant_residency_;
+        mdo_config.moe_expert_overlay_cpu_joint_context=cpu_expert_shard_ctx_;
         mdo_config.moe_expert_overlay_decode_histogram =
             moe_expert_overlay_decode_histogram_;
         mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
@@ -23685,6 +24751,18 @@ namespace llaminar2
             moe_overlay_device_controller_fabric_;
         mdo_config.reusable_execution_workspaces =
             reusable_execution_workspaces_;
+        if (config_.moe_routed_expert_plan && moe_expert_overlay_residency_authority_)
+        {
+            const auto snapshot = moe_expert_overlay_residency_authority_->snapshot();
+            const auto context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!snapshot || !snapshot->valid() || !context)
+                return setError("Rank auxiliary expert selection lost its original admitted ownership");
+            const auto endpoints = MoEOverlayHostServiceContract::resolveAdmitted(
+                *config_.moe_routed_expert_plan, snapshot->originalOwnerMap(), *context);
+            if (endpoints.requiresRankLocalInferencePublisher())
+                mdo_config.rank_local_expert_endpoints = makeMoEOverlayParticipantConfig(
+                    MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary);
+        }
 
         LOG_DEBUG("[OrchestrationRunner] Multi-device precision config: activation="
                   << activationPrecisionToString(mdo_config.activation_precision)
@@ -23744,6 +24822,7 @@ namespace llaminar2
 
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
+        mdo_config.original_pipeline_mpi_ctx = mpi_ctx_;
         if (retained_prepared_weight_plan_validated_)
         {
             const auto prepared = model_ctx_->concreteWeightManager()->preparedWeightStoreIfInitialized();
@@ -23782,12 +24861,15 @@ namespace llaminar2
             return setError("Invalid LOCAL PP configuration");
         }
 
-        // Ensure GlobalBackendRouter is initialized for inter-stage transfers.
-        // LOCAL PP uses TensorBase::transferTo() which routes through the backend router.
-        GlobalBackendRouter::initForTests();
-
+        // The original active MPI context already owns the canonical discovery
+        // membership projection. Captured PP edges own their native transports;
+        // a router must not create copy communicators from host-wide visibility.
+        std::vector<std::vector<GlobalDeviceAddress>> router_stages;
+        for(const auto& stage:mdo_config.pp_stages)router_stages.push_back(stage.stage_devices);
         std::unique_ptr<RankOrchestrator> orch;
         orch = std::make_unique<RankOrchestrator>(model_ctx_, mdo_config);
+        GlobalBackendRouter::initForPipeline(PipelineRouterAdmission::admit(
+            mpi_ctx_,router_stages,orch->pipelineGraphExecutionPlan()));
         runner_ = std::move(orch);
 
         LOG_DEBUG("Local PP compute graph built successfully");
@@ -23877,6 +24959,7 @@ namespace llaminar2
             moe_expert_overlay_residency_authority_;
         runner_config.moe_expert_overlay_participant_residency =
             moe_expert_overlay_participant_residency_;
+        runner_config.moe_expert_overlay_cpu_joint_context=cpu_expert_shard_ctx_;
         runner_config.moe_expert_overlay_decode_histogram =
             moe_expert_overlay_decode_histogram_;
         runner_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
@@ -23976,6 +25059,17 @@ namespace llaminar2
         {
             runner_->setSnapshotCaptureFilter(keys);
         }
+    }
+
+    bool OrchestrationRunner::setOrdinaryTerminalProjectionCapacity(
+        OrdinaryTerminalProjectionCapacity capacity)
+    {
+        // A precompiled plan is already immutable; its caller supplies demand
+        // through RuntimeConfig before construction, never by editing children.
+        if (plan_built_ || initialization_lifecycle_.admissionComplete() || runner_)
+            return setError("Ordinary terminal projection capacity must be declared before plan compilation and model admission");
+        ordinary_terminal_projection_setup_ = capacity;
+        return true;
     }
 
     bool OrchestrationRunner::setSnapshotMemoryCapacity(
@@ -24134,6 +25228,11 @@ namespace llaminar2
         }
         out_size = 0;
         return nullptr;
+    }
+
+    SnapshotInfo OrchestrationRunner::getSnapshotWithShape(const std::string &key) const
+    {
+        return runner_ ? runner_->getSnapshotWithShape(key) : SnapshotInfo{};
     }
 
     std::vector<std::string> OrchestrationRunner::getSnapshotKeys() const
@@ -24384,6 +25483,18 @@ namespace llaminar2
     OrchestrationRunner::internalInferencePreparationReadiness() const
     {
         InferenceMeasurementReadiness overlay_readiness;
+        InferenceMeasurementReadiness stage_readiness;
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+            {
+                if (!owner->service()) return {.state = InferenceMeasurementReadinessState::Failed,
+                    .owner = "cpu_pipeline_host_maintenance", .phase = "unprepared",
+                    .diagnostic = "CPU pipeline maintenance has no prepared service"};
+                const auto observed = owner->service()->measurementReadiness();
+                if (observed.failed()) return observed;
+                if (!observed.ready()) stage_readiness = observed;
+            }
+        if (!stage_readiness.ready()) return stage_readiness;
         if (moe_expert_overlay_maintenance_service_ &&
             moe_overlay_device_controller_graph_service_)
         {
@@ -24829,6 +25940,16 @@ namespace llaminar2
         shutdownMoEExpertOverlayResidencyMaintenance(
             MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
         flushPrefixCacheOnShutdown();
+    }
+
+    void OrchestrationRunner::abortMPIWorkers(const std::string& reason)
+    {
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
+            mpi_ctx_->rank() != mpi_coordinated_root_rank_)
+        {
+            terminateFailedMPIWorkerCommand("coordinated cancellation", reason);
+        }
+        shutdownMPIWorkers();
     }
 
     [[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand(

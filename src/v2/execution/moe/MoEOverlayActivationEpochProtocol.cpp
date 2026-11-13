@@ -4,6 +4,8 @@
  */
 
 #include "MoEOverlayActivationEpochProtocol.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
+#include "CPUExpertShardRouteCompletion.h"
 
 #include <algorithm>
 #include <atomic>
@@ -76,6 +78,15 @@ namespace llaminar2
             return false;
         }
 
+        /** @return Whether the scheduler still has no terminal failure reason to preserve. */
+        constexpr bool schedulerReasonPending(std::uint32_t code) noexcept
+        {
+            return code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Idle) ||
+                   code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) ||
+                   code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::NotReady) ||
+                   code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::BufferBusy);
+        }
+
         /** @return Previous stage, with -1 representing the initial state. */
         constexpr std::int32_t previousStage(
             std::uint32_t stage_ordinal) noexcept
@@ -118,13 +129,15 @@ namespace llaminar2
 
     bool MoEOverlayActivationEpochConfig::valid() const noexcept
     {
-        if (channel_nonce == 0u || topology_fingerprint_low == 0u ||
-            topology_fingerprint_high == 0u || workspace_generation == 0u ||
-            !source.valid() || !target.valid() || graph_role_mask == 0u ||
+        if (!moeOverlayActivationReturnRoleValid(static_cast<std::uint32_t>(return_role)) ||
+            ((return_role == MoEOverlayActivationReturnRole::Ordinary) ? cohort_target != -1
+                                                                       : cohort_target >= -1) ||
+            channel_nonce == 0u || topology_fingerprint_low == 0u ||
+            topology_fingerprint_high == 0u || workspace_generation == 0u || !source.valid() ||
+            !target.valid() || graph_role_mask == 0u ||
             (source.world_rank == target.world_rank &&
              source.participant_id == target.participant_id) ||
-            model_layer_indices.empty() ||
-            model_layer_indices.size() > kMaximumStageCount)
+            model_layer_indices.empty() || model_layer_indices.size() > kMaximumStageCount)
         {
             return false;
         }
@@ -229,6 +242,8 @@ namespace llaminar2
             config.model_layer_indices.size());
         control.channel.lane_ordinal = config.lane_ordinal;
         control.channel.graph_role_mask = config.graph_role_mask;
+        control.channel.return_role = static_cast<std::uint32_t>(config.return_role);
+        control.channel.cohort_target = config.cohort_target;
     }
 
     MoEOverlayActivationEpochProtocol::MoEOverlayActivationEpochProtocol(
@@ -245,13 +260,10 @@ namespace llaminar2
         if (header.magic != kMoEOverlayActivationMagic ||
             header.abi_version != kMoEOverlayActivationABIVersion ||
             header.channel_nonce != config_.channel_nonce ||
-            header.topology_fingerprint_low !=
-                config_.topology_fingerprint_low ||
-            header.topology_fingerprint_high !=
-                config_.topology_fingerprint_high ||
+            header.topology_fingerprint_low != config_.topology_fingerprint_low ||
+            header.topology_fingerprint_high != config_.topology_fingerprint_high ||
             header.workspace_generation != config_.workspace_generation ||
-            header.stage_manifest_digest !=
-                stageManifestDigest(config_.model_layer_indices) ||
+            header.stage_manifest_digest != stageManifestDigest(config_.model_layer_indices) ||
             header.source_world_rank != config_.source.world_rank ||
             header.target_world_rank != config_.target.world_rank ||
             header.source_participant_id != config_.source.participant_id ||
@@ -263,11 +275,92 @@ namespace llaminar2
             header.stage_count != config_.model_layer_indices.size() ||
             header.buffer_count != kMoEOverlayActivationBufferCount ||
             header.lane_ordinal != config_.lane_ordinal ||
-            header.graph_role_mask != config_.graph_role_mask)
+            header.graph_role_mask != config_.graph_role_mask ||
+            header.return_role != static_cast<std::uint32_t>(config_.return_role) ||
+            header.cohort_target != config_.cohort_target)
         {
             throw std::logic_error(
                 "ExpertOverlay activation epoch mapping disagrees with its exact topology or retained stage manifest");
         }
+    }
+
+    bool MoEOverlayActivationEpochProtocol::ticketAuthenticatesChannel(
+        const MoEOverlayInferenceTransactionTicket &ticket) const noexcept
+    {
+        const auto graph_role_value = static_cast<std::uint32_t>(
+            ticket.graph_role);
+        const bool graph_role_admitted =
+            graph_role_value < 32u &&
+            (control_->channel.graph_role_mask &
+             (std::uint32_t{1} << graph_role_value)) != 0u;
+        return !(!ticket.valid() ||
+            ticket.action != MoEOverlayInferenceTransactionAction::Execute ||
+            !graph_role_admitted ||
+            ticket.workspace_generation !=
+                control_->channel.workspace_generation ||
+            ticket.topology_fingerprint_low !=
+                control_->channel.topology_fingerprint_low ||
+            ticket.topology_fingerprint_high !=
+                control_->channel.topology_fingerprint_high ||
+            ticket.source_world_rank != control_->channel.source_world_rank ||
+            ticket.target_world_rank != control_->channel.target_world_rank);
+    }
+
+    MoEOverlayActivationEpochIdentity MoEOverlayActivationEpochProtocol::immutableTicketIdentity(
+        const MoEOverlayInferenceTransactionTicket &ticket,std::uint64_t epoch_generation) const noexcept
+    {
+        MoEOverlayActivationEpochIdentity identity{
+            .request_generation = ticket.request_generation,
+            .command_id = ticket.command_id,
+            .transaction_ordinal = ticket.transaction_ordinal,
+            .logical_step_id = ticket.logical_step_id,
+            .workspace_generation = ticket.workspace_generation,
+            .placement_epoch_floor = ticket.placement_epoch,
+            .topology_fingerprint_low = ticket.topology_fingerprint_low,
+            .topology_fingerprint_high = ticket.topology_fingerprint_high,
+            .channel_nonce = control_->channel.channel_nonce,
+            .epoch_generation = epoch_generation,
+            .stage_manifest_digest = control_->channel.stage_manifest_digest,
+            .digest = {},
+            .source_world_rank = ticket.source_world_rank,
+            .target_world_rank = ticket.target_world_rank,
+            .source_participant_id = control_->channel.source_participant_id,
+            .target_participant_id = control_->channel.target_participant_id,
+            .source_tier_priority = control_->channel.source_tier_priority,
+            .target_tier_priority = control_->channel.target_tier_priority,
+            .source_domain_ordinal = control_->channel.source_domain_ordinal,
+            .target_domain_ordinal = control_->channel.target_domain_ordinal,
+            .graph_role = static_cast<std::uint32_t>(ticket.graph_role),
+            .request_count = static_cast<std::uint32_t>(ticket.request_count),
+            .logical_rows_per_request = static_cast<std::uint32_t>(ticket.logical_rows_per_request),
+            .physical_rows_per_request =
+                static_cast<std::uint32_t>(ticket.physical_rows_per_request),
+            .draft_depth = ticket.draft_depth,
+            .sidecar_depth = ticket.sidecar_depth,
+            .stage_count = control_->channel.stage_count,
+            .lane_ordinal = control_->channel.lane_ordinal,
+            .return_role = control_->channel.return_role,
+            .cohort_target = control_->channel.cohort_target,
+            .reserved = {},
+        };
+        identity.digest = moeOverlayActivationIdentityDigest(identity);
+        return identity;
+    }
+
+    MoEOverlayActivationEpochIdentity MoEOverlayActivationEpochProtocol::describeOriginalNativeSubmission(
+        const MoEOverlayInferenceOriginalSlot &original,std::uint64_t epoch_generation) const
+    {
+        original.domain()->requireActiveAdmission(original);
+        if(!ticketAuthenticatesChannel(original.ticket()) || epoch_generation==0u ||
+            epoch_generation>kMoEOverlayActivationMaxGeneration)
+            throw std::logic_error("Original native admission does not authenticate its channel/timeline identity");
+        auto identity=immutableTicketIdentity(original.ticket(),epoch_generation);
+        if(original.index()>std::numeric_limits<std::uint32_t>::max())
+            throw std::logic_error("Original native slot index exceeds its exact ABI");
+        identity.original_slot_index=static_cast<std::uint32_t>(original.index());
+        identity.digest=moeOverlayActivationIdentityDigest(identity);
+        if(!identity.digest.valid())throw std::logic_error("Original native admission has an invalid immutable digest");
+        return identity;
     }
 
     std::optional<MoEOverlayActivationEpochIdentity>
@@ -301,23 +394,7 @@ namespace llaminar2
                 return std::nullopt;
             }
         }
-        const auto graph_role_value = static_cast<std::uint32_t>(
-            ticket.graph_role);
-        const bool graph_role_admitted =
-            graph_role_value < 32u &&
-            (control_->channel.graph_role_mask &
-             (std::uint32_t{1} << graph_role_value)) != 0u;
-        if (!ticket.valid() ||
-            ticket.action != MoEOverlayInferenceTransactionAction::Execute ||
-            !graph_role_admitted ||
-            ticket.workspace_generation !=
-                control_->channel.workspace_generation ||
-            ticket.topology_fingerprint_low !=
-                control_->channel.topology_fingerprint_low ||
-            ticket.topology_fingerprint_high !=
-                control_->channel.topology_fingerprint_high ||
-            ticket.source_world_rank != control_->channel.source_world_rank ||
-            ticket.target_world_rank != control_->channel.target_world_rank)
+        if (!ticketAuthenticatesChannel(ticket))
         {
             fail("ExpertOverlay activation ticket does not authenticate this retained rank-pair graph", error);
             return std::nullopt;
@@ -340,40 +417,7 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        MoEOverlayActivationEpochIdentity identity{
-            .request_generation = ticket.request_generation,
-            .command_id = ticket.command_id,
-            .transaction_ordinal = ticket.transaction_ordinal,
-            .logical_step_id = ticket.logical_step_id,
-            .workspace_generation = ticket.workspace_generation,
-            .placement_epoch_floor = ticket.placement_epoch,
-            .topology_fingerprint_low = ticket.topology_fingerprint_low,
-            .topology_fingerprint_high = ticket.topology_fingerprint_high,
-            .channel_nonce = control_->channel.channel_nonce,
-            .epoch_generation = epoch_generation,
-            .stage_manifest_digest = control_->channel.stage_manifest_digest,
-            .digest = {},
-            .source_world_rank = ticket.source_world_rank,
-            .target_world_rank = ticket.target_world_rank,
-            .source_participant_id = control_->channel.source_participant_id,
-            .target_participant_id = control_->channel.target_participant_id,
-            .source_tier_priority = control_->channel.source_tier_priority,
-            .target_tier_priority = control_->channel.target_tier_priority,
-            .source_domain_ordinal = control_->channel.source_domain_ordinal,
-            .target_domain_ordinal = control_->channel.target_domain_ordinal,
-            .graph_role = static_cast<std::uint32_t>(ticket.graph_role),
-            .request_count = static_cast<std::uint32_t>(ticket.request_count),
-            .logical_rows_per_request = static_cast<std::uint32_t>(
-                ticket.logical_rows_per_request),
-            .physical_rows_per_request = static_cast<std::uint32_t>(
-                ticket.physical_rows_per_request),
-            .draft_depth = ticket.draft_depth,
-            .sidecar_depth = ticket.sidecar_depth,
-            .stage_count = control_->channel.stage_count,
-            .lane_ordinal = control_->channel.lane_ordinal,
-            .reserved = {},
-        };
-        identity.digest = moeOverlayActivationIdentityDigest(identity);
+        auto identity=immutableTicketIdentity(ticket,epoch_generation);
         if (!identity.digest.valid())
         {
             fail("ExpertOverlay activation identity digest is invalid", error);
@@ -701,11 +745,28 @@ namespace llaminar2
     }
 
     bool MoEOverlayActivationEpochProtocol::publishReturn(
+        const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage,
+        std::uint64_t bytes,std::string *error) {
+        return publishReturnImpl(identity,stage,bytes,nullptr,error);
+    }
+    bool MoEOverlayActivationEpochProtocol::publishJointReturn(
+        const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage,
+        std::uint64_t bytes,const CPUExpertShardRouteCompletion &completed,std::string *error) {
+        return publishReturnImpl(identity,stage,bytes,&completed,error);
+    }
+
+    bool MoEOverlayActivationEpochProtocol::publishReturnImpl(
         const MoEOverlayActivationEpochIdentity &identity,
         std::uint32_t stage_ordinal,
         std::uint64_t payload_bytes,
+        const CPUExpertShardRouteCompletion *completed,
         std::string *error)
     {
+        const bool joint=config_.return_role!=MoEOverlayActivationReturnRole::Ordinary;
+        if ((joint && (!completed || !completed->matches(*control_,identity,stage_ordinal))) ||
+            (!joint && completed))
+            return fail("Joint CPU return requires its exact completed original cohort witness",error);
+
         constexpr auto endpoint = MoEOverlayActivationEndpoint::Follower;
         constexpr auto operation = MoEOverlayActivationOperation::PublishReturn;
         if (!validateActiveEndpoint(endpoint, identity, operation, error))
@@ -735,9 +796,13 @@ namespace llaminar2
         const std::uint64_t dispatch_observed = acquireValue(
             buffer.dispatch_signal.value);
         const auto dispatch = buffer.dispatch_descriptor;
+        const bool contributor =
+            config_.return_role == MoEOverlayActivationReturnRole::JointContributor;
+        const std::uint64_t return_rows=contributor?0u:dispatch.live_rows;
+        const std::uint64_t return_entries=contributor?0u:dispatch.live_entries;
         if (dispatch_observed != timeline ||
             !validDescriptor(dispatch, identity, stage_ordinal, timeline) ||
-            ((payload_bytes == 0u) != (dispatch.live_rows == 0u)))
+            ((payload_bytes == 0u) != (return_rows == 0u)))
         {
             return reject(
                 endpoint,
@@ -762,8 +827,8 @@ namespace llaminar2
         if (!canAccumulatePublishedTraffic(
                 endpoint_status,
                 payload_bytes,
-                dispatch.live_rows,
-                dispatch.live_entries))
+                return_rows,
+                return_entries))
         {
             return reject(
                 endpoint,
@@ -780,8 +845,8 @@ namespace llaminar2
              * the authenticated dispatch, which may be newer than the host
              * scheduler's immutable floor. */
             .placement_epoch = dispatch.placement_epoch,
-            .live_rows = dispatch.live_rows,
-            .live_entries = dispatch.live_entries,
+            .live_rows = return_rows,
+            .live_entries = return_entries,
             .payload_bytes = payload_bytes,
             .stage_ordinal = stage_ordinal,
             .model_layer_index = layer,
@@ -789,8 +854,8 @@ namespace llaminar2
         accumulatePublishedTraffic(
             endpoint_status,
             payload_bytes,
-            dispatch.live_rows,
-            dispatch.live_entries);
+            return_rows,
+            return_entries);
         atomicValue(buffer.return_signal.value).store(
             timeline, std::memory_order_release);
         atomicValue(endpoint_status.last_published_stage).store(
@@ -868,8 +933,8 @@ namespace llaminar2
         const auto dispatch = buffer.dispatch_descriptor;
         if (observed != timeline ||
             !validDescriptor(descriptor, identity, stage_ordinal, timeline) ||
-            descriptor.live_rows != dispatch.live_rows ||
-            descriptor.live_entries != dispatch.live_entries ||
+            !moeOverlayActivationReturnCountsMatch(control_->channel.return_role,
+                descriptor.live_rows,descriptor.live_entries,dispatch.live_rows,dispatch.live_entries) ||
             descriptor.placement_epoch != dispatch.placement_epoch)
         {
             reject(
@@ -1020,6 +1085,42 @@ namespace llaminar2
             error);
     }
 
+    bool MoEOverlayActivationEpochProtocol::cancelOriginalInvocation(
+        const MoEOverlayActivationEpochIdentity &identity,
+        MoEOverlayActivationStatusCode code, std::string *error)
+    {
+        if (!fatalStatusCode(code))
+            return fail("Original scheduler cancellation requires a terminal reason", error);
+        const auto state = admissionState();
+        if ((state != MoEOverlayActivationAdmissionState::Armed &&
+             state != MoEOverlayActivationAdmissionState::Failed) || !matchesPublishedIdentity(identity))
+            return fail("Original scheduler cancellation identity is absent, stale or divergent", error);
+
+        auto reason = atomicValue(control_->admission.code);
+        auto observed = reason.load(std::memory_order_acquire);
+        while (schedulerReasonPending(observed))
+        {
+            if (reason.compare_exchange_weak(observed, static_cast<std::uint32_t>(code),
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
+        atomicValue(control_->admission.state).store(
+            static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed), std::memory_order_release);
+        // This is scheduler-owned cancellation, not a host observation or
+        // replacement of either GPU endpoint's first semantic failure. Existing
+        // admission acquisition and native timeline waits already drain this sentinel.
+        atomicValue(control_->admission.ready_signal).store(
+            kMoEOverlayActivationAbortTimeline, std::memory_order_release);
+        for (auto &buffer : control_->buffers)
+        {
+            atomicValue(buffer.dispatch_signal.value).store(kMoEOverlayActivationAbortTimeline,
+                std::memory_order_release);
+            atomicValue(buffer.return_signal.value).store(kMoEOverlayActivationAbortTimeline,
+                std::memory_order_release);
+        }
+        return true;
+    }
+
     bool MoEOverlayActivationEpochProtocol::markTimedOut(
         std::uint64_t epoch_generation,
         std::uint64_t observed_ns,
@@ -1040,10 +1141,15 @@ namespace llaminar2
         }
 
         control_->admission.observed_timeout_ns = observed_ns;
-        atomicValue(control_->admission.code).store(
-            static_cast<std::uint32_t>(
-                MoEOverlayActivationStatusCode::TimedOut),
-            std::memory_order_release);
+        auto reason = atomicValue(control_->admission.code);
+        auto observed = reason.load(std::memory_order_acquire);
+        while (schedulerReasonPending(observed))
+        {
+            if (reason.compare_exchange_weak(observed,
+                    static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::TimedOut),
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
         atomicValue(control_->admission.state).store(
             static_cast<std::uint32_t>(
                 MoEOverlayActivationAdmissionState::Failed),
@@ -1193,6 +1299,8 @@ namespace llaminar2
             source.published_live_entries);
         snapshot.published_stage_count = acquireValue(
             source.published_stage_count);
+        snapshot.published_shared_hidden_bytes = acquireValue(
+            source.published_shared_hidden_bytes);
         return snapshot;
     }
 
@@ -1220,6 +1328,15 @@ namespace llaminar2
             MoEOverlayActivationEndpoint::Continuation);
         const auto follower = endpointStatus(
             MoEOverlayActivationEndpoint::Follower);
+        return completedSnapshotTraffic(identity,control_->channel.return_role,continuation,follower,error);
+    }
+
+    std::optional<MoEOverlayActivationEpochTraffic>
+    MoEOverlayActivationEpochProtocol::completedSnapshotTraffic(
+        const MoEOverlayActivationEpochIdentity& identity,std::uint32_t return_role,
+        const MoEOverlayActivationEndpointStatus& continuation,
+        const MoEOverlayActivationEndpointStatus& follower,std::string* error)
+    {
         const auto complete_for_identity = [&identity](
                                                const auto &status)
         {
@@ -1257,17 +1374,23 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        const bool row_symmetric =
-            continuation.published_live_rows ==
-            follower.published_live_rows;
+        if (follower.published_shared_hidden_bytes != 0u)
+        {
+            fail("ExpertOverlay follower cannot publish source-owned shared hidden bytes", error);
+            return std::nullopt;
+        }
+
+        const bool row_symmetric = moeOverlayActivationReturnCountsMatch(return_role,
+            follower.published_live_rows,follower.published_live_entries,
+            continuation.published_live_rows,continuation.published_live_entries);
         const bool dispatch_entry_geometry_valid =
             continuation.published_live_rows == 0u
                 ? continuation.published_live_entries == 0u
                 : continuation.published_live_entries >=
                       continuation.published_live_rows;
-        const bool return_entry_geometry_valid =
-            follower.published_live_entries ==
-                continuation.published_live_entries;
+        const bool return_entry_geometry_valid = moeOverlayActivationReturnCountsMatch(return_role,
+            follower.published_live_rows,follower.published_live_entries,
+            continuation.published_live_rows,continuation.published_live_entries);
         const bool entry_geometry_valid =
             dispatch_entry_geometry_valid && return_entry_geometry_valid;
         const bool byte_geometry_valid =
@@ -1288,6 +1411,7 @@ namespace llaminar2
             .dispatch_payload_bytes =
                 continuation.published_payload_bytes,
             .return_payload_bytes = follower.published_payload_bytes,
+            .dispatch_shared_hidden_bytes = continuation.published_shared_hidden_bytes,
             .dispatch_live_rows = continuation.published_live_rows,
             .return_live_rows = follower.published_live_rows,
             .dispatch_live_entries =
@@ -1320,34 +1444,31 @@ namespace llaminar2
     bool MoEOverlayActivationEpochProtocol::matchesActiveIdentity(
         const MoEOverlayActivationEpochIdentity &identity) const noexcept
     {
-        if (admissionState() != MoEOverlayActivationAdmissionState::Armed ||
-            identity != control_->identity || !identity.digest.valid() ||
+        return admissionState() == MoEOverlayActivationAdmissionState::Armed && matchesPublishedIdentity(identity);
+    }
+
+    bool MoEOverlayActivationEpochProtocol::matchesPublishedIdentity(
+        const MoEOverlayActivationEpochIdentity &identity) const noexcept
+    {
+        if (identity != control_->identity || !identity.digest.valid() ||
             identity.digest != moeOverlayActivationIdentityDigest(identity) ||
             identity.channel_nonce != control_->channel.channel_nonce ||
-            identity.topology_fingerprint_low !=
-                control_->channel.topology_fingerprint_low ||
-            identity.topology_fingerprint_high !=
-                control_->channel.topology_fingerprint_high ||
-            identity.stage_manifest_digest !=
-                control_->channel.stage_manifest_digest ||
-            identity.source_world_rank !=
-                control_->channel.source_world_rank ||
-            identity.target_world_rank !=
-                control_->channel.target_world_rank ||
-            identity.source_participant_id !=
-                control_->channel.source_participant_id ||
-            identity.target_participant_id !=
-                control_->channel.target_participant_id ||
-            identity.source_tier_priority !=
-                control_->channel.source_tier_priority ||
-            identity.target_tier_priority !=
-                control_->channel.target_tier_priority ||
-            identity.source_domain_ordinal !=
-                control_->channel.source_domain_ordinal ||
-            identity.target_domain_ordinal !=
-                control_->channel.target_domain_ordinal ||
+            identity.topology_fingerprint_low != control_->channel.topology_fingerprint_low ||
+            identity.topology_fingerprint_high != control_->channel.topology_fingerprint_high ||
+            identity.stage_manifest_digest != control_->channel.stage_manifest_digest ||
+            identity.source_world_rank != control_->channel.source_world_rank ||
+            identity.target_world_rank != control_->channel.target_world_rank ||
+            identity.source_participant_id != control_->channel.source_participant_id ||
+            identity.target_participant_id != control_->channel.target_participant_id ||
+            identity.source_tier_priority != control_->channel.source_tier_priority ||
+            identity.target_tier_priority != control_->channel.target_tier_priority ||
+            identity.source_domain_ordinal != control_->channel.source_domain_ordinal ||
+            identity.target_domain_ordinal != control_->channel.target_domain_ordinal ||
             identity.stage_count != control_->channel.stage_count ||
             identity.lane_ordinal != control_->channel.lane_ordinal ||
+            identity.return_role != control_->channel.return_role ||
+            identity.cohort_target != control_->channel.cohort_target ||
+            !moeOverlayActivationReturnRoleValid(identity.return_role) ||
             identity.epoch_generation == 0u ||
             identity.epoch_generation > kMoEOverlayActivationMaxGeneration)
         {

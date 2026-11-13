@@ -58,6 +58,11 @@ namespace llaminar2
                               public IWorkspaceConsumer
     {
     public:
+        /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+        qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream) override;
+
         /**
          * @brief Construct TQ KV cache on CUDA device.
          *
@@ -284,6 +289,7 @@ namespace llaminar2
         const TurboQuantContext *tq_ctx_;
 
         // GPU rotation matrices (owned)
+        const float *native_centroids_ = nullptr; ///< Construction-bound canonical device codebook.
         CUDATurboQuantRotations rotations_;
 
         // =====================================================================

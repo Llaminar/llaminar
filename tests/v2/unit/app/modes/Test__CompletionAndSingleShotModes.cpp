@@ -5,7 +5,11 @@
  * Modes may stop their runner and command followers, but process finalization
  * belongs to the enclosing application session. Mock modes must neither start
  * MPI nor require a fake process-wide shutdown to reach their terminal result.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -620,6 +624,8 @@ TEST(Test__InteractiveChatMode, ThrowingPreconditionAbortsWaitingFollowers)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleMock(&argc, argv);
     return RUN_ALL_TESTS();
 }

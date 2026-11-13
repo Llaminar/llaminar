@@ -14,11 +14,17 @@
  * - Compute graphs (with PP Send/Recv stages)
  * - LOCAL TP context for intra-rank collectives
  * - KV cache state
+ * - Requested weight identity installed with its canonical resolved topology,
+ *   before later physical quotas and placements replace declarative intent.
  * - Per-stage expert runtime lifetimes for local PP composition; each stage
  *   shares its owners only among that stage's TP participants.
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #pragma once
@@ -46,6 +52,7 @@
 #include "../../utils/Assertions.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/Tokenizer.h"
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -59,9 +66,16 @@
 
 namespace llaminar2
 {
+    class GlobalTPContext;
+    class CapturedTransferRankSession;
+    enum class MTPRankParticipation;
+
+    struct MoEOverlayParticipantGraphRunnerConfig;
+    enum class MoEOverlayParticipantGraphOwnership : std::uint8_t;
     enum class ModelContextPhysicalSealBoundary;
 
     class MoEOverlayResidencyAuthority;
+    class MoEOverlayCPUHostMaintenance;
     class MoEOverlayParticipantResidencyRegistry;
     class MoEOverlayPhysicalResidencyFabric;
     class MoEOverlayPipelineStageBinding;
@@ -137,6 +151,7 @@ namespace llaminar2
      */
     class OrchestrationRunner : public IOrchestrationRunner
     {
+        friend class OrchestrationRunnerResolvedAdmissionTestAccess;
     public:
         /**
          * @brief Construct from configuration
@@ -259,6 +274,17 @@ namespace llaminar2
          */
         bool initialize() override;
         /**
+         * @brief Observe the original runner's status for one locally owned global pipeline stage.
+         * @param stage_id Authored global stage identifier.
+         * @return Passive leaf observation, or absence for a nonlocal stage or another runner kind.
+         */
+        std::optional<MoEOptimizationStatus> localPipelineStageOptimizationStatus(int stage_id) const;
+
+        /** @return Borrowed stage preparation authority while initialized; never a reusable context export. */
+        const MoEPipelinePreparedPlan *pipelinePreparedPlanForDiagnostics() const noexcept
+        { return isInitialized() ? moe_pipeline_prepared_plan_.get() : nullptr; }
+
+        /**
          * @brief Validate admission without publishing inference readiness.
          * @return Whether planning and memory admission completed successfully.
          * No prepared-weight retention seal is owed by this lifecycle.
@@ -286,6 +312,14 @@ namespace llaminar2
         void setDecodeStepTokenBudget(int max_tokens) override;
         bool maybeApplyMoERebalance(uint64_t committed_tokens) override;
         uint64_t moeRuntimeMovementEpoch() const override;
+
+        /** @copydoc IOrchestrationRunner::withMoEOverlayDevicePlacementScope */
+        void withMoEOverlayDevicePlacementScope(const std::function<void()> &body) override;
+
+        /** @copydoc IOrchestrationRunner::withMoEOverlayInferencePlacementScope */
+        MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
+            const std::function<void()> &body) override;
+
         MoEOptimizationStatus moeOptimizationStatus() const override;
         /** @copydoc IOrchestrationRunner::moeOptimizationMovementTopology */
         MoEOptimizationMovementTopology moeOptimizationMovementTopology() const override;
@@ -335,6 +369,10 @@ namespace llaminar2
         std::shared_ptr<ITokenizer> tokenizer() const override;
         const std::string &architecture() const override;
         const IModelContext *modelContextForDiagnostics() const override;
+        /** @return Actual immutable topology/model economics with current width strategy. */
+        [[nodiscard]] MTPDepthPolicyScope mtpDepthPolicyScope() const override;
+        /** @return Explicit reason for generic scope, without changing execution policy. */
+        [[nodiscard]] const char *mtpDepthPolicyScopeGenericReason() const override;
 
         /**
          * @brief Return the immutable live ExpertOverlay map for diagnostics.
@@ -355,6 +393,10 @@ namespace llaminar2
 
         void enableSnapshotCapture(const std::string &output_dir = "") override;
         void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override;
+        /** @brief Freeze authored ordinary output demand before plan compilation.
+         * @param capacity Positive diagnostic demand or selected-final-row policy.
+         * @return False after plan compilation/admission/runner creation. */
+        bool setOrdinaryTerminalProjectionCapacity(OrdinaryTerminalProjectionCapacity capacity) override;
         bool setSnapshotMemoryCapacity(
             GraphSnapshotMemoryCapacity capacity) override;
         bool prepareInactiveSnapshotCapture(
@@ -363,6 +405,8 @@ namespace llaminar2
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;
+        /** @brief Return the immutable typed snapshot; integer values never enter the float adapter. */
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const override;
         std::vector<std::string> getSnapshotKeys() const override;
 
         // =====================================================================
@@ -460,6 +504,16 @@ namespace llaminar2
          * command so old residency banks retire before terminal evidence.
          */
         void shutdownMPIWorkers() override;
+
+        /**
+         * @brief Terminate a failed coordinated lane through its original rank authority.
+         * @param reason Original failure detail retained in the fatal worker diagnostic.
+         * @note Roots retain ordinary terminal publication. Followers cannot publish
+         * root commands and terminate the original communicator instead.
+         * @throws std::runtime_error For a fatal follower failure under a scripted
+         * MPI context with no live communicator; a real communicator terminates.
+         */
+        void abortMPIWorkers(const std::string& reason) override;
         int coordinatedRootRank() const override
         {
             return mpi_coordinated_root_rank_;
@@ -538,6 +592,17 @@ namespace llaminar2
         bool buildExecutionPlan();
 
         /**
+         * @brief Install one canonical resolved topology and its pre-freeze request identity.
+         * @param resolved Model-aware rank compiler result, before capacity freezing.
+         *
+         * Implicit TP may synthesize the first routed authority during resolution.
+         * The identity must be captured with that exact config/rank-plan install,
+         * then retained while model-aware quotas and placements are frozen later.
+         * Pipeline stages instead contribute their complete aggregate identity.
+         */
+        void installResolvedExecutionPlan(const ResolvedRankOrchestration &resolved);
+
+        /**
          * @brief Gather cluster inventory for plan building
          */
         ClusterInventory gatherClusterInventory();
@@ -607,6 +672,8 @@ namespace llaminar2
          * double-buffered histogram from the exact owner-map geometry.
          */
         bool initializeMoEExpertOverlayResidencyAuthority();
+        /** @brief Materialize the one original Static CPU expert domain after exact source/PMA setup. */
+        bool initializeCPUExpertShardDomain();
 
         /**
          * @brief Identify native GPU controllers in one domain or every PP stage.
@@ -788,6 +855,7 @@ namespace llaminar2
          * @brief Rebind the model registry from a canonical physical seal.
          * @param seal Exact loader-allocation aliases produced after reader drain.
          * @param error Receives missing-bank or atomic replacement diagnostics.
+         * @param residency Exact stage or ordinary registry; null is a fatal scope error.
          * @return True only after every process-local scope is rebound.
          *
          * Published participant banks may still name temporary shadow slots even
@@ -796,7 +864,8 @@ namespace llaminar2
          */
         bool rebindModelRegistryFromReusableContextSeal(
             const MoEOverlayReusableContextSeal &seal,
-            std::string *error = nullptr) noexcept;
+            std::string *error,
+            const std::shared_ptr<MoEOverlayParticipantResidencyRegistry> &residency) noexcept;
 
         /**
          * @brief Validate TP/PP configuration against loaded model
@@ -822,25 +891,24 @@ namespace llaminar2
         bool validateContextLength();
 
         /**
-         * @brief Refresh live GPU capacity in the rank inventory.
+         * @brief Prepare selected GPU workers under their original physical authority.
          *
-         * Discovery-time free memory is valid only before persistent model
-         * allocations begin. A reused ModelContext observes free bytes after
-         * its certified weights and workspace are already resident, so final
-         * admission must replace the stale discovery value with one exact
-         * backend observation before applying retained-allocation credits.
-         * Capacity solving and final memory validation both use this method so
-         * they cannot drift onto different physical-memory authorities.
+         * Every native graph/resource BOM consumes an authenticated prepared
+         * worker, independently of ngram storage policy. Adaptive storage adds
+         * its explicitly authored endpoints to the compute participants. One
+         * source owns their original inventory observations, exact worker
+         * storage and typed opaque commitments before capacity solving.
          *
-         * Every selected context is initialized before any device is sampled;
-         * this preserves a common post-runtime-initialization observation
-         * boundary on backends with process-wide lazy state.
+         * Reuse preserves that source's PMA and generation; it does not adopt
+         * an ordinary worker or replace capacity with a late free-memory sample.
+         * The final admission later consumes the same preparation snapshot.
+         * CPU-only ranks require no native source.
          *
-         * @param devices Rank-local devices participating in the physical plan.
-         * @param purpose Stable diagnostic identity for the observation edge.
-         * @return True after every unique GPU has updated the rank inventory.
+         * @param devices Rank-local compute participants in the physical plan.
+         * @param purpose Stable diagnostic identity for this preparation edge.
+         * @return True after every selected GPU has its original prepared owner.
          */
-        bool refreshRankLocalGPUCapacityObservations(
+        bool prepareRankLocalGPUContexts(
             const std::vector<DeviceId> &devices,
             std::string_view purpose);
 
@@ -901,6 +969,13 @@ namespace llaminar2
          * @brief Build compute graphs
          */
         bool buildComputeGraph();
+        /**
+         * @brief Project the same original expert graph configuration for either actual owner role.
+         * @param ownership Existing expert-only rank or subordinate same-rank endpoint ownership.
+         * @return Original model/PMA/residency/controller family and exact admitted row bounds.
+         */
+        MoEOverlayParticipantGraphRunnerConfig makeMoEOverlayParticipantConfig(
+            MoEOverlayParticipantGraphOwnership ownership) const;
 
         /**
          * @brief Initialize MPI context if needed
@@ -971,6 +1046,12 @@ namespace llaminar2
          * Consolidates topology, config, model, and preflight info.
          */
         void printStartupBanner(FILE *stream = stderr);
+
+        /** @brief Project MTP participation from installed original transaction owners.
+         * @return Exact pipeline/expert service role, otherwise the full-model MPI participation.
+         * Original GPU stage followers never become vocabulary peers from world size alone.
+         */
+        MTPRankParticipation mtpRankParticipation() const;
 
         bool shouldUseMTPDecode() const;
         /**
@@ -1097,6 +1178,39 @@ namespace llaminar2
             int transaction_base_tokens,
             int committed_rows,
             const char *source);
+        /** @brief Authority which submitted the first transaction of a response window. */
+        enum class DeviceGenerationFirstTransaction
+        {
+            External, ///< Fresh request's externally scheduled captured transaction.
+            AdmissionTicket, ///< Continued response's native ticket-zero retained branch.
+        };
+
+        /**
+         * @brief Detect a hosted adaptive response continuation without observing depth.
+         * @param mtp Immutable active request policy.
+         * @return Whether the next admitted transaction must be selected by native ticket zero.
+         */
+        bool isHostedDynamicMTPContinuation(const MTPRuntimeConfig &mtp) const;
+
+        /**
+         * @brief Validate and publish one scalar controller's immutable terminal ledger.
+         * @param sampling_mode Exact captured sampling law.
+         * @param transaction_base_cached_tokens Scheduler position before admitted work.
+         * @param first_transaction Explicit owner of the first transaction's submission.
+         * @param requested_draft_depth External selected depth; zero for admission-ticket work.
+         * @param initial_transaction_draft_depth External geometry to retire from host draft
+         *        statistics; zero for retained work, whose geometry stays ticket-owned.
+         * @param result Current response object to receive terminal tokens and evidence.
+         * @return Complete response or a fatal controller/ownership/ledger error.
+         */
+        GenerationResult finishScalarDeviceResidentGeneration(
+            DeviceGenerationSamplingMode sampling_mode,
+            int transaction_base_cached_tokens,
+            DeviceGenerationFirstTransaction first_transaction,
+            int requested_draft_depth,
+            int initial_transaction_draft_depth,
+            GenerationResult result);
+
         /**
          * @brief Run and surface one complete native device-generation parent.
          *
@@ -1112,8 +1226,8 @@ namespace llaminar2
          * @param sampling_mode Greedy or stochastic parent topology.
          * @param transaction_base_cached_tokens Scheduler position at entry.
          * @param requested_draft_depth Device-selected first-transaction depth.
-         * @param capture_draft_depth Physical child-family capacity materialized
-         *        by the first transaction.
+         * @param initial_transaction_draft_depth Exact first transaction geometry;
+         *        retained parent capacity is resolved independently from admitted policy.
          * @param result Current decode result to complete with terminal tokens.
          * @return Completed result, or an error suitable for atomic rollback.
          */
@@ -1122,7 +1236,7 @@ namespace llaminar2
             DeviceGenerationSamplingMode sampling_mode,
             int transaction_base_cached_tokens,
             int requested_draft_depth,
-            int capture_draft_depth,
+            int initial_transaction_draft_depth,
             GenerationResult result);
         /**
          * @brief Complete a request batch from one native device-generation parent.
@@ -1176,12 +1290,22 @@ namespace llaminar2
             const char *context,
             std::string *error = nullptr) const;
         void recordMTPDepthZeroBypass();
+        /**
+         * @brief Publish one actual host transaction to its adaptive owner and optional trace.
+         * @param requested_depth Controller-requested draft count.
+         * @param effective_depth Actually attempted draft count after budget admission.
+         * @param accepted_speculative_prefix Actual verifier-accepted prefix.
+         * @param budget_limited Whether this observation is excluded from adaptive samples.
+         * @param rollback Actual host rollback signal.
+         * @param publication Exact committed source output/state/debt/stop witness.
+         */
         void recordMTPDepthObservation(
             int requested_depth,
             int effective_depth,
             int accepted_speculative_prefix,
             bool budget_limited,
-            bool rollback);
+            bool rollback,
+            const MTPPublicationWitness &publication);
         GenerationResult decodeStepMTP();
         void clearBatchedDecodeState();
         /**
@@ -1378,9 +1502,11 @@ namespace llaminar2
          * Physical graph and weight identity never enters this value.
          */
         std::optional<MTPRequestPolicy> mtp_request_policy_;
-        /** Requested routed-weight identity captured before model-aware freezing. */
+        /** Requested identity installed with canonical topology, before capacity freezing. */
         std::string requested_routed_weight_authority_identity_;
         RankExecutionPlan plan_;
+        /** Setup-only declaration consumed by the pure rank compiler before child projection. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection_setup_;
         bool plan_built_{false};
         ClusterInventory cluster_inventory_;
         /** Root-published metadata retained for placement and canonical BOM construction. */
@@ -1433,8 +1559,12 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
             moe_expert_overlay_proposal_publisher_;
         /** Sole host background scheduler for durable overlay movement. */
-        std::unique_ptr<MoEOverlayResidencyMaintenanceService>
+        std::shared_ptr<MoEOverlayResidencyMaintenanceService>
             moe_expert_overlay_maintenance_service_;
+        /** Common CPU-only owner also used by exact mutable pipeline stages. */
+        std::shared_ptr<MoEOverlayCPUHostMaintenance> moe_cpu_host_maintenance_;
+        /** Mutable roots restore before child retirement; final proof follows retirement. */
+        bool model_context_pipeline_host_restored_ = false;
         /** Lock-free live inference interval boundary used only when armed. */
         std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
             moe_expert_overlay_interference_probe_;
@@ -1467,6 +1597,12 @@ namespace llaminar2
          */
         std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
             moe_overlay_device_controller_fabric_;
+        /** Host submission intent only: the actual parent epoch/lease lives on device. */
+        enum class FiniteDevicePlacementSubmission { Inactive, PendingArm, Armed };
+        FiniteDevicePlacementSubmission finite_device_placement_submission_=
+            FiniteDevicePlacementSubmission::Inactive;
+        /** @brief Arm after public reset, before any new original source/follower launch. */
+        void ensureFiniteDevicePlacementArmed();
         /** Retained group-root graphs on dedicated controller streams. */
         std::unique_ptr<MoEOverlayDeviceControllerGraphService>
             moe_overlay_device_controller_graph_service_;
@@ -1542,6 +1678,8 @@ namespace llaminar2
          */
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
             physical_memory_admission_;
+        /** Original source created by this runner before model publication; borrowed/exported sources are never adopted here. */
+        std::shared_ptr<NativeContextPreparation> created_native_context_source_;
         /** Rank-bound admission and live-allocation authority. */
         std::shared_ptr<PhysicalMemoryAuthority>
             physical_memory_authority_;
@@ -1574,9 +1712,13 @@ namespace llaminar2
         bool model_context_reuse_seal_succeeded_{true};
         /** First terminal seal failure retained until contract invalidation. */
         std::string model_context_reuse_seal_error_;
+        std::shared_ptr<GlobalTPContext> cpu_expert_shard_ctx_; ///< Original declared CPU expert-domain owner; explicit terminal retirement before arena/PMA release.
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 
+        // The original all-rank channel session encloses runner/graph/alias
+        // destruction; explicit shutdown closes peer mappings before PMA release.
+        std::shared_ptr<CapturedTransferRankSession> rank_pipeline_transfer_session_;
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
 
@@ -1852,6 +1994,17 @@ namespace llaminar2
          * hidden state, and publication metadata remain device-owned.
          */
         std::optional<int> decode_transaction_planning_position_;
+        /** One immutable CPU/composed response admission; never a progress counter. */
+        std::optional<DeviceGenerationAdmissionRequest> host_sparse_query_admission_;
+        /**
+         * @brief Build host response metadata from the existing budget and host position authority.
+         * @param budget Existing caller response budget, or zero for existing context remainder.
+         * @param forward_only Explicit one-target-row forced transaction on either backend.
+         * @return No new admission for a resident path or nested host response.
+         * @throws std::invalid_argument When the existing boundary has invalid geometry.
+         */
+        std::optional<DeviceGenerationAdmissionRequest> hostSparseQueryAdmission(int budget, bool forward_only = false) const;
+
         /**
          * @brief Typed scheduler lifecycle for the resident generation controller.
          *
@@ -1948,6 +2101,27 @@ namespace llaminar2
                             ? Phase::Inactive
                             : Phase::AwaitingContinuationBudget;
                 admitted_token_budget = 0;
+                return true;
+            }
+
+            /**
+             * @brief Open a fresh ordinary response after a completed sampler-free model row.
+             * @return True only at an already-open zero-budget admission boundary.
+             *
+             * A forced ordinary token first consumes its prior emitted condition.
+             * Pipeline ForwardOnly owns that no-response transaction and replaces
+             * the original ordinary controller row with its own policy. A later
+             * response must therefore initialize its ordinary policy freshly;
+             * ContinueResponse may preserve only an unchanged controller policy.
+             * This edge neither resets request/KV/history nor invents prefill,
+             * and it cannot reopen a stopped or active controller. The caller
+             * invokes it only after the actual model-only forward succeeds.
+             */
+            [[nodiscard]] bool reopenAfterOrdinaryForwardOnly() noexcept
+            {
+                if (!awaitsAdmission() || admitted_token_budget != 0)
+                    return false;
+                phase = Phase::AwaitingBudget;
                 return true;
             }
 
@@ -2072,6 +2246,9 @@ namespace llaminar2
             MPIWorkerCommandLifecycle::AcceptingCommands};
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
+        /** Frozen setup metadata; request reset does not change geometry or ownership. */
+        MTPDepthPolicyScope mtp_depth_policy_scope_geometry_;
+        const char *mtp_depth_policy_scope_generic_reason_ = "model_free";
         std::unique_ptr<MTPDepthController> mtp_depth_controller_;
         PrefillChunkStats prefill_chunk_stats_;
         PrefixCacheRequestSummary prefix_request_summary_;

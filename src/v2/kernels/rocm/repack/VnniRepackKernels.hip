@@ -19,10 +19,10 @@
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/rocm/repack/VnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
-#include "tensors/NativeVnniQ6Scale.h"
-#include "tensors/NativeVnniIQ2SScale.h"
-#include "tensors/NativeVnniIQ4XSScale.h"
-#include "tensors/NativeVnniIQ3SScale.h"
+#include "tensors/NativeQuantisedQ6Scale.h"
+#include "tensors/NativeQuantisedIQ2SScale.h"
+#include "tensors/NativeQuantisedIQ4XSScale.h"
+#include "tensors/NativeQuantisedIQ3SScale.h"
 
 namespace llaminar2 {
 
@@ -635,7 +635,7 @@ __global__ void repack_q6k_to_vnni(
     // Preserve the original factors in the same two16-bit metadata planes.
     // The consumer reconstructs each product before applying either integer dot.
     d_scales[linear] = blk.d;
-    d_mins[linear] = native_vnni_q6_scale::pack(
+    d_mins[linear] = native_quantised_q6_scale::pack(
         signed_scales[sc_lo_idx], signed_scales[sc_hi_idx]);
 }
 
@@ -851,7 +851,7 @@ __global__ void repack_iq4xs_to_vnni(
     // Keep original d and encoded6 as raw words. No coefficient half conversion.
     d_scales[linear] = blk.d;
     d_coefficients[linear] =
-        llaminar2::native_vnni_iq4xs_scale::encodeSourceCoefficient(static_cast<uint8_t>(ls));
+        llaminar2::native_quantised_iq4xs_scale::encodeSourceCoefficient(static_cast<uint8_t>(ls));
 }
 
 // ============================================================================
@@ -892,7 +892,7 @@ __global__ void repack_iq3s_to_vnni(
     // Source factors remain two typed words: original half d and raw nibble.
     // Consumers resolve d*(1+2*nibble) in FP32 before unchanged dot scaling.
     d_scales[linear] = blk.d;
-    d_source_nibbles[linear] = llaminar2::native_vnni_iq3s_scale::encodeSourceCoefficient(
+    d_source_nibbles[linear] = llaminar2::native_quantised_iq3s_scale::encodeSourceCoefficient(
         static_cast<uint8_t>(nibble));
 }
 
@@ -996,7 +996,7 @@ __global__ void repack_iq2s_to_vnni(
     // are resolved in FP32 by the execution codebook13 loader; no half
     // narrowing or transformation of the nine payload bytes occurs here.
     d_scales[linear] = blk.d;
-    d_mins[linear] = llaminar2::native_vnni_iq2s_scale::pack(blk.scales[sub_idx]);
+    d_mins[linear] = llaminar2::native_quantised_iq2s_scale::pack(blk.scales[sub_idx]);
 }
 
 // ============================================================================

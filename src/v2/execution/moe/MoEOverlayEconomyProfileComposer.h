@@ -11,14 +11,18 @@
  */
 
 #pragma once
+#include "MoEOverlayPreparedTargetService.h"
 
 #include "ExpertTierTransferMeasurement.h"
+#include "MoEOverlayMigrationTargetCoordinate.h"
+#include "MoEOverlayTierMigrationTransport.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayResidencyAuthority.h"
 
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,6 +91,51 @@ namespace llaminar2
         /** Reserved zero: startup performs no paired synthetic inference. */
         std::uint64_t interference_sample_count = 0;
     };
+
+    /** @brief One independently quoted robust median at its original canonical piece ordinal. */
+    struct MoEOverlayQuotedPieceMigrationMeasurement
+    {
+        std::uint64_t quoted_payload_bytes = 0;
+        ExpertTierProjectionTransferMeasurement measurement;
+        /** @return Whether the median retains the exact original bound byte extent and real work. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /**
+     * @brief One complete-target robust row, retaining every original physical piece.
+     *
+     * Geometry is passive source metadata, never an engine/source/publication permit.
+     * Only explicit legacy whole adapters may omit geometry, retaining the original
+     * three-role scalar contract without claiming cuts or source-format evidence.
+     */
+    struct MoEOverlayTargetLayerMigrationMeasurement
+    {
+        MoEOverlayMigrationTargetCoordinate coordinate;
+        std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> geometry;
+        std::vector<MoEOverlayQuotedPieceMigrationMeasurement> pieces;
+        std::uint64_t wave_wall_nanoseconds = 0;
+        std::uint64_t wave_sample_count = 0;
+        std::uint64_t inference_interference_nanoseconds = 0;
+        std::uint64_t interference_sample_count = 0;
+        /** Original physically measured coordinate when this row projects an exact equivalent layer.
+         * Empty identifies direct measurements; projection never relabels retained piece geometry. */
+        std::optional<MoEOverlayMigrationTargetCoordinate> measured_coordinate;
+        /** @brief Check typed target identity against original passive geometry.
+         * @param coordinate Explicit original targets and model layer. @param geometry Checked original geometry.
+         * @return Whether both target alternatives and physical member identities agree. */
+        [[nodiscard]] static bool geometryMatches(const MoEOverlayMigrationTargetCoordinate &coordinate,
+            const MoEOverlayMigrationMeasurementGeometry &geometry) noexcept;
+        /** @return Whether original target geometry and complete robust piece evidence agree. */
+        [[nodiscard]] bool valid() const noexcept;
+        /** @return Checked singleton legacy row. @throws std::invalid_argument For any cohort target. */
+        [[nodiscard]] MoEOverlayParticipantLayerMigrationMeasurement whole() const;
+        /** @brief Explicitly import an existing whole-only robust row without inventing geometry.
+         * @param row Original whole-only evidence. @return Checked typed whole row.
+         * @throws std::invalid_argument For incomplete or invalid scalar evidence. */
+        [[nodiscard]] static MoEOverlayTargetLayerMigrationMeasurement fromWhole(
+            const MoEOverlayParticipantLayerMigrationMeasurement &row);
+    };
+
 
     /**
      * @brief Validated immutable profiles ready for residency-authority sealing.
@@ -179,9 +228,9 @@ namespace llaminar2
          * Rows are canonicalized by directed participant pair and layer. The
          * charged transfer/repack cost is the larger of the measured whole-wave
          * latency and any projection latency, never the sum of three lanes that
-         * execute concurrently. A zero measured interference delta is valid;
-         * its positive paired-sample count proves it was observed rather than
-         * omitted.
+         * execute concurrently. Startup interference fields remain reserved
+         * zero; runtime contention is governed by existing maintenance budgets,
+         * not synthetic paired-inference samples.
          *
          * @param measurements Complete normalized calibration observations.
          * @return Canonically ordered directed migration-cost rows.
@@ -193,6 +242,33 @@ namespace llaminar2
         normalizeMigrationMeasurements(
             std::vector<MoEOverlayParticipantLayerMigrationMeasurement>
                 measurements);
+
+        /** @brief Normalize complete original-target observations using the unchanged wave maximum.
+         * @param measurements Complete typed rows with all original pieces.
+         * @return Canonical typed directed prices, never summed across concurrent pieces.
+         * @throws std::invalid_argument For incomplete, duplicate, or foreign geometry/evidence. */
+        [[nodiscard]] static std::vector<MoEOverlayTargetLayerMigrationCost>
+        normalizeMigrationMeasurements(std::vector<MoEOverlayTargetLayerMigrationMeasurement> measurements);
+
+        /** @brief Project typed prices at an explicitly whole-only profile consumer.
+         * @param costs Complete typed prices. @return Existing canonical whole-owner costs.
+         * @throws std::invalid_argument For any cohort or invalid/duplicate coordinate. */
+        [[nodiscard]] static std::vector<MoEOverlayParticipantLayerMigrationCost>
+        checkedWholeMigrationCosts(std::vector<MoEOverlayTargetLayerMigrationCost> costs);
+
+        /** @brief Normalize only genuine prepared target samples, never live packet totals.
+         * @param plan Original checked target/source declaration. @param samples Complete root-owned corpus.
+         * @return One rate per original target/layer and phase. */
+        static std::vector<MoERoutedTargetLayerPhaseServiceCost> normalizePreparedService(
+            const MoEOverlayPreparedTargetServicePlan& plan,
+            std::span<const MoEOverlayPreparedTargetServiceTotals> samples);
+        /** @brief Compose the existing tier selection profile from prepared-only complete targets.
+         * @param plan Original checked declaration, retained without engine owners.
+         * @param samples Complete original root-owned sample corpus.
+         * @return Same canonical target vector plus existing tier aggregates. */
+        static std::shared_ptr<const MoERoutedTierServiceProfile> composePreparedService(
+            std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+            std::span<const MoEOverlayPreparedTargetServiceTotals> samples);
 
         /**
          * @brief Validate, canonicalize, and compose one complete profile pair.

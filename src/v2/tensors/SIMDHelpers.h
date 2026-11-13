@@ -6227,7 +6227,7 @@ namespace llaminar2
          * @param value Derived source scale or additive minimum in FP32.
          * @return The exact FP32 value represented by the published FP16 bits.
          *
-         * GPU NativeVNNI preparation stores derived per-block metadata as
+         * GPU NativeQuantised preparation stores derived per-block metadata as
          * FP16.  Any CPU preparation that must be reproducible from a migrated
          * GPU expert must start from these bits rather than retain an
          * unavailable pre-publication product.

@@ -5,21 +5,117 @@
  * Stage and model-wide consumers use the same ordered policy serialization.
  * Only metadata is inspected; model and cache payloads are never hashed. Active
  * request controls may change within the unchanged admitted capacity envelope.
+ * Complete runtime handoff borrows the original immutable admission after exact plan
+ * validation; participant factories retain their existing geometry checks.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "PreparedWeightAuthorityIdentity.h"
+#include "execution/config/RuntimeConfig.h"
+#include "backends/NativeContextPreparation.h"
+#include "loaders/ResolvedImmutableRowTablePlacement.h"
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
+#include "execution/moe/MoEOverlayHostServiceContract.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include <algorithm>
+#include <stdexcept>
 #include "planning/MoEPipelineMemoryAdmission.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "utils/DebugEnv.h"
 #include <sstream>
+#include <iomanip>
 
 namespace llaminar2
 {
+    std::vector<DeviceId> admittedOverlayPreparedWeightDevices(
+        const MoERoutedExpertPlacementPlan& plan, const MoEExpertOverlayExecutionPlan& execution)
+    {
+        // Initial import may precede placement admission. Without original
+        // layer ownership there is no proof permitting any endpoint omission.
+        if (plan.placements.empty()) return execution.currentRankPlan().local_devices;
+        // This projection needs only original membership, never whole-expert owner
+        // rows. A joint fragment must not accidentally mint a whole owner here.
+        const auto participants = MoEExpertOwnerMap::declaredParticipants(plan, {.reject_tensor_sharded_domains = false});
+        const auto admitted = MoEOverlayHostServiceContract::admittedExpertParticipants(plan, participants);
+        const auto& rank = execution.currentRankPlan();
+        const auto endpoint = [&](const auto& participant, DeviceId device) {
+            return participant.world_rank_known && participant.world_rank == rank.world_rank && participant.device == device;
+        };
+        const auto denseOwner = [&](DeviceId device) {
+            for (const auto& domain : execution.domains) {
+                const bool dense = domain.name == plan.continuation_domain ||
+                    std::find(rank.root_weight_domains.begin(), rank.root_weight_domains.end(), domain.name) != rank.root_weight_domains.end() ||
+                    std::find(rank.shared_expert_weight_domains.begin(), rank.shared_expert_weight_domains.end(), domain.name) != rank.shared_expert_weight_domains.end();
+                if (!dense) continue;
+                for (const auto& participant : domain.participants)
+                    if (participant.world_rank_known && participant.world_rank == rank.world_rank && participant.local_device == device)
+                        return true;
+            }
+            return false;
+        };
+        std::vector<DeviceId> result;
+        for (const auto device : rank.local_devices) {
+            if (!device.is_valid()) throw std::logic_error("Prepared-weight authority has an invalid original endpoint");
+            const bool declared = std::any_of(participants.begin(), participants.end(),
+                [&](const auto& participant) { return endpoint(participant, device); });
+            const bool live = std::any_of(admitted.begin(), admitted.end(),
+                [&](const auto& participant) { return endpoint(participant, device); });
+            // Unclassified original devices are retained conservatively. Only
+            // a routed membership explicitly removed by the shared admitted
+            // projection may disappear from the prepared-record authority set.
+            if ((!declared || live || denseOwner(device)) &&
+                std::find(result.begin(), result.end(), device) == result.end()) result.push_back(device);
+        }
+        return result;
+    }
+
     bool retainedMTPWeightAuthorityMatches(const MTPRuntimeConfig &retained, const MTPRuntimeConfig &requested)
     {
         return resolveMTPRetainedDraftCapacity(retained) == resolveMTPRetainedDraftCapacity(requested) &&
             retained.max_request_batch == requested.max_request_batch &&
             retained.sidecar_dense_policy == requested.sidecar_dense_policy &&
             retained.terminal_head_policy == requested.terminal_head_policy;
+    }
+
+    void restoreRetainedAdmittedRuntime(RuntimeConfig& current,const RuntimeConfig& original,int world_rank)
+    {
+        if(world_rank<0)throw std::invalid_argument("Retained runtime admission requires its original physical rank");
+        const auto& source=original.native_context_preparation;
+        const auto& requested_source=current.native_context_preparation;
+        if(requested_source && (!source || requested_source.get()!=source.get() ||
+            requested_source.owner_before(source) || source.owner_before(requested_source)))
+            throw std::logic_error("Retained runtime admission cannot replace its original native source");
+        if(source && source->memory()->worldRank()!=world_rank)
+            throw std::logic_error("Retained runtime source crossed its original physical rank");
+        if(original.attention_participants && current.attention_setup_request!=original.attention_setup_request)
+            throw std::invalid_argument("Retained attention admission has a different startup policy request");
+        const auto& placement=original.ngram_table_placement;
+        if(placement){
+            if(placement->worldRank()!=world_rank)
+                throw std::logic_error("Retained lookup placement crossed its original physical rank");
+            placement->requireRequestedPolicy(current.ngram_table_policy);
+        }
+        if(current.ngram_table_placement && (!placement || *current.ngram_table_placement!=*placement))
+            throw std::logic_error("Retained runtime admission conflicts with an existing lookup placement");
+        if(original.retained_host_services){
+            if(original.retained_host_services->worldRank()!=world_rank)
+                throw std::logic_error("Retained CPU service declaration crossed its original physical rank");
+            // This is the same final placement selector used by the factory.
+            // In particular, a CPU I/O role cannot be restored without its
+            // original selected source. No instance is bound or materialized.
+            (void)original.retained_host_services->selectedForLookup(placement.get());
+        }
+        // Stage the only allocating metadata copy before publishing any field.
+        auto cpu_storage=original.cpu_serial_expert_storage;
+        current.native_context_preparation=source;
+        current.resident_graph_rows=original.resident_graph_rows;
+        current.moe_routed_prefill.overlay_segment_rows=original.moe_routed_prefill.overlay_segment_rows;
+        current.ngram_table_placement=placement;
+        current.attention_participants=original.attention_participants;
+        current.cpu_serial_expert_storage=std::move(cpu_storage);
+        current.retained_host_services=original.retained_host_services;
     }
 
     /**
@@ -168,15 +264,82 @@ namespace llaminar2
             << config.max_seq_len << ','
             << debugEnv().execution.prefill_graph_max_cached_buckets
             << ',';
+        if (config.ngram_table_policy.isFixedHeadSharded())
+            out << "prefill_cache_limit_explicit="
+                << debugEnv().execution.prefill_graph_max_cached_buckets_explicit << ',';
         append_optional_bytes(config.max_gpu_memory_mb);
         append_optional_bytes(config.max_cpu_memory_mb);
         append_string(config.activation_precision);
         append_string(config.kv_cache_precision);
+        out << ";ngram=" << static_cast<int>(config.ngram_table_policy.storage) << ','
+            << config.ngram_table_policy.window_bytes << ',' << config.ngram_table_policy.window_count
+            << ",distribution=" << static_cast<int>(config.ngram_table_policy.distribution);
+        if(config.ngram_table_policy.isHostAdaptive())
+        {
+            const auto &a=config.ngram_table_policy.host_adaptive;
+            out << ",adaptive=" << a.maximum_cache_rows << ',' << a.cache_physical_byte_limit << ','
+                << a.policy.aging_accesses << ',' << a.policy.protected_numerator << ',' << a.policy.protected_denominator;
+        }
+        if(config.ngram_table_policy.isGPUAdaptive())
+        {
+            const auto &g=config.ngram_table_policy.gpu_adaptive;
+            out << ",gpu_adaptive=" << g.maximum_gpu_cache_rows << ',' << g.gpu_cache_physical_byte_limit << ','
+                << g.gpu_policy.aging_accesses << ',' << g.gpu_policy.protected_numerator << ',' << g.gpu_policy.protected_denominator
+                << ",subordinate=" << g.host.maximum_cache_rows << ',' << g.host.cache_physical_byte_limit << ','
+                << g.host.policy.aging_accesses << ',' << g.host.policy.protected_numerator << ',' << g.host.policy.protected_denominator;
+            g.placement.validate();
+            if(g.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+            {
+                // Retained authorities cannot normalize away authored physical
+                // coordinate order, C0 owners, individual limits or coordinator.
+                out << ",gpu_placement=" << static_cast<int>(g.placement.mode) << ",owners=" << g.placement.owners.size();
+                for(const auto& owner:g.placement.owners)
+                    out << ';' << owner.participant.world_rank << ',' << static_cast<int>(owner.participant.backend) << ','
+                        << owner.participant.ordinal << ',' << owner.maximum_cache_rows << ',' << owner.cache_physical_byte_limit;
+                const auto& coordinator=*g.placement.coordinator;
+                out << ",coordinator=" << coordinator.world_rank << ',' << static_cast<int>(coordinator.backend) << ',' << coordinator.ordinal;
+            }
+        }
+        // Explicit HC-up correction changes stage workspace capacity even
+        // though every prepared source weight byte remains identical. A
+        // retained capacity authority must reject that setup-policy change.
+        if (debugEnv().gemm.qfn_hc_up_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_hc_up_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_hc_up_activation);
+        if (debugEnv().gemm.qfn_gdn_output_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_gdn_output_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_gdn_output_activation);
+        if (debugEnv().gemm.qfn_fa_output_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_fa_output_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_fa_output_activation);
+        if (debugEnv().gemm.qfn_gdn_qkv_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_gdn_qkv_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_gdn_qkv_activation);
         return out.str();
     }
 
     namespace
     {
+        /** @brief Encode the original global stage declaration without mutable runtime observations. */
+        void appendGlobalPipeline(std::ostream &out, const std::optional<GlobalPPTopology> &global)
+        {
+            if (!global) return; // Preserve existing local prepared identities.
+            out << "global-stage-ownership-v1/" << global->world_size << '/' << global->total_layers << '/';
+            for (const auto &stage : global->stages)
+            {
+                out << stage.stage_id << ',' << stage.first_layer << ',' << stage.last_layer << ','
+                    << stage.has_embedding << ',' << stage.has_lm_head << ',' << stage.owning_rank << ','
+                    << stage.is_global_tp << ',' << static_cast<int>(stage.inner_mode) << ','
+                    << static_cast<int>(stage.backend) << '/' << stage.domain_name.size() << ':' << stage.domain_name;
+                for (const auto &device : stage.devices)
+                    out << '/' << device.hostname.size() << ':' << device.hostname << ','
+                        << static_cast<int>(device.device_type) << ',' << device.device_ordinal << ',' << device.numa_node;
+                out << "/weights";
+                for (const auto weight : stage.tp_weights) out << ',' << std::hexfloat << weight << std::defaultfloat;
+                out << ';';
+            }
+        }
+
         /** @brief Append one global interval and its complete capacity-affecting policy. */
         void appendPipelineStage(std::ostream &out, const ResolvedMoEPipelineStage &stage)
         {
@@ -185,6 +348,7 @@ namespace llaminar2
             const auto identity = routedWeightAuthorityRequestIdentity(config.moe_routed_expert_plan, config);
             const auto &cache = config.prefix_cache;
             out << scope.first_layer << ',' << scope.last_layer << ',' << scope.has_embedding << ',' << scope.has_lm_head
+                << ',' << static_cast<int>(scope.generation_domain)
                 << '/' << identity.size() << ':' << identity << '/'
                 << cache.enabled << ',' << static_cast<int>(cache.storage_mode) << ',' << cache.block_size << ','
                 << cache.ram_budget_bytes << ',' << cache.device_budget_bytes << ',' << cache.disk_budget_bytes << ','
@@ -197,6 +361,7 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "pipeline-expert-authority-v1/" << topology.pipelineStages().size() << '/';
+        appendGlobalPipeline(out, topology.globalPipeline());
         for (const auto &stage : topology.pipelineStages()) appendPipelineStage(out, stage);
         return out.str();
     }
@@ -205,6 +370,7 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "pipeline-expert-authority-v1/" << admission.stages().size() << '/';
+        appendGlobalPipeline(out, admission.globalPipeline());
         for (const auto &stage : admission.stages()) appendPipelineStage(out, stage.topology());
         return out.str();
     }

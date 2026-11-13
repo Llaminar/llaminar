@@ -733,7 +733,7 @@ The collector's internal guard is too late: callers have already constructed
 its string/map arguments. The fix checks the existing collection policy before
 constructing those arguments, including the related router-Q8 wrapper.
 
-Explicit AVX2 and AVX512 `NativeVNNIDisabledDiagnostics` preflight entries use
+Explicit AVX2 and AVX512 `NativeQuantisedDisabledDiagnostics` preflight entries use
 the same serial-byte oracles and require zero warmed C++ allocations; enabled
 diagnostics and actual worker-ownership checks remain separate entries. The
 interposer first proves it sees a real allocation, and the disabled case

@@ -38,7 +38,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kInventoryMagic = 0x4c494e56u; ///< LINV, not an unversioned rank id.
-        constexpr uint32_t kInventoryVersion = 4u; ///< Carries the complete native GPU PCI endpoint.
+        constexpr uint32_t kInventoryVersion = 5u; ///< Carries original PCI ancestry for peer-domain grouping.
         /** @brief Lend a checked communicator to a standalone topology constructor. */
         MPIContext standaloneTopologyContext(MPI_Comm comm)
         {
@@ -158,6 +158,7 @@ namespace llaminar2
             writeValue(buffer, info.memory_bandwidth_gbps);
             writeString(buffer, info.name);
             writeString(buffer, info.uuid);
+            writeString(buffer, info.native_isa);
             writeValue(buffer, static_cast<uint8_t>(info.supports_p2p ? 1 : 0));
             writeString(buffer, info.pci_bus_address);
             writeValue(buffer, static_cast<int32_t>(info.numa_node));
@@ -169,6 +170,8 @@ namespace llaminar2
             writeValue(buffer, info.pcie_max_speed_gts);
             writeValue(buffer, static_cast<uint8_t>(info.pcie_degraded ? 1 : 0));
             writeString(buffer, info.pcie_bottleneck_bdf);
+            writeValue(buffer, static_cast<uint32_t>(info.pcie_upstream_bdfs.size()));
+            for (const auto &bridge : info.pcie_upstream_bdfs) writeString(buffer, bridge);
             writeValue(buffer, static_cast<uint64_t>(info.last_level_cache_bytes));
         }
 
@@ -188,6 +191,7 @@ namespace llaminar2
             info.memory_bandwidth_gbps = readValue<float>(ptr, end);
             info.name = readString(ptr, end);
             info.uuid = readString(ptr, end);
+            info.native_isa = readString(ptr, end);
             info.supports_p2p = (readValue<uint8_t>(ptr, end) != 0);
             info.pci_bus_address = readString(ptr, end);
             info.numa_node = readValue<int32_t>(ptr, end);
@@ -199,6 +203,11 @@ namespace llaminar2
             info.pcie_max_speed_gts = readValue<double>(ptr, end);
             info.pcie_degraded = (readValue<uint8_t>(ptr, end) != 0);
             info.pcie_bottleneck_bdf = readString(ptr, end);
+            const auto bridge_count = readValue<uint32_t>(ptr, end);
+            if (bridge_count > static_cast<std::size_t>(end - ptr) / sizeof(uint32_t))
+                throw std::runtime_error("Truncated original PCI ancestry");
+            for (uint32_t index = 0; index < bridge_count; ++index)
+                info.pcie_upstream_bdfs.push_back(readString(ptr, end));
             info.last_level_cache_bytes = readValue<uint64_t>(ptr, end);
             return info;
         }

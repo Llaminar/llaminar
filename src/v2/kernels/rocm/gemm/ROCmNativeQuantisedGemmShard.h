@@ -1,0 +1,67 @@
+/**
+ * @file ROCmNativeQuantisedGemmShard.h
+ * @brief Internal ABI between the ROCm NativeQuantised GEMM dispatcher and shards.
+ *
+ * The production NativeQuantised prefill implementation instantiates a substantial
+ * template surface for every quantization codebook. Keeping all formats in one
+ * HIP translation unit serialized several minutes of LLVM optimization. The
+ * eight physical shards declared here each own two codebooks and can therefore
+ * compile concurrently. The public backend ABI remains centralized in
+ * ROCmNativeQuantisedGemmDispatch.cpp.
+ *
+ * These functions are internal build artifacts. Callers outside the dispatcher
+ * must continue to use rocmGemm_native_quantised_fp32_with_policy() (or the
+ * self-describing compatibility wrapper) and rocmInitIQGridTables_gemm().
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include "ROCmVNNIPrefillLaunch.h"
+
+using ROCmNativeQuantisedGemmShardFn = bool (*)(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const void *d_block_scales,
+    const void *d_block_mins,
+    const void *d_block_emins,
+    float *d_output,
+    const float *d_scales_A,
+    const float *d_scales_A_blockwise,
+    int M,
+    int N,
+    int K,
+    uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
+    int device_id,
+    void *stream);
+
+using ROCmNativeQuantisedGridInitShardFn = bool (*)(
+    int device_id,
+    const void *h_iq3s_grid,
+    const void *h_iq3xxs_grid,
+    const void *h_iq2s_grid,
+    const void *h_iq2xs_grid,
+    const void *h_iq2xxs_grid,
+    const void *h_iq1s_grid);
+
+#define LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(INDEX)                   \
+    extern "C" bool rocmGemm_native_quantised_fp32_shard_##INDEX(           \
+        const int8_t *, const uint8_t *, const void *, const void *,    \
+        const void *, float *, const float *, const float *, int, int,  \
+        int, uint8_t, uint8_t, int, void *);                            \
+    extern "C" bool rocmInitIQGridTables_gemm_shard_##INDEX(            \
+        int, const void *, const void *, const void *, const void *,     \
+        const void *, const void *)
+
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(0);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(1);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(2);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(3);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(4);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(5);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(6);
+LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(7);
+
+#undef LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD

@@ -10,7 +10,8 @@
  * Physical CPU locality comes only from the gathered observation, never from
  * communicator rank order or a presumed contiguous NUMA numbering scheme.
  * Automatic terminal-head placement is bounded by authenticated model geometry,
- * complete physical membership and measured retained verifier families.
+ * complete physical membership, ordinary terminal-row demand and measured
+ * retained verifier families.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -23,6 +24,7 @@
 #include "../../backends/ComputeBackend.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -106,6 +108,53 @@ namespace llaminar2
             return common.value_or(MTPDepthDefaultsProfile::Portable);
         }
 
+        /** @brief Closed measured ordinary domain, derived from existing plan owners. */
+        enum class OrdinaryHeadDomain
+        {
+            Unmeasured,
+            EqualLocalFullModelSingleRow
+        };
+
+        /**
+         * @brief Classify the measured ordinary domain without another placement ledger.
+         * @param config Authored batch and all-phase dense TP intent; no KV extent is a logit-row count.
+         * @param model Authenticated complete transformer interval.
+         * @param plans Already-built runtime owners, including typed output-row demand.
+         * @param weights Actual terminal-domain vocabulary shares; empty means equal.
+         * @param single_full_stage Whether the exact terminal domain owns one full model stage.
+         * @return The measured single-request equal local domain, or Unmeasured.
+         *
+         * This startup decision inspects the demand present in the returned plan.
+         * A later diagnostic declaration cannot retroactively re-resolve Auto;
+         * callers requiring another head policy retain the explicit override.
+         */
+        OrdinaryHeadDomain ordinaryHeadDomain(
+            const OrchestrationConfig &config, const ModelConfig &model,
+            const std::vector<RankExecutionPlan> &plans,
+            const std::vector<float> &weights, bool single_full_stage)
+        {
+            if (!single_full_stage || plans.size() != 1 || config.batch_size != 1 ||
+                config.disable_gpu_tp || config.heterogeneous_mode)
+                return OrdinaryHeadDomain::Unmeasured;
+            if (config.moe_routed_expert_plan && config.moe_routed_expert_plan->enabled &&
+                config.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy() !=
+                    DenseParallelPolicy::TensorParallel)
+                return OrdinaryHeadDomain::Unmeasured;
+            const auto &plan = plans.front();
+            if (!plan.has_embedding || !plan.has_lm_head || plan.first_layer != 0 ||
+                plan.last_layer != model.n_layers - 1 || plan.usesPipelineParallel() ||
+                plan.usesLocalPP() || plan.usesGlobalTP() ||
+                plan.local_tp_backend != CollectiveBackendType::RCCL ||
+                plan.runtime.ordinary_terminal_projection.hasExplicitRows())
+                return OrdinaryHeadDomain::Unmeasured;
+            if (!weights.empty() && (weights.size() != 4 ||
+                !std::isfinite(weights.front()) || weights.front() <= 0 ||
+                !std::all_of(weights.begin(), weights.end(),
+                    [&](float weight) { return weight == weights.front(); })))
+                return OrdinaryHeadDomain::Unmeasured;
+            return OrdinaryHeadDomain::EqualLocalFullModelSingleRow;
+        }
+
         /**
          * @brief Seal terminal-head intent using its complete execution domain.
          * @param requested Automatic intent or an explicit physical policy.
@@ -114,22 +163,25 @@ namespace llaminar2
          * @param inventory Canonical gathered hardware facts.
          * @param model Authenticated architecture, geometry, and terminal format.
          * @param mtp Requested retained graph/sidecar policy.
-         * @return CPU shards, measured dense-Qwen GPU TP2 shards, or accelerator mirrors.
+         * @param ordinary_domain Existing plan's ordinary demand and terminal ownership.
+         * @return CPU shards, measured GPU families' shards, or accelerator mirrors.
          * @throws std::invalid_argument if automatic intent has no domain to inspect.
          *
          * CPU projection work benefits from sharing the vocabulary across sockets.
          * The RTX 3090 and MI50 results are bounded to the native Q6_K head and
          * three-/sixteen-row dynamic verifier families on one rank. Both retain
          * the replicated sidecar and prove their native vocabulary publication.
-         * Other architectures,
-         * precision modes, distributed cliques and explicit choices retain
+         * Ordinary QFN Q8_0 MI50 TP4 is bounded to an equal full-model local
+         * domain, one selected final row, and no retained MTP capacity.
+         * Other architectures, precision modes, distributed cliques and explicit choices retain
          * their own policies. No model path or filename participates.
          */
         MTPTerminalHeadPolicy mtpHeadPolicyForDomain(
             MTPTerminalHeadPolicy requested,
             const std::vector<GlobalDeviceAddress> &devices,
             const std::vector<int> &ranks, const ClusterInventory &inventory,
-            const ModelConfig &model, const MTPRuntimeConfig &mtp)
+            const ModelConfig &model, const MTPRuntimeConfig &mtp,
+            OrdinaryHeadDomain ordinary_domain)
         {
             if (requested != MTPTerminalHeadPolicy::Automatic)
             {
@@ -142,11 +194,27 @@ namespace llaminar2
                 model.hidden_size == 5120 && model.intermediate_size == 17408 && model.vocab_size == 248320 &&
                 model.n_heads == 24 && model.n_kv_heads == 4 && model.head_dim == 256 &&
                 model.terminal_head_source.present && model.terminal_head_source.is_superblock &&
-                model.terminal_head_source.codebook_id == native_vnni_formats::Q6_K.codebook_id;
+                model.terminal_head_source.codebook_id == native_quantised_formats::Q6_K.codebook_id;
             const int graph_maximum = resolveMTPMaximumDraftDepth(mtp);
             const bool measured_verifier = (graph_maximum == 2 || graph_maximum == 15) &&
                 resolveMTPMaximumExecutionDraftDepth(mtp) == graph_maximum;
             const auto profile = mtpProfileForDomain(devices, ranks, inventory);
+            const bool ordinary_qfn = model.name == "qwen4exp" && model.n_layers == 48 &&
+                model.hidden_size == 2560 && model.intermediate_size == 640 && model.vocab_size == 248320 &&
+                model.n_heads == 24 && model.n_kv_heads == 2 && model.head_dim == 256 &&
+                model.terminal_head_source.present && !model.terminal_head_source.is_superblock &&
+                model.terminal_head_source.codebook_id == native_quantised_formats::Q8_0.codebook_id;
+            bool distinct_local_four = devices.size() == 4 && ranks.size() == 4;
+            for (std::size_t index = 0; distinct_local_four && index < devices.size(); ++index)
+                distinct_local_four = devices[index].device_type == DeviceType::ROCm &&
+                    ranks[index] == ranks.front() &&
+                    std::none_of(devices.begin(), devices.begin() + index,
+                        [&](const auto &prior) { return prior.device_type == devices[index].device_type &&
+                            prior.device_ordinal == devices[index].device_ordinal; });
+            if (ordinary_qfn && !mtp.enabled && !retainsMTPGraphCapacity(mtp) &&
+                ordinary_domain == OrdinaryHeadDomain::EqualLocalFullModelSingleRow &&
+                distinct_local_four && profile == MTPDepthDefaultsProfile::ROCmMI50)
+                return MTPTerminalHeadPolicy::VocabularySharded;
             const bool measured_cards = profile == MTPDepthDefaultsProfile::CUDARTX3090 ||
                 profile == MTPDepthDefaultsProfile::ROCmMI50;
             if (measured_model && mtp.enabled && mtp.max_request_batch == 1 &&
@@ -181,7 +249,10 @@ namespace llaminar2
         const ModelConfig &model_config,
         const ClusterInventory &cluster_inventory)
     {
-        LOG_DEBUG("Building execution plans for " << cluster_inventory.world_size
+        // Automatic admission revisits this geometry for many candidates.
+        // Keep participant details at TRACE; the selected orchestration
+        // reports lifecycle summaries through its owning runner.
+        LOG_TRACE("Building execution plans for " << cluster_inventory.world_size
                                                   << " ranks, model " << model_config.name);
 
         std::vector<RankExecutionPlan> plans;
@@ -189,7 +260,7 @@ namespace llaminar2
 
         if (config.usesNamedDomains())
         {
-            LOG_DEBUG("Using named domains mode");
+            LOG_TRACE("Using named domains mode");
             auto domains = resolveDomains(config, cluster_inventory);
             auto pp_stages = resolvePPStages(config, model_config, domains, cluster_inventory);
 
@@ -243,7 +314,13 @@ namespace llaminar2
             }
             const auto head_policy = mtpHeadPolicyForDomain(config.mtp.terminal_head_policy,
                 terminal ? terminal->devices : std::vector<GlobalDeviceAddress>{},
-                terminal ? terminal->device_ranks : std::vector<int>{}, cluster_inventory, model_config, config.mtp);
+                terminal ? terminal->device_ranks : std::vector<int>{}, cluster_inventory, model_config, config.mtp,
+                ordinaryHeadDomain(config, model_config, plans,
+                    terminal ? terminal->weights : std::vector<float>{},
+                    terminal && pp_stages.size() == 1 &&
+                        pp_stages.front().domain_name == terminal->name &&
+                        pp_stages.front().first_layer == 0 &&
+                        pp_stages.front().last_layer == model_config.n_layers - 1));
             for (auto &plan : plans)
             {
                 plan.runtime.mtp.depth_defaults_profile = profile;
@@ -252,7 +329,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("Using simple TP/PP mode");
+            LOG_TRACE("Using simple TP/PP mode");
             for (int rank = 0; rank < cluster_inventory.world_size; ++rank)
             {
                 plans.push_back(buildSimplePlan(
@@ -295,11 +372,39 @@ namespace llaminar2
             }
             const auto head_policy = mtpHeadPolicyForDomain(
                 config.mtp.terminal_head_policy, terminal_devices, terminal_ranks,
-                cluster_inventory, model_config, config.mtp);
+                cluster_inventory, model_config, config.mtp,
+                ordinaryHeadDomain(config, model_config, plans,
+                    plans.empty() ? std::vector<float>{} : plans.front().local_tp_weights,
+                    config.pp_degree == 1));
             for (auto &plan : plans)
                 plan.runtime.mtp.terminal_head_policy = head_policy;
         }
 
+        // Declared ngram source/cache roles may be outside compute domains,
+        // including opposite-vendor storage-only GPUs. Authenticate their
+        // authored owner independently of which rank owns model arithmetic.
+        if (config.ngram_table_policy.isGPUAdaptive())
+            for (const auto &endpoint : config.ngram_table_policy.gpu_adaptive.placement.declaredParticipants())
+            {
+                const auto owner = std::find_if(cluster_inventory.ranks.begin(), cluster_inventory.ranks.end(),
+                    [&](const RankInventory &rank) { return rank.rank == endpoint.world_rank; });
+                if (owner == cluster_inventory.ranks.end())
+                    throw std::invalid_argument("Declared ngram GPU owner rank is absent from the original inventory");
+                requireRankLocalGPUOwnership(*owner, endpoint.device(), "Declared ngram GPU role");
+            }
+        // Validate actual emitted owners, including simple explicit device maps
+        // and PP participants that do not pass through named-domain resolution.
+        for (const auto &plan : plans)
+        {
+            const auto validate = [&](const GlobalDeviceAddress &device) {
+                if (!device.isGPU()) return;
+                if (findRankForDevice(device, cluster_inventory, plan.rank) < 0)
+                    throw std::invalid_argument("Execution plan GPU is absent from its declared owner rank");
+            };
+            validate(plan.primary_device);
+            for (const auto &device : plan.local_tp_devices) validate(device);
+            for (const auto &device : plan.local_pp_devices) validate(device);
+        }
         return plans;
     }
 
@@ -517,7 +622,7 @@ namespace llaminar2
                 domain.rank_to_index[rank] = idx++;
             }
 
-            LOG_DEBUG("Resolved domain '" << domain.name << "' with "
+            LOG_TRACE("Resolved domain '" << domain.name << "' with "
                                           << domain.devices.size() << " devices on "
                                           << domain.ranks.size() << " ranks");
 
@@ -564,6 +669,7 @@ namespace llaminar2
             {
                 for (const auto &gpu : rank_inv.gpus)
                 {
+                    if (!rankOwnsGPUDevice(rank_inv, gpu)) continue;
                     domain.devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
                         DeviceId(gpu.type, gpu.local_device_id),
                         rank_inv.hostname,
@@ -611,6 +717,8 @@ namespace llaminar2
         const ClusterInventory &cluster_inventory,
         int required_rank)
     {
+        const RankInventory *ineligible_rank = nullptr;
+        const DeviceInfo *ineligible_gpu = nullptr;
         for (const auto &rank_inv : cluster_inventory.ranks)
         {
             if (required_rank >= 0 && rank_inv.rank != required_rank)
@@ -641,12 +749,16 @@ namespace llaminar2
                         if (gpu.numa_node < 0 || device.numa_node < 0 ||
                             gpu.numa_node == device.numa_node)
                         {
-                            return rank_inv.rank;
+                            if (rankOwnsGPUDevice(rank_inv, gpu)) return rank_inv.rank;
+                            ineligible_rank = &rank_inv;
+                            ineligible_gpu = &gpu;
                         }
                     }
                 }
             }
         }
+        if (ineligible_gpu)
+            requireRankLocalGPUOwnership(*ineligible_rank, *ineligible_gpu, "Execution domain");
         return -1; // Not found
     }
 
@@ -914,6 +1026,7 @@ namespace llaminar2
                             tp_info.devices = domain.devices;
                             tp_info.tp_weights = domain.weights;
                             tp_info.tp_backend = domain.backend;
+                            tp_info.domain_name = domain.name;
                             plan.local_pp_stage_tp_info.push_back(std::move(tp_info));
                             break;
                         }
@@ -1010,9 +1123,11 @@ namespace llaminar2
         else if (rank < static_cast<int>(cluster_inventory.ranks.size()))
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
-            if (!rank_inv.gpus.empty())
+            const auto local_gpu = std::find_if(rank_inv.gpus.begin(), rank_inv.gpus.end(),
+                [&](const auto &gpu) { return rankOwnsGPUDevice(rank_inv, gpu); });
+            if (local_gpu != rank_inv.gpus.end())
             {
-                const auto &gpu = rank_inv.gpus[0];
+                const auto &gpu = *local_gpu;
                 plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(
                     DeviceId(gpu.type, gpu.local_device_id),
                     rank_inv.hostname,
@@ -1075,7 +1190,8 @@ namespace llaminar2
             config.moe_rebalance,
             config.prefix_cache,
             config.mtp,
-            config.tp_allreduce_precision_override);
+            config.tp_allreduce_precision_override,
+            config.ngram_table_policy);
         plan.runtime.routed_expert_owner_order =
             config.routed_expert_owner_order;
 
@@ -1158,9 +1274,10 @@ namespace llaminar2
                 if (rank < static_cast<int>(cluster_inventory.ranks.size()))
                 {
                     const auto &rank_inv = cluster_inventory.ranks[rank];
-                    for (int i = 0; i < std::min(config.tp_degree, static_cast<int>(rank_inv.gpus.size())); ++i)
+                    for (const auto &gpu : rank_inv.gpus)
                     {
-                        const auto &gpu = rank_inv.gpus[i];
+                        if (!rankOwnsGPUDevice(rank_inv, gpu)) continue;
+                        if (plan.local_tp_devices.size() >= static_cast<std::size_t>(config.tp_degree)) break;
                         plan.local_tp_devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
                             DeviceId(gpu.type, gpu.local_device_id),
                             rank_inv.hostname,
@@ -1273,9 +1390,11 @@ namespace llaminar2
         else if (rank < static_cast<int>(cluster_inventory.ranks.size()))
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
-            if (!rank_inv.gpus.empty())
+            const auto local_gpu = std::find_if(rank_inv.gpus.begin(), rank_inv.gpus.end(),
+                [&](const auto &gpu) { return rankOwnsGPUDevice(rank_inv, gpu); });
+            if (local_gpu != rank_inv.gpus.end())
             {
-                const auto &gpu = rank_inv.gpus[0];
+                const auto &gpu = *local_gpu;
                 plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(
                     DeviceId(gpu.type, gpu.local_device_id),
                     rank_inv.hostname,
@@ -1351,7 +1470,8 @@ namespace llaminar2
             config.moe_rebalance,
             config.prefix_cache,
             config.mtp,
-            config.tp_allreduce_precision_override);
+            config.tp_allreduce_precision_override,
+            config.ngram_table_policy);
         plan.runtime.routed_expert_owner_order =
             config.routed_expert_owner_order;
 
@@ -1617,6 +1737,13 @@ namespace llaminar2
                 spec.per_rank_device = resolved->devices.front();
             }
 
+            // This public topology entrypoint can be called without
+            // buildAllPlans. A local stage may not move another rank's
+            // resolved GPU onto its first owner during topology emission.
+            if (!spec.is_global_tp)
+                for (const auto &device : spec.devices)
+                    if (device.isGPU() && findRankForDevice(device, cluster_inventory, spec.owning_rank) < 0)
+                        throw std::invalid_argument("Local PP stage GPU is absent from its declared owner rank");
             specs.push_back(std::move(spec));
         }
 

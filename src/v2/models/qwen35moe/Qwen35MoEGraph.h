@@ -11,6 +11,7 @@
 #include "../qwen35/Qwen35Graph.h"
 #include "../../execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "../../execution/moe/DeviceMoERebalanceController.h"
+#include "../../execution/moe/ExpertHistogramSource.h"
 #include "../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../execution/moe/MoERuntimeTable.h"
 #include "../../execution/moe/MoEOverlayReturnLayout.h"
@@ -19,6 +20,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,6 +33,7 @@ namespace llaminar2
     class ILocalTPContext;
     class IMoERuntimeTable;
     class MappedHostTransferArena;
+    class MoEOverlayDispatchTicketStorage;
     class MoELocalExpertSerialBufferArena;
     class MoEExpertOwnerMap;
     class MoEOverlayCollectiveWorkspace;
@@ -49,15 +53,6 @@ namespace llaminar2
         NonDecode,
         SerialDecode,
         GroupedMainVerifier,
-    };
-
-    /**
-     * @brief Typed authority decision for host runtime-histogram registration.
-     */
-    enum class MoERuntimeHistogramProducerRole : std::uint8_t
-    {
-        NotProducer,
-        ProductionDecode,
     };
 
     /**
@@ -88,6 +83,16 @@ namespace llaminar2
         }
     }
 
+    /** @brief Frozen continuation descriptor, never live placement/residency state. */
+    struct QwenRoutedContinuationTopology
+    {
+        int tier_index = -1;
+        const RoutedExpertDomain *domain = nullptr;
+        int graph_local_participant = -1;
+        bool captured_continuation_device = false;
+        bool captured_local_tp = false;
+    };
+
     /**
      * @brief Qwen 3.5 MoE graph builder
      *
@@ -97,6 +102,49 @@ namespace llaminar2
      */
     class Qwen35MoEGraph : public Qwen35Graph
     {
+        /**
+         * @brief Original immutable routed source used by all layer/family expansions.
+         * @details Equal canonical setup maps alias the existing admitted residency
+         * metadata owner. If initial preferred placement differs, retain the one
+         * canonical map the old graph path required, replacing its former per-stage
+         * copies under the same graph metadata lifetime. This is never a live map.
+         */
+        struct RoutedForwardRecipe
+        {
+            DeviceId source_device;
+            DeviceId effective_device;
+            std::shared_ptr<const MoEExpertOverlayRuntimePlan> runtime;
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> source;
+            std::shared_ptr<const MoEExpertOwnerMap> owners;
+            QwenRoutedContinuationTopology continuation;
+            bool reused_original_owners = false;
+        };
+        PreparedGraphTemplate<RoutedForwardRecipe> routed_forward_template_;
+        std::uint64_t canonical_owner_map_build_attempts_ = 0;
+        std::uint64_t continuation_resolution_attempts_ = 0;
+        std::uint64_t original_owner_map_reuses_ = 0;
+        std::uint64_t routed_layer_specialization_attempts_ = 0;
+        /** @brief Prepare routed metadata independently of later weight/store publication. */
+        const RoutedForwardRecipe &prepareRoutedForwardRecipe(DeviceId device);
+        /** @brief Borrow the original routed recipe, preparing it once on cold entry. */
+        const RoutedForwardRecipe &routedForwardRecipe(DeviceId device);
+        /** @brief Const queries may only borrow a previously published routed recipe. */
+        const RoutedForwardRecipe &routedForwardRecipe(DeviceId device) const;
+
+        /**
+         * @brief Resolve whether the canonical local GPU fold must consume external expert results.
+         * @param plan Original admitted routed topology and frozen per-layer quotas.
+         * @param owners Actual complete expert ownership used by this captured graph.
+         * @param layer Model-global routed layer.
+         * @param mode Existing residency policy; mutable zero tiers require frozen zero quotas.
+         * @param completed_return Exact root return node, or absent on a non-root graph.
+         * @return True only when this layer has an external contribution; no dummy frontier is created.
+         * @throws std::logic_error For absent/incompatible ownership or unresolved mutable zero capacity.
+         */
+        static bool requiresCapturedSparseReturn(const MoERoutedExpertPlacementPlan& plan,
+            const MoEExpertOwnerMap& owners, int layer, MoERebalanceRuntimeMode mode,
+            std::optional<std::string_view> completed_return = std::nullopt);
+
         /** Metadata-sealed arena replacement, present only for the explicit projection mode. */
         std::optional<MoEProjectionArenaGeometry> projection_arena_;
 
@@ -123,6 +171,12 @@ namespace llaminar2
 
         std::string architectureName() const override { return "qwen35moe"; }
 
+        /** @copydoc QwenGraphBase::prepareForwardGraphTemplate */
+        void prepareForwardGraphTemplate(DeviceId device) override;
+        /** @copydoc QwenGraphBase::forwardGraphTemplateStats */
+        [[nodiscard]] PreparedGraphTemplateStats forwardGraphTemplateStats() const override;
+
+
         /**
          * @brief Inject the source context before schema resolution or graph construction.
          * @param model_ctx Model lifetime owning GGUF metadata and prepared weights.
@@ -144,6 +198,20 @@ namespace llaminar2
             void *device_state_publication_stream,
             const int32_t *sequence_lengths_device = nullptr,
             const int32_t *absolute_position_ids_device = nullptr) override;
+
+        /**
+         * @brief Compose the existing routed body with immutable source/workload and HC destinations.
+         * @param identity Exact frozen source and predictor depth, independent of cache ordinal.
+         * @param predictor QFN predictor HC/rows/write targets, or nullptr for unchanged main/inline behavior.
+         * @return Existing routed graph using one canonical implementation.
+         * @throws std::invalid_argument For a mismatched source, participant, count or predictor policy.
+         */
+        ComputeGraph buildFFNGraphForLayer(
+            const LayerWeights &layer, ActivationBuffers &buffers,
+            const LayerGraphSourceIdentity &identity, int seq_len, int batch_size,
+            DeviceId device, void *device_state_publication_stream,
+            const int32_t *sequence_lengths_device, const int32_t *absolute_position_ids_device,
+            const Qwen4ExpPredictorResidualBinding *predictor);
 
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device) override;
@@ -259,6 +327,28 @@ namespace llaminar2
         mirroredLayerCheckpoints() const;
 
     protected:
+        /**
+         * @brief Declare original epoch storage before prepared-weight publication.
+         * @param device Exact allocator owned by the admitted model context.
+         * @return Existing epoch/bank/slot declaration with the original WeightManager PMA.
+         * @throws std::logic_error For absent model admission, an unowned device,
+         *         or a bound prepared store carrying a different authority.
+         * @note This resolves the same immutable model owner injected by the
+         *       runner factory; it allocates nothing and creates no new authority.
+         */
+        DeviceMoEOverlayEpochArena::Config moeOverlayEpochArenaConfig(DeviceId device) const;
+
+        /**
+         * @brief Require the original model-bound prepared store before Batch construction.
+         * @param device Exact Batch allocator already owned by the model admission.
+         * @return Same shared model/PMA identity carried by the prepared store.
+         * @throws std::logic_error For missing prepared binding, missing model admission,
+         *         an unowned device or a foreign prepared-store authority.
+         * @note Early epoch declaration remains legal before store publication; an
+         *       actual Batch must consume the store installed by the runner factory.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority> moeActivationBatchMemoryAuthority(DeviceId device) const;
+
         /**
          * @brief Retain every grouped-verifier embedding row on device.
          *
@@ -561,6 +651,23 @@ namespace llaminar2
     private:
         /** Device-free archive tests install real tables without admitting GPU work. */
         friend struct Qwen35MoEPrefixRuntimeTestPeer;
+
+        /**
+         * @brief Create this exact forward invocation's original dispatch ticket.
+         *
+         * WorkspaceDeclaration retains only checked geometry; no persistent
+         * mapped arena is requested. Executable construction retains the same
+         * per-device arena, native binding and original epoch pointer.
+         * @param layer_idx Original source layer.
+         * @param rows Exact physical forward row capacity.
+         * @param device Original GPU publisher.
+         * @param epoch Original request epoch pointer borrowed by executable graphs.
+         * @return Ticket with the immutable original forward construction purpose.
+         * @throws std::invalid_argument For invalid original purpose or geometry.
+         */
+        std::shared_ptr<MoEOverlayDispatchTicketStorage> dispatchTicketForForward(
+            int layer_idx, int rows, DeviceId device,
+            const DeviceMoEOverlayEpochTicket *epoch);
 
         /**
          * @brief Return model-lifetime mapped ticket storage for one GPU.

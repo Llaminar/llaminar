@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <limits>
 #include "../../../tensors/TensorKernels.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
@@ -331,6 +332,29 @@ namespace llaminar2
                     stream);
             }
             return true;
+        }
+
+        /**
+         * @brief Publish exact scalar raw convolution and compact prepared Q/K together.
+         * @param input Original projection/weight/bias operands and arena activation.
+         * @return Native enqueue success on the already bound exact stage stream.
+         * @throws std::invalid_argument For invalid original scalar head geometry.
+         * @details Reuses the original cache live state, speculative destination and
+         * snapshot contract. It adds no allocation, state bank, transfer or seed copy.
+         */
+        bool forwardPreparedQK(const gdn::ScalarPreparedQKConvolution& input) override
+        {
+            const auto layout=gdn::ScalarPreparedQKLayout::fromHeads(
+                input.key_heads,input.value_heads,input.key_width,input.value_width);
+            const auto channels=layout.elements+std::size_t(input.value_heads)*input.value_width;
+            if(channels>std::size_t(std::numeric_limits<int>::max())/3)return false;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int size=static_cast<int>(channels*3);
+            const float* initial=requireState(size,"ROCmShortConvolution::forwardPreparedQK");
+            float* destination=resolveVerifierStateDestination(size,stream_);
+            if(!initial||!destination)return false;
+            return gdn::launchROCmScalarPreparedQKConvolution({input,initial,destination,
+                verifier_state_capture_,verifier_state_capture_size_,verifier_state_capture_rows_},stream_);
         }
 
         bool forward(

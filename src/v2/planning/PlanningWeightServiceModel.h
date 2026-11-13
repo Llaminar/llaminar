@@ -4,8 +4,11 @@
  *
  * This setup-only model combines repeated native-kernel observations with an
  * independently measured streaming-memory limit. Its output is a weight-work
- * estimate, not a model benchmark or an allocation decision. Attention, KV/GDN,
- * communication, dependency scheduling and MTP acceptance remain separate; a
+ * estimate, not a model benchmark or an allocation decision. An optional
+ * separately observed CPU-only host-source stream preserves GPU-only
+ * compute eligibility and the main arithmetic/streaming endpoint invariant.
+ * Attention, KV/GDN, communication, dependency scheduling and MTP acceptance
+ * remain separate; a
  * caller must not advertise this component as complete request latency.
  */
 #pragma once
@@ -60,10 +63,14 @@ namespace llaminar2
          * @brief Seal independently authenticated memory and source-family observations.
          * @param memory Source-free streaming catalog, not cached matrix service.
          * @param kernels Ordinary projection and complete-expert catalogs.
+         * @param host_source_memory Optional CPU-only streaming service for immutable
+         *        host-source roles when CPU is excluded from compute. It is not
+         *        arithmetic evidence and never extends the main compute roster.
          * @throws std::invalid_argument for wrong/duplicate families or missing endpoints.
          */
         PlanningWeightServiceModel(PlanningKernelServiceCatalog memory,
-            std::vector<PlanningKernelServiceCatalog> kernels);
+            std::vector<PlanningKernelServiceCatalog> kernels,
+            std::optional<PlanningKernelServiceCatalog> host_source_memory = std::nullopt);
 
         /**
          * @brief Estimate an ordinary projection using its actual prepared format and local N/K.
@@ -92,7 +99,9 @@ namespace llaminar2
         double expertSeconds(int rank, DeviceId device,
             const PlanningRoutedExpertWeightWork &work, size_t token_rows) const;
 
-        /** @return Streaming service time for explicitly supplied traffic, not allocation capacity. */
+        /** @return Streaming service time for explicitly supplied traffic, not allocation capacity.
+         * CPU host-source roles use their separate observed catalog when present;
+         * missing rank evidence is fatal and never borrows another CPU service. */
         double memorySeconds(int rank, DeviceId device, double traffic_bytes) const;
 
         /** @return Immutable streaming evidence for joining other compute families by physical observer. */
@@ -105,5 +114,6 @@ namespace llaminar2
         const PlanningKernelServiceCatalog &expert(const std::array<std::string, 3> &formats) const;
         PlanningKernelServiceCatalog memory_;
         std::vector<PlanningKernelServiceCatalog> kernels_;
+        std::optional<PlanningKernelServiceCatalog> host_source_memory_; ///< Separate CPU source role; not compute/arithmetic eligibility.
     };
 }

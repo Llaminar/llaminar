@@ -91,6 +91,29 @@ class ContainerOwnershipTests(unittest.TestCase):
             with self.subTest(code=code, log=log), self.assertRaises(ValueError):
                 runtime.admission_outcome(code, log)
 
+    def test_fixed_head_capacity_requires_a_complete_positive_bom_deficit(self):
+        """A real fixed-head rejection is capacity; crashes and partial quotes are not."""
+        marker = 'Explicit fixed head native ranges exceed complete frozen PMA capacity;'
+        # Retained PP8 failure: the ordinary dry-run capacity message differs
+        # from the generic MemoryPlan boundary, but carries exact PMA totals.
+        quote = (' rank=0;device=ROCm:6 total=34261230328 incremental=34261230328'
+                 ' available=34261172224 deficit_bytes=58104')
+        other = ('; rank=0;device=ROCm:7 total=34261235564 incremental=34261235564'
+                 ' available=34261172224 deficit_bytes=63340')
+        self.assertEqual(runtime.admission_outcome(1, '[ERROR] ' + marker + quote + other),
+                         runtime.AdmissionOutcome.CAPACITY_REJECTED)
+        for code, log in (
+                (139, marker + quote), (0, marker + quote), (1, marker),
+                (1, marker + ' deficit_bytes=58104'),
+                (1, marker + quote.replace('58104', '0')),
+                (1, marker + quote.replace('58104', '58105')),
+                (1, marker + quote.replace('total=34261230328', 'total=1')),
+                (1, marker + quote + other.replace('63340', '0')),
+                (1, marker + quote + '\n' + marker),
+                (1, 'failed to initialize graph' + quote)):
+            with self.subTest(code=code, log=log), self.assertRaises(ValueError):
+                runtime.admission_outcome(code, log)
+
     def test_failed_helper_retirement_cannot_replace_operator_cancellation(self):
         owners = runtime.ContainerOwners()
         interrupted = KeyboardInterrupt('cancelled')
@@ -146,6 +169,38 @@ class ContainerOwnershipTests(unittest.TestCase):
         for policy in ('unknown', 'depth_0', 'depth_01', None):
             with self.subTest(policy=policy), self.assertRaises(ValueError):
                 runtime.generation_policy(configuration(policy=policy))
+
+
+class EvidenceCollectionTests(unittest.TestCase):
+    """Serving filters retain both required evidence and forbidden operations."""
+
+    def test_transfer_domains_preserve_unknown_semantic_operations(self):
+        """An unknown readback must remain visible regardless of its producer."""
+        for domain in ('backend', 'heterogeneous_collective', 'transfer', 'sampling',
+                       'mtp', 'moe_rebalance', 'moe_overlay_activation_epoch'):
+            self.assertIn(domain, runtime.PERF_STATS_FAMILIES)
+            for name in ('unexpected_d2h', 'unexpected_host_bridge',
+                         'unexpected_host_materialization', 'host_logits_access'):
+                with self.subTest(domain=domain, name=name):
+                    record = {'domain': domain, 'name': name, 'kind': 'counter',
+                              'device': 'cuda:0', 'phase': 'decode', 'rank': 0,
+                              'count': 1, 'value': 1, 'tags': {}}
+                    # Broad domain selection must preserve unknown names. The
+                    # real production validator, not a success-counter oracle,
+                    # then decides whether this transfer is authorized.
+                    retained = [record] if domain in runtime.PERF_STATS_FAMILIES else []
+                    result = runtime.validate_gpu_host_transfer_policy(
+                        retained, device_kinds=frozenset({'cuda'}))
+                    self.assertIsNotNone(result.error)
+                    self.assertIn(name, result.forbidden_operations)
+
+    def test_serving_collection_excludes_detailed_cpu_geometry(self):
+        self.assertNotIn('kernel', runtime.PERF_STATS_FAMILIES)
+        self.assertNotIn('cpu_moe_grouped_rows', runtime.PERF_STATS_FAMILIES)
+        self.assertNotIn('moe_overlay_participant_graph', runtime.PERF_STATS_FAMILIES)
+        self.assertIn('kernel.cpu_fa2_parallel_plan_executions', runtime.PERF_STATS_FAMILIES)
+        self.assertIn('physical_memory', runtime.PERF_STATS_FAMILIES)
+        self.assertIn('forward_graph', runtime.PERF_STATS_FAMILIES)
 
 
 class CellLifetimeTests(unittest.TestCase):
@@ -286,6 +341,10 @@ class CellLifetimeTests(unittest.TestCase):
         self.assertTrue(result['complete'])
         self.assertEqual(result['app']['completed_phases'], 10)
         self.assertTrue(all(not state['Running'] for state in self.containers.values()))
+        serving_commands = [args for args in result['command']
+                            if isinstance(args, str) and args.startswith('LLAMINAR_PERF_STATS_FILTER=')]
+        self.assertEqual(serving_commands,
+                         ['LLAMINAR_PERF_STATS_FILTER=' + ','.join(runtime.PERF_STATS_FAMILIES)])
 
     def test_failed_audit_preserved_while_other_audits_finish(self):
         with patch.object(runtime, 'runtime_evidence', side_effect=ValueError('graph mismatch')):

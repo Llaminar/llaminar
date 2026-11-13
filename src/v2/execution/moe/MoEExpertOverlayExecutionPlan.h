@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 
 #include "MoEExpertOverlayRuntimePlan.h"
 
@@ -80,6 +81,9 @@ namespace llaminar2
         bool loads_worker_fallback_experts = false;
         bool loads_expert_weights = false;
 
+        /** @return Complete immutable role, loading and membership equality. */
+        bool operator==(const OverlayRankPlan &) const = default;
+
         bool hasRole(OverlayRankRole role) const;
         bool ownsDomain(const std::string &domain_name) const;
         bool hasLocalDevice(DeviceId device) const;
@@ -114,6 +118,13 @@ namespace llaminar2
         std::vector<OverlayRankPlan> rank_plans;
         OverlayRankPlan current_rank;
 
+        /**
+         * @return Equality of every rank-local policy descriptor, including ordered domains.
+         * @note Factories derive these values independently for sibling graphs. This
+         * comparison proves policy agreement, never shared model/communicator ownership.
+         */
+        bool operator==(const MoEExpertOverlayExecutionPlan &) const = default;
+
         const OverlayRankPlan &currentRankPlan() const { return current_rank; }
         const OverlayRankPlan *rankPlanFor(int world_rank) const;
         /**
@@ -131,6 +142,15 @@ namespace llaminar2
         {
             return current_rank.ownsContinuationGraph();
         }
+        /**
+         * @brief Project complete immutable generation ownership before graph admission.
+         * @return Hosted for mixed backends or a continuation authority with
+         *         expert-only transaction followers; native-domain otherwise.
+         *
+         * Dense NodeTP peers retain their coordinated dense lifecycle. This
+         * projection does not create a remote coordinator or inspect live state.
+         */
+        [[nodiscard]] DeviceGenerationExecutionDomain generationExecutionDomain() const noexcept;
         std::string diagnostics() const;
     };
 
@@ -165,7 +185,8 @@ namespace llaminar2
      *
      * @param plan Immutable requested placement plan.
      * @param inventory Cluster-wide rank/device inventory gathered at startup.
-     * @return A copied plan with deterministic world-rank and owner bindings.
+     * @param diagnostic Already-resolved typed startup intent, never parsed again by the allocator.
+     * @return A copied plan with deterministic world-rank, owner and local route transport bindings.
      * @throws std::invalid_argument when requested hardware is absent,
      *         ambiguous after locality tie-breaking, or incompatible with the
      *         domain scope.
@@ -173,6 +194,7 @@ namespace llaminar2
     std::shared_ptr<MoERoutedExpertPlacementPlan>
     bindMoEExpertOverlayPlanToClusterInventory(
         const MoERoutedExpertPlacementPlan &plan,
-        const ClusterInventory &inventory);
+        const ClusterInventory &inventory,
+        std::optional<MoEOverlayNodeLocalRouteTransport> diagnostic = std::nullopt);
 
 } // namespace llaminar2

@@ -125,15 +125,16 @@ namespace llaminar2::test
         const auto sealed = ledger.seal();
         ASSERT_TRUE(sealed.valid());
         ASSERT_EQ(sealed.rows.size(), 2u);
-        EXPECT_EQ(sealed.rows[0].source_participant, 0);
-        EXPECT_EQ(sealed.rows[0].destination_participant, 1);
+        const auto whole_rows=sealed.wholeRows();
+        EXPECT_EQ(whole_rows[0].source_participant, 0);
+        EXPECT_EQ(whole_rows[0].destination_participant, 1);
         EXPECT_EQ(sealed.rows[0].wave_wall_nanoseconds, 2'000u);
         EXPECT_EQ(
             sealed.rows[0].inference_interference_nanoseconds,
             0u);
         EXPECT_EQ(sealed.rows[0].interference_sample_count, 0u);
-        EXPECT_EQ(sealed.rows[0].projections[0].wall_nanoseconds, 200u);
-        EXPECT_EQ(sealed.rows[0].projections[2].wall_nanoseconds, 202u);
+        EXPECT_EQ(whole_rows[0].projections[0].wall_nanoseconds, 200u);
+        EXPECT_EQ(whole_rows[0].projections[2].wall_nanoseconds, 202u);
         EXPECT_EQ(sealed.rows[1].wave_wall_nanoseconds, 2'100u);
 
         const auto normalized =
@@ -286,3 +287,11 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 } // namespace llaminar2::test
+
+#include "PhysicalPieceMeasurementContract.inc"
+
+#include "PhysicalMeasurementProducerRoleContract.inc"
+
+#include "LiveEconomyEvidenceCodecContract.inc"
+
+#include "TargetMigrationLedgerContract.inc"

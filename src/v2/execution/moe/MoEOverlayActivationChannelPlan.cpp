@@ -9,8 +9,12 @@
  */
 
 #include "MoEOverlayActivationChannelPlan.h"
+#include "MoEOverlayActivationBatchResources.h"
+#include <array>
 
 #include "MoEOverlayActivationPacketABI.h"
+#include "MoEOverlayFollowerRowGeometry.h"
+#include <array>
 
 #include <algorithm>
 #include <limits>
@@ -140,6 +144,9 @@ namespace llaminar2
     MoEOverlayNodeLocalActivationChannelPlan::localLanes(
         int world_rank) const
     {
+        if (source_world_rank == target_world_rank &&
+            world_rank == source_world_rank)
+            return rank_local_lanes;
         if (world_rank == source_world_rank)
             return source_lanes;
         if (world_rank == target_world_rank)
@@ -162,7 +169,7 @@ namespace llaminar2
         return found == staging_charges.end() ? 0u : found->bytes;
     }
 
-    bool MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+    bool MoEOverlayActivationChannelPlanner::requiresActivationChannels(
         const MoERoutedExpertPlacementPlan &placement)
     {
         const auto participants =
@@ -183,8 +190,53 @@ namespace llaminar2
             [&](const auto &participant)
             {
                 return participant.participant_id != source_participant_id &&
-                       participant.world_rank != source->world_rank;
+                       (participant.world_rank != source->world_rank ||
+                        (participant.device.is_gpu() &&
+                         placement.routed_tiers.at(static_cast<std::size_t>(participant.tier_index)).domain !=
+                             placement.continuation_domain));
             });
+    }
+
+    std::size_t MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
+        int maximum_rows, const MoEOverlayInferenceGraphFamilyIdentity& family,
+        std::span<const int> prefill_rows)
+    {
+        if (!family.valid() || maximum_rows <= 0)
+            throw std::invalid_argument("Follower terminal roster requires the original graph family");
+        // This count-only projection uses no backing authority. Row identity
+        // depends solely on exact execution bounds; PGR separately validates
+        // the same manifest against its actual retained serial arena capacities.
+        const std::array<std::size_t, 1> count_backing{static_cast<std::size_t>(maximum_rows)};
+        auto count = MoEOverlayFollowerRowGeometry::declare(maximum_rows,
+            family.max_decode_rows, prefill_rows, count_backing).shapes().size();
+        const auto draft_count = MoEOverlayFollowerRowGeometry::declareDraft(
+            family.max_request_count, count_backing).shapes().size();
+        for (const auto source_layer : family.mtp_source_layers)
+        {
+            (void)source_layer; // One cache manifest per actual learned source family.
+            count = checkedAdd(count, draft_count, "follower terminal cache roster");
+        }
+        return count;
+    }
+
+    std::optional<MoEOverlayInferenceOriginalSlotGeometry>
+    MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+        const MoERoutedExpertPlacementPlan& placement,
+        const ClusterInventory& inventory,
+        const MoEOverlayInferenceGraphFamilyIdentity& family)
+    {
+        if (!family.valid())
+            throw std::invalid_argument("Native activation slots require the original retained graph family");
+        (void)rankIndex(inventory);
+        const auto participants = MoEOverlayCapacityAdmission::boundParticipants(placement);
+        if (inventory.world_size != 1 ||
+            placement.authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident ||
+            !std::all_of(participants.begin(), participants.end(), [](const auto& participant) {
+                return participant.world_rank == 0 && participant.device.is_gpu();
+            }) || !requiresActivationChannels(placement))
+            return std::nullopt;
+        return MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(
+            family.max_mtp_draft_depth);
     }
 
     MoEOverlayActivationChannelPlan
@@ -202,8 +254,15 @@ namespace llaminar2
 
         const auto &placement = *input.placement_plan;
         const auto rank_by_id = rankIndex(*input.cluster_inventory);
+        if (input.original_native_slots &&
+            (input.cluster_inventory->world_size != 1 ||
+             placement.authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident))
+            throw std::invalid_argument("Native activation slots require their original world-one device authority");
         const auto participants =
             MoEOverlayCapacityAdmission::boundParticipants(placement);
+        if (input.original_native_slots && !std::all_of(participants.begin(), participants.end(),
+                [](const auto& participant) { return participant.world_rank == 0 && participant.device.is_gpu(); }))
+            throw std::invalid_argument("Native activation slots cannot bind CPU, mixed or remote participants");
         const int source_participant_id =
             placement.continuation_domain_spec.logical_root_participant;
         const auto source = std::find_if(
@@ -243,7 +302,7 @@ namespace llaminar2
             input.graph_family_count,
             "retained-family lane bytes");
         const std::size_t grant_bytes = checkedMultiply(
-            sizeof(MoEOverlayActivationDeviceEpochGrant),
+            MoEOverlayActivationBatchResources::grantGPUBytes(),
             input.graph_family_count,
             "retained-family grant bytes");
         const std::size_t max_entries = checkedMultiply(
@@ -259,17 +318,15 @@ namespace llaminar2
             {
                 continue;
             }
-            if (participant.world_rank == source->world_rank)
+            if (participant.world_rank == source->world_rank &&
+                (!participant.device.is_gpu() ||
+                 placement.routed_tiers.at(
+                     static_cast<std::size_t>(participant.tier_index)).domain ==
+                     placement.continuation_domain))
             {
-                /*
-                 * A rank may own the continuation device and a participant in
-                 * another tier (for example one socket of a NodeTP CPU tier).
-                 * That participant is already part of the rank-local graph and
-                 * its compact activation arena is priced by the ordinary local
-                 * participant BOM. This planner owns only cross-rank channels;
-                 * manufacturing a self-channel would violate the transport's
-                 * two-rank identity and double-charge those local buffers.
-                 */
+                // Dense continuation shards and explicit CPU endpoints retain
+                // their existing graph-local storage. Only actual foreign GPU
+                // domains require a separately submitted endpoint parent.
                 continue;
             }
             const auto target_rank = rank_by_id.find(participant.world_rank);
@@ -299,6 +356,9 @@ namespace llaminar2
         result.graph_family_count = input.graph_family_count;
         result.payload_matrix_bytes = matrix_bytes;
         result.device_grant_bytes_per_lane = grant_bytes;
+        result.host_grant_bytes_per_lane = checkedMultiply(
+            MoEOverlayActivationBatchResources::grantUploadDeclaration().physicalBytes(),input.graph_family_count,
+            "retained-family CPU grant roots");
         result.canonical_route_matrix_bytes =
             canonical_route_matrix_bytes;
         std::map<PhysicalKey, std::size_t> charge_by_resource;
@@ -335,21 +395,17 @@ namespace llaminar2
                 }
                 channel.source_lanes.push_back(source_lane);
                 channel.target_lanes.push_back(target_lane);
-                {
-                    auto &bytes = charge_by_resource[PhysicalKey{
-                        source->world_rank, source->device}];
-                    bytes = checkedAdd(
-                        bytes,
-                        grant_bytes,
-                        "source retained-family grants");
-                }
-                {
-                    auto &bytes = charge_by_resource[PhysicalKey{
-                        participant.world_rank, participant.device}];
-                    bytes = checkedAdd(
-                        bytes,
-                        grant_bytes,
-                        "target retained-family grants");
+                const auto cpu_grant_bytes=checkedMultiply(
+                    MoEOverlayActivationBatchResources::grantUploadDeclaration().physicalBytes(),
+                    input.graph_family_count,"retained-family CPU grant roots");
+                for(const auto endpoint:std::array{PhysicalKey{source->world_rank,source->device},
+                                                   PhysicalKey{participant.world_rank,participant.device}}){
+                    if(endpoint.device.is_gpu()){
+                        auto& gpu=charge_by_resource[endpoint];
+                        gpu=checkedAdd(gpu,grant_bytes,"retained-family GPU grant workspaces");
+                    }
+                    auto& host=charge_by_resource[PhysicalKey{endpoint.world_rank,DeviceId::cpu()}];
+                    host=checkedAdd(host,cpu_grant_bytes,"retained-family CPU grant roots");
                 }
                 if (source->device.is_gpu())
                 {
@@ -375,6 +431,22 @@ namespace llaminar2
                         "participant canonical route bytes");
                 }
             }
+            if (channel.source_world_rank == channel.target_world_rank)
+            {
+                channel.rank_local_lanes = channel.source_lanes;
+                for (const auto &lane : channel.target_lanes)
+                {
+                    const auto alias = std::find_if(
+                        channel.rank_local_lanes.begin(), channel.rank_local_lanes.end(),
+                        [&](const auto &existing)
+                        {
+                            return existing.participant_id == lane.participant_id &&
+                                   existing.device == lane.device;
+                        });
+                    if (alias == channel.rank_local_lanes.end())
+                        channel.rank_local_lanes.push_back(lane);
+                }
+            }
             channel.mapping_layout =
                 planMoEOverlayNodeLocalActivationLayout({
                     .participant_count = grouped.size(),
@@ -386,6 +458,7 @@ namespace llaminar2
                     .return_layout = source->device.is_cpu()
                         ? MoEOverlayReturnLayout::CanonicalExpertRoutes
                         : MoEOverlayReturnLayout::ParticipantTokenPartials,
+                    .original_native_slots = input.original_native_slots,
                 });
             auto &source_host_bytes = charge_by_resource[PhysicalKey{
                 source->world_rank, DeviceId::cpu()}];

@@ -22,6 +22,8 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -224,7 +226,7 @@ namespace llaminar2
             params_.max_state_commit_rows < 0 ||
             params_.max_state_commit_rows >
                 params_.verifier_rows_per_request ||
-            !params_.accepted_restore_rows_device ||
+            !deviceVerifierStateMetadataCovers(params_.accepted_restore_rows_device, params_.request_count, 1) ||
             !params_.target_cached_tokens_device ||
             !params_.accepted_state_counts_device ||
             !params_.publication_ok_flags_device)
@@ -246,9 +248,9 @@ namespace llaminar2
                 params_.next_sidecar_condition_tokens_device || params_.next_sidecar_position_ids_device ||
                 params_.generation_response_tokens_device || params_.generation_response_token_stride ||
                 params_.generation_control_device || params_.generation_control_stride ||
+                params_.depth_transaction_trace_device ||
                 params_.verifier_input_tokens_device || params_.verifier_input_token_stride ||
                 params_.committed_verifier_identity_device || params_.publish_shifted_kv ||
-                params_.dynamic_moe_commit_boundary ||
                 !params_.shifted_kv_caches.empty() || params_.shifted_target_cached_tokens_device ||
                 params_.shifted_accepted_state_counts_device || params_.penalty_policy_device ||
                 params_.generated_token_counts_device || params_.vocab_size)
@@ -287,6 +289,12 @@ namespace llaminar2
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Main-KV checkpoint cardinality does not match request geometry");
             return false;
         }
+        if (params_.depth_transaction_trace_device &&
+            (params_.authority != Authority::BoundedGeneration || params_.request_count != 1))
+        {
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Depth transaction trace requires its sole scalar response owner");
+            return false;
+        }
         if (params_.authority == Authority::BoundedGeneration &&
             (params_.max_state_commit_rows != 0 ||
              !params_.generation_response_tokens_device ||
@@ -304,11 +312,21 @@ namespace llaminar2
             return false;
         }
         if (params_.dynamic_moe_commit_boundary &&
-            (params_.authority != Authority::BoundedGeneration ||
-             !params_.dynamic_moe_commit_boundary->valid()))
+            ((params_.authority != Authority::BoundedGeneration && params_.authority != Authority::PipelineFollower) ||
+             !params_.dynamic_moe_commit_boundary->valid() ||
+             (params_.authority == Authority::PipelineFollower && !params_.pipeline_moe_commit_evidence)))
         {
             LOG_ERROR(
                 "[MTPSpeculativeStatePublicationStage] Dynamic MoE cadence must be a complete controller-owned publication transition");
+            return false;
+        }
+        if (params_.pipeline_moe_commit_evidence &&
+            (!params_.pipeline_moe_commit_evidence->valid() ||
+             (params_.authority != Authority::PipelineFollower &&
+              (params_.pipeline_moe_commit_evidence->meta_device != params_.outcome_meta_device ||
+               params_.pipeline_moe_commit_evidence->meta_stride != params_.outcome_meta_stride))))
+        {
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Pipeline cadence evidence changed its original compact-field producer");
             return false;
         }
         if (params_.publish_shifted_kv &&
@@ -449,7 +467,8 @@ namespace llaminar2
                          stream,
                          params_.shifted_target_cached_tokens_device,
                          params_.shifted_accepted_state_counts_device,
-                         params_.publication_ok_flags_device))
+                         params_.publication_ok_flags_device,
+                         params_.shifted_kv_caches[depth]->stateOwnership().shifted_origin))
             {
                 LOG_ERROR("[MTPSpeculativeStatePublicationStage] Shifted publication metadata derivation failed at depth "
                           << depth);
@@ -566,9 +585,9 @@ namespace llaminar2
         const DynamicMoECommitBoundaryBinding &boundary =
             *params_.dynamic_moe_commit_boundary;
         if (!params_.backend->enqueueAdvanceSpeculativeCommitBoundary(
-                params_.outcome_meta_device,
+                params_.authority == Authority::PipelineFollower ? params_.pipeline_moe_commit_evidence->meta_device : params_.outcome_meta_device,
                 params_.request_count,
-                params_.outcome_meta_stride,
+                params_.authority == Authority::PipelineFollower ? params_.pipeline_moe_commit_evidence->meta_stride : params_.outcome_meta_stride,
                 boundary.decode_rounds_committed_device,
                 boundary.decode_rounds_until_maintenance_device,
                 boundary.maintenance_due_device,
@@ -616,7 +635,7 @@ namespace llaminar2
                           params_.generation_control_stride,
                           params_.device_id.gpu_ordinal(),
                           stream,
-                          params_.accepted_restore_rows_device,
+                          params_.accepted_restore_rows_device.data(),
                           params_.target_cached_tokens_device,
                           params_.accepted_state_counts_device,
                           params_.publication_ok_flags_device,
@@ -628,7 +647,8 @@ namespace llaminar2
                           params_.next_verifier_condition_tokens_device,
                           params_.verifier_input_tokens_device,
                           params_.verifier_input_token_stride,
-                          params_.committed_verifier_identity_device)
+                          params_.committed_verifier_identity_device,
+                          params_.depth_transaction_trace_device)
                 : params_.backend
                       ->enqueueDeriveSpeculativePublicationMetadata(
                           params_.outcome_meta_device,
@@ -639,7 +659,7 @@ namespace llaminar2
                           params_.max_state_commit_rows,
                           params_.device_id.gpu_ordinal(),
                           stream,
-                          params_.accepted_restore_rows_device,
+                          params_.accepted_restore_rows_device.data(),
                           params_.target_cached_tokens_device,
                           params_.accepted_state_counts_device,
                           params_.publication_ok_flags_device,
@@ -748,11 +768,56 @@ namespace llaminar2
     MTPSpeculativeStatePublicationStage::bufferContract() const
     {
         StageBufferContract contract;
-        // Committed metadata and local cache/state bindings are persistent raw
-        // addresses, not sampler arena slots. A follower must not reserve dummy
-        // vocabulary, response or predictor buffers to satisfy this contract.
-        if (params_.authority == Authority::PipelineFollower)
+        // Restore hooks run beneath this stage's ledger, not their earlier
+        // verifier stage. Declare the exact retained reads and accepted writes;
+        // candidate scratch and raw backend state grant no arena write access.
+        for (const auto *stage : params_.verifier_state_stages)
+        {
+            if (!stage)
+                throw std::logic_error("MTP publication contract contains a null retained-state stage");
+            // Restore kernels consume verifier-produced priors/candidates on a
+            // distinct publication stream. Expose the original tensor frontier
+            // before capture, rather than relying on a transitive stream edge
+            // that the tensor coherence authority has not authenticated.
+            for (const auto &binding : stage->verifierStatePublicationInputs())
+            {
+                if (binding.access != BufferAccess::READ || binding.prepare_write_storage ||
+                    !binding.dtype || !*binding.dtype)
+                    throw std::logic_error("MTP accepted-state input must be a typed preallocated read");
+                const auto existing = std::find_if(contract.inputs.begin(), contract.inputs.end(),
+                    [&](const auto &input) { return input.id == binding.id; });
+                if (existing != contract.inputs.end())
+                {
+                    if (std::strcmp(existing->dtype, binding.dtype) != 0)
+                        throw std::logic_error("MTP accepted-state input has conflicting tensor types");
+                }
+                else
+                    contract.addInput(binding.id, binding.dtype);
+            }
+            for (const auto &binding : stage->verifierStatePublicationOutputs())
+            {
+                if (binding.access != BufferAccess::WRITE || binding.prepare_write_storage ||
+                    !binding.dtype || !*binding.dtype)
+                    throw std::logic_error("MTP accepted-state output must be a typed preallocated write");
+                const auto existing = std::find_if(contract.outputs.begin(), contract.outputs.end(),
+                    [&](const auto &output) { return output.id == binding.id; });
+                if (existing != contract.outputs.end())
+                {
+                    if (std::strcmp(existing->dtype, binding.dtype) != 0)
+                        throw std::logic_error("MTP accepted-state output has conflicting tensor types");
+                }
+                else
+                    contract.addPreallocatedOutput(binding.id, binding.dtype);
+            }
+        }
+        // A follower reads only exact tail-authored cadence fields when its
+        // own controller consumes them. It never acquires outcome writes,
+        // vocabulary, response or predictor storage through this dependency.
+        if (params_.authority == Authority::PipelineFollower) {
+            if (params_.dynamic_moe_commit_boundary && params_.pipeline_moe_commit_evidence)
+                contract.addInput(BufferId::STOCHASTIC_BATCH_OUTPUT_META, "INT32");
             return contract;
+        }
         contract.addInput(
             BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS,
             "INT32");
@@ -764,6 +829,8 @@ namespace llaminar2
             "INT32");
         if (params_.authority == Authority::BoundedGeneration)
         {
+            if (params_.depth_transaction_trace_device)
+                contract.addPreallocatedInOut(BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC, "INT32");
             contract.addPreallocatedInOut(
                 BufferId::MTP_GENERATION_RESPONSE_TOKENS,
                 "INT32");
@@ -808,8 +875,8 @@ namespace llaminar2
                self.outcome_meta_stride == other.outcome_meta_stride &&
                self.base_cached_tokens_device ==
                    other.base_cached_tokens_device &&
-               self.accepted_restore_rows_device ==
-                   other.accepted_restore_rows_device &&
+               self.accepted_restore_rows_device.data() == other.accepted_restore_rows_device.data() &&
+               self.accepted_restore_rows_device.size() == other.accepted_restore_rows_device.size() &&
                self.target_cached_tokens_device ==
                    other.target_cached_tokens_device &&
                self.accepted_state_counts_device ==
@@ -836,6 +903,7 @@ namespace llaminar2
                    other.generation_control_device &&
                self.generation_control_stride ==
                    other.generation_control_stride &&
+               self.depth_transaction_trace_device == other.depth_transaction_trace_device &&
                self.verifier_input_tokens_device ==
                    other.verifier_input_tokens_device &&
                self.verifier_input_token_stride ==
@@ -844,6 +912,7 @@ namespace llaminar2
                    other.committed_verifier_identity_device &&
                self.dynamic_moe_commit_boundary ==
                    other.dynamic_moe_commit_boundary &&
+               self.pipeline_moe_commit_evidence == other.pipeline_moe_commit_evidence &&
                self.request_count == other.request_count &&
                self.verifier_rows_per_request ==
                    other.verifier_rows_per_request &&

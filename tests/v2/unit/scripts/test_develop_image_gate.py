@@ -487,7 +487,8 @@ class DevelopImageGateTests(unittest.TestCase):
                  patch.object(gate.subprocess, "run") as retire:
                 self.assertEqual(gate.run_pr_tests(images("AVX512"), directory),
                                  pr_report())
-            devices.assert_not_called()
+            devices.assert_called_once_with("test-runner-avx512", "CPU",
+                                            user=f"{os.getuid()}:{os.getgid()}")
             mounts.assert_called_once_with([(directory, "/ci-results", False)])
             retirement = retire.call_args.args[0]
             self.assertEqual(retirement[:3], ["docker", "rm", "-f"])

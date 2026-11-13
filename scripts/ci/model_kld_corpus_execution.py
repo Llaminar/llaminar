@@ -1,0 +1,477 @@
+"""Optional fixed-history corpus adapter for the existing native canary lifecycle.
+
+This module never starts a model process or owns driver/resource retirement.
+The existing runner owns those operations. Source-owned argv/config, explicit
+paired arithmetic/document obligations and actual native proofs stay separate
+from numerical acceptance and unexecuted benchmark obligations.
+"""
+from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
+import hashlib
+import json
+import tempfile
+
+import model_kld_corpus_v2 as corpus_v2
+from model_kld_corpus import identity, metadata_digest, require, unchanged, require_reference_file_identity
+
+SELECTORS = {
+    'gdn_projection': 'LLAMINAR_GDN_PROJECTION_ARITHMETIC',
+    'moe_router': 'LLAMINAR_MOE_ROUTER_ARITHMETIC',
+    'hc_up': 'LLAMINAR_QFN_HC_UP_ACTIVATION',
+    'gdn_output': 'LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION',
+    'fa_output': 'LLAMINAR_QFN_FA_OUTPUT_ACTIVATION',
+    'gdn_qkv': 'LLAMINAR_QFN_GDN_QKV_ACTIVATION',
+}
+
+
+def file_sha256(path):
+    """Hash the actual small executable; never read a model or logit payload."""
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024*1024), b''): digest.update(block)
+    return digest.hexdigest()
+
+
+def original_source_identity(path, descriptor):
+    """Authenticate durable reference metadata and pin this run's full physical identity.
+
+    The stored device number is observational across reboots. All file metadata
+    must match, and the returned current device number stays strict for this run.
+    """
+    pin = identity(path)
+    observed = dict(path=pin[0],device=pin[1],inode=pin[2],bytes=pin[3],mtime_ns=pin[4],ctime_ns=pin[5])
+    try:expected = json.loads(descriptor['object_identity'])
+    except (KeyError,TypeError,ValueError) as error:
+        raise ValueError('Original source needs reference-issued stat identity') from error
+    require_reference_file_identity(expected, observed)
+    return pin
+
+
+def select_topologies(corpus, selected):
+    """Select only reviewed corpus-owned identities, preserving requested order."""
+    available = {t['id']: t for t in corpus['manifest']['topologies']}
+    names = selected if selected else list(available)
+    require(names and len(names) == len(set(names)) and all(n in available for n in names),
+            'Unknown or duplicate selected corpus topology')
+    return [available[n] for n in names]
+
+
+def validate_described_config(topology, described):
+    """Require the actual public parser's model-free output and exact original argv."""
+    argv = topology.get('engine_argv')
+    require(type(argv) is list and argv and all(type(v) is str and v and '\0' not in v for v in argv),
+            'Corpus topology needs original canonical engine_argv export')
+    require(type(described) is dict and described.get('schema') == 'llaminar.model-kld-described-config.v1' and
+            described.get('engine_argv') == argv and described.get('config') == topology['expected_config'] and
+            described.get('runtime_config_digest') == topology['runtime_config_digest'] == metadata_digest(described['config']),
+            'Native public parser differs from source-owned argv/config')
+    return argv
+
+
+def physical_devices(config):
+    """Observe original compute addresses and separately declared rank-local cache GPUs.
+
+    This does not resolve placement or grant devices. Native compares the entire
+    original config and validates its actual admitted execution plan separately.
+    """
+    require(type(config) is dict, 'Invalid canonical configuration document')
+    found = set()
+    def visit(value):
+        if type(value) is dict:
+            if 'device_type' in value and 'device_ordinal' in value:
+                backend = {'CPU':'cpu','CUDA':'cuda','ROCm':'rocm'}.get(value['device_type'])
+                ordinal = value['device_ordinal']
+                require(backend is not None and type(ordinal) is int and ordinal >= 0,
+                        'Invalid explicit physical device in canonical config')
+                found.add(backend+':'+str(ordinal))
+            for child in value.values(): visit(child)
+        elif type(value) is list:
+            for child in value: visit(child)
+    visit(config)
+    # Cache endpoints are rank-local storage roles, not GlobalDeviceAddress
+    # compute participants. Observe their physical GPUs without modifying the
+    # canonical configuration or inferring an extra compute/expert domain.
+    configuration = config.get('configuration', {})
+    require(type(configuration) is dict, 'Invalid canonical configuration')
+    table = configuration.get('ngram_table_policy')
+    if table is not None:
+        require(type(table) is dict, 'Invalid canonical ngram policy')
+        adaptive = table.get('gpu_adaptive', {})
+        require(type(adaptive) is dict, 'Invalid canonical GPU cache policy')
+        placement = adaptive.get('placement')
+        if placement is not None:
+            require(type(placement) is dict and placement.get('mode') in ('ConsumerLocal', 'DeclaredRankLocal'),
+                    'Invalid explicit GPU cache placement')
+            owners = placement.get('owners')
+            require(type(owners) is list, 'Invalid explicit GPU cache owners')
+            endpoints = []
+            for owner in owners:
+                require(type(owner) is dict and 'participant' in owner, 'Invalid explicit GPU cache owner')
+                endpoints.append(owner['participant'])
+            coordinator = placement.get('coordinator')
+            if placement['mode'] == 'ConsumerLocal':
+                require(not endpoints and coordinator is None, 'Consumer-local cache has declared endpoints')
+            else:
+                require(endpoints and coordinator is not None, 'Declared GPU cache has incomplete endpoints')
+                endpoints.append(coordinator)
+            for endpoint in endpoints:
+                require(type(endpoint) is dict and set(endpoint) == {'world_rank', 'backend', 'ordinal'},
+                        'Invalid explicit GPU cache participant')
+                require(type(endpoint['world_rank']) is int and endpoint['world_rank'] == 0,
+                        'QFN observer requires rank-local GPU cache participants')
+                require(type(endpoint['backend']) is str, 'Invalid explicit GPU cache participant backend')
+                backend = {'CUDA': 'cuda', 'ROCm': 'rocm'}.get(endpoint['backend'])
+                ordinal = endpoint['ordinal']
+                require(backend is not None and type(ordinal) is int and ordinal >= 0,
+                        'Invalid explicit GPU cache participant device')
+                found.add(backend + ':' + str(ordinal))
+    require(found, 'Canonical config has no original physical device inventory')
+    return sorted(found)
+
+
+def validate_absolute_pilot(policy, manifest, topology):
+    """Validate actual selected row-group roles/limits before native admission.
+
+    The installed evaluator alone parses policy meaning. Expected original rows
+    establish groups without inventing candidate metrics or numerical evidence.
+    """
+    groups = {(topology['backend'], topology['id'], row['context_group'], row['phase'])
+              for row in corpus_v2.expected_rows(manifest)}
+    _, roles = corpus_v2._absolute_pilot_limits(policy, manifest, groups)
+    return dict(policy='initial_absolute_pilot',
+        required_groups=[dict(zip(corpus_v2.GROUP_FIELDS,key)) for key in sorted(groups) if roles[key]=='required'],
+        diagnostic_groups=[dict(zip(corpus_v2.GROUP_FIELDS,key)) for key in sorted(groups) if roles[key]=='diagnostic'],
+        diagnostic_verdict='UNAVAILABLE', whole_corpus_accepted=False)
+
+
+class PairedMetadataPolicy(str, Enum):
+    """Bound metadata location only; reference payload containment never changes."""
+    CANONICAL_ROOT = "canonical_root_manifest"
+    SOURCE_BOUND_DIAGNOSTIC = "source_bound_external_diagnostic_manifest"
+    SOURCE_BOUND_OBSERVED_PIPELINE = "source_bound_complete_observed_pipeline_manifest"
+
+
+
+def declared_benchmark_profile(record):
+    """Validate the source-owned exact argv/document union, never reconstruct policy."""
+    profile=record.get('diagnostic_benchmark')
+    require(type(profile) is dict and type(profile.get('schema')) is int and profile['schema']==1 and
+        profile.get('policy')=='diagnostic_declared' and profile.get('certification_eligible') is False and
+        type(profile.get('context_length')) is int and profile['context_length']>0,
+        'Paired case lacks its original typed diagnostic profile')
+    argv='args' in profile; document='configuration_document' in profile
+    require(argv!=document, 'Diagnostic profile requires exactly one original argv or configuration document')
+    if argv:
+        arguments=profile['args']
+        require('configuration_policy' not in profile and type(arguments) is list and arguments and
+            all(type(v) is str and v and '\0' not in v for v in arguments),
+            'Malformed original diagnostic argv')
+    else:
+        from model_parity_inventory import declared_document_configuration
+        declared_document_configuration(profile,'args')
+    return profile
+
+
+def canonical_diagnostic_arguments(record, directory=None, *, paired_observer=None):
+    """Keep a source-authored document alive through its actual public parser use.
+
+    The temporary file is only a lossless spelling of original exported input,
+    not a source/planning authority. Its original stat identity is pinned by the
+    selection alongside the corpus inputs. No model or subprocess is started.
+    """
+    profile=declared_benchmark_profile(record);owner=None;pins={}
+    if 'args' in profile:
+        arguments=list(profile['args'])
+    else:
+        if directory is None:
+            owner=tempfile.TemporaryDirectory(prefix='llaminar-paired-profile-',dir='/tmp')
+            directory=Path(owner.name)
+        path=Path(directory)/'original-configuration.json'
+        require(not path.exists(), 'Original diagnostic configuration output must be fresh')
+        with path.open('x') as stream:
+            stream.write(json.dumps(profile['configuration_document'],sort_keys=True,indent=2)+'\n')
+        pins[str(path)]=identity(path)
+        arguments=['--config',str(path)]
+    if paired_observer is not None:
+        # The source-authenticated numerical observer already declares this
+        # policy. Project only its explicit disabled-prefix arm; never inherit
+        # a public parser default or copy unrelated observer workload flags.
+        prefix = paired_observer.get('expected_config',{}).get('configuration',{}).get('prefix_cache')
+        argv = paired_observer.get('engine_argv')
+        require(type(prefix) is dict and prefix.get('enabled') is False and
+                type(argv) is list and argv.count('--no-prefix-cache') == 1 and '--prefix-cache' not in argv,
+                'Paired diagnostic observer must explicitly disable prefix cache')
+        require('--prefix-cache' not in arguments,
+                'Original diagnostic benchmark conflicts with disabled observer prefix policy')
+        if '--no-prefix-cache' not in arguments:
+            arguments.append('--no-prefix-cache')
+    return [*arguments,'-m',record['model'],'--context-length',str(profile['context_length'])],owner,pins
+
+@dataclass(frozen=True)
+class PairedCorpusSelection:
+    """One existing exact canonical case and its pinned local document obligations.
+
+    This value neither attaches a profile nor declares topology/certification.
+    The source-owned exported case is the only placement/argv authority. Model,
+    driver and process ownership remain in the existing CorpusExecution runner.
+    """
+    exact: str
+    record: dict
+    corpus: dict
+    topology: dict
+    paths: dict
+    pins: dict
+    documents: dict
+    canonical_arguments: list
+    canonical_configuration_owner: object = None  # Retains the original source document until all parser/native users retire.
+
+    @classmethod
+    def from_export(cls, exact, record, corpus_root, document_root, *, metadata_policy=PairedMetadataPolicy.CANONICAL_ROOT, configuration_directory=None):
+        """Authenticate all declared small documents before selecting or launching a model."""
+        require(type(record) is dict and record.get('model_parity_schema') == 1 and
+                type(exact) is str and '.ProductionParity/' in exact,
+                'Paired acceptance needs one original registered ProductionParity cell')
+        runtime=record.get('runtime',{})
+        if runtime.get('configuration_policy')=='observed_pipeline_binding_required_v1':
+            raise ValueError('Paired observer needs its completed original pipeline binding')
+        if 'observed_pipeline_binding' in record:
+            from model_parity_inventory import require_observed_pipeline_document
+            require_observed_pipeline_document(record)
+        pair = record.get('paired_workload')
+        require(type(pair) is dict and set(pair) == {'schema','policy','certification_eligible','role',
+                'case_id','source_fields','accuracy','benchmark','arithmetic'} and type(pair['schema']) is int and pair['schema']==2 and
+                pair['policy']=='diagnostic_obligation' and pair['certification_eligible'] is False and
+                pair['role'] in ('required','expanded') and pair['case_id']==record.get('id'),
+                'Missing or malformed source-owned paired workload; no automatic profile attachment')
+        fields = ['model'] + (['shared_predictor'] if 'shared_predictor' in record else [])
+        require(pair['source_fields']==fields and all(type(record.get(k)) is str and record[k] for k in fields),
+                'Paired source roles differ from original canonical cell')
+        require(record.get('runtime',{}).get('generation',{}).get('mtp_policy')=='off',
+                'Local QFN paired acceptance supports ordinary MTP-off cells only')
+        accuracy, benchmark = pair['accuracy'], pair['benchmark']
+        common = {'arguments_from','catalog','workload','policy'}
+        require(type(accuracy) is dict and accuracy.get('arguments_from')=='diagnostic_benchmark' and
+                type(benchmark) is dict and set(benchmark)=={'policy','arguments_from','profile'} and
+                benchmark['policy']=='diagnostic_declared' and benchmark['arguments_from']=='diagnostic_benchmark',
+                'Paired obligations must reuse the original diagnostic argv')
+        policy = accuracy.get('policy')
+        if policy=='initial_absolute_pilot':
+            require(set(accuracy)==common|{'pilot','approved_baseline','calibrated','whole_corpus_accepted'} and
+                    all(accuracy[k] is False for k in ('approved_baseline','calibrated','whole_corpus_accepted')),
+                    'Initial paired pilot cannot claim baseline/calibration/whole-corpus acceptance')
+            names = ('pilot',)
+        else:
+            require(policy=='calibrated_revision' and set(accuracy)==common|{'baseline','approval','calibration'},
+                    'Paired revision needs actual baseline, approval and calibration documents')
+            names = ('baseline','approval','calibration')
+        refs = {k:accuracy[k] for k in ('catalog','workload',*names)}
+        refs['benchmark'] = benchmark['profile']
+        paths, pins, documents = {}, {}, {}
+        for name, reference in refs.items():
+            require(type(reference) is dict and set(reference)=={'path','sha256'} and
+                    type(reference['path']) is str and reference['path'] and '\0' not in reference['path'] and
+                    type(reference['sha256']) is str and len(reference['sha256'])==64 and
+                    all(c in '0123456789abcdef' for c in reference['sha256']),
+                    'Paired document needs its exact source-owned path and SHA256')
+            path = (Path(document_root)/reference['path']).resolve(strict=True)
+            pin = identity(path)
+            require(path.is_file() and 0 < pin[3] <= 16*1024*1024, 'Paired document exceeds bounded metadata extent')
+            raw = path.read_bytes()
+            require(hashlib.sha256(raw).hexdigest()==reference['sha256'] and identity(path)==pin,
+                    'Paired document changed or has a foreign digest: '+name)
+            document = json.loads(raw)
+            require(type(document) is dict, 'Paired document must be a JSON object: '+name)
+            paths[name], pins[str(path)], documents[name] = path, pin, document
+        root = Path(corpus_root).resolve(strict=True)
+        require(isinstance(metadata_policy,PairedMetadataPolicy),'Unknown paired metadata-location policy')
+        if metadata_policy == PairedMetadataPolicy.CANONICAL_ROOT:
+            require(paths['workload']==(root/'manifest.json').resolve(strict=True),
+                    'Paired workload must be the exact approved corpus manifest, not a searched generation')
+            corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'])
+        else:
+            if metadata_policy == PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE:
+                require('observed_pipeline_binding' in record,
+                        'Complete adapted metadata requires its authenticated original observed pipeline')
+                # from_export already validates the actual observed source document
+                # above. The old root manifest remains the authority for every
+                # source, prompt, Pending teacher, reset and reference declaration;
+                # adaptation may replace only the explicit topology inventory.
+                original_path = (root/'manifest.json').resolve(strict=True)
+                original_pin = identity(original_path)
+                require(original_path.is_file() and 0 < original_pin[3] <= 16*1024*1024,
+                        'Original adapted corpus metadata exceeds bounded extent')
+                original = json.loads(original_path.read_bytes())
+                require(identity(original_path) == original_pin and
+                        {k:v for k,v in documents['workload'].items() if k != 'topologies'} ==
+                        {k:v for k,v in original.items() if k != 'topologies'},
+                        'Adapted pipeline metadata changed original source, histories or references')
+                pins[str(original_path)] = original_pin
+            # Only the source-owned paired document selects this bounded metadata.
+            # load_corpus retains original-root containment for every reference byte.
+            corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'],manifest_path=paths['workload'])
+        require(corpus['manifest']==documents['workload'], 'Paired corpus differs from its declared workload')
+        matches = [t for t in corpus['manifest']['topologies'] if t['canonical_cell']==exact]
+        require(len(matches)==1, 'Paired corpus needs exactly one topology for the original exact cell')
+        topology = matches[0]
+        require(type(pair['arithmetic']) is dict and set(pair['arithmetic'])==set(SELECTORS) and
+                pair['arithmetic']==topology['arithmetic'],
+                'Corpus arithmetic differs from explicit original paired-profile selectors')
+        source = corpus['manifest']['source']
+        require(Path(record['model']).resolve(strict=True)==Path(source['shards'][0]['path']).resolve(strict=True),
+                'Paired corpus names another original main source')
+        require(('shared_predictor' in record)==('shared_predictor' in source),
+                'Paired corpus has a missing or extra original predictor source role')
+        if 'shared_predictor' in record:
+            require('shared_predictor' in source and Path(record['shared_predictor']).resolve(strict=True)==
+                    Path(source['shared_predictor']['path']).resolve(strict=True),
+                    'Paired corpus names another original predictor source')
+        if policy=='initial_absolute_pilot':
+            validate_absolute_pilot(documents['pilot'], corpus['manifest'], topology)
+        else:
+            # Use the existing evaluator's row and calibration validators;
+            # document authentication never fabricates a candidate/self-baseline.
+            baseline, approval = documents['baseline'], documents['approval']
+            corpus_v2.validate_observation(corpus['manifest'],baseline)
+            require(baseline['topology_id']==topology['id'] and baseline['backend']==topology['backend'] and
+                    approval.get('schema')=='llaminar.model-kld-baseline-approval.v1' and
+                    approval.get('corpus_manifest_digest')==metadata_digest(corpus['manifest']) and
+                    approval.get('baseline_report_digest')==metadata_digest(baseline),
+                    'Paired revision is not bound to its actual approved baseline/topology')
+            groups={(topology['backend'],topology['id'],row['context_group'],row['phase'])
+                    for row in corpus_v2.expected_rows(corpus['manifest'])}
+            corpus_v2._limits(documents['calibration'],corpus['manifest'],baseline,approval,groups)
+        # One original public representation; unequal ceilings are never
+        # downgraded to scalar argv or inferred from observer runtime state.
+        canonical_arguments,configuration_owner,configuration_pins=canonical_diagnostic_arguments(record,configuration_directory,paired_observer=topology)
+        pins.update(configuration_pins)
+        unchanged(pins)
+        return cls(exact, json.loads(json.dumps(record)), corpus, topology, paths, pins, documents, canonical_arguments, configuration_owner)
+
+    def require_public_projection(self, runner, args, environment, observed):
+        """Compare actual parser-issued intent; never interpret topology/CLI in Python."""
+        unchanged(self.pins)
+        validate_described_config(self.topology, observed)
+        canonical = json.loads(runner.subprocess.check_output(
+            [str(args.binary),'--describe-config','--',*self.canonical_arguments],env=environment,text=True))
+        require(canonical.get('schema')=='llaminar.model-kld-described-config.v1' and
+                canonical.get('engine_argv')==self.canonical_arguments and
+                canonical.get('runtime_config_digest')==metadata_digest(canonical.get('config')),
+                'Canonical public parser did not preserve original exported arguments')
+        for described in (canonical, observed):
+            require(type(described.get('qfn_canonical_intent')) is dict and described['qfn_canonical_intent'] and
+                    described.get('qfn_arithmetic_intent')==self.topology['arithmetic'],
+                    'Paired parser omitted typed QFN placement/math or changed actual arithmetic')
+        require(canonical['qfn_canonical_intent']==observed['qfn_canonical_intent'],
+                'Paired observer changed original canonical placement/math intent')
+        config = canonical['config']['configuration']
+        for role, field in (('model','model_path'),('shared_predictor','shared_predictor')):
+            expected = self.record.get(role)
+            actual = config.get(field)
+            require((expected is None and actual is None) or (expected is not None and type(actual) is str and
+                    Path(expected).resolve(strict=True)==Path(actual).resolve(strict=True)),
+                    'Canonical parser changed original source role: '+role)
+        unchanged(self.pins)
+        return canonical
+
+    def observation(self):
+        """Retain original obligations separately from numerical and benchmark outcomes."""
+        return dict(exact_cell=self.exact, source_export=self.record,
+            documents={name:dict(path=str(path),sha256=(self.record['paired_workload']['benchmark']['profile'] if name=='benchmark' else
+                self.record['paired_workload']['accuracy'][name])['sha256']) for name,path in self.paths.items()},
+            benchmark_status='DECLARED_NOT_EXECUTED',certification_eligible=False)
+
+
+class CorpusExecution:
+    """One immutable selected corpus topology; no second execution lifecycle."""
+
+    def __init__(self, corpus, topology, *, baseline=None, approval=None, calibration=None, absolute_pilot=None, paired=None):
+        """Pin original sources and optional reviewed numerical inputs before admission."""
+        self.corpus = corpus; self.topology = topology; self.paired = paired
+        self.baseline = baseline; self.approval = approval; self.calibration = calibration
+        self.absolute_pilot = absolute_pilot
+        require(absolute_pilot is None or not any(value is not None for value in (baseline,approval,calibration)),
+                'Absolute pilot cannot use a baseline, approval or calibration')
+        require((baseline is None) == (approval is None), 'Baseline report and approval must be supplied together')
+        require(baseline is not None or calibration is None, 'Calibration requires an approved baseline report')
+        self.pins = dict(corpus['inputs'])
+        if paired is not None:self.pins.update(paired.pins)
+        self.sources = []
+        source = corpus['manifest']['source']
+        for descriptor in source['shards'] + ([source['shared_predictor']] if 'shared_predictor' in source else []):
+            path = Path(descriptor['path']).resolve(strict=True)
+            pin = original_source_identity(path,descriptor)
+            require(path.name == descriptor['name'] and pin[3] == descriptor['bytes'], 'Original source extent/name changed')
+            self.pins[str(path)] = pin; self.sources.append(path)
+        self.devices = physical_devices(topology['expected_config'])
+        self.backends = sorted({d.split(':')[0] for d in self.devices})
+        self.environment = {SELECTORS[k]:topology['arithmetic'][k] for k in SELECTORS}
+        for key in ('baseline', 'approval', 'calibration', 'absolute_pilot'):
+            path = getattr(self, key)
+            if path is not None:
+                path = Path(path).resolve(strict=True); self.pins[str(path)] = identity(path)
+                setattr(self, key, json.loads(path.read_text()))
+        if self.absolute_pilot is not None:
+            validate_absolute_pilot(self.absolute_pilot, corpus['manifest'], topology)
+        self.binary_sha256 = None
+
+    def prepare(self, runner, args, output, env):
+        """Publish a native descriptor and authenticate parser output before model work."""
+        unchanged(self.pins)
+        argv = self.topology.get('engine_argv')
+        # Validate argv shape before passing it to a subprocess. The actual
+        # parser remains the sole config meaning/roundtrip authority.
+        require(type(argv) is list and argv and all(type(v) is str and v and '\0' not in v for v in argv),
+                'Missing source-owned canonical engine argv')
+        self.binary_pin = identity(args.binary)
+        self.binary_sha256 = file_sha256(args.binary)
+        described = json.loads(runner.subprocess.check_output(
+            [str(args.binary),'--describe-config','--',*argv], env=env, text=True))
+        validate_described_config(self.topology, described)
+        runner.write_json(output/'described-config.json', described)
+        if self.paired is not None:
+            canonical = self.paired.require_public_projection(runner,args,env,described)
+            runner.write_json(output/'canonical-described-config.json',canonical)
+            self.pins[str(output/'canonical-described-config.json')]=identity(output/'canonical-described-config.json')
+        workload = output/'workload.json'
+        runner.write_json(workload, dict(schema='llaminar.model-kld-workload.v2',
+            corpus=self.corpus['manifest'], topology_id=self.topology['id']))
+        self.pins[str(workload)] = identity(workload)
+        self.pins[str(output/'described-config.json')] = identity(output/'described-config.json')
+        return workload, argv
+
+    def score(self, runner, payload, output):
+        """Join real native proof to actual binary and publish uncalibrated or approved metrics."""
+        unchanged(self.pins)
+        require(identity(Path(self.binary_pin[0])) == self.binary_pin, 'Native observer executable changed')
+        raw = json.loads((payload/'logits.json').read_text())
+        perf = json.loads((output/'perf-stats.json').read_text())
+        require(type(perf.get('records')) is list and perf['records'], 'Missing original native PerfStats artifact')
+        require(raw.get('native_identity',{}).get('executable_sha256') == self.binary_sha256,
+                'Native observer executable proof differs from launched binary')
+        require(raw.get('actual_owner') and type(raw.get('path_records')) is list,
+                'Missing actual original owner/path evidence')
+        observed_pipeline = self.paired is not None and 'observed_pipeline_binding' in self.paired.record
+        if observed_pipeline:
+            from model_parity_inventory import require_observed_pipeline_runtime, require_observed_pipeline_terminal
+            require_observed_pipeline_runtime(self.paired.record,raw.get('observed_pipeline_binding'))
+            require_observed_pipeline_terminal(raw,perf['records'])
+        metrics = corpus_v2.score_observation(self.corpus,payload/'logits.json')
+        runner.write_json(output/'metrics.json', metrics)
+        summary = corpus_v2.summarize(self.corpus['manifest'],metrics,self.baseline,self.approval,calibration=self.calibration,absolute_pilot=self.absolute_pilot)
+        runner.write_json(output/'numerical-summary.json', summary)
+        unchanged(self.pins)
+        result = dict(passed=summary['passed'],verdict=summary['verdict'],metrics=metrics,
+            numerical_summary=summary,observations_complete=True,production_path=raw['proofs'],
+            native_identity=raw['native_identity'],actual_owner=raw['actual_owner'],path_records=raw['path_records'],
+            reset_byte_equal=metrics['proofs']['reset_byte_equal'],driver_window_clean=True)
+        if observed_pipeline:
+            result.update(observed_pipeline_binding=raw['observed_pipeline_binding'],
+                          fixed_native_pipeline_terminal=raw['fixed_native_pipeline_terminal'])
+        if 'reset_pair' in metrics:
+            result['reset_pair'] = metrics['reset_pair']
+        if self.absolute_pilot is not None:
+            result.update(scope=summary['scope'],acceptance_scope=summary['acceptance_scope'],
+                calibrated=False,certification_eligible=False,whole_corpus_accepted=False,
+                diagnostic_verdict='UNAVAILABLE',absolute_pilot_digest=summary['absolute_pilot_digest'])
+        return result

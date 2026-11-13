@@ -16,10 +16,12 @@ server. OpenCode supplies its own system prompt, tool schemas, argument
 validation, tool execution, and continuation messages. The harness records the
 client version and relays its request bodies and JSON/SSE responses unchanged.
 
-The qualified client is OpenCode 1.18.34. The published-suite controller installs
-its pinned native npm artifact with `scripts/ci/install_opencode_client.py`, which
-verifies artifact integrity and the actual executable version before publication.
-For local use, pass `--destination /path/to/opencode` to that installer, then run:
+The qualified client is OpenCode `1.18.34-llaminar.1`, with the terminal-stop
+compaction repair described below. The published-suite controller builds pinned
+source with `scripts/ci/install_opencode_client.py` and verifies the actual native
+CLI lifecycle before publication. Build tools remain in a separate Docker stage.
+For local installation, provide C++/make, Python, git, patch and pkg-config,
+then pass `--destination /path/to/opencode` to the installer and run:
 
 ```bash
 python3 tests/v2/e2e/server/opencode_tool_stress.py \
@@ -114,7 +116,19 @@ Requested streaming usage must arrive once before DONE, and the real SDK must
 report positive input counts so automatic context compaction can run. The
 summary request is a separate, tool-free exchange. It retains the pending tool
 join until the resumed coding request supplies the recent assistant/tool tail;
-missing or changed continuation arguments still fail. Reports count these
+missing or changed continuation arguments still fail. If the pinned client
+summarizes the complete head instead, dropped IDs require a unique exact native
+tool outcome, matching typed JSON call values and exact result/error text inside
+the summary input, a successful tool-free summary, and the exact native summary
+pair in the next coding request. Numeric formatting and object key order may
+change under native JSON serialization; booleans remain distinct from numbers.
+UTF-16 truncation, attachment names and identical-call multiplicity are checked;
+consecutive summaries must preserve the authenticated prior-summary chain.
+Upstream leaves transcript role labels unescaped: this proves independently
+authenticated content reached the summary input, not its original role
+provenance from those labels. Quoted delimiters remain payload within the pinned
+outer prompt wrapper. Compaction alone never consumes a pending continuation
+obligation. Reports count these
 auxiliary requests as `compaction_requests`, and native audits include their
 tokens and reasoning even when the request omits `tools`. OpenCode's
 [compaction implementation](https://github.com/anomalyco/opencode/blob/v1.18.34/packages/opencode/src/session/compaction.ts)
@@ -123,6 +137,42 @@ The live workload is the ten-phase app development session. Device-free parser
 fixtures retain primitive string, Unicode and error cases; the live harness does
 not schedule separate primitive sessions. The final app sentinel checks exact
 JSON-looking file bytes through authenticated `write` and `read` calls.
+
+The dedicated client is `1.18.34-llaminar.1`, built from pinned upstream
+v1.18.34 source with the narrowly scoped terminal-stop compaction repair in
+`scripts/ci/opencode-client/terminal-stop.patch`. A completed tool-free turn
+becomes idle; its recorded usage still triggers compaction before the next user
+turn. Ongoing tool work and genuine provider overflow retain automatic
+compaction. The installer runs four actual native CLI/HTTP lifecycle controls
+before atomic publication, retaining error events and the full output budget.
+The suite-driver uses a separate build stage so Bun and compiler dependencies
+never enter its final image. Its receipt records source, patch, Bun, lockfile,
+metadata and executable identities plus every native control result.
+
+Build metadata comes from the authenticated upstream source's
+`packages/opencode/test/tool/fixtures/models-api.json`, with its own pinned
+digest. This test client enables only the explicitly configured local provider;
+its embedded general model catalog is not qualified. `--archive` on
+`scripts/ci/install_opencode_client.py` accepts the exact preseeded upstream
+source tarball, and `--bun-archive` accepts the pinned Bun package. The default
+installation downloads and authenticates those source-build inputs; it does
+not require an unpublished patched binary package.
+
+Phase prompt authentication skips only structurally recognized leading summary
+requests and checks the first coding request. The intended user turn must match
+exactly, optionally followed immediately by the pinned client's exact synthetic
+continuation. Later requests or unrelated history cannot repair missing or
+changed input; summary protocol evidence remains mandatory independently.
+
+`--reply-reserve-tokens N` explicitly changes the client's compaction reply-space
+reserve, leaving the admitted context and configured maximum reply unchanged.
+For example, context 47,168 and reserve 16,384 permit a 30,784-token input budget;
+the configured output limit stays 32,768 (the pinned client's wire cap is 32,000).
+That maximum reply is available only when enough context remains. The default
+omits this override and preserves the native client policy. Campaign reports
+record `reply_reserve_tokens`; each session publishes `client-context-policy.json`
+and the same `client_context_policy` in its result. An override must be explicitly
+expected by the evidence consumer; it cannot silently certify the default policy.
 
 Ten turns share one OpenCode session. Coding turns have no default elapsed-time,
 socket-inactivity or agent-step limit. Prefill and a buffered tool call can keep

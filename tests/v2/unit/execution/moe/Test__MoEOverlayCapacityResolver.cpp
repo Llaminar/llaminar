@@ -9,10 +9,16 @@
  * expectations independently count its1408-byte CPU unit and20-byte GPU block.
  */
 
+#include "execution/moe/MoEOverlayActivationBatchResources.h"
+#include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
+#include "../../../fixtures/planning/RecordedHostServicePlanning.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
@@ -20,7 +26,7 @@
 #include "planning/PlanningGPUExpertMeasurement.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
 #include "../../../utils/CPUExecutionTestGeometry.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <gtest/gtest.h>
 
@@ -112,13 +118,13 @@ namespace llaminar2
             ExpertTierWeightProjection role,
             int N,
             int K,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             return {
                 .projection = role,
                 .N = N,
                 .K = K,
-                .format = ExpertWeightFormat::nativeVnni({
+                .format = ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock,
                     .present = true,
@@ -129,7 +135,7 @@ namespace llaminar2
         /** @return One valid gate/up/down layer with non-trivial alignment edges. */
         [[nodiscard]] MoEOverlayLayerWeightManifest layer(
             int layer_idx,
-            const NativeVnniFormatInfo &format,
+            const NativeQuantisedFormatInfo &format,
             int geometry_delta = 0)
         {
             MoEOverlayLayerWeightManifest result;
@@ -157,7 +163,7 @@ namespace llaminar2
         /** @return A contiguous model manifest using one source codebook. */
         [[nodiscard]] std::vector<MoEOverlayLayerWeightManifest> manifest(
             int layer_count,
-            const NativeVnniFormatInfo &format,
+            const NativeQuantisedFormatInfo &format,
             bool vary_geometry = false)
         {
             std::vector<MoEOverlayLayerWeightManifest> result;
@@ -174,7 +180,7 @@ namespace llaminar2
 
         /** @return Independently expected CPU interleaved unit stride. */
         [[nodiscard]] constexpr std::size_t expectedCpuStride(
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             // Independently describe the compact multi-scale unit: 16 native
             // payload bytes per column, two half scales and two half minima.
@@ -202,7 +208,7 @@ namespace llaminar2
         /** @return Independently expected allocation for one CPU projection. */
         [[nodiscard]] std::size_t expectedCpuProjectionBytes(
             const MoEOverlayProjectionWeightManifest &spec,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             const std::size_t padded_n = testAlignUp(
                 static_cast<std::size_t>(spec.N), 64);
@@ -241,7 +247,7 @@ namespace llaminar2
 
         /** @return Migration-stable GPU payload width for a CPU round trip. */
         [[nodiscard]] constexpr int expectedMigrationPayload(
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             // These sources never normalize to a single-scale INT8 GPU blob.
             // Migration preserves their native payload and all metadata planes.
@@ -265,7 +271,7 @@ namespace llaminar2
         /** @return Expected complete gate/up/down footprint from independent math. */
         [[nodiscard]] MoEOverlayPreparedExpertFootprint expectedFootprint(
             const MoEOverlayLayerWeightManifest &model_layer,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             MoEOverlayPreparedExpertFootprint expected;
             expected.layer_idx = model_layer.layer_idx;
@@ -415,8 +421,12 @@ namespace llaminar2
                 .max_graph_rows = 4096, .max_decode_rows = 1, .max_request_count = 1};
         }
 
-        /** @brief Add exact expert matrices for CPU metadata-only workspace admission. */
-        void addRoutedExpertMetadata(ModelMemoryProfile &profile)
+        /**
+         * @brief Add exact expert matrices for metadata-only workspace admission.
+         * @param profile Original fixture geometry receiving the source declarations.
+         * @param format Source format; floating fixtures may use small unquantized widths.
+         */
+        void addRoutedExpertMetadata(ModelMemoryProfile &profile, std::string_view format = "Q8_0")
         {
             for (int layer = 0; layer < profile.n_layers; ++layer)
             for (const auto suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
@@ -424,9 +434,53 @@ namespace llaminar2
                 const int k = std::string_view(suffix) == "ffn_down_exps.weight"
                     ? profile.expert_feed_forward_length : profile.d_model;
                 profile.tensors.push_back({.name = "blk." + std::to_string(layer) + "." + suffix,
-                    .quant_type = "Q8_0", .elements = size_t(profile.expert_count) * profile.d_model *
+                    .quant_type = std::string(format), .elements = size_t(profile.expert_count) * profile.d_model *
                         profile.expert_feed_forward_length, .K = size_t(k), .layer_index = layer});
             }
+        }
+
+        /**
+         * @brief Project the authored source directory into the physical lane contract.
+         * @param profile Same original metadata consumed by fixed-memory planning.
+         * @return Exact retained gate/up/down geometry and source provenance.
+         * @throws std::invalid_argument For absent, duplicate or unsupported sources.
+         *
+         * No hardware facts or payloads are synthesized here. In particular the
+         * quantization and dimensions come from each existing tensor descriptor,
+         * rather than the unrelated alignment-edge manifests used by quota tests.
+         */
+        std::vector<MoEOverlayLayerWeightManifest> sourceManifest(const ModelMemoryProfile &profile)
+        {
+            std::vector<MoEOverlayLayerWeightManifest> result;
+            for(int layer=0;layer<profile.n_layers;++layer) {
+                MoEOverlayLayerWeightManifest entry{.layer_idx=layer};
+                constexpr std::array suffixes{"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"};
+                constexpr std::array roles{ExpertTierWeightProjection::Gate,ExpertTierWeightProjection::Up,ExpertTierWeightProjection::Down};
+                for(size_t role=0;role<roles.size();++role) {
+                    const auto name="blk."+std::to_string(layer)+"."+suffixes[role];
+                    const TensorSizeInfo* source=nullptr;
+                    for(const auto& tensor:profile.tensors)if(tensor.name==name) {
+                        if(source)throw std::invalid_argument("Duplicate original fixture expert source");
+                        source=&tensor;
+                    }
+                    if(!source || !source->K || profile.expert_count<=0 ||
+                       source->elements%(source->K*size_t(profile.expert_count)))
+                        throw std::invalid_argument("Missing or incompatible original fixture expert source");
+                    ExpertWeightFormat format;
+                    if(const auto* native=native_quantised_formats::forQuantType(source->quant_type))
+                        format=ExpertWeightFormat::nativeQuantised({.codebook_id=native->codebook_id,
+                            .is_superblock=native->is_superblock,.present=true});
+                    else if(source->quant_type=="F32")format=ExpertWeightFormat::floating(TensorType::FP32);
+                    else if(source->quant_type=="F16")format=ExpertWeightFormat::floating(TensorType::FP16);
+                    else if(source->quant_type=="BF16")format=ExpertWeightFormat::floating(TensorType::BF16);
+                    entry.projections[role]={.projection=roles[role],
+                        .N=int(source->elements/(source->K*size_t(profile.expert_count))),
+                        .K=int(source->K),.format=format};
+                }
+                if(!entry.valid())throw std::invalid_argument("Invalid original fixture expert manifest");
+                result.push_back(entry);
+            }
+            return result;
         }
 
         /** @return Explicit model/load contract required by GPU capacity tests. */
@@ -491,7 +545,7 @@ namespace llaminar2
         const auto capacity = Directory::planBufferedCapacity(1, 1, 2);
         for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
         {
-            auto model_manifest = manifest(2, native_vnni_formats::Q8_0);
+            auto model_manifest = manifest(2, native_quantised_formats::Q8_0);
             size_t wire_bytes = 0;
             WeightVRAMPool planner;
             for (auto &layer : model_manifest)
@@ -525,7 +579,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityResolver, MixedProjectionAdmissionNamesExactSourceTensors)
     {
         using Directory = DeviceMoETransferSlotDirectory;
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
             {
@@ -547,7 +601,7 @@ namespace llaminar2
                         for (const auto *projection_name : {"gate", "up", "down"})
                             EXPECT_NE(message.find("blk.1.ffn_" + std::string(projection_name) +
                                                    "_exps.weight="), std::string::npos);
-                        EXPECT_NE(message.find("NativeVNNI/" + std::string(source.quant_type)),
+                        EXPECT_NE(message.find("NativeQuantised/" + std::string(source.quant_type)),
                                   std::string::npos);
                         const std::string precision = type == TensorType::FP16 ? "FP16" :
                             type == TensorType::BF16 ? "BF16" : "FP32";
@@ -571,7 +625,7 @@ namespace llaminar2
             for (const auto second : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
             {
                 if (first == second) continue;
-                auto mixed_precision = manifest(1, native_vnni_formats::Q8_0);
+                auto mixed_precision = manifest(1, native_quantised_formats::Q8_0);
                 for (auto &projection : mixed_precision.front().projections)
                     projection.format = ExpertWeightFormat::floating(first);
                 mixed_precision.front().projections[2].format = ExpertWeightFormat::floating(second);
@@ -582,8 +636,8 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, EveryCataloguedCodebookHasExactCpuAndGpuFootprint)
     {
-        ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 21u);
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             SCOPED_TRACE(::testing::Message() << source.quant_type);
             ASSERT_NE(source.metadata, nullptr);
@@ -750,7 +804,7 @@ namespace llaminar2
         constexpr int experts = 8;
         // Small geometry exercises the same byte contracts without creating a
         // backend or mapping a model. One GPU is deliberately the limiting peer.
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
         {
             SCOPED_TRACE(::testing::Message() << source.quant_type << '/' << static_cast<int>(backend));
@@ -856,7 +910,7 @@ namespace llaminar2
         constexpr int kExperts = 256;
         constexpr std::uint32_t kHotReplicasPerParticipant = 25u;
         const auto model_manifest =
-            manifest(kLayers, native_vnni_formats::Q4_K);
+            manifest(kLayers, native_quantised_formats::Q4_K);
         const auto profile =
             DeviceMoETransferSlotDirectory::
                 profileForLayerWeightManifest(model_manifest);
@@ -1007,7 +1061,7 @@ namespace llaminar2
         }
         EXPECT_TRUE(
             MoEOverlayCapacityAdmission::transferStagingBOM(
-                plan, 1, policy)
+                plan, 1, policy,{},0)
                 .empty());
 
         auto incomplete_policy = policy;
@@ -1027,7 +1081,7 @@ namespace llaminar2
     {
         constexpr int kExperts = 6;
         const auto model_manifest = manifest(
-            2, native_vnni_formats::Q4_K, /*vary_geometry=*/true);
+            2, native_quantised_formats::Q4_K, /*vary_geometry=*/true);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
 
@@ -1169,7 +1223,7 @@ namespace llaminar2
     {
         constexpr int kExperts = 8;
         const auto model_manifest = manifest(
-            1, native_vnni_formats::Q4_K);
+            1, native_quantised_formats::Q4_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
 
@@ -1275,7 +1329,7 @@ namespace llaminar2
          MigrationFabricSelectsInitialSourceResidencyPolicy)
     {
         const auto model_manifest = manifest(
-            1, native_vnni_formats::Q4_0);
+            1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         const auto cuda_budget = exactBudget(
@@ -1342,7 +1396,7 @@ namespace llaminar2
     {
         constexpr int kExperts = 6;
         const auto model_manifest = manifest(
-            2, native_vnni_formats::Q4_K, /*vary_geometry=*/true);
+            2, native_quantised_formats::Q4_K, /*vary_geometry=*/true);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
 
@@ -1452,7 +1506,7 @@ namespace llaminar2
          SharedPhysicalResourceIsChargedOnceAcrossOpaqueLogicalTiers)
     {
         constexpr int kExperts = 2;
-        const auto model_manifest = manifest(1, native_vnni_formats::Q5_K);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q5_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         const auto shared_budget = exactBudget(
@@ -1521,7 +1575,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityAdmission,
          MissingBoundResourceAndTensorShardedTierFailClosed)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q4_0);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         const auto budget = exactBudget(
@@ -1608,7 +1662,7 @@ namespace llaminar2
             .overlay_world_size = 2,
         };
         const auto charges = MoEOverlayCapacityAdmission::transferStagingBOM(
-            plan, /*world_size=*/2, policy);
+            plan, /*world_size=*/2, policy,manifest(1,native_quantised_formats::Q4_0),4);
         const auto bytesFor = [&](int rank, DeviceId device)
         {
             const auto found = std::find_if(
@@ -1638,7 +1692,7 @@ namespace llaminar2
         EXPECT_THROW(
             (void)MoEOverlayCapacityAdmission::transferStagingBOM(
                 plan, /*world_size=*/2,
-                underprovisioned_two_cycle_policy),
+                underprovisioned_two_cycle_policy,manifest(1,native_quantised_formats::Q4_0),4),
             std::invalid_argument);
 
         auto two_cycle_policy = underprovisioned_two_cycle_policy;
@@ -1649,7 +1703,7 @@ namespace llaminar2
                     two_cycle_policy.maximum_cycles_per_layer);
         const auto two_cycle_charges =
             MoEOverlayCapacityAdmission::transferStagingBOM(
-                plan, /*world_size=*/2, two_cycle_policy);
+                plan, /*world_size=*/2, two_cycle_policy,manifest(1,native_quantised_formats::Q4_0),4);
         ASSERT_EQ(two_cycle_charges.size(), charges.size());
         for (std::size_t index = 0; index < charges.size(); ++index)
         {
@@ -1679,7 +1733,7 @@ namespace llaminar2
         const auto broad_charges =
             MoEOverlayCapacityAdmission::transferStagingBOM(
                 plan, /*world_size=*/2,
-                broad_one_cycle_per_layer_policy);
+                broad_one_cycle_per_layer_policy,manifest(8,native_quantised_formats::Q4_0),4);
         ASSERT_EQ(broad_charges.size(), charges.size());
         for (std::size_t index = 0; index < charges.size(); ++index)
         {
@@ -1687,6 +1741,171 @@ namespace llaminar2
                 broad_charges[index].bytes,
                 8u * charges[index].bytes);
         }
+    }
+
+    TEST(MoEOverlayLocalCapacityPlanner,
+         RankLocalGPUActivationBOMKeepsOnePhysicalOwnerAndExactEndpointGrants)
+    {
+        MoERoutedExpertPlacementPlan overlay;
+        overlay.enabled = true;
+        overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        overlay.continuation_domain = "opaque-primary";
+        overlay.base_model_domain = "opaque-primary";
+        overlay.shared_expert_domain = "opaque-primary";
+        overlay.continuation_domain_spec.domain = "opaque-primary";
+        overlay.continuation_domain_spec.logical_root_participant = 0;
+
+        RoutedExpertDomain primary;
+        primary.name = "opaque-primary";
+        primary.scope = ExecutionDomainScope::RANK_LOCAL;
+        primary.participants = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1),
+        };
+        primary.world_ranks = {0, 0};
+        primary.owner_rank = 0;
+        primary.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+
+        RoutedExpertDomain secondary;
+        secondary.name = "opaque-secondary";
+        secondary.scope = ExecutionDomainScope::RANK_LOCAL;
+        secondary.participants = {
+            GlobalDeviceAddress::rocm(0),
+            GlobalDeviceAddress::rocm(1),
+            GlobalDeviceAddress::rocm(2),
+            GlobalDeviceAddress::rocm(3),
+        };
+        secondary.world_ranks = {0, 0, 0, 0};
+        secondary.owner_rank = 0;
+        secondary.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+
+        RoutedExpertDomain inter_node;
+        inter_node.name = "opaque-inter-node";
+        inter_node.scope = ExecutionDomainScope::SINGLE;
+        inter_node.participants = {GlobalDeviceAddress::cuda(2)};
+        inter_node.world_ranks = {2};
+        inter_node.owner_rank = 2;
+        inter_node.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        RoutedExpertDomain cpu;
+        cpu.name = "original-cpu";
+        cpu.scope = ExecutionDomainScope::SINGLE;
+        cpu.participants = {GlobalDeviceAddress::cpu(0)};
+        cpu.world_ranks = {0};
+        cpu.owner_rank = 0;
+        overlay.domains = {primary, secondary, inter_node, cpu};
+        overlay.routed_tiers = {
+            RoutedExpertTier{
+                .name = "priority-minus-seven",
+                .domain = primary.name,
+                .priority = -7,
+            },
+            RoutedExpertTier{
+                .name = "priority-eleven",
+                .domain = secondary.name,
+                .priority = 11,
+            },
+            RoutedExpertTier{
+                .name = "priority-ninety",
+                .domain = inter_node.name,
+                .priority = 90,
+                .fallback = true,
+            },
+        };
+
+        overlay.routed_tiers.push_back(RoutedExpertTier{
+            .name = "cpu-backing", .domain = cpu.name, .priority = 100,
+        });
+
+        ClusterInventory cluster;
+        cluster.world_size = 3;
+        cluster.ranks.resize(3);
+        for (int rank = 0; rank < 3; ++rank)
+        {
+            cluster.ranks[static_cast<std::size_t>(rank)].rank = rank;
+            cluster.ranks[static_cast<std::size_t>(rank)].node_id =
+                rank == 2 ? 9 : 4;
+            cluster.ranks[static_cast<std::size_t>(rank)].hostname =
+                rank == 2 ? "other-node" : "shared-node";
+        }
+
+        constexpr std::size_t kRows = 8;
+        constexpr int kDModel = 16;
+        constexpr int kTopK = 2;
+        constexpr std::size_t kFamilies = 3;
+        constexpr std::size_t kMatrixBytes =
+            kRows * static_cast<std::size_t>(kDModel) * sizeof(float);
+        constexpr std::size_t kLaneBytes = kFamilies * kMatrixBytes;
+        constexpr std::size_t kCanonicalRouteBytes =
+            kRows * static_cast<std::size_t>(kTopK) *
+            static_cast<std::size_t>(kDModel) * sizeof(float);
+        const auto channel_plan =
+            MoEOverlayActivationChannelPlanner::plan({
+                .placement_plan = &overlay,
+                .cluster_inventory = &cluster,
+                .row_capacity = kRows,
+                .d_model = kDModel,
+                .top_k = kTopK,
+                .graph_family_count = kFamilies,
+            });
+
+        EXPECT_EQ(channel_plan.payload_matrix_bytes, kMatrixBytes);
+        const std::size_t kGrantBytes =
+            channel_plan.device_grant_bytes_per_lane;
+        EXPECT_EQ(
+            channel_plan.canonical_route_matrix_bytes,
+            kCanonicalRouteBytes);
+        ASSERT_EQ(channel_plan.channels.size(), 1u)
+            << "the different-node tier must remain on the MPI path";
+        const auto &channel = channel_plan.channels.front();
+        EXPECT_EQ(channel.tier_index, 1);
+        EXPECT_EQ(channel.domain_ordinal, 1);
+        EXPECT_EQ(channel.source_world_rank, 0);
+        EXPECT_EQ(channel.target_world_rank, 0);
+        EXPECT_EQ(channel.source_device, DeviceId::cuda(0));
+        EXPECT_EQ(
+            channel.targetParticipantIds(),
+            (std::vector<int>{2, 3, 4, 5}));
+        ASSERT_EQ(channel.source_lanes.size(), 4u);
+        ASSERT_EQ(channel.target_lanes.size(), 4u);
+        for (std::size_t lane = 0; lane < 4u; ++lane)
+        {
+            EXPECT_EQ(channel.source_lanes[lane].device, DeviceId::cuda(0));
+            EXPECT_EQ(
+                channel.target_lanes[lane].device,
+                DeviceId::rocm(static_cast<int>(lane)));
+        }
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cuda(0)),
+            4u * (kLaneBytes + kGrantBytes));
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cuda(1)), 0u);
+        for (int device = 0; device < 4; ++device)
+        {
+            EXPECT_EQ(
+                channel_plan.stagingBytesFor(0, DeviceId::rocm(device)),
+                kLaneBytes + kGrantBytes + kCanonicalRouteBytes);
+        }
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cpu()),
+            channel.mapping_layout.sourceOwnedBytes() + channel.mapping_layout.targetOwnedBytes() +
+                channel.rank_local_lanes.size() * channel_plan.host_grant_bytes_per_lane);
+        EXPECT_EQ(channel_plan.stagingBytesFor(1, DeviceId::cpu()), 0u);
+        const auto &local = channel.localLanes(0);
+        ASSERT_EQ(local.size(), 8u);
+        for (std::size_t i = 0; i < local.size(); ++i)
+        {
+            EXPECT_TRUE(local[i].valid());
+            for (std::size_t j = 0; j < i; ++j)
+                EXPECT_FALSE(local[i].participant_id == local[j].participant_id &&
+                             local[i].device == local[j].device);
+        }
+        EXPECT_THROW((void)channel.localLanes(1), std::invalid_argument);
+        EXPECT_TRUE(MoEOverlayActivationChannelPlanner::requiresActivationChannels(overlay));
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(2, DeviceId::cuda(2)), 0u);
+
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
@@ -1825,10 +2044,12 @@ namespace llaminar2
         }
         EXPECT_EQ(
             channel_plan.stagingBytesFor(0, DeviceId::cpu()),
-            channel.mapping_layout.sourceOwnedBytes());
+            channel.mapping_layout.sourceOwnedBytes() +
+                channel.source_lanes.size() * channel_plan.host_grant_bytes_per_lane);
         EXPECT_EQ(
             channel_plan.stagingBytesFor(1, DeviceId::cpu()),
-            channel.mapping_layout.targetOwnedBytes());
+            channel.mapping_layout.targetOwnedBytes() +
+                channel.target_lanes.size() * channel_plan.host_grant_bytes_per_lane);
         EXPECT_EQ(
             channel_plan.stagingBytesFor(2, DeviceId::cuda(2)), 0u);
 
@@ -1837,6 +2058,10 @@ namespace llaminar2
          * independent model-upload ring. */
         auto profile = smallModelProfile();
         profile.d_model = kDModel;
+        // Dynamic expert service admission consumes the same original source
+        // geometry as execution. This 16-column channel fixture uses floating
+        // sources because its width does not form a complete Q8 block.
+        addRoutedExpertMetadata(profile, "F32");
         RankExecutionPlan rank_plan;
         rank_plan.rank = 0;
         rank_plan.first_layer = 0;
@@ -1875,8 +2100,18 @@ namespace llaminar2
                 .compute_units = 82,
             },
         };
+        // Authored metadata fixture: these local endpoints have no directed
+        // peer path. This is not a runtime hardware-capability observation.
+        rank_zero.p2p_cuda_count=2;
+        rank_zero.p2p_cuda={true,false,false,true};
+        overlay.authority_execution=resolveMoEOverlayAuthorityExecutionKind(overlay);
+        const auto original_manifest=sourceManifest(profile);
         const auto gpu_load = testGPUWeightLoadCapacityInput();
-        const auto capacity = MoEOverlayLocalCapacityPlanner::plan({
+        const std::array<int, 1> batch_prefill_rows{static_cast<int>(kRows)};
+        const auto batch_inventory = MoEOverlayActivationBatchInventory::declare(
+            testGraphFamily(profile), batch_prefill_rows, static_cast<int>(kRows), 1,
+            MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, profile.sparseQueryProgramCount());
+        const auto capacity = test::planWithRecordedHostServices({
             .model_profile = &profile,
             .rank_plan = &rank_plan,
             .overlay_plan = &overlay,
@@ -1887,6 +2122,9 @@ namespace llaminar2
             .resident_graph_rows = static_cast<int>(kRows),
             .activation_channel_row_capacity = static_cast<int>(kRows),
             .activation_graph_family_count = kFamilies,
+            .activation_prefill_graph_rows = {static_cast<int>(kRows)},
+            .activation_batch_inventory = batch_inventory,
+            .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
             .captured_graph_plan = resolveMoEOverlayCapturedGraphPlan(
                 profile.n_layers,
                 MoEOverlayAuthorityExecutionKind::HostResident,
@@ -1895,6 +2133,7 @@ namespace llaminar2
                 /*auxiliary_executable_count=*/0u),
             .gpu_weight_load = gpu_load,
             .graph_family = testGraphFamily(profile),
+            .original_expert_manifest = original_manifest,
         });
         const auto budgetFor = [&](DeviceId device)
             -> const MoEOverlayBoundPhysicalMemoryBudget &
@@ -1911,11 +2150,31 @@ namespace llaminar2
         const auto upload = resolveGPUWeightLoadMemoryGeometry(
             gpu_load.maximum_source_bytes,
             gpu_load.policy);
+        EXPECT_EQ(capacity.activation_batch_inventory, batch_inventory);
+        std::vector<MoEOverlayNodeLocalActivationChannelPlan> batch_channels;
+        for (const auto& channel : capacity.activation_channel_plan.channels)
+            if (channel.source_world_rank == 0 && channel.source_device == DeviceId::cuda(0))
+                batch_channels.push_back(channel);
+        std::size_t batch_gpu_bytes = 0;
+        for (const auto& source : batch_inventory->sources())
+            for (std::size_t ordinal = 0; ordinal < source.model_layers.size(); ++ordinal)
+            {
+                const auto quoted = source.physical_rows == 0
+                    ? MoEOverlayActivationBatchResources::variableSourceBOM(batch_channels, source.maximum_rows,
+                        static_cast<std::uint32_t>(ordinal), budgetFor(DeviceId::cpu()).bom().resource(),
+                        budgetFor(DeviceId::cuda(0)).bom().resource())
+                    : MoEOverlayActivationBatchResources::bom(batch_channels, source.physical_rows,
+                        static_cast<std::uint32_t>(ordinal), budgetFor(DeviceId::cpu()).bom().resource(),
+                        budgetFor(DeviceId::cuda(0)).bom().resource());
+                for (const auto& resource : quoted.resources())
+                    if (resource.resource().world_rank == 0 && resource.resource().device == DeviceId::cuda(0))
+                        batch_gpu_bytes += resource.bytes(PhysicalMemoryOwner::ActivationTransportStaging);
+            }
         EXPECT_EQ(
             budgetFor(DeviceId::cuda(0))
                 .stagingBytes(),
             upload.staging_bytes +
-                4u * (kLaneBytes + kGrantBytes));
+                4u * (kLaneBytes + kGrantBytes) + batch_gpu_bytes);
         EXPECT_EQ(
             budgetFor(DeviceId::cuda(1))
                 .stagingBytes(),
@@ -2086,7 +2345,7 @@ namespace llaminar2
         }
 
         EXPECT_TRUE(
-            MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+            MoEOverlayActivationChannelPlanner::requiresActivationChannels(
                 overlay));
         const auto plan = MoEOverlayActivationChannelPlanner::plan({
             .placement_plan = &overlay,
@@ -2110,7 +2369,7 @@ namespace llaminar2
         EXPECT_EQ(channel.source_lanes.front().device, DeviceId::cpu());
         EXPECT_EQ(channel.target_lanes.front().device, DeviceId::cpu());
         const std::size_t kGrantBytes =
-            plan.device_grant_bytes_per_lane;
+            plan.host_grant_bytes_per_lane;
         EXPECT_EQ(
             plan.stagingBytesFor(0, DeviceId::cpu()),
             channel.mapping_layout.sourceOwnedBytes() + kGrantBytes);
@@ -2224,13 +2483,15 @@ namespace llaminar2
             kLaneBytes + kGrantBytes);
         EXPECT_EQ(
             plan.stagingBytesFor(0, DeviceId::cpu()),
-            plan.channels.front().mapping_layout.sourceOwnedBytes());
+            plan.channels.front().mapping_layout.sourceOwnedBytes() +
+                plan.channels.front().source_lanes.size() * plan.host_grant_bytes_per_lane);
         EXPECT_EQ(
             plan.stagingBytesFor(1, DeviceId::rocm(0)),
             kLaneBytes + kGrantBytes + kCanonicalRouteBytes);
         EXPECT_EQ(
             plan.stagingBytesFor(1, DeviceId::cpu()),
-            plan.channels.front().mapping_layout.targetOwnedBytes());
+            plan.channels.front().mapping_layout.targetOwnedBytes() +
+                plan.channels.front().target_lanes.size() * plan.host_grant_bytes_per_lane);
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
@@ -2399,7 +2660,8 @@ namespace llaminar2
                 .fallback = true,
             }};
 
-            const auto result = MoEOverlayLocalCapacityPlanner::plan({
+            overlay.authority_execution=resolveMoEOverlayAuthorityExecutionKind(overlay);
+            const auto result = test::planWithRecordedHostServices({
                 .model_profile = &profile,
                 .rank_plan = &rank_plan,
                 .overlay_plan = &overlay,
@@ -2421,6 +2683,9 @@ namespace llaminar2
                  ++participant)
             {
                 const auto &input = result.device_inputs[participant];
+                EXPECT_EQ(input.mtp_routed_expert_weight_authority,
+                    MTPRoutedExpertWeightAuthority::ExpertOverlay)
+                    << "The capacity input must preserve the frozen overlay's sole expert authority";
                 EXPECT_EQ(input.device, device(static_cast<int>(participant)));
                 EXPECT_EQ(input.shard_index, 0);
                 EXPECT_EQ(input.total_shards, 1);
@@ -2467,11 +2732,17 @@ namespace llaminar2
         }
     }
 
-    /** @test Setup probes must not interpret source matrices owned by another stage. */
+    /**
+     * @test Setup probes must not interpret source matrices owned by another stage.
+     *
+     * A singleton CPU stage has no movable expert destination even under Dynamic
+     * maintenance. Its exact BOM therefore excludes the host routing-evidence
+     * mirror; supplying one must fail before any admission transaction.
+     */
     TEST(MoEOverlayLocalCapacityPlanner, PipelineCPUSetupUsesOwnedSourceIntervalAllFormats)
     {
         std::vector<std::string> formats{"F16", "BF16", "F32"};
-        for (const auto &format : native_vnni_formats::kAllSourceFormats)
+        for (const auto &format : native_quantised_formats::kAllSourceFormats)
             formats.emplace_back(format.quant_type);
         for (const auto &format : formats)
         {
@@ -2512,43 +2783,82 @@ namespace llaminar2
                 .model_profile = &profile, .rank_plan = &rank, .overlay_plan = &overlay,
                 .rank_inventory = &inventory, .rank_execution_kind = OverlayRankExecutionKind::ContinuationAuthority,
                 .resident_graph_rows = 8,
-                .host_demand_memory = MoEOverlayHostDemandMemoryPlan(MoEOverlayHostDemandGeometry{
-                    .num_layers = 1, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
-                    .initial_window_rows = rank.runtime.moe_rebalance.window_size,
-                    .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
-                    .maximum_invocation_rows = 8}),
                 .graph_family = family};
-            const auto complete = MoEOverlayLocalCapacityPlanner::plan(input);
+            const auto complete = test::planWithRecordedHostServices(input);
+            EXPECT_FALSE(complete.host_demand_memory.has_value());
             // Deliberately unreadable neighboring source descriptors prove the
             // child never interprets them. Keep their global directory entries
             // and geometry; truncating the parent profile would hide the bug.
             for (auto &tensor : profile.tensors)
                 if (tensor.layer_index != 1) tensor.quant_type = "FOREIGN_STAGE_DESCRIPTOR";
             std::optional<MoEOverlayLocalCapacityPlannerResult> isolated;
-            ASSERT_NO_THROW(isolated.emplace(MoEOverlayLocalCapacityPlanner::plan(input)));
+            ASSERT_NO_THROW(isolated.emplace(test::planWithRecordedHostServices(input)));
+            EXPECT_FALSE(isolated->host_demand_memory.has_value());
             ASSERT_EQ(complete.physical_budgets.size(), isolated->physical_budgets.size());
             for (size_t index = 0; index < complete.physical_budgets.size(); ++index)
                 EXPECT_EQ(complete.physical_budgets[index].fixedBytes(), isolated->physical_budgets[index].fixedBytes());
 
             input.graph_family = {};
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
             input.graph_family = family;
             input.graph_family.first_model_layer = 0;
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
             input.graph_family = family;
             input.graph_family.mtp_source_layers = {3};
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
             input.graph_family = family;
             rank.last_layer = 2;
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
             rank.last_layer = 1;
+            // Even an exact one-layer mirror is forbidden for a singleton;
+            // geometry correctness does not authorize unnecessary storage.
+            input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
+                .num_layers = 1, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
+                .initial_window_rows = rank.runtime.moe_rebalance.window_size,
+                .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
+                .maximum_invocation_rows = 8});
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
             input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
                 .num_layers = 3, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
                 .initial_window_rows = rank.runtime.moe_rebalance.window_size,
                 .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
                 .maximum_invocation_rows = 8});
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
         }
+    }
+
+    /** @test Probe geometry preserves original stacked shapes in one serial scratch envelope. */
+    TEST(MoEOverlayLocalCapacityPlanner, PreparedGPUServiceOriginalGeometryAndSerialEnvelope)
+    {
+        for (const auto format : {"Q8_0", "Q4_K", "F16", "BF16", "F32"})
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE(format);
+            SCOPED_TRACE(device.toString());
+            auto profile = smallModelProfile();
+            profile.d_model = profile.expert_feed_forward_length = 256;
+            addRoutedExpertMetadata(profile);
+            for (auto& tensor : profile.tensors) tensor.quant_type = format;
+            const WorkspaceMemoryGeometry geometry{
+                .device = device, .device_compute_units = device.is_cuda() ? 82 : 60,
+                .resident_graph_rows = 8, .first_layer = 0, .last_layer = 1,
+                .apportioned_routed_experts = true};
+            const auto original = WorkspaceMemoryEstimator::estimatePreparedExpertService(profile, geometry);
+            EXPECT_GT(original, 0u);
+            auto doubled_bank = profile;
+            doubled_bank.expert_count *= 2;
+            for (auto& tensor : doubled_bank.tensors) tensor.elements *= 2;
+            EXPECT_EQ(WorkspaceMemoryEstimator::estimatePreparedExpertService(doubled_bank, geometry), original);
+            auto incomplete = profile;
+            incomplete.tensors.front().elements += 1;
+            EXPECT_THROW((void)WorkspaceMemoryEstimator::estimatePreparedExpertService(incomplete, geometry),
+                std::invalid_argument);
+            const auto allocation = MoEOverlayCPUServiceMeasurement::gpuAllocationBytes(
+                {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, original);
+            EXPECT_GT(allocation.host_bytes, 0u);
+            EXPECT_GT(allocation.device_bytes, original);
+        }
+
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
@@ -2589,6 +2899,8 @@ namespace llaminar2
             },
         };
 
+        inventory.gpus.front().uuid = "recorded-capacity-host-5-cuda-0";
+
         MoERoutedExpertPlacementPlan overlay;
         overlay.enabled = true;
         overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
@@ -2615,6 +2927,23 @@ namespace llaminar2
             },
         };
 
+        // Keep discovery rank five explicit: unused ranks are independent
+        // metadata hosts, while both tested consumers live on the original rank.
+        ClusterInventory cluster;
+        cluster.world_size = 6;
+        cluster.ranks.resize(6);
+        for (int rank = 0; rank < cluster.world_size; ++rank) {
+            auto& observed = cluster.ranks[rank];
+            observed.rank = rank;
+            observed.node_id = rank;
+            observed.hostname = "capacity-host-" + std::to_string(rank);
+        }
+        cluster.ranks[5] = inventory;
+        cluster.ranks[5].node_id = 5;
+        cluster.ranks[5].hostname = "capacity-host-5";
+        cluster.buildNodeAggregations();
+
+        const auto original_manifest=sourceManifest(profile);
         const auto gpu_weight_load = testGPUWeightLoadCapacityInput();
         rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
         MoEOverlayLocalCapacityPlannerInput capacity_input{
@@ -2622,16 +2951,20 @@ namespace llaminar2
             .rank_plan = &rank_plan,
             .overlay_plan = &overlay,
             .rank_inventory = &inventory,
+            .cluster_inventory = &cluster,
             .rank_execution_kind =
                 OverlayRankExecutionKind::ContinuationAuthority,
             .require_host_memory_authority = true,
             .max_gpu_memory_bytes = 1024u * 1024u * 1024u,
             .max_cpu_memory_bytes = 512u * 1024u * 1024u,
             .resident_graph_rows = 8,
+            .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
             .gpu_weight_load = gpu_weight_load,
             .graph_family = testGraphFamily(profile),
+            .original_expert_manifest = original_manifest,
+            .native_source_placement = CPUStoragePlacement::local(),
         };
-        const auto result = MoEOverlayLocalCapacityPlanner::plan(capacity_input);
+        const auto result = test::planWithRecordedHostServices(capacity_input);
         rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
         overlay.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
         capacity_input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
@@ -2640,7 +2973,14 @@ namespace llaminar2
             .initial_window_rows = rank_plan.runtime.moe_rebalance.window_size,
             .maximum_window_rows = rank_plan.runtime.moe_rebalance.max_window_size,
             .maximum_invocation_rows = 8});
-        const auto dynamic = MoEOverlayLocalCapacityPlanner::plan(capacity_input);
+        // Conservative General host commitments are real setup resources;
+        // enlarge this metadata observation explicitly rather than inventing a
+        // tiny graph allowance for the original planner.
+        inventory.cpu_memory_bytes = inventory.cpu.memory_bytes = 64ULL * 1024 * 1024 * 1024;
+        inventory.cpu.free_memory_bytes = 32ULL * 1024 * 1024 * 1024;
+        cluster.ranks[5] = inventory;
+        capacity_input.max_cpu_memory_bytes = 32ULL * 1024 * 1024 * 1024;
+        const auto dynamic = test::planWithRecordedHostServices(capacity_input);
         ASSERT_TRUE(dynamic.host_demand_memory);
         EXPECT_FALSE(result.host_demand_memory);
         EXPECT_EQ(dynamic.host_demand_memory->capacity().max_transaction_rows, 8u);
@@ -2668,15 +3008,21 @@ namespace llaminar2
                       .intermediate = profile.expert_feed_forward_length},
                       WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(probe_profile, probe_geometry)) +
                       capacity_input.host_demand_memory->allocationBytes());
+        const auto graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
+            dynamic_bom->resource(),
+            dynamic.physical_memory_admission->plan().find({5, DeviceId::cuda(0)})->resource());
+        EXPECT_EQ(dynamic_bom->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable) -
+                      static_bom->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable),
+                  graph_bom.find(cpu_identity)->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable));
         // Missing evidence is an admission defect; an all-GPU authority or
         // Static policy must not silently acquire a host routing mirror either.
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), std::invalid_argument);
+        EXPECT_THROW((void)test::planWithRecordedHostServices(capacity_input), std::invalid_argument);
         rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
         overlay.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), std::invalid_argument);
+        EXPECT_THROW((void)test::planWithRecordedHostServices(capacity_input), std::invalid_argument);
         overlay.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
         capacity_input.host_demand_memory.reset();
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), std::invalid_argument);
+        EXPECT_THROW((void)test::planWithRecordedHostServices(capacity_input), std::invalid_argument);
         ASSERT_EQ(result.fixed_memory_plan.devices.size(), 2u);
         ASSERT_EQ(result.physical_budgets.size(), 2u);
 
@@ -2707,14 +3053,17 @@ namespace llaminar2
         EXPECT_EQ(
             cuda->stagingBytes(),
             expected_load_geometry.staging_bytes);
-        /*
-         * One serial participant owns the complete immutable route-family
-         * ladder. Eight rows at top-k two retain capacities 1, 2, 4, 8, and
-         * the exact terminal capacity 16, shared across all model layers.
-         */
-        constexpr std::size_t kExpectedCpuSparsePacketBytes =
-            (1u + 2u + 4u + 8u + 16u) *
-            (2u * 64u + 2u) * sizeof(float);
+        // The immutable admission owns both separately rounded packet roots
+        // and the exact grouped workspace. Invocation scratch stays separate.
+        const auto cpu_config = std::find_if(result.device_inputs.begin(),result.device_inputs.end(),
+            [](const DevicePlanConfig &config) { return config.device.is_cpu(); });
+        ASSERT_NE(cpu_config,result.device_inputs.end());
+        ASSERT_TRUE(cpu_config->cpu_serial_expert_storage);
+        const auto &serial=*cpu_config->cpu_serial_expert_storage;
+        size_t grouped_bytes=0;
+        for(const auto controller:serial.controller_devices)
+            grouped_bytes+=serial.envelope->forController(controller)->workspaceBytes();
+        grouped_bytes*=serial.participant_ids.size();
         auto invocation_workspace = cpuSwiGLUWorkspaceRequirements(
             capacity_input.resident_graph_rows * profile.expert_used_count,
             profile.expert_feed_forward_length);
@@ -2727,8 +3076,22 @@ namespace llaminar2
                 .rows = capacity_input.resident_graph_rows * profile.expert_used_count,
                 .n = n, .k = k, .workers = inventory.cpu_cores, .execution = inventory.cpu_execution,
                 .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
-        EXPECT_EQ(cpu->fixedBytes(), kExpectedCpuSparsePacketBytes +
-            invocation_workspace.total_bytes_with_alignment());
+        // The hosted GPU parent also owns one persistent executor worker on the
+        // same CPU0 resource. Its original typed declaration supplies both
+        // exact storage and retained runtime costs, independently of FFN scratch.
+        const RetainedHostServiceInstance ticket_owner{
+            5, DeviceId::cuda(0), RetainedHostServiceRole::ExecutorParentTicket};
+        ASSERT_TRUE(cpu_config->retained_host_services);
+        EXPECT_EQ(cpu_config->retained_host_services->instances(),
+                  std::vector<RetainedHostServiceInstance>{ticket_owner});
+        const auto ticket_plan = cpu_config->retained_host_services->bom(
+            ticket_owner, static_bom->resource());
+        const auto *ticket_bom = ticket_plan.find(cpu_identity);
+        ASSERT_NE(ticket_bom, nullptr);
+        EXPECT_EQ(cpu->fixedBytes(), serial.physicalBytes() + grouped_bytes +
+            invocation_workspace.total_bytes_with_alignment()*cpu_config->concurrent_workspace_owners +
+            ticket_bom->bytes(PhysicalMemoryOwner::RetainedHostServiceStorage) +
+            ticket_bom->bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime));
         EXPECT_GT(cuda->fixedBytes(), 0u);
         EXPECT_EQ(
             cuda->resourceId(),
@@ -2745,11 +3108,11 @@ namespace llaminar2
             auto &observed = cpu_resource ? inventory.cpu : inventory.gpus.front();
             const auto original = observed.free_memory_bytes;
             observed.free_memory_bytes = 0;
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), PhysicalMemoryCapacityExhausted);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(capacity_input), PhysicalMemoryCapacityExhausted);
             observed.free_memory_bytes = observed.memory_bytes + 1;
             try
             {
-                (void)MoEOverlayLocalCapacityPlanner::plan(capacity_input);
+                (void)test::planWithRecordedHostServices(capacity_input);
                 FAIL() << "An impossible observation was admitted";
             }
             catch (const PhysicalMemoryCapacityExhausted &)
@@ -2759,6 +3122,8 @@ namespace llaminar2
             catch (const std::invalid_argument &) {}
             observed.free_memory_bytes = original;
         }
+
+
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
@@ -2837,7 +3202,7 @@ namespace llaminar2
                                  .fallback = true},
             };
 
-            const auto result = MoEOverlayLocalCapacityPlanner::plan({
+            const auto result = test::planWithRecordedHostServices({
                 .model_profile = &profile,
                 .rank_plan = &rank_plan,
                 .overlay_plan = &overlay,
@@ -2845,8 +3210,10 @@ namespace llaminar2
                 .rank_execution_kind =
                     OverlayRankExecutionKind::ContinuationAuthority,
                 .resident_graph_rows = 8,
+                .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
                 .graph_family = testGraphFamily(profile),
+                .native_source_placement = CPUStoragePlacement::local(),
             });
             const auto cpu_input = std::find_if(
                 result.device_inputs.begin(), result.device_inputs.end(),
@@ -2860,6 +3227,11 @@ namespace llaminar2
             ASSERT_EQ(cpu_input->concurrent_workspace_owners, 2u);
             auto one_owner = *cpu_input;
             one_owner.concurrent_workspace_owners = 1u;
+            EXPECT_THROW((void)MemoryPlanner::plan(profile,{one_owner}),std::invalid_argument);
+            ASSERT_TRUE(one_owner.cpu_serial_expert_storage);
+            auto one_admission=std::make_shared<CPUSerialExpertStorageAdmission>(*one_owner.cpu_serial_expert_storage);
+            one_admission->controller_devices.resize(1);
+            one_owner.cpu_serial_expert_storage=std::move(one_admission);
             const auto one_plan = MemoryPlanner::plan(profile, {one_owner});
             ASSERT_EQ(one_plan.devices.size(), 1u);
             const auto cpu_plan = std::find_if(
@@ -2907,11 +3279,26 @@ namespace llaminar2
             .fallback = true,
         }};
 
-        const auto result = MoEOverlayLocalCapacityPlanner::plan({
+        // The relay is rank one; the continuation remains on its declared
+        // remote rank zero instead of being relabeled as a local participant.
+        ClusterInventory cluster;
+        cluster.world_size = 2;
+        cluster.ranks.resize(2);
+        cluster.ranks[0].rank = 0;
+        cluster.ranks[0].node_id = 0;
+        cluster.ranks[0].hostname = "continuation-host";
+        cluster.ranks[1] = inventory;
+        cluster.ranks[1].node_id = 1;
+        cluster.ranks[1].hostname = "relay-host";
+        cluster.buildNodeAggregations();
+
+        overlay.authority_execution=resolveMoEOverlayAuthorityExecutionKind(overlay);
+        const auto result = test::planWithRecordedHostServices({
             .model_profile = &profile,
             .rank_plan = &rank_plan,
             .overlay_plan = &overlay,
             .rank_inventory = &inventory,
+            .cluster_inventory = &cluster,
             .rank_execution_kind =
                 OverlayRankExecutionKind::ExpertOnlyFollower,
             .require_host_memory_authority = true,
@@ -2938,7 +3325,7 @@ namespace llaminar2
             gpu_load.maximum_source_bytes,
             gpu_load.policy);
         const auto model_manifest = manifest(
-            /*layers=*/1, native_vnni_formats::Q4_0);
+            /*layers=*/1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         ASSERT_EQ(footprints.size(), 1u);
@@ -3080,9 +3467,18 @@ namespace llaminar2
             },
         };
 
+        overlay.authority_execution=resolveMoEOverlayAuthorityExecutionKind(overlay);
+        const auto original_manifest=sourceManifest(profile);
+        inventory.gpus.front().uuid="recorded-captured-candidate-cuda-0";
         const auto planForRows = [&](int rows)
         {
-            return MoEOverlayLocalCapacityPlanner::plan({
+            const MoEOverlayHostDemandMemoryPlan demand(MoEOverlayHostDemandGeometry{
+                .num_layers=profile.n_layers,.num_experts=profile.expert_count,
+                .top_k=profile.expert_used_count,
+                .initial_window_rows=rank_plan.runtime.moe_rebalance.window_size,
+                .maximum_window_rows=rank_plan.runtime.moe_rebalance.max_window_size,
+                .maximum_invocation_rows=rows});
+            return test::planWithRecordedHostServices({
                 .model_profile = &profile,
                 .rank_plan = &rank_plan,
                 .overlay_plan = &overlay,
@@ -3091,15 +3487,19 @@ namespace llaminar2
                     OverlayRankExecutionKind::ContinuationAuthority,
                 .require_host_memory_authority = true,
                 .resident_graph_rows = rows,
+                .host_demand_memory = demand,
+                .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
                 .graph_family = testGraphFamily(profile),
+                .original_expert_manifest = original_manifest,
+                .native_source_placement = CPUStoragePlacement::local(),
             });
         };
         auto small = planForRows(8);
         auto large = planForRows(4096);
 
         const auto model_manifest = manifest(
-            profile.n_layers, native_vnni_formats::Q4_1);
+            profile.n_layers, native_quantised_formats::Q4_1);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         ASSERT_EQ(footprints.size(), 2u);
@@ -3183,9 +3583,271 @@ namespace llaminar2
 
     }
 
+    /** @brief Bulk mandatory quotas match an independent per-copy cyclic billing oracle. */
+    TEST(MoEOverlayCapacityResolver, BulkMandatoryPrefixMatchesSerialBillingOracle)
+    {
+        for (const int count : {1, 3, 5})
+        for (const auto policy : {MoEOverlayTierCopyPolicy::Apportioned,
+                                  MoEOverlayTierCopyPolicy::Replicated})
+        for (const auto mode : {MoEOverlayLiveQuotaMode::FixedPerLayer,
+                                MoEOverlayLiveQuotaMode::Automatic})
+        {
+            SCOPED_TRACE(count);
+            const auto source = manifest(2, native_quantised_formats::Q6_K, true);
+            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(
+                source, moeOverlayMovableProjections(policy));
+            constexpr int experts = 17;
+            std::vector<std::vector<int>> serial(count, std::vector<int>(2));
+            std::vector<int> physical(2);
+            // This oracle deliberately executes each original logical addition.
+            for (int layer = 0; layer < 2; ++layer)
+                for (int expert = 0; expert < experts; ++expert)
+                    for (int owner = 0; owner < count; ++owner)
+                        if (policy == MoEOverlayTierCopyPolicy::Replicated ||
+                            owner == expert % count)
+                        {
+                            ++serial[owner][layer];
+                            ++physical[layer];
+                        }
+            std::vector<MoEOverlayTierCapacityParticipant> participants;
+            for (int owner = 0; owner < count; ++owner)
+                participants.push_back(participant(owner, "shared"));
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts = experts;
+            input.layer_weight_manifest = source;
+            input.physical_budgets = {exactBudget("shared", DeviceId::cuda(0),
+                footprints, physical, count)};
+            input.tiers = {tier(0, "mandatory", 0, true, mode, participants,
+                mode == MoEOverlayLiveQuotaMode::FixedPerLayer
+                    ? std::vector<int>{experts, experts} : std::vector<int>{}, policy)};
+            const auto resolved = MoEOverlayCapacityResolver::resolve(input);
+            ASSERT_NE(resolved.tier(0), nullptr);
+            EXPECT_EQ(resolved.tier(0)->participant_live_copies, serial);
+            ASSERT_NE(resolved.resource("shared"), nullptr);
+            EXPECT_EQ(resolved.resource("shared")->live_copies_per_layer, physical);
+            EXPECT_EQ(resolved.resource("shared")->remainingBytes(), 0u);
+            // The last original addition now fails, rather than rounding down
+            // a quota, omitting a replica, or billing an entire cycle.
+            input.physical_budgets.front() = input.physical_budgets.front().withAvailableBytes(
+                input.physical_budgets.front().usableBudgetBytes() - 1);
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input), std::invalid_argument);
+        }
+    }
+
+    /** @brief Unequal original CPU fragments retain exact billing across shared tier resources. */
+    TEST(MoEOverlayCapacityResolver, BulkTensorShardedPrefixMatchesSerialFragmentBilling)
+    {
+        const auto &format = native_quantised_formats::Q4_0;
+        MoEOverlayLayerWeightManifest source;
+        source.layer_idx = 0;
+        source.projections = {{projection(ExpertTierWeightProjection::Gate,160,1024,format),
+            projection(ExpertTierWeightProjection::Up,160,1024,format),
+            projection(ExpertTierWeightProjection::Down,1024,160,format)}};
+        const auto cohort = std::make_shared<const MoEExpertShardCohort>(
+            MoEExpertShardCohort::checked(source,17,
+                {{7,0,GlobalDeviceAddress::cpu(0)}, {19,1,GlobalDeviceAddress::cpu(1)},
+                 {31,2,GlobalDeviceAddress::cpu(2)}}, {{0,32},{32,64},{96,64}}));
+        for (const bool seeded : {false,true})
+        {
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts = 17;
+            input.layer_weight_manifest = {source};
+            if (seeded) input.initial_residency_policy =
+                MoEOverlayInitialResidencyPolicy::MigrationSourcePerParticipant;
+            std::vector<MoEOverlayTierCapacityParticipant> members;
+            for (size_t p = 0; p < 3; ++p)
+            {
+                const std::string name = "rank-" + std::to_string(p);
+                members.push_back(participant(cohort->participants()[p].participant_id,name,0));
+                // Independently reproduce each prepared projection's native
+                // block layout and unconditional page-sized allocation. The
+                // old generic fixture helper uses cache-line alignment for
+                // small projections and is not this storage contract.
+                size_t fragment_bytes=0;
+                for(const auto &projection:cohort->localManifest(p).projections) {
+                    const size_t units=(testAlignUp(static_cast<size_t>(projection.N),64)/64)*
+                        static_cast<size_t>(projection.K/32);
+                    fragment_bytes+=testAlignUp(units*expectedCpuStride(format),kCpuPage);
+                }
+                size_t serial_bytes = 0;
+                for (int expert = 0; expert < 17; ++expert)
+                    serial_bytes += fragment_bytes;
+                PhysicalMemoryBOMBuilder bom(PhysicalMemoryResource{
+                    static_cast<int>(p),DeviceId::cpu(),serial_bytes,serial_bytes});
+                input.physical_budgets.emplace_back(name,PhysicalMemoryAdmissionCertificate(bom.build()));
+            }
+            ASSERT_LT(input.physical_budgets[0].usableBudgetBytes(),
+                input.physical_budgets[1].usableBudgetBytes());
+            auto hot = tier(0,"fixed",0,false,MoEOverlayLiveQuotaMode::FixedPerLayer,
+                members,{3},MoEOverlayTierCopyPolicy::TensorSharded);
+            auto cold_members=members;
+            auto cold_originals=std::vector<MoEExpertShardCohort::Participant>(
+                cohort->participants().begin(),cohort->participants().end());
+            for(size_t p=0;p<cold_members.size();++p) {
+                cold_members[p].participant_id+=100;
+                cold_originals[p].participant_id+=100;
+            }
+            const auto cold_cohort=std::make_shared<const MoEExpertShardCohort>(
+                MoEExpertShardCohort::checked(source,17,cold_originals,{{0,32},{32,64},{96,64}}));
+            auto cold = tier(1,"fallback",1,true,MoEOverlayLiveQuotaMode::Automatic,
+                cold_members,{},MoEOverlayTierCopyPolicy::TensorSharded);
+            hot.shard_cohorts = {cohort}; cold.shard_cohorts = {cold_cohort};
+            input.tiers = {hot,cold};
+            const auto result = MoEOverlayCapacityResolver::resolve(input);
+            for (size_t p = 0; p < 3; ++p)
+            {
+                EXPECT_EQ(result.tier(0)->participant_live_copies[p],(std::vector<int>{3}));
+                EXPECT_EQ(result.tier(1)->participant_live_copies[p],(std::vector<int>{14}));
+                EXPECT_EQ(result.resource("rank-"+std::to_string(p))->remainingBytes(),0u);
+                auto rejected = input;
+                rejected.physical_budgets[p] = rejected.physical_budgets[p].withAvailableBytes(
+                    rejected.physical_budgets[p].usableBudgetBytes()-1);
+                EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(rejected),std::invalid_argument);
+            }
+            input.tiers[1].max_live_experts_per_layer = {13};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::invalid_argument);
+        }
+    }
+
+    /** @brief Seeded cyclic and replicated prefixes preserve the original quota cursor. */
+    TEST(MoEOverlayCapacityResolver, BulkSeededFallbackMatchesSerialCopies)
+    {
+        for (const auto policy : {MoEOverlayTierCopyPolicy::Apportioned,
+            MoEOverlayTierCopyPolicy::Replicated})
+        {
+            const auto source = manifest(1,native_quantised_formats::Q4_0);
+            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(
+                source,moeOverlayMovableProjections(policy));
+            std::vector<std::vector<int>> serial(3,std::vector<int>(1));
+            int copies = 0;
+            for (int expert=0; expert<17; ++expert)
+                for (int p=0;p<3;++p)
+                    if (policy==MoEOverlayTierCopyPolicy::Replicated || p==expert%3)
+                    { ++serial[p][0]; ++copies; }
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts=17; input.layer_weight_manifest=source;
+            input.initial_residency_policy=MoEOverlayInitialResidencyPolicy::MigrationSourcePerParticipant;
+            input.physical_budgets={exactBudget("shared",DeviceId::cuda(0),footprints,{copies},3)};
+            input.tiers={tier(0,"seeded",0,true,MoEOverlayLiveQuotaMode::Automatic,
+                {participant(0,"shared"),participant(1,"shared"),participant(2,"shared")},{},policy)};
+            const auto result=MoEOverlayCapacityResolver::resolve(input);
+            EXPECT_EQ(result.tier(0)->participant_live_copies,serial);
+            EXPECT_EQ(result.resource("shared")->remainingBytes(),0u);
+            input.tiers[0].max_live_experts_per_layer={16};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::invalid_argument);
+        }
+    }
+
+    /** @brief Gate/up prefixes bill native distinct GPU owners plus immutable down banks. */
+    TEST(MoEOverlayCapacityResolver, BulkGateUpPrefixMatchesSerialOwnerBilling)
+    {
+        const auto &format=native_quantised_formats::Q4_0;
+        MoEOverlayLayerWeightManifest source;
+        source.layer_idx=0;
+        source.projections={{projection(ExpertTierWeightProjection::Gate,64,96,format),
+            projection(ExpertTierWeightProjection::Up,64,96,format),
+            projection(ExpertTierWeightProjection::Down,96,64,format)}};
+        const auto movable=MoEOverlayCapacityResolver::preparedFootprints(
+            {source},DeviceMoEProjectionSet::GateUp).front();
+        const auto down=projection(ExpertTierWeightProjection::Down,32,64,format);
+        const auto down_bytes=expectedGpuProjectionBytes(down,
+            std::max(format.payload_bytes,expectedMigrationPayload(format)),
+            format.is_asymmetric || format.codebook_id==11 ||
+                (format.codebook_id==4 && format.is_superblock),format.has_emins);
+        for(const bool seeded:{false,true})
+        for(const auto mode:{MoEOverlayLiveQuotaMode::FixedPerLayer,MoEOverlayLiveQuotaMode::Automatic})
+        {
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts=17; input.layer_weight_manifest={source};
+            if(seeded)input.initial_residency_policy=MoEOverlayInitialResidencyPolicy::MigrationSourcePerParticipant;
+            std::vector<MoEOverlayTierCapacityParticipant> members;
+            std::vector<std::vector<int>> serial(3,std::vector<int>(1));
+            for(int expert=0;expert<17;++expert)++serial[expert%3][0];
+            for(int p=0;p<3;++p) {
+                const auto name="gpu-"+std::to_string(p);
+                members.push_back(participant(p,name,0));
+                size_t bytes=0;
+                for(int expert=0;expert<17;++expert) {
+                    bytes+=down_bytes;
+                    if(expert%3==p)bytes+=movable.gpu_live_bytes;
+                }
+                input.physical_budgets.push_back(physicalBudget(name,DeviceId::cuda(p),bytes,0,0));
+            }
+            input.tiers={tier(0,"gateup",0,true,mode,members,
+                mode==MoEOverlayLiveQuotaMode::FixedPerLayer?std::vector<int>{17}:std::vector<int>{},
+                MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns)};
+            const auto result=MoEOverlayCapacityResolver::resolve(input);
+            EXPECT_EQ(result.tier(0)->participant_live_copies,serial);
+            for(int p=0;p<3;++p) {
+                EXPECT_EQ(result.resource("gpu-"+std::to_string(p))->remainingBytes(),0u);
+                auto rejected=input;
+                rejected.physical_budgets[p]=rejected.physical_budgets[p].withAvailableBytes(
+                    rejected.physical_budgets[p].usableBudgetBytes()-1);
+                EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(rejected),std::invalid_argument);
+            }
+            input.tiers.front().max_live_experts_per_layer={16};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::invalid_argument);
+        }
+    }
+
+    /** @brief Unrepresentable multi-copy prefixes fail capacity; one-copy overflow remains arithmetic. */
+    TEST(MoEOverlayCapacityResolver, BulkPrefixOverflowPreservesFailureCategory)
+    {
+        auto source=manifest(1,native_quantised_formats::Q4_0);
+        for (auto &projection:source.front().projections)
+        {
+            projection.N=1<<29; projection.K=1<<29;
+            projection.format=ExpertWeightFormat::floating(TensorType::FP32);
+        }
+        const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(source).front();
+        const size_t capacity=std::numeric_limits<size_t>::max();
+        ASSERT_GT(footprint.cpu_live_bytes,capacity/17);
+        MoEOverlayCapacityResolverInput input;
+        input.num_experts=17; input.layer_weight_manifest=source;
+        input.physical_budgets={physicalBudget("shared",DeviceId::cpu(),capacity,0,0)};
+        input.tiers={tier(0,"overflow",0,true,MoEOverlayLiveQuotaMode::FixedPerLayer,
+            {participant(0,"shared",0)},{17})};
+        size_t used=0;
+        while (footprint.cpu_live_bytes<=capacity-used) used+=footprint.cpu_live_bytes;
+        try { (void)MoEOverlayCapacityResolver::resolve(input); FAIL()<<"Prefix exceeded size_t capacity"; }
+        catch (const std::invalid_argument &error) {
+            EXPECT_NE(std::string(error.what()).find("remaining_bytes="+std::to_string(capacity-used)),std::string::npos);
+        }
+        input.tiers[0].copy_policy=MoEOverlayTierCopyPolicy::Replicated;
+        input.tiers[0].participants.clear();
+        // Seven replicas overflow one original logical addition, independently
+        // of the prefix search; no expert-count-sized loop is required.
+        for(int p=0;p<7;++p)input.tiers[0].participants.push_back(participant(p,"shared",0));
+        EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::overflow_error);
+    }
+
+    /** @brief A partial prefix preserves the serial first-failure physical balance. */
+    TEST(MoEOverlayCapacityResolver, BulkMandatoryPrefixReportsExactSerialFailureState)
+    {
+        const auto source = manifest(1, native_quantised_formats::Q5_1);
+        const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(source);
+        MoEOverlayCapacityResolverInput input;
+        input.num_experts = 23;
+        input.layer_weight_manifest = source;
+        input.physical_budgets = {exactBudget("shared", DeviceId::cuda(0), footprints, {11}, 3)};
+        input.tiers = {tier(0, "mandatory", 0, true, MoEOverlayLiveQuotaMode::FixedPerLayer,
+            {participant(0, "shared"), participant(1, "shared"), participant(2, "shared")}, {23})};
+        // Serially consume eleven copies: the twelfth must see exactly zero
+        // bytes, and must still name a single expert's actual prepared charge.
+        try {
+            (void)MoEOverlayCapacityResolver::resolve(input);
+            FAIL() << "An incomplete mandatory quota was accepted";
+        } catch (const std::invalid_argument &error) {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("remaining_bytes=0"), std::string::npos);
+            EXPECT_NE(message.find("requires_additional_bytes=" +
+                std::to_string(footprints.front().gpu_live_bytes)), std::string::npos);
+        }
+    }
+
     TEST(MoEOverlayCapacityResolver, SharedPhysicalResourceAggregatesEveryTierCopy)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q6_K);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q6_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3229,7 +3891,7 @@ namespace llaminar2
         constexpr int kLayerCount = 4;
         const auto model_manifest = manifest(
             kLayerCount,
-            native_vnni_formats::Q4_0,
+            native_quantised_formats::Q4_0,
             /*vary_geometry=*/false);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
@@ -3289,7 +3951,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityResolver,
          CapacityFailureReportsExactLimitingPhysicalBom)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q4_0);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         ASSERT_EQ(footprints.size(), 1u);
@@ -3350,7 +4012,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, ReplicatedTierChargesEveryParticipantCopy)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q5_1);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q5_1);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3399,7 +4061,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, EmptyTierStillPaysForMaterializedShadowBanks)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::IQ2_S);
+        const auto model_manifest = manifest(1, native_quantised_formats::IQ2_S);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3439,7 +4101,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, FallbackCoverageFailsClosedWhenOneExpertDoesNotFit)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q8_K);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q8_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3460,7 +4122,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, AutomaticUpperBoundsLimitHotTierAndFallbackCoverage)
     {
-        const auto model_manifest = manifest(2, native_vnni_formats::Q4_1);
+        const auto model_manifest = manifest(2, native_quantised_formats::Q4_1);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3523,7 +4185,7 @@ namespace llaminar2
             .matrices = {{{512, 2048, 0}, {512, 2048, 0}, {2048, 512, 0}}},
             .formats = {"Q8_0", "Q8_0", "Q8_0"}, .layer = 34,
             .source_bytes = 0, .largest_source_bytes = 0};
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             description.formats = {std::string(source.quant_type), "Q8_0", "Q4_K"};
             EXPECT_NO_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description));
@@ -3571,7 +4233,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, MalformedTopologyAndOverflowAreRejected)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q4_0);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3612,7 +4274,7 @@ namespace llaminar2
     /** @brief Stage origins change identity, never physical bytes or row counts. */
     TEST(MoEOverlayCapacityResolver, PipelineStageCapacityUsesOnlyOwnedRowsAcrossFormatsAndBackends)
     {
-        for (const auto &format : native_vnni_formats::kAllSourceFormats)
+        for (const auto &format : native_quantised_formats::kAllSourceFormats)
         for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
         {
             const auto base_manifest = manifest(2, *format.metadata, true);
@@ -3681,7 +4343,7 @@ namespace llaminar2
                                std::array{33, 32}, std::array{std::numeric_limits<int>::max() - 1,
                                                           std::numeric_limits<int>::max()}})
         {
-            const std::vector malformed{layer(ids[0], native_vnni_formats::Q4_K), layer(ids[1], native_vnni_formats::Q4_K)};
+            const std::vector malformed{layer(ids[0], native_quantised_formats::Q4_K), layer(ids[1], native_quantised_formats::Q4_K)};
             EXPECT_THROW((void)MoEOverlayCapacityResolver::preparedFootprints(malformed), std::invalid_argument);
             EXPECT_THROW((void)DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(malformed), std::invalid_argument);
         }
@@ -3697,7 +4359,7 @@ namespace llaminar2
         plan.continuation_domain = plan.shared_expert_domain = "stage";
         plan.domains = {boundDomain("stage", 0, GlobalDeviceAddress::cpu(0))};
         plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
-        const std::vector owned{layer(32, native_vnni_formats::Q4_K), layer(33, native_vnni_formats::Q4_K)};
+        const std::vector owned{layer(32, native_quantised_formats::Q4_K), layer(33, native_quantised_formats::Q4_K)};
         const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned);
         const std::vector budgets{boundBudget(0, exactBudget("stage", DeviceId::cpu(), footprints, {2, 2}, 0))};
         const auto input = MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, owned, budgets, {});
@@ -3708,4 +4370,241 @@ namespace llaminar2
         for (auto &entry : foreign) entry.layer_idx -= 32;
         EXPECT_THROW((void)MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, foreign, budgets, {}), std::invalid_argument);
     }
+    /** @test A frozen quota draft owns metadata and cannot retry fewer experts after a table rejection. */
+    TEST(MoEOverlayCapacityResolver, FinalNgramAdmissionCannotReopenFrozenQuotaSearch)
+    {
+        const auto make_draft=[] {
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts=4;
+            input.layer_weight_manifest=manifest(1,native_quantised_formats::Q4_K);
+            const auto footprints=MoEOverlayCapacityResolver::preparedFootprints(input.layer_weight_manifest);
+            const auto bound=boundBudget(0,exactBudget("gpu",DeviceId::cuda(0),footprints,{4},1));
+            input.physical_budgets.emplace_back("gpu",bound.certificate());
+            input.tiers={tier(0,"gpu-only",0,true,MoEOverlayLiveQuotaMode::Automatic,{participant(0,"gpu")})};
+            return MoEOverlayCapacityResolver::resolvePipelineDraft(std::span(&input,1u));
+        };
+        // All borrowed resolver inputs have retired before final admission.
+        const auto draft=make_draft();
+        ASSERT_EQ(draft.stageCount(),1u);
+        const auto before=draft.physicalPlan().summary();
+        const auto frozen=draft.admit();
+        ASSERT_EQ(frozen.size(),1u);ASSERT_NE(frozen.front().tier(0),nullptr);
+        const auto frozen_quotas=frozen.front().tier(0)->live_experts_per_layer;
+        const auto frozen_copies=frozen.front().tier(0)->participant_live_copies;
+        EXPECT_EQ(frozen_quotas,(std::vector<int>{4}));
+        const auto *gpu=draft.physicalPlan().find({0,DeviceId::cuda(0)});
+        ASSERT_NE(gpu,nullptr);
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<30,1u<<30};
+        const std::array consumers{gpu->resource()};
+        const auto extent=ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),1024,4096);
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(extent,host,consumers);
+        const ImmutableRowTableModeContributions eligible{.vram=PhysicalMemoryPlan{}};
+        const std::array explicit_request{ImmutableRowTableAdmissionRequest{
+            {ImmutableRowStoragePreference::VRAM,65536,1},input,eligible}};
+        // Final placement reports canonical capacity exhaustion. Its caller
+        // finalizes outside the row/quota catch; this immutable draft cannot
+        // mutate or reopen its already selected expert ownership.
+        EXPECT_THROW((void)draft.admit(explicit_request),PhysicalMemoryCapacityExhausted);
+        EXPECT_EQ(draft.physicalPlan().summary(),before);
+        const auto after_rejection=draft.admit();
+        ASSERT_EQ(after_rejection.size(),1u);ASSERT_NE(after_rejection.front().tier(0),nullptr);
+        EXPECT_EQ(after_rejection.front().tier(0)->live_experts_per_layer,frozen_quotas);
+        EXPECT_EQ(after_rejection.front().tier(0)->participant_live_copies,frozen_copies);
+        EXPECT_EQ(after_rejection.front().physical_memory_admission->plan().summary(),before);
+        const std::array automatic{ImmutableRowTableAdmissionRequest{
+            {ImmutableRowStoragePreference::Automatic,65536,1},input,eligible}};
+        const auto admitted=draft.admit(automatic);
+        ASSERT_EQ(admitted.size(),1u);
+        EXPECT_EQ(admitted.front().tier(0)->live_experts_per_layer,frozen_quotas);
+        EXPECT_EQ(admitted.front().tier(0)->participant_live_copies,frozen_copies);
+        EXPECT_EQ(draft.physicalPlan().summary(),before);
+        ASSERT_EQ(admitted.front().ngram_table_placements.size(),1u);
+        EXPECT_EQ(admitted.front().ngram_table_placements.front()->storage(),ImmutableRowStorage::RAM);
+        EXPECT_EQ(admitted.front().physical_memory_admission->plan().find({0,DeviceId::cuda(0)})->
+            bytes(PhysicalMemoryOwner::RoutedExpertWeights),gpu->bytes(PhysicalMemoryOwner::RoutedExpertWeights));
+    }
+
+    /** @test Disjoint stages share one deferred physical plan and one final table/certificate. */
+    TEST(MoEOverlayCapacityResolver, PipelineDraftFinalizesOneRankTableWithoutRecomputingStageQuotas)
+    {
+        auto manifests=manifest(2,native_quantised_formats::Q4_K);
+        const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifests.front()});
+        const auto raw=exactBudget("gpu",DeviceId::cuda(0),footprint,{4},1);
+        const auto capacity=raw.usableBudgetBytes()*2u;
+        const auto bound=boundBudget(0,physicalBudget("gpu",DeviceId::cuda(0),capacity,113,257));
+        std::vector<MoEOverlayCapacityResolverInput> inputs(2);
+        for(std::size_t i=0;i<inputs.size();++i)
+        {
+            auto &input=inputs[i];input.num_experts=4;input.layer_weight_manifest={manifests[i]};
+            input.physical_budgets.emplace_back("gpu",bound.certificate());
+            input.tiers={tier(0,"owned",0,true,MoEOverlayLiveQuotaMode::Automatic,{participant(0,"gpu")})};
+        }
+        const auto draft=MoEOverlayCapacityResolver::resolvePipelineDraft(inputs);
+        inputs.clear(); // immutable publication must not retain input/tier pointers.
+        const auto *gpu=draft.physicalPlan().find({0,DeviceId::cuda(0)});
+        ASSERT_NE(gpu,nullptr);
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<30,1u<<30};
+        const std::array consumers{gpu->resource()};
+        const auto source=ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),1024,4096);
+        const std::array requests{ImmutableRowTableAdmissionRequest{
+            {ImmutableRowStoragePreference::RAM,65536,1},
+            ImmutableRowTablePlacementInput::forConsumers(source,host,consumers),{}}};
+        const auto result=draft.admit(requests);
+        ASSERT_EQ(result.size(),2u);
+        EXPECT_EQ(result[0].physical_memory_admission,result[1].physical_memory_admission);
+        for(const auto &stage:result)
+            EXPECT_EQ(stage.tier(0)->live_experts_per_layer,(std::vector<int>{4}));
+        EXPECT_EQ(result[0].physical_memory_admission->plan().find({0,DeviceId::cpu()})->
+            bytes(PhysicalMemoryOwner::ImmutableTableStorage),source.nativeBytes());
+    }
+    /** @brief Actual follower row factories, not depth/family approximations, own event multiplicity. */
+    TEST(MoEOverlayCapacityResolver, OriginalNativeSlotBOMUsesActualFollowerCacheRoster)
+    {
+        auto family = testGraphFamily(smallModelProfile());
+        family.max_graph_rows = 600;
+        family.max_decode_rows = 4;
+        family.max_mtp_draft_depth = 3;
+        family.mtp_source_layers = {family.main_layer_count};
+        const std::vector<int> prefill{16, 600};
+        ASSERT_TRUE(family.valid());
+        // Main M1..4 + source-owned M16/M600, plus ONE actual learned R1.
+        EXPECT_EQ(MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(600, family, prefill), 7u);
+        family.max_mtp_draft_depth = 8;
+        EXPECT_EQ(MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(600, family, prefill), 7u);
+        family.max_request_count = 2;
+        EXPECT_EQ(MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(600, family, prefill), 8u);
+        EXPECT_THROW((void)MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
+            600, family, std::vector<int>{600,16}), std::invalid_argument);
+    }
+
+    /** @brief Native geometry is original world-one GPU authority; host and remote channels remain explicit. */
+    TEST(MoEOverlayCapacityResolver, OriginalNativeSlotBOMRejectsHostAndRemoteAuthority)
+    {
+        MoERoutedExpertPlacementPlan placement;
+        placement.enabled = true;
+        placement.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        placement.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+        placement.continuation_domain = "original-source";
+        placement.base_model_domain = placement.continuation_domain;
+        placement.shared_expert_domain = placement.continuation_domain;
+        placement.continuation_domain_spec.domain = placement.continuation_domain;
+        placement.continuation_domain_spec.logical_root_participant = 0;
+        RoutedExpertDomain source;
+        source.name = placement.continuation_domain;
+        source.scope = ExecutionDomainScope::SINGLE;
+        source.participants = {GlobalDeviceAddress::cuda(0)};
+        source.world_ranks = {0}; source.owner_rank = 0;
+        RoutedExpertDomain follower = source;
+        follower.name = "original-follower";
+        follower.participants = {GlobalDeviceAddress::rocm(0)};
+        placement.domains = {source, follower};
+        placement.routed_tiers = {
+            RoutedExpertTier{.name="source", .domain=source.name, .priority=0},
+            RoutedExpertTier{.name="follower", .domain=follower.name, .priority=1}};
+        ClusterInventory inventory;
+        inventory.world_size = 1; inventory.ranks.resize(1);
+        inventory.ranks[0].rank = 0; inventory.ranks[0].node_id = 0;
+        auto family = testGraphFamily(smallModelProfile());
+        for (const int depth : {0,1,3,8})
+        {
+            family.max_mtp_draft_depth = depth;
+            const auto geometry = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                placement, inventory, family);
+            ASSERT_TRUE(geometry);
+            EXPECT_EQ(geometry->retainedDraftCapacity(), depth);
+            const auto channels = MoEOverlayActivationChannelPlanner::plan({
+                .placement_plan=&placement, .cluster_inventory=&inventory,
+                .row_capacity=8, .d_model=16, .top_k=2, .graph_family_count=1,
+                .original_native_slots=geometry});
+            ASSERT_EQ(channels.channels.size(), 1u);
+            EXPECT_EQ(channels.channels.front().mapping_layout.geometry.original_native_slots, geometry);
+        }
+        placement.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+        EXPECT_FALSE(MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(placement,inventory,family));
+        placement.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+        placement.domains[1].participants = {GlobalDeviceAddress::cpu(0)};
+        EXPECT_FALSE(MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(placement,inventory,family));
+        inventory.world_size = 2; inventory.ranks.resize(2);
+        inventory.ranks[1].rank = 1; inventory.ranks[1].node_id = 0;
+        placement.domains[1].world_ranks = {1}; placement.domains[1].owner_rank = 1;
+        EXPECT_FALSE(MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(placement,inventory,family));
+    }
 } // namespace llaminar2
+
+#include "CPUExpertShardAccountingReplay.inc"
+
+#include "CPUJointSerialGeometryContract.inc"
+
+#include "PhysicalProjectionLaneDemandContract.inc"
+
+namespace llaminar2 {
+/** @test Fixed BOM and materializer share original rank/tier multiplicity independent of layer count. */
+TEST(Test__MoEOverlayCapacityResolver, OriginalMovementExecutionStreamPopulationContract)
+{
+    MoERoutedExpertPlacementPlan plan;
+    plan.enabled=true;
+    plan.domains={boundDomain("first",2,GlobalDeviceAddress::cuda(7)),
+        boundDomain("colocated",2,GlobalDeviceAddress::cuda(7)),
+        boundDomain("other",2,GlobalDeviceAddress::rocm(11)),
+        boundDomain("remote",5,GlobalDeviceAddress::cuda(7)),
+        boundDomain("host",2,GlobalDeviceAddress::cpu(4))};
+    for(size_t i=0;i<plan.domains.size();++i)plan.routed_tiers.push_back({
+        .name="tier"+std::to_string(i),.domain=plan.domains[i].name,.priority=int(i)});
+    for(const size_t count:{1u,3u,7u,32u,65u}) {
+        const auto local=MoEOverlayCapacityAdmission::executionStreamCounts(plan,2,count);
+        ASSERT_EQ(local.size(),2u);
+        EXPECT_EQ(local.at(DeviceId::cuda(7)),2*count);
+        EXPECT_EQ(local.at(DeviceId::rocm(11)),count);
+        EXPECT_EQ(MoEOverlayCapacityAdmission::executionStreamCounts(plan,5,count),
+            (std::map<DeviceId,size_t>{{DeviceId::cuda(7),count}}));
+        EXPECT_TRUE(MoEOverlayCapacityAdmission::executionStreamCounts(plan,9,count).empty());
+    }
+    EXPECT_THROW(MoEOverlayCapacityAdmission::executionStreamCounts(plan,-1,1),std::invalid_argument);
+    EXPECT_THROW(MoEOverlayCapacityAdmission::executionStreamCounts(plan,2,0),std::invalid_argument);
+    EXPECT_THROW(MoEOverlayCapacityAdmission::executionStreamCounts(plan,2,std::numeric_limits<size_t>::max()),std::overflow_error);
+}
+}
+
+namespace llaminar2 {
+/** @test Original directed choices and exact operation incidence are immutable before native creation. */
+TEST(Test__MoEOverlayCapacityResolver, OriginalPhysicalPeerChoiceAdmissionContract)
+{
+    const auto a=DeviceId::cuda(7),b=DeviceId::cuda(31),other=DeviceId::rocm(9);
+    RankInventory inventory;inventory.rank=2;
+    inventory.gpus={{.type=DeviceType::CUDA,.local_device_id=31},
+        {.type=DeviceType::ROCm,.local_device_id=9},{.type=DeviceType::CUDA,.local_device_id=7}};
+    inventory.p2p_cuda_count=2;inventory.p2p_cuda={true,true,false,true};
+    MoEOverlayPhysicalLaneDemandPlan actual;actual.maximum_concurrent_cycles=3;
+    actual.original_execution_streams={{a,1},{b,1},{other,1}};
+    const auto add=[&](DeviceId source,DeviceId destination,size_t count,int rank=2){
+        actual.migration_pieces[{.kind=MoEOverlayPhysicalLaneKind::LocalDevice,.world_rank=rank,
+            .source=source,.destination=destination,.projection=ExpertTierWeightProjection::Gate}]=count;};
+    add(a,b,3);add(b,a,5);add(a,a,2);add(a,other,11);add(a,b,17,5);
+    actual.setup_ports[{.kind=MoEOverlayPhysicalLaneKind::RemoteSource,.world_rank=2,.source=a}]=13;
+    const auto query=[&](DeviceId accessor,DeviceId allocation){return originalMoEOverlayDirectedPeerAccess(inventory,accessor,allocation);};
+    auto admitted=actual;bindOriginalMoEOverlayGpuChoices(admitted,2,query);
+    EXPECT_TRUE(admittedMoEOverlayDirectGpuPeer(admitted,a,b));
+    EXPECT_FALSE(admittedMoEOverlayDirectGpuPeer(admitted,b,a));
+    EXPECT_FALSE(admittedMoEOverlayDirectGpuPeer(admitted,a,other));
+    EXPECT_EQ(originalMoEOverlayPeerEventCounts(admitted),(std::map<DeviceId,size_t>{{a,2},{b,3}}));
+    for(int replay=0;replay<20;++replay)EXPECT_NO_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,actual,2,query));
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(nullptr,actual,2,query),std::invalid_argument);
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,actual,5,query),std::invalid_argument);
+    auto changed=actual;changed.maximum_concurrent_cycles=4;
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,changed,2,query),std::invalid_argument);
+    changed=actual;++changed.migration_pieces.begin()->second;
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,changed,2,query),std::invalid_argument);
+    changed=actual;changed.original_execution_streams[a]=2;
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,changed,2,query),std::invalid_argument);
+    auto wrong_choice=admitted;wrong_choice.direct_gpu_edges[{a,b}]=false;
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&wrong_choice,actual,2,query),std::invalid_argument);
+    auto missing_choice=admitted;missing_choice.direct_gpu_edges.erase({a,b});
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&missing_choice,actual,2,query),std::invalid_argument);
+    EXPECT_THROW(bindOriginalMoEOverlayGpuChoices(admitted,2,query),std::invalid_argument);
+    inventory.p2p_cuda[1]=false;
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,actual,2,query),std::invalid_argument);
+    inventory.p2p_cuda={true};
+    EXPECT_THROW(requireOriginalMoEOverlayGpuDemand(&admitted,actual,2,query),std::runtime_error);
+    EXPECT_FALSE(originalMoEOverlayDirectedPeerAccess(inventory,b,a).has_value());
+}
+}

@@ -17,6 +17,8 @@
 #include "MoEExpertOverlayExecutionPlan.h"
 #include "MoEExpertOwnerMap.h"
 #include "loaders/IModelLoader.h"
+#include "loaders/ModelLoader.h"
+#include "MoEOverlayPhysicalResidencyFabric.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +34,14 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return Whether this original domain declares actual multi-rank CPU F fragments. */
+        bool cpuJointDomain(const MoEOverlayRuntimeDomain& domain)
+        {
+            return domain.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+                domain.participants.size()>1 && std::any_of(domain.participants.begin(),domain.participants.end(),
+                    [](const auto& member){return member.address.isCPU();});
+        }
+
         const char *residencyPolicyName(RoutedExpertResidencyPolicy policy)
         {
             switch (policy)
@@ -414,6 +424,64 @@ namespace llaminar2
         return *ownership;
     }
 
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::forOriginalSource(
+        const MoEExpertOverlayRuntimePlan &runtime,const IModelLoader &loader,
+        std::shared_ptr<const MoEExpertOverlayPreparationPlan> original,size_t estimated_bytes)
+    {
+        const auto &source=runtime.sourcePlan();
+        if(!MoEExpertOwnerMap::usesCPUJointFragments(source))return build(runtime,loader,estimated_bytes);
+        if(!original || !original->cpuJointOwnerMap() || !original->original_source_plan_)
+            throw std::invalid_argument("CPU joint graph preparation requires its retained original source authority");
+        const auto &authored=*original->original_source_plan_;
+        if(authored.owner_order!=source.owner_order || authored.residency_policy!=source.residency_policy ||
+            authored.first_model_layer!=source.first_model_layer || authored.domains.size()!=source.domains.size())
+            throw std::invalid_argument("CPU joint original preparation changed its source policy");
+        // Validate the immutable policy declaration itself, not a second owner
+        // map compiled from it. The retained original cohorts remain sole owners.
+        for(size_t i=0;i<authored.domains.size();++i) {
+            const auto &a=authored.domains[i];const auto &b=source.domains[i];
+            if(std::tie(a.name,a.scope,a.backend,a.participants,a.world_ranks,a.owner_rank,
+                a.routed_compute_policy,a.routed_phase_policy,a.routed_decode_assignment_policy,
+                a.routed_prefill_assignment_policy,a.weights)!=
+               std::tie(b.name,b.scope,b.backend,b.participants,b.world_ranks,b.owner_rank,
+                b.routed_compute_policy,b.routed_phase_policy,b.routed_decode_assignment_policy,
+                b.routed_prefill_assignment_policy,b.weights))
+                throw std::invalid_argument("CPU joint original preparation changed its source domain policy");
+        }
+        const auto *native_loader=dynamic_cast<const ModelLoader*>(&loader);
+        if(!native_loader)throw std::invalid_argument("CPU joint original preparation requires its genuine native loader");
+        if(std::any_of(runtime.domains().begin(),runtime.domains().end(),[](const auto &domain){
+            return domain.routed_compute_policy==RoutedExpertComputePolicy::GateUpOwnedDownColumns;}))
+            throw std::invalid_argument("CPU joint source cannot combine a separate GPU projection partition mode");
+        const auto &owners=*original->cpuJointOwnerMap();
+        if(owners.participants()!=MoEExpertOwnerMap::declaredParticipants(source,{.reject_tensor_sharded_domains=false}))
+            throw std::invalid_argument("CPU joint original preparation changed its declared participants");
+        size_t expected_rows=0;
+        for(const auto &placement:source.placements) {
+            const auto manifest=buildMoEOverlayLayerWeightManifestFromLoader(*native_loader,1,
+                static_cast<int>(placement.routed_expert_tier.size()),placement.layer);
+            expected_rows+=placement.routed_expert_tier.size();
+            for(size_t expert=0;expert<placement.routed_expert_tier.size();++expert) {
+                const auto *row=owners.placementFor(placement.layer,static_cast<int>(expert));
+                const int tier=placement.routed_expert_tier[expert];
+                if(!row || tier<0 || size_t(tier)>=source.routed_tiers.size() || row->tier_idx!=tier ||
+                    row->tier_name!=source.routed_tiers[size_t(tier)].name || row->domain_name!=source.routed_tiers[size_t(tier)].domain)
+                    throw std::invalid_argument("CPU joint original preparation changed its original expert placement");
+                if(row->shard_cohort && (manifest.size()!=1 || row->shard_cohort->source()!=manifest.front()))
+                    throw std::invalid_argument("CPU joint original preparation changed original native source geometry/format");
+            }
+        }
+        if(owners.owners().size()!=expected_rows)
+            throw std::invalid_argument("CPU joint original preparation has foreign source layers or experts");
+        for(const auto &request:original->requests())if(request.cpu_joint_source) {
+            const auto *row=owners.placementFor(request.layer,request.expert_id);
+            if(!row || !row->shard_cohort || request.cpu_joint_source->cohort()!=row->shard_cohort ||
+                !request.cpu_joint_source->contains(request.expert_id))
+                throw std::invalid_argument("CPU joint preparation lost the exact original source/cohort");
+        }
+        return *original;
+    }
+
     MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::build(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         size_t routed_expert_bytes_per_expert)
@@ -423,9 +491,10 @@ namespace llaminar2
         // resolved to projection ownership, whether by auto or an override.
         if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
             [](const auto &domain) {
-                return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+                return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
+                       cpuJointDomain(domain);
             }))
-            throw std::invalid_argument("Gate/up-owned down-column preparation requires the source-authenticated overload");
+            throw std::invalid_argument("Gate/up-owned down-column or CPU joint preparation requires the source-authenticated overload");
         return compile(runtime_plan, routed_expert_bytes_per_expert, {});
     }
 
@@ -438,6 +507,22 @@ namespace llaminar2
             [](const auto &domain) {
                 return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
             });
+        const bool joint_mode=std::any_of(runtime_plan.domains().begin(),runtime_plan.domains().end(),
+            [](const auto& domain){return cpuJointDomain(domain);});
+        if(joint_mode) {
+            if(projection_mode)throw std::invalid_argument("CPU joint source cannot combine a separate GPU projection partition mode");
+            const auto* source_loader=dynamic_cast<const ModelLoader*>(&loader);
+            if(!source_loader)throw std::invalid_argument("CPU joint preparation requires original source-aware model metadata");
+            std::vector<MoEOverlayLayerWeightManifest> manifests;
+            for(const auto& placement:runtime_plan.sourcePlan().placements) {
+                auto layer=buildMoEOverlayLayerWeightManifestFromLoader(*source_loader,1,
+                    static_cast<int>(placement.routed_expert_tier.size()),placement.layer);
+                manifests.insert(manifests.end(),layer.begin(),layer.end());
+            }
+            const auto original=std::make_shared<const MoEExpertOwnerMap>(
+                MoEExpertOwnerMap::buildShardPlacement(runtime_plan.sourcePlan(),manifests));
+            return compile(runtime_plan,routed_expert_bytes_per_expert,{},original);
+        }
         return projection_mode ? buildProjectionPartitioned(runtime_plan, loader)
                                : build(runtime_plan, routed_expert_bytes_per_expert);
     }
@@ -504,13 +589,16 @@ namespace llaminar2
     MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::compile(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         size_t routed_expert_bytes_per_expert,
-        const std::map<int, MoEExpertProjectionOwnership::Geometry> &projection_geometries)
+        const std::map<int, MoEExpertProjectionOwnership::Geometry> &projection_geometries,
+        std::shared_ptr<const MoEExpertOwnerMap> joint_sources)
     {
         const auto &source = runtime_plan.sourcePlan();
         if (!source.usesExpertOverlayAuthority())
             return {};
 
         MoEExpertOverlayPreparationPlan result;
+        result.original_source_plan_=runtime_plan.sourcePlanPtr();
+        result.cpu_joint_owners_=joint_sources;
         constexpr ExpertGemmRegistry::WeightRole kRoles[] = {
             ExpertGemmRegistry::WeightRole::GATE,
             ExpertGemmRegistry::WeightRole::UP,
@@ -541,7 +629,8 @@ namespace llaminar2
 
         std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
         std::optional<MoEExpertOwnerMap> owner_map;
-        if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
+        if(joint_sources)owner_map=*joint_sources;
+        else if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
                         [](const auto &domain)
                         {
                             return (domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
@@ -554,6 +643,7 @@ namespace llaminar2
                 MoEExpertOwnerMapBuildOptions{.reject_tensor_sharded_domains = false});
         }
 
+        std::map<std::pair<int,int>,std::shared_ptr<const CPUExpertShardSourceSelection>> joint_selections;
         for (const auto &placement : source.placements)
         {
             const auto projection_geometry = projection_geometries.empty()
@@ -634,7 +724,21 @@ namespace llaminar2
                         request.estimated_routed_bytes = routed_expert_bytes_per_expert;
                         request.memory_budget_bytes = tier.memory_budget_bytes;
                         request.fallback = tier.fallback;
-                        if (projection_geometry)
+                        if(cpuJointDomain(domain)) {
+                            if(!joint_sources)throw std::invalid_argument("CPU joint preparation lacks original source map");
+                            const auto& descriptors=joint_sources->participants();
+                            const auto member=std::find_if(descriptors.begin(),descriptors.end(),[&](const auto& p){
+                                return p.domain_name==domain.name && p.domain_participant_index==participant.participant_index &&
+                                    p.world_rank==participant.world_rank && p.device==participant.device;
+                            });
+                            if(member==descriptors.end())throw std::invalid_argument("CPU joint preparation lost its original member");
+                            auto& selection=joint_selections[{placement.layer,member->participant_id}];
+                            if(!selection)selection=CPUExpertShardSourceSelection::fromOriginalPlacement(
+                                *joint_sources,placement.layer,member->participant_id);
+                            request.cpu_joint_source=selection;
+                            request.projection_ownership=request.cpu_joint_source->ownership();
+                        }
+                        else if (projection_geometry)
                             request.projection_ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
                                 *projection_geometry, participant.participant_index,
                                 static_cast<int>(domain.participants.size()));
@@ -730,11 +834,40 @@ namespace llaminar2
             requirement.slice.expert_count = experts.size();
             requirement.slice.expert_ids = std::move(experts);
             requirement.slice.inner_is_presliced = true;
+            if(first.cpu_joint_source) {
+                for(const auto* request:requests)
+                    if(!request->cpu_joint_source || *request->cpu_joint_source!=*first.cpu_joint_source)
+                        throw std::invalid_argument("CPU joint grouped source changed its original selection");
+                if(requirement.slice.expert_ids!=std::vector<int>(first.cpu_joint_source->expertIds().begin(),
+                    first.cpu_joint_source->expertIds().end()))
+                    throw std::invalid_argument("CPU joint source cannot silently narrow its selected expert inventory");
+                requirement.cpu_joint_source=first.cpu_joint_source;
+                requirement.projection_ownership=first.projection_ownership;
+                requirement.tp_rank_or_device_index=first.participant_index;
+                requirement.slice=first.cpu_joint_source->sourceLoadSlice(role);
+            }
             plan.add(std::move(requirement));
         }
         // Empty initial residency is valid. The retained endpoint may receive
         // an economical move later; it has no source payload to load today.
         return plan;
+    }
+
+    std::shared_ptr<const CPUExpertShardSourceSelection> MoEExpertOverlayPreparationPlan::cpuShardSourceFor(
+        int layer,const MoEExpertOwnerParticipant& participant) const
+    {
+        std::shared_ptr<const CPUExpertShardSourceSelection> selected;
+        for(const auto& request:requests_) {
+            if(request.layer!=layer || request.domain_name!=participant.domain_name ||
+               request.participant_index!=participant.domain_participant_index ||
+               request.participant_world_rank!=participant.world_rank || request.device!=participant.device)continue;
+            if(!request.cpu_joint_source || request.cpu_joint_source->participant()!=participant ||
+               (selected && *selected!=*request.cpu_joint_source))
+                throw std::invalid_argument("CPU joint preparation changed its original source selection");
+            selected=request.cpu_joint_source;
+        }
+        if(!selected)throw std::invalid_argument("CPU joint preparation has no exact original member source");
+        return selected;
     }
 
     bool MoEExpertOverlayPreparationPlan::hasRequestsForDevice(DeviceId device) const
@@ -773,6 +906,8 @@ namespace llaminar2
         const OverlayRankPlan &rank_plan) const
     {
         MoEExpertOverlayPreparationPlan filtered;
+        filtered.original_source_plan_=original_source_plan_;
+        filtered.cpu_joint_owners_=cpu_joint_owners_;
         std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
 
         for (const auto &request : requests_)
@@ -831,11 +966,50 @@ namespace llaminar2
         }
 
         MoEExpertOverlayPreparationPlan filtered;
+        filtered.original_source_plan_=original_source_plan_;
+        filtered.cpu_joint_owners_=cpu_joint_owners_;
         std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
 
         for (const auto &request : requests_)
         {
             if (!device_set.contains(request.device))
+                continue;
+
+            filtered.requests_.push_back(request);
+            auto &stats = recordRequestStats(filtered.diagnostics_, request);
+            const auto expert_key = std::make_tuple(
+                request.domain_name,
+                request.device,
+                request.participant_index,
+                request.participant_world_rank,
+                request.residency_category,
+                request.layer,
+                request.expert_id);
+            if (request.role == ExpertGemmRegistry::WeightRole::GATE && counted_experts.insert(expert_key).second)
+            {
+                ++stats.assigned_routed_experts;
+                stats.estimated_routed_bytes += request.estimated_routed_bytes;
+            }
+        }
+
+        sortDiagnostics(filtered.diagnostics_);
+        return filtered;
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::filteredForGraphScope(
+        const MoEExpertOverlayRuntimePlan &runtime, const MoEExpertOverlayGraphScope &scope) const
+    {
+        scope.validate(runtime, scope.device());
+        MoEExpertOverlayPreparationPlan filtered;
+        filtered.original_source_plan_=original_source_plan_;
+        filtered.cpu_joint_owners_=cpu_joint_owners_;
+        std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
+
+        for (const auto &request : requests_)
+        {
+            if (!request.participant_world_rank_known ||
+                !scope.contains(request.domain_name, request.device,
+                    request.participant_world_rank, request.participant_index))
                 continue;
 
             filtered.requests_.push_back(request);

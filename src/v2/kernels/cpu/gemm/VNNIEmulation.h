@@ -26,7 +26,7 @@
 #include <immintrin.h>
 #include <cstdint>
 
-namespace llaminar2::cpu::native_vnni::isa
+namespace llaminar2::cpu::native_quantised::isa
 {
 
     // =========================================================================
@@ -110,4 +110,4 @@ namespace llaminar2::cpu::native_vnni::isa
         return _mm_extract_epi32(lo, 0);
     }
 
-} // namespace llaminar2::cpu::native_vnni::isa
+} // namespace llaminar2::cpu::native_quantised::isa

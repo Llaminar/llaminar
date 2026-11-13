@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_production_parity_campaigns.py
+#  @brief Test discovery, native process retirement, staging and scheduling without devices.
 """Device-free production campaign discovery, staging and watchdog contracts.
 
 Synthetic artifacts cover the canonical matrix without loading models. Deadline
@@ -18,6 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from test_source_admission_discovery import discovery_session_arguments
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -25,11 +28,254 @@ SCRIPT = REPO_ROOT / "scripts" / "ci" / "run_production_parity_campaigns.py"
 TMPFS_SETUP_SCRIPT = (
     REPO_ROOT / "scripts" / "ci" / "setup_production_parity_tmpfs.sh"
 )
-SPEC = importlib.util.spec_from_file_location("production_parity_campaigns", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
-campaigns = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = campaigns
-SPEC.loader.exec_module(campaigns)
+def load_campaign_module(name: str):
+    """Match a script launch's sibling-import scope during explicit importlib loading.
+
+    exec_module does not prepend the script directory as Python's CLI does.
+    Supply that scope only while importing; restore the caller's search path
+    afterwards. Register the module before exec for dataclasses' normal lookup.
+    """
+    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+        spec.loader.exec_module(module)
+    return module
+
+
+campaigns = load_campaign_module("production_parity_campaigns")
+
+
+def native_mpi_helper_target() -> str:
+    """Import the real selection policy and process helper into a CMake fixture.
+
+    The installed runner carries this CPU-only executable, so these Unit tests
+    need neither a compiler nor another implementation of registration or
+    launch policy. The extracted add_v2_test retains its actual selector call.
+    """
+    return (f'include("{REPO_ROOT}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
+            f'include("{REPO_ROOT}/tests/v2/cmake/V2TestTargetSelection.cmake")\n')
+
+
+def production_parity_sources_without_typed_expansion(repo_root: Path) -> list[str]:
+    """Inspect compiled source/header ownership without crediting mere declarations.
+
+    Thin registrations may put their typed matrix factory in quoted local
+    headers or linked object libraries. Follow both boundaries once, restricting
+    header traversal to test-owned files. The canonical entrypoint declaration
+    itself is not evidence that a consumer actually expands its definition.
+    """
+    cmake_root = repo_root / "tests" / "v2"
+    parity_root = cmake_root / "integration" / "parity"
+    entrypoint = (parity_root / "ModelParityDefinition.h").resolve()
+    cmake = (cmake_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    sources_by_target = {
+        target: {
+            (cmake_root / source).resolve()
+            for source in re.findall(r"(?<!\S)[\w./-]+\.cpp(?!\S)", body)
+        }
+        for target, body in re.findall(
+            r"add_(?:executable|library)\(\s*(\w+)\s+(.*?)\)",
+            cmake, re.DOTALL | re.IGNORECASE,
+        )
+    }
+    links_by_target: dict[str, set[str]] = {}
+    for target, body in re.findall(
+        r"target_link_libraries\(\s*(\w+)\s+(.*?)\)",
+        cmake, re.DOTALL | re.IGNORECASE,
+    ):
+        links_by_target.setdefault(target, set()).update(body.split())
+
+    def source_closure(target: str) -> set[Path]:
+        """Collect only compiled sources owned by this target's link closure."""
+        pending = [target]
+        seen: set[str] = set()
+        sources: set[Path] = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            sources.update(sources_by_target.get(current, set()))
+            pending.extend(links_by_target.get(current, set()) - seen)
+        return sources
+
+    non_code = re.compile(
+        r'(?P<literal>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+        r'|(?P<comment>//[^\n]*|/\*.*?\*/)', re.DOTALL,
+    )
+    contents_by_path: dict[Path, str] = {}
+
+    def contents_for(path: Path) -> str:
+        """Read each shared source/header once without touching model payloads."""
+        if path not in contents_by_path:
+            contents_by_path[path] = path.read_text(encoding="utf-8")
+        return contents_by_path[path]
+
+    parts_by_path: dict[Path, tuple[str, tuple[Path, ...]]] = {}
+
+    def parts_for(path: Path) -> tuple[str, tuple[Path, ...]]:
+        """Parse each shared header once while retaining per-target ownership."""
+        if path not in parts_by_path:
+            contents = contents_for(path)
+            # Comments cannot invent an include edge. Preserve quoted strings
+            # here because they carry the actual local include target.
+            includes = non_code.sub(
+                lambda match: match.group(0) if match.lastgroup == "literal" else " ",
+                contents,
+            )
+            dependencies: list[Path] = []
+            for name in re.findall(r'^\s*#\s*include\s*"([^"\n]+)"', includes, re.MULTILINE):
+                included = (path.parent / name).resolve()
+                if included.is_relative_to(cmake_root.resolve()) and included.is_file():
+                    dependencies.append(included)
+            # Names in comments or strings do not constitute a typed call.
+            parts_by_path[path] = (non_code.sub(" ", contents), tuple(dependencies))
+        return parts_by_path[path]
+
+    def contract_for(sources: set[Path]) -> str:
+        """Follow quoted local includes; cycles and aliases cannot duplicate proof."""
+        pending = list(sources)
+        seen: set[Path] = set()
+        contracts: list[str] = []
+        while pending:
+            path = pending.pop().resolve()
+            if path in seen or path == entrypoint:
+                continue
+            seen.add(path)
+            contract, dependencies = parts_for(path)
+            pending.extend(dependencies)
+            contracts.append(contract)
+        return "\n".join(contracts)
+
+    contracts_by_target = {
+        target: contract_for(source_closure(target))
+        for target, sources in sources_by_target.items()
+        if any(parity_root in path.parents for path in sources)
+    }
+    offenders: list[str] = []
+    for source in sorted(parity_root.rglob("*.cpp")):
+        if "ProductionParity" not in contents_for(source):
+            continue
+        contracts = [
+            contracts_by_target[target]
+            for target, sources in sources_by_target.items()
+            if source.resolve() in sources
+        ]
+        if not any(
+            re.search(r"\bexpandModelParityDefinition\s*\(", contract)
+            for contract in contracts
+        ):
+            offenders.append(str(source.relative_to(repo_root)))
+    return offenders
+
+
+class CampaignModuleImportTests(unittest.TestCase):
+    """CLI and explicit importlib consumers use the actual sibling module."""
+
+    def test_importlib_loads_actual_history_sibling_without_leaking_search_path(self):
+        """A clean module cache and unrelated cwd cannot hide the original failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            isolated = [value for value in sys.path
+                        if Path(value or previous).resolve() != SCRIPT.parent.resolve()]
+            try:
+                os.chdir(directory)
+                with mock.patch.object(sys, "path", isolated), mock.patch.dict(sys.modules):
+                    sys.modules.pop("model_kld_history_replay", None)
+                    loaded = load_campaign_module("production_parity_campaigns_isolated_regression")
+                    sibling = sys.modules["model_kld_history_replay"]
+                    self.assertEqual(Path(sibling.__file__).resolve(), (SCRIPT.parent / "model_kld_history_replay.py").resolve())
+                    self.assertIs(loaded.prepare_history_replay, sibling.prepare_history_replay)
+                    self.assertEqual(loaded.HANDOFF_FIELDS, sibling.HANDOFF_FIELDS)
+                    self.assertEqual(sys.path, isolated)
+            finally:
+                os.chdir(previous)
+
+    def test_normal_script_cli_help_keeps_history_replay_option(self):
+        """The real CLI help imports normally, without discovery/model/backend work."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ)
+            environment.pop("PYTHONPATH", None)
+            result = subprocess.run([sys.executable, str(SCRIPT), "--help"], cwd=directory,
+                env=environment, text=True, capture_output=True, check=True)
+            self.assertIn("--history-replay", result.stdout)
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+
+class TypedMatrixSourceOwnershipTests(unittest.TestCase):
+    """Thin registrations retain typed ownership across headers/object boundaries."""
+
+    def check_sources(self, files: dict[str, str], *, linked: bool = False) -> list[str]:
+        """Inspect a private metadata-only CMake/source tree, without compilation."""
+        with tempfile.TemporaryDirectory(prefix="llaminar-parity-source-policy-") as raw:
+            root = Path(raw)
+            tests = root / "tests" / "v2"
+            parity = tests / "integration" / "parity"
+            parity.mkdir(parents=True)
+            (parity / "ModelParityDefinition.h").write_text(
+                "struct ModelParityDefinition {};\n"
+                "inline auto expandModelParityDefinition(const ModelParityDefinition &d) { return d; }\n",
+                encoding="utf-8",
+            )
+            cmake = "add_executable(fixture integration/parity/fixture.cpp)\n"
+            if "shared.cpp" in files:
+                cmake += "add_library(shared OBJECT integration/parity/shared.cpp)\n"
+                if linked:
+                    cmake += "target_link_libraries(fixture PRIVATE shared)\n"
+            (tests / "CMakeLists.txt").write_text(cmake, encoding="utf-8")
+            for name, contents in files.items():
+                (parity / name).write_text(contents, encoding="utf-8")
+            return production_parity_sources_without_typed_expansion(root)
+
+    def test_nested_header_wrapper_owns_actual_typed_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '#include "base.h"\nTEST_P(Fixture, ProductionParity) {}\n',
+            "base.h": '#include "cases.h"\n',
+            "cases.h": '#include "ModelParityDefinition.h"\n'
+                'inline auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), [])
+
+    def test_header_cycles_are_bounded_without_losing_the_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '#include "base.h"\nTEST_P(Fixture, ProductionParity) {}\n',
+            "base.h": '#include "cases.h"\n',
+            "cases.h": '#include "base.h"\n#include "ModelParityDefinition.h"\n'
+                'inline auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), [])
+
+    def test_canonical_type_header_alone_does_not_prove_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '#include "ModelParityDefinition.h"\nTEST_P(Fixture, ProductionParity) {}\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
+
+    def test_comments_and_strings_do_not_invent_typed_calls(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": 'TEST_P(Fixture, ProductionParity) {}\n'
+                '// ModelParityDefinition expandModelParityDefinition(d)\n'
+                'const char *diagnostic = "expandModelParityDefinition(d)";\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
+
+    def test_commented_include_cannot_borrow_an_unused_factory(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '/*\n#include "cases.h"\n*/\nTEST_P(Fixture, ProductionParity) {}\n',
+            "cases.h": 'inline auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
+
+    def test_linked_object_source_can_own_the_typed_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": 'TEST_P(Fixture, ProductionParity) {}\n',
+            "shared.cpp": '#include "ModelParityDefinition.h"\n'
+                'auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }, linked=True), [])
+
+    def test_unlinked_source_cannot_rescue_a_fixed_fixture(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": 'TEST_P(Fixture, ProductionParity) {}\n',
+            "shared.cpp": '#include "ModelParityDefinition.h"\n'
+                'auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
 
 
 class EmptyGTestGateTests(unittest.TestCase):
@@ -63,7 +309,7 @@ class EmptyGTestGateTests(unittest.TestCase):
             (root / "CMakeLists.txt").write_text(
                 "cmake_minimum_required(VERSION 3.20)\nproject(EmptyGTestGate NONE)\n"
                 "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
-                + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+                + native_mpi_helper_target() + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
             )
             configured = subprocess.run(
                 ["cmake", "-S", str(root), "-B", str(root / "build")],
@@ -81,8 +327,98 @@ class EmptyGTestGateTests(unittest.TestCase):
                                      observed.stdout + observed.stderr)
 
 
+    def test_native_selection_rejects_skipped_or_empty_execution(self) -> None:
+        """The actual native registration rejects skip summaries, not normal tools.
+
+        Synthetic stdout is emitted by an exit-zero Python child under real
+        CTest. No GPU discovery occurs; only the production registration policy
+        classifies the declared backend and finalized gate alias.
+        """
+        source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        begin = source.index("function(add_v2_test TEST_NAME)")
+        end = source.index("endfunction()", begin) + len("endfunction()")
+        cases = [
+            ("AllSkipped", "[  SKIPPED ] 9 tests.\n[  PASSED  ] 0 tests.", False),
+            ("PartialSkipped", "[  PASSED  ] 2 tests.\n[  SKIPPED ] 1 test.", False),
+            ("ColorSkipped", "\x1b[0;33m[  SKIPPED ]\x1b[m One.Native", False),
+            ("Empty", "[==========] 0 tests from 0 test suites ran.", False),
+            ("Executed", "[==========] 1 test from 1 test suite ran.\n[  PASSED  ] 1 test.", True),
+            ("NonGTest", "NATIVE_ACTOR_BYTE_TAIL_TERMINAL_PASS", True),
+            ("ExistingFailure", "existing_failure_sentinel", False),
+        ]
+        with tempfile.TemporaryDirectory(prefix="llaminar-native-gtest-") as directory:
+            root = Path(directory)
+            printer = root / "summary.py"
+            printer.write_text(
+                f"import sys\nsummaries = {[case[1] for case in cases]!r}\n"
+                "print(summaries[int(sys.argv[1])])\n", encoding="utf-8",
+            )
+            declarations = []
+            expected = []
+            for backend in ("CUDA", "ROCm"):
+                for index, (suffix, output, passes) in enumerate(cases):
+                    name = f"Native{backend}{suffix}"
+                    # Deliberately omit preflight at declaration: existing
+                    # native aliases acquire their gate label later in CMake.
+                    declarations.append(
+                        f'add_v2_test({name} COMMAND "{sys.executable}" "{printer}" '
+                        f'{index} LABELS "V2;Integration;{backend}" '
+                        'MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 5)'
+                    )
+                    declarations.append(
+                        f'set_property(TEST {name} APPEND PROPERTY LABELS ProductionTestPreflight)'
+                    )
+                    declarations.append(
+                        f'set_property(TEST {name} APPEND PROPERTY FAIL_REGULAR_EXPRESSION existing_failure_sentinel)'
+                    )
+                    expected.append((name, passes))
+            # Device-free/backend metadata and ordinary host tests may exercise
+            # GTest skip reporting without claiming native execution.
+            for label in ("V2;Integration;DeviceFree;CUDA", "V2;Unit;CPU"):
+                name = f"Excluded{len(expected)}"
+                declarations.append(
+                    f'add_v2_test({name} COMMAND "{sys.executable}" "{printer}" '
+                    '0 '
+                    f'LABELS "{label}" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 5)'
+                )
+                expected.append((name, True))
+            (root / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(NativeGTestGate NONE)\n"
+                "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
+                + native_mpi_helper_target() + source[begin:end] + "\n"
+                + "\n".join(declarations), encoding="utf-8",
+            )
+            configured = subprocess.run(
+                ["cmake", "-S", str(root), "-B", str(root / "build")],
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            for name, passes in expected:
+                with self.subTest(name=name):
+                    observed = subprocess.run(
+                        ["ctest", "--test-dir", str(root / "build"), "--output-on-failure",
+                         "-R", f"^{name}$"], text=True, capture_output=True, timeout=10,
+                    )
+                    self.assertEqual(observed.returncode, 0 if passes else 8,
+                                     observed.stdout + observed.stderr)
+
+
 class DeviceInventoryGateTests(unittest.TestCase):
     """Prove CMake startup ownership reaches the actual preflight scheduler."""
+
+    def test_owned_mpi_application_words_do_not_change_rank_geometry(self) -> None:
+        """Only the delimited native launcher prefix owns rank count."""
+        command = ["/build/llaminar_mpi_session", "--session-base", "/build/sessions", "--",
+                   "mpirun", "-np", "2", "--", "program", "mpirun", "-np", "99"]
+        self.assertEqual(campaigns._preflight_mpi_ranks("owned", command), 2)
+        command[4:] = ["python3", "probe.py", "--mpirun", "/usr/bin/mpirun"]
+        self.assertIsNone(campaigns._preflight_mpi_ranks("script", command))
+
+    def test_owned_mpi_missing_application_boundary_fails(self) -> None:
+        command = ["/build/llaminar_mpi_session", "--session-base", "/build/sessions", "--",
+                   "mpirun", "-np", "2", "program"]
+        with self.assertRaisesRegex(RuntimeError, "application boundary"):
+            campaigns._preflight_mpi_ranks("owned", command)
 
     def configure_scope(self, directory: Path, scope: str, labels: str,
                         environment: str = "") -> subprocess.CompletedProcess:
@@ -108,12 +444,32 @@ class DeviceInventoryGateTests(unittest.TestCase):
             "add_executable(inventory_probe IMPORTED)\n"
             f'set_target_properties(inventory_probe PROPERTIES IMPORTED_LOCATION "{sys.executable}" '
             f'V2_TEST_DEVICE_SCOPE "{scope}")\n'
-            + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+            + native_mpi_helper_target() + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
         )
         return subprocess.run(
             ["cmake", "-S", str(directory), "-B", str(directory / "build")],
             text=True, capture_output=True, timeout=10,
         )
+
+    def test_native_mpi_registration_leaves_selection_to_mpi_and_accepts_explicit_override(self):
+        """Inspect real CTest commands/properties; no MPI process is launched."""
+        key = 'OMPI_MCA_btl_vader_single_copy_mechanism'
+        for selected in (None, 'cma', 'none'):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                authored = '' if selected is None else f'ENVIRONMENT "{key}={selected}"'
+                result = self.configure_scope(root, 'DeclaredBackends', 'Integration', authored)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                tests = json.loads(subprocess.check_output(
+                    ['ctest', '--test-dir', str(root/'build'), '--show-only=json-v1'], text=True))['tests']
+                self.assertEqual(len(tests), 2)
+                for test in tests:
+                    self.assertNotIn('btl_vader_single_copy_mechanism', test['command'])
+                    properties = {item['name']: item['value'] for item in test['properties']}
+                    selections = [item for item in properties['ENVIRONMENT'] if item.startswith(key+'=')]
+                    self.assertEqual(selections, [] if selected is None else [key+'='+selected])
+                    self.assertIn('mpi_leave_pinned', test['command'])
+                    self.assertIn('orte_allowed_exit_without_sync', test['command'])
 
     def test_process_inventory_scope_overrides_backend_specific_filters(self) -> None:
         """Discovery cannot race either vendor's free-memory/graph certificate."""
@@ -269,8 +625,9 @@ def preflight_registrations(
             labels=frozenset(("V2", "Integration", campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL)),
             mpi_ranks=None,
             lane=lane,
+            ctest_index=index,
         )
-        for name in names
+        for index, name in enumerate(names, start=1)
     )
 
 
@@ -297,7 +654,339 @@ def unit_ctest_document(*names: str) -> str:
     )
 
 
+class PreflightIndexSelectionTests(unittest.TestCase):
+    """Real CTest numeric selection, excluded sentinels and owned selector lifetime."""
+
+    def write_inventory(self, build: Path, names: list[tuple[str, bool]]) -> None:
+        """Write native CTest registrations; excluded/model commands fail if executed."""
+        build.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for name, admitted in names:
+            command = [sys.executable, str(build / "record.py"), str(build / "executed.jsonl"), name,
+                       "0" if admitted or name.startswith("V2_Unit_") else "97"]
+            lines.append("add_test(" + " ".join(json.dumps(value) for value in [name, *command]) + ")")
+            labels = ("V2;Integration;ProductionTestPreflight" if admitted else
+                      "V2;Unit" if name.startswith("V2_Unit_") else "V2;FullModel")
+            lines.append("set_tests_properties(" + json.dumps(name) +
+                         ' PROPERTIES LABELS ' + json.dumps(labels) + ' TIMEOUT 5)')
+        (build / "CTestTestfile.cmake").write_text("\n".join(lines) + "\n")
+        (build / "record.py").write_text(
+            "import json,sys\nfrom pathlib import Path\n"
+            "with Path(sys.argv[1]).open('a') as output: output.write(json.dumps(sys.argv[2])+'\\n')\n"
+            "raise SystemExit(int(sys.argv[3]))\n")
+
+    def selected_names(self, build: Path, selector: Path) -> tuple[str, ...]:
+        """Read CTest's exact native selection without a regex or label projection."""
+        result = subprocess.run(["ctest", "--test-dir", str(build), "--show-only=json-v1", "-I", str(selector)],
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return tuple(test["name"] for test in json.loads(result.stdout)["tests"])
+
+    def test_large_literal_inventory_and_original_regex_negative(self) -> None:
+        """A >128KiB name inventory selects exactly through the actual legacy -I ABI."""
+        with tempfile.TemporaryDirectory(prefix="llaminar-index-large-") as directory:
+            build = Path(directory)
+            rows = [("V2_Model_FirstSentinel", False)]
+            for index in range(1200):
+                name = ("V2_Integration_" if index % 3 else "V2_Model_") + f"{index:04d}_" + "literal" * 25 + ".[x](y)+?"
+                rows.append((name, index % 3 != 0))
+            self.assertGreater(sum(len(name.encode()) for name, _ in rows), 128 * 1024)
+            self.write_inventory(build, rows)
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            expected = {name for name, admitted in rows if admitted}
+            self.assertEqual({record.name for record in records}, expected)
+            indices = {name: index for index, (name, _) in enumerate(rows, start=1)}
+            self.assertTrue(all(record.ctest_index == indices[record.name] for record in records))
+            with campaigns._preflight_index_selection(build, records, tuple(sorted(expected))) as selector:
+                self.assertEqual(set(self.selected_names(build, selector)), expected)
+                self.assertTrue(selector.read_text().startswith("1,0,1,"))
+            self.assertFalse(selector.exists())
+            # Execute only two actual children; any interspersed excluded/model
+            # selection records a sentinel and exits97 rather than silently passing.
+            tiny = (records[0].name, records[-1].name)
+            with campaigns._preflight_index_selection(build, records, tiny) as selector:
+                result = subprocess.run(["ctest", "--test-dir", str(build), "--no-tests=error", "-I", str(selector)],
+                                        capture_output=True, text=True, check=False, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.selected_names(build, selector), tiny)
+            executed = [json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()]
+            self.assertEqual(executed, list(tiny))
+            # Literal old production helper, retained only as this negative oracle.
+            # Bound its argv below Linux's single-argument128KiB limit so CTest's
+            # own regex compiler, rather than execve, demonstrates the defect.
+            def literal_old_preflight_name_regex(names):
+                if not names:
+                    raise ValueError("preflight CTest selector requires at least one test")
+                if len(set(names)) != len(names):
+                    raise ValueError("preflight CTest selector contains duplicate tests")
+                return "^(" + "|".join(re.escape(name) for name in names) + ")$"
+            old = literal_old_preflight_name_regex(tuple(record.name for record in records[:400]))
+            self.assertLess(len(old.encode()), 128 * 1024)
+            broken = subprocess.run(["ctest", "--test-dir", str(build), "--no-tests=error", "-R", old],
+                                    capture_output=True, text=True, check=False, timeout=10)
+            self.assertIn("RegularExpression::compile(): Expression too big", broken.stdout + broken.stderr)
+            self.assertNotEqual(broken.returncode, 0)
+            self.assertEqual([json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()], list(tiny))
+
+    def test_unfiltered_native_order_survives_alphabetical_receipt_order(self) -> None:
+        """Interspersed foreign rows count toward indices, while receipts stay name-sorted."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Model_One", False), ("V2_Integration_Zeta", True),
+                                         ("V2_Model_Two", False), ("V2_Integration_Alpha", True)])
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            self.assertEqual([(record.name, record.ctest_index) for record in records],
+                             [("V2_Integration_Alpha", 4), ("V2_Integration_Zeta", 2)])
+            with campaigns._preflight_index_selection(build, records, (records[0].name, records[1].name)) as selector:
+                self.assertEqual(selector.read_text(), "1,0,1,2,4\n")
+                self.assertEqual(set(self.selected_names(build, selector)), {record.name for record in records})
+
+    def test_empty_duplicate_foreign_and_invalid_indices_reject(self) -> None:
+        """Invalid index sets cannot become CTest's implicit all-tests/default range."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Model_Excluded", False), ("V2_Integration_A", True), ("V2_Integration_B", True)])
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            for names in [(), (records[0].name, records[0].name), ("V2_Integration_Foreign",)]:
+                with self.subTest(names=names), self.assertRaises(ValueError):
+                    with campaigns._preflight_index_selection(build, records, names):
+                        self.fail("invalid names admitted")
+            from dataclasses import replace
+            for index in [0, -1, True, False, 1.5, "2", None]:
+                with self.subTest(index=index), self.assertRaises(ValueError):
+                    replace(records[0], ctest_index=index)
+            with self.assertRaisesRegex(RuntimeError, "duplicate CTest index"):
+                with campaigns._preflight_index_selection(build, (records[0], replace(records[1], ctest_index=records[0].ctest_index)),
+                                                          (records[0].name, records[1].name)):
+                    self.fail("duplicate native index admitted")
+            for index in [1, 100000]:
+                with self.subTest(index=index), self.assertRaisesRegex(RuntimeError, "stale or foreign"):
+                    with campaigns._preflight_index_selection(build, (replace(records[0], ctest_index=index),), (records[0].name,)):
+                        self.fail("foreign native index admitted")
+            self.assertFalse((build / "executed.jsonl").exists())
+
+    def test_changed_inventory_rejects_stale_indices_before_execution(self) -> None:
+        """A once-valid index shifted onto a model sentinel cannot execute it."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            rows = [("V2_Model_First", False), ("V2_Integration_A", True)]
+            self.write_inventory(build, rows)
+            stale = campaigns.discover_production_test_preflight_registrations(build)
+            self.write_inventory(build, [("V2_Model_Added", False), *rows])
+            with self.assertRaisesRegex(RuntimeError, "stale or foreign"):
+                with campaigns._preflight_index_selection(build, stale, (stale[0].name,)):
+                    self.fail("stale index admitted")
+            current = campaigns.discover_production_test_preflight_registrations(build)
+            self.assertEqual(current[0].ctest_index, 3)
+            with campaigns._preflight_index_selection(build, current, (current[0].name,)) as selector:
+                self.assertEqual(self.selected_names(build, selector), (current[0].name,))
+            self.assertFalse((build / "executed.jsonl").exists())
+
+    def test_selector_cleanup_on_validation_and_child_failure(self) -> None:
+        """Temporary ownership spans child use and retires even when validation/launch fails."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Integration_A", True)])
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            with self.assertRaisesRegex(OSError, "child failure"):
+                with campaigns._preflight_index_selection(build, records, (records[0].name,)) as selector:
+                    self.assertTrue(selector.exists())
+                    raise OSError("child failure")
+            self.assertFalse(selector.parent.exists())
+            observed = []
+            def reject(_build, path, _names):
+                observed.append(path)
+                self.assertTrue(path.exists())
+                raise OSError("preview failure")
+            with mock.patch.object(campaigns, "_validate_preflight_index_selection", side_effect=reject):
+                with self.assertRaisesRegex(OSError, "preview failure"):
+                    with campaigns._preflight_index_selection(build, records, (records[0].name,)):
+                        self.fail("preview failure admitted")
+            self.assertTrue(all(not path.parent.exists() for path in observed))
+
+    def test_parallel_child_launch_failure_retires_before_selector_cleanup(self) -> None:
+        """Both files survive actual parallel-helper retirement on its second Popen failure."""
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Integration_CUDA", True), ("V2_Integration_ROCm", True)])
+            discovered = campaigns.discover_production_test_preflight_registrations(build)
+            records = (replace(discovered[0], lane=campaigns.PreflightExecutionLane.CUDA_SOCKET),
+                       replace(discovered[1], lane=campaigns.PreflightExecutionLane.ROCM_SOCKET))
+            paths = []
+            first = mock.Mock()
+            first.poll.return_value = None
+            def launch(command, **_kwargs):
+                selector = Path(command[command.index("-I") + 1])
+                paths.append(selector)
+                self.assertTrue(all(path.exists() for path in paths))
+                if len(paths) == 2:
+                    raise OSError("second child launch failed")
+                return first
+            def retire(process):
+                self.assertIs(process, first)
+                self.assertEqual(len(paths), 2)
+                self.assertTrue(all(path.exists() for path in paths))
+                first.poll.return_value = -15
+                first.returncode = -15
+            with (mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_Fake",)),
+                  mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=records),
+                  mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=("0", "1")),
+                  mock.patch.object(campaigns, "_run_process", return_value=0),
+                  mock.patch.object(campaigns.subprocess, "Popen", side_effect=launch),
+                  mock.patch.object(campaigns, "_terminate_process_group", side_effect=retire) as retirement):
+                # Numeric preview is independently exercised against real CTest;
+                # keep Popen injection scoped to the actual two-child launcher.
+                with mock.patch.object(campaigns, "_validate_preflight_index_selection"):
+                    with self.assertRaisesRegex(OSError, "second child launch failed"):
+                        campaigns.run_production_test_preflight(build, None)
+                retirement.assert_called_once_with(first)
+            self.assertTrue(all(not path.parent.exists() for path in paths))
+
+    def test_actual_post_build_inventory_is_rediscovered(self) -> None:
+        """A real tiny CMake build replaces/renumbers tests before the gate selects indices."""
+        import shutil
+        with tempfile.TemporaryDirectory(prefix="llaminar-index-rebuild-") as directory:
+            root = Path(directory)
+            build = root / "build"
+            root.joinpath("CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(SelectorRebuild NONE)\nenable_testing()\n"
+                "add_custom_target(v2_unit_gate COMMAND ${CMAKE_COMMAND} -E copy " +
+                json.dumps(str(root / "new-tests.cmake")) + " ${CMAKE_BINARY_DIR}/CTestTestfile.cmake)\n"
+                "add_custom_target(v2_production_test_preflight_gate)\n")
+            result = subprocess.run(["cmake", "-G", "Ninja", "-DCMAKE_MAKE_PROGRAM=" + shutil.which("ninja"),
+                                     "-S", str(root), "-B", str(build)], capture_output=True, text=True, check=False, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.write_inventory(build, [("V2_Model_Inserted", False), ("V2_Unit_Actual", False),
+                                         ("V2_Model_Excluded", False), ("V2_Integration_New", True), ("V2_Integration_Added", True)])
+            (root / "new-tests.cmake").write_text((build / "CTestTestfile.cmake").read_text())
+            self.write_inventory(build, [("V2_Unit_Actual", False), ("V2_Integration_Old", True), ("V2_Model_Excluded", False)])
+            with mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None):
+                preflight_result = campaigns.run_production_test_preflight(build, 20)
+                code = preflight_result.return_code
+                names = preflight_result.tests
+            self.assertEqual(code, 0)
+            self.assertEqual(names, ("V2_Unit_Actual", "V2_Integration_Added", "V2_Integration_New"))
+            executed = [json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()]
+            self.assertEqual(set(executed), set(names))
+            self.assertEqual(len(executed), len(names))
+
+
 class ProductionParityCampaignTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Mock CTest preview only for scheduler tests with fabricated registrations."""
+        self.selected_names = {}
+        self.selector_contents = {}
+        def observe(_build, selector, names):
+            self.selected_names[str(selector)] = names
+            self.selector_contents[str(selector)] = selector.read_text()
+        preview = mock.patch.object(campaigns, "_validate_preflight_index_selection", side_effect=observe)
+        preview.start()
+        self.addCleanup(preview.stop)
+
+    def test_qfn_campaign_requires_query_program_observer_domain(self) -> None:
+        """Actual discovery admission authenticates explicit CTest filter overrides."""
+        test = json.loads(ctest_document("V2_Campaign_CPU_FP16"))["tests"][0]
+        test["command"][-1] = (
+            "--gtest_filter=Qwen4ExpMain/Qwen4ExpMainParityTest.ProductionParity/CPU0")
+        environment = next(prop["value"] for prop in test["properties"]
+                           if prop["name"] == "ENVIRONMENT")
+        for domains in ("forward_graph", "forward_graph,qsa.query_program_forward_submissions",
+                        "forward_graph,not_qsa"):
+            with self.subTest(domains=domains):
+                environment[:] = [entry for entry in environment
+                                  if not entry.startswith("LLAMINAR_PERF_STATS_FILTER=")]
+                environment.append("LLAMINAR_PERF_STATS_FILTER=" + domains)
+                with self.assertRaisesRegex(ValueError, "required qsa"):
+                    campaigns._validate_campaign_registration(test)
+        environment[:] = [entry for entry in environment
+                          if not entry.startswith("LLAMINAR_PERF_STATS_FILTER=")]
+        environment.append("LLAMINAR_PERF_STATS_FILTER=forward_graph,qsa")
+        cases, _, _, actual_environment, _ = campaigns._validate_campaign_registration(test)
+        self.assertEqual(len(cases), 1)
+        self.assertIn("LLAMINAR_PERF_STATS_FILTER=forward_graph,qsa", actual_environment)
+        environment.append("LLAMINAR_PERF_STATS_FILTER=forward_graph")
+        with self.assertRaisesRegex(ValueError, "required qsa"):
+            campaigns._validate_campaign_registration(test)
+        environment[-1] = "LLAMINAR_PERF_STATS_FILTER=forward_graph,qsa"
+        with self.assertRaisesRegex(ValueError, "required qsa"):
+            campaigns._validate_campaign_registration(test)
+        # Unrelated canonical model families retain their existing domain contract.
+        generic = json.loads(ctest_document("V2_Campaign_CPU_FP16"))["tests"][0]
+        campaigns._validate_campaign_registration(generic)
+
+    def test_gpu_adaptive_complete_artifact_names_fit_without_request_identity_loss(self) -> None:
+        """The real writer projection accepts all four source-declared cells and both bodies.
+
+        These explicit source-profile values are an independent boundary oracle,
+        not another campaign inventory. The C++ canonical expansion regression
+        checks every actual parameter and the exact ASCII byte bound. No model,
+        subprocess or artifact directory is created here.
+        """
+        components = set()
+        for backend in ("CUDA", "ROCm"):
+            for rows, physical_bytes in ((0, 0), (64, 1048576)):
+                parameter = (
+                    f"Qwen38FlashNext_UDQ4KXL_{backend}0_CPU0_ExpertOverlay_GpuExperts8_"
+                    f"NgramAdaptiveVRAMRAMSSD_G{rows}_B{physical_bytes}_A65536_P3of4_"
+                    f"H{rows}_B{physical_bytes}_A65536_P3of4_W65536_N1024_"
+                    "Static_Ordinal_ActFP32_KVFP16_MTPOff"
+                )
+                for body in ("ProductionParity", "SnapshotAdmission"):
+                    exact = f"Qwen4ExpGPUAdaptive/Qwen4ExpMainParityTest.{body}/{parameter}"
+                    component = campaigns._gtest_artifact_directory_name(exact)
+                    self.assertLessEqual(len(component.encode("utf-8")), 255)
+                    self.assertIn(parameter, component)
+                    self.assertNotIn("/", component)
+                    self.assertNotIn(component, components)
+                    components.add(component)
+                    if rows:
+                        old = exact.replace("Qwen4ExpGPUAdaptive/", "Qwen4ExpGPUAdaptiveVRAMRAMSSD/", 1)
+                        raw_old = re.sub(r'[/\\:*?"<>|]', "_", old.replace(".", "/", 1))
+                        self.assertGreater(len(raw_old.encode("utf-8")), 255)
+                        bounded_old = Path(campaigns._gtest_artifact_directory_name(old))
+                        self.assertEqual(bounded_old.parts[0], "long-identities")
+                        self.assertEqual(bounded_old.parts[-1], "artifacts")
+                        self.assertTrue(all(len(os.fsencode(part)) <= 255 for part in bounded_old.parts))
+        self.assertEqual(len(components), 8)
+
+    def test_long_exact_artifact_paths_preserve_full_identity_and_prefix_neighbors(self) -> None:
+        """The existing mirror chunks bytes without hashes or shared cleanup ancestors."""
+        prefix = "Qwen4ExpOppositeVendorMTPRetained15Exact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
+        identities = [prefix + "a" * size for size in (260, 480, 481)]
+        paths = [Path(campaigns._gtest_artifact_directory_name(value)) for value in identities]
+        self.assertEqual(len(set(paths)), len(identities))
+        for original, path in zip(identities, paths):
+            self.assertEqual(path.parts[0], "long-identities")
+            self.assertEqual(path.parts[-1], "artifacts")
+            self.assertTrue(all(len(os.fsencode(part)) <= 255 for part in path.parts))
+            self.assertTrue(all(part.startswith("c") for part in path.parts[1:-1]))
+            reconstructed = b"".join(os.fsencode(part)[1:] for part in path.parts[1:-1])
+            expected = re.sub(r'[/\\:*?"<>|]', "_", original.replace(".", "/", 1))
+            self.assertEqual(reconstructed, os.fsencode(expected))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in paths:
+                (root / path).mkdir(parents=True)
+                (root / path / "original.txt").write_text("original")
+            import shutil
+            shutil.rmtree(root / paths[0])
+            for path in paths[1:]:
+                self.assertEqual((root / path / "original.txt").read_text(), "original")
+        for left in paths:
+            for right in paths:
+                if left != right:
+                    self.assertNotIn(left, right.parents)
+
+    def test_short_artifact_names_and_reserved_namespace(self) -> None:
+        """Short numerical names retain the original sanitizer; reserved encoding remains disjoint."""
+        self.assertEqual(campaigns._gtest_artifact_directory_name("Suite.ProductionParity/Original"),
+                         "Suite_ProductionParity_Original")
+        # A boundary control exercises escaping without changing a canonical case ID.
+        with mock.patch.object(campaigns.re, "sub", return_value="long-identities"):
+            self.assertEqual(campaigns._gtest_artifact_directory_name("Suite.Method"),
+                             "long-identities/clong-identities/artifacts")
+
     @staticmethod
     def write_canonical_artifacts(directory: Path) -> None:
         """Materialize the smallest schema-valid campaign evidence fixture."""
@@ -306,10 +995,178 @@ class ProductionParityCampaignTest(unittest.TestCase):
         for filename, header in campaigns.REQUIRED_CSV_HEADERS.items():
             payload = header + "\n"
             if filename in campaigns.CSV_ARTIFACTS_REQUIRING_DATA:
-                payload += ",".join(
-                    "value" for _ in next(campaigns.csv.reader([header]))
-                ) + "\n"
+                columns = next(campaigns.csv.reader([header]))
+                row = dict.fromkeys(columns, "value")
+                if filename in ("prefill_stages.csv", "decode_stages.csv"):
+                    proof_start = columns.index("checkpoint_evidence_kind")
+                    row.update({column: "" for column in columns[proof_start:]})
+                    row["checkpoint_evidence_kind"] = "compared_values"
+                payload += ",".join(row[column] for column in columns) + "\n"
             (directory / filename).write_text(payload, encoding="utf-8")
+
+    @staticmethod
+    def typed_stage_fixture(decode: bool) -> list[list[str]]:
+        """Describe the writer layout independently of validator constants.
+
+        Integer diagnostics leave floating metrics empty. Failed canonical
+        comparisons remain distinct from successful route-conditioned proof.
+        """
+        distribution = (
+            "min,max,mean,stddev,kurtosis,skewness,p95,p99,outlier_frac,"
+            "dynamic_range,sparsity,zero_frac,nan_count,inf_count,elements"
+        ).split(",")
+        columns = ["backend"] + (["step"] if decode else []) + (
+            "layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,"
+            "error_entropy,is_routing,routing_overlap,routing_top1_match,"
+            "routing_weight_l1"
+        ).split(",")
+        columns += [prefix + field for prefix in ("llaminar_", "pytorch_")
+                    for field in distribution]
+        columns += (
+            "proof_authority,canonical_passed,route_conditioned_evaluated,"
+            "route_conditioned_passed,route_conditioned_cosine,"
+            "route_conditioned_rel_l2,route_conditioned_max_abs,"
+            "route_weights_max_error,hf_reconstruction_rel_l2,scalar_type,"
+            "integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,history_prompt_rows,"
+            "history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,observed_prefix_rows,"
+            "observed_live_rows,observed_row_capacity,observed_source_capacity,observed_first_required_logical_row,"
+            "observed_row_offset,observed_first_row,observed_end_row,observed_payload_row_offset,observed_physical_rows,"
+            "observed_repeats_per_row,observed_slice_first_row,observed_payload_rows,observed_payload_columns,"
+            "observed_payload_elements,reference_rows,reference_first_row,query_program_observation"
+        ).split(",")
+        rows = [columns]
+        for scalar_type, stage, mismatches, authority, passed in (
+            ("INT64", "PLE_HASH_INDICES", "0", "canonical_hf", "1"),
+            ("INT32", "QSA_SELECTED_INDICES", "3", "canonical_hf", "0"),
+            ("FP32", "MOE_EXPERT_OUT", "", "route_conditioned_hf", "0"),
+        ):
+            row = dict.fromkeys(columns, "")
+            row["checkpoint_evidence_kind"] = "compared_values"
+            row.update(backend="CPU0", layer="1", stage=stage,
+                       scalar_type=scalar_type, integer_mismatch_count=mismatches,
+                       proof_authority=authority, canonical_passed=passed,
+                       route_conditioned_evaluated="0", passed=passed)
+            if decode:
+                row["step"] = "0"
+            if scalar_type == "FP32":
+                row.update(cosine="0.75", rel_l2="0.25",
+                           route_conditioned_evaluated="1",
+                           route_conditioned_passed="1",
+                           route_conditioned_cosine="0.9999")
+            rows.append([row[column] for column in columns])
+        return rows
+
+    def write_typed_stage_artifacts(self, directory: Path) -> None:
+        """Write independent stage schemas over other canonical fixtures."""
+        self.write_canonical_artifacts(directory)
+        for decode in (False, True):
+            name = "decode_stages.csv" if decode else "prefill_stages.csv"
+            with (directory / name).open("w", encoding="utf-8", newline="") as stream:
+                campaigns.csv.writer(stream).writerows(self.typed_stage_fixture(decode))
+
+    @staticmethod
+    def typed_stage_cell() -> campaigns.CampaignCell:
+        """Use a main-only cell without model or MTP execution."""
+        return campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=("MatrixSuite.ProductionParity/CPU_KV_FP16",),
+        )
+
+    def test_stage_schema_accepts_typed_integer_and_proof_authority_columns(self) -> None:
+        """Admit exact writer layouts with blank floating integer metrics."""
+        cell = self.typed_stage_cell()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_typed_stage_artifacts(directory)
+            count, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertEqual(errors, ())
+            self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS))
+            for decode in (False, True):
+                name = "decode_stages.csv" if decode else "prefill_stages.csv"
+                self.assertEqual(next(campaigns.csv.reader(
+                    [campaigns.REQUIRED_CSV_HEADERS[name]])),
+                    self.typed_stage_fixture(decode)[0])
+                self.assertTrue(campaigns._prior_artifact_file_has_evidence(
+                    directory / name, campaigns.REQUIRED_CSV_HEADERS[name],
+                    requires_data=True))
+
+    def test_stage_schema_rejects_unknown_missing_duplicate_or_reordered_columns(self) -> None:
+        """Reject legacy and invented typed/proof layouts without normalization."""
+        cell = self.typed_stage_cell()
+        for decode in (False, True):
+            for mutation in ("legacy", "unknown", "duplicate", "reorder", "proof"):
+                with self.subTest(decode=decode, mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+                    self.write_typed_stage_artifacts(directory)
+                    rows = self.typed_stage_fixture(decode)
+                    if mutation == "legacy":
+                        rows = [row[:-3] + row[-1:] for row in rows]
+                    elif mutation == "unknown":
+                        rows[0][-2] = "unrecognized_mismatch_count"
+                    elif mutation == "duplicate":
+                        rows[0][-2] = "scalar_type"
+                    elif mutation == "reorder":
+                        rows[0][-3], rows[0][-2] = rows[0][-2], rows[0][-3]
+                    else:
+                        rows[0][rows[0].index("proof_authority")] = "proof_source"
+                    name = "decode_stages.csv" if decode else "prefill_stages.csv"
+                    path = directory / name
+                    with path.open("w", encoding="utf-8", newline="") as stream:
+                        campaigns.csv.writer(stream).writerows(rows)
+                    count, _, errors = campaigns.validate_campaign_artifacts(
+                        cell, campaigns.time.time_ns(), revision_results_root=root)
+                    self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) - 1)
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn(name + " header does not match", errors[0])
+                    self.assertFalse(campaigns._prior_artifact_file_has_evidence(
+                        path, campaigns.REQUIRED_CSV_HEADERS[name], requires_data=True))
+
+    def test_stage_schema_rejects_malformed_typed_row_width(self) -> None:
+        """Keep exact row-width validation after admitting the typed fields."""
+        cell = self.typed_stage_cell()
+        for decode in (False, True):
+            with self.subTest(decode=decode), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+                self.write_typed_stage_artifacts(directory)
+                rows = self.typed_stage_fixture(decode)
+                rows[1].pop(-2)
+                name = "decode_stages.csv" if decode else "prefill_stages.csv"
+                with (directory / name).open("w", encoding="utf-8", newline="") as stream:
+                    campaigns.csv.writer(stream).writerows(rows)
+                _, _, errors = campaigns.validate_campaign_artifacts(
+                    cell, campaigns.time.time_ns(), revision_results_root=root)
+                self.assertEqual(len(errors), 1)
+                self.assertIn(name + " row 2 has the wrong column count", errors[0])
+
+    @mock.patch.object(campaigns, "_run_process", return_value=8)
+    def test_typed_stage_schema_keeps_failed_numerical_campaign(self, run_process: mock.Mock) -> None:
+        """Valid CSV evidence cannot override the numerical process failure."""
+        cell = self.typed_stage_cell()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_typed_stage_artifacts(directory)
+            before = {path.name: path.read_bytes() for path in directory.iterdir()}
+            result = campaigns.run_campaign(Path("unused-build"), cell, 30.0,
+                                           artifact_results_root=root)
+            self.assertEqual(result.return_code, 8)
+            self.assertEqual(result.outcome, "completed")
+            self.assertTrue(result.artifact_contract_passed)
+            self.assertEqual(result.artifact_errors, ())
+            self.assertEqual(result.validated_artifact_file_count,
+                             len(campaigns.REQUIRED_CSV_HEADERS))
+            self.assertEqual(before, {path.name: path.read_bytes()
+                                      for path in directory.iterdir()})
+            self.assertEqual(run_process.call_count, 1)
+            ledger_path = root / "individual-green.json"
+            with self.assertRaisesRegex(ValueError, "refusing to record non-green"):
+                campaigns.record_individual_green(ledger_path, cell, result)
+            self.assertFalse(ledger_path.exists())
 
     def test_prefix_restore_schema_requires_cross_epoch_gdn_evidence(self) -> None:
         """Keep the validator synchronized with typed GDN state comparison."""
@@ -337,49 +1194,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ],
         )
 
-    def test_preflight_ctest_selector_uses_portable_group_syntax(self) -> None:
-        """Run the generated lane selector through CTest's actual regex engine."""
-
-        selector = campaigns._preflight_name_regex(
-            ("V2_Integration_Alpha", "V2_Integration_Beta")
-        )
-        self.assertEqual(
-            selector,
-            "^(V2_Integration_Alpha|V2_Integration_Beta)$",
-        )
-        self.assertNotIn("(?:", selector)
-        with tempfile.TemporaryDirectory(prefix="llaminar-preflight-selector-") as directory:
-            root = Path(directory)
-            (root / "CMakeLists.txt").write_text(
-                "cmake_minimum_required(VERSION 3.20)\n"
-                "project(PreflightSelector NONE)\n"
-                "enable_testing()\n"
-                "add_test(NAME V2_Integration_Alpha COMMAND ${CMAKE_COMMAND} -E true)\n"
-                "add_test(NAME V2_Integration_Beta COMMAND ${CMAKE_COMMAND} -E true)\n",
-                encoding="utf-8",
-            )
-            configured = subprocess.run(
-                ["cmake", "-S", str(root), "-B", str(root / "build")],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
-            selected = subprocess.run(
-                ["ctest", "--test-dir", str(root / "build"), "--no-tests=error", "-R", selector],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-            self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
-            self.assertIn("2/2", selected.stdout)
-
     def test_prefix_restore_schema_names_the_actual_seed_authority(self) -> None:
         """The cached seed epoch is distinct from the old serial oracle epoch."""
         header = campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]
         columns = next(campaigns.csv.reader([header]))
-        self.assertEqual(columns[-9], "cached_prefix_moe_movement_epoch")
-        self.assertEqual(columns[-8:], [
+        seed = columns.index("cached_prefix_moe_movement_epoch")
+        self.assertEqual(columns[seed + 1:seed + 9], [
             "shifted_mtp_kv_numerically_compared", "shifted_mtp_kv_exact_prefix_segments",
             "shifted_mtp_kv_numerical_suffix_payloads", "shifted_mtp_kv_numerical_elements",
             "shifted_mtp_kv_minimum_cosine", "shifted_mtp_kv_maximum_relative_l2",
@@ -388,6 +1208,38 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("oracle_moe_movement_epoch", columns)
         self.assertIn("observed_moe_movement_epoch", columns)
         self.assertEqual(columns.count("cached_prefix_moe_movement_epoch"), 1)
+
+    def test_prefix_restore_schema_preserves_explicit_partial_logit_policy(self) -> None:
+        """Require the native writer's policy evidence without changing raw cosine fields."""
+        cell = self.typed_stage_cell()
+        suffix = ["partial_checkpoint_policy", "partial_checkpoint_rows",
+                  "partial_checkpoint_maximum_kl", "partial_checkpoint_kl_limit"]
+        columns = next(campaigns.csv.reader([campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]]))
+        self.assertEqual(columns[-4:], suffix)
+        self.assertIn("checkpoint_cosine", columns)
+        for mutation in ("complete", "missing_policy", "duplicate", "reorder"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+                self.write_canonical_artifacts(directory)
+                emitted = list(columns)
+                if mutation == "missing_policy":
+                    emitted = emitted[:-4]
+                elif mutation == "duplicate":
+                    emitted[-1] = emitted[-2]
+                elif mutation == "reorder":
+                    emitted[-1], emitted[-2] = emitted[-2], emitted[-1]
+                path = directory / "prefix_restore.csv"
+                with path.open("w", newline="") as stream:
+                    writer = campaigns.csv.writer(stream)
+                    writer.writerow(emitted)
+                    writer.writerow(["value"] * len(emitted))
+                _, _, errors = campaigns.validate_campaign_artifacts(
+                    cell, campaigns.time.time_ns(), revision_results_root=root)
+                if mutation == "complete":
+                    self.assertEqual(errors, ())
+                else:
+                    self.assertTrue(any("prefix_restore.csv header" in error for error in errors))
 
     @mock.patch.object(campaigns.subprocess, "run")
     def test_complete_unit_inventory_is_discovered_from_ctest(
@@ -462,10 +1314,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
         command = run.call_args.args[0]
         self.assertIn("--show-only=json-v1", command)
-        self.assertIn(
-            f"^{campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL}$",
-            command,
-        )
+        self.assertNotIn("-L", command)  # Native indices belong to the unfiltered inventory.
 
     @mock.patch.object(campaigns.subprocess, "run")
     def test_preflight_inventory_rejects_model_fixture_dependency(
@@ -484,6 +1333,588 @@ class ProductionParityCampaignTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "requires a fixture"):
             campaigns.discover_production_test_preflight_tests(Path("build"))
+
+    def test_directed_peer_optional_geometry_uses_original_complete_asymmetric_facts(self):
+        """One original directed edge suffices; absent observations never mean false."""
+        row = campaigns.PreflightRegistration("V2_Integration_DirectedPeer", frozenset(
+            ("HardwareOptional", "CUDA", "Devices2", "DirectedPeerEdge")), 2,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        requirement = campaigns.preflight_optional_hardware_requirements((row,))[row.name]
+        self.assertEqual(requirement["peer_access"], "directed-edge")
+        def hardware(nodes=(0, 0), available=(False, False)):
+            return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks",
+                "devices": [{"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (0, 1)] +
+                    [{"backend": "cuda", "ordinal": i, "numa_node": node} for i, node in enumerate(nodes)],
+                "directed_peer_access": [{"backend": "cuda", "accessor": a, "peer": b, "available": value}
+                    for (a, b), value in zip(((0, 1), (1, 0)), available)]}
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, hardware()))
+        for direction in ((True, False), (False, True)):
+            self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, hardware(available=direction)))
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement,
+            hardware(nodes=(0, 1), available=(True, True))))
+        missing_cpu = hardware(available=(True, False)); missing_cpu["devices"].pop(1)
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, missing_cpu))
+        unknown_cpu = hardware(available=(True, False)); unknown_cpu["devices"][1]["numa_node"] = -1
+        with self.assertRaisesRegex(ValueError, "identity"):
+            campaigns.optional_native_cohort_absence(requirement, unknown_cpu)
+        for mutate in (lambda h: h.pop("directed_peer_access"),
+                       lambda h: h["directed_peer_access"].pop(),
+                       lambda h: h["directed_peer_access"].append(dict(h["directed_peer_access"][0])),
+                       lambda h: h["directed_peer_access"][0].update(peer=99),
+                       lambda h: h["directed_peer_access"][0].update(peer=0)):
+            malformed = hardware(); mutate(malformed)
+            with self.assertRaisesRegex(ValueError, "peer"):
+                campaigns.optional_native_cohort_absence(requirement, malformed)
+        later = hardware()
+        later["devices"] += [{"backend": "cuda", "ordinal": i, "numa_node": 1} for i in (2, 3)]
+        later["directed_peer_access"] = [{"backend": "cuda", "accessor": a, "peer": b,
+            "available": a == 3 and b == 2} for a in range(4) for b in range(4) if a != b]
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, later))
+        for changed in ({"degree": 1}, {"mpi_ranks": 0}, {"peer_access": "clique"},
+                        {"locality": "two-distinct-numa-local-ranks"}):
+            with self.assertRaises(ValueError):
+                campaigns.validate_optional_native_cohort_requirement({**requirement, **changed})
+        campaigns.validate_optional_native_cohort_requirement({**requirement, "degree": 3, "mpi_ranks": 1})
+
+    def test_no_peer_pair_requires_two_original_absent_directions_and_one_owner(self):
+        """No native edge is disabled: qualify only an observed bidirectionally absent pair."""
+        row = campaigns.PreflightRegistration("V2_Integration_NoPeerPair", frozenset(
+            ("HardwareOptional", "CUDA", "Devices2", "NoDirectedPeerPair")), 2,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        requirement = campaigns.preflight_optional_hardware_requirements((row,))[row.name]
+        self.assertEqual(requirement["peer_access"], "no-directed-pair")
+        def hardware(available=(False, False), nodes=(0, 0)):
+            return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks",
+                "devices": [{"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (0, 1)] +
+                    [{"backend": "cuda", "ordinal": ordinal, "numa_node": node}
+                     for ordinal, node in zip((3, 9), nodes)],
+                "directed_peer_access": [{"backend": "cuda", "accessor": a, "peer": b, "available": value}
+                    for (a, b), value in zip(((3, 9), (9, 3)), available)]}
+        original = hardware()
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, original))
+        reordered = hardware()
+        reordered["devices"].reverse()
+        reordered["directed_peer_access"].reverse()
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, reordered))
+        for available in ((True, False), (False, True), (True, True)):
+            self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, hardware(available)))
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, hardware(nodes=(0, 1))))
+        later = hardware((True, True))
+        later["devices"] += [{"backend": "cuda", "ordinal": ordinal, "numa_node": 1} for ordinal in (14, 21)]
+        later["directed_peer_access"] = [{"backend": "cuda", "accessor": a, "peer": b,
+            "available": {a, b} != {14, 21}} for a in (3, 9, 14, 21) for b in (3, 9, 14, 21) if a != b]
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, later))
+        for mutate in (lambda h: h.pop("directed_peer_access"),
+                       lambda h: h["directed_peer_access"].pop(),
+                       lambda h: h["directed_peer_access"].append(dict(h["directed_peer_access"][0])),
+                       lambda h: h["directed_peer_access"][0].update(peer=99)):
+            malformed = hardware(); mutate(malformed)
+            with self.assertRaisesRegex(ValueError, "peer"):
+                campaigns.optional_native_cohort_absence(requirement, malformed)
+        with self.assertRaises(ValueError):
+            campaigns.validate_optional_native_cohort_requirement({**requirement, "degree": 3})
+        conflicting = campaigns.PreflightRegistration(row.name, row.labels | {"DirectedPeerEdge"},
+            row.mpi_ranks, row.lane, row.ctest_index)
+        with self.assertRaisesRegex(RuntimeError, "geometry"):
+            campaigns.preflight_optional_hardware_requirements((conflicting,))
+
+    def test_optional_mixed_families_authenticate_original_local_and_distinct_rank_geometry(self):
+        """Visible vendor counts cannot admit a fictional original local GPU owner."""
+        local_name = "V2_Integration_MixedLocalTransfer"
+        remote_name = "V2_Integration_MixedRankTransfer"
+        labels = frozenset(("Integration", "ProductionTestPreflight", "HardwareOptional",
+                            "CUDA", "ROCm", "Devices2", "CUDADevices1", "ROCmDevices1"))
+        rows = (campaigns.PreflightRegistration(local_name, labels, 2,
+                    campaigns.PreflightExecutionLane.EXCLUSIVE, 1),
+                campaigns.PreflightRegistration(remote_name, labels | {"DistinctNUMARanks"}, 2,
+                    campaigns.PreflightExecutionLane.EXCLUSIVE, 2))
+        requirements = campaigns.preflight_optional_hardware_requirements(rows)
+        self.assertEqual(requirements[local_name],
+            {"backend_degrees": {"cuda": 1, "rocm": 1}, "mpi_ranks": 2,
+             "locality": "original-numa-local-rank"})
+        self.assertEqual(requirements[remote_name]["locality"], "two-distinct-numa-local-ranks")
+        cpus = [{"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)]
+        def hardware(cuda_node, rocm_node):
+            return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                *cpus, {"backend": "cuda", "ordinal": 3, "numa_node": cuda_node, "uuid": "original-cuda"},
+                {"backend": "rocm", "ordinal": 9, "numa_node": rocm_node, "uuid": "original-rocm"}]}
+        for cuda, rocm, selected in ((7, 11, [remote_name]), (11, 7, [remote_name]),
+                                    (7, 7, [local_name]), (11, 11, [local_name]),
+                                    (-1, 11, []), (7, -1, []), (7, 13, []), (13, 13, [])):
+            with self.subTest(cuda=cuda, rocm=rocm):
+                result = campaigns.preflight_hardware_qualification(
+                    (local_name, remote_name), requirements, hardware(cuda, rocm))
+                self.assertEqual(result["selected"], selected)
+                campaigns.validate_preflight_qualification([local_name, remote_name], result)
+                for name in set((local_name, remote_name)) - set(selected):
+                    self.assertEqual(result["unqualified"][name]["qualification"], "hardware-ineligible-unqualified")
+                forged = {**result, "selected": [local_name, remote_name], "unqualified": {}}
+                with self.assertRaises(ValueError):
+                    campaigns.validate_preflight_qualification([local_name, remote_name], forged)
+        observed = hardware(7, 11)
+        observed["devices"] = [device for device in observed["devices"]
+                               if device["backend"] != "cpu" or device["numa_node"] == 7]
+        self.assertFalse(campaigns.preflight_hardware_qualification(
+            (local_name, remote_name), requirements, observed)["selected"])
+
+    def test_optional_rank_populations_preserve_distinct_original_owners(self):
+        """Unequal native domains cannot borrow cards from another original NUMA owner."""
+        name = "V2_Integration_OriginalUnequalRanks"
+        def row(first, second):
+            return campaigns.PreflightRegistration(name, frozenset(("HardwareOptional", "ROCm",
+                "DistinctNUMARanks", f"Devices{first + second}", f"RankSizes{first}x{second}")),
+                2, campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
+        for first, second in ((1, 1), (2, 4), (3, 5), (7, 2)):
+            requirement = campaigns.preflight_optional_hardware_requirements((row(first, second),))[name]
+            self.assertEqual(requirement["rank_sizes"], [first, second])
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                *({"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)),
+                *({"backend": "rocm", "ordinal": 3 * ordinal + offset, "numa_node": node}
+                  for node, count, offset in ((7, first, 1), (11, second, 100)) for ordinal in range(count))]}
+            self.assertEqual(campaigns.preflight_hardware_qualification((name,), {name: requirement}, hardware)["selected"], [name])
+            for device in hardware["devices"]:
+                if device["backend"] == "rocm":
+                    device["numa_node"] = 7
+            self.assertFalse(campaigns.preflight_hardware_qualification((name,), {name: requirement}, hardware)["selected"])
+        for requirement in ({"backend": "rocm", "degree": 6, "locality": "two-distinct-numa-local-ranks", "rank_sizes": [2, 3], "mpi_ranks": 2},
+                            {"backend": "rocm", "degree": 6, "locality": "two-distinct-numa-local-ranks", "rank_sizes": [2, 4], "mpi_ranks": 1}):
+            with self.assertRaises(ValueError):
+                campaigns.validate_optional_native_cohort_requirement(requirement)
+
+    def test_optional_mixed_family_degrees_are_generic_and_fail_closed(self):
+        """Positive per-family widths are exact; the legacy receipt arm remains strict."""
+        name = "V2_Integration_ArbitraryMixedLocal"
+        def registration(cuda, rocm):
+            return campaigns.PreflightRegistration(name, frozenset((
+                "HardwareOptional", "CUDA", "ROCm", f"Devices{cuda + rocm}",
+                f"CUDADevices{cuda}", f"ROCmDevices{rocm}")), 2,
+                campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        for cuda, rocm in ((1, 1), (1, 3), (4, 4), (5, 2), (3, 9)):
+            row = registration(cuda, rocm)
+            requirement = campaigns.preflight_optional_hardware_requirements((row,))[name]
+            self.assertEqual(requirement["backend_degrees"], {"cuda": cuda, "rocm": rocm})
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                *({"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)),
+                *({"backend": family, "ordinal": 3 * ordinal + 1, "numa_node": 11}
+                  for family, degree in (("cuda", cuda), ("rocm", rocm)) for ordinal in range(degree))]}
+            self.assertEqual(campaigns.preflight_hardware_qualification(
+                (name,), {name: requirement}, hardware)["selected"], [name])
+            hardware["devices"].pop()
+            self.assertEqual(campaigns.preflight_hardware_qualification(
+                (name,), {name: requirement}, hardware)["selected"], [])
+        row = registration(1, 3)
+        for labels, ranks in (
+            (row.labels - {"HardwareOptional"}, 2), (row.labels - {"CUDADevices1"}, 2),
+            (row.labels | {"CUDADevices2"}, 2), (row.labels | {"NativeISA-gfx906"}, 2),
+            (row.labels | {"StageSizes1x3"}, 2),
+            (row.labels - {"Devices4"} | {"Devices3"}, 2),
+            (row.labels - {"ROCmDevices3"} | {"ROCmDevices0"}, 2),
+            (row.labels - {"CUDADevices1"} | {"CUDADevices01"}, 2),
+            (row.labels, None), (row.labels | {"DistinctNUMARanks"}, 1)):
+            invalid = campaigns.PreflightRegistration(name, labels, ranks,
+                campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+            with self.subTest(labels=labels, ranks=ranks), self.assertRaisesRegex(RuntimeError, "optional|HardwareOptional"):
+                campaigns.preflight_optional_hardware_requirements((invalid,))
+        requirement = campaigns.preflight_optional_hardware_requirements((row,))[name]
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cpu", "ordinal": 0, "numa_node": 7}]}
+        for invalid in ({**requirement, "degree": 4},
+                        {**requirement, "backend_degrees": {"cuda": True, "rocm": 3}},
+                        {**requirement, "backend_degrees": {"cuda": 1, "rocm": 0}},
+                        {**requirement, "backend_degrees": {"cuda": 1}},
+                        {**requirement, "backend_degrees": {"cpu": 1, "rocm": 3}},
+                        {**requirement, "mpi_ranks": True}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaigns.preflight_hardware_qualification((name,), {name: invalid}, hardware)
+
+    def test_optional_native_geometry_uses_actual_inventory_and_keeps_required_cells_strict(self):
+        """Original scheduler selects exact eligible indices and retains all absent cases in its receipt."""
+        rows = []
+        for backend, degrees in (("CUDA", (2, 4, 8)), ("ROCm", (2, 4, 8))):
+            for degree in degrees:
+                for source in (0, degree - 1):
+                    optional = (backend, degree) in (("CUDA", 4), ("CUDA", 8), ("ROCm", 8))
+                    labels = {"Integration", "ProductionTestPreflight", backend, f"Devices{degree}"}
+                    if optional:
+                        labels.add("HardwareOptional")
+                    rows.append(campaigns.PreflightRegistration(
+                        f"V2_Integration_NativeCompleted_{backend}_Addressed{degree}Source{source}Replay",
+                        frozenset(labels), 1, campaigns.PreflightExecutionLane.EXCLUSIVE, len(rows) + 2))
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": backend, "ordinal": ordinal, "numa_node": 0}
+            for backend, count in (("cuda", 2), ("rocm", 5)) for ordinal in range(count)]}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
+             mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=tuple(rows)), \
+             mock.patch.object(campaigns, "observe_preflight_hardware", return_value=hardware) as observe, \
+             mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+             mock.patch.object(campaigns, "_run_process", return_value=0):
+            result = campaigns.run_production_test_preflight(Path(directory), None,
+                artifact_directory=Path(directory) / "evidence")
+            self.assertEqual(result.return_code, 0)
+            self.assertEqual(len(result.tests), 13)
+            self.assertEqual(len(result.qualification["unqualified"]), 6)
+            self.assertEqual(len(result.qualification["selected"]), 7)
+            executed = set().union(*(set(names) for names in self.selected_names.values()))
+            self.assertEqual(executed, set(result.qualification["selected"]) - {"V2_Unit_A"})
+            self.assertFalse(executed & set(result.qualification["unqualified"]))
+            observe.assert_called_once()
+            report = json.loads((Path(directory) / "evidence/prerequisites.json").read_text())
+            self.assertEqual(report["preflight_qualification"], result.qualification)
+            campaigns.validate_preflight_qualification(list(result.tests), result.qualification)
+        # Losing a required board does not silently turn required2 or ROCm4 into absence.
+        missing_required = {**hardware, "devices": [d for d in hardware["devices"]
+            if (d["backend"] == "cuda" and d["ordinal"] == 0) or
+               (d["backend"] == "rocm" and d["ordinal"] < 3)]}
+        tests = tuple(row.name for row in rows)
+        required = campaigns.preflight_optional_hardware_requirements(rows)
+        q = campaigns.preflight_hardware_qualification(tests, required, missing_required)
+        for row in rows:
+            if "HardwareOptional" not in row.labels:
+                self.assertIn(row.name, q["selected"])
+        all_present = {**hardware, "devices": [{"backend": b, "ordinal": i, "numa_node": 0}
+            for b in ("cuda", "rocm") for i in range(8)]}
+        self.assertFalse(campaigns.preflight_hardware_qualification(tests, required, all_present)["unqualified"])
+
+    def test_optional_native_geometry_rejects_bad_hardware_and_dropped_receipt_evidence(self):
+        """Actual schema/identity reader and receipt validator reject ambiguous or erased proof."""
+        name = "V2_Integration_NativeCompleted_CUDA_Addressed4Source0Replay"
+        tests = ("V2_Unit_A", name)
+        required = {name: {"backend": "cuda", "degree": 4, "locality": "original-numa-local-rank"}}
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cuda", "ordinal": 0, "numa_node": 0},
+            {"backend": "cuda", "ordinal": 1, "numa_node": 0}]}
+        q = campaigns.preflight_hardware_qualification(tests, required, hardware)
+        # Native coordinates select real cohort positions; sparse physical ordinals are valid.
+        gap = {**hardware, "devices": [{"backend": "cuda", "ordinal": i, "numa_node": 0}
+            for i in (0, 1, 4, 5)]}
+        gap_q = campaigns.preflight_hardware_qualification(tests, required, gap)
+        self.assertFalse(gap_q["unqualified"])
+        split = {**hardware, "devices": [{"backend": "cuda", "ordinal": i,
+            "numa_node": i // 2} for i in range(4)]}
+        split_q = campaigns.preflight_hardware_qualification(tests, required, split)
+        self.assertEqual(split_q["unqualified"][name]["observed_numa_cohorts"], [
+            {"numa_node": 0, "ordinals": [0, 1]}, {"numa_node": 1, "ordinals": [2, 3]}])
+        self.assertEqual(split_q["selected"], ["V2_Unit_A"])
+        unknown = {**hardware, "devices": [{"backend": "cuda", "ordinal": i,
+            "numa_node": -1} for i in range(4)]}
+        unknown_q = campaigns.preflight_hardware_qualification(tests, required, unknown)
+        self.assertEqual(unknown_q["unqualified"][name]["unknown_locality_ordinals"], [0, 1, 2, 3])
+        from production_artifacts import validate_preflight_qualification
+        validate_preflight_qualification(list(tests), split_q)
+        with self.assertRaises(ValueError):
+            validate_preflight_qualification(list(tests), {**split_q, "selected": list(tests), "unqualified": {}})
+        from production_artifacts import validate_prerequisites
+        report = {"preflight_return_code": 0, "preflight_tests": list(tests),
+            "preflight_test_count": len(tests), "preflight_qualification": q}
+        validate_prerequisites(report)
+        for mutation in (None, {**q, "selected": list(tests)}, {**q, "unqualified": {}},
+                         {**q, "registered": list(tests)[1:]}, {**q, "schema": True}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate_prerequisites({**report, "preflight_qualification": mutation})
+        for mutation in ({}, {**hardware, "devices": hardware["devices"] * 2},
+                         {**hardware, "scope": "filtered"}):
+            with self.subTest(hardware=mutation), self.assertRaises(ValueError):
+                campaigns.preflight_hardware_qualification(tests, required, mutation)
+        generic = campaigns.PreflightRegistration(name,
+            frozenset(("HardwareOptional", "ROCm", "Devices4")), 1,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        self.assertEqual(campaigns.preflight_optional_hardware_requirements((generic,))[name],
+                         {"backend": "rocm", "degree": 4, "locality": "original-numa-local-rank"})
+
+    def test_optional_observed_pipeline_isa_selects_exact_original_cohort(self):
+        """Seven gfx906 boards plus a different ISA cannot certify EP4+EP4."""
+        name = "V2_Integration_MoEPipelinePreparation_MI50_EP4_MI50_EP4_Ordinal_Static_DisabledMTP"
+        labels = frozenset(("Integration", "ProductionTestPreflight", "HardwareOptional",
+                            "ROCm", "Devices8", "NativeISA-gfx906", "StageSizes4x4"))
+        row = campaigns.PreflightRegistration(name, labels, 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
+        host = campaigns.PreflightRegistration("V2_Integration_RequiredHost", frozenset(("Integration",)),
+            None, campaigns.PreflightExecutionLane.HOST, 2)
+        requirement = {"backend": "rocm", "degree": 8, "locality": "original-numa-local-rank",
+                       "native_isa": "gfx906", "stage_sizes": [4, 4], "mpi_ranks": 2}
+        self.assertEqual(campaigns.preflight_optional_hardware_requirements((row,)), {name: requirement})
+        cpus = [{"backend": "cpu", "ordinal": 0, "numa_node": numa} for numa in (0, 1)]
+        mi50 = [{"backend": "rocm", "ordinal": i, "numa_node": 1,
+                 "native_isa": "gfx906:sramecc+:xnack-", "uuid": f"MI50-{i}"} for i in range(8)]
+        xtx = {"backend": "rocm", "ordinal": 9, "numa_node": 1, "native_isa": "gfx1100", "uuid": "XTX"}
+        for eligible, devices in ((False, cpus + mi50[:7] + [xtx]), (True, cpus + mi50 + [xtx])):
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": devices}
+            self.selected_names.clear()
+            with self.subTest(eligible=eligible), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
+                 mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=(host, row)), \
+                 mock.patch.object(campaigns, "observe_preflight_hardware", return_value=hardware) as observe, \
+                 mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+                 mock.patch.object(campaigns, "_run_process", return_value=0):
+                result = campaigns.run_production_test_preflight(Path(directory), None)
+                self.assertEqual(result.return_code, 0)
+                self.assertIn(name, result.tests)
+                self.assertEqual(name in result.qualification["selected"], eligible)
+                executed = set().union(*(set(names) for names in self.selected_names.values()))
+                self.assertIn(host.name, executed)
+                self.assertEqual(name in executed, eligible)
+                observe.assert_called_once()
+                campaigns.validate_preflight_qualification(list(result.tests), result.qualification)
+                if not eligible:
+                    absent = result.qualification["unqualified"][name]
+                    self.assertEqual(absent["qualification"], "hardware-ineligible-unqualified")
+                    self.assertEqual(absent["observed_pipeline_cohort"]["observed_eligible_devices_by_numa"], {"1": 7})
+                else:
+                    self.assertFalse(result.qualification["unqualified"])
+                    forged = {**result.qualification,
+                        "selected": [test for test in result.tests if test != name],
+                        "unqualified": {name: {"qualification": "hardware-ineligible-unqualified"}}}
+                    with self.assertRaises(ValueError):
+                        campaigns.validate_preflight_qualification(list(result.tests), forged)
+        # Full visible ISA capacity still needs one complete original rank and
+        # enough observed CPU discovery participants for the authored MPI width.
+        for devices in (cpus[1:] + mi50,
+                        cpus + mi50[:4] + [{**gpu, "numa_node": 0} for gpu in mi50[4:]]):
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": devices}
+            qualified = campaigns.preflight_hardware_qualification((host.name, name), {name: requirement}, hardware)
+            self.assertEqual(qualified["selected"], [host.name])
+            self.assertIn(name, qualified["unqualified"])
+
+    def test_optional_native_geometry_accepts_positive_widths_and_rejects_bad_labels(self):
+        """Original local widths are generic; optional declarations stay exact and fail closed."""
+        name = "V2_Integration_ArbitraryNativeGeometry"
+        def registration(*labels, ranks=2):
+            return campaigns.PreflightRegistration(name, frozenset(labels), ranks,
+                campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        base = ("HardwareOptional", "ROCm")
+        for width in (1, 3, 5, 9, 17):
+            req = campaigns.preflight_optional_hardware_requirements((registration(*base, f"Devices{width}"),))[name]
+            self.assertEqual(req, {"backend": "rocm", "degree": width, "locality": "original-numa-local-rank"})
+        row = registration(*base, "Devices9", "NativeISA-gfx906", "StageSizes3x1x5")
+        odd = campaigns.preflight_optional_hardware_requirements((row,))[name]
+        self.assertEqual(odd["stage_sizes"], [3, 1, 5])
+        self.assertEqual(odd["mpi_ranks"], 2)
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            *({"backend": "cpu", "ordinal": 0, "numa_node": i} for i in range(2)),
+            *({"backend": "rocm", "ordinal": 3 * i, "numa_node": 1,
+               "native_isa": "gfx906", "uuid": f"original-{i}"} for i in range(9))]}
+        for required in (odd, {key: value for key, value in odd.items() if key != "native_isa"},
+                         {key: value for key, value in odd.items() if key not in ("stage_sizes", "mpi_ranks")}):
+            self.assertEqual(campaigns.preflight_hardware_qualification((name,), {name: required}, hardware)["selected"], [name])
+        for labels, ranks in (
+            ((*base, "Devices0"), 2), ((*base, "Devices03"), 2), ((*base, "Devices3", "Devices4"), 2),
+            ((*base, "Devices3", "NativeISA-gfx906:xnack-"), 2),
+            ((*base, "Devices3", "NativeISA-gfx906", "NativeISA-gfx1100"), 2),
+            (("HardwareOptional", "CUDA", "Devices3", "NativeISA-gfx906"), 2),
+            ((*base, "Devices3", "StageSizes1x0"), 2), ((*base, "Devices3", "StageSizes3"), 2),
+            ((*base, "Devices3", "StageSizes1x3"), 2),
+            ((*base, "Devices3", "StageSizes1x2", "StageSizes2x1"), 2),
+            ((*base, "Devices3", "StageSizes1x2"), None),
+            ((*base, "Devices2", "StageSizes1x1", "DistinctNUMARanks"), 2),
+            (("ROCm", "Devices3", "NativeISA-gfx906", "StageSizes1x2"), 2),
+        ):
+            with self.subTest(labels=labels, ranks=ranks), self.assertRaisesRegex(RuntimeError, "optional|HardwareOptional"):
+                campaigns.preflight_optional_hardware_requirements((registration(*labels, ranks=ranks),))
+        for invalid in ({**odd, "degree": True}, {**odd, "stage_sizes": [3, False, 5]},
+                        {**odd, "mpi_ranks": 0}, {**odd, "native_isa": "gfx906:xnack-"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaigns.preflight_hardware_qualification((name,), {name: invalid}, hardware)
+
+    def test_observed_pipeline_cmake_registrations_emit_exact_optional_geometry(self):
+        """Discover one exact original-source MPI process per body from actual CMake registrations."""
+        include = REPO_ROOT / "tests/v2/cmake/V2ObservedNativePipelineTests.cmake"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            build = Path(directory) / "build"
+            source.mkdir()
+            launcher = source / "mpiexec"
+            launcher.write_text("#!/bin/sh\nexit 99\n") # Inventory only; no fabricated native pass.
+            launcher.chmod(0o755)
+            (source / "CMakeLists.txt").write_text(r'''
+cmake_minimum_required(VERSION 3.20)
+project(ObservedNativePipelineRegistration NONE)
+enable_testing()
+set(HAVE_ROCM TRUE)
+add_executable(v2_integration_moe_pipeline_weight_preparation IMPORTED)
+set_target_properties(v2_integration_moe_pipeline_weight_preparation PROPERTIES IMPORTED_LOCATION "${CMAKE_COMMAND}")
+function(add_v2_test name)
+    cmake_parse_arguments(ENTRY "NO_MODELS" "MPI_PROCS;TIMEOUT" "COMMAND;LABELS" ${ARGN})
+    if(NOT ENTRY_NO_MODELS OR ENTRY_UNPARSED_ARGUMENTS OR NOT ENTRY_MPI_PROCS)
+        message(FATAL_ERROR "Malformed native fixture declaration: ${name}")
+    endif()
+    add_test(NAME "${name}" COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/mpiexec" -np ${ENTRY_MPI_PROCS} -- ${ENTRY_COMMAND})
+    set_tests_properties("${name}" PROPERTIES LABELS "${ENTRY_LABELS}" TIMEOUT "${ENTRY_TIMEOUT}")
+endfunction()
+''' + f'include({json.dumps(str(include))})\n' + r'''
+v2_mi50_pipeline_optional_hardware_labels("MI50_EP3_MI50_EP1_MI50_EP5" _odd)
+add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COMMAND}" -E false
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;${_odd}" MPI_PROCS 2 NO_MODELS TIMEOUT 30)
+''')
+            configured = subprocess.run(["cmake", "-S", str(source), "-B", str(build)],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            rows = campaigns.discover_production_test_preflight_registrations(build)
+            requirements = campaigns.preflight_optional_hardware_requirements(rows)
+            self.assertEqual(len(rows), 131) # 128 exact bodies, two focused aliases and one odd probe.
+            self.assertEqual(set(requirements), {row.name for row in rows})
+            listing = json.loads(subprocess.check_output(
+                ["ctest", "--test-dir", str(build), "--show-only=json-v1"], text=True, timeout=10))
+            filters = {"Preparation": "MoEPipelineWeightPreparation.NativePreparationContract/",
+                       "Lifecycle": "MoEPipelineRequestLifecycle.FirstDecodeResetAndPrefixReuse/"}
+            exact_bodies = set()
+            for test in listing["tests"]:
+                self.assertNotIn("ProcessResident", test["name"])
+                for role, body in filters.items():
+                    prefix = f"V2_Integration_MoEPipeline{role}_"
+                    if not test["name"].startswith(prefix):
+                        continue
+                    expected = "--gtest_filter=Topologies/" + body + test["name"].removeprefix(prefix)
+                    self.assertEqual(test["command"][1:3], ["-np", "2"])
+                    self.assertEqual(test["command"][-1], expected)
+                    self.assertFalse(any(character in expected for character in "*?:"))
+                    self.assertNotIn(expected, exact_bodies)
+                    exact_bodies.add(expected)
+            self.assertEqual(len(exact_bodies), 128)
+            for row in rows:
+                widths = ([3, 1, 5] if row.name.endswith("OddGeometryProbe") else
+                          [int(width) for width in re.findall(r"MI50_EP(\d+)", row.name)])
+                self.assertEqual(requirements[row.name], {"backend": "rocm", "degree": sum(widths),
+                    "locality": "original-numa-local-rank", "native_isa": "gfx906",
+                    "stage_sizes": widths, "mpi_ranks": 2})
+            malformed = source / "malformed.cmake"
+            malformed.write_text(f'include({json.dumps(str(include))})\n'
+                'v2_mi50_pipeline_optional_hardware_labels("MI50_EP0_MI50_EP4" _bad)\n')
+            rejected = subprocess.run(["cmake", "-P", str(malformed)], capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Malformed original MI50 pipeline geometry", rejected.stderr)
+
+    def test_optional_rank_transfer_geometry_requires_distinct_known_numa_owners(self):
+        """Captured rank transport needs actual separate NUMA owners, never two visible ordinals."""
+        name = "V2_Integration_CapturedTransferRank_ROCm"
+        row = campaigns.PreflightRegistration(name, frozenset(("Integration", "HardwareOptional",
+            "ROCm", "Devices2", "DistinctNUMARanks")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
+        mixed = campaigns.PreflightRegistration("V2_Integration_CapturedTransferRank_MixedCUDA_ROCm",
+            frozenset(("Integration", "CUDA", "ROCm")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
+        local = campaigns.PreflightRegistration("V2_Integration_NativeCompleted_ROCm4",
+            frozenset(("Integration", "ROCm", "Devices4")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 4)
+        tests = ("V2_Unit_A", name, mixed.name, local.name)
+        requirements = campaigns.preflight_optional_hardware_requirements((row, mixed, local))
+        self.assertEqual(requirements, {name: {"backend": "rocm", "degree": 2,
+            "locality": "two-distinct-numa-local-ranks"}})
+        same_socket = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "rocm", "ordinal": ordinal, "numa_node": 1} for ordinal in range(5)]}
+        from production_artifacts import validate_preflight_qualification
+        for nodes, eligible in (((1, 1, 1, 1, 1), False), ((1, 1, 1, 1, 0), True),
+                                ((-1, -1, -1, -1, -1), False), ((1, 1, 1, 1, -1), False)):
+            with self.subTest(nodes=nodes):
+                hardware = {**same_socket, "devices": [{"backend": "rocm", "ordinal": ordinal,
+                    "numa_node": numa} for ordinal, numa in enumerate(nodes)]}
+                qualified = campaigns.preflight_hardware_qualification(tests, requirements, hardware)
+                self.assertEqual(name in qualified["selected"], eligible)
+                self.assertEqual(name in qualified["unqualified"], not eligible)
+                self.assertIn(mixed.name, qualified["selected"])
+                self.assertIn(local.name, qualified["selected"])
+                validate_preflight_qualification(list(tests), qualified)
+                forged = {**qualified, "selected": [test for test in tests if test != name] if eligible else list(tests),
+                    "unqualified": {} if not eligible else {name: {"qualification": "hardware-ineligible-unqualified"}}}
+                with self.assertRaises(ValueError):
+                    validate_preflight_qualification(list(tests), forged)
+        # Sparse/reordered ordinals do not change actual physical NUMA ownership.
+        sparse = {**same_socket, "devices": [{"backend": "rocm", "ordinal": ordinal, "numa_node": numa}
+            for ordinal, numa in ((19, 7), (3, 2))]}
+        self.assertIn(name, campaigns.preflight_hardware_qualification(tests, requirements, sparse)["selected"])
+        bad_rank_count = campaigns.PreflightRegistration(row.name, row.labels, 1, row.lane, row.ctest_index)
+        with self.assertRaisesRegex(RuntimeError, "unsupported optional"):
+            campaigns.preflight_optional_hardware_requirements((bad_rank_count,))
+
+    def test_optional_native_geometry_reuse_requires_same_current_hardware(self):
+        """The original reuse authority rejects an erased or changed eligibility partition."""
+        name = "V2_Integration_NativeCompleted_CUDA_Addressed4Source0Replay"
+        tests = ("V2_Unit_A", name)
+        row = campaigns.PreflightRegistration(name,
+            frozenset(("Integration", "HardwareOptional", "CUDA", "Devices4")), 1,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cuda", "ordinal": i, "numa_node": 0} for i in range(2)]}
+        q = campaigns.preflight_hardware_qualification(tests,
+            campaigns.preflight_optional_hardware_requirements((row,)), hardware)
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory) / "build"
+            build.mkdir()
+            for filename in (".ninja_log", "build.ninja", "CTestTestfile.cmake"):
+                path = build / filename
+                path.write_text("original boundary\n")
+                os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            report = Path(directory) / "prerequisites.json"
+            document = {"schema": 1, "mode": "model-free-prerequisites", "certification_eligible": False,
+                "preflight_return_code": 0, "preflight_tests": list(tests), "preflight_test_count": 2,
+                "preflight_build_directory": str(build.resolve()), "preflight_completed_ns": 2_000_000_000,
+                "preflight_qualification": q}
+            report.write_text(json.dumps(document))
+            with mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=tests[:1]), \
+                 mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=(row,)), \
+                 mock.patch.object(campaigns, "observe_preflight_hardware", return_value=hardware) as observe:
+                result = campaigns.reuse_unchanged_production_test_preflight(build, report)
+                self.assertEqual(result, campaigns.PreflightResult(0, 0.0, tests, q))
+                observe.return_value = {**hardware, "devices": [
+                    {"backend": "cuda", "ordinal": i, "numa_node": 0} for i in range(4)]}
+                with self.assertRaisesRegex(ValueError, "hardware qualification changed"):
+                    campaigns.reuse_unchanged_production_test_preflight(build, report)
+                document.pop("preflight_qualification")
+                report.write_text(json.dumps(document))
+                with self.assertRaisesRegex(ValueError, "hardware qualification"):
+                    campaigns.reuse_unchanged_production_test_preflight(build, report)
+
+    def test_optional_native_exporter_uses_original_owner_and_preserves_native_failure(self):
+        """Observe through the original fresh-file mode; a failed native query is never absence."""
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cuda", "ordinal": 0, "numa_node": 0}]}
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            binary = build / "relocated" / "tests" / "v2_integration_parity_qwen4exp_production_matrix"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            # A plausible but unregistered build-root binary is never selected.
+            (build / binary.name).touch()
+            properties = {"LABELS": ["Admission", "RealModel", "FullModel"],
+                "FIXTURES_REQUIRED": ["V2_Models"], "RESOURCE_LOCK": ["Integration_Serial"],
+                "RUN_SERIAL": True, "TIMEOUT": 900, "REQUIRED_FILES": ["/canonical/model.gguf"]}
+            registration = {"name": "V2_Integration_Parity_Qwen4Exp_Production_Opaque",
+                "command": ["mpirun", "-np", "1", str(binary),
+                    "--gtest_filter=Source.FullSourceAdmission/Opaque"],
+                "properties": [{"name": key, "value": value} for key, value in properties.items()]}
+            listing = {"tests": [registration]}
+            def ctest(command, **kwargs):
+                self.assertEqual(command, ["ctest", "--test-dir", str(build), "--show-only=json-v1"])
+                self.assertEqual(kwargs, {"text": True, "timeout": 30})
+                return json.dumps(listing)
+            def export(command, **kwargs):
+                self.assertEqual(command[0], str(binary.resolve()))
+                self.assertEqual(len(command), 2)
+                option = "--qfn-source-hardware-inventory="
+                self.assertTrue(command[1].startswith(option))
+                output = Path(command[1][len(option):])
+                self.assertFalse(output.exists())
+                self.assertEqual(kwargs["timeout"], 30)
+                for key in ("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "LLAMINAR_SKIP_CUDA_STARTUP", "LLAMINAR_SKIP_ROCM_STARTUP"):
+                    self.assertEqual(kwargs["env"][key], "0")
+                output.write_text(json.dumps(hardware))
+                return subprocess.CompletedProcess(command, 0, "")
+            with mock.patch.object(campaigns.subprocess, "check_output", side_effect=ctest):
+                with mock.patch.object(campaigns.subprocess, "run", side_effect=export):
+                    self.assertEqual(campaigns.observe_preflight_hardware(build, None), hardware)
+                with mock.patch.object(campaigns.subprocess, "run", side_effect=subprocess.CalledProcessError(2, [str(binary)])):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        campaigns.observe_preflight_hardware(build, None)
+                duplicate = dict(registration, name=registration["name"] + "Other",
+                    command=["mpirun", "-np", "1", str(build / binary.name),
+                        "--gtest_filter=Source.FullSourceAdmission/Other"])
+                listing["tests"].append(duplicate)
+                with mock.patch.object(campaigns.subprocess, "run") as native:
+                    with self.assertRaisesRegex(ValueError, "more than one executable"):
+                        campaigns.observe_preflight_hardware(build, None)
+                    native.assert_not_called()
+                listing["tests"].pop()
+                binary.unlink()
+                with mock.patch.object(campaigns.subprocess, "run") as native:
+                    with self.assertRaises(FileNotFoundError):
+                        campaigns.observe_preflight_hardware(build, None)
+                    native.assert_not_called()
 
     def test_preflight_execution_plan_only_overlaps_single_rank_homogeneous_backends(self) -> None:
         """Mixed and multi-rank GPU tests retain exclusive package ownership."""
@@ -504,7 +1935,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(lane, expected_lane)
                 self.assertEqual(ranks, int(command[2]) if command[:2] == ["/usr/bin/mpirun", "-np"] else None)
-            registrations.append(campaigns.PreflightRegistration(name, labels, ranks, lane))
+            registrations.append(campaigns.PreflightRegistration(name, labels, ranks, lane, ctest_index=len(registrations) + 1))
         plan = campaigns.preflight_execution_plan(registrations)
         self.assertEqual(plan[campaigns.PreflightExecutionLane.CUDA_SOCKET], ("cuda",))
         self.assertEqual(plan[campaigns.PreflightExecutionLane.ROCM_SOCKET], ("rocm",))
@@ -513,6 +1944,188 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns._preflight_execution_lane(
                 "invalid-cuda", frozenset(("Integration", "CUDA")), mpi_one, ["rocm_gpu_0"]
             )
+
+    def test_preflight_completed_ctest_failure_is_distinct_from_infrastructure_exit(self) -> None:
+        """Only normal CTest success/test-failure outcomes allow the next owner."""
+        self.assertTrue(campaigns._preflight_test_phase_completed(0))
+        self.assertTrue(campaigns._preflight_test_phase_completed(8))
+        for code in (1, 2, 7, 124, 130, -9, -15):
+            self.assertFalse(campaigns._preflight_test_phase_completed(code))
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(8, 0), 8)
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(8, 124), 124)
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(7, 130), 7)
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(124, -9), 124)
+
+    def test_preflight_completed_test_failures_collect_all_serial_lanes_and_stay_red(self) -> None:
+        """Unit/host/backend failures cannot hide later safe tests or publish green."""
+        lanes = campaigns.PreflightExecutionLane
+        registrations = tuple(
+            campaigns.PreflightRegistration(
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), None, lane,
+                ctest_index=list(lanes).index(lane) + 2,
+            )
+            for lane in lanes
+        )
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            mock.patch.object(
+                campaigns, "discover_production_parity_unit_tests",
+                return_value=("V2_Unit_Example",),
+            ),
+            mock.patch.object(
+                campaigns, "discover_production_test_preflight_registrations",
+                return_value=registrations,
+            ),
+            mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None),
+            mock.patch.object(campaigns, "_run_process", side_effect=[0, 8, 8, 0, 8, 0]) as execute,
+        ):
+            artifact = Path(folder) / "evidence"
+            preflight_result = campaigns.run_production_test_preflight(
+                Path(folder), None, artifact_directory=artifact
+            )
+            code = preflight_result.return_code
+            inventory = preflight_result.tests
+            self.assertEqual(code, 8)
+            self.assertEqual(execute.call_count, 6)
+            selectors = [
+                call.args[0][call.args[0].index("-I") + 1]
+                for call in execute.call_args_list[2:]
+            ]
+            self.assertEqual(len(selectors), 4)
+            for lane in lanes:
+                self.assertIn(("V2_Integration_" + lane.value,),
+                              [self.selected_names[selector] for selector in selectors])
+            self.assertTrue(all(not Path(selector).exists() for selector in selectors))
+            report = json.loads((artifact / "prerequisites.json").read_text())
+            self.assertEqual(report["preflight_return_code"], 8)
+            self.assertEqual(report["preflight_tests"], list(inventory))
+            self.assertFalse(report["certification_eligible"])
+
+    def test_preflight_backend_test_failure_still_collects_exclusive_lane(self) -> None:
+        """The exact present defect: backend8 preserves EXCLUSIVE and final red."""
+        lanes = campaigns.PreflightExecutionLane
+        registrations = tuple(
+            campaigns.PreflightRegistration(
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane,
+                ctest_index=list(lanes).index(lane) + 2,
+            )
+            for lane in lanes
+        )
+        with (
+            mock.patch.object(
+                campaigns, "discover_production_parity_unit_tests",
+                return_value=("V2_Unit_Example",),
+            ),
+            mock.patch.object(
+                campaigns, "discover_production_test_preflight_registrations",
+                return_value=registrations,
+            ),
+            mock.patch.object(
+                campaigns, "preflight_accelerator_cpu_sets", return_value=("0-27", "28-55")
+            ),
+            mock.patch.object(
+                campaigns, "_run_preflight_parallel_processes",
+                return_value={lanes.CUDA_SOCKET: 0, lanes.ROCM_SOCKET: 8},
+            ),
+            mock.patch.object(campaigns, "_run_process", return_value=0) as execute,
+        ):
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+            code = preflight_result.return_code
+            self.assertEqual(code, 8)
+            self.assertEqual(execute.call_count, 4)
+            self.assertEqual(self.selected_names[execute.call_args_list[-1].args[0][-1]], ("V2_Integration_exclusive",))
+
+    def test_preflight_build_and_infrastructure_failures_do_not_admit_later_lanes(self) -> None:
+        """An8 build failure is never reinterpreted as completed CTest work."""
+        for outcomes, expected_calls in (([8], 1), ([0, 124], 2), ([0, 0, 2], 3)):
+            with (
+                self.subTest(outcomes=outcomes),
+                mock.patch.object(
+                    campaigns, "discover_production_parity_unit_tests",
+                    return_value=("V2_Unit_Example",),
+                ),
+                mock.patch.object(
+                    campaigns, "discover_production_test_preflight_registrations",
+                    return_value=preflight_registrations("V2_Integration_Host"),
+                ),
+                mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as execute,
+            ):
+                preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+                code = preflight_result.return_code
+                self.assertEqual(code, outcomes[-1])
+                self.assertEqual(execute.call_count, expected_calls)
+
+    def test_preflight_first_backend_fatal_is_not_replaced_by_peer_cancellation(self) -> None:
+        """Keep the observed fatal result when retirement adds a cancelled sibling."""
+        lanes = campaigns.PreflightExecutionLane
+        registrations = tuple(
+            campaigns.PreflightRegistration(
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane,
+                ctest_index=list(lanes).index(lane) + 2,
+            )
+            for lane in lanes
+        )
+        with (
+            mock.patch.object(
+                campaigns, "discover_production_parity_unit_tests",
+                return_value=("V2_Unit_Example",),
+            ),
+            mock.patch.object(
+                campaigns, "discover_production_test_preflight_registrations",
+                return_value=registrations,
+            ),
+            mock.patch.object(
+                campaigns, "preflight_accelerator_cpu_sets", return_value=("0-27", "28-55")
+            ),
+            mock.patch.object(
+                campaigns, "_run_preflight_parallel_processes",
+                return_value={lanes.ROCM_SOCKET: 7, lanes.CUDA_SOCKET: 130},
+            ),
+            mock.patch.object(campaigns, "_run_process", return_value=0) as execute,
+        ):
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+            code = preflight_result.return_code
+            self.assertEqual(code, 7)
+            self.assertEqual(execute.call_count, 3)  # Build, Unit, host; no EXCLUSIVE.
+
+    def test_preflight_parallel_test_failure_does_not_cancel_peer(self) -> None:
+        """A completed CTest8 lets the independently owned sibling finish."""
+        lanes = campaigns.PreflightExecutionLane
+        commands = {
+            lanes.CUDA_SOCKET: ["ctest", "cuda"],
+            lanes.ROCM_SOCKET: ["ctest", "rocm"],
+        }
+        first = mock.Mock()
+        first.poll.return_value = 8
+        second = mock.Mock()
+        second.poll.side_effect = [None, 0]
+        with (
+            mock.patch.object(campaigns.subprocess, "Popen", side_effect=[first, second]),
+            mock.patch.object(campaigns, "_terminate_process_group") as retire,
+            mock.patch.object(campaigns.time, "sleep"),
+        ):
+            result = campaigns._run_preflight_parallel_processes(commands, None)
+        self.assertEqual(result, {lanes.CUDA_SOCKET: 8, lanes.ROCM_SOCKET: 0})
+        retire.assert_not_called()
+
+    def test_preflight_parallel_launch_failure_retires_started_peer(self) -> None:
+        """Ownership exceptions stay fatal and close a partially launched pair."""
+        lanes = campaigns.PreflightExecutionLane
+        commands = {
+            lanes.CUDA_SOCKET: ["ctest", "cuda"],
+            lanes.ROCM_SOCKET: ["ctest", "rocm"],
+        }
+        first = mock.Mock()
+        first.poll.return_value = None
+        with (
+            mock.patch.object(
+                campaigns.subprocess, "Popen", side_effect=[first, OSError("authored launch failure")]
+            ),
+            mock.patch.object(campaigns, "_terminate_process_group") as retire,
+        ):
+            with self.assertRaisesRegex(OSError, "authored launch failure"):
+                campaigns._run_preflight_parallel_processes(commands, None)
+        retire.assert_called_once_with(first)
 
     def test_preflight_parallel_lanes_terminate_the_sibling_process_group_on_failure(self) -> None:
         """A red accelerator lane cannot leave its opposite MPI family running."""
@@ -541,18 +2154,22 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.PreflightRegistration(
                 "V2_Integration_Host", frozenset(("Integration",)), 1,
                 campaigns.PreflightExecutionLane.HOST,
+                ctest_index=2,
             ),
             campaigns.PreflightRegistration(
                 "V2_Integration_CUDA", frozenset(("Integration", "CUDA")), 1,
                 campaigns.PreflightExecutionLane.CUDA_SOCKET,
+                ctest_index=3,
             ),
             campaigns.PreflightRegistration(
                 "V2_Integration_ROCm", frozenset(("Integration", "ROCm")), 1,
                 campaigns.PreflightExecutionLane.ROCM_SOCKET,
+                ctest_index=4,
             ),
             campaigns.PreflightRegistration(
                 "V2_Integration_Mixed", frozenset(("Integration", "CUDA", "ROCm")), 1,
                 campaigns.PreflightExecutionLane.EXCLUSIVE,
+                ctest_index=5,
             ),
         ),
     )
@@ -571,14 +2188,16 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.PreflightExecutionLane.CUDA_SOCKET: 0,
             campaigns.PreflightExecutionLane.ROCM_SOCKET: 0,
         }
-        code, _, names = campaigns.run_production_test_preflight(Path("build"), 60.0)
+        preflight_result = campaigns.run_production_test_preflight(Path("build"), 60.0)
+        code = preflight_result.return_code
+        names = preflight_result.tests
         self.assertEqual(code, 0)
         self.assertEqual(names, (
             "V2_Unit_One", "V2_Integration_Host", "V2_Integration_CUDA",
             "V2_Integration_ROCm", "V2_Integration_Mixed",
         ))
-        self.assertEqual(discover_units.call_count, 2)
-        self.assertEqual(discover_registrations.call_count, 2)
+        self.assertEqual(discover_units.call_count, 1)
+        self.assertEqual(discover_registrations.call_count, 1)
         self.assertEqual(run_process.call_count, 4)  # build, Unit, host, mixed
         cpu_sets.assert_called_once_with()
         commands = parallel.call_args.args[0]
@@ -588,8 +2207,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         })
         self.assertEqual(commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][:3], ["taskset", "--cpu-list", "0-27,56-83"])
         self.assertEqual(commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][:3], ["taskset", "--cpu-list", "28-55,84-111"])
-        self.assertIn("V2_Integration_CUDA", commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][-1])
-        self.assertIn("V2_Integration_ROCm", commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][-1])
+        self.assertEqual(self.selected_names[commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][-1]], ("V2_Integration_CUDA",))
+        self.assertEqual(self.selected_names[commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][-1]], ("V2_Integration_ROCm",))
+        self.assertTrue(all(not Path(command[-1]).exists() for command in commands.values()))
 
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     @mock.patch.object(
@@ -608,9 +2228,11 @@ class ProductionParityCampaignTest(unittest.TestCase):
         discover: mock.Mock,
         run_process: mock.Mock,
     ) -> None:
-        return_code, _, tests = campaigns.run_production_test_preflight(
+        preflight_result = campaigns.run_production_test_preflight(
             Path("build"), 60.0
         )
+        return_code = preflight_result.return_code
+        tests = preflight_result.tests
 
         self.assertEqual(return_code, 0)
         self.assertEqual(
@@ -621,9 +2243,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ),
         )
         self.assertEqual(discover_units.call_args_list,
-                         [mock.call(Path("build"))] * 2)
+                         [mock.call(Path("build"))])
         self.assertEqual(discover.call_args_list,
-                         [mock.call(Path("build"))] * 2)
+                         [mock.call(Path("build"))])
         self.assertEqual(run_process.call_count, 3)
         build_command = run_process.call_args_list[0].args[0]
         unit_command = run_process.call_args_list[1].args[0]
@@ -633,33 +2255,96 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("--parallel", unit_command)
         self.assertIn("--no-tests=error", unit_command)
         self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
-        self.assertIn("-R", command)
-        self.assertRegex(command[command.index("-R") + 1], "ParityCellLifecycle_MPI1")
+        self.assertIn("-I", command)
+        self.assertEqual(self.selected_names[command[command.index("-I") + 1]], ("V2_Integration_ParityCellLifecycle_MPI1",))
+        self.assertFalse(Path(command[command.index("-I") + 1]).exists())
 
     def test_preflight_receipt_uses_registrations_after_build_regeneration(self) -> None:
-        """A build-triggered CMake refresh must not certify a stale inventory."""
+        """Only the successfully built, regenerated inventory enters the receipt."""
+        built = False
+        def execute(_command, _timeout):
+            nonlocal built
+            built = True
+            return 0
         with mock.patch.object(
             campaigns, "discover_production_parity_unit_tests",
-            side_effect=[("V2_Unit_Old",), ("V2_Unit_New", "V2_Unit_Added")],
+            side_effect=lambda _build: ("V2_Unit_New", "V2_Unit_Added") if built else ("V2_Unit_Old",),
         ), mock.patch.object(
             campaigns, "discover_production_test_preflight_registrations",
-            side_effect=[
-                preflight_registrations("V2_Integration_Old"),
-                preflight_registrations("V2_Integration_New"),
-            ],
-        ), mock.patch.object(campaigns, "_run_process", return_value=0):
-            return_code, _, tests = campaigns.run_production_test_preflight(
-                Path("build"), 60.0
-            )
+            side_effect=lambda _build: preflight_registrations(
+                "V2_Integration_New" if built else "V2_Integration_Old"),
+        ), mock.patch.object(campaigns, "_run_process", side_effect=execute):
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), 60.0)
+            return_code = preflight_result.return_code
+            tests = preflight_result.tests
         self.assertEqual(return_code, 0)
-        self.assertEqual(tests, (
-            "V2_Unit_New", "V2_Unit_Added", "V2_Integration_New",
-        ))
+        self.assertEqual(tests, ("V2_Unit_New", "V2_Unit_Added", "V2_Integration_New"))
+
+    def test_preflight_build_bootstraps_missing_ctest_command_without_weakening_discovery(self) -> None:
+        """An unbuilt CTest entry becomes mandatory runnable metadata after the build."""
+        for remains_missing in (False, True):
+            built = False
+            document = json.loads(preflight_ctest_document("V2_Integration_Bootstrap"))
+            def inventory(*_args, **_kwargs):
+                current = json.loads(json.dumps(document))
+                if not built or remains_missing:
+                    current["tests"][0].pop("command", None)
+                return subprocess.CompletedProcess([], 0, json.dumps(current), "")
+            def execute(command, _timeout):
+                nonlocal built
+                if command[0] == "cmake":
+                    built = True
+                return 0
+            with self.subTest(remains_missing=remains_missing), \
+                 mock.patch.object(campaigns.subprocess, "run", side_effect=inventory), \
+                 mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_Bootstrap",)), \
+                 mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+                 mock.patch.object(campaigns, "_run_process", side_effect=execute) as run:
+                if remains_missing:
+                    with self.assertRaisesRegex(RuntimeError, "has no command"):
+                        campaigns.run_production_test_preflight(Path("build"), None)
+                    self.assertEqual(run.call_count, 1)  # Build only; no unchecked CTest execution.
+                else:
+                    preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+                    code = preflight_result.return_code
+                    tests = preflight_result.tests
+                    self.assertEqual(code, 0)
+                    self.assertEqual(tests, ("V2_Unit_Bootstrap", "V2_Integration_Bootstrap"))
+                    self.assertEqual(run.call_args_list[0].args[0][0], "cmake")
+                    self.assertTrue(built)
+
+    def test_preflight_installed_receipt_is_authenticated_before_runnable_inventory(self) -> None:
+        """Installed images never build, and bad receipts cannot reach CTest discovery."""
+        image = mock.Mock()
+        events = []
+        image.validate.side_effect = lambda *_args: events.append("receipt")
+        def registrations(_build):
+            self.assertEqual(events, ["receipt"])
+            events.append("inventory")
+            return preflight_registrations("V2_Integration_Installed")
+        with mock.patch.dict(sys.modules, {"prebuilt_test_image": image}), \
+             mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_Installed",)), \
+             mock.patch.object(campaigns, "discover_production_test_preflight_registrations", side_effect=registrations) as discover, \
+             mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+             mock.patch.object(campaigns, "_run_process", return_value=0) as run:
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), None, Path("receipt.json"))
+            code = preflight_result.return_code
+            tests = preflight_result.tests
+            self.assertEqual(code, 0)
+            self.assertEqual(tests, ("V2_Unit_Installed", "V2_Integration_Installed"))
+            self.assertTrue(all(call.args[0][0] != "cmake" for call in run.call_args_list))
+            discover.reset_mock()
+            run.reset_mock()
+            image.validate.side_effect = RuntimeError("invalid installed receipt")
+            with self.assertRaisesRegex(RuntimeError, "invalid installed receipt"):
+                campaigns.run_production_test_preflight(Path("build"), None, Path("receipt.json"))
+            discover.assert_not_called()
+            run.assert_not_called()
 
     @mock.patch.object(
         campaigns,
-        "discover_production_test_preflight_tests",
-        return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
+        "discover_production_test_preflight_registrations",
+        return_value=preflight_registrations("V2_Integration_ParityCellLifecycle_MPI1"),
     )
     @mock.patch.object(
         campaigns,
@@ -696,6 +2381,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
                         "mode": "sequential_unseen_exact_cells",
                         "certification_eligible": False,
                         "preflight_return_code": 0,
+                        "preflight_qualification": campaigns.preflight_hardware_qualification(
+                            ("V2_Unit_PhysicalMemoryAuthority", "V2_Integration_ParityCellLifecycle_MPI1"), {}, None),
                         "preflight_test_count": 2,
                         "preflight_tests": [
                             "V2_Unit_PhysicalMemoryAuthority",
@@ -707,12 +2394,13 @@ class ProductionParityCampaignTest(unittest.TestCase):
             )
             os.utime(report, ns=(2_000_000_000, 2_000_000_000))
 
-            return_code, elapsed, tests = (
-                campaigns.reuse_unchanged_production_test_preflight(
+            preflight_result = campaigns.reuse_unchanged_production_test_preflight(
                     build,
                     report,
                 )
-            )
+            return_code = preflight_result.return_code
+            elapsed = preflight_result.elapsed_seconds
+            tests = preflight_result.tests
 
             self.assertEqual(return_code, 0)
             self.assertEqual(elapsed, 0.0)
@@ -731,6 +2419,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             generation = {
                 "schema": 1, "mode": "collect-controls", "certification_eligible": False,
                 "passed": False, "preflight_return_code": 0, "preflight_test_count": 2,
+                "preflight_qualification": campaigns.preflight_hardware_qualification(tests, {}, None),
                 "preflight_tests": list(tests), "preflight_build_directory": str(build.resolve()),
                 "preflight_completed_ns": 2_000_000_000,
             }
@@ -738,7 +2427,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 receipt = {**generation, "mode": mode}
                 report.write_text(json.dumps(receipt))
                 os.utime(report, ns=(4_000_000_000, 4_000_000_000))
-                self.assertEqual(campaigns.reuse_unchanged_production_test_preflight(build, report), (0, 0.0, tests))
+                self.assertEqual(campaigns.reuse_unchanged_production_test_preflight(build, report),
+                    campaigns.PreflightResult(0, 0.0, tests, receipt["preflight_qualification"]))
                 for mutation in ({"preflight_completed_ns": None}, {"preflight_completed_ns": 5_000_000_000},
                                  {"preflight_build_directory": str(root)}, {"preflight_test_count": 1},
                                  {"preflight_tests": list(reversed(tests))},
@@ -774,9 +2464,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 ), mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as run, mock.patch.object(
                     campaigns.time, "time_ns", return_value=123456789
                 ):
-                    code, elapsed, inventory = campaigns.run_production_test_preflight(
+                    preflight_result = campaigns.run_production_test_preflight(
                         directory, None, artifact_directory=directory / "gate"
                     )
+                    code = preflight_result.return_code
+                    elapsed = preflight_result.elapsed_seconds
+                    inventory = preflight_result.tests
                     report = json.loads((directory / "gate/prerequisites.json").read_text())
                     self.assertEqual(report["mode"], "model-free-prerequisites")
                     self.assertEqual(report["preflight_return_code"], outcomes[-1])
@@ -785,7 +2478,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     self.assertEqual(report["preflight_build_directory"], str(directory.resolve()))
                     self.assertEqual(report["preflight_elapsed_seconds"], elapsed)
                     self.assertEqual(report["preflight_tests"], list(inventory))
-                    self.assertEqual(report["preflight_test_count"], len(tests))
+                    # A failed build has admitted no runnable inventory yet.
+                    expected_tests = () if len(outcomes) == 1 else tests
+                    self.assertEqual(inventory, expected_tests)
+                    self.assertEqual(report["preflight_test_count"], len(expected_tests))
                     self.assertIs(report["certification_eligible"], False)
                     for command in run.call_args_list[1:]:
                         self.assertIn("--output-log", command.args[0])
@@ -805,71 +2501,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
     ) -> None:
         """Every compiled fixture family must use the typed matrix expander."""
 
-        parity_root = REPO_ROOT / "tests" / "v2" / "integration" / "parity"
-        cmake_root = REPO_ROOT / "tests" / "v2"
-        cmake = (cmake_root / "CMakeLists.txt").read_text(encoding="utf-8")
-        # Compilation boundaries are not configuration authorities. Follow the
-        # declared object-library links so a thin registration can use a shared
-        # typed expander without copying it into every implementation shard.
-        sources_by_target = {
-            target: {
-                (cmake_root / source).resolve()
-                for source in re.findall(r"(?<!\S)[\w./-]+\.cpp(?!\S)", body)
-            }
-            for target, body in re.findall(
-                r"add_(?:executable|library)\(\s*(\w+)\s+(.*?)\)",
-                cmake, re.DOTALL | re.IGNORECASE,
-            )
-        }
-        links_by_target: dict[str, set[str]] = {}
-        for target, body in re.findall(
-            r"target_link_libraries\(\s*(\w+)\s+(.*?)\)",
-            cmake, re.DOTALL | re.IGNORECASE,
-        ):
-            links_by_target.setdefault(target, set()).update(body.split())
-
-        def source_closure(target: str) -> set[Path]:
-            """Collect declared source ownership, visiting shared objects once."""
-            pending = [target]
-            seen: set[str] = set()
-            sources: set[Path] = set()
-            while pending:
-                current = pending.pop()
-                if current in seen:
-                    continue
-                seen.add(current)
-                sources.update(sources_by_target.get(current, set()))
-                pending.extend(links_by_target.get(current, set()) - seen)
-            return sources
-
-        contents_by_path: dict[Path, str] = {}
-        def contents_for(path: Path) -> str:
-            """Read each shared source once, without interpreting model files."""
-            if path not in contents_by_path:
-                contents_by_path[path] = path.read_text(encoding="utf-8")
-            return contents_by_path[path]
-
-        contracts_by_target = {
-            target: "\n".join(contents_for(path) for path in source_closure(target))
-            for target in sources_by_target
-            if any(parity_root in path.parents for path in sources_by_target[target])
-        }
-        offenders: list[str] = []
-        for source in sorted(parity_root.rglob("*.cpp")):
-            contents = contents_for(source)
-            if "ProductionParity" not in contents:
-                continue
-            contracts = [
-                contracts_by_target[target]
-                for target, sources in sources_by_target.items()
-                if source.resolve() in sources
-            ]
-            if not any(
-                "ModelParityDefinition" in contract and
-                "expandModelParityDefinition" in contract
-                for contract in contracts
-            ):
-                offenders.append(str(source.relative_to(REPO_ROOT)))
+        offenders = production_parity_sources_without_typed_expansion(REPO_ROOT)
 
         self.assertEqual(
             offenders,
@@ -1868,6 +3500,58 @@ time.sleep(30)
         self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) + 2)
         self.assertEqual(errors, ())
 
+    def test_dynamic_acceptance_requires_authenticated_complete_continuation(self) -> None:
+        header = campaigns.MTP_ACCEPTANCE_WITNESS_HEADER.split(",")
+        row = "2,71093,12305,15,15,1,2,71093;12305;198;464,71093;12305;198;464,2,true,15,true,true".split(",")
+        rows = [header, row]
+        self.assertIsNone(campaigns.validate_mtp_acceptance_witness(rows))
+        self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness([header]))
+        self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness(rows + [row]))
+        for field, value in (
+            ("reference_step", "-1"), ("condition_token", "271"),
+            ("authenticated_first_draft", "760"), ("admitted_depth", "1"),
+            ("attempted_drafts", "14"), ("accepted_drafts", "0"),
+            ("accepted_drafts", "16"), ("verifier_transactions", "0"),
+            ("emitted_tokens", "71093"), ("serial_tokens", "71093;760;198;464"),
+            ("continuation_tokens", "1"), ("state_byte_exact", "false"),
+            ("accepted_drafts", "nan"), ("observed_depth", "1"),
+            ("prefix_restored", "false"), ("adaptive_enabled", "false"),
+        ):
+            mutated = [list(values) for values in rows]
+            mutated[1][header.index(field)] = value
+            with self.subTest(field=field, value=value):
+                self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness(mutated))
+        dynamic_headers = campaigns._required_csv_headers_for_case(
+            "Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDynamicDepth")
+        fixed_headers = campaigns._required_csv_headers_for_case(
+            "Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDepth15")
+        self.assertEqual(dynamic_headers["mtp_acceptance_witness.csv"],
+                         campaigns.MTP_ACCEPTANCE_WITNESS_HEADER)
+        self.assertNotIn("mtp_acceptance_witness.csv", fixed_headers)
+        self.assertIn("mtp_acceptance_witness.csv", campaigns.CSV_ARTIFACTS_REQUIRING_DATA)
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=("Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDynamicDepth",),
+        )
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            result_directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_canonical_artifacts(result_directory)
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertTrue(any("missing mtp_acceptance_witness.csv" in error for error in errors))
+            path = result_directory / "mtp_acceptance_witness.csv"
+            path.write_text(campaigns.MTP_ACCEPTANCE_WITNESS_HEADER + "\n" + ",".join(row) + "\n")
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertFalse(any("mtp_acceptance_witness.csv" in error for error in errors))
+            row[header.index("state_byte_exact")] = "false"
+            path.write_text(campaigns.MTP_ACCEPTANCE_WITNESS_HEADER + "\n" + ",".join(row) + "\n")
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertTrue(any("mtp_acceptance_witness.csv" in error for error in errors))
+
     def test_native_verifier_artifacts_reject_close_or_incomplete_evidence(self) -> None:
         header = campaigns.NATIVE_VERIFIER_ROWS_HEADER.split(",")
         rows = [header] + [
@@ -2320,6 +4004,7 @@ time.sleep(30)
             executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
+                f"printf '%s' \"${{OMPI_MCA_btl_vader_single_copy_mechanism-__native__}}\" > '{directory / 'mpi-selection.txt'}'\n"
                 "cat <<'EOF'\n"
                 "MatrixSuite.\n"
                 '  ProductionParity/CPU_KV_FP16  # GetParam() = {"argv":["truncated...\n'
@@ -2340,11 +4025,14 @@ time.sleep(30)
                 backend_model.write_bytes(backend_model.name.encode("utf-8"))
             generated = directory / "discovered.cmake"
 
+            inherited = dict(os.environ)
+            inherited.pop("OMPI_MCA_btl_vader_single_copy_mechanism", None)
             completed = subprocess.run(
                 [
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_Fake",
                     "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;NCCL;RCCL",
                     "-DMPI_PROCS=1",
@@ -2359,6 +4047,7 @@ time.sleep(30)
                     "-P",
                     str(discovery),
                 ],
+                env=inherited,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -2369,6 +4058,14 @@ time.sleep(30)
                 msg=completed.stderr or completed.stdout,
             )
             registration = generated.read_text(encoding="utf-8")
+            self.assertNotIn("btl_vader_single_copy_mechanism", registration)
+            self.assertEqual((directory/'mpi-selection.txt').read_text(), '__native__')
+            explicit = subprocess.run(completed.args, env={**inherited,
+                "OMPI_MCA_btl_vader_single_copy_mechanism": "cma"},
+                check=False, capture_output=True, text=True)
+            self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+            self.assertEqual((directory/'mpi-selection.txt').read_text(), 'cma')
+            self.assertNotIn("btl_vader_single_copy_mechanism", generated.read_text())
 
             # The same production inventory must not be published under a
             # cell-shaped or legacy binary identity. Exercise real discovery,
@@ -2463,7 +4160,8 @@ time.sleep(30)
         self.assertNotIn("LLAMINAR_SKIP_ROCM_STARTUP=1", hybrid_campaign)
         self.assertIn("NCCL", hybrid_campaign)
         self.assertIn("RCCL", hybrid_campaign)
-        self.assertIn("HSA_OVERRIDE_GFX_VERSION=9.0.6", hybrid_campaign)
+        self.assertNotIn("HSA_OVERRIDE_GFX_VERSION=9.0.6", hybrid_campaign)
+        self.assertIn('ENVIRONMENT_MODIFICATION "HSA_OVERRIDE_GFX_VERSION=unset:"', hybrid_campaign)
         self.assertIn(
             f'TIMEOUT "{campaigns.REGISTERED_TIMEOUT_SECONDS:g}"',
             registration,
@@ -2483,7 +4181,7 @@ time.sleep(30)
                     binary.write_text("#!/bin/sh\n" + script + "\n")
                     binary.chmod(0o755)
                     result = subprocess.run(["cmake", f"-DTEST_EXECUTABLE={binary}",
-                        f"-DCTEST_FILE={output}", "-P", str(discovery)],
+                        f"-DCTEST_FILE={output}", *discovery_session_arguments(root), "-P", str(discovery)],
                         capture_output=True, text=True, check=False)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(output.exists())
@@ -2515,6 +4213,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FakeNodeTP",
                     "-DLABELS=V2;Integration;Parity;CPU;MPI",
                     "-DMPI_PROCS=2",
@@ -2585,6 +4284,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FocusedMPI",
                     "-DLABELS=V2;Integration;Parity;CPU;ROCm;MPI",
                     "-DMPI_PROCS=1",
@@ -2656,6 +4356,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FakePolicy",
                     "-DLABELS=V2;Integration;Parity;CPU;Static;Dynamic;LLEP",
                     "-DMPI_PROCS=1",
@@ -2740,6 +4441,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FakeOverlay",
                     "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;MPI",
                     "-DMPI_PROCS=2",
@@ -3504,6 +5206,44 @@ class ModelStagingCapacityTests(unittest.TestCase):
         self.assertEqual((self.models / self.sources[0].name).read_bytes(), b"O" * (16 * self.page))
         self.assertEqual(list(self.models.glob(".*.copying-*")), [])
 
+
+
+class CPUJointMovementArtifactTests(unittest.TestCase):
+    """Source-owned obligations and registered MPI width drive the shared audit without name parsing."""
+    def test_complete_original_rank_documents_and_freshness_are_required(self):
+        from test_generation_movement_ledger import CohortPublicationInferenceTests, topology
+        for width in (2,4,8):
+            journal,records=CohortPublicationInferenceTests.evidence(width)
+            case="OriginalTypedSuite.ProductionParity/Original"
+            cell=campaigns.CampaignCell("V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",campaigns.CampaignGroup("CPU","ALL"),
+                gtest_cases=(case,),command=("mpirun","-np",str(width),"--","original_matrix"))
+            typed={case:dict(model_parity_schema=1,runtime=dict(movement_evidence="required",cohort_publication_inference=True))}
+            bound=campaigns.bind_canonical_movement_obligations([cell],typed)[0]
+            self.assertEqual(bound.cohort_movement_cases,(case,))
+            population=campaigns._preflight_mpi_ranks(bound.name,list(bound.command));self.assertEqual(population,width)
+            with tempfile.TemporaryDirectory() as raw:
+                directory=Path(raw)
+                for rank in range(width):
+                    document=CohortPublicationInferenceTests.documents(journal,records,case=case,width=width)[rank]
+                    (directory/f"cohort_movement_rank_{rank}.json").write_text(json.dumps(document),encoding="utf-8")
+                campaigns.validate_cpu_joint_movement_artifacts(directory,case,0,world_size=population)
+                with self.assertRaises(ValueError): campaigns.validate_cpu_joint_movement_artifacts(directory,case+"foreign",0,world_size=population)
+                stale=directory/f"cohort_movement_rank_{width-1}.json";os.utime(stale,ns=(0,0))
+                with self.assertRaises(ValueError): campaigns.validate_cpu_joint_movement_artifacts(directory,case,1,world_size=population)
+                stale.unlink()
+                with self.assertRaises(ValueError): campaigns.validate_cpu_joint_movement_artifacts(directory,case,0,world_size=population)
+
+    def test_canonical_typed_obligation_cannot_omit_shared_movement_audit(self):
+        case="ArbitraryOriginalSuite.ProductionParity/Original"
+        cell=campaigns.CampaignCell("V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",campaigns.CampaignGroup("CPU","ALL"),
+            gtest_cases=(case,),command=("mpirun","-np","4","--","original_matrix"))
+        typed={case:dict(model_parity_schema=1,runtime=dict(movement_evidence="required",cohort_publication_inference=True))}
+        cell=campaigns.bind_canonical_movement_obligations([cell],typed)[0]
+        with tempfile.TemporaryDirectory() as raw:
+            _,_,errors=campaigns.validate_campaign_artifacts(cell,0,revision_results_root=Path(raw))
+            self.assertTrue(any("Dynamic cohort movement proof" in error for error in errors),errors)
+        for invalid in ({}, {case:dict(model_parity_schema=1,runtime=dict(cohort_publication_inference=False))}):
+            with self.assertRaises(ValueError):campaigns.bind_canonical_movement_obligations([cell],invalid)
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,9 @@
  * state, hardware discovery or performance ranking.
  */
 #pragma once
+#include "planning/PlanningNativeContextEvidence.h"
 #include "planning/AutomaticOrchestrationCandidates.h"
+#include "planning/PlanningHostServiceEvidence.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/MemoryPlanner.h"
@@ -19,6 +21,7 @@
 
 namespace llaminar2
 {
+    class PlanningAdmissionPreparation;
     /** @brief Borrowed expert evidence for one exact global layer of an admitted candidate. */
     struct AdmittedMoELayerView
     {
@@ -33,6 +36,13 @@ namespace llaminar2
         int minimum_prefill_sequence_rows = 0;
         int maximum_cached_prefill_buckets = 0;
         GPUWeightLoadMemoryPolicy weight_load;
+        /** Same immutable event-program source through actual lowering; production selects installed rows. */
+        NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+        /** Original discovery-rank classes; candidate membership alone renumbers consumers. */
+        PlanningHostServiceBudgets retained_host_services;
+        /** Original-rank keys; production startup requires complete selected GPU coverage. */
+        PlanningNativeContextBudgets native_context_budgets;
+        bool require_native_context_budgets=false;
 
         /** @return The production startup policy; no workload or memory estimate is invented. */
         static OrchestrationCandidateMemoryPolicy fromStartup();
@@ -54,6 +64,7 @@ namespace llaminar2
          * @param candidate Declarative proposal, consumed without altering its source request.
          * @param model One retained metadata-only GGUF owner for the entire search.
          * @param policy Exact captured-prefill and initial-upload policies.
+         * @param preparation Original per-search pure source compiler; null creates one local call-scoped owner.
          * @return Complete configuration, per-rank geometry and shared physical certificate.
          * @throws PhysicalMemoryCapacityExhausted when no allowed graph shape fits.
          * @throws std::invalid_argument for malformed topology/model/capture policy.
@@ -63,7 +74,8 @@ namespace llaminar2
         static AdmittedOrchestrationCandidate admit(
             AutomaticOrchestrationCandidate candidate,
             const PlanningModelSource &model,
-            const OrchestrationCandidateMemoryPolicy &policy);
+            const OrchestrationCandidateMemoryPolicy &policy,
+            PlanningAdmissionPreparation *preparation = nullptr);
 
         /** @return Original strategy family, independently of its lowered graph form. */
         OrchestrationStrategy strategy() const noexcept { return candidate_.strategy; }

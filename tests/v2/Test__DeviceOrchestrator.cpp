@@ -5,6 +5,7 @@
  * @date 2025-10-24
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include "loaders/DeviceOrchestrator.h"
 #include "loaders/ModelContext.h"
@@ -251,6 +252,9 @@ TEST_F(Test__DeviceOrchestrator, VerboseLogging)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     ::testing::InitGoogleTest(&argc, argv);
 
     // Initialize MPI for tests

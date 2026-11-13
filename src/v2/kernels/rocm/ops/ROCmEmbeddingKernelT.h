@@ -12,8 +12,7 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
-#include <mutex>
-#include <unordered_map>
+#include "ROCmEmbeddingExecutionBinding.h"
 #include <stdexcept>
 
 namespace llaminar2
@@ -38,29 +37,32 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Construct with optional default device index
-         * @param device_idx Default HIP device index (-1 for current device)
+         * @brief Construct for one explicit immutable device owner
+         * @param device_idx Exact nonnegative HIP device ordinal
          */
-        explicit ROCmEmbeddingKernelT(int device_idx = -1) : device_idx_(device_idx) {}
+        explicit ROCmEmbeddingKernelT(int device_idx) : binding_(device_idx) {}
 
         /**
          * @brief Construct with device context (Phase 4 pattern)
          * @param ctx Device context for shared handles/streams
          */
         explicit ROCmEmbeddingKernelT(IWorkerGPUContext *ctx)
+            : ROCmEmbeddingKernelT(requireContextOwner(ctx))
         {
-            if (!ctx)
-                throw std::runtime_error("ROCmEmbeddingKernelT: Device context is null");
-            if (!ctx->isInitialized())
-                throw std::runtime_error("ROCmEmbeddingKernelT: Device context not initialized");
             device_ctx_ = ctx;
-            device_idx_ = ctx->deviceOrdinal();
         }
 
         ~ROCmEmbeddingKernelT() override;
 
         // ===== Device Context Support (Phase 4) =====
-        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+        /** @brief Bind only an initialized context for this immutable participant.
+         * @param ctx Borrowed initialized context whose device matches this instance.
+         * @throws std::invalid_argument Before replacing a valid context on mismatch. */
+        void setDeviceContext(IWorkerGPUContext *ctx)
+        {
+            (void)binding_.resolveOrdinal(requireContextOwner(ctx));
+            device_ctx_ = ctx;
+        }
         IWorkerGPUContext *deviceContext() const { return device_ctx_; }
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
         void *getStream() const;
@@ -68,10 +70,15 @@ namespace llaminar2
         // ITensorKernel interface
         bool supports_device(int device_idx) const override
         {
-            return device_idx >= 0; // ROCm supports any valid device index
+            return device_idx == binding_.ordinal();
         }
 
+        /** @brief Authenticate the stream's native owner before replacing its borrowed binding.
+         * @param stream Explicit non-null native producer stream owned by this participant.
+         * @throws std::runtime_error On failed native ownership observation.
+         * @throws std::invalid_argument For a stream belonging to another participant. */
         void bindGPUStream(ExplicitGPUStream stream) override;
+        /** @brief Withdraw only the borrowed stream; retain the immutable participant. */
         void clearGPUStreamBinding() override;
         void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
         {
@@ -202,18 +209,16 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override;
 
     private:
-        int device_idx_;
+        /** @brief Authenticate the context before deriving the immutable participant ordinal. */
+        static int requireContextOwner(IWorkerGPUContext *ctx)
+        {
+            if (!ctx || !ctx->isInitialized() || ctx->deviceOrdinal() < 0)
+                throw std::invalid_argument("ROCm embedding requires an initialized explicit device context");
+            return ctx->deviceOrdinal();
+        }
+        ROCmEmbeddingExecutionBinding<DeviceWorkspaceManager> binding_;
         IWorkerGPUContext *device_ctx_ = nullptr;
-        void *gpu_stream_ = nullptr;
         const PreparedEmbeddingHandle *prepared_embedding_handle_ = nullptr;
-
-        mutable std::mutex stream_mutex_;
-        std::unordered_map<int, void *> stream_by_device_;
-
-        // IWorkspaceConsumer state
-        DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
-        mutable std::mutex workspace_mutex_;
-        std::unordered_map<int, DeviceWorkspaceManager *> workspace_by_device_;
 
         int *h_token_ids_ = nullptr;
         int max_token_ids_ = 0;

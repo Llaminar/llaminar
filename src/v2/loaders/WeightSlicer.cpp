@@ -27,7 +27,7 @@ namespace llaminar2
 
     WeightSlicer::WeightSlicer(const ModelDimensions &dimensions,
                                const WeightShardingConfig &sharding_config,
-                               std::shared_ptr<TensorParallelConfig> tp_config)
+                               std::shared_ptr<const TensorParallelConfig> tp_config)
         : dimensions_(dimensions),
           sharding_config_(sharding_config),
           tp_config_(std::move(tp_config))

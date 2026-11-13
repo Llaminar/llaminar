@@ -17,11 +17,14 @@
 
 #pragma once
 
+#include "kernels/CPUSharedGDNSnapshots.h"
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,9 +39,22 @@
 #include "../../utils/MPITopology.h"
 #include "../../memory/StageBufferContract.h"
 #include "../../snapshots/SnapshotRowPartition.h"
+#include "../../snapshots/SnapshotSemanticExtent.h"
 
 namespace llaminar2
 {
+    /** @brief Validate addressed device metadata against its actual borrowed allocation extent.
+     * @param owner Existing owner-backed device-address span, never host-loaded here.
+     * @param requests Positive request count.
+     * @param stride Positive int32 element stride between request selections.
+     * @return Whether every addressed value is inside the admitted owner view. */
+    inline bool deviceVerifierStateMetadataCovers(std::span<const int> owner,
+        int requests, int stride) noexcept
+    {
+        return owner.data() && requests > 0 && stride > 0 && !owner.empty() &&
+            std::size_t(requests - 1) <= (owner.size() - 1) / std::size_t(stride);
+    }
+
 
     // Forward declarations
     namespace verification
@@ -126,6 +142,10 @@ namespace llaminar2
         {
             return rows * cols * sizeof(int8_t);
         }
+        else if (std::strcmp(dtype, "INT64") == 0)
+        {
+            return rows * cols * sizeof(int64_t);
+        }
         else if (std::strcmp(dtype, "INT32") == 0)
         {
             return rows * cols * sizeof(int32_t);
@@ -155,6 +175,8 @@ namespace llaminar2
             size_t element_size = sizeof(float);
             size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
             ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
+            size_t tensor_byte_offset = 0; ///< Exact admitted byte subview within tensor storage.
+            SnapshotSemanticExtent semantic_extent; ///< Exact authored input intervals; capacity is not read extent.
         };
 
         // Output buffers (written during execute)
@@ -169,6 +191,11 @@ namespace llaminar2
             size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
             ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
             SnapshotRowLayout row_layout; ///< Explicit compact/observed row ownership, diagnostics only.
+            size_t tensor_byte_offset = 0; ///< Exact admitted byte subview retained after diagnostic publication.
+            SnapshotSemanticExtent semantic_extent; ///< Explicit authored axis; never infer cache geometry from token-shaped capacity.
+            const SnapshotObservedHeader *observed_header=nullptr; ///< Acquired diagnostic metadata, never a live device pointer.
+            std::span<const std::uint64_t> observed_row_offsets; ///< Acquired native selection counts encoded as exclusive offsets.
+            std::span<const SnapshotAuthoredTokenRowRecord> observed_authored_rows; ///< Acquired original request intervals, never live pointers.
         };
 
         // Weight/parameter buffers (read-only during execute)
@@ -387,6 +414,27 @@ namespace llaminar2
         FUSED_RESIDUAL_NORM,
         FUSED_ADD_ALLREDUCE, ///< Fused residual-add + allreduce (MoE output combine + TP reduce)
 
+        // Qwen4Exp participant-local GR/PLE arithmetic and explicit history publication.
+        QWEN4EXP_BRANCH_RMS_NORM,
+        QWEN4EXP_RESIDUAL_EXPAND,
+        QWEN4EXP_RESIDUAL_DOWN,
+        QWEN4EXP_RESIDUAL_READ,
+        QWEN4EXP_RESIDUAL_WRITE,
+        QWEN4EXP_NGRAM_HASH,
+        QWEN4EXP_PLE_GATE,
+        QWEN4EXP_PLE_CONV,
+        QWEN4EXP_COMMIT_CONV_HISTORY,
+        QWEN4EXP_COMMIT_TOKEN_HISTORY,
+        QWEN4EXP_QSA_INDEXER,
+        QWEN4EXP_QSA_ATTENTION,
+        QWEN4EXP_QSA_COMMIT_PARTIAL,
+        QWEN4EXP_QSA_RETAIN_CANDIDATES,
+        QWEN4EXP_QSA_SNAPSHOT_PRIOR,
+        QWEN4EXP_NGRAM_LOOKUP,
+        QWEN4EXP_POOLED_NATIVE_PHASE, ///< Participant-local pooled metadata/copy operation with explicit boundaries.
+        QWEN4EXP_POOLED_SOURCE_PHASE, ///< Actual provider request/acquire/private-copy/original-order consumer.
+        QWEN4EXP_QSA_PREPARE_REPLAY,
+
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output
         GATED_RMS_NORM,        ///< RMSNorm with learned multiplicative gate
@@ -453,6 +501,11 @@ namespace llaminar2
         MOE_PROJECTION_PHASE,
         /** Explicit same-rank byte exchange with GPU-authored live extents. */
         DEVICE_COUNTED_ALLGATHER,
+        QWEN4EXP_PLE_SNAPSHOT_PRIOR, ///< Ordered immutable transaction prestate capture.
+        QWEN4EXP_PLE_RETAIN_CANDIDATES, ///< Live retention and accepted-prefix publication.
+        QWEN4EXP_BRANCH_CONCAT, ///< Token-owned Dense0 four-branch concatenation.
+        MTP_DIRECT_TOKEN_HISTORY_PUBLICATION, ///< Append-only diagnostic identity for direct history commit.
+        QWEN4EXP_POOLED_DIRECTED_TRANSFER, ///< Exact participant-local endpoint of an explicit original pooled protocol edge.
     };
 
     /**
@@ -477,6 +530,11 @@ namespace llaminar2
         case ComputeStageType::ALLGATHER:
         case ComputeStageType::NATIVE_ALLGATHER:
         case ComputeStageType::DEVICE_COUNTED_ALLGATHER:
+        case ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_PACK:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_CONSUME:
         case ComputeStageType::NATIVE_REDUCE_SCATTER:
         case ComputeStageType::ALLGATHER_V:
         case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
@@ -624,6 +682,13 @@ namespace llaminar2
      * Derived classes implement device-specific kernels while maintaining
      * a common interface for orchestration.
      */
+    /** @brief Which existing authority owns capture of a stage's collective operation.
+     * A participant-local captured transfer still is a collective. Its immutable
+     * native binding and device-counted kernels do not depend on NCCL/RCCL/CPU
+     * collective-runtime graph support. Neither arm overrides stage readiness.
+     */
+    enum class CollectiveGraphCaptureAuthority : uint8_t { RuntimeBackend, ParticipantLocalCapturedTransfer };
+
     /**
      * @brief Declares when a stage needs work outside its captured graph body.
      *
@@ -640,6 +705,7 @@ namespace llaminar2
         None,
         CaptureOnly,
         CaptureAndReplay,
+        HostEntry, ///< CPU-only idempotent metadata preparation before input validation/execution.
     };
 
     /**
@@ -745,14 +811,33 @@ namespace llaminar2
         Invalid,
     };
 
+    /** @brief Exact publication work, selected explicitly rather than inferred from missing snapshot bytes. */
+    enum class CPUVerifierStateRestorePlanKind : uint8_t
+    {
+        SnapshotCopy,
+        SharedGDNPrefixScatter,
+        NativeAcceptedPrefixCommit,
+    };
+
+    /** @brief One live interval written by a validated native accepted-prefix publication. */
+    struct CPUVerifierStateRestoreDestination
+    {
+        void *data = nullptr;
+        size_t bytes = 0;
+    };
+
     /**
-     * @brief Immutable byte-copy plan for one CPU-owned verifier-state stage.
+     * @brief Immutable snapshot-copy or native-prefix plan for one CPU state stage.
      *
-     * `source` points at the selected post-verifier snapshot and `destination`
-     * points at that stage's live CPU state. Both allocations remain owned by
-     * the stage/workspace that produced the plan and must stay valid until the
-     * enclosing publication transaction finishes. Publication copies these
-     * bytes verbatim; it never replays recurrence math.
+     * SnapshotCopy exposes an already-computed source and live destination.
+     * SharedGDNPrefixScatter names immutable compact checkpoints/history and a
+     * typed accepted prefix; bytes is the complete canonical live-bank extent.
+     * NativeAcceptedPrefixCommit exposes exact stage-owned write intervals;
+     * its stage validates candidate indices before returning Ready. All sources,
+     * intervals and owners remain stable until publication completes. The
+     * publisher validates every plan and source/live span before any mutation,
+     * then copies/zeros canonical bytes or performs the declared native splice.
+     * Publication never stages another full bank or replays recurrence arithmetic.
      */
     struct CPUVerifierStateRestorePlan
     {
@@ -761,12 +846,28 @@ namespace llaminar2
         void *destination = nullptr;
         const void *source = nullptr;
         size_t bytes = 0;
+        CPUVerifierStateRestorePlanKind kind = CPUVerifierStateRestorePlanKind::SnapshotCopy;
+        /** Exact writes of a native prefix splice, retained by the stage until publication completes.
+         * Empty is valid when an accepted QSA prefix ends on a complete four-token block.
+         * Planning validates candidate indices before returning Ready and never mutates live state.
+         */
+        std::span<const CPUVerifierStateRestoreDestination> native_destinations{};
+        /** @brief Immutable compact source, present only for SharedGDNPrefixScatter. */
+        std::optional<CPUSharedGDNAcceptedPrefix> shared_gdn_prefix;
 
-        /** @brief Return true when this plan describes a concrete byte copy. */
+        /** @brief Reject inconsistent kind/payload combinations before publication. */
         [[nodiscard]] bool ready() const noexcept
         {
             return status == CPUVerifierStateRestorePlanStatus::Ready &&
-                   destination != nullptr && source != nullptr && bytes > 0;
+                   ((kind == CPUVerifierStateRestorePlanKind::SnapshotCopy &&
+                     destination != nullptr && source != nullptr && bytes > 0 &&
+                     !shared_gdn_prefix && native_destinations.empty()) ||
+                    (kind == CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter &&
+                     destination != nullptr && source != nullptr && bytes > 0 &&
+                     shared_gdn_prefix.has_value() && native_destinations.empty()) ||
+                    (kind == CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit &&
+                     destination == nullptr && source == nullptr && bytes == 0 &&
+                     !shared_gdn_prefix));
         }
     };
 
@@ -1138,6 +1239,25 @@ namespace llaminar2
          */
         virtual bool isPassiveGraphCaptureNoOp() const { return false; }
 
+        /** @return Immutable source-declared collective capture authority; ordinary collectives retain the runtime-backend contract. */
+        virtual CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept {return CollectiveGraphCaptureAuthority::RuntimeBackend;}
+        /** @return Whether this actual stage is a participant-local native captured endpoint.
+         * @throws std::logic_error For an invalid authority or a non-collective claiming transport authority.
+         */
+        bool isParticipantLocalCapturedTransfer() const {
+            switch(collectiveGraphCaptureAuthority()){
+            case CollectiveGraphCaptureAuthority::RuntimeBackend:return false;
+            case CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer:
+                if(!isCollectiveStage() || !device().is_gpu())throw std::logic_error("Captured transport authority requires an actual participant-local GPU collective stage");
+                return true;
+            }
+            throw std::logic_error("Unknown collective graph capture authority");
+        }
+        /** @return Shared capture-dependency rule for actual stages and existing named collective declarations. */
+        bool requiresCollectiveRuntimeCapture(bool named_collective=false)const {
+            return (isCollectiveStage() || named_collective) && !isParticipantLocalCapturedTransfer();
+        }
+
         /**
          * @brief Variant signature for graph-captured launch topology.
          *
@@ -1313,8 +1433,10 @@ namespace llaminar2
          * @brief Restore one host-selected verifier row per CPU request.
          *
          * `host_row_indices[request]` contains a flat verifier snapshot row;
-         * negative values leave that request's live state unchanged.  Native
-         * CPU grouped stages must restore the complete vector in one call so
+         * negative values select that request's original pre-transaction state.
+         * Legacy snapshot NoOp preserves it; immutable-prior stages may restore
+         * original bytes after an earlier publication. Native CPU grouped stages
+         * must restore the complete vector in one call so
          * scalar publication cannot overwrite one shared layer state or clear
          * capture bindings between requests.
          */
@@ -1333,14 +1455,21 @@ namespace llaminar2
          * @brief Plan a byte-exact single-request CPU state publication.
          *
          * The method validates @p row and exposes the already-computed snapshot
-         * span without mutating live state. The MTP publisher first gathers and
-         * validates plans from every captured stage, then copies all `Ready`
-         * spans in one persistent OpenMP region. This two-phase contract makes
+         * span, or an explicitly typed native accepted-prefix commit with exact
+         * live destination intervals, without mutating live state. The MTP
+         * publisher validates every plan and destination before writing any
+         * bytes, copies snapshot spans in one persistent OpenMP region, then
+         * invokes validated native prefix commits through the existing row hook.
+         * Native commits splice retained candidates and immutable prior history;
+         * they must never replay the model graph or recurrence arithmetic. This two-phase contract makes
          * malformed publication atomic and removes serial per-layer memory
          * bandwidth from the decode hot path.
          *
-         * A negative row is a valid `NoOp`: that request accepted no verifier
-         * row and retains its pre-transaction live state. GPU stages and CPU
+         * A negative row accepts no verifier row. Legacy snapshot stages may
+         * return NoOp; immutable-prior stages return Ready NativeAcceptedPrefixCommit
+         * when original prior bytes must be restored after a revised publication.
+         * Exact empty native write spans are valid for a live prefix ending on a
+         * complete pool or an empty request. GPU stages and CPU
          * stages without native snapshot spans return `Unsupported`; a required
          * captured CPU stage returning that status is a fatal publication
          * contract violation, not permission to call a slower path.
@@ -1355,19 +1484,48 @@ namespace llaminar2
         }
 
         /**
+         * @brief Exact arena reads performed by accepted-state restore hooks.
+         * @return Preallocated READ bindings consumed on the publication stream.
+         * The containing publication stage forwards these to its ordinary input
+         * frontier so TransferEngine joins original producer events before capture.
+         * These are publication inputs, not the verifier's ordinary inputs.
+         */
+        virtual std::span<const BufferBinding> verifierStatePublicationInputs() const noexcept
+        {
+            return {};
+        }
+
+        /**
+         * @brief Exact arena tensor writes performed by accepted-state restore hooks.
+         * @return Immutable preallocated WRITE bindings owned by this stage.
+         *
+         * A containing publication stage must declare these writes under its
+         * own capture ledger. Raw backend-owned cache/state bytes have no arena
+         * tensor publication and retain the empty default. This is not the
+         * verifier's ordinary output contract: candidate scratch is not accepted
+         * state and must never be granted publication authority here.
+         */
+        virtual std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept
+        {
+            return {};
+        }
+
+        /**
          * @brief Restore mutable model state captured after a verifier row chosen on device.
          *
          * Device-resident stochastic MTP publication receives accepted-count
          * metadata in GPU memory.  Stages that implement this method must read
-         * @p device_row_index on @p stream and restore the corresponding
+         * the owner-backed device row-index view on @p stream and restore the corresponding
          * captured row without synchronizing that index or mutable stage state
          * to the host. This is the device-owned hot path used by resident MTP
          * publication; host mirror refresh must be a separate explicit action.
          */
         virtual bool restoreVerifierStateCaptureRowFromDeviceIndex(
-            const int *device_row_index,
+            std::span<const int> device_row_index_view,
             void *stream)
         {
+            if (!deviceVerifierStateMetadataCovers(device_row_index_view, 1, 1)) return false;
+            const int *device_row_index = device_row_index_view.data();
             (void)device_row_index;
             (void)stream;
             return false;
@@ -1378,7 +1536,7 @@ namespace llaminar2
          *
          * Batched device-resident MTP publication receives a device array of
          * accepted verifier rows. Implementations that override this method
-         * must read `device_row_indices[request * row_index_stride]` on
+         * must read `device_row_indices_view[request * row_index_stride]` on
          * @p stream and restore that request's mutable model state into a
          * request-owned live-state slot. A negative row index means that
          * request accepted no verifier row and its live state must be left at
@@ -1392,11 +1550,13 @@ namespace llaminar2
          * are request-aware.
          */
         virtual bool restoreVerifierStateCaptureRowsFromDeviceIndices(
-            const int *device_row_indices,
+            std::span<const int> device_row_indices_view,
             int request_count,
             int row_index_stride,
             void *stream)
         {
+            if (!deviceVerifierStateMetadataCovers(device_row_indices_view, request_count, row_index_stride)) return false;
+            const int *device_row_indices = device_row_indices_view.data();
             (void)device_row_indices;
             (void)request_count;
             (void)row_index_stride;
@@ -1626,6 +1786,29 @@ namespace llaminar2
         [[nodiscard]] StageGPUExecution gpuExecution() const
         {
             return StageGPUExecution(device_id_, requireGPUStream());
+        }
+
+        /**
+         * @brief Bind the explicit verifier-publication invocation without changing ordinary capture configuration.
+         *
+         * Existing retained-state hooks receive their canonical producer stream
+         * from the publication stage. It may differ from this stage's earlier
+         * verifier recording stream. The immutable token carries that exact
+         * invocation stream and this stage's declared device; no binding, graph
+         * identity or execution state is mutated, so independent recording calls
+         * cannot race through temporary stream replacement.
+         *
+         * @param stream Exact non-default stream supplied to the retained-state publication hook.
+         * @return One immutable execution authority for launch, dependencies and publication.
+         * @throws std::invalid_argument for CPU or non-retained-publication stages and default streams.
+         */
+        [[nodiscard]] StageGPUExecution gpuExecutionForVerifierPublication(void *stream) const
+        {
+            if (!device_id_.is_gpu() || !hasVerifierStateCapture() || !requiresVerifierStateCaptureForPublication() ||
+                reinterpret_cast<std::uintptr_t>(stream) <= 2)
+                throw std::invalid_argument(
+                    "Verifier publication requires a retained GPU stage and its exact non-default invocation stream");
+            return StageGPUExecution(device_id_, stream);
         }
 
         /**
@@ -2235,6 +2418,26 @@ namespace llaminar2
          */
         void validateMatmulShapes(const std::string &a_name, const ITensor *a,
                                   const std::string &b_name, const ITensor *b) const;
+
+        /**
+         * @brief Validate every CPU request and append immutable publication plans.
+         * @param rows Complete host-owned flat restore-row vector; negative rows preserve prestate.
+         * @param requests Exact canonical request count, unrelated to buffer capacity.
+         * @param plans Caller-owned transient metadata receiving existing typed plans.
+         * @return True only after all stage-owned request decisions are validated without mutation.
+         * @details Snapshot spans and native-prefix write intervals remain owned by the stage/kernel.
+         * No live state is copied or rebound here. The publisher admits every stage's plans before
+         * any copy, native commit, or capture-binding clear. Multi-request stages must explicitly
+         * implement their request ownership; a scalar-only stage cannot infer it from flat rows.
+         */
+        virtual bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans)
+        {
+            if(!rows || requests!=1 || device().is_gpu())return false;
+            auto plan=planCPUVerifierStateRestoreRow(rows[0]);
+            if(!plan.ready() && plan.status!=CPUVerifierStateRestorePlanStatus::NoOp)return false;
+            plans.push_back(plan);return true;
+        }
 
     private:
         DeviceId device_id_;         ///< Authoritative device (set via constructor, no default)

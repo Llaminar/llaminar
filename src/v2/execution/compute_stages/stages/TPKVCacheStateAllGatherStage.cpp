@@ -1,6 +1,11 @@
 /**
  * @file TPKVCacheStateAllGatherStage.cpp
- * @brief Implementation of LocalTP K/V state allgather handoff.
+ * @brief Exact live-row LocalTP K/V handoff for CPU and captured native GPUs.
+ *
+ * CPU projections are compacted into their admitted workspace and exchanged in
+ * declared participant order. Separate per-participant full rows seed the same
+ * canonical cache used by replicated decode. No unowned tensor capacity enters
+ * the protocol, and the existing GPU stream/capture implementation is retained.
  */
 
 #include "TPKVCacheStateAllGatherStage.h"
@@ -15,6 +20,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -67,7 +74,9 @@ extern "C"
 namespace llaminar2
 {
     TPKVCacheStateAllGatherStage::TPKVCacheStateAllGatherStage(Params params)
-        : IComputeStage(params.device_id), params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params)),
+          host_k_stage_name_((params_.stage_name.empty() ? "tp_kv_state_allgather" : params_.stage_name) + "_K"),
+          host_v_stage_name_((params_.stage_name.empty() ? "tp_kv_state_allgather" : params_.stage_name) + "_V")
     {
     }
 
@@ -96,6 +105,12 @@ namespace llaminar2
         if (!ensureContext(ctx, "TPKVCacheStateAllGatherStage"))
             return false;
 
+        if (params_.device_id.is_cpu())
+        {
+            if (ctx->deviceId() != params_.device_id)
+                return false;
+            return executeHost();
+        }
         if (!params_.device_id.is_gpu())
         {
             LOG_ERROR("[TPKVCacheStateAllGatherStage] GPU device required, got "
@@ -397,6 +412,97 @@ namespace llaminar2
         return true;
     }
 
+    bool TPKVCacheStateAllGatherStage::executeHost()
+    {
+        const auto reject = [&](const char *reason) {
+            LOG_ERROR("[TPKVCacheStateAllGatherStage] " << reason);
+            if (params_.tp_ctx) params_.tp_ctx->requestAbort();
+            return false;
+        };
+        if (!params_.tp_ctx || params_.tp_ctx->backend() != CollectiveBackendType::HOST ||
+            params_.tp_device_idx < 0 || params_.tp_device_idx >= params_.tp_ctx->degree() ||
+            params_.tokens < 0 || params_.local_kv_dim <= 0 || params_.full_kv_dim <= 0 ||
+            params_.local_k_stride < params_.local_kv_dim || params_.local_v_stride < params_.local_kv_dim ||
+            static_cast<size_t>(params_.full_kv_dim) !=
+                static_cast<size_t>(params_.local_kv_dim) * static_cast<size_t>(params_.tp_ctx->degree()) ||
+            !params_.local_K || !params_.local_V || !params_.full_K || !params_.full_V)
+        {
+            return reject("Invalid indexed CPU handoff geometry");
+        }
+        const auto cpu_tensor = [](const ITensor *tensor) {
+            // current_device() names a GPU allocation; a native host owner has
+            // no such device. Require the existing host coherence authority so
+            // active pointer access cannot choose a device buffer or transfer.
+            const auto *native = dynamic_cast<const TensorBase *>(tensor);
+            const auto *owner = native ? native->transferStorageOwner() : nullptr;
+            return owner && tensor->native_type() == TensorType::FP32 &&
+                owner->home_device().is_cpu() && !owner->current_device() && owner->hostValid();
+        };
+        if (!cpu_tensor(params_.local_K) || !cpu_tensor(params_.local_V) ||
+            !cpu_tensor(params_.full_K) || !cpu_tensor(params_.full_V))
+        {
+            return reject("CPU handoff requires native CPU FP32 owners");
+        }
+        if (params_.tokens == 0)
+            return params_.tp_ctx->allgatherHostIndexed({}, {}, params_.tp_device_idx, host_k_stage_name_) &&
+                params_.tp_ctx->allgatherHostIndexed({}, {}, params_.tp_device_idx, host_v_stage_name_);
+        const size_t rows = static_cast<size_t>(params_.tokens);
+        const size_t width = static_cast<size_t>(params_.local_kv_dim);
+        const size_t full_width = static_cast<size_t>(params_.full_kv_dim);
+        if (rows > std::numeric_limits<size_t>::max() / (full_width * sizeof(float)) ||
+            !bound_workspace_ || params_.local_K->rows() < rows || params_.local_V->rows() < rows ||
+            params_.full_K->rows() < rows || params_.full_V->rows() < rows ||
+            params_.local_K->cols() < width || params_.local_V->cols() < width ||
+            params_.full_K->shape().size() != 2 || params_.full_V->shape().size() != 2 ||
+            params_.full_K->cols() != full_width || params_.full_V->cols() != full_width ||
+            params_.local_K->numel() < (rows - 1) * static_cast<size_t>(params_.local_k_stride) + width ||
+            params_.local_V->numel() < (rows - 1) * static_cast<size_t>(params_.local_v_stride) + width)
+        {
+            return reject("CPU live rows exceed admitted owners/workspace");
+        }
+        if (bound_workspace_->device() != params_.device_id ||
+            bound_workspace_->getBufferSize(compactKBufferName()) < rows * width * sizeof(float) ||
+            bound_workspace_->getBufferSize(compactVBufferName()) < rows * width * sizeof(float) ||
+            bound_workspace_->getBufferSize(gatheredKBufferName()) < rows * full_width * sizeof(float) ||
+            bound_workspace_->getBufferSize(gatheredVBufferName()) < rows * full_width * sizeof(float))
+        {
+            return reject("CPU workspace owner or exact live extent is insufficient");
+        }
+        auto *compact_k = static_cast<float *>(bound_workspace_->getBuffer(compactKBufferName()));
+        auto *compact_v = static_cast<float *>(bound_workspace_->getBuffer(compactVBufferName()));
+        auto *gathered_k = static_cast<float *>(bound_workspace_->getBuffer(gatheredKBufferName()));
+        auto *gathered_v = static_cast<float *>(bound_workspace_->getBuffer(gatheredVBufferName()));
+        const auto *local_k = static_cast<const float *>(params_.local_K->active_data_ptr());
+        const auto *local_v = static_cast<const float *>(params_.local_V->active_data_ptr());
+        auto *full_k = static_cast<float *>(params_.full_K->active_mutable_data_ptr());
+        auto *full_v = static_cast<float *>(params_.full_V->active_mutable_data_ptr());
+        if (!compact_k || !compact_v || !gathered_k || !gathered_v || !local_k || !local_v || !full_k || !full_v)
+        {
+            return reject("Missing admitted CPU handoff pointers");
+        }
+        for (size_t row = 0; row < rows; ++row)
+        {
+            std::memcpy(compact_k + row * width, local_k + row * params_.local_k_stride, width * sizeof(float));
+            std::memcpy(compact_v + row * width, local_v + row * params_.local_v_stride, width * sizeof(float));
+        }
+        const size_t local_elements = rows * width;
+        const size_t full_elements = rows * full_width;
+        if (!params_.tp_ctx->allgatherHostIndexed(std::as_bytes(std::span(compact_k, local_elements)),
+                std::as_writable_bytes(std::span(gathered_k, full_elements)), params_.tp_device_idx, host_k_stage_name_) ||
+            !params_.tp_ctx->allgatherHostIndexed(std::as_bytes(std::span(compact_v, local_elements)),
+                std::as_writable_bytes(std::span(gathered_v, full_elements)), params_.tp_device_idx, host_v_stage_name_))
+            return false;
+        for (size_t row = 0; row < rows; ++row)
+            for (size_t participant = 0; participant < static_cast<size_t>(params_.tp_ctx->degree()); ++participant)
+            {
+                const size_t source = participant * local_elements + row * width;
+                const size_t destination = row * full_width + participant * width;
+                std::memcpy(full_k + destination, gathered_k + source, width * sizeof(float));
+                std::memcpy(full_v + destination, gathered_v + source, width * sizeof(float));
+            }
+        return true;
+    }
+
     size_t TPKVCacheStateAllGatherStage::estimatedMemoryBytes() const
     {
         const int degree = params_.tp_ctx ? params_.tp_ctx->degree() : 0;
@@ -413,6 +519,8 @@ namespace llaminar2
     {
         switch (backend)
         {
+        case ComputeBackendType::CPU:
+            return true;
 #ifdef HAVE_CUDA
         case ComputeBackendType::GPU_CUDA:
             return true;

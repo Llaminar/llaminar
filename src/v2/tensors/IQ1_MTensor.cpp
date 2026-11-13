@@ -2,6 +2,8 @@
  * @file IQ1_MTensor.cpp
  * @brief IQ1_M quantized tensor implementation (1-bit medium IQ)
  * @author David Sanftenberg
+ * Aligned final storage keeps its original CPU allocator identity and lease;
+ * row views inherit that endpoint without copying native blocks.
  */
 
 #include "TensorClasses.h"
@@ -39,9 +41,11 @@ namespace llaminar2
 
     IQ1_MTensor::IQ1_MTensor(
         const std::vector<size_t> &shape,
-        AlignedVector<uint8_t> raw_data)
-        : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr), view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
+        AlignedVector<uint8_t> raw_data, DeviceId device)
+        : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr), view_byte_offset_(0), parent_(nullptr), device_(device), device_blocks_(nullptr)
     {
+        if (!device.is_valid() || !device.is_cpu())
+            throw std::invalid_argument("IQ1_MTensor owned native storage requires its exact CPU allocator");
         if (shape.empty())
         {
             throw std::invalid_argument("IQ1_MTensor: shape cannot be empty");
@@ -65,7 +69,7 @@ namespace llaminar2
     IQ1_MTensor::IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                              size_t byte_offset, std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(raw_data_ptr),
-          view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr) {}
+          view_byte_offset_(byte_offset), parent_(parent), device_(parent ? parent->home_device() : DeviceId::cpu()), device_blocks_(nullptr) {}
     // Zero-copy constructor for mmap-backed data
     IQ1_MTensor::IQ1_MTensor(const std::vector<size_t> &shape,
                              const uint8_t *mmap_data,

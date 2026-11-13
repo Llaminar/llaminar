@@ -4,7 +4,7 @@
  *
  * One source is compiled into separate CUDA and ROCm executables.  Each
  * executable prepares real quantized tensors through the production
- * NativeVNNI packer, proves both conversion directions byte-for-byte, and then
+ * NativeQuantised packer, proves both conversion directions byte-for-byte, and then
  * measures the exact explicit-stream kernels with and without pinned-host DMA.
  * CUDA additionally measures service-finite/service-captured public background
  * transactions. Those report complete wall time, not native kernel duration,
@@ -12,16 +12,23 @@
  * The default matrix covers every loader-supported quantized format and the
  * two projection geometries used by Qwen3.5/Qwen3.6 MoE experts.
  *
+ * The explicit `--shape rectangle` benchmark fixture reuses the native regression's
+ * original47-row overlap and independent endpoint strides; it is excluded from
+ * the default shape matrix and is not a production dispatch specialization.
+ *
  * Profilers should use `--single-launch` with one format, shape, and direction.
  * That mode performs all allocation and upload work first, launches exactly
  * one selected conversion kernel, and observes completion only on its owning
  * non-default stream.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/VnniPackContext.h"
 #include "utils/QuantizedVerifierFormats.h"
+#include "utils/ExpertTierWeightWireTestOracle.h"
 
 #if defined(LLAMINAR_EXPERT_TIER_PERF_CUDA)
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
@@ -69,7 +76,7 @@
 extern "C"
 {
     /** Publish production IQ decode tables before an IQ tier conversion. */
-    bool cudaNativeVNNIInitIQGridTables_tuned();
+    bool cudaNativeQuantisedInitIQGridTables_tuned();
 }
 #endif
 
@@ -113,10 +120,13 @@ namespace llaminar2
             std::string_view name;
             int N = 0;
             int K = 0;
+            bool rectangle = false; ///< Explicit benchmark fixture, not a production dispatch specialization.
         };
 
         constexpr ProjectionShape kGateUpShape{"gate_up", 512, 2048};
         constexpr ProjectionShape kDownShape{"down", 2048, 512};
+        // Same original-coordinate overlap as the native byte/capture regression.
+        constexpr ProjectionShape kRectangleShape{"rectangle",70,512,true};
 
         /** Parsed benchmark policy; all defaults form the exhaustive sweep. */
         struct Options
@@ -161,6 +171,8 @@ namespace llaminar2
             int samples = 0;
             double economy_floor_gbps = 0.0;
             bool economical = false;
+            ExpertTierWeightDeviceLayout layout; ///< Exact selected endpoint strides and live wire geometry.
+            std::vector<double> batch_mean_ms; ///< Unprofiled native-event batches, before median selection.
         };
 
         /** Convert a backend status to a stable diagnostic string. */
@@ -586,15 +598,19 @@ namespace llaminar2
                 dynamic_cast<const IINT8Unpackable *>(&tensor);
             if (unpackable == nullptr || unpackable->vnniFormatInfo() == nullptr)
                 throw std::invalid_argument(
-                    "benchmark format is not NativeVNNI-packable");
+                    "benchmark format is not NativeQuantised-packable");
 
-            const NativeVnniFormatInfo &format =
+            const NativeQuantisedFormatInfo &format =
                 *unpackable->vnniFormatInfo();
+            // Physical secondary planes also carry original source coefficients.
+            // IQ3_S/IQ4_XS are not mathematically asymmetric, but omitting this
+            // storage would discard their original quantization metadata.
+            const auto execution = canonicalDeviceVnniFormat(format);
             const int N = static_cast<int>(tensor.rows());
             const int K = static_cast<int>(tensor.cols());
             if (N <= 0 || K <= 0 || (K % 32) != 0)
                 throw std::invalid_argument(
-                    "benchmark projection is not a complete NativeVNNI geometry");
+                    "benchmark projection is not a complete NativeQuantised geometry");
 
             HostGpuExpertPackedProjection projection;
             projection.N = N;
@@ -602,33 +618,33 @@ namespace llaminar2
             projection.blocks_per_row = static_cast<std::uint32_t>(K / 32);
             projection.source_codebook_id = format.codebook_id;
             projection.codebook_id =
-                canonicalDeviceVnniCodebookId(format.codebook_id);
+                execution.codebook_id;
             projection.payload_bytes_per_block =
-                static_cast<std::uint8_t>(format.payload_bytes);
-            projection.is_asymmetric = format.is_asymmetric;
+                execution.payload_bytes_per_block;
+            projection.is_asymmetric = execution.is_asymmetric;
             projection.is_superblock = format.is_superblock;
-            projection.has_emins = format.has_emins;
+            projection.has_emins = execution.has_emins;
 
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * projection.blocks_per_row;
-            projection.payload.resize(blocks * format.payload_bytes);
+            projection.payload.resize(blocks * execution.payload_bytes_per_block);
             projection.scales.resize(blocks);
-            if (format.is_asymmetric)
+            if (execution.is_asymmetric)
                 projection.mins.resize(blocks);
-            if (format.has_emins)
+            if (execution.has_emins)
                 projection.emins.resize(blocks);
 
             VnniPackContext context{};
             context.N = N;
             context.K = K;
             context.blocks_per_row = K / 32;
-            context.payload_bytes = format.payload_bytes;
+            context.payload_bytes = execution.payload_bytes_per_block;
             context.payload_array = projection.payload.data();
             context.scales_array = projection.scales.data();
             context.mins_array =
-                format.is_asymmetric ? projection.mins.data() : nullptr;
+                execution.is_asymmetric ? projection.mins.data() : nullptr;
             context.emins_array =
-                format.has_emins ? projection.emins.data() : nullptr;
+                execution.has_emins ? projection.emins.data() : nullptr;
 
             for (int n = 0; n < N; ++n)
             {
@@ -778,26 +794,12 @@ namespace llaminar2
                           static_cast<std::uint32_t>(shape.N))),
                   source_host_(requireAndPackTensor()),
                   source_format_(requireSourceFormat()),
-                  demotion_manifest_(
-                      makeGpuToCpuExpertTierWeightStreamManifest(
-                          source_format_,
-                          shape.N,
-                          shape.K,
-                          1,
-                          0,
-                          0,
-                          ExpertTierWeightProjection::Gate,
-                          checkedChunkUnits(units_per_chunk))),
+                  demotion_manifest_(makeDemotionManifest(units_per_chunk)),
                   demotion_layout_(demotion_manifest_.deviceLayout()),
                   cpu_host_(packCpuWeights()),
-                  promotion_manifest_(
-                      makeCpuToGpuExpertTierWeightStreamManifest(
-                          cpu_host_,
-                          2,
-                          0,
-                          0,
-                          ExpertTierWeightProjection::Gate,
-                          checkedChunkUnits(units_per_chunk))),
+                  wire_oracle_(makeWireOracle()),
+                  cpu_destination_(makeCPUDestination()),
+                  promotion_manifest_(makePromotionManifest(units_per_chunk)),
                   promotion_layout_(promotion_manifest_.deviceLayout()),
                   destination_host_(makeDestinationReference()),
                   source_payload_(source_host_.payload.size()),
@@ -813,18 +815,18 @@ namespace llaminar2
                           demotion_layout_.maximum_units_per_chunk),
                       promotion_layout_.chunkBytes(
                           promotion_layout_.maximum_units_per_chunk))),
-                  pinned_cpu_(cpu_host_.native_interleaved.size())
+                  pinned_cpu_(wire_oracle_.size())
             {
                 if (!tensor_)
                     throw std::runtime_error("format factory returned null");
                 if (!demotion_layout_.valid() || !promotion_layout_.valid())
                     throw std::runtime_error("fixture produced an invalid device layout");
-                if (cpu_host_.native_interleaved.size() != pinned_cpu_.size())
+                if (wire_oracle_.size() != pinned_cpu_.size())
                     throw std::runtime_error("CPU packed byte capacity mismatch");
 
                 std::memcpy(
                     pinned_cpu_.data(),
-                    cpu_host_.native_interleaved.data(),
+                    wire_oracle_.data(),
                     pinned_cpu_.size());
                 uploadVector(source_payload_, source_host_.payload, stream_);
                 uploadVector(source_scales_, source_host_.scales, stream_);
@@ -887,9 +889,8 @@ namespace llaminar2
                     std::span<const std::uint8_t>(
                         pinned_cpu_.data(), pinned_cpu_.size()),
                     std::span<const std::uint8_t>(
-                        cpu_host_.native_interleaved.data(),
-                        cpu_host_.native_interleaved.size()),
-                    "GPU-to-CPU stream");
+                        wire_oracle_.data(),wire_oracle_.size()),
+                    "GPU-to-CPU compact stream");
 
                 enqueuePromotionStream();
                 stream_.synchronize();
@@ -933,6 +934,8 @@ namespace llaminar2
                     economy_floor_gbps < 0.0)
                     throw std::invalid_argument("invalid timing iteration count");
 
+                if(shape_.rectangle && (mode==MeasurementMode::ServiceFinite || mode==MeasurementMode::ServiceCaptured))
+                    throw std::invalid_argument("Rectangle fixture supports kernel/streaming; public service timing has no rectangle contract yet");
                 const bool service = mode == MeasurementMode::ServiceFinite ||
                     mode == MeasurementMode::ServiceCaptured;
                 // The kernel-only promotion sample excludes staging DMA.  Put
@@ -986,6 +989,7 @@ namespace llaminar2
                             static_cast<double>(iterations));
                     }
                 }
+                const auto raw_batch_means=sample_mean_ms;
                 std::sort(sample_mean_ms.begin(), sample_mean_ms.end());
                 const double mean_ms = sample_mean_ms[
                     sample_mean_ms.size() / 2u];
@@ -1032,12 +1036,15 @@ namespace llaminar2
                     .samples = samples,
                     .economy_floor_gbps = economy_floor_gbps,
                     .economical = gb_per_s >= economy_floor_gbps,
+                    .layout=layout,.batch_mean_ms=raw_batch_means,
                 };
             }
 
             /** Launch exactly one selected kernel for an isolated profiler run. */
             void singleLaunch(Direction direction, MeasurementMode mode = MeasurementMode::Kernel)
             {
+                if(shape_.rectangle && mode!=MeasurementMode::Kernel)
+                    throw std::invalid_argument("Rectangle single-launch profiles only its actual native kernel");
                 if (mode == MeasurementMode::ServiceFinite)
                 {
                     if (demotion_layout_.maximum_units_per_chunk != demotion_layout_.unit_count)
@@ -1051,6 +1058,10 @@ namespace llaminar2
                 enqueueOneKernel(direction);
                 stream_.synchronize();
             }
+
+            /** @param direction Selected native movement. @return Immutable exact profiler-dispatch layout. */
+            [[nodiscard]] const ExpertTierWeightDeviceLayout& profileLayout(Direction direction) const noexcept
+            { return direction==Direction::GpuToCpu?demotion_layout_:promotion_layout_; }
 
         private:
             /**
@@ -1083,7 +1094,7 @@ namespace llaminar2
                     device_chunk_.bytes(), 1u, device).front();
                 auto epoch = MappedTransferProgressEpoch::create({
                     .device = device, .slot_capacity = 1u, .execution_lane_capacity = 1u,
-                    .execution_streams = engine.allocatePersistentTransferExecutionLanes(
+                    .execution_streams = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(engine,
                         1u, device, "packed_service_economy"),
                     .maximum_bytes = device_chunk_.bytes(), .name = "packed_service_economy"});
                 auto command = epoch->reserveSlot(direction == Direction::GpuToCpu
@@ -1194,6 +1205,60 @@ namespace llaminar2
 #endif
             }
 
+            /**
+             * @param reverse Whether the original CPU endpoint is the source.
+             * @return Checked original-coordinate benchmark overlap; never a runtime dispatch policy.
+             */
+            [[nodiscard]] ExpertTierWeightProjectionIntersection rectangle(bool reverse=false) const
+            {
+                using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
+                const P gpu{R::ParticipantOutputSlice,200,1024,11,70,32,512};
+                const P cpu{R::ParticipantInputSlice,200,1024,34,95,128,256};
+                return ExpertTierWeightProjectionIntersection::between(reverse?cpu:gpu,reverse?gpu:cpu);
+            }
+            /** @param units Existing bounded lane population. @return Original GPU→CPU manifest or explicit fixture overlap. */
+            [[nodiscard]] ExpertTierWeightStreamManifest makeDemotionManifest(uint32_t units) const
+            {
+                auto result=makeGpuToCpuExpertTierWeightStreamManifest(source_format_,shape_.N,shape_.K,
+                    1,0,0,ExpertTierWeightProjection::Gate,checkedChunkUnits(units));
+                return shape_.rectangle?result.forIntersection(rectangle()):result;
+            }
+            /** @return Exact native wire oracle from independently CPU-prepared original weights. */
+            [[nodiscard]] std::vector<uint8_t> makeWireOracle() const
+            {
+                auto original=demotion_layout_;
+                original.cpu_N=shape_.N;original.cpu_K=shape_.K;
+                original.cpu_first_row=shape_.rectangle?rectangle().sourceRowOrigin():0;
+                original.cpu_first_column=shape_.rectangle?rectangle().sourceColumnOrigin():0;
+                original.maximum_units_per_chunk=original.unit_count;
+                return test::expertTierWireOracle(original,cpu_host_.native_interleaved,0,original.unit_count);
+            }
+            /** @return Genuine final CPU rectangle root; identity controls retain their existing root. */
+            [[nodiscard]] std::optional<cpu::native_quantised::CPUNativeQuantisedPackedWeights> makeCPUDestination() const
+            {
+                if(!shape_.rectangle)return std::nullopt;
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights result;
+                result.N=95;result.K=256;result.N_padded=128;result.blocks_per_row=8;
+                result.payload_bytes=cpu_host_.payload_bytes;result.codebook_id=cpu_host_.codebook_id;
+                result.is_asymmetric=cpu_host_.is_asymmetric;result.is_superblock=cpu_host_.is_superblock;
+                result.encoding=cpu_host_.encoding;result.data_stride=cpu_host_.data_stride;
+                result.interleaved_block_stride=cpu_host_.interleaved_block_stride;
+                result.native_interleaved.resize_uninitialized(demotion_layout_.cpuStorageBytes());
+                std::fill(result.native_interleaved.begin(),result.native_interleaved.end(),0xa5);
+                auto layout=demotion_layout_;layout.maximum_units_per_chunk=layout.unit_count;
+                if(!scatterExpertTierCPUWeightChunk(layout,wire_oracle_,0,layout.unit_count,
+                    std::span<uint8_t>(result.native_interleaved.data(),result.native_interleaved.size())))
+                    throw std::runtime_error("Original CPU rectangle root cannot receive exact oracle planes");
+                return result;
+            }
+            /** @param units Existing bounded lane population. @return Original CPU→GPU manifest with the same overlap. */
+            [[nodiscard]] ExpertTierWeightStreamManifest makePromotionManifest(uint32_t units) const
+            {
+                auto result=makeCpuToGpuExpertTierWeightStreamManifest(cpu_destination_?*cpu_destination_:cpu_host_,
+                    2,0,0,ExpertTierWeightProjection::Gate,checkedChunkUnits(units));
+                return shape_.rectangle?result.forIntersection(rectangle(true)):result;
+            }
+
             /** Validate the newly created tensor before member initialization proceeds. */
             [[nodiscard]] HostGpuExpertPackedProjection requireAndPackTensor() const
             {
@@ -1203,10 +1268,10 @@ namespace llaminar2
             }
 
             /** Resolve exact source provenance; aliases require superblock identity. */
-            [[nodiscard]] const NativeVnniFormatInfo &requireSourceFormat() const
+            [[nodiscard]] const NativeQuantisedFormatInfo &requireSourceFormat() const
             {
-                const NativeVnniFormatInfo *format =
-                    native_vnni_formats::forSourceIdentity(
+                const NativeQuantisedFormatInfo *format =
+                    native_quantised_formats::forSourceIdentity(
                         source_host_.source_codebook_id,
                         source_host_.is_superblock);
                 if (format == nullptr)
@@ -1231,14 +1296,14 @@ namespace llaminar2
             }
 
             /** Build the byte-exact final CPU representation used on the wire. */
-            [[nodiscard]] cpu::native_vnni::CPUNativeVNNIPackedWeights
+            [[nodiscard]] cpu::native_quantised::CPUNativeQuantisedPackedWeights
             packCpuWeights() const
             {
-                cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
-                if (!cpu::native_vnni::packWeightsCPUNativeVNNI(
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+                if (!cpu::native_quantised::packWeightsCPUNativeQuantised(
                         tensor_.get(), packed))
                     throw std::runtime_error("production CPU weight pack failed");
-                if (packed.native_interleaved.size() !=
+                if (!shape_.rectangle && packed.native_interleaved.size() !=
                     demotion_manifest_.total_stream_bytes)
                     throw std::runtime_error(
                         "CPU oracle disagrees with demotion manifest byte count");
@@ -1254,6 +1319,18 @@ namespace llaminar2
                 if (!cpuToGpuExpertPackedReference(cpu_host_, result, &error))
                     throw std::runtime_error(
                         "CPU-to-GPU reference conversion failed: " + error);
+                if(shape_.rectangle) {
+                    const auto& layout=promotion_layout_;
+                    for(int kb=0;kb<result.K/32;++kb)for(int n=0;n<result.N;++n) {
+                        if(n>=layout.gpu_first_row && n<layout.gpu_first_row+layout.N &&
+                           kb>=layout.gpu_first_column/32 && kb<(layout.gpu_first_column+layout.K)/32)continue;
+                        const size_t index=size_t(kb)*result.N+n;
+                        std::fill_n(result.payload.data()+index*result.payload_bytes_per_block,result.payload_bytes_per_block,0);
+                        result.scales[index]=0;
+                        if(!result.mins.empty())result.mins[index]=0;
+                        if(!result.emins.empty())result.emins[index]=0;
+                    }
+                }
                 return result;
             }
 
@@ -1346,7 +1423,7 @@ namespace llaminar2
                 {
                     const std::uint32_t units = std::min<std::uint32_t>(
                         chunk_capacity, demotion_layout_.unit_count - first);
-                    const std::size_t bytes = demotion_layout_.chunkBytes(units);
+                    const std::size_t bytes = demotion_layout_.chunkBytes(units,first);
                     if (!launchGpuToCpu(
                             sourceView(),
                             demotion_layout_,
@@ -1358,7 +1435,7 @@ namespace llaminar2
                         throw std::runtime_error(
                             "GPU-to-CPU streaming kernel launch rejected");
                     copyDeviceToHostAsync(
-                        pinned_cpu_.data() + demotion_layout_.chunkBytes(first),
+                        pinned_cpu_.data() + expertTierWirePrefix(demotion_layout_,first),
                         device_chunk_.data(),
                         bytes,
                         stream_);
@@ -1376,10 +1453,10 @@ namespace llaminar2
                 {
                     const std::uint32_t units = std::min<std::uint32_t>(
                         chunk_capacity, promotion_layout_.unit_count - first);
-                    const std::size_t bytes = promotion_layout_.chunkBytes(units);
+                    const std::size_t bytes = promotion_layout_.chunkBytes(units,first);
                     copyHostToDeviceAsync(
                         device_chunk_.data(),
-                        pinned_cpu_.data() + promotion_layout_.chunkBytes(first),
+                        pinned_cpu_.data() + expertTierWirePrefix(promotion_layout_,first),
                         bytes,
                         stream_);
                     if (!launchCpuToGpu(
@@ -1400,10 +1477,12 @@ namespace llaminar2
             int numa_node_ = -1;
             std::unique_ptr<TensorBase> tensor_;
             HostGpuExpertPackedProjection source_host_;
-            const NativeVnniFormatInfo &source_format_;
+            const NativeQuantisedFormatInfo &source_format_;
             ExpertTierWeightStreamManifest demotion_manifest_;
             ExpertTierWeightDeviceLayout demotion_layout_;
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_host_;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_host_;
+            std::vector<uint8_t> wire_oracle_;
+            std::optional<cpu::native_quantised::CPUNativeQuantisedPackedWeights> cpu_destination_;
             ExpertTierWeightStreamManifest promotion_manifest_;
             ExpertTierWeightDeviceLayout promotion_layout_;
             HostGpuExpertPackedProjection destination_host_;
@@ -1462,7 +1541,8 @@ namespace llaminar2
             output
                 << "Usage: " << program << " [options]\n"
                 << "  --format NAME|all          Quantized source format (default all)\n"
-                << "  --shape gate_up|down|all   Real expert projection shape\n"
+                << "  --shape gate_up|down|all|rectangle   Whole expert shapes or explicit benchmark rectangle\n"
+                << "       rectangle: original GPU70x512@(11,32), CPU95x256@(34,128), live47x256; excluded from all\n"
                 << "  --direction gpu-to-cpu|cpu-to-gpu|both\n"
                 << "  --mode kernel|streaming|both\n"
                 << "         service-finite|service-captured  CUDA public transaction wall timing\n"
@@ -1488,6 +1568,9 @@ namespace llaminar2
                 if (argument == "--help" || argument == "-h")
                 {
                     printUsage(std::cout, argv[0]);
+                    // Help terminates before native setup. std::exit skips
+                    // main's stack, so close its process owner explicitly.
+                    llaminar2::GPUDeviceProcessLifetime::retireActive();
                     std::exit(0);
                 }
                 if (argument == "--single-launch")
@@ -1629,6 +1712,7 @@ namespace llaminar2
                 result.push_back(kGateUpShape);
             if (options.shape == "all" || options.shape == kDownShape.name)
                 result.push_back(kDownShape);
+            if(options.shape==kRectangleShape.name)result.push_back(kRectangleShape);
             if (result.empty())
                 throw std::invalid_argument(
                     "unknown projection shape: " + options.shape);
@@ -1699,7 +1783,8 @@ namespace llaminar2
                 << "backend,numa_node,mode,direction,format,source_codebook,physical_codebook,"
                    "shape,n,k,unit_count,units_per_chunk,chunk_count,semantic_bytes,"
                    "mean_ms,gb_per_s,iterations,samples,economy_floor_gbps,"
-                   "validated,economical\n";
+                   "validated,economical,live_n,live_k,cpu_n,cpu_k,cpu_first_n,cpu_first_k,"
+                   "gpu_n,gpu_k,gpu_first_n,gpu_first_k,batch_mean_ms,fixture_geometry\n";
         }
 
         /** Emit one fully reproducible measurement row. */
@@ -1725,14 +1810,23 @@ namespace llaminar2
                    << measurement.iterations << ','
                    << measurement.samples << ','
                    << measurement.economy_floor_gbps << ",true,"
-                   << (measurement.economical ? "true" : "false") << '\n';
+                   << (measurement.economical ? "true" : "false") << ','
+                   << measurement.layout.N << ',' << measurement.layout.K << ','
+                   << measurement.layout.cpu_N << ',' << measurement.layout.cpu_K << ','
+                   << measurement.layout.cpu_first_row << ',' << measurement.layout.cpu_first_column << ','
+                   << measurement.layout.gpu_N << ',' << measurement.layout.gpu_K << ','
+                   << measurement.layout.gpu_first_row << ',' << measurement.layout.gpu_first_column << ',';
+            for(size_t i=0;i<measurement.batch_mean_ms.size();++i) {
+                if(i)output << ';';output << measurement.batch_mean_ms[i];
+            }
+            output << ',' << (measurement.shape.rectangle?"regression_rectangle":"whole_identity") << '\n';
         }
 
         /** Initialize backend-local IQ tables before any conversion is launched. */
         void initializeDecodeTables(int device)
         {
 #if defined(LLAMINAR_EXPERT_TIER_PERF_CUDA)
-            if (!cudaNativeVNNIInitIQGridTables_tuned())
+            if (!cudaNativeQuantisedInitIQGridTables_tuned())
                 throw std::runtime_error(
                     "CUDA production IQ table initialization failed");
 #else
@@ -1750,6 +1844,9 @@ namespace llaminar2
             const auto shapes = selectedShapes(options);
             const auto directions = selectedDirections(options);
             const auto modes = selectedModes(options);
+            if(std::any_of(shapes.begin(),shapes.end(),[](const auto& shape){return shape.rectangle;}) &&
+               std::any_of(modes.begin(),modes.end(),[](auto mode){return mode==MeasurementMode::ServiceFinite || mode==MeasurementMode::ServiceCaptured;}))
+                throw std::invalid_argument("Rectangle benchmark supports kernel/streaming only; service rectangle timing is not implemented");
 
             if (options.device >= deviceCount())
                 throw std::invalid_argument(
@@ -1793,11 +1890,11 @@ namespace llaminar2
                           << " shape=" << shapes.front().name
                           << " direction=" << directionName(directions.front())
                           << " units="
-                          << std::min<std::uint32_t>(
-                                 options.units_per_chunk,
-                                 static_cast<std::uint32_t>(
-                                     ((shapes.front().N + 63) / 64) *
-                                     (shapes.front().K / 32)))
+                          << fixture.profileLayout(directions.front()).maximum_units_per_chunk
+                          << " live_n=" << fixture.profileLayout(directions.front()).N
+                          << " live_k=" << fixture.profileLayout(directions.front()).K
+                          << " wire_bytes=" << fixture.profileLayout(directions.front()).chunkBytes(
+                              fixture.profileLayout(directions.front()).maximum_units_per_chunk)
                           << '\n';
                 return 0;
             }
@@ -1839,6 +1936,7 @@ namespace llaminar2
                                 ++uneconomical_rows;
                         }
                     }
+                    if(shape.rectangle)fixture.validateRoundTrip(); // Terminal byte checks stay outside all event brackets.
                 }
             }
             std::cout.flush();
@@ -1856,6 +1954,8 @@ namespace llaminar2
 /** Standalone Release benchmark entry point. */
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         return llaminar2::run(argc, argv);

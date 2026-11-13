@@ -14,6 +14,10 @@
  * remains the independent physical4 control with no secondary plane.
  */
 
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
+#include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
+#include "utils/ExpertTierWeightWireTestOracle.h"
+
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "tensors/IQQuantTables.h"
@@ -29,7 +33,7 @@
 #include "backends/IBackend.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
-#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/VnniPackContext.h"
@@ -63,12 +67,12 @@
 extern "C"
 {
     /** Initialize immutable CUDA IQ lookup tables used by production decode. */
-    bool cudaNativeVNNIInitIQGridTables_tuned();
-    void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
-    int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
+    bool cudaNativeQuantisedInitIQGridTables_tuned();
+    void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int enabled);
+    int cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
 
-    /** Production M=1 NativeVNNI inference kernel used by the overlap proof. */
-    bool cudaNativeVNNIGemvTuned_fp32(
+    /** Production M=1 NativeQuantised inference kernel used by the overlap proof. */
+    bool cudaNativeQuantisedGemvTuned_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const std::uint16_t *d_scales,
@@ -89,7 +93,7 @@ extern "C"
         CUDARowMajorWeights **rm_slot);
 
     /** Physical decoder plus independent source arithmetic identity. */
-    bool cudaNativeVNNIGemvTuned_fp32_withPolicy(
+    bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const std::uint16_t *d_scales,
@@ -110,8 +114,8 @@ extern "C"
         CUDAGemvContext *gemv_ctx,
         CUDARowMajorWeights **rm_slot);
 
-    /** Production verifier-depth NativeVNNI kernel used by promotion parity. */
-    bool cudaNativeVNNIGemvTuned_small_m_fp32(
+    /** Production verifier-depth NativeQuantised kernel used by promotion parity. */
+    bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const std::uint16_t *d_scales,
@@ -134,8 +138,8 @@ extern "C"
 
     /** Grouped physical decoder plus independent source arithmetic identity. */
 
-    /** Production dense-prefill NativeVNNI kernel used by promotion parity. */
-    bool cudaNativeVNNIPrefill_fp32(
+    /** Production dense-prefill NativeQuantised kernel used by promotion parity. */
+    bool cudaNativeQuantisedPrefill_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const std::uint16_t *d_scales,
@@ -157,7 +161,7 @@ extern "C"
         CUDAPrefillContext *prefill_ctx);
 
     /** Execute promoted bytes while preserving their source arithmetic tree. */
-    bool cudaNativeVNNIPrefill_fp32_withPolicy(
+    bool cudaNativeQuantisedPrefill_fp32_withPolicy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const std::uint16_t *d_scales,
@@ -244,14 +248,14 @@ namespace llaminar2
         public:
             ScopedDecodeEquivalentM1()
                 : previous_(
-                      cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+                      cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config())
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+                cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
             }
 
             ~ScopedDecodeEquivalentM1()
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_);
+                cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(previous_);
             }
 
             ScopedDecodeEquivalentM1(const ScopedDecodeEquivalentM1 &) = delete;
@@ -418,7 +422,7 @@ namespace llaminar2
             projection.N = N;
             projection.K = K;
             projection.blocks_per_row = static_cast<std::uint32_t>(K / 32);
-            projection.source_codebook_id = format.codebook == kNativeVnniIQ4XSSourceScaleCodebook
+            projection.source_codebook_id = format.codebook == kNativeQuantisedIQ4XSSourceScaleCodebook
                 ? uint8_t{4} : format.codebook;
             projection.codebook_id = format.codebook;
             projection.payload_bytes_per_block = format.payload_bytes;
@@ -442,7 +446,7 @@ namespace llaminar2
                         (block * 37u + byte * 19u + 11u) & 0xffu);
                     if (format.codebook == 19 ||
                         format.codebook ==
-                            kNativeVnniExpandedInt8MinCodebook)
+                            kNativeQuantisedExpandedInt8MinCodebook)
                     {
                         value = static_cast<std::uint8_t>(
                             static_cast<std::int8_t>(
@@ -478,7 +482,7 @@ namespace llaminar2
                             (static_cast<std::uint16_t>(
                                  static_cast<std::uint8_t>(source.scales[1])) << 8);
                     }
-                    if (format.codebook == kNativeVnniIQ4XSSourceScaleCodebook)
+                    if (format.codebook == kNativeQuantisedIQ4XSSourceScaleCodebook)
                     {
                         // Independent original half base repeated across its
                         // eight32-value subblocks; encoded6 is raw, never half.
@@ -506,7 +510,7 @@ namespace llaminar2
          * representation consumed by production GEMM and MoE kernels.
          * @param tensor Source tensor implementing `IINT8Unpackable`.
          * @return Complete host projection with original source provenance.
-         * @throws std::invalid_argument when the tensor is not NativeVNNI or
+         * @throws std::invalid_argument when the tensor is not NativeQuantised or
          *         its K dimension is not a whole execution block.
          */
         HostGpuExpertPackedProjection packProductionGpuProjection(
@@ -517,9 +521,9 @@ namespace llaminar2
             if (unpackable == nullptr || unpackable->vnniFormatInfo() == nullptr)
             {
                 throw std::invalid_argument(
-                    "all-format tier test requires a NativeVNNI tensor");
+                    "all-format tier test requires a NativeQuantised tensor");
             }
-            const NativeVnniFormatInfo &format =
+            const NativeQuantisedFormatInfo &format =
                 *unpackable->vnniFormatInfo();
             const int N = static_cast<int>(tensor.rows());
             const int K = static_cast<int>(tensor.cols());
@@ -653,230 +657,22 @@ namespace llaminar2
                 if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
                     GTEST_SKIP() << "No CUDA device available";
                 ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-                ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
+                ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned())
                     << "production IQ decode tables must be initialized";
             }
         };
 
-        /** Both CPU edge frontends must consume the canonical transfer receipt. */
-        enum class CapturedPackedClient { LocalTier, RemoteProjection };
-
-        /**
-         * @brief Prove every source format progresses under a captured future-reader fanout.
-         * @param client Production local or remote CPU edge, never a kernel-only surrogate.
-         *
-         * Every allocation, graph and event is prepared before the peer is held.
-         * The held graph makes native future readers unable to service the
-         * conversion; the graph-owned worker must finish both directions anyway.
-         * Its receipt, not wall time or PerfStats, releases each staging slice.
-         */
-        void proveCapturedPackedTransfer(CapturedPackedClient client)
-        {
-            const auto device = DeviceId::cuda(0);
-            auto &context = GPUDeviceContextPool::instance().getContext(device);
-            auto *backend = getBackendFor(device);
-            ASSERT_NE(backend, nullptr);
-            constexpr int N = 70, K = 256;
-            constexpr std::uint32_t chunk_units = 3u;
-            constexpr std::size_t readers = 32u;
-            const DeviceId devices[] = {device};
-            TransferEngine transfers;
-            for (const auto &format : test::quantizedVerifierFormats())
-            {
-                SCOPED_TRACE(format.label);
-                auto tensor = format.create({N, K}, 91037u);
-                auto source = packProductionGpuProjection(*tensor);
-                cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-                ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(), cpu));
-                std::string error;
-                HostGpuExpertPackedProjection promoted;
-                ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, promoted, &error)) << error;
-                const auto *metadata = native_vnni_formats::forSourceIdentity(
-                    source.source_codebook_id, source.is_superblock);
-                ASSERT_NE(metadata, nullptr);
-                const auto down = makeGpuToCpuExpertTierWeightStreamManifest(*metadata,
-                    N, K, 901, 2, 5, ExpertTierWeightProjection::Down, chunk_units).deviceLayout();
-                const auto up = makeCpuToGpuExpertTierWeightStreamManifest(cpu,
-                    902, 2, 5, ExpertTierWeightProjection::Down, chunk_units).deviceLayout();
-
-                TestCUDABuffer<std::uint8_t> payload(source.payload.size()), output(promoted.payload.size());
-                TestCUDABuffer<std::uint16_t> scales(source.scales.size()), mins(source.mins.size()),
-                    output_scales(promoted.scales.size()), output_mins(promoted.mins.size());
-                TestCUDABuffer<std::uint32_t> emins(source.emins.size()), output_emins(promoted.emins.size());
-                ASSERT_EQ(payload.upload(source.payload), cudaSuccess);
-                ASSERT_EQ(scales.upload(source.scales), cudaSuccess);
-                ASSERT_EQ(mins.upload(source.mins), cudaSuccess);
-                ASSERT_EQ(emins.upload(source.emins), cudaSuccess);
-                const ExpertTierGpuConstProjectionView source_view{
-                    payload.data(), scales.data(), mins.data(), emins.data(),
-                    payload.bytes(), scales.bytes(), mins.bytes(), emins.bytes()};
-                const ExpertTierGpuMutableProjectionView destination_view{
-                    output.data(), output_scales.data(), output_mins.data(), output_emins.data(),
-                    output.bytes(), output_scales.bytes(), output_mins.bytes(), output_emins.bytes()};
-                const auto capacity = std::max(down.chunkBytes(chunk_units), up.chunkBytes(chunk_units));
-                auto execution = transfers.allocatePersistentTransferExecutionLanes(
-                    1u, device, "captured_packed_transfer");
-                auto epoch = MappedTransferProgressEpoch::create({
-                    .device = device, .slot_capacity = 2u, .execution_lane_capacity = 1u,
-                    .execution_streams = execution, .maximum_bytes = capacity,
-                    .name = "captured_packed_transfer", .perf_device = "CUDA:0"});
-                auto staging = transfers.allocatePersistentTransferStagingSlices(capacity, 1u, device).front();
-                std::unique_ptr<ExpertTierWeightTransferLane> local;
-                std::unique_ptr<MoEOverlayGpuRemoteProjectionLane> remote;
-                if (client == CapturedPackedClient::LocalTier)
-                {
-                    local = std::make_unique<ExpertTierWeightTransferLane>(ExpertTierWeightTransferLane::Config{
-                        .device = device, .staging = staging, .execution = execution.front(),
-                        .progress = BackgroundTransferProgressBinding::graphService(epoch),
-                        .lane_name = "captured_packed_local", .perf_device = "CUDA:0"});
-                    ASSERT_TRUE(local->materialize(&error)) << error;
-                }
-                else
-                {
-                    remote = std::make_unique<MoEOverlayGpuRemoteProjectionLane>(MoEOverlayGpuRemoteProjectionLane::Config{
-                        .device = device, .staging = staging, .execution = execution.front(),
-                        .progress = BackgroundTransferProgressBinding::graphService(epoch),
-                        .lane_name = "captured_packed_remote", .perf_device = "CUDA:0"});
-                    ASSERT_TRUE(remote->materialize(&error)) << error;
-                }
-                auto control = transfers.allocateMappedHostRegion((readers + 1u) * 64u, devices);
-                std::memset(control->mutableHostData(), 0, control->sizeBytes());
-                void *stream = nullptr, *terminal = nullptr;
-                std::vector<void *> observers;
-                std::unique_ptr<IGPUGraphCapture> graph;
-                auto branch = epoch->graphBranchFactory().create();
-                context.submitAndWait([&] {
-                    stream = context.getOrCreateAuxiliaryStream("captured_packed_inference");
-                    terminal = context.createEvent();
-                    for (std::size_t index = 0; index < readers; ++index)
-                        observers.push_back(context.getOrCreateAuxiliaryStream(
-                            "captured_packed_reader_" + std::to_string(index)));
-                    graph = context.createGraphCapture(stream);
-                    if (!stream || !terminal || !graph)
-                        throw std::runtime_error("Captured packed proof has incomplete setup");
-                    ScopedBackendGraphCapture capture(context, *graph, "captured packed progress");
-                    if (!capture.begin()) throw std::runtime_error("Captured packed proof did not begin");
-                    transfers.enqueueMappedTimelineWait64(*control, 0u, 1u, device, stream);
-                    capture.finish();
-                    if (!branch->attach(*graph) || !graph->instantiate())
-                        throw std::runtime_error("Captured packed service did not attach");
-                });
-
-                bool remote_acquired = false;
-                // Release the peer before any teardown/drain, even on a failed
-                // assertion. Pending commands retain their original leases.
-                auto release = [&](void *) {
-                    std::atomic_ref<std::uint64_t>(*static_cast<std::uint64_t *>(
-                        control->mutableHostData())).store(1u, std::memory_order_release);
-                    context.submitAndWait([&] {
-                        context.synchronizeStream(stream);
-                        for (auto *observer : observers) context.synchronizeStream(observer);
-                    });
-                    if (local && local->progress() == ExpertTierWeightTransferProgress::Pending)
-                        EXPECT_EQ(pollLaneToCompletion(*local), ExpertTierWeightTransferProgress::Ready);
-                    if (remote_acquired)
-                    {
-                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                        while (remote->poll(remote.get(), &error) == MoEOverlayGpuRemoteLaneProgress::Pending &&
-                               std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-                        EXPECT_TRUE(remote->release(remote.get(), &error)) << error;
-                        remote_acquired = false;
-                    }
-                    context.submitAndWait([&] { graph.reset(); context.destroyEvent(terminal); });
-                    branch.reset();
-                };
-                std::unique_ptr<void, decltype(release)> release_guard(control.get(), release);
-                context.submitAndWait([&] {
-                    if (!graph->launch() || !context.recordEventChecked(terminal, stream))
-                        throw std::runtime_error("Captured packed proof did not launch");
-                    for (std::size_t index = 0; index < readers; ++index)
-                        if (!context.waitEventChecked(terminal, observers[index]) ||
-                            !backend->copyDeviceVisibleRegionByKernelOnStream(
-                                control->deviceAlias(device, (index + 1u) * 64u), payload.data(),
-                                16u, 0, observers[index]))
-                            throw std::runtime_error("Captured packed future-reader submission failed");
-                });
-                std::vector<std::uint8_t> observed_cpu(cpu.native_interleaved.size());
-                if (local)
-                {
-                    ASSERT_TRUE(local->startGpuToCpu(down, source_view, observed_cpu,
-                        ExpertTierSourceReadiness::publishedResidencyBank(901), &error)) << error;
-                    ASSERT_EQ(pollLaneToCompletion(*local), ExpertTierWeightTransferProgress::Ready);
-                    EXPECT_TRUE(std::equal(observed_cpu.begin(), observed_cpu.end(),
-                        cpu.native_interleaved.begin(), cpu.native_interleaved.end()));
-                    ASSERT_TRUE(local->startCpuToGpu(up, cpu.native_interleaved, destination_view, &error)) << error;
-                    ASSERT_EQ(pollLaneToCompletion(*local), ExpertTierWeightTransferProgress::Ready);
-                }
-                else
-                {
-                    for (const bool to_cpu : {true, false})
-                    {
-                        const auto &layout = to_cpu ? down : up;
-                        for (std::uint32_t first = 0; first < layout.unit_count; first += chunk_units)
-                        {
-                            const auto count = std::min(chunk_units, layout.unit_count - first);
-                            const auto bytes = layout.chunkBytes(count);
-                            ASSERT_TRUE(remote->tryAcquire(remote.get()));
-                            remote_acquired = true;
-                            ASSERT_TRUE(remote->bindSourceReadiness(remote.get(),
-                                ExpertTierSourceReadiness::publishedResidencyBank(901), &error)) << error;
-                            if (to_cpu)
-                            {
-                                ASSERT_TRUE(remote->submitGpuToCpuRepack(remote.get(), layout,
-                                    source_view, first, count, &error)) << error;
-                            }
-                            else
-                            {
-                                ASSERT_TRUE(remote->submitCpuToGpuRepack(remote.get(), layout,
-                                    destination_view, first, count,
-                                    std::span(cpu.native_interleaved).subspan(layout.chunkBytes(first), bytes),
-                                    &error)) << error;
-                            }
-                            auto state = MoEOverlayGpuRemoteLaneProgress::Pending;
-                            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                            while (state == MoEOverlayGpuRemoteLaneProgress::Pending &&
-                                   std::chrono::steady_clock::now() < deadline)
-                            {
-                                state = remote->poll(remote.get(), &error);
-                                std::this_thread::yield();
-                            }
-                            ASSERT_EQ(state, MoEOverlayGpuRemoteLaneProgress::Ready) << error;
-                            if (to_cpu)
-                            {
-                                const auto bytes_out = remote->pinnedOutput(remote.get(), bytes);
-                                ASSERT_EQ(bytes_out.size(), bytes);
-                                EXPECT_TRUE(std::equal(bytes_out.begin(), bytes_out.end(),
-                                    cpu.native_interleaved.begin() + layout.chunkBytes(first)));
-                            }
-                            ASSERT_TRUE(remote->release(remote.get(), &error)) << error;
-                            remote_acquired = false;
-                        }
-                    }
-                }
-                EXPECT_EQ(epoch->stats().commands_published, epoch->stats().commands_completed);
-                EXPECT_GT(epoch->stats().bytes_completed, 0u);
-                release_guard.reset();
-                std::vector<std::uint8_t> actual_payload;
-                std::vector<std::uint16_t> actual_scales, actual_mins;
-                std::vector<std::uint32_t> actual_emins;
-                ASSERT_EQ(output.download(actual_payload), cudaSuccess);
-                ASSERT_EQ(output_scales.download(actual_scales), cudaSuccess);
-                ASSERT_EQ(output_mins.download(actual_mins), cudaSuccess);
-                ASSERT_EQ(output_emins.download(actual_emins), cudaSuccess);
-                EXPECT_EQ(actual_payload, promoted.payload);
-                EXPECT_EQ(actual_scales, promoted.scales);
-                EXPECT_EQ(actual_mins, promoted.mins);
-                EXPECT_EQ(actual_emins, promoted.emins);
-            }
-        }
-
-        /** All local CPU-tier source formats share captured conversion progress. */
-        TEST_F(CUDAExpertTierWeightKernelsTest, CapturedLocalPackedTransfersProgressAllFormats)
-        { proveCapturedPackedTransfer(CapturedPackedClient::LocalTier); }
-
-        /** MPI-facing projection lanes obey the identical capture/completion contract. */
-        TEST_F(CUDAExpertTierWeightKernelsTest, CapturedRemotePackedTransfersProgressAllFormats)
-        { proveCapturedPackedTransfer(CapturedPackedClient::RemoteProjection); }
+#include "utils/ExpertTierCapturedPackedTransferContract.inc"
+        /** Existing capture progression coverage; original backend completion policy is explicit. */
+        TEST_F(CUDAExpertTierWeightKernelsTest,CapturedLocalPackedTransfersProgressAllFormats)
+        { proveCapturedPackedTransfer<TestCUDABuffer,cudaSuccess>(DeviceId::cuda(0),CapturedPackedClient::LocalTier); }
+        TEST_F(CUDAExpertTierWeightKernelsTest,CapturedRemotePackedTransfersProgressAllFormats)
+        { proveCapturedPackedTransfer<TestCUDABuffer,cudaSuccess>(DeviceId::cuda(0),CapturedPackedClient::RemoteProjection); }
+        /** Compact rectangle repetition uses the actual retained lane and exact completion extents. */
+        TEST_F(CUDAExpertTierWeightKernelsTest,CapturedLocalRectangularTransfersAllFormats)
+        { proveCapturedPackedTransfer<TestCUDABuffer,cudaSuccess>(DeviceId::cuda(0),CapturedPackedClient::LocalTier,true); }
+        TEST_F(CUDAExpertTierWeightKernelsTest,CapturedRemoteRectangularTransfersAllFormats)
+        { proveCapturedPackedTransfer<TestCUDABuffer,cudaSuccess>(DeviceId::cuda(0),CapturedPackedClient::RemoteProjection,true); }
 
         /**
          * @test TransferEngine exposes exactly the requested reusable CUDA queues.
@@ -893,8 +689,7 @@ namespace llaminar2
             const std::string pool_name =
                 "cuda_expert_tier_execution_pool_contract";
 
-            const auto first = TransferEngine::instance()
-                                   .allocatePersistentTransferExecutionLanes(
+            const auto first = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                        lane_count,
                                        device,
                                        pool_name);
@@ -913,8 +708,7 @@ namespace llaminar2
                 }
             }
 
-            const auto reused = TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+            const auto reused = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         lane_count,
                                         device,
                                         pool_name);
@@ -951,8 +745,7 @@ namespace llaminar2
                                          staging_bytes,
                                          2u,
                                          device);
-            const auto execution = TransferEngine::instance()
-                                       .allocatePersistentTransferExecutionLanes(
+            const auto execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                            1u,
                                            device,
                                            "cuda_shared_execution_race_contract")
@@ -1088,12 +881,12 @@ namespace llaminar2
                 makeProjection(GetParam());
             ASSERT_TRUE(source.valid());
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
                 source, expected_cpu, &error)) << error;
-            const NativeVnniFormatInfo *source_format =
-                native_vnni_formats::forSourceIdentity(
+            const NativeQuantisedFormatInfo *source_format =
+                native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id, source.is_superblock);
             ASSERT_NE(source_format, nullptr);
             const ExpertTierWeightStreamManifest manifest =
@@ -1139,7 +932,7 @@ namespace llaminar2
             {
                 const std::uint32_t units =
                     std::min<std::uint32_t>(2, layout.unit_count - first_unit);
-                const std::size_t bytes = layout.chunkBytes(units);
+                const std::size_t bytes = layout.chunkBytes(units,first_unit);
                 ASSERT_TRUE(launchGpuToCpuExpertTierChunkCUDA(
                     source_view, layout, first_unit, units,
                     device_cpu_chunk.data(), device_cpu_chunk.bytes(),
@@ -1149,10 +942,8 @@ namespace llaminar2
                     cudaMemcpyDeviceToHost, stream.native()), cudaSuccess);
                 ASSERT_EQ(stream.synchronize(), cudaSuccess);
 
-                const auto expected_begin =
-                    expected_cpu.native_interleaved.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        layout.chunkBytes(first_unit));
+                const auto expected_wire=test::expertTierWireOracle(layout,expected_cpu.native_interleaved,first_unit,units);
+                const auto expected_begin=expected_wire.begin();
                 EXPECT_TRUE(std::equal(
                     observed_chunk.begin(), observed_chunk.begin() + bytes,
                     expected_begin));
@@ -1191,10 +982,9 @@ namespace llaminar2
                 const std::uint32_t units =
                     std::min<std::uint32_t>(
                         2, promotion_layout.unit_count - first_unit);
-                const std::size_t bytes = promotion_layout.chunkBytes(units);
-                const std::uint8_t *host_source =
-                    expected_cpu.native_interleaved.data() +
-                    promotion_layout.chunkBytes(first_unit);
+                const std::size_t bytes = promotion_layout.chunkBytes(units,first_unit);
+                const auto expected_wire=test::expertTierWireOracle(promotion_layout,expected_cpu.native_interleaved,first_unit,units);
+                const std::uint8_t *host_source=expected_wire.data();
                 ASSERT_EQ(cudaMemcpyAsync(
                     device_cpu_chunk.data(), host_source, bytes,
                     cudaMemcpyHostToDevice, stream.native()), cudaSuccess);
@@ -1222,7 +1012,7 @@ namespace llaminar2
             ::testing::Values(
                 FormatCase{0, 16, false, false, "Q4_0"},
                 FormatCase{4, 16, false, false, "IQ4NL"},
-                FormatCase{kNativeVnniIQ4XSSourceScaleCodebook, 16, true, true, "IQ4XS"},
+                FormatCase{kNativeQuantisedIQ4XSSourceScaleCodebook, 16, true, true, "IQ4XS"},
                 FormatCase{5, 16, true, true, "Q4K"},
                 FormatCase{8, 24, true, true, "Q6K"},
                 FormatCase{19, 32, false, false, "ExpandedInt8"}),
@@ -1258,12 +1048,12 @@ namespace llaminar2
                     packProductionGpuProjection(*tensor);
                 std::string error;
                 ASSERT_TRUE(source.valid(&error)) << error;
-                cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
-                ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
+                ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                     tensor.get(), expected_cpu));
 
-                const NativeVnniFormatInfo *source_format =
-                    native_vnni_formats::forSourceIdentity(
+                const NativeQuantisedFormatInfo *source_format =
+                    native_quantised_formats::forSourceIdentity(
                         source.source_codebook_id,
                         source.is_superblock);
                 ASSERT_NE(source_format, nullptr);
@@ -1282,7 +1072,7 @@ namespace llaminar2
                 ASSERT_TRUE(layout.valid());
                 ASSERT_EQ(
                     expected_cpu.native_interleaved.size(),
-                    manifest.total_stream_bytes);
+                    manifest.deviceLayout().cpuStorageBytes());
 
                 TestCUDABuffer<std::uint8_t> source_payload(
                     source.payload.size());
@@ -1321,7 +1111,7 @@ namespace llaminar2
                             units_per_chunk,
                             layout.unit_count - first_unit);
                     const std::size_t bytes =
-                        layout.chunkBytes(unit_count);
+                        layout.chunkBytes(unit_count,first_unit);
                     ASSERT_TRUE(launchGpuToCpuExpertTierChunkCUDA(
                         source_view,
                         layout,
@@ -1337,10 +1127,8 @@ namespace llaminar2
                         cudaMemcpyDeviceToHost,
                         stream.native()), cudaSuccess);
                     ASSERT_EQ(stream.synchronize(), cudaSuccess);
-                    const auto expected_begin =
-                        expected_cpu.native_interleaved.begin() +
-                        static_cast<std::ptrdiff_t>(
-                            layout.chunkBytes(first_unit));
+                    const auto expected_wire=test::expertTierWireOracle(layout,expected_cpu.native_interleaved,first_unit,unit_count);
+                    const auto expected_begin=expected_wire.begin();
                     const auto mismatch = std::mismatch(
                         observed.begin(),
                         observed.begin() + bytes,
@@ -1371,13 +1159,13 @@ namespace llaminar2
             const FormatCase format{19, 32, false, false, "ExpandedInt8"};
             const HostGpuExpertPackedProjection source =
                 makeProjection(format, 192, 256);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
                 source, expected_cpu, &error)) << error;
 
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(19, false);
+                native_quantised_formats::forSourceIdentity(19, false);
             ASSERT_NE(source_format, nullptr);
             const auto demotion_manifest =
                 makeGpuToCpuExpertTierWeightStreamManifest(
@@ -1415,8 +1203,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_tier_round_trip")
@@ -1530,11 +1317,11 @@ namespace llaminar2
             ASSERT_NE(tensor, nullptr);
             const HostGpuExpertPackedProjection source =
                 packProductionGpuProjection(*tensor);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), expected_cpu));
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id,
                     source.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -1577,10 +1364,10 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        layout.chunkBytes(units_per_chunk),
                                        1u,
-                                       DeviceId::cuda(device_ordinal))
+                                       DeviceId::cuda(device_ordinal),
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          DeviceId::cuda(device_ordinal),
                                          "cuda_secondary_device_remote_projection")
@@ -1691,8 +1478,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_floating_tier_round_trip")
@@ -1768,11 +1554,44 @@ namespace llaminar2
                 ASSERT_EQ(
                     gpu_destination.download(observed_gpu), cudaSuccess);
                 EXPECT_EQ(observed_gpu, source);
+                // Same lane, original coordinate intersections and arbitrary
+                // floating K17. No quantized-block alignment is imposed here.
+                using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
+                const P originalSource{R::ParticipantOutputSlice,32,32,2,n,1,k};
+                const P originalTarget{R::ParticipantInputSlice,32,32,8,17,7,17};
+                const auto rectangle=ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget);
+                const auto reverse=ExpertTierWeightProjectionIntersection::between(originalTarget,originalSource);
+                std::vector<uint8_t> rectangleCPU(size_t(17*17)*element_bytes,0xa5);
+                const auto beforeRectangleBytes=lane.stats().bytes_submitted;
+                void* rectangleReady=backend->createEvent(0);ASSERT_NE(rectangleReady,nullptr);
+                ASSERT_TRUE(backend->recordEvent(rectangleReady,0,producer_stream.opaque()));
+                ASSERT_TRUE(lane.startGpuToCpuContiguous(source_descriptor,rectangleCPU,
+                    ExpertTierSourceReadiness::producerEvent(rectangleReady),rectangle,&error)) << error;
+                ASSERT_EQ(pollLaneToCompletion(lane),ExpertTierWeightTransferProgress::Ready);
+                backend->destroyEvent(rectangleReady,0);
+                for(size_t row=0;row<17;++row)for(size_t column=0;column<17;++column)
+                    for(size_t byte=0;byte<element_bytes;++byte)
+                        EXPECT_EQ(rectangleCPU[(row*17+column)*element_bytes+byte],
+                            row<13?source[((row+6)*k+column+6)*element_bytes+byte]:uint8_t(0xa5));
+                ASSERT_EQ(gpu_destination.upload(std::vector<uint8_t>(bytes,0xa5)),cudaSuccess);
+                ASSERT_TRUE(lane.startCpuToGpuContiguous(rectangleCPU,destination_descriptor,reverse,&error)) << error;
+                ASSERT_EQ(pollLaneToCompletion(lane),ExpertTierWeightTransferProgress::Ready);
+                ASSERT_EQ(gpu_destination.download(observed_gpu),cudaSuccess);
+                for(size_t row=0;row<size_t(n);++row)for(size_t column=0;column<size_t(k);++column)
+                    for(size_t byte=0;byte<element_bytes;++byte) {
+                        const size_t index=(row*k+column)*element_bytes+byte;
+                        EXPECT_EQ(observed_gpu[index],row>=6 && column>=6?source[index]:uint8_t(0xa5));
+                    }
+                EXPECT_EQ(lane.stats().bytes_submitted-beforeRectangleBytes,size_t(2*13*17)*element_bytes);
+
             }
 
             const auto stats = lane.stats();
-            EXPECT_EQ(stats.transfers_started, 6u);
-            EXPECT_EQ(stats.transfers_completed, 6u);
+            // Each precision completes a whole projection and an original-coordinate
+            // rectangle in both directions on this same persistent lane.
+            const auto completed_per_direction = 2u * formats.size();
+            EXPECT_EQ(stats.transfers_started, 2u * completed_per_direction);
+            EXPECT_EQ(stats.transfers_completed, 2u * completed_per_direction);
             EXPECT_GT(stats.chunks_submitted, stats.transfers_completed);
             EXPECT_EQ(stats.inference_stream_waits, 0u);
             EXPECT_EQ(stats.blocking_synchronizations, 0u);
@@ -1787,7 +1606,7 @@ namespace llaminar2
                     [&](const PerfStatRecord &record)
                     {
                         return perfTag(record, "direction") == direction &&
-                               record.value == 3.0;
+                               record.value == static_cast<double>(completed_per_direction);
                     });
             };
             EXPECT_TRUE(observed_direction("gpu_to_cpu"));
@@ -1795,17 +1614,12 @@ namespace llaminar2
         }
 
         /**
-         * @test Promoted asymmetric CPU weights remain executable on CUDA.
+         * @test Partial-N Q5_1 remote promotion and demotion preserve every live byte.
          *
-         * Q5_1 loses its compact 5-bit representation in the CPU cold tier.
-         * Promotion must therefore publish execution codebook 23: signed INT8
-         * payload plus the original FP16 minimum. This test streams those real
-         * CPU-native bytes through the persistent production lane, then compares
-         * CUDA decode and verifier-depth output words against the original
-         * compact codebook-7 matrix. N=512,K=2048 deliberately selects a
-         * different generated serial split-K count for source codebook 7 and
-         * physical codebook 23 on Ampere, proving that promotion retains the
-         * source arithmetic policy rather than merely decoding equal values.
+         * N70/K96 retains a 128-column CPU allocation but communicates only
+         * 70 live columns. GPU payload and metadata are checked against the
+         * original CPU oracle. The final CPU allocation must contain exact
+         * live encoded planes and untouched poison in allocation-only columns.
          */
         TEST_F(
             CUDAExpertTierWeightKernelsTest,
@@ -1819,8 +1633,8 @@ namespace llaminar2
             auto tensor = format.create({N, K}, 0xc0da51u);
             ASSERT_NE(tensor, nullptr);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
             ASSERT_TRUE(cpu_weights.usesExpandedInt8());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
@@ -1831,7 +1645,7 @@ namespace llaminar2
                 << error;
             ASSERT_EQ(
                 expected_gpu.codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
 
             const MoEOverlayRemoteProjectionIdentity promotion_identity{
                 .expected_epoch = promoted_epoch - 1,
@@ -1906,10 +1720,10 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        promotion_manifest.maximum_chunk_bytes,
                                        1u,
-                                       DeviceId::cuda(0))
+                                       DeviceId::cuda(0),
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          DeviceId::cuda(0),
                                          "cuda_remote_q51_roundtrip")
@@ -1920,7 +1734,7 @@ namespace llaminar2
                 });
             ASSERT_TRUE(lane->materialize(&error)) << error;
 
-            const NativeVnniSourceIdentity source_identity{
+            const NativeQuantisedSourceIdentity source_identity{
                 .codebook_id = cpu_weights.codebook_id,
                 .is_superblock = cpu_weights.is_superblock,
                 .present = true,
@@ -1982,9 +1796,30 @@ namespace llaminar2
                 };
             MoEOverlayRemoteProjectionChunkCursor cursor(
                 promotion_manifest, cpu_regions);
+            ASSERT_TRUE(cursor.requiresCPUStaging());
+            // The original CPU root is gathered into one exclusive bounded
+            // send lane. Retain it until beginChunk/pollChunk reports the
+            // exact native copy complete before reusing it for the next chunk.
+            const auto send_staging = TransferEngine::instance().allocatePinnedHostBuffer(
+                promotion_manifest.maximum_chunk_bytes, DeviceId::cuda(0));
+            ASSERT_TRUE(send_staging->isBound());
+            ASSERT_EQ(send_staging->sizeBytes(), promotion_manifest.maximum_chunk_bytes);
+            ASSERT_LT(send_staging->sizeBytes(), cpu_regions[0].size());
+            ASSERT_LT(send_staging->sizeBytes(), promotion_manifest.total_bytes);
+            const std::span<std::uint8_t> send_bytes{
+                static_cast<std::uint8_t *>(send_staging->mutableData()), send_staging->sizeBytes()};
+            const auto source_hash = expertTierWeightBytesHash(cpu_regions[0]);
+            EXPECT_FALSE(cursor.takeNext().has_value());
+            EXPECT_FALSE(cursor.complete()); // Missing staging cannot advance source ownership.
             std::uint64_t promotion_chunks = 0;
-            while (auto chunk = cursor.takeNext())
+            std::uint64_t promotion_wire_bytes = 0;
+            while (auto chunk = cursor.takeNext(send_bytes))
             {
+                ASSERT_EQ(chunk->payload.data(), send_bytes.data());
+                ASSERT_GT(chunk->payload.size(), 0u);
+                ASSERT_LE(chunk->payload.size(), send_bytes.size());
+                ASSERT_EQ(chunk->header.payload_bytes, chunk->payload.size());
+                promotion_wire_bytes += chunk->payload.size();
                 auto progress = destination.beginChunk(
                     chunk->header, chunk->payload, &error);
                 const auto deadline = std::chrono::steady_clock::now() +
@@ -2000,6 +1835,8 @@ namespace llaminar2
                 ++promotion_chunks;
             }
             ASSERT_TRUE(cursor.complete());
+            EXPECT_EQ(promotion_wire_bytes, promotion_manifest.total_bytes);
+            EXPECT_EQ(expertTierWeightBytesHash(cpu_regions[0]), source_hash);
             ASSERT_TRUE(destination.complete());
             ASSERT_TRUE(destination.publishFinal(&error)) << error;
             ASSERT_NE(destination.preparedEngine(), nullptr);
@@ -2020,7 +1857,7 @@ namespace llaminar2
             EXPECT_EQ(observed_emins, expected_gpu.emins);
 
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     cpu_weights.codebook_id,
                     cpu_weights.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -2065,12 +1902,21 @@ namespace llaminar2
                 ExpertTierSourceReadiness::publishedResidencyBank(
                     promoted_epoch),
                 source_lifetime);
-            MoEOverlayRemoteProjectionChunkValidator validator(
-                demotion_manifest);
-            std::vector<std::uint8_t> redemoted_cpu_bytes(
+            auto cpu_destination_owner = std::make_shared<std::vector<std::uint8_t>>(
                 cpu_weights.native_interleaved.size(), 0xa5u);
+            auto &redemoted_cpu_bytes = *cpu_destination_owner;
+            // Wire units are compact transfer order, not native interleaved
+            // CPU allocation offsets. Exercise the production destination's
+            // authenticated scatter into the original final representation.
+            MoEOverlayHostRemoteProjectionDestination cpu_destination(
+                demotion_identity,
+                {std::span<std::uint8_t>(redemoted_cpu_bytes), {}, {}, {}},
+                cpu_destination_owner,
+                demotion_manifest);
+            ASSERT_TRUE(cpu_destination.beginManifest(demotion_manifest, &error)) << error;
             std::uint64_t demotion_chunks = 0;
-            while (!validator.complete())
+            std::uint64_t demotion_wire_bytes = 0;
+            while (!cpu_destination.complete())
             {
                 MoEOverlayRemoteProjectionChunkView chunk;
                 auto progress = source.pollNextChunk(&chunk, &error);
@@ -2084,24 +1930,32 @@ namespace llaminar2
                 }
                 ASSERT_EQ(progress, MoEOverlayResidencyWaveProgress::Ready)
                     << error;
-                ASSERT_TRUE(validator.accept(
-                    chunk.header, chunk.payload, &error))
-                    << error;
-                std::memcpy(
-                    redemoted_cpu_bytes.data() + chunk.header.region_offset,
-                    chunk.payload.data(),
-                    chunk.payload.size());
+                ASSERT_EQ(cpu_destination.beginChunk(
+                              chunk.header, chunk.payload, &error),
+                          MoEOverlayResidencyWaveProgress::Ready) << error;
+                demotion_wire_bytes += chunk.payload.size();
                 ASSERT_TRUE(source.acknowledgeChunkSent(
                     chunk.header, &error))
                     << error;
                 ++demotion_chunks;
             }
+            EXPECT_EQ(demotion_wire_bytes, demotion_manifest.total_bytes);
+            ASSERT_TRUE(cpu_destination.publishFinal(&error)) << error;
             EXPECT_EQ(redemoted_cpu_bytes.size(),
                       cpu_weights.native_interleaved.size());
-            EXPECT_TRUE(std::equal(
-                redemoted_cpu_bytes.begin(),
-                redemoted_cpu_bytes.end(),
-                cpu_weights.native_interleaved.begin()));
+            // Original packing coordinates, not observed transfer writes,
+            // determine every expected byte, including untouched padding.
+            std::vector<std::uint8_t> expected_cpu_bytes(redemoted_cpu_bytes.size(), 0xa5u);
+            size_t live_bytes = 0;
+            for (size_t byte = 0; byte < expected_cpu_bytes.size(); ++byte)
+                if (test::expertTierExpandedCPUByteRow(cpu_weights, byte) < size_t(N))
+                {
+                    expected_cpu_bytes[byte] = cpu_weights.native_interleaved[byte];
+                    ++live_bytes;
+                }
+            EXPECT_EQ(demotion_wire_bytes, live_bytes);
+            EXPECT_LT(live_bytes, expected_cpu_bytes.size());
+            EXPECT_EQ(redemoted_cpu_bytes, expected_cpu_bytes);
             EXPECT_GT(promotion_chunks, 1u);
             EXPECT_GT(demotion_chunks, 1u);
 
@@ -2148,8 +2002,8 @@ namespace llaminar2
             ASSERT_EQ(compact.codebook_id, 7u);
             ASSERT_TRUE(compact.is_asymmetric);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
             ASSERT_TRUE(cpu_weights.usesExpandedInt8());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
@@ -2184,7 +2038,7 @@ namespace llaminar2
             ASSERT_TRUE(layout.valid());
             ASSERT_EQ(
                 layout.gpu_codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * (K / 32);
 
@@ -2213,8 +2067,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_asymmetric_promotion_execution")
@@ -2243,7 +2096,7 @@ namespace llaminar2
              * source storage or a host shadow of the GPU bank.
              */
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     compact.source_codebook_id,
                     compact.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -2290,19 +2143,19 @@ namespace llaminar2
                 layout.gpu_codebook_id,
                 static_cast<std::uint32_t>(K / 32),
                 slot_lifetime,
-                NativeVnniSourceIdentity{
+                NativeQuantisedSourceIdentity{
                     .codebook_id = compact.source_codebook_id,
                     .is_superblock = compact.is_superblock,
                     .present = true,
                 },
-                NativeVnniReusableDeviceAllocationFormat{
+                NativeQuantisedReusableDeviceAllocationFormat{
                     .payload_bytes_per_block =
                         layout.gpu_payload_bytes_per_block,
                     .has_mins = layout.gpu_is_asymmetric != 0,
                     .has_emins = layout.gpu_has_emins != 0,
                 });
-            DeviceNativeVNNIMatrixDesc published_descriptor;
-            ASSERT_TRUE(promoted_engine->exportNativeVNNIMatrixDesc(
+            DeviceNativeQuantisedMatrixDesc published_descriptor;
+            ASSERT_TRUE(promoted_engine->exportNativeQuantisedMatrixDesc(
                 published_descriptor));
             ASSERT_TRUE(published_descriptor.valid());
             EXPECT_EQ(published_descriptor.payload, promoted_payload.data());
@@ -2331,7 +2184,7 @@ namespace llaminar2
             ASSERT_TRUE(redemotion_layout.valid());
             ASSERT_EQ(
                 redemotion_layout.gpu_codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
             const ExpertTierGpuConstProjectionView promoted_source_view{
                 .payload = promoted_payload.data(),
                 .scales = promoted_scales.data(),
@@ -2425,7 +2278,7 @@ namespace llaminar2
             ASSERT_NE(gemv_context, nullptr);
             TestCUDABuffer<float> partials(
                 static_cast<std::size_t>(
-                    NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                 verifier_rows * N);
             cudaGemvContext_bindWorkspace(
                 gemv_context,
@@ -2438,7 +2291,7 @@ namespace llaminar2
             std::size_t compact_prefill_workspace_bytes = 0;
             std::size_t promoted_prefill_workspace_bytes = 0;
             int planned_partitions = 1;
-            ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
+            ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
                 compact.codebook_id,
                 compact.source_codebook_id,
                 prefill_rows,
@@ -2447,7 +2300,7 @@ namespace llaminar2
                 0,
                 &compact_prefill_workspace_bytes,
                 &planned_partitions));
-            ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
+            ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
                 layout.gpu_codebook_id,
                 layout.gpu_source_codebook_id,
                 prefill_rows,
@@ -2484,7 +2337,7 @@ namespace llaminar2
                 {
                     if (rows == 1)
                     {
-                        return cudaNativeVNNIGemvTuned_fp32_withPolicy(
+                        return cudaNativeQuantisedGemvTuned_fp32_withPolicy(
                             activation.data(), payload, scales, mins, nullptr,
                             output, activation_scales.data(), N, K,
                             1.0f, 0.0f, nullptr, nullptr, codebook,
@@ -2493,14 +2346,14 @@ namespace llaminar2
                     }
                     if (rows == verifier_rows)
                     {
-                        return cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+                        return cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
                             activation.data(), payload, scales, mins, nullptr,
                             output, activation_scales.data(), rows, N, K,
                             1.0f, 0.0f, nullptr, nullptr, codebook,
                             arithmetic_policy_codebook, 0,
                             stream.opaque(), gemv_context, nullptr);
                     }
-                    return cudaNativeVNNIPrefill_fp32_withPolicy(
+                    return cudaNativeQuantisedPrefill_fp32_withPolicy(
                         activation.data(), payload, scales, mins, nullptr,
                         output, activation_scales.data(), activation_sums.data(),
                         rows, N, K, 1.0f, 0.0f, nullptr, nullptr, codebook,
@@ -2541,9 +2394,9 @@ namespace llaminar2
             }
 
             const auto decode_records = PerfStatsCollector::snapshot(
-                {"kernel.cuda_native_vnni_gemv_dispatch"});
+                {"kernel.cuda_native_quantised_gemv_dispatch"});
             const auto prefill_records = PerfStatsCollector::snapshot(
-                {"kernel.cuda_native_vnni_prefill_calls"});
+                {"kernel.cuda_native_quantised_prefill_calls"});
             const auto has_policy_record = [](
                 const std::vector<PerfStatRecord> &records,
                 int rows,
@@ -2621,7 +2474,7 @@ namespace llaminar2
          *
          * The lower-level repack proof owns tightly sized test allocations. The
          * production physical fabric instead writes into a model-lifetime
-         * `GpuExpertSlotPool`: each NativeVNNI projection reserves the largest
+         * `GpuExpertSlotPool`: each NativeQuantised projection reserves the largest
          * supported payload/min/emins family and exposes only the arriving
          * format's logical regions. This regression closes that allocation
          * boundary so offset aliasing, capacity accounting, or slot-pool layout
@@ -2639,8 +2492,8 @@ namespace llaminar2
             auto tensor = format.create({N, K}, 0xc0da5b1u);
             ASSERT_NE(tensor, nullptr);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
             ASSERT_TRUE(cpu_weights.usesExpandedInt8());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
@@ -2652,9 +2505,9 @@ namespace llaminar2
                 << error;
             ASSERT_EQ(
                 expected.codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
 
-            const NativeVnniSourceIdentity source_identity{
+            const NativeQuantisedSourceIdentity source_identity{
                 .codebook_id = cpu_weights.codebook_id,
                 .is_superblock = cpu_weights.is_superblock,
                 .present = true,
@@ -2675,7 +2528,7 @@ namespace llaminar2
                     .is_asymmetric = true,
                     .has_emins = true,
                     .codebook_id = expected.codebook_id,
-                    .format = ExpertWeightFormat::nativeVnni(
+                    .format = ExpertWeightFormat::nativeQuantised(
                         source_identity),
                 }},
                 /*transfer_capacity=*/0);
@@ -2724,13 +2577,13 @@ namespace llaminar2
             ASSERT_GE(slot.mins_bytes, logical_mins_bytes);
 
             ExpertTierGpuMutableProjectionView destination{
-                .payload = slot.d_native_vnni_payload,
+                .payload = slot.d_native_quantised_payload,
                 .scales = static_cast<std::uint16_t *>(
-                    slot.d_native_vnni_scales),
+                    slot.d_native_quantised_scales),
                 .mins = static_cast<std::uint16_t *>(
-                    slot.d_native_vnni_mins),
+                    slot.d_native_quantised_mins),
                 .emins = static_cast<std::uint32_t *>(
-                    slot.d_native_vnni_emins),
+                    slot.d_native_quantised_emins),
                 // The production descriptor exposes exact logical regions
                 // over the deliberately larger reusable slot allocation.
                 .payload_bytes = logical_payload_bytes,
@@ -2748,8 +2601,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_production_shadow_slot_q5k")
@@ -2777,21 +2629,21 @@ namespace llaminar2
             ASSERT_EQ(
                 cudaMemcpy(
                     observed_payload.data(),
-                    slot.d_native_vnni_payload,
+                    slot.d_native_quantised_payload,
                     observed_payload.size(),
                     cudaMemcpyDeviceToHost),
                 cudaSuccess);
             ASSERT_EQ(
                 cudaMemcpy(
                     observed_scales.data(),
-                    slot.d_native_vnni_scales,
+                    slot.d_native_quantised_scales,
                     observed_scales.size() * sizeof(std::uint16_t),
                     cudaMemcpyDeviceToHost),
                 cudaSuccess);
             ASSERT_EQ(
                 cudaMemcpy(
                     observed_mins.data(),
-                    slot.d_native_vnni_mins,
+                    slot.d_native_quantised_mins,
                     observed_mins.size() * sizeof(std::uint16_t),
                     cudaMemcpyDeviceToHost),
                 cudaSuccess);
@@ -2804,7 +2656,7 @@ namespace llaminar2
         }
 
         /**
-         * @test Real NativeVNNI inference completes unchanged during migration.
+         * @test Real NativeQuantised inference completes unchanged during migration.
          *
          * The baseline and concurrent launches use the same production GEMV,
          * inputs, weights, and explicit inference stream. A 24-chunk demotion
@@ -2819,12 +2671,12 @@ namespace llaminar2
             const FormatCase format{0, 16, false, false, "Q4_0"};
             const HostGpuExpertPackedProjection source =
                 makeProjection(format, 192, 256);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
                 source, expected_cpu, &error)) << error;
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(0, false);
+                native_quantised_formats::forSourceIdentity(0, false);
             ASSERT_NE(source_format, nullptr);
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
@@ -2867,13 +2719,13 @@ namespace llaminar2
             ASSERT_NE(gemv_context, nullptr);
             TestCUDABuffer<float> gemv_partials(
                 static_cast<std::size_t>(
-                    NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                 static_cast<std::size_t>(source.N));
             cudaGemvContext_bindWorkspace(
                 gemv_context,
                 gemv_partials.data(),
                 gemv_partials.bytes());
-            ASSERT_TRUE(cudaNativeVNNIGemvTuned_fp32(
+            ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
                 activation.data(),
                 payload.data(),
                 scales.data(),
@@ -2911,8 +2763,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_inference_overlap")
@@ -2931,7 +2782,7 @@ namespace llaminar2
                 ExpertTierSourceReadiness::producerEvent(source_ready),
                 &error)) << error;
 
-            ASSERT_TRUE(cudaNativeVNNIGemvTuned_fp32(
+            ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
                 activation.data(),
                 payload.data(),
                 scales.data(),
@@ -3031,12 +2882,12 @@ namespace llaminar2
             const FormatCase format{0, 16, false, false, "Q4_0"};
             const HostGpuExpertPackedProjection source =
                 makeProjection(format, 1024, 256);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
                 source, expected_cpu, &error)) << error;
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(0, false);
+                native_quantised_formats::forSourceIdentity(0, false);
             ASSERT_NE(source_format, nullptr);
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
@@ -3089,7 +2940,7 @@ namespace llaminar2
             DeviceWorkspaceManager probe_workspace(device, 4096);
             constexpr int n = 64, k = 256;
             constexpr size_t blocks = n * (k / 32);
-            for (const auto &format : native_vnni_formats::kAllSourceFormats)
+            for (const auto &format : native_quantised_formats::kAllSourceFormats)
             {
                 SCOPED_TRACE(std::string(format.quant_type));
                 auto storage = std::make_shared<TestCUDABuffer<uint8_t>>(blocks * 40);
@@ -3097,7 +2948,7 @@ namespace llaminar2
                 auto *scales = reinterpret_cast<uint16_t *>(payload + blocks * 32);
                 auto *mins = scales + blocks;
                 auto *emins = reinterpret_cast<uint32_t *>(mins + blocks);
-                const NativeVnniSourceIdentity identity{
+                const NativeQuantisedSourceIdentity identity{
                     .codebook_id = format.metadata->codebook_id,
                     .is_superblock = format.metadata->is_superblock,
                     .present = true,
@@ -3106,7 +2957,7 @@ namespace llaminar2
                     n, k, 0, payload, scales, mins, emins,
                     canonicalDeviceVnniCodebookId(identity), k / 32,
                     storage, identity,
-                    NativeVnniReusableDeviceAllocationFormat{32, true, true});
+                    NativeQuantisedReusableDeviceAllocationFormat{32, true, true});
                 serving->setGPUStream(serving_stream.opaque());
                 serving->bindWorkspace(&serving_workspace);
                 auto probe = KernelFactory::createExpertServiceExecutionView(serving, device);
@@ -3119,9 +2970,9 @@ namespace llaminar2
                 EXPECT_EQ(serving->getGPUStream(), serving_stream.opaque());
                 EXPECT_EQ(serving->getWorkspace(), &serving_workspace);
 
-                DeviceNativeVNNIMatrixDesc expected, observed;
-                ASSERT_TRUE(serving->exportNativeVNNIMatrixDesc(expected));
-                ASSERT_TRUE(probe->exportNativeVNNIMatrixDesc(observed));
+                DeviceNativeQuantisedMatrixDesc expected, observed;
+                ASSERT_TRUE(serving->exportNativeQuantisedMatrixDesc(expected));
+                ASSERT_TRUE(probe->exportNativeQuantisedMatrixDesc(observed));
                 EXPECT_EQ(observed.payload, expected.payload);
                 EXPECT_EQ(observed.scales, expected.scales);
                 EXPECT_EQ(observed.mins, expected.mins);
@@ -3130,8 +2981,8 @@ namespace llaminar2
                 EXPECT_EQ(observed.k, expected.k);
                 EXPECT_EQ(observed.codebook_id, expected.codebook_id);
                 EXPECT_EQ(observed.allocation_payload_bytes_per_block, 32);
-                NativeVnniSourceIdentity observed_identity;
-                ASSERT_TRUE(probe->exportNativeVNNISourceIdentity(observed_identity));
+                NativeQuantisedSourceIdentity observed_identity;
+                ASSERT_TRUE(probe->exportNativeQuantisedSourceIdentity(observed_identity));
                 EXPECT_EQ(observed_identity, identity);
                 EXPECT_THROW((void)KernelFactory::createExpertServiceExecutionView(
                     serving, DeviceId::rocm(0)), std::invalid_argument);
@@ -3258,11 +3109,11 @@ namespace llaminar2
                 ASSERT_EQ(source.payload[at * 13 + 8],block.qh[sub]);
                 ASSERT_EQ(std::memcmp(source.payload.data() + at * 13 + 9,block.signs + sub * 4,4),0);
             }
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
             constexpr std::uint32_t first_unit = 1;
-            const auto *format = native_vnni_formats::forSourceIdentity(11,true);
+            const auto *format = native_quantised_formats::forSourceIdentity(11,true);
             ASSERT_NE(format,nullptr);
             const auto probe = makeGpuToCpuExpertTierWeightStreamManifest(*format,N,K,405,3,7,ExpertTierWeightProjection::Down,capacity_units);
             const auto demotion = probe.deviceLayout();
@@ -3274,7 +3125,7 @@ namespace llaminar2
             TestCUDABuffer<std::uint8_t> input_payload(source.payload.size()),destination_payload(source.payload.size());
             TestCUDABuffer<std::uint16_t> input_scales(source.scales.size()),input_coeff(source.mins.size());
             TestCUDABuffer<std::uint16_t> destination_scales(source.scales.size()),destination_coeff(source.mins.size());
-            TestCUDABuffer<std::uint8_t> chunk(demotion.chunkBytes(units));
+            TestCUDABuffer<std::uint8_t> chunk(demotion.chunkBytes(units,first_unit));
             ASSERT_EQ(input_payload.upload(source.payload),cudaSuccess);
             ASSERT_EQ(input_scales.upload(source.scales),cudaSuccess);ASSERT_EQ(input_coeff.upload(source.mins),cudaSuccess);
             ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
@@ -3311,7 +3162,7 @@ namespace llaminar2
                 ASSERT_EQ(cudaMemcpyAsync(observed_scales.data(),destination_scales.data(),destination_scales.bytes(),cudaMemcpyDeviceToHost,stream.native()),cudaSuccess);
                 ASSERT_EQ(cudaMemcpyAsync(observed_coeff.data(),destination_coeff.data(),destination_coeff.bytes(),cudaMemcpyDeviceToHost,stream.native()),cudaSuccess);
                 ASSERT_EQ(stream.synchronize(),cudaSuccess);
-                EXPECT_EQ(std::memcmp(observed_cpu.data(),cpu.native_interleaved.data()+demotion.chunkBytes(first_unit),chunk.bytes()),0) << "first_unit=" << first_unit;
+                EXPECT_EQ(std::memcmp(observed_cpu.data(),test::expertTierWireOracle(demotion,cpu.native_interleaved,first_unit,units).data(),chunk.bytes()),0) << "first_unit=" << first_unit;
                 for (int kb = 0; kb < K / 32; ++kb) for (int row = 0; row < N; ++row)
                 {
                     const auto linear = static_cast<std::size_t>(kb) * N + row;
@@ -3352,9 +3203,9 @@ namespace llaminar2
             }
             std::vector<std::uint8_t> bytes(sizeof(original));std::memcpy(bytes.data(),&original,sizeof(original));
             auto tensor=std::make_shared<IQ3_STensor>(std::vector<std::size_t>{N,K},bytes);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
             const auto layout=makeCpuToGpuExpertTierWeightStreamManifest(cpu,407,3,7,ExpertTierWeightProjection::Down,2).deviceLayout();
             ASSERT_TRUE(layout.valid());ASSERT_EQ(layout.gpu_codebook_id,11);
             TestCUDABuffer<std::uint8_t> payload(8*13);
@@ -3363,7 +3214,7 @@ namespace llaminar2
                 .payload=payload.data(),.scales=scales.data(),.mins=coefficients.data(),
                 .payload_bytes=payload.bytes(),.scales_bytes=scales.bytes(),.mins_bytes=coefficients.bytes()};
             ASSERT_TRUE(destination.validFor(layout));
-            const auto execution=TransferEngine::instance().allocatePersistentTransferExecutionLanes(
+            const auto execution=::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                 1u,DeviceId::cuda(0),"cuda_iq3_source_cold_promotion").front();
             ExpertTierWeightTransferLane lane({
                 .device=DeviceId::cuda(0),
@@ -3405,3 +3256,5 @@ namespace llaminar2
         }
     } // namespace
 } // namespace llaminar2
+
+#include "CUDAExpertTierRectangularWeightContract.inc"

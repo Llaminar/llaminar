@@ -50,9 +50,14 @@ Rank **paired exposed-time deficits**, not only percent-of-total hot spots.
 Compare arithmetic, reduction order, operand formats, actual memory traffic,
 occupancy, spills, launch geometry and stream overlap for the selected kernels.
 For GEMM dispatch work also use
-[NativeVNNI tuning](../nativevnni-gemm-tuning/SKILL.md); for MTP work use
+[NativeQuantised tuning](../nativequantised-gemm-tuning/SKILL.md); for MTP work use
 [MTP tuning](../mtp-tuning/SKILL.md). Never adopt a baseline's precision or
 non-invariant reduction merely to match its timing.
+
+Use the canonical [production kernel replay procedure](../llaminar-testing/references/kernel-replay.md)
+to isolate a paired deficit with fixed inputs/routes and complete operation
+boundaries. Its captured timings and byte checks guide tuning; the matched
+cross-engine model comparison remains the acceptance evidence.
 
 Profile one exact candidate/shape per launch, outside canonical timing. Then
 repeat the fixed Release benchmark, preferably A/B/A or interleaved repetitions,

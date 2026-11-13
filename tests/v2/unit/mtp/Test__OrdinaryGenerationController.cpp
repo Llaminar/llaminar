@@ -12,8 +12,10 @@
 #include "execution/mtp/DeviceGenerationContract.h"
 #include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "kernels/common/GenerationLogicalState.h"
+#include "kernels/common/NativeCounter64.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <bit>
 #include <limits>
 
 namespace
@@ -63,11 +65,32 @@ TEST(OrdinaryGenerationController, OrdinaryGraphOwnerInventoryMatchesNativeAndHo
 {
     using llaminar2::DeviceId;
     using llaminar2::OrdinaryGenerationGraphPlan;
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false), 2u);
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), true), 1u);
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0), false), 4u);
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0), true), 3u);
-    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cpu(), false), std::invalid_argument);
+    using llaminar2::MTPGenerationParentRole;
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::cuda(0),
+        false,
+        llaminar2::DeviceGenerationExecutionPolicy::NativeConditionalGraph,
+        MTPGenerationParentRole::Controller), 2u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::cuda(0),
+        true,
+        llaminar2::DeviceGenerationExecutionPolicy::NativeConditionalGraph,
+        MTPGenerationParentRole::Controller), 1u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::rocm(0),
+        false,
+        llaminar2::DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions,
+        MTPGenerationParentRole::Controller), 4u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::rocm(0),
+        true,
+        llaminar2::DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions,
+        MTPGenerationParentRole::Controller), 3u);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::cpu(),
+        false,
+        llaminar2::DeviceGenerationExecutionPolicy::Unsupported,
+        MTPGenerationParentRole::Controller), std::invalid_argument);
 }
 
 /** @test Admission owns resolved randomness; wrong row geometry fails before launch. */
@@ -433,8 +456,15 @@ TEST(OrdinaryGenerationController, HistoryAdmissionAndCommitAreExclusiveAndFailu
 
 TEST(OrdinaryGenerationController, PolicyIsExplicitAndSharesTheResidentStorageABI)
 {
-    static_assert(kDeviceGenerationControlCount == 52);
-    static_assert(sizeof(DeviceGenerationPolicy) == 15 * sizeof(int));
+    // Immutable measured-scope words append after existing observations; execution ordinals stay fixed.
+    static_assert(kDeviceGenerationControlInitialDraftDepth == 51);
+    static_assert(kDeviceGenerationControlQsaPriorHeaderBytesLow == 52);
+    static_assert(kDeviceGenerationControlQsaAcceptedPayloadBytesHigh == 59);
+    static_assert(kDeviceGenerationControlFixedHeadCallsLow == 60);
+    static_assert(kDeviceGenerationControlLearnedScopeWidthPolicy == 90);
+    static_assert(kDeviceGenerationControlLearnedScopeComputeCapabilityMinor == 99);
+    static_assert(kDeviceGenerationControlCount == 108);
+    static_assert(sizeof(DeviceGenerationPolicy) == 25 * sizeof(int));
     EXPECT_FALSE(DeviceGenerationPolicy::fixed(0).valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().isOrdinary());
@@ -664,9 +694,10 @@ TEST(OrdinaryGenerationController, TerminalContractRejectsForgedPolicyBudgetAndS
             i == 0 ? Source::PrefillLogits : Source::DecodeLogits, response.data(), 3, control.data()));
     ASSERT_EQ(validateDeviceGenerationTerminal(control, admission, 3, 0, 0),
         DeviceGenerationTerminalError::None);
-    // Every ABI word has a validity constraint in the ordinary terminal. The
-    // one legal nonzero movement row is separately authenticated by its source.
-    for (int index = 0; index < kDeviceGenerationControlCount; ++index)
+    // Execution words have signed validity constraints. The appended UINT64
+    // observation pairs are reporting only and permit every low/high bit pattern.
+    // The one legal nonzero movement row is authenticated by its source.
+    for (int index = 0; index < kDeviceGenerationControlQsaPriorHeaderBytesLow; ++index)
     {
         SCOPED_TRACE(index);
         for (int poison : {-1, std::numeric_limits<int>::max()})
@@ -688,6 +719,39 @@ TEST(OrdinaryGenerationController, TerminalContractRejectsForgedPolicyBudgetAndS
         DeviceGenerationTerminalError::InvalidMovementEvidence);
 }
 
+/** @test Unsigned work observations cannot change execution-terminal admission. */
+TEST(OrdinaryGenerationController, TerminalContractSeparatesUnsignedWorkObservations)
+{
+    Control control{};
+    std::array<int32_t, 1> response{};
+    const DeviceGenerationAdmissionRequest admission{
+        .request_count = 1, .max_new_tokens = 1,
+        .depth_policy = DeviceGenerationPolicy::ordinary()};
+    ASSERT_TRUE(initialize_device_generation_control(1, 1, admission.depth_policy, control.data()));
+    ASSERT_TRUE(append_ordinary_sample_to_device_generation(
+        19, false, Source::PrefillLogits, response.data(), 1, control.data()));
+    const std::array<std::uint64_t, 7> totals{
+        0, 1, UINT32_MAX, UINT64_C(1) << 32,
+        UINT64_C(0x7fffffffffffffff), UINT64_C(1) << 63, UINT64_MAX};
+    for (int low : {kDeviceGenerationControlQsaPriorHeaderBytesLow,
+                    kDeviceGenerationControlQsaPriorPayloadBytesLow,
+                    kDeviceGenerationControlQsaCandidatePayloadBytesLow,
+                    kDeviceGenerationControlQsaAcceptedPayloadBytesLow})
+    for (const auto total : totals)
+    {
+        SCOPED_TRACE(::testing::Message() << "low=" << low << " total=" << total);
+        auto observed = control;
+        observed[low] = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(total));
+        observed[low + 1] = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(total >> 32));
+        EXPECT_EQ(llaminar2::readNativeCounter64(observed.data() + low), total);
+        EXPECT_EQ(validateDeviceGenerationTerminal(observed, admission, 1, 0, 0),
+            DeviceGenerationTerminalError::None);
+        observed[kDeviceGenerationControlResponseTokenCount] = -1;
+        EXPECT_NE(validateDeviceGenerationTerminal(observed, admission, 1, 0, 0),
+            DeviceGenerationTerminalError::None);
+    }
+}
+
 /** @test The shared terminal gate preserves fixed, observed and dynamic MTP. */
 TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculativeDepth)
 {
@@ -704,16 +768,20 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
         Control control{};
         std::array<int32_t, 16> response{};
         std::array<int32_t, 16> tokens{};
+        std::array<int, 16> targets{}, accepted{};
         std::array<int, kSpeculativeBatchMetaCount> meta{};
-        for (int i = 0; i <= depth; ++i)
-            tokens[i] = 100 + i;
-        meta[kSpecBatchMetaOk] = 1;
-        meta[kSpecBatchMetaOutputCount] = depth + 1;
-        meta[kSpecBatchMetaAcceptedSpeculativePrefix] = depth;
-        meta[kSpecBatchMetaTargetVerifierStateCommitCount] = depth;
-        meta[kSpecBatchMetaAllSpeculativeAccepted] = 1;
-        meta[kSpecBatchMetaConsumedVerifierRows] = depth;
-        meta[kSpecBatchMetaSampledTerminal] = 1;
+        for (int i = 0; i < depth; ++i)
+        {
+            targets[i] = 100 + i;
+            accepted[i] = 1;
+        }
+        // The canonical producer includes the condition state in a full commit;
+        // hand-writing only `depth` states gives the learner inconsistent input.
+        summarize_speculative_verify_batch_at_commit_boundary(99, targets.data(),
+            accepted.data(), depth, nullptr, 0, 200, 1, depth + 1,
+            tokens.data(), tokens.size(), meta.data());
+        ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+        ASSERT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], depth + 1);
         ASSERT_TRUE(initialize_device_generation_control(depth + 1, response.size(), policy, control.data()));
         ASSERT_EQ(prepare_device_generation_transaction_budget(depth + 1, depth + 1, control.data()), depth + 1);
         ASSERT_TRUE(append_speculative_outcome_to_device_generation(tokens.data(), depth + 1,
@@ -744,4 +812,196 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
             DeviceGenerationTerminalError::InvalidAlgorithmAccounting);
     }
 }
+}
+
+/** @test One-shot PP operation has an explicit owner and rejects sampled/partial accounting. */
+TEST(OrdinaryGenerationController, PipelineForwardOnlyAdmissionAndTerminalAreExact)
+{
+    using namespace llaminar2;
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant), 2u);
+    DeviceGenerationAdmissionRequest request{.request_count = 1, .max_new_tokens = 0,
+        .depth_policy = DeviceGenerationPolicy::forwardOnly(),
+        .initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+    ASSERT_TRUE(request.valid());
+    auto invalid = request;
+    invalid.max_new_tokens = 1;
+    EXPECT_FALSE(invalid.valid());
+    invalid = request;
+    invalid.kind = DeviceGenerationAdmissionKind::ContinueResponse;
+    EXPECT_FALSE(invalid.valid());
+    invalid = request;
+    invalid.initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::PendingResponse;
+    EXPECT_FALSE(invalid.valid());
+    Control control{};
+    ASSERT_TRUE(initialize_device_generation_control(0, 8, request.depth_policy, control.data(),
+        request.initial_leading_row_disposition));
+    EXPECT_NE(validateDeviceGenerationTerminal(control, request, 8, 0, 0), DeviceGenerationTerminalError::None);
+    ASSERT_TRUE(complete_device_generation_forward(control.data()));
+    EXPECT_EQ(validateDeviceGenerationTerminal(control, request, 8, 0, 0), DeviceGenerationTerminalError::None);
+    for (int defect = 0; defect < 4; ++defect)
+    {
+        auto corrupt = control;
+        if (defect == 0) corrupt[kDeviceGenerationControlResponseTokenCount] = 1;
+        if (defect == 1) corrupt[kDeviceGenerationControlPublishedStateCommitCount] = 0;
+        if (defect == 2) corrupt[kDeviceGenerationControlTransactionCount] = 2;
+        if (defect == 3) corrupt[kDeviceGenerationControlOk] = 0;
+        EXPECT_NE(validateDeviceGenerationTerminal(corrupt, request, 8, 0, 0), DeviceGenerationTerminalError::None);
+    }
+}
+
+/** @test Immutable bounds preserve missing-proof safety, threshold and all request origins. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityAdmissionIsConservative)
+{
+    using namespace llaminar2;
+    using Program = SparseQueryExecutionProgram;
+    DeviceGenerationAdmissionRequest a{.request_count=1, .max_new_tokens=1,
+        .depth_policy=DeviceGenerationPolicy::ordinary()};
+    ASSERT_TRUE(a.valid());
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(a), Program::RankingPossible);
+    for (int visible : {2050, 2051, 2052})
+    {
+        a.initial_target_counts.emplace(std::vector<int>{visible-1});
+        ASSERT_TRUE(a.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a), visible <= 2051
+            ? Program::ProvenNoRanking : Program::RankingPossible);
+    }
+    a.request_count=3;
+    a.initial_target_counts.emplace(std::vector<int>{0,2050,12});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::ProvenNoRanking);
+    a.initial_target_counts.emplace(std::vector<int>{0,2051,12});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+    for (auto bad : {std::vector<int>{},std::vector<int>{0},std::vector<int>{0,-1,0},
+                    std::vector<int>{0,std::numeric_limits<int>::max(),0}})
+    {
+        a.initial_target_counts.emplace(std::move(bad));
+        EXPECT_FALSE(a.valid());
+        EXPECT_THROW(resolveSparseQueryExecutionProgram(a),std::invalid_argument);
+    }
+}
+
+/** @test Maximum executed depth protects clipped/observed/dynamic verifier overshoot. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityCoversDepthLeadingAndContinuation)
+{
+    using namespace llaminar2;
+    using Program = SparseQueryExecutionProgram;
+    for (auto mode : {DeviceGenerationPolicyMode::Fixed,DeviceGenerationPolicyMode::Observe,
+                      DeviceGenerationPolicyMode::Dynamic})
+    for (auto leading : {DeviceGenerationLeadingRowDisposition::PendingResponse,
+                         DeviceGenerationLeadingRowDisposition::AlreadyEmitted})
+    {
+        auto policy=DeviceGenerationPolicy::fixed(4);
+        policy.mode=mode;
+        if(mode!=DeviceGenerationPolicyMode::Fixed){policy.minimum_depth=1;policy.initial_depth=1;}
+        DeviceGenerationAdmissionRequest a{.request_count=1,.max_new_tokens=1,
+            .depth_policy=policy,.initial_leading_row_disposition=leading};
+        a.initial_target_counts.emplace(std::vector<int>{2045});
+        ASSERT_TRUE(a.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::ProvenNoRanking);
+        a.initial_target_counts.emplace(std::vector<int>{2046});
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+        a.kind=DeviceGenerationAdmissionKind::ContinueResponse;
+        a.initial_target_counts.emplace(std::vector<int>{2045});
+        a.max_new_tokens=2;
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+    }
+    DeviceGenerationAdmissionRequest restored{.request_count=1,.max_new_tokens=256,
+        .depth_policy=DeviceGenerationPolicy::ordinary()};
+    restored.initial_target_counts.emplace(std::vector<int>{512});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(restored),Program::ProvenNoRanking);
+    restored.initial_target_counts.emplace(std::vector<int>{4096});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(restored),Program::RankingPossible);
+}
+
+/** @test Every supported maximum depth and leading disposition uses one checked bound. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilitySweepsSupportedExecutionDepths)
+{
+    using namespace llaminar2;
+    using Program = SparseQueryExecutionProgram;
+    for (int depth=1;depth<=DeviceGenerationPolicy::kMaximumSupportedDraftDepth;++depth)
+    for (auto mode : {DeviceGenerationPolicyMode::Fixed,DeviceGenerationPolicyMode::Observe,
+                      DeviceGenerationPolicyMode::Dynamic})
+    for (auto leading : {DeviceGenerationLeadingRowDisposition::PendingResponse,
+                         DeviceGenerationLeadingRowDisposition::AlreadyEmitted})
+    {
+        SCOPED_TRACE(::testing::Message()<<"depth="<<depth<<" mode="<<int(mode)<<" leading="<<int(leading));
+        auto policy=DeviceGenerationPolicy::fixed(depth);
+        policy.mode=mode;
+        if(mode!=DeviceGenerationPolicyMode::Fixed){policy.minimum_depth=1;policy.initial_depth=1;}
+        DeviceGenerationAdmissionRequest a{.request_count=1,.max_new_tokens=1,
+            .depth_policy=policy,.initial_leading_row_disposition=leading};
+        a.initial_target_counts.emplace(std::vector<int>{2051-depth-2});
+        ASSERT_TRUE(a.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::ProvenNoRanking);
+        a.initial_target_counts.emplace(std::vector<int>{2052-depth-2});
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+        for(int invalid_budget : {-1,0,std::numeric_limits<int>::max()})
+        {
+            a.max_new_tokens=invalid_budget;
+            EXPECT_FALSE(a.valid());
+            EXPECT_THROW(resolveSparseQueryExecutionProgram(a),std::invalid_argument);
+        }
+        a.max_new_tokens=1;
+        a.initial_target_counts.emplace(std::vector<int>{std::numeric_limits<int>::max()-depth-1});
+        EXPECT_FALSE(a.valid());
+        EXPECT_THROW(resolveSparseQueryExecutionProgram(a),std::invalid_argument);
+    }
+}
+
+/** @test A supplied completed-prefix proof certifies one forced target row, never budget zero alone. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityForwardOnlyRequiresExplicitExtent)
+{
+    using namespace llaminar2;
+    DeviceGenerationAdmissionRequest request{.request_count=1,.max_new_tokens=0,
+        .depth_policy=DeviceGenerationPolicy::forwardOnly(),
+        .initial_leading_row_disposition=DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(request),SparseQueryExecutionProgram::RankingPossible);
+    for(int initial : {2050,2051})
+    {
+        request.initial_target_counts.emplace(std::vector<int>{initial});
+        ASSERT_TRUE(request.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(request),initial==2050
+            ? SparseQueryExecutionProgram::ProvenNoRanking : SparseQueryExecutionProgram::RankingPossible);
+    }
+    request.initial_target_counts.emplace(std::vector<int>{std::numeric_limits<int>::max()});
+    EXPECT_FALSE(request.valid());
+    EXPECT_THROW(resolveSparseQueryExecutionProgram(request),std::invalid_argument);
+    request.initial_target_counts.emplace(std::vector<int>{512});
+    request.initial_leading_row_disposition=DeviceGenerationLeadingRowDisposition::PendingResponse;
+    EXPECT_FALSE(request.valid());
+}
+
+/** @test Closed retained-program slots reject unknown values before owner access. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityProgramSlotsAreClosed)
+{
+    using namespace llaminar2;
+    static_assert(kSparseQueryExecutionProgramCount == 2);
+    static_assert(sparseQueryExecutionProgramIndex(SparseQueryExecutionProgram::RankingPossible) == 0);
+    static_assert(sparseQueryExecutionProgramIndex(SparseQueryExecutionProgram::ProvenNoRanking) == 1);
+    EXPECT_THROW(sparseQueryExecutionProgramIndex(static_cast<SparseQueryExecutionProgram>(-1)),
+                 std::invalid_argument);
+    EXPECT_THROW(sparseQueryExecutionProgramIndex(static_cast<SparseQueryExecutionProgram>(2)),
+                 std::invalid_argument);
+}
+
+/** @test Hosted CUDA and role-specific tail children are exact native owners. */
+TEST(OrdinaryGenerationController, DeclaredExecutionAndParentRoleOwnOrdinaryAuxiliaries)
+{
+    using namespace llaminar2;
+    using Policy = DeviceGenerationExecutionPolicy;
+    using Role = MTPGenerationParentRole;
+    for (const bool retained : {false, true})
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const std::size_t programs : {1u, 2u})
+    {
+        const auto base = retained ? 1u : 2u;
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::HostScheduledCapturedTransactions, Role::Controller, programs), (base + 2u) * programs);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::HostScheduledCapturedTransactions, Role::PipelineFollower, programs), base * programs);
+        if (device.is_cuda())
+            EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::NativeConditionalGraph, Role::PipelineFollower, programs), base * programs);
+        else
+            EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::NativeConditionalGraph, Role::PipelineFollower, programs), std::invalid_argument);
+    }
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false, Policy::Unsupported, MTPGenerationParentRole::Controller), std::invalid_argument);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false, Policy::HostScheduledCapturedTransactions, static_cast<Role>(255)), std::invalid_argument);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false, Policy::HostScheduledCapturedTransactions, Role::Controller, 3u), std::invalid_argument);
 }

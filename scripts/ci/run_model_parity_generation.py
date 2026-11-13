@@ -21,7 +21,7 @@ import time
 from generation_regression_http import MTPPolicy, admit_control, generation_profile, observation_traces, serial_workload_identity
 from generation_tokens import compare_tokens
 from generation_corpus import ApprovedGenerationCorpus
-from model_parity_inventory import InventoryScope, discover, source_revision
+from model_parity_inventory import InventoryScope, discover, source_revision, map_predictor_source, runtime_server_arguments
 from production_artifacts import digest, image_identity, model_identities, validate_prerequisites, write_json
 import run_model_parity_e2e as e2e
 import run_production_parity_campaigns as parity
@@ -221,15 +221,18 @@ def main(argv: list[str] | None = None) -> int:
         if installed is not None:
             validate_prerequisites(installed)
             report["prerequisite_report_digest"] = digest(installed)
-        prerequisites = ((installed["preflight_return_code"], installed["preflight_elapsed_seconds"],
-                          installed["preflight_tests"]) if installed is not None else
+        prerequisites = (parity.PreflightResult(installed["preflight_return_code"], installed["preflight_elapsed_seconds"],
+                          tuple(installed["preflight_tests"]), installed["preflight_qualification"]) if installed is not None else
                          parity.reuse_unchanged_production_test_preflight(args.build_dir, args.reuse_preflight_report)
                          if args.reuse_preflight_report else
                          parity.run_production_test_preflight(args.build_dir, None,
                                                                artifact_directory=args.output / "preflight"))
-        code, elapsed, tests = prerequisites
+        code = prerequisites.return_code
+        elapsed = prerequisites.elapsed_seconds
+        tests = prerequisites.tests
         report.update(preflight_return_code=code, preflight_elapsed_seconds=elapsed,
                       preflight_tests=list(tests), preflight_test_count=len(tests),
+                      preflight_qualification=prerequisites.qualification,
                       preflight_build_directory=str(args.build_dir.resolve()),
                       preflight_completed_ns=time.time_ns())
         if args.reuse_preflight_report:
@@ -254,9 +257,10 @@ def main(argv: list[str] | None = None) -> int:
                 directory = args.output / key
                 directory.mkdir()
                 write_json(directory / "configuration.json", record)
-                write_json(directory / "server-args.json", [*record["runtime"]["server_args"],
-                           "--context-length", str(record["runtime"]["context_length"])])
+                staged_record = map_predictor_source(record, lambda path: paths[Path(path).resolve()])
                 model = paths[Path(record["model"]).resolve()]
+                write_json(directory / "server-args.json", [*runtime_server_arguments(staged_record, directory, model),
+                           "--context-length", str(record["runtime"]["context_length"])])
                 if any(ch in model + record["id"] for ch in "|\r\n"):
                     raise ValueError("model/cell identity contains a harness delimiter")
                 command = ["bash", str(ROOT / "tests/v2/e2e/server/test_server_e2e.sh"),

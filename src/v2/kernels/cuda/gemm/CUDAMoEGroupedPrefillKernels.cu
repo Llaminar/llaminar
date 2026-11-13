@@ -9,7 +9,7 @@
  * directory directly and execute exact `mma.sync.m16n8k32` integer products.
  *
  * Integer equality alone is not the MTP contract. Every 32-value block is
- * converted through the shared NativeVNNI FP32 contribution helper, accumulated
+ * converted through the shared NativeQuantised FP32 contribution helper, accumulated
  * inside the public serial-M1 K partitions, and then folded in ascending
  * partition order. Consequently row grouping, directory order, and CTA
  * scheduling cannot alter a result byte. There are no atomics, allocations,
@@ -22,7 +22,7 @@
 
 #include "CUDAMoEGroupedPrefillKernels.h"
 
-#include "CUDANativeVNNIDecodeCommon.cuh"
+#include "CUDANativeQuantisedDecodeCommon.cuh"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "kernels/common/DeviceSwiGLUNumericalContract.h"
 
@@ -34,7 +34,7 @@
 
 namespace
 {
-    constexpr uint32_t kExpertBits = 9u;
+    constexpr uint32_t kExpertBits = llaminar2::moe_grouped_directory::kExpertBits;
     constexpr uint32_t kExpertMask = (uint32_t{1} << kExpertBits) - 1u;
     constexpr uint32_t kUnusedDirectoryEntry = UINT32_MAX;
     constexpr int kRows = llaminar2::cuda::moe::kGroupedImmaTileRows;
@@ -103,7 +103,7 @@ namespace
     constexpr uint32_t kSupportedCodebookMask =
         (uint32_t{1} << 0) |
         (uint32_t{1} << 4) |
-        (uint32_t{1} << llaminar2::kNativeVnniIQ4XSSourceScaleCodebook) |
+        (uint32_t{1} << llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook) |
         (uint32_t{1} << 5) |
         (uint32_t{1} << 6) |
         (uint32_t{1} << 7) |
@@ -118,7 +118,7 @@ namespace
         (uint32_t{1} << 16) |
         (uint32_t{1} << 17) |
         (uint32_t{1} << 19) |
-        (uint32_t{1} << llaminar2::kNativeVnniExpandedInt8MinCodebook);
+        (uint32_t{1} << llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
     /** Abort the captured graph when device-owned grouping metadata is invalid. */
     __device__ __forceinline__ void failFastInvalidGroupedImmaState()
@@ -226,16 +226,16 @@ namespace
      */
     template <uint8_t CodebookId>
     __device__ __forceinline__ bool descriptorMatches(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int N,
         int K)
     {
         using Traits =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
         return desc.payload && desc.scales &&
                desc.n == N && desc.k == K &&
                desc.blocks_per_row == static_cast<uint32_t>(K / kQuantBlock) &&
-               llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
+               llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
                (!Traits::requires_secondary_metadata ||
                 (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
                (!Traits::is_dual_scale_asym || desc.emins);
@@ -251,12 +251,12 @@ namespace
      */
     template <uint8_t CodebookId>
     __device__ __forceinline__ bool pairedDescriptorMatches(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc, int N, int K)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc, int N, int K)
     {
-        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+        if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
             return desc.codebook_id == 4 ? descriptorMatches<4>(desc, N, K)
-                : desc.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
-                  descriptorMatches<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(desc, N, K);
+                : desc.codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
+                  descriptorMatches<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(desc, N, K);
         return descriptorMatches<CodebookId>(desc, N, K);
     }
 
@@ -282,13 +282,13 @@ namespace
         uint8_t physical_codebook = CodebookId)
     {
         using Traits =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
         if constexpr (Traits::is_iq4_lut)
         {
-            const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(scales[linear], mins[linear])
-                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scales[linear]);
-            return llaminar2::device_native_vnni_contract::singleScaleBlock(
+            const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
+                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(scales[linear], mins[linear])
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(scales[linear]);
+            return llaminar2::device_native_quantised_contract::singleScaleBlock(
                 dot_lo, scale, activation_scale);
         }
         const uint16_t secondary_bits =
@@ -302,22 +302,22 @@ namespace
         const int32_t *activation_words =
             reinterpret_cast<const int32_t *>(activation_values);
         const int subgroup_sum0 =
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[0]) +
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[1]);
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[0]) +
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[1]);
         const int subgroup_sum1 =
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[2]) +
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[3]);
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[2]) +
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[3]);
         const int subgroup_sum2 =
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[4]) +
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[5]);
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[4]) +
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[5]);
         const int subgroup_sum3 =
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[6]) +
-            llaminar2::cuda_native_vnni::sum_packed_i8(activation_words[7]);
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[6]) +
+            llaminar2::cuda_native_quantised::sum_packed_i8(activation_words[7]);
         const int activation_sum_lo = subgroup_sum0 + subgroup_sum1;
         const int activation_sum_hi = subgroup_sum2 + subgroup_sum3;
 
-        return llaminar2::cuda_native_vnni::
-            native_vnni_block_contribution_from_reduced_terms_rn<CodebookId>(
+        return llaminar2::cuda_native_quantised::
+            native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
                 dot_lo,
                 dot_hi,
                 activation_scale,
@@ -346,7 +346,7 @@ namespace
      * canonical contribution function as the generic path; shared-memory
      * placement changes where metadata is loaded, never its arithmetic.
      *
-     * @tparam CodebookId NativeVNNI ordinary dual-scale codebook identifier.
+     * @tparam CodebookId NativeQuantised ordinary dual-scale codebook identifier.
      * @param dot_lo Exact low-half integer dot product from IMMA.
      * @param dot_hi Exact high-half integer dot product from IMMA.
      * @param activation_scale Exact FP32 activation scale for this row/block.
@@ -362,12 +362,12 @@ namespace
         uint32_t packed_scales)
     {
         using Traits =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
         static_assert(Traits::is_dual_scale);
         static_assert(!Traits::is_dual_scale_asym);
         static_assert(!Traits::is_iq1_m);
-        return llaminar2::cuda_native_vnni::
-            native_vnni_block_contribution_from_reduced_terms_rn<CodebookId>(
+        return llaminar2::cuda_native_quantised::
+            native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
                 dot_lo,
                 dot_hi,
                 activation_scale,
@@ -390,10 +390,10 @@ namespace
      * One32-bit shared slot holds the raw primary word and, for tuple24, the
      * raw source coefficient. IQ4_NL retains only its original half scale.
      * Metadata loaded once per column is shared by all sixteen row owners. The call still
-     * enters the canonical NativeVNNI FP32 publication contract and therefore
+     * enters the canonical NativeQuantised FP32 publication contract and therefore
      * preserves every serial-row rounding boundary.
      *
-     * @tparam CodebookId NativeVNNI symmetric codebook identifier.
+     * @tparam CodebookId NativeQuantised symmetric codebook identifier.
      * @param dot Exact integer dot product from IMMA.
      * @param activation_scale Exact FP32 activation scale for this row/block.
      * @param scale_bits Primary word in low16, raw coefficient in high16 for24.
@@ -407,20 +407,20 @@ namespace
         uint32_t scale_bits, uint8_t physical_codebook)
     {
         using Traits =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
         static_assert(!Traits::is_asymmetric);
         static_assert(!Traits::is_dual_scale);
         static_assert(!Traits::is_iq1_m);
         if constexpr (Traits::is_iq4_lut)
         {
-            const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(
+            const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
+                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
                       static_cast<uint16_t>(scale_bits), static_cast<uint16_t>(scale_bits >> 16))
-                : llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(scale_bits));
-            return llaminar2::device_native_vnni_contract::singleScaleBlock(dot, scale, activation_scale);
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(static_cast<uint16_t>(scale_bits));
+            return llaminar2::device_native_quantised_contract::singleScaleBlock(dot, scale, activation_scale);
         }
-        return llaminar2::cuda_native_vnni::
-            native_vnni_block_contribution_from_reduced_terms_rn<CodebookId>(
+        return llaminar2::cuda_native_quantised::
+            native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
                 dot,
                 /*dot_hi=*/0,
                 activation_scale,
@@ -467,7 +467,7 @@ namespace
         int lane)
     {
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<13>::payload_bytes;
+            llaminar2::cuda_native_quantised::CodebookTraits<13>::payload_bytes;
         const int local_column = lane >> 2;
         const int lookup = lane & 3;
         const int column = column_base + local_column;
@@ -496,26 +496,26 @@ namespace
              * before either result reaches its packed-byte data path.
              */
             const uint64_t gate_grid =
-                llaminar2::cuda_native_vnni::iq2_grid_lookup<13>(gate_index);
+                llaminar2::cuda_native_quantised::iq2_grid_lookup<13>(gate_index);
             const uint64_t up_grid =
-                llaminar2::cuda_native_vnni::iq2_grid_lookup<13>(up_index);
+                llaminar2::cuda_native_quantised::iq2_grid_lookup<13>(up_index);
             const uint8_t gate_signs = gate_payload[5 + lookup];
             const uint8_t up_signs = up_payload[5 + lookup];
 
             const uint32_t gate_low =
-                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                llaminar2::cuda_native_quantised::iq_apply_signs_4(
                     static_cast<uint32_t>(gate_grid),
                     gate_signs & 0x0Fu);
             const uint32_t gate_high =
-                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                llaminar2::cuda_native_quantised::iq_apply_signs_4(
                     static_cast<uint32_t>(gate_grid >> 32),
                     gate_signs >> 4);
             const uint32_t up_low =
-                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                llaminar2::cuda_native_quantised::iq_apply_signs_4(
                     static_cast<uint32_t>(up_grid),
                     up_signs & 0x0Fu);
             const uint32_t up_high =
-                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                llaminar2::cuda_native_quantised::iq_apply_signs_4(
                     static_cast<uint32_t>(up_grid >> 32),
                     up_signs >> 4);
             signed_gate_grid =
@@ -548,7 +548,7 @@ namespace
      */
     template <uint8_t CodebookId>
     __device__ __forceinline__ void decodeMmaWeightFragment(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &descriptor,
         int8_t *__restrict__ shared_warp_weights,
         int block,
         int N,
@@ -556,7 +556,7 @@ namespace
         int lane)
     {
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
 
         if constexpr (CodebookId == 13)
@@ -576,14 +576,14 @@ namespace
                     static_cast<int>(payload[lookup]) |
                     (static_cast<int>((qh >> (2 * lookup)) & 0x3u) << 8);
                 const uint64_t grid =
-                    llaminar2::cuda_native_vnni::iq2_grid_lookup<13>(index);
+                    llaminar2::cuda_native_quantised::iq2_grid_lookup<13>(index);
                 const uint8_t signs = payload[5 + lookup];
                 const uint32_t low =
-                    llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
                         static_cast<uint32_t>(grid),
                         signs & 0x0Fu);
                 const uint32_t high =
-                    llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
                         static_cast<uint32_t>(grid >> 32),
                         signs >> 4);
                 signed_grid =
@@ -594,7 +594,7 @@ namespace
                 shared_warp_weights + local_column * kQuantBlock +
                 lookup * sizeof(uint64_t)) = signed_grid;
         }
-        else if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+        else if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
         {
             const int local_column = lane >> 2;
             const int group = lane & 3;
@@ -609,7 +609,7 @@ namespace
                     descriptor.payload + linear * kPayloadBytes;
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(
                     payload + group * sizeof(uint32_t));
-                llaminar2::cuda_native_vnni::iq4nl_decode_word(
+                llaminar2::cuda_native_quantised::iq4nl_decode_word(
                     raw,
                     low,
                     high);
@@ -627,7 +627,7 @@ namespace
             {
                 const size_t linear =
                     static_cast<size_t>(block) * N + column;
-                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(
                     descriptor.payload + linear * kPayloadBytes,
                     packed_groups);
             }
@@ -647,7 +647,7 @@ namespace
     /**
      * @brief Build a compact directory of populated 16-row expert tiles.
      *
-     * One 512-thread CTA performs a deterministic inclusive scan over expert
+     * One 1024-thread CTA performs a deterministic inclusive scan over expert
      * tile counts. The captured projection grid uses the conservative directory
      * capacity and exits on the explicit sentinel tail, so replay never needs a
      * host-visible live tile count.
@@ -689,7 +689,7 @@ namespace
             (count + kRows - 1) / kRows;
         __syncthreads();
 
-        for (int stride = 1; stride < kMaximumExperts; stride <<= 1)
+        for (int stride = 1; stride < static_cast<int>(blockDim.x); stride <<= 1)
         {
             const int addend = tid >= stride
                                    ? inclusive_tile_counts[tid - stride]
@@ -699,7 +699,7 @@ namespace
             __syncthreads();
         }
 
-        const int total_tiles = inclusive_tile_counts[kMaximumExperts - 1];
+        const int total_tiles = inclusive_tile_counts[blockDim.x - 1];
         if (total_tiles > directory_entries)
         {
             if (tid == 0)
@@ -742,7 +742,7 @@ namespace
     void groupedImmaProjectionKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *__restrict__ descriptors,
         const int *__restrict__ group_counts,
         const int *__restrict__ group_offsets,
         const uint32_t *__restrict__ directory,
@@ -783,7 +783,7 @@ namespace
         }
 
         const auto descriptor = descriptors[expert];
-        if (!llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(descriptor.codebook_id))
+        if (!llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(descriptor.codebook_id))
             return;
         if (!descriptorMatches<CodebookId>(descriptor, N, K) ||
             k_partitions <= 0)
@@ -801,7 +801,7 @@ namespace
             kColumnsPerWarp;
 
         constexpr bool kStageIQ4Metadata =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut && ColumnsPerBlock == 32;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut && ColumnsPerBlock == 32;
         constexpr int kScaleColumns =
             Geometry::projection_warps * kColumnsPerWarp;
         constexpr int kOperandBytes =
@@ -821,7 +821,7 @@ namespace
             shared_storage + kOperandBytes / sizeof(uint32_t);
 
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
         const uint16_t *weight_scales =
             static_cast<const uint16_t *>(descriptor.scales);
@@ -885,8 +885,8 @@ namespace
                             const size_t linear =
                                 static_cast<size_t>(block) * N + column;
                             scale_bits = weight_scales[linear];
-                            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_source_scale)
-                                if (descriptor.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+                            if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_source_scale)
+                                if (descriptor.codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)
                                     scale_bits |= uint32_t{weight_mins[linear]} << 16;
                         }
                         shared_weight_scales[
@@ -908,7 +908,7 @@ namespace
 
                 int32_t dot_lo[4] = {0, 0, 0, 0};
                 int32_t dot_hi[4] = {0, 0, 0, 0};
-                if constexpr (llaminar2::cuda_native_vnni::
+                if constexpr (llaminar2::cuda_native_quantised::
                                   CodebookTraits<CodebookId>::is_dual_scale)
                 {
                     const uint32_t b_lo[2] = {b_fragment[0], 0u};
@@ -1025,8 +1025,8 @@ namespace
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ gate_descriptors,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ up_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *__restrict__ up_descriptors,
         const int *__restrict__ group_counts,
         const int *__restrict__ group_offsets,
         const uint32_t *__restrict__ directory,
@@ -1071,7 +1071,7 @@ namespace
          * the exact gate id gives every thread the same specialization
          * decision and makes the early exit safe before any CTA barrier.
          */
-        if (!llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(gate_descriptors[expert].codebook_id))
+        if (!llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(gate_descriptors[expert].codebook_id))
             return;
 
         const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -1119,7 +1119,7 @@ namespace
             warp * kColumnsPerWarp * kQuantBlock;
 
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
         const uint16_t *weight_scales =
             static_cast<const uint16_t *>(descriptor.scales);
@@ -1180,7 +1180,7 @@ namespace
 
                 int32_t dot_lo[4] = {0, 0, 0, 0};
                 int32_t dot_hi[4] = {0, 0, 0, 0};
-                if constexpr (llaminar2::cuda_native_vnni::
+                if constexpr (llaminar2::cuda_native_quantised::
                                   CodebookTraits<CodebookId>::is_dual_scale)
                 {
                     const uint32_t b_lo[2] = {b_fragment[0], 0u};
@@ -1346,8 +1346,8 @@ namespace
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ gate_descriptors,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ up_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *__restrict__ up_descriptors,
         const int *__restrict__ group_counts,
         const int *__restrict__ group_offsets,
         const uint32_t *__restrict__ directory,
@@ -1386,7 +1386,7 @@ namespace
             failFastInvalidGroupedImmaState();
             return;
         }
-        if (!llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(gate_descriptors[expert].codebook_id))
+        if (!llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(gate_descriptors[expert].codebook_id))
             return;
 
         const auto &gate_descriptor = gate_descriptors[expert];
@@ -1443,7 +1443,7 @@ namespace
             shared_up_scale_pairs + kScaleColumns);
 
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
         const uint8_t *gate_payload_base = gate_descriptor.payload;
         const uint8_t *up_payload_base = up_descriptor.payload;
@@ -1636,7 +1636,7 @@ namespace
                     int32_t gate_dot_hi[4] = {0, 0, 0, 0};
                     int32_t up_dot_lo[4] = {0, 0, 0, 0};
                     int32_t up_dot_hi[4] = {0, 0, 0, 0};
-                    if constexpr (llaminar2::cuda_native_vnni::
+                    if constexpr (llaminar2::cuda_native_quantised::
                                       CodebookTraits<CodebookId>::is_dual_scale)
                     {
                         const uint32_t gate_b_lo[2] = {
@@ -1827,7 +1827,7 @@ namespace
         cudaStream_t stream,
         const int8_t *A_int8,
         const float *scales_A,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *descriptors,
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
@@ -1875,8 +1875,8 @@ namespace
         const int8_t *A_int8,
         const float *scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *up_descriptors,
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
@@ -1926,8 +1926,8 @@ namespace
         const int8_t *A_int8,
         const float *scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *up_descriptors,
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
@@ -1977,7 +1977,7 @@ namespace
         cudaStream_t stream,
         const int8_t *A_int8,
         const float *scales_A,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *descriptors,
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
@@ -2010,7 +2010,7 @@ namespace
 
         LAUNCH_CODEBOOK(0);
         LAUNCH_CODEBOOK(4);
-        LAUNCH_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        LAUNCH_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
         LAUNCH_CODEBOOK(5);
         LAUNCH_CODEBOOK(6);
         LAUNCH_CODEBOOK(7);
@@ -2025,7 +2025,7 @@ namespace
         LAUNCH_CODEBOOK(16);
         LAUNCH_CODEBOOK(17);
         LAUNCH_CODEBOOK(19);
-        LAUNCH_CODEBOOK(llaminar2::kNativeVnniExpandedInt8MinCodebook);
+        LAUNCH_CODEBOOK(llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
 #undef LAUNCH_CODEBOOK
         return launched;
@@ -2039,8 +2039,8 @@ namespace
         const int8_t *A_int8,
         const float *scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *up_descriptors,
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
@@ -2073,7 +2073,7 @@ namespace
 
         LAUNCH_GATE_UP_CODEBOOK(0);
         LAUNCH_GATE_UP_CODEBOOK(4);
-        LAUNCH_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        LAUNCH_GATE_UP_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
         LAUNCH_GATE_UP_CODEBOOK(5);
         LAUNCH_GATE_UP_CODEBOOK(6);
         LAUNCH_GATE_UP_CODEBOOK(7);
@@ -2089,7 +2089,7 @@ namespace
         LAUNCH_GATE_UP_CODEBOOK(17);
         LAUNCH_GATE_UP_CODEBOOK(19);
         LAUNCH_GATE_UP_CODEBOOK(
-            llaminar2::kNativeVnniExpandedInt8MinCodebook);
+            llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
 #undef LAUNCH_GATE_UP_CODEBOOK
         return launched;
@@ -2103,8 +2103,8 @@ namespace
         const int8_t *A_int8,
         const float *scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *up_descriptors,
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
@@ -2137,7 +2137,7 @@ namespace
 
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(0);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(4);
-        LAUNCH_PAIRED_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(5);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(6);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(7);
@@ -2153,7 +2153,7 @@ namespace
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(17);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(19);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(
-            llaminar2::kNativeVnniExpandedInt8MinCodebook);
+            llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
 #undef LAUNCH_PAIRED_GATE_UP_CODEBOOK
         return launched;
@@ -2172,7 +2172,9 @@ extern "C" bool cudaMoEGroupedImma_buildDirectory(
     if (!d_group_counts || !d_directory || !stream ||
         num_experts <= 0 ||
         num_experts > llaminar2::cuda::moe::kGroupedImmaMaximumExperts ||
-        total_slots <= 0 || directory_entries <= 0 ||
+        total_slots <= 0 ||
+        static_cast<uint32_t>(total_slots) > llaminar2::moe_grouped_directory::kMaximumRows ||
+        directory_entries <= 0 ||
         static_cast<std::size_t>(directory_entries) <
             llaminar2::cuda::moe::groupedImmaDirectoryEntries(
                 static_cast<std::size_t>(total_slots),
@@ -2185,7 +2187,7 @@ extern "C" bool cudaMoEGroupedImma_buildDirectory(
 
     buildGroupedImmaDirectoryKernel<<<
         1,
-        llaminar2::cuda::moe::kGroupedImmaMaximumExperts,
+        llaminar2::moe_grouped_directory::directoryThreads(num_experts),
         0,
         static_cast<cudaStream_t>(stream)>>>(
         d_group_counts,
@@ -2199,7 +2201,7 @@ extern "C" bool cudaMoEGroupedImma_buildDirectory(
 extern "C" bool cudaMoEGroupedImma_project(
     const int8_t *d_A_int8,
     const float *d_scales_A,
-    const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+    const llaminar2::DeviceNativeQuantisedMatrixDesc *d_desc_table,
     const int *d_group_counts,
     const int *d_group_offsets,
     const uint32_t *d_directory,
@@ -2216,7 +2218,7 @@ extern "C" bool cudaMoEGroupedImma_project(
     int device_idx,
     void *stream)
 {
-    codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(codebook_mask);
+    codebook_mask = llaminar2::cuda_native_quantised::native_quantised_iq4_launch_mask(codebook_mask);
     if (!d_A_int8 || !d_scales_A || !d_desc_table ||
         !d_group_counts || !d_group_offsets || !d_directory || !d_output ||
         !stream || directory_entries <= 0 || num_experts <= 0 ||
@@ -2267,8 +2269,8 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     const int8_t *d_A_int8,
     const float *d_scales_A,
     llaminar2::MoEGroupedSourceRows source_rows,
-    const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-    const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+    const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+    const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
     const int *d_group_counts,
     const int *d_group_offsets,
     const uint32_t *d_directory,
@@ -2286,7 +2288,7 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     int device_idx,
     void *stream)
 {
-    codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(codebook_mask);
+    codebook_mask = llaminar2::cuda_native_quantised::native_quantised_iq4_launch_mask(codebook_mask);
     if (!d_A_int8 || !d_scales_A || !d_gate_desc_table ||
         !d_up_desc_table || !d_group_counts || !d_group_offsets ||
         !d_directory || !d_swiglu_int8 || !d_swiglu_scales || !stream ||
@@ -2500,7 +2502,7 @@ namespace
         {
             QUERY_CODEBOOK(0);
             QUERY_CODEBOOK(4);
-            QUERY_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            QUERY_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
             QUERY_CODEBOOK(5);
             QUERY_CODEBOOK(6);
             QUERY_CODEBOOK(7);
@@ -2515,7 +2517,7 @@ namespace
             QUERY_CODEBOOK(16);
             QUERY_CODEBOOK(17);
             QUERY_CODEBOOK(19);
-            QUERY_CODEBOOK(llaminar2::kNativeVnniExpandedInt8MinCodebook);
+            QUERY_CODEBOOK(llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -2551,7 +2553,7 @@ namespace
         {
             QUERY_GATE_UP_CODEBOOK(0);
             QUERY_GATE_UP_CODEBOOK(4);
-            QUERY_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            QUERY_GATE_UP_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
             QUERY_GATE_UP_CODEBOOK(5);
             QUERY_GATE_UP_CODEBOOK(6);
             QUERY_GATE_UP_CODEBOOK(7);
@@ -2567,7 +2569,7 @@ namespace
             QUERY_GATE_UP_CODEBOOK(17);
             QUERY_GATE_UP_CODEBOOK(19);
             QUERY_GATE_UP_CODEBOOK(
-                llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }

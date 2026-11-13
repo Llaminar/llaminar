@@ -114,11 +114,11 @@ TEST(IQ4XSSourceROCm,MixedSourcesCaptured)
 
 #ifdef HAVE_CUDA
 extern "C" {
-void cudaNativeVNNIGemvSweep_setConfig(int,int,int,int,int,int,int,int);
-void cudaNativeVNNIGemvSweep_setGroupedRows(int);
-void cudaNativeVNNIGemvSweep_clearConfig();
-int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
-void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int);
+void cudaNativeQuantisedGemvSweep_setConfig(int,int,int,int,int,int,int,int);
+void cudaNativeQuantisedGemvSweep_setGroupedRows(int);
+void cudaNativeQuantisedGemvSweep_clearConfig();
+int cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
+void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int);
 }
 namespace llaminar2::test {
 /**
@@ -146,30 +146,30 @@ TEST(IQ4XSSourceCUDA, DirectAndRowparVerifierCaptured)
             int previous; ///< Existing serial equivalence policy.
             /** @brief Select exactly one already implemented dispatch family. */
             explicit Selection(int selected)
-                : previous(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+                : previous(cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config())
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
-                cudaNativeVNNIGemvSweep_setConfig(selected,
+                cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
+                cudaNativeQuantisedGemvSweep_setConfig(selected,
                     selected == 3 ? 2 : 64,1,1,1,1,0,0);
-                cudaNativeVNNIGemvSweep_setGroupedRows(8);
+                cudaNativeQuantisedGemvSweep_setGroupedRows(8);
             }
             /** @brief Clear the family and restore the previous scoped policy. */
             ~Selection()
             {
-                cudaNativeVNNIGemvSweep_clearConfig();
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous);
+                cudaNativeQuantisedGemvSweep_clearConfig();
+                cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(previous);
             }
         } selection(family);
         ASSERT_NO_FATAL_FAILURE(witness::runDense(gpu_device_, rows,
             witness::DenseExecutionScope::VerifierDecodeEquivalent));
         const auto records = PerfStatsCollector::snapshot(
-            {"kernel.cuda_native_vnni_gemv_dispatch"});
+            {"kernel.cuda_native_quantised_gemv_dispatch"});
         for (int physical : {4,24}) for (int m : rows)
         {
             uint64_t captured = 0;
             for (const auto &record : records)
             {
-                if (record.domain != "kernel" || record.name != "cuda_native_vnni_gemv_dispatch" ||
+                if (record.domain != "kernel" || record.name != "cuda_native_quantised_gemv_dispatch" ||
                     record.device != "cuda:" + std::to_string(gpu_device_.ordinal)) continue;
                 if (record.tags.at("codebook") != std::to_string(physical) ||
                     record.tags.at("m") != std::to_string(m) ||

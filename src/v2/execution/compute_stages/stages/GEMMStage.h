@@ -1,13 +1,30 @@
 /** @file GEMMStage.h
  * @brief GEMM stage: C = alpha * A * B + beta * C
  * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
+ * Original causal query work is a separate retained descriptor; it never selects
+ * verifier arithmetic or invents a second live-count owner.
+ * Typed bias retains its original tensor/view through ordinary and verifier dispatch.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * GDN-output TwoTerm observations retain cold prepared source/row identity and
+ * count successful host submissions without sampling device live state.
  */
 
 #pragma once
 
+#include <array>
+#include <vector>
+#include "tensors/TensorType.h"
+#include "execution/local_execution/device/WorkspaceBufferLease.h"
+#include "utils/PerfStatsCollector.h"
+
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/DeviceRequestRowRanges.h"
+#include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/common/GatedRMSNormProjection.h"
 
 #include "../IComputeStage.h"
+#include "../ProjectionRowWorkBinding.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../utils/GemmContext.h"
@@ -19,6 +36,7 @@
 
 namespace llaminar2
 {
+    class CapturedDeviceStorageLease;
 
     // Forward declarations
     class ITensorGemm;
@@ -46,6 +64,18 @@ namespace llaminar2
     class GEMMStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
+        /** @brief Retained FP32 result of HC /4 SiLU, produced before two-term projection. */
+        struct HCResidualDownPublication {
+            TensorBase* activated; ///< Existing arena result, never a new allocation.
+            BufferId buffer; ///< Exact output coherence authority.
+        };
+        /** @brief Immutable gate/gain input for one retained FP32 normalization+projection. */
+        struct GatedNormPublication {
+            const ITensor* gate=nullptr; ///< Existing read-only arena gate output.
+            const ITensor* gamma=nullptr; ///< Original model gain tensor.
+            BufferId gate_buffer; ///< Exact gate coherence authority.
+            GatedRMSNormProjectionParameters parameters; ///< Original norm arithmetic.
+        };
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -54,6 +84,8 @@ namespace llaminar2
             const ITensor *A = nullptr; ///< Input activation tensor [m, k]
             const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
             ITensor *C = nullptr;       ///< Output tensor [m, n]
+            std::optional<HCResidualDownPublication> hc_residual_down; ///< Typed raw-down input transform; valid only for TwoTermQ8.
+            std::optional<GatedNormPublication> gated_norm; ///< Explicit ordinary scalar SingleQ8 input program.
             int m = 0, n = 0, k = 0;    ///< Matrix dimensions
             float alpha = 1.0f;         ///< Scale factor for A*B
             float beta = 0.0f;          ///< Scale factor for existing C
@@ -70,7 +102,7 @@ namespace llaminar2
             const float *bias = nullptr;
 
             /**
-             * @brief Bias tensor (preferred interface)
+             * @brief Original FP32 bias tensor/view, retained through ordinary and verifier execution.
              */
             const ITensor *bias_tensor = nullptr;
 
@@ -136,6 +168,10 @@ namespace llaminar2
             bool force_decode_equivalent_verifier_prefill = false;
             /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
             std::optional<DeviceRowRange> verifier_row_range;
+            /// Independent floating request prefixes; requires explicit decode-equivalent arithmetic and excludes verifier_row_range.
+            std::optional<DeviceRequestRowRanges> request_rows;
+            /// Explicit decode-only causal work; plain projections keep their original arithmetic.
+            std::optional<ProjectionRowWorkDeclaration> projection_row_work;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -153,6 +189,8 @@ namespace llaminar2
              * Lifetime managed by DeviceGraphOrchestrator.
              */
             PreparedWeightStore *prepared_store = nullptr;
+            /// Explicit immutable operand precision; existing model defaults retain SingleQ8.
+            QuantizedActivationOperandPrecision quantized_operand_precision=QuantizedActivationOperandPrecision::SingleQ8;
         };
 
         explicit GEMMStage(Params params);
@@ -167,6 +205,30 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
+        /** @brief Include the explicit arithmetic/quantizer and static row geometry in capture identity.
+         * Uncounted SingleQ8 stages keep their established zero variant. Explicit
+         * prefix/request selections and TwoTermQ8 hash complete immutable row
+         * metadata and arithmetic policy; count values are never host-observed.
+         * HC compares its frozen native binding as a validation side effect;
+         * addresses/leases never change the signature during materialization.
+         * Existing prepared/arena ownership remains the allocation authority.
+         */
+        uint64_t graphCaptureVariantSignature() const override;
+        /** @brief Freeze HC native operands after the executor's allocation-only prebind.
+         * @param ctx Exact participant context; no GPU query or work is issued.
+         * @param stream Exact non-default recording stream.
+         * @return True after first binding or identical preparatory reentry.
+         * @details Retains only the four original TwoTerm workspace allocations
+         * through existing PMA-backed leases; it does not allocate GPU storage.
+         * @throws std::logic_error On any postbind operand/workspace replacement.
+         */
+        bool prepareGraphLaunch(IDeviceContext* ctx,void* stream) override;
+        /** @brief GPU metadata binds before capture; CPU query metadata binds before input observation. */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override {
+            if(params_.projection_row_work&&params_.device_id.is_cpu())return GraphLaunchPreparationPolicy::HostEntry;
+            return (params_.projection_row_work||params_.hc_residual_down||params_.gated_norm)&&params_.device_id.is_gpu()
+                ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None;
+        }
         void resetSessionState() override;
         void resetSessionStatePreservingCapturedReplay() override;
         void resetSessionStatePreservingLazyInitialization() override;
@@ -188,12 +250,73 @@ namespace llaminar2
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
          */
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+        /** @brief Bind the admitted arena and prepare CPU address metadata before validation. */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
 
         /** @brief Declare projection scratch and the explicitly selected input transform. */
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
     private:
         Params params_;
+        std::unique_ptr<ProjectionRowWorkBinding> projection_row_work_; ///< Cold original-owner binding, retained across request reset.
+        /** @brief Exact address/geometry identity; contains no live GPU values. */
+        struct HCNativePublicationIdentity {
+            std::array<const void*,7> pointers{}; ///< Raw A, activated, C, then the four consumed banks.
+            std::array<size_t,7> bytes{}; ///< Complete retained tensor/bank extents.
+            std::array<TensorType,3> types{}; ///< Original tensor storage representations.
+            std::array<const void*,4> weight_planes{}; ///< Prepared payload/scales/mins/emins.
+            std::array<uint64_t,12> weight_geometry{}; ///< Every nonpointer native descriptor field.
+            uint64_t workspace_id=0; ///< Original manager instance, never a new epoch counter.
+            ITensorGemm* engine=nullptr; ///< Original prepared engine resolved from the store.
+            friend bool operator==(const HCNativePublicationIdentity&,const HCNativePublicationIdentity&)=default;
+        };
+        /** @brief Immutable captured ownership, published once after allocation prebind. */
+        struct HCNativePublicationBinding {
+            HCNativePublicationIdentity identity;
+            std::array<std::vector<size_t>,3> shapes; ///< Exact complete tensor shapes, copied only at setup.
+            std::array<std::shared_ptr<const CapturedDeviceStorageLease>,3> operands; ///< Original mutable activation allocation borrows.
+            std::array<std::shared_ptr<const WorkspaceBufferLease>,4> banks; ///< Original PMA-owned allocation leases.
+            void* stream=nullptr; ///< Exact recording stream; preparatory reentry cannot replace it.
+        };
+        std::optional<HCNativePublicationBinding> hc_native_binding_; ///< Survives data reset; only stage destruction retires it.
+        /** @brief Inspect immutable addresses/descriptors without GPU work or host value reads.
+         * @return Complete consumed native identity; no ownership is created here.
+         * @throws std::logic_error For incomplete, foreign or unprepared operands/banks.
+         */
+        HCNativePublicationIdentity currentHCNativePublicationIdentity() const;
+        /** @brief Reject unbound/replaced native identity, shape or bank ownership before capture/replay.
+         * @throws std::logic_error For any stale pointer, extent, source, shape, stream or generation.
+         */
+        void requireHCNativePublicationBinding() const;
+
+        /** @brief Exact prepared scalar producer/consumer address identity, never live data. */
+        struct GatedNormIdentity {
+            std::array<const void*,9> pointers{}; ///< A/gate/gamma/C, then original five workspace banks.
+            std::array<size_t,9> bytes{}; ///< Complete original retained capacities.
+            std::array<TensorType,4> types{}; ///< Actual tensor storage representations.
+            std::array<const void*,4> weight_planes{}; ///< Original native immutable planes.
+            std::array<uint64_t,12> weight_geometry{}; ///< Complete descriptor fields.
+            uint64_t workspace_id=0; ///< Original PMA-backed workspace instance.
+            ITensorGemm* engine=nullptr; ///< Exact prepared-store engine.
+            friend bool operator==(const GatedNormIdentity&,const GatedNormIdentity&)=default;
+        };
+        /** @brief Capture-held borrows of existing tensor and workspace authorities. */
+        struct GatedNormBinding {
+            GatedNormIdentity identity;
+            std::array<std::vector<size_t>,4> shapes;
+            std::array<std::shared_ptr<const CapturedDeviceStorageLease>,4> operands;
+            std::array<std::shared_ptr<const WorkspaceBufferLease>,5> banks;
+            void* stream=nullptr; ///< Exact recording stream, immutable after preparation.
+        };
+        std::optional<GatedNormBinding> gated_norm_binding_; ///< Survives data-only request resets.
+        /** @return Original allocation-prebound tensors, engine, native source and scratch identity.
+         * @throws std::logic_error For missing/foreign owner, source or native storage.
+         */
+        GatedNormIdentity currentGatedNormIdentity() const;
+        /** @brief Reject any post-preparation pointer/capacity/type/shape/source/stream replacement. */
+        void requireGatedNormBinding() const;
+        /** @brief Freeze the exact retained composite owners at the existing cold capture boundary. */
+        bool prepareGatedNormBinding(IDeviceContext* ctx,void* stream);
 
         // === Cached kernel pointers (avoid KernelFactory mutex per execute) ===
         // These are populated on first execute() and reused thereafter.
@@ -201,6 +324,36 @@ namespace llaminar2
         // registry maps), so raw pointers are safe here.
         ITensorGemm *cached_gemm_ = nullptr;
         bool cache_resolved_ = false;
+
+        /** @brief Actual selected API, independent of a caller's verifier request flag. */
+        enum class HCUpSubmissionOperation { Ordinary, DecodeEquivalent, FusedSwiGLU, ResidualCorrected };
+        /** @brief Bind original HC metadata once, independently of collection.
+         * @throws std::invalid_argument For foreign immutable source or policy.
+         * @details No device count is read. Keys own no mutable counter state.
+         */
+        void initializeHCUpSubmissionIdentities();
+        /** @brief Count one successful host submission with setup-bound metadata.
+         * @param columns Actual output width, authenticated against setup geometry.
+         * @param operation Actual API that succeeded, never inferred from request flags.
+         * @details CPU team zero observes once; GPU replay does not call execute.
+         */
+        void recordHCUpSubmission(int columns, HCUpSubmissionOperation operation);
+        std::array<std::optional<PerfStatsCollector::CounterIdentity>, 4> hc_submission_identities_;
+
+        /**
+         * @brief Bind the exact prepared GDN-output residual program during construction.
+         * @throws std::invalid_argument For a foreign mutable tensor/device binding.
+         * @details This immutable observation reads no device-owned live count.
+         */
+        void initializeGDNOutputResidualSubmissionIdentity();
+        /**
+         * @brief Count one successful host execute/capture submission, never native completion.
+         * @param columns Actual output width, checked against the prepared stage.
+         * @throws std::logic_error If execution changes the prepared output width.
+         * @details CPU workshare observes only on team zero; replay does not call execute.
+         */
+        void recordGDNOutputResidualSubmission(int columns);
+        std::optional<PerfStatsCollector::CounterIdentity> gdn_output_residual_submission_identity_;
 
         bool executeDecodeEquivalentVerifierPrefill(
             const TensorBase *A_base,

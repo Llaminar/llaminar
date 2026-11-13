@@ -1,6 +1,6 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "loaders/GPUVramPreflight.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "backends/IBackend.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
@@ -146,7 +146,7 @@ namespace llaminar2
         plan.K = K;
         plan.staging_bytes = raw_gguf_bytes;
 
-        const NativeVnniFormatInfo format{
+        const NativeQuantisedFormatInfo format{
             .codebook_id = 0,
             .payload_bytes = payload_bytes_per_block,
             .is_asymmetric = is_asymmetric,
@@ -154,13 +154,13 @@ namespace llaminar2
             .has_emins = has_emins,
             .max_abs_factor = 0.0f,
         };
-        const NativeVnniPackedRegionSizes regions =
-            nativeVnniPackedRegionSizes(
+        const NativeQuantisedPackedRegionSizes regions =
+            nativeQuantisedPackedRegionSizes(
                 static_cast<size_t>(N),
                 static_cast<size_t>(K),
                 format);
 
-        // Every persistent region uses the canonical native-VNNI layout.
+        // Every persistent region uses the canonical native-quantised layout.
         plan.payload_bytes = regions.payload_bytes;
         plan.payload_offset = allocateRegion(plan.payload_bytes);
 
@@ -426,10 +426,10 @@ namespace llaminar2
 
         if (base)
         {
-            slot.d_native_vnni_payload = base + plan.payload_offset;
-            slot.d_native_vnni_scales = plan.scales_bytes > 0 ? base + plan.scales_offset : nullptr;
-            slot.d_native_vnni_mins = plan.mins_bytes > 0 ? base + plan.mins_offset : nullptr;
-            slot.d_native_vnni_emins = plan.emins_bytes > 0 ? base + plan.emins_offset : nullptr;
+            slot.d_native_quantised_payload = base + plan.payload_offset;
+            slot.d_native_quantised_scales = plan.scales_bytes > 0 ? base + plan.scales_offset : nullptr;
+            slot.d_native_quantised_mins = plan.mins_bytes > 0 ? base + plan.mins_offset : nullptr;
+            slot.d_native_quantised_emins = plan.emins_bytes > 0 ? base + plan.emins_offset : nullptr;
         }
 
         return slot;
@@ -499,8 +499,8 @@ namespace llaminar2
                 backend_->setDevice(device_id_);
                 if (!backend_->synchronize(device_id_))
                 {
-                    LOG_WARN("WeightVRAMPool: device synchronize failed before releasing temporary staging on device "
-                             << device_id_);
+                    throw std::runtime_error(
+                        "WeightVRAMPool: setup drain failed; temporary staging and its admission remain live");
                 }
                 backend_->free(d_staging_base_, device_id_);
             }

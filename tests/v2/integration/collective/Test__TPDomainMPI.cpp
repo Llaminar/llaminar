@@ -13,6 +13,8 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <vector>
@@ -373,6 +375,10 @@ TEST_F(Test__TPDomainMPI, NonParticipatingCPUDomain)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Initialize MPI before GTest
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -384,6 +390,7 @@ int main(int argc, char **argv)
     int result = RUN_ALL_TESTS();
 
     // Finalize MPI
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
 
     return result;

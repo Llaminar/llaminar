@@ -8,9 +8,15 @@
  * never finalize the process while their adapters or callers still own state.
  */
 #pragma once
+#include <memory>
+#include <utility>
+
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
+    class NativeCPUCollectiveProgram;
+    namespace detail { struct MPICollectiveUse; }
     /** @brief Single move-only owner of a process's initialized MPI runtime. */
     class MPIProcessSession final
     {
@@ -23,7 +29,7 @@ namespace llaminar2
          * @param argv Argument vector MPI may modify.
          * @return The only scope responsible for this process's MPI shutdown.
          * @throws std::runtime_error if initialization/thread support fails.
-         * @throws std::logic_error if MPI already has a process owner or ended.
+         * @throws std::logic_error if startup ownership is missing, MPI already has an owner, or ended.
          */
         [[nodiscard]] static MPIProcessSession initialize(int &argc, char **&argv);
         /** @brief Transfer finalization responsibility without touching MPI. */
@@ -41,10 +47,28 @@ namespace llaminar2
         [[nodiscard]] bool ownsMPI() const noexcept { return ownership_ == Ownership::Owned; }
 
     private:
+        friend class NativeCPUCollectiveProgram;
+        friend struct detail::MPICollectiveUse;
+        friend void mpiShutdown();
+        struct State;
+        /** @brief Attach one admitted domain to the original process-pool lifetime. */
+        [[nodiscard]] static std::shared_ptr<detail::MPICollectiveUse> retainCPUCollectivePool(const std::shared_ptr<PhysicalMemoryAuthority>&);
+        /** @brief Require the same original session still open immediately before native split entry. */
+        static void requireCPUCollectiveNativeEntry(const std::shared_ptr<detail::MPICollectiveUse>&);
+        /** @brief Close new domain admission before cache/context teardown begins. */
+        static void closeCPUCollectiveAdmission();
+        /** @brief Require every native domain retired before the original MPI_Finalize. */
+        static void requireCPUCollectiveRetirement();
+        /** @brief Release the sole process commitment only after successful original MPI_Finalize. */
+        static void publishFinalizedCPUCollectivePool();
+        /** @brief Reject external finalization that bypassed a live admitted pool. */
+        static void requireNoUnretiredCPUCollectivePool();
+        static std::weak_ptr<State> active_;
+        std::shared_ptr<State> state_;
         /** @brief Ownership, not MPI execution state or a shadow of rank data. */
         enum class Ownership { Unowned, Owned };
         /** @brief Only successful initialization can arm the finalizer. */
-        explicit MPIProcessSession(Ownership ownership) noexcept : ownership_(ownership) {}
+        explicit MPIProcessSession(Ownership ownership, std::shared_ptr<State> state) noexcept : state_(std::move(state)), ownership_(ownership) {}
         Ownership ownership_{Ownership::Unowned};
     };
 }

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "MoEOptimizationMovementEndpoint.h"
 #include "DeviceMoERebalanceLoadSpreadProof.h"
 #include "MoEOptimizationStages.h"
 
@@ -38,7 +39,7 @@ namespace llaminar2
     enum class MoEOptimizationLifecycleState : std::uint8_t
     {
         NotApplicable,    ///< The model does not use ExpertOverlay.
-        MovementDisabled, ///< ExpertOverlay is live under a non-moving policy.
+        MovementDisabled, ///< Movement cannot run under the policy or authenticated no-peer topology.
         LearningEconomy,  ///< Measured economy is not yet active in policy.
         Active,           ///< Measured economy is installed and movement may run.
         Drained,          ///< Admission is closed and terminal evidence is stable.
@@ -57,7 +58,7 @@ namespace llaminar2
     enum class MoEOptimizationActivityState : std::uint8_t
     {
         NotApplicable, ///< No ExpertOverlay optimization authority exists.
-        Dormant,       ///< Movement is disabled by the selected policy.
+        Dormant,       ///< Policy or an authenticated no-peer topology prevents movement.
         LearningEconomy, ///< Measured policy inputs are not yet installed.
         CollectingDemand, ///< No complete demand window or wave is admitted.
         ReconcilingDemand, ///< The owner is checking for queued demand/work.
@@ -154,16 +155,10 @@ namespace llaminar2
         /** Logical objective of this edge's authoritative closed cycle. */
         MoEOptimizationMovementAxis axis =
             MoEOptimizationMovementAxis::TierResidency;
-        int source_participant = -1;
-        int destination_participant = -1;
+        MoEOptimizationMovementEndpoint source;
+        MoEOptimizationMovementEndpoint destination;
         int source_priority = 0;
         int destination_priority = 0;
-        DeviceId source_device = DeviceId::invalid();
-        DeviceId destination_device = DeviceId::invalid();
-        int source_world_rank = -1;
-        int destination_world_rank = -1;
-        bool source_world_rank_known = false;
-        bool destination_world_rank_known = false;
         std::uint64_t estimated_weight_bytes = 0u;
         std::uint64_t activation_count = 0u;
         bool blocking_inference = false;
@@ -178,9 +173,7 @@ namespace llaminar2
                     authority == MoEOptimizationAuthority::Device) &&
                    transaction > 0u && candidate_epoch > 0u && layer >= 0 &&
                    expert >= 0 && cycle_size > 0u &&
-                   source_participant >= 0 &&
-                   destination_participant >= 0 &&
-                   source_device.is_valid() && destination_device.is_valid();
+                   source.validForLayer(layer) && destination.validForLayer(layer) && source.target().word() != destination.target().word();
         }
     };
 
@@ -631,11 +624,16 @@ namespace llaminar2
         std::uint64_t projected_net_benefit_ns = 0u;
         std::uint32_t layer_scan_start = 0u;
         std::uint32_t layer_scan_next = 0u;
+        /** Native request namespace for transaction; zero for non-request-scoped authorities. */
+        std::uint64_t source_request_epoch = 0u;
+        /** False when the retained native policy proof has no rejection-count observation. */
+        bool rejected_cycles_observed = true;
 
         /** @return Whether the receipt names one completed decision window. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
-            return transaction > 0u && candidate_epoch > 0u;
+            return transaction > 0u && candidate_epoch > 0u &&
+                (rejected_cycles_observed || rejected_cycles == 0u);
         }
 
         /** @return Whether policy deliberately completed without movement. */

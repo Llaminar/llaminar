@@ -2321,12 +2321,12 @@ minimal reproducer, exact system information and patch are published as
   The first attempt passes 683 cases and fails only the build-flags test because
   this isolated configuration omitted `compile_commands.json`; enabling the
   compilation database fixes that setup error and the complete rerun is green.
-- LLVM 23 exposes genuine memory spills in epoch acquisition, NativeVNNI
+- LLVM 23 exposes genuine memory spills in epoch acquisition, NativeQuantised
   schedules and persistent attention. The guard remains enabled. Exact epoch
   launch bounds, bounded dot-product temporary groups and phase-local address
   lifetimes remove the reported spills without reducing concurrency, changing
   formats, increasing workspaces or changing floating-point order.
-- The expanded captured NativeVNNI regression finds a pre-existing whole-row
+- The expanded captured NativeQuantised regression finds a pre-existing whole-row
   scale-ordering gap: GEMM scaled after the partition fold, while serial GEMV
   scales each partition before folding. The corrected all-format blockwise and
   whole-row proof passes in **33.3 seconds**, with **zero new driver records**.
@@ -2338,7 +2338,7 @@ minimal reproducer, exact system information and patch are published as
   seconds**, with **zero new driver records**; the earlier 33.3-second pass is
   not reused as evidence for this later change.
 - Both final kernel regressions pass together in **38.8 seconds**, after the
-  final Integration rebuild: NativeVNNI covers both scale modes and signed
+  final Integration rebuild: NativeQuantised covers both scale modes and signed
   zero; captured attention covers FP32, FP16, BF16 and Q8_1. The driver observer
   records no new warnings. The formerly spilling HD128 attention variants use
   **67–68 VGPRs**, down from 128, with **zero private memory**. This is resource
@@ -2631,6 +2631,6 @@ Final paired kernel evidence is `rocm10-focused-kernel-final.log` and
 `rocm10-focused-kernel-final-driver.json`; loader evidence is
 `rocm10-release-runtime-closure.log`.
 Complete Unit evidence is `rocm10-full-unit-final.{log,xml}`. Initial Release
-samples are `rocm10-release-nvnni-grouped-production-timing.log`; isolated traces
-and counters use `rocm10-release-nvnni-iq1m-profile/`,
-`rocm10-release-nvnni-iq1m-counter/` and `rocm10-release-attention-profile/`.
+samples are `rocm10-release-native_quantised-grouped-production-timing.log`; isolated traces
+and counters use `rocm10-release-native_quantised-iq1m-profile/`,
+`rocm10-release-native_quantised-iq1m-counter/` and `rocm10-release-attention-profile/`.

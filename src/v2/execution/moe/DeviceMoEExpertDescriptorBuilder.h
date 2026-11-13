@@ -2,11 +2,13 @@
  * @file DeviceMoEExpertDescriptorBuilder.h
  * @brief Typed export of prepared expert engines into the runtime-table ABI.
  *
- * Prepared weights may be NativeVNNI or contiguous FP16/BF16/FP32. Graph
+ * Prepared weights may be NativeQuantised or contiguous FP16/BF16/FP32. Graph
  * builders, compute stages and migration share one family/geometry validator.
  * Whole experts require all three projections. Projection-partitioned domains
  * publish an explicitly typed movable gate/up pair and keep fixed down slices
- * outside that placement lifecycle. Rejection never partially mutates a bank.
+ * outside that placement lifecycle. Static within-expert F geometry is not a
+ * complete movable pair and rejects before querying any prepared engine.
+ * Rejection never partially mutates a bank.
  */
 
 #pragma once
@@ -88,10 +90,10 @@ namespace llaminar2
 
         const std::array<ITensorGemm *, 3> engines{gate, up, down};
         const std::size_t count = complete ? 3u : 2u;
-        std::array<DeviceNativeVNNIMatrixDesc, 3> native{};
+        std::array<DeviceNativeQuantisedMatrixDesc, 3> native{};
         std::size_t native_count = 0u;
         for (std::size_t i = 0; i < count; ++i)
-            native_count += engines[i]->exportNativeVNNIMatrixDesc(native[i]) ? 1u : 0u;
+            native_count += engines[i]->exportNativeQuantisedMatrixDesc(native[i]) ? 1u : 0u;
         if (native_count != 0u)
         {
             if (native_count != count)
@@ -110,7 +112,7 @@ namespace llaminar2
             output.floating_gate = {};
             output.floating_up = {};
             output.floating_down = {};
-            output.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            output.weight_format = DeviceMoEWeightFormat::NativeQuantised;
             output.projection_set = projections;
             return true;
         }
@@ -173,7 +175,10 @@ namespace llaminar2
         const MoEExpertProjectionOwnership &ownership,
         DeviceMoEExpertDescriptor &output) noexcept
     {
-        if (ownership.movableProjections() != DeviceMoEProjectionSet::GateUp)
+        // A static input/output rectangle is not a complete movable pair.
+        // Reject before the checked throwing query inside this noexcept validator.
+        if (!ownership.hasMovableProjectionSet() ||
+            ownership.movableProjections() != DeviceMoEProjectionSet::GateUp)
             return false;
         const auto geometry = ownership.geometry();
         return moe_descriptor_detail::exportMovableWeights(gate, up, nullptr,
@@ -197,8 +202,8 @@ namespace llaminar2
     {
         if (!payload.ready())
             return false;
-        DeviceNativeVNNIMatrixDesc native_gate{};
-        if (payload.gate()->exportNativeVNNIMatrixDesc(native_gate))
+        DeviceNativeQuantisedMatrixDesc native_gate{};
+        if (payload.gate()->exportNativeQuantisedMatrixDesc(native_gate))
         {
             return native_gate.valid() && moe_descriptor_detail::exportMovableWeights(
                 payload.gate().get(), payload.up().get(), payload.down().get(), payload.projections(),
@@ -225,7 +230,7 @@ namespace llaminar2
      * @param up Prepared up projection engine.
      * @param down Prepared down projection engine.
      * @param output Runtime descriptor to populate.
-     * @return True only for one complete coherent NativeVNNI or floating family.
+     * @return True only for one complete coherent NativeQuantised or floating family.
      */
     inline bool exportDeviceMoEExpertWeightDescriptors(
         ITensorGemm *gate,
@@ -236,12 +241,12 @@ namespace llaminar2
         if (!gate || !up || !down)
             return false;
 
-        DeviceNativeVNNIMatrixDesc native_gate{};
-        DeviceNativeVNNIMatrixDesc native_up{};
-        DeviceNativeVNNIMatrixDesc native_down{};
-        const bool gate_native = gate->exportNativeVNNIMatrixDesc(native_gate);
-        const bool up_native = up->exportNativeVNNIMatrixDesc(native_up);
-        const bool down_native = down->exportNativeVNNIMatrixDesc(native_down);
+        DeviceNativeQuantisedMatrixDesc native_gate{};
+        DeviceNativeQuantisedMatrixDesc native_up{};
+        DeviceNativeQuantisedMatrixDesc native_down{};
+        const bool gate_native = gate->exportNativeQuantisedMatrixDesc(native_gate);
+        const bool up_native = up->exportNativeQuantisedMatrixDesc(native_up);
+        const bool down_native = down->exportNativeQuantisedMatrixDesc(native_down);
         if (gate_native || up_native || down_native)
         {
             if (!gate_native || !up_native || !down_native ||

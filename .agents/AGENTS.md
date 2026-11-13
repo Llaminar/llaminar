@@ -11,6 +11,14 @@ user-selectable mode is a first-class implementation with its own correctness
 and economy gates; no mode may be entered automatically to hide a missing,
 broken, or uneconomical implementation.
 
+Missing GPU tuning records are not missing hardware support. NativeQuantised
+dispatch prefers the actual architecture's exact records, then the nearest
+compatible measured architecture within that backend. Actual device identity,
+compiled kernel support and launch/resource limits remain authoritative; the
+selected tuning architecture never replaces them. If no compatible exact key
+exists, the complete general dispatcher still covers supported shapes. Missing
+tuning data alone must never prevent inference.
+
 ### Architecture and Ownership
 
 1. **Implement the target state directly.** Do not add serial replay, host
@@ -37,7 +45,10 @@ broken, or uneconomical implementation.
 5. **Keep graphs per-device and symmetric.** Compute stages are
    participant-local and cross-device movement is an explicit graph collective.
    Never create nested multi-device subgraphs or hide rank coordination inside
-   an ordinary compute stage.
+   an ordinary compute stage. An MPI rank may execute on GPUs only on its own
+   observed NUMA node, including calibration and storage-only roles. Full-host
+   discovery is visibility, not execution ownership. A rank without local GPUs
+   participates through its CPU; explicit remote GPU ownership fails admission.
 6. **Use one public transfer/coherence authority.** Production callers use
    `TransferEngine`, arena contracts, and event-aware publication APIs. Direct
    `transitionTo()`, ad hoc `ensureOnDevice()`, and manual dirty-state mutation
@@ -46,6 +57,37 @@ broken, or uneconomical implementation.
 7. **Retire replaced machinery completely.** Remove obsolete launchers,
    entrypoints, generic suites, CLI names, capability checks, and dead code when
    the replacement is installed. Do not preserve a second path "just in case."
+
+### Topology Flexibility
+
+**Derive inference structure from the admitted topology, never from the
+development machine's device counts.** Planning, allocation, loading, graph
+construction, communication, scheduling and retirement must use the same typed
+participant and ownership plan. Support valid positive GPU, CPU socket, MPI
+rank and pipeline-stage counts, including singleton stages, unequal stage
+widths and composed CPU/GPU TP/EP/PP domains. Do not introduce two-rank,
+two-socket or two-stage assumptions, count whitelists such as `2/4/8`, fixed
+participant arrays or masks that impose arbitrary limits, or special loading
+and execution paths tied to one tested arrangement. Size persistent storage
+from admitted membership before execution; this does not permit hot-path
+allocation.
+
+Actual hardware, model geometry, numerical contracts and transport/API limits
+may constrain a configuration. Express each necessary constraint in the typed
+admission contract, document its reason and test its boundary; an unimplemented
+case or the number of devices available for testing is not such a constraint.
+Kernel specializations may optimize particular geometries without restricting
+the engine's supported topology. Preserve original MPI rank and NUMA ownership:
+native GPU collectives operate within the actual rank-local homogeneous domain;
+cross-rank and CPU-socket communication uses the existing MPI/shmemspin
+machinery. Never invent ranks, remote device aliases or ownership bypasses to
+make a configuration fit.
+
+Regressions must exercise singleton, odd/non-power-of-two and larger participant
+counts, unequal widths, more than two pipeline stages and CPU/GPU compositions
+where valid. Device-free topology tests must cover counts beyond the local
+hardware; native tests use real ownership and report unavailable configurations
+as unqualified. A successful fixed-size fixture does not prove generality.
 
 ### Communication Volume
 
@@ -65,6 +107,26 @@ recapture to satisfy this rule. Empty participants exchange only the metadata
 required for safe progress. Tests must prove actual communication extents for
 partial buckets, empty participants, skewed ownership, and large-to-small
 replays; correct output alone does not prove economical communication.
+
+### GPU Launch Work
+
+**Size GPU launches to the actual live work.** Every CUDA/ROCm grid, including
+captured grids, must cover the live rows, tiles, experts or other work items
+required by that invocation. Allocation capacity and maximum admitted shape
+are never the launch extent. Capturing or replaying an oversized grid and
+discarding excess blocks through bounds checks, sentinels or early returns is
+**forbidden**. Skip compute launches when their live work is empty; launch only
+the bounded control work genuinely required for protocol progress. Necessary
+rounding of the final partial block to the kernel's execution granularity does
+not justify additional wholly inactive blocks or empty kernel families.
+
+Graph capture is not an exception: retained storage may cover the worst case,
+but launch selection and geometry must follow device-owned live work. Do not
+introduce host count readbacks, blocking synchronization or recapture to satisfy
+this rule. Tests must verify actual submitted launch dimensions and work
+coverage for partial buckets, empty participants, skewed expert loads and
+large-to-small replays. Correct outputs or an early-exit guard alone do not
+prove economical GPU execution.
 
 ### GPU Execution and Memory
 
@@ -142,6 +204,25 @@ replays; correct output alone does not prove economical communication.
     focused regression registered explicitly in the `ProductionTestPreflight`
     suite; broad Unit or backend coverage does not replace that preflight entry.
 
+**Replay tests are standard for controllers and GPU kernels.** New or changed
+controllers and GPU kernels must include replay regressions explicitly
+registered in `ProductionTestPreflight`. Replay recorded inputs and initial
+state through the actual production implementation, preserving the relevant
+policy/version, geometry, precision, ordering and execution configuration.
+Check decisions, state transitions and outputs against the applicable numerical
+contract; cover reset, partial work and repeated replay. Keep controller replay
+fast and device-free where possible, and exercise GPU kernels in the explicit
+CUDA/ROCm integration suites. Reject incomplete or incompatible traces and
+report unsupported candidate paths instead of inventing missing observations.
+Replay complements native capture and end-to-end gates; it does not replace them.
+
+Name tests after the contract they prove. Reserve **replay** for replaying
+recorded inputs and initial state through the production implementation against
+an expected outcome. Repeating a synthetic fixture does not by itself make a
+replay test. Construction, ownership, retirement and destruction checks are
+**lifecycle** tests; allocation and layout checks are **contract** or **geometry**
+tests. Use that distinction consistently in test names, labels and documentation.
+
 ### Performance and Observability
 
 23. **Measure production binaries and production workloads.** Canonical server
@@ -152,6 +233,15 @@ replays; correct output alone does not prove economical communication.
     `rocprof`/ISA inspection to report occupancy, registers/VGPRs, spills,
     throughput, memory efficiency, and launch geometry. Tune until occupancy
     and throughput are economical; zero spills is the default expectation.
+
+**Use tensor cores for GPU prefill.** Prefill matrix kernels must use tensor
+cores, or the architecture's equivalent matrix instructions, on GPUs that
+support them. A non-tensor-core implementation is an exception only when
+matched measurements prove that tensor cores are not beneficial for the
+relevant architecture, precision and workload geometry. Preserve the applicable
+numerical contract and retain the comparison evidence with the dispatch policy;
+implementation convenience or an untuned candidate does not justify an exception.
+
 25. **Profile CPU kernels with the same rigor.** Use `perf`, IPC/cache evidence,
     physical-core scaling, AVX2/AVX-512 runtime dispatch, and NUMA-aware tests.
     Work must scale sensibly from one thread through the physical cores per
@@ -212,6 +302,16 @@ replays; correct output alone does not prove economical communication.
     commands, gates, and architecture; dashboards/project plans record current
     progress, measurements, failures, and next steps. Do not turn `SKILL.md` or
     `AGENTS.md` into a task diary.
+    **Only tuning dashboards—at-a-glance status references for projects in
+    progress—must declare and stay within a byte-size limit.** Use 15,000 UTF-8
+    bytes unless another limit is explicitly agreed. Dashboards contain current
+    status, comparison matrices, blockers, next actions, and evidence links;
+    they never become exhaustive audit logs. Replace superseded entries rather
+    than appending a chronology. Put detailed experiments, commands, samples,
+    traces, and failure investigations in linked notes or dated records.
+    **Regular project plans, design documents, proof documents, investigations,
+    and other detailed records have no dashboard size limit.** Classify a
+    document by its purpose; do not truncate a plan or proof to meet 15,000 bytes.
 38. **Keep names and docs synchronized.** When modes or CLI options change,
     update code, tests, help, `README.md`, `AGENTS.md`, project docs, and source
     sanitizers together. Fully disambiguate execution modes rather than carrying
@@ -256,7 +356,8 @@ head's push CI, run `gh workflow run ci.yml --ref develop --repo Llaminar/llamin
 and wait for the published pair before opening the PR.
 The master workflow admits the exact develop source and published
 image pair, runs complete Unit and production preflight in source-bound test
-companions for both ISAs, then the full canonical E2E suite and the published
+companions for both ISAs, runs the separate QFN source-admission gate in
+source/ISA-bound full-matrix test companions, then the full canonical E2E suite and the published
 benchmark gates and then complete OpenCode app sessions on every blessed E2E
 cell and both ISAs. Merge only after all required checks pass. The merge cuts a
 release through the canonical release workflow, promoting the same tested
@@ -292,9 +393,10 @@ single-source.
 - `.agents/llaminar-testing/SKILL.md`: Unit and production-preflight gates,
   generation regressions, real-weight HF/CSV diagnostics, canonical matrix
   extension, HTTP/remote-MPI E2E, and image/benchmark certification.
-- `.agents/nativevnni-gemm-tuning/SKILL.md`: cross-backend NativeVNNI
-  GEMV/GEMM candidate tuning, evidence collection, dispatch installation, and
-  corpus certification.
+- `.agents/nativequantised-gemm-tuning/SKILL.md`: cross-backend NativeQuantised
+  GEMV/GEMM exact-overlay tuning, evidence collection, dispatch installation,
+  and numerical/performance qualification. Generic fitting is retired; existing
+  runtime rules continue to cover unmeasured shapes.
 - `.agents/llama-cpp-comparison/SKILL.md`: matched Release comparisons against
   llama.cpp, exact bucket-aligned prompts, paired phase/kernel attribution, and
   overlap-aware performance evidence.
@@ -403,6 +505,26 @@ the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
 
+Parallel full-LTO RCCL builds use the builder-owned fixed linker installed by
+`scripts/docker/install-rocm-lto-linker.sh`. Its source/patch pins belong to
+`scripts/docker/rocm-release.env`; it recompiles one LLVM backend translation
+unit and links the SDK's matching static archives, preserving parallel native
+partitions. The installer proves original-code record loss and complete repaired
+records on every shipping target, including unchanged final device bytes. Each
+ISA has distinct object-partition YAML files; assembly-only diagnostic records
+cannot substitute for actual object-backend allocation evidence. The canonical
+spill parser reads every final kernel and helper. RCCL is a pinned external
+dependency: its complete resource evidence reports physical spill usage and does
+not certify zero spills, protocol correctness, native execution or performance.
+Absolute zero-spill enforcement remains unchanged for project kernel targets. Host `fmt`/utility links keep
+their host role; only the exact RCCL DSO output undergoes the native final-link
+audit. `V2_Integration_RCCLFinalParallelLTOResourceEvidence` verifies the
+source/compiler/DSO-bound compact proof without an SDK or accelerator. These are
+build and test artifacts, not inference-time source hashing or device probes.
+Local additional ISA selections require compiler proof for those explicit targets
+as well as the shipping set. `RCCL_LTO_LINKER_PREFIX` can name that separately
+proved compiler artifact; it cannot select an unqualified linker executable.
+
 ROCm user-space package/source pins and the stable SDK alias belong only to
 `scripts/docker/rocm-release.env`. Development and release images use the shared
 `scripts/docker/install-rocm.sh` installer; local builds must select that same
@@ -450,10 +572,19 @@ build-tree discovery and belongs to `ProductionTestPreflight`.
 CUDA builds use the canonical capture-reentry NCCL dependency installed by
 `scripts/docker/install-nccl.sh` in both development and release images.
 Outside those images, run `sudo bash scripts/docker/install-nccl.sh` before
-configuring. The runtime deliberately loads its distinct SONAME, not the
-distribution NCCL package, because retained parent recording requires the
-corrected stream-membership lifecycle. Do not substitute a system library to
-make dependency discovery pass.
+configuring. The runtime loads the exact NCCL library selected by CMake, with
+the dependency's distinct SONAME. Retained parent recording requires its
+corrected stream-membership lifecycle. Do not substitute a system library or
+search for another installation after dependency admission.
+`V2_Integration_NCCLConfiguredLibrary_*` replays the actual loader's configured,
+explicit and missing path behavior without loading a runtime. Its original-code
+control authenticates the former bare-SONAME search so dependency qualification
+cannot certify one library while inference loads another.
+The same installer repairs native GIN auto selection when a successful probe
+finds no compatible devices. `V2_Integration_NCCLGinSelection` belongs to
+production preflight: the dependency builder replays the actual selector and
+the original failing code, while installed runners authenticate the resulting
+source/DSO-bound proof without an SDK or accelerator.
 
 RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
 second runtime search. Select the compatible library explicitly when configuring
@@ -461,6 +592,29 @@ a local build. Container builders and Release images install the same source-
 built RCCL at the same stable path; moving a checkout must not change the DSO.
 Its project-patched source/ABI pin is separate from the SDK release pin; compile
 it against the selected SDK and prove its native capture/storage contracts.
+Both loaders retain their exact selection until unload and withdraw resolved
+callbacks before closing a partially admitted library.
+`V2_Integration_NCCLPartialAdmission` and
+`V2_Integration_RCCLRetainedLibraryIdentity` replay the actual loader bodies
+and their original failures in preflight without loading a GPU runtime.
+
+Native NCCL/RCCL asynchronous groups retain successful thread creation separately
+from worker execution state. Partial creation failure signals the existing abort
+state, joins every created worker, and only then destroys jobs or their storage.
+A failed join is fatal before cleanup; returning an error is insufficient because
+some native callers deliberately ignore abort results. The dependency builders
+replay the actual native bodies and original-code negative controls.
+`V2_Integration_NCCLThreadLifetime` and
+`V2_Integration_RCCLThreadLifetimeReplay` authenticate the source/DSO-bound
+results in production preflight without SDKs or accelerators. These host-lifetime
+proofs complement actual communicator, capture and admission tests.
+
+Apply the canonical RCCL patch chain through
+`scripts/docker/apply-rccl-capture-patch.sh`. It validates the entire transition
+in a temporary index before updating source, so overlapping patch context cannot
+leave a partially updated tree. Fresh sources, the explicitly supported prior
+chain and the complete current chain are accepted; repeated application preserves
+unchanged file mtimes. `V2_Integration_RCCLPatchChain` guards this contract.
 
 For gfx906, `scripts/docker/install-rocblas-gfx906.sh` compiles matching rocBLAS
 and Tensile sources, including the full floating-format kernel inventory.
@@ -470,6 +624,15 @@ graft another release's kernel pack into a newer DSO or ship only the host
 library. `V2_Integration_ROCmBLASKernelPackaging` belongs to preflight, alongside
 the functional floating-format BLAS/expert tests.
 
+NCCL and RCCL shared-file creators acquire fresh names exclusively and retire
+partial file creations before returning failure. Their complete native host
+translation-unit replays and literal original controls run in the dependency
+builder. `V2_Integration_NCCLSharedFileLifecycle` and
+`V2_Integration_RCCLSharedFileLifecycle` authenticate the resulting
+source/compiler/DSO-bound evidence in production preflight without an SDK or
+GPU. These proofs cover named-file partial creation, not failed GPU registration
+or complete communicator retirement.
+
 RCCL protocol defaults are communicator-local values. Do not cache thread limits
 or publish partially initialized protocol arrays across communicator lifetimes.
 `V2_Integration_RCCLProtocolDefaults` verifies the real native consumers and an
@@ -478,6 +641,25 @@ use. Its source/DSO-bound proof is produced in the compiler builder; installed
 preflight needs neither the vendor source nor an accelerator. An external local
 RCCL build must export its compile database and be supplied through
 `RCCL_PROTOCOL_BUILD_DIR` alongside the exact `RCCL_LIBRARY` selection.
+
+RCCL per-collective protocol and algorithm selectors use native enum indices.
+Their name table must derive from the canonical enum-to-name function rather
+than a separately ordered list. `V2_Integration_RCCLCollectiveSelectors` proves
+the actual parser against every tunable collective and the original faulty
+table. Its builder-only probe captures diagnostics locally without querying HIP;
+installed preflight verifies the source/DSO-bound evidence without a GPU or SDK.
+
+RCCL's small-AllGather LL preference is a native, communicator-local policy.
+It is published only after a complete blocking `ncclCommInitAll` proves the
+four-gfx906, single-process direct-SHM transport configuration. It applies to
+at most 16 KiB of live data per rank; explicit selectors and external tuners
+retain their native semantics. Channel geometry and other native postpasses
+remain owned by RCCL. `V2_Integration_RCCLSmallAllGatherPolicy` verifies the
+actual selector and complete-clique publication helper, including the original
+enqueue negative control. Its builder-owned proof is source/compiler/DSO bound;
+it does not replace real captured-collective, model-parity or performance tests.
+`V2_Integration_RCCLSmallAllGatherProofPackaging` rejects incomplete or stale
+proofs. A failed rebuild must retire any prior successful proof before it runs.
 
 RCCL bootstrap proves host/process identity before selecting transport storage.
 Container launchers pair IPC storage with PID identity: private IPC is the
@@ -798,7 +980,7 @@ The expanded forms split the same intent into
 `--moe-routed-expert-tier 'tier@name;priority=N;...'`. Unlike compact tiers,
 these require explicit `--moe-routed-expert-placement single-domain` or
 `tiered-overlay` to enable placement. Domain options such as `scope`, `owner`,
-`ranks`, `backend`, and `routed_compute` override those
+`ranks`, `backend`, and `expert_compute` override those
 particular axes; do not specify them all unless the topology actually requires
 it. A routed domain accepts single/rank-local/node-local scope, not a global
 TP domain; cross-host overlay connects distinct hardware domains.
@@ -843,7 +1025,7 @@ rows are decode work, not ordinary prefill. There is no `llep` value for
 for supported combinations rather than treating these policies as synonyms.
 
 Projection ownership is a separate physical mode and the automatic default for a native
-homogeneous multi-GPU domain, `routed_compute=gate-up-owned-down-columns`
+homogeneous multi-GPU domain, `expert_compute=gate-up-owned-down-columns`
 keeps movable gate/up pairs with their expert owner and fixes disjoint full-K
 down-output columns on every participant. Both exchanges are graph-visible:
 proven no-P2P domains use device-counted TransferEngine channels for compact
@@ -856,6 +1038,18 @@ execution are not admitted by this implementation. Compare the same model,
 topology, precision, MTP, movement and request policy before claiming a benefit.
 
 ### Cluster launch and shared runtime policy
+
+Executable entrypoints enter `MPISessionOwner` before MPI/runtime setup. Its
+CPU-only sibling `llaminar_mpi_session` owns the actual descendant process tree
+and fresh temporary/shared-memory roots through final retirement. Never delete
+MPI files at `MPI_Finalize`, scan another job's files, or infer retirement from
+a numeric PID or an empty process group. External MPI parents retain their own
+job ownership; explicit native launches use the same helper and MPI's `--`
+application delimiter. Canonical `add_v2_test` registrations use this owner,
+including `NO_MPI` jobs; cancellation must finish native retirement before the
+next campaign lane. Keep the matching sibling helper and native component in
+runtime/test installation and register changed lifetime behavior in
+`ProductionTestPreflight`.
 
 The executable normally bootstraps MPI and installs rank, NUMA, OpenMP, and
 BLAS placement. Do not use `--no-mpi-bootstrap` for ordinary execution; it is

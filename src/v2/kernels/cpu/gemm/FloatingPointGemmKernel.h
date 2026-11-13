@@ -7,19 +7,25 @@
  * - FP16 weights × FP16 activations → FP32 output
  * - BF16 weights × BF16 activations → FP32 output
  *
- * Quantized weights use CPUNativeVNNIGemmKernel's canonical packed layout.
+ * Quantized weights use CPUNativeQuantisedGemmKernel's canonical packed layout.
  * Explicit FP16RNE engines consume half-rounded A and prepared half B through
  * SIMD register conversions and a fixed256-lane FP32 tree for every runtime M.
  * They allocate no activation mirror and retain immutable policy in service views.
+ * Decode work selection preserves original request/row coordinates through
+ * each SIMD tile. Unauthored query rows never enter casts, products or epilogues.
  * Service-measurement execution handles may alias an existing prepared
  * engine's immutable tensor. Each invocation receives participant-owned
  * SwiGLU scratch; shared prepared engines retain no mutable arena binding.
+ * Bounded loading may supply an already-final CPU tensor. That engine retains
+ * its actual storage owner without copying and forbids retiring those live
+ * bytes as if they were a disposable source window.
  *
  * @author David Sanftenberg
  * @date 2025-11-26
  */
 
 #pragma once
+#include "kernels/common/FloatingProjectionRows.h"
 
 #include "memory/CPUWeightStoragePlacement.h"
 
@@ -58,6 +64,25 @@ namespace llaminar2
 {
     namespace gemm
     {
+        /**
+         * @brief Capture original CPU row selection before entering an OpenMP team.
+         * @param rows Physical matrix capacity, unchanged by mutable publications.
+         * @return Borrowed selection or no selection for an ordinary complete matrix.
+         * @throws std::invalid_argument For corrupt or disagreeing host publications.
+         * @details Thread-local launch scopes belong to the submitting thread;
+         * workers receive this immutable value through their enclosing workshare.
+         */
+        inline std::optional<FloatingProjectionRows> cpuFloatingProjectionRows(int rows)
+        {
+            if(rows<=0||!currentProjectionRowWork(rows))return std::nullopt;
+            const auto *prefix=ITensorGemm::VerifierKernelModeScope::prefixForFloating(rows);
+            const auto *requests=ITensorGemm::VerifierKernelModeScope::requestsFor(rows);
+            if(!prefix&&!requests&&!currentProjectionRowWork(rows))return std::nullopt;
+            auto selection=FloatingProjectionRows::bind(rows,prefix,requests);
+            selection.validateHostPublications();
+            return selection;
+        }
+
         // ========== OneDNN Engine/Stream Singletons ==========
 
         /**
@@ -145,7 +170,8 @@ namespace llaminar2
                                            bool transpose_B,
                                            float alpha = 1.0f,
                                            float beta = 0.0f,
-                                           const float *bias = nullptr)
+                                           const float *bias = nullptr,
+                                           const FloatingProjectionRows *selection = nullptr)
         {
             if (!A || !B || !C || M < 0 || N < 0 || K < 0)
             {
@@ -155,6 +181,14 @@ namespace llaminar2
                           << " C=" << static_cast<void *>(C)
                           << " M=" << M << " N=" << N << " K=" << K);
                 return false;
+            }
+
+            const auto scoped_selection=cpuFloatingProjectionRows(M);
+            if(!selection&&scoped_selection)selection=&*scoped_selection;
+
+            if(selection) {
+                if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
+                selection->validateHostPublications();
             }
 
             /*
@@ -169,7 +203,7 @@ namespace llaminar2
              * recurrent-state drift in GDN/short-conv publication.
              */
             constexpr int kVerifierRowTile = 4;
-            const int row_tiles = (M + kVerifierRowTile - 1) / kVerifierRowTile;
+            const int row_tiles = selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             const int workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
             const int64_t scalar_tasks = static_cast<int64_t>(M) * N;
             const int64_t grouped_tasks = static_cast<int64_t>(row_tiles) * N;
@@ -186,9 +220,11 @@ namespace llaminar2
                     {
                         for (int col = 0; col < N; ++col)
                         {
-                            const int first_row = row_tile * kVerifierRowTile;
-                            const int tile_rows =
-                                std::min(kVerifierRowTile, M - first_row);
+                            const auto span=selection ? selection->hostTileSpan(row_tile,kVerifierRowTile) :
+                                ProjectionRowSpan{row_tile*kVerifierRowTile,std::min(M,(row_tile+1)*kVerifierRowTile)};
+                            const int first_row=span.first;
+                            const int tile_rows=span.size();
+                            if(tile_rows==0)continue;
                             const float *b_row =
                                 B + static_cast<size_t>(col) * K;
                             float accumulators[kVerifierRowTile] = {};
@@ -286,6 +322,7 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
+                        if(selection && !selection->hostRowIsActive(row))continue;
                         float acc = 0.0f;
                         const float *a_row = A + static_cast<size_t>(row) * K;
                         if (transpose_B)
@@ -348,9 +385,9 @@ namespace llaminar2
              * the per-row accumulators. Every accumulator still visits K in
              * increasing order, exactly as the one-row decode primitive does.
              */
+            const auto selection=cpuFloatingProjectionRows(M);
             constexpr int kVerifierRowTile = 4;
-            const int row_tiles =
-                (M + kVerifierRowTile - 1) / kVerifierRowTile;
+            const int row_tiles = selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -358,9 +395,11 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        const int first_row = row_tile * kVerifierRowTile;
-                        const int tile_rows =
-                            std::min(kVerifierRowTile, M - first_row);
+                        const auto span=selection ? selection->hostTileSpan(row_tile,kVerifierRowTile) :
+                            ProjectionRowSpan{row_tile*kVerifierRowTile,std::min(M,(row_tile+1)*kVerifierRowTile)};
+                        const int first_row=span.first;
+                        const int tile_rows=span.size();
+                        if(tile_rows==0)continue;
                         float accumulators[kVerifierRowTile] = {};
                         for (int kk = 0; kk < K; ++kk)
                         {
@@ -449,7 +488,8 @@ namespace llaminar2
                                               bool transpose_B,
                                               DecodeFn decode,
                                               float alpha = 1.0f,
-                                              float beta = 0.0f)
+                                              float beta = 0.0f,
+                                              const FloatingProjectionRows *selection = nullptr)
         {
             if (!A || !B || !C || M < 0 || N < 0 || K < 0)
             {
@@ -461,6 +501,14 @@ namespace llaminar2
                 return false;
             }
 
+            const auto scoped_selection=cpuFloatingProjectionRows(M);
+            if(!selection&&scoped_selection)selection=&*scoped_selection;
+
+            if(selection) {
+                if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
+                selection->validateHostPublications();
+            }
+
             /*
              * Match the homogeneous 16-bit primitive above: a fixed four-row
              * tile shares each decoded weight while preserving one independent
@@ -468,7 +516,7 @@ namespace llaminar2
              */
             constexpr int kVerifierRowTile = 4;
             const int row_tiles =
-                (M + kVerifierRowTile - 1) / kVerifierRowTile;
+                selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -476,9 +524,11 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        const int first_row = row_tile * kVerifierRowTile;
-                        const int tile_rows =
-                            std::min(kVerifierRowTile, M - first_row);
+                        const auto span=selection ? selection->hostTileSpan(row_tile,kVerifierRowTile) :
+                                ProjectionRowSpan{row_tile*kVerifierRowTile,std::min(M,(row_tile+1)*kVerifierRowTile)};
+                            const int first_row=span.first;
+                            const int tile_rows=span.size();
+                            if(tile_rows==0)continue;
                         float accumulators[kVerifierRowTile] = {};
                         for (int kk = 0; kk < K; ++kk)
                         {
@@ -516,7 +566,8 @@ namespace llaminar2
                                                 int K,
                                                 bool transpose_B,
                                                 float alpha = 1.0f,
-                                                float beta = 0.0f)
+                                                float beta = 0.0f,
+                                                const FloatingProjectionRows *selection = nullptr)
         {
             return run_fp32x16_skinny_matmul(
                 A, B, C, M, N, K, transpose_B,
@@ -525,7 +576,7 @@ namespace llaminar2
                     return fp16_to_fp32(value);
                 },
                 alpha,
-                beta);
+                beta, selection);
         }
 
         inline bool run_fp32xbf16_skinny_matmul(const float *A,
@@ -536,7 +587,8 @@ namespace llaminar2
                                                 int K,
                                                 bool transpose_B,
                                                 float alpha = 1.0f,
-                                                float beta = 0.0f)
+                                                float beta = 0.0f,
+                                                const FloatingProjectionRows *selection = nullptr)
         {
             return run_fp32x16_skinny_matmul(
                 A, B, C, M, N, K, transpose_B,
@@ -545,7 +597,7 @@ namespace llaminar2
                     return simd::bf16_to_fp32(value);
                 },
                 alpha,
-                beta);
+                beta, selection);
         }
 
         /**
@@ -1133,12 +1185,13 @@ namespace llaminar2
                 return false;
             }
 
+            const auto selection=cpuFloatingProjectionRows(M);
             constexpr int kRowTile = 4;
             constexpr int kLanes =
                 floating_expert_numerical_contract::kReductionLanes;
             static_assert(kLanes == 256,
                           "CPU SIMD schedules implement the 256-lane device tree");
-            const int row_tiles = (M + kRowTile - 1) / kRowTile;
+            const int row_tiles = selection ? selection->hostTiles(kRowTile) : (M + kRowTile - 1) / kRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -1146,9 +1199,11 @@ namespace llaminar2
                 {
                     for (int column = 0; column < N; ++column)
                     {
-                        const int first_row = row_tile * kRowTile;
-                        const int tile_rows =
-                            std::min(kRowTile, M - first_row);
+                        const auto span=selection ? selection->hostTileSpan(row_tile,kRowTile) :
+                            ProjectionRowSpan{row_tile*kRowTile,std::min(M,(row_tile+1)*kRowTile)};
+                        const int first_row=span.first;
+                        const int tile_rows=span.size();
+                        if(tile_rows==0)continue;
                         std::array<float, kRowTile> reduced{};
 #if defined(__AVX512F__) && defined(__AVX512BW__)
                         if constexpr (ISA == ISALevel::AVX512)
@@ -2232,6 +2287,77 @@ namespace llaminar2
         class FloatingPointGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
         {
         private:
+            /** @brief Distinguish disposable source bytes from retained execution bytes. */
+            enum class WeightStorageRelation { BorrowedSource, DetachedCopy, RetainedFinal };
+
+            /** @brief Restrict final-storage construction to its validating named factory. */
+            struct FinalCPUStorageTag {};
+
+            /**
+             * @brief Validate an owning CPU matrix before retaining it as final storage.
+             * @param tensor Fully populated FP32, FP16 or BF16 CPU tensor.
+             * @throws std::invalid_argument For absent, borrowed, mapped, released,
+             *         non-CPU, non-matrix or inconsistent physical storage.
+             * @details Source views and mapped GGUF payloads are not final roots.
+             * The tensor's original allocation lease remains its sole authority.
+             */
+            static void validateFinalCPUStorage(const std::shared_ptr<const TensorBase> &tensor)
+            {
+                if (!tensor || !tensor->home_device().is_cpu() ||
+                    tensor->current_device().has_value() || !tensor->isHostAuthoritative() ||
+                    tensor->is_view() || tensor->is_mmap_data() || tensor->isMapped() ||
+                    tensor->transferStorageOwner() != tensor.get() || !tensor->raw_data() ||
+                    tensor->shape().size() != 2u)
+                    throw std::invalid_argument("Final CPU floating weights require a live owning CPU matrix");
+
+                const size_t n = tensor->shape()[0], k = tensor->shape()[1];
+                const size_t max_dimension = static_cast<size_t>(std::numeric_limits<int>::max());
+                if (!n || !k || n > max_dimension || k > max_dimension ||
+                    n > std::numeric_limits<size_t>::max() / k)
+                    throw std::invalid_argument("Final CPU floating weight geometry is invalid");
+
+                size_t element_bytes = 0;
+                const void *native_data = nullptr;
+                if (tensor->native_type() == TensorType::FP32)
+                {
+                    if (const auto *fp32 = dynamic_cast<const FP32Tensor *>(tensor.get()))
+                    { element_bytes = sizeof(float); native_data = fp32->typed_data(); }
+                }
+                else if (tensor->native_type() == TensorType::FP16)
+                {
+                    if (const auto *fp16 = dynamic_cast<const FP16Tensor *>(tensor.get()))
+                    { element_bytes = sizeof(uint16_t); native_data = fp16->typed_data(); }
+                }
+                else if (tensor->native_type() == TensorType::BF16)
+                {
+                    if (const auto *bf16 = dynamic_cast<const BF16Tensor *>(tensor.get()))
+                    { element_bytes = sizeof(uint16_t); native_data = bf16->typed_data(); }
+                }
+                if (!element_bytes || native_data != tensor->raw_data() ||
+                    n * k > std::numeric_limits<size_t>::max() / element_bytes ||
+                    tensor->size_bytes() != n * k * element_bytes)
+                    throw std::invalid_argument("Final CPU floating weight type and storage disagree");
+            }
+
+            /**
+             * @brief Retain the caller's exact final owner without allocating weight storage.
+             * @param weight_tensor Validated final CPU matrix and its original lease.
+             * @param numerical_policy Immutable reduction policy.
+             * @param operand_precision Immutable activation operand policy.
+             */
+            FloatingPointGemmKernel(FinalCPUStorageTag,
+                std::shared_ptr<const TensorBase> weight_tensor,
+                CPUProjectionNumericalPolicy numerical_policy,
+                FloatingActivationOperandPrecision operand_precision)
+                : weight_tensor_lifetime_(std::move(weight_tensor)),
+                  weight_tensor_(weight_tensor_lifetime_.get()),
+                  numerical_policy_(numerical_policy), operand_precision_(operand_precision),
+                  storage_relation_(WeightStorageRelation::RetainedFinal)
+            {
+                validateFinalCPUStorage(weight_tensor_lifetime_);
+                validateBoundWeight();
+            }
+
             /**
              * @brief Copy one expert view into engine-owned execution storage.
              *
@@ -2350,9 +2476,35 @@ namespace llaminar2
                       cloneExpertExecutionStorage(weight_tensor, placement)),
                   weight_tensor_(weight_tensor_lifetime_.get()),
                   numerical_policy_(numerical_policy), operand_precision_(operand_precision),
-                  owned_weight_bytes_(weight_tensor_lifetime_->size_bytes())
+                  owned_weight_bytes_(weight_tensor_lifetime_->size_bytes()),
+                  storage_relation_(WeightStorageRelation::DetachedCopy)
             {
                 validateBoundWeight();
+            }
+
+            /**
+             * @brief Bind one already-admitted final CPU tensor without a second weight root.
+             * @param final_tensor Fully populated owning CPU matrix; views are rejected.
+             * @param numerical_policy Immutable backend-native or GPU-aligned arithmetic.
+             * @param operand_precision Immutable native/FP32/FP16RNE operand identity.
+             * @return Engine retaining the same tensor and original allocation lease.
+             * @throws std::invalid_argument For invalid storage or incompatible policy.
+             * @details This tensor remains live execution storage. Source retirement
+             * must discard only the bounded input window, never these final bytes.
+             */
+            static std::shared_ptr<FloatingPointGemmKernel> fromFinalCPUStorage(
+                std::shared_ptr<const TensorBase> final_tensor,
+                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
+            {
+                return std::shared_ptr<FloatingPointGemmKernel>(new FloatingPointGemmKernel(
+                    FinalCPUStorageTag{}, std::move(final_tensor), numerical_policy, operand_precision));
+            }
+
+            /** @return Exact retained execution tensor, shared without copying its storage. */
+            const std::shared_ptr<const TensorBase> &retainedFinalWeightTensor() const noexcept
+            {
+                return weight_tensor_lifetime_;
             }
 
             ~FloatingPointGemmKernel() override = default;
@@ -2379,7 +2531,8 @@ namespace llaminar2
                 : weight_tensor_lifetime_(source, source ? source->weight_tensor_ : nullptr),
                   weight_tensor_(weight_tensor_lifetime_.get()),
                   numerical_policy_(source ? source->numerical_policy_ : NumericalPolicy::BackendNative),
-                  operand_precision_(source ? source->operand_precision_ : FloatingActivationOperandPrecision::Native)
+                  operand_precision_(source ? source->operand_precision_ : FloatingActivationOperandPrecision::Native),
+                  storage_relation_(source ? source->storage_relation_ : WeightStorageRelation::BorrowedSource)
             {
                 if (!source || !weight_tensor_)
                     throw std::invalid_argument("CPU floating execution view requires a prepared source");
@@ -2450,13 +2603,13 @@ namespace llaminar2
 
             /**
              * @brief Confirm that expert preparation detached from loader bytes.
-             * @return Always true for the shared expert constructor's owning
-             *         representation; borrowed dense callers never use the raw
-             *         expert-preparation API.
+             * @return True only when preparation copied to independent storage.
+             *         A retained final tensor is still the engine's live input;
+             *         sharing its owner never authorizes destructive retirement.
              */
             bool canReleaseSourceWeightTensor() const override
             {
-                return weight_tensor_lifetime_ != nullptr;
+                return storage_relation_ == WeightStorageRelation::DetachedCopy;
             }
 
             /**
@@ -2552,6 +2705,12 @@ namespace llaminar2
                               << static_cast<int>(act_type)
                               << " weight=" << static_cast<int>(weight_type_));
                     return false;
+                }
+
+                if(const auto *work=currentProjectionRowWork(m)) {
+                    if(m!=1)
+                        throw std::invalid_argument("Selected floating decode rows require explicit grouped decode arithmetic");
+                    if(!work->resolveHost().contains(0))return true;
                 }
 
                 // Extract bias pointer (FP32 fused bias only for now)
@@ -2784,6 +2943,12 @@ namespace llaminar2
                               << static_cast<int>(act_type)
                               << " weight=" << static_cast<int>(weight_type_));
                     return false;
+                }
+
+                if(const auto *work=currentProjectionRowWork(m)) {
+                    if(m!=1)
+                        throw std::invalid_argument("Selected floating decode rows require explicit grouped decode arithmetic");
+                    if(!work->resolveHost().contains(0))return true;
                 }
 
                 // Extract bias pointer (FP32 fused bias only for now)
@@ -3378,6 +3543,10 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
                 for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
+                for (const auto &projection : projections)
                 {
                     const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(projection.kernel);
                     if (!engine || engine->operand_precision_ != operand_precision_)
@@ -3623,6 +3792,16 @@ namespace llaminar2
              * order as the M=1 decode GEMV.  This is intentionally not a hidden
              * serial row loop.
              */
+            /** @brief Bind request-local holes only for the source-preserving native floating primitives. */
+            std::unique_ptr<VerifierKernelModeScope> beginFloatingRequestRowsScope(DeviceRequestRowRanges rows) override
+            {
+                if(operand_precision_!=FloatingActivationOperandPrecision::Native ||
+                    numerical_policy_!=NumericalPolicy::BackendNative ||
+                    (weight_type_!=TensorType::FP32 && weight_type_!=TensorType::FP16 && weight_type_!=TensorType::BF16))
+                    throw std::invalid_argument("Counted CPU floating requests require native FP32/FP16/BF16 policy");
+                return makeFloatingRequestRowsScope(rows);
+            }
+
             bool multiply_fused_verifier_rows_decode_equivalent(
                 const TensorBase *input,
                 const std::vector<TensorProjectionDesc> &projections,
@@ -3630,6 +3809,10 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
                 for (const auto &projection : projections)
                 {
                     const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(projection.kernel);
@@ -3652,6 +3835,12 @@ namespace llaminar2
                               << " projections=" << projections.size());
                     return false;
                 }
+
+                const auto *request_rows=VerifierKernelModeScope::requestsFor(m);
+                if(request_rows && input->native_type()!=TensorType::FP32)
+                    throw std::invalid_argument("Counted floating requests require FP32 activation rows");
+                const auto selection=FloatingProjectionRows::bind(m,VerifierKernelModeScope::prefixForFloating(m),request_rows);
+                selection.validateHostPublications();
 
                 const bool mixed_fp32_activation =
                     input->native_type() == TensorType::FP32 &&
@@ -3832,7 +4021,7 @@ namespace llaminar2
                                       /*transpose_B=*/true,
                                       /*alpha=*/1.0f,
                                       /*beta=*/0.0f,
-                                      bias_ptr);
+                                      bias_ptr, &selection);
                     }
                     else if (weight_type_ == TensorType::FP16)
                     {
@@ -3856,7 +4045,7 @@ namespace llaminar2
                                               m,
                                               proj.n,
                                               k,
-                                              /*transpose_B=*/true))
+                                              /*transpose_B=*/true,1.0f,0.0f,&selection))
                                  : run_fp16_skinny_matmul(
                                        input_fp16,
                                        weight_fp16->typed_data(),
@@ -3888,7 +4077,7 @@ namespace llaminar2
                                               m,
                                               proj.n,
                                               k,
-                                              /*transpose_B=*/true))
+                                              /*transpose_B=*/true,1.0f,0.0f,&selection))
                                  : run_bf16_skinny_matmul(
                                        input_bf16,
                                        weight_bf16->typed_data(),
@@ -3954,7 +4143,7 @@ namespace llaminar2
              * The timers sit around grouped verifier projection families rather
              * than inside every dot product.  They are enabled only when the
              * structured perf collector is active, and they preserve enough shape
-             * tags to compare FP32 GDN projection cost with NativeVNNI cost.
+             * tags to compare FP32 GDN projection cost with NativeQuantised cost.
              */
             static void recordVerifierTiming(
                 const char *name,
@@ -4656,6 +4845,7 @@ namespace llaminar2
             NumericalPolicy numerical_policy_ = NumericalPolicy::BackendNative;
             const FloatingActivationOperandPrecision operand_precision_ = FloatingActivationOperandPrecision::Native; ///< Sealed prepared operand identity.
             const size_t owned_weight_bytes_ = 0; ///< Zero for non-allocating execution views.
+            const WeightStorageRelation storage_relation_ = WeightStorageRelation::BorrowedSource; ///< Source retirement follows actual storage identity.
         };
 
     } // namespace gemm

@@ -33,7 +33,7 @@ namespace llaminar2
         {
             switch (format.kind)
             {
-            case ExpertWeightFormatKind::NativeVnni: return DeviceMoEWeightFormat::NativeVNNI;
+            case ExpertWeightFormatKind::NativeQuantised: return DeviceMoEWeightFormat::NativeQuantised;
             case ExpertWeightFormatKind::FP16: return DeviceMoEWeightFormat::FP16;
             case ExpertWeightFormatKind::BF16: return DeviceMoEWeightFormat::BF16;
             case ExpertWeightFormatKind::FP32: return DeviceMoEWeightFormat::FP32;
@@ -50,15 +50,15 @@ namespace llaminar2
         }
 
         /** @return Native plane view, absent when no quantized storage was planned. */
-        DeviceNativeVNNIMatrixDesc descriptorFromSlot(
+        DeviceNativeQuantisedMatrixDesc descriptorFromSlot(
             const WeightVRAMPool::WeightSlot &slot,
             const DeviceMoETransferSlotDirectory::ProjectionSpec &spec)
         {
-            DeviceNativeVNNIMatrixDesc desc;
-            desc.payload = slot.d_native_vnni_payload;
-            desc.scales = slot.d_native_vnni_scales;
-            desc.mins = slot.d_native_vnni_mins;
-            desc.emins = slot.d_native_vnni_emins;
+            DeviceNativeQuantisedMatrixDesc desc;
+            desc.payload = slot.d_native_quantised_payload;
+            desc.scales = slot.d_native_quantised_scales;
+            desc.mins = slot.d_native_quantised_mins;
+            desc.emins = slot.d_native_quantised_emins;
             desc.n = spec.N;
             desc.k = spec.K;
             desc.blocks_per_row = static_cast<uint32_t>(spec.K / 32);
@@ -67,13 +67,13 @@ namespace llaminar2
                 static_cast<uint8_t>(spec.payload_bytes_per_block);
             desc.allocation_has_mins = spec.is_asymmetric ? 1u : 0u;
             desc.allocation_has_emins = spec.has_emins ? 1u : 0u;
-            if (!spec.format.isNativeVnni())
+            if (!spec.format.isNativeQuantised())
                 return {};
-            desc.source_codebook_id = spec.format.native_vnni.codebook_id;
+            desc.source_codebook_id = spec.format.native_quantised.codebook_id;
             desc.source_is_superblock = static_cast<uint8_t>(
-                spec.format.native_vnni.is_superblock);
+                spec.format.native_quantised.is_superblock);
             desc.source_identity_present = static_cast<uint8_t>(
-                spec.format.native_vnni.present);
+                spec.format.native_quantised.present);
             return desc;
         }
 
@@ -87,7 +87,7 @@ namespace llaminar2
             const auto matrix_desc = descriptorFromSlot(slot, spec);
             const DeviceMoEFloatingMatrixDesc floating_desc =
                 deviceMoEWeightFormatIsFloating(floating_capacity)
-                    ? DeviceMoEFloatingMatrixDesc{slot.d_native_vnni_payload, spec.N, spec.K}
+                    ? DeviceMoEFloatingMatrixDesc{slot.d_native_quantised_payload, spec.N, spec.K}
                     : DeviceMoEFloatingMatrixDesc{};
             if (spec.label == "gate")
             {
@@ -112,16 +112,16 @@ namespace llaminar2
         /** @return Checkpoint format and arithmetic family for a diagnostic only. */
         std::string projectionFormatName(const ExpertWeightFormat &format)
         {
-            if (format.isNativeVnni())
+            if (format.isNativeQuantised())
             {
-                const auto *source = native_vnni_formats::forSourceIdentity(
-                    format.native_vnni.codebook_id, format.native_vnni.is_superblock);
-                const auto entry = std::find_if(native_vnni_formats::kAllSourceFormats.begin(),
-                    native_vnni_formats::kAllSourceFormats.end(),
+                const auto *source = native_quantised_formats::forSourceIdentity(
+                    format.native_quantised.codebook_id, format.native_quantised.is_superblock);
+                const auto entry = std::find_if(native_quantised_formats::kAllSourceFormats.begin(),
+                    native_quantised_formats::kAllSourceFormats.end(),
                     [&](const auto &candidate) { return candidate.metadata == source; });
-                return entry != native_vnni_formats::kAllSourceFormats.end()
-                    ? "NativeVNNI/" + std::string(entry->quant_type)
-                    : "invalid NativeVNNI source";
+                return entry != native_quantised_formats::kAllSourceFormats.end()
+                    ? "NativeQuantised/" + std::string(entry->quant_type)
+                    : "invalid NativeQuantised source";
             }
             switch (format.kind)
             {
@@ -142,7 +142,7 @@ namespace llaminar2
          *
          * The compact device descriptor carries one arithmetic tag for the
          * movable payload. Dropping this check would reinterpret floating bytes
-         * as NativeVNNI planes. Name every source tensor on rejection so the user
+         * as NativeQuantised planes. Name every source tensor on rejection so the user
          * can distinguish that implementation limit from a capacity failure.
          */
         void validateSpecs(
@@ -170,7 +170,7 @@ namespace llaminar2
                         "DeviceMoETransferSlotDirectory projection label must be gate, up, or down");
 
                 if (spec.N <= 0 || spec.K <= 0 || !spec.format.valid() ||
-                    (spec.format.isNativeVnni() &&
+                    (spec.format.isNativeQuantised() &&
                      ((spec.K % 32) != 0 || spec.payload_bytes_per_block <= 0)))
                 {
                     throw std::invalid_argument(
@@ -183,7 +183,7 @@ namespace llaminar2
                 throw std::invalid_argument("DeviceMoETransferSlotDirectory projection labels differ from its ownership contract");
 
             const bool mixed = std::any_of(specs.begin(), specs.end(), [&](const auto &spec) {
-                return spec.format.isNativeVnni() != specs.front().format.isNativeVnni() ||
+                return spec.format.isNativeQuantised() != specs.front().format.isNativeQuantised() ||
                        (spec.format.isFloating() && spec.format != specs.front().format);
             });
             if (mixed)
@@ -203,7 +203,7 @@ namespace llaminar2
                         message << spec.label;
                     message << '=' << projectionFormatName(spec.format);
                 }
-                message << ". The movable payload requires all NativeVNNI projections "
+                message << ". The movable payload requires all NativeQuantised projections "
                            "(different quantized codebooks are supported), or one shared "
                            "FP16/BF16/FP32 precision. Mixed quantized/floating or floating-precision "
                            "projections within a movable payload are not implemented; choose "
@@ -230,7 +230,7 @@ namespace llaminar2
         /** @return Complete wire size, or union capacity when a raw alias is supplied. */
         size_t expertPayloadBytes(
             const std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> &specs,
-            DeviceMoEWeightFormat floating_capacity = DeviceMoEWeightFormat::NativeVNNI)
+            DeviceMoEWeightFormat floating_capacity = DeviceMoEWeightFormat::NativeQuantised)
         {
             size_t bytes = 0;
             for (const auto &spec : specs)
@@ -436,13 +436,13 @@ namespace llaminar2
                     continue;
                 }
                 const auto *source =
-                    native_vnni_formats::forSourceIdentity(
-                        projection.format.native_vnni.codebook_id,
-                        projection.format.native_vnni.is_superblock);
+                    native_quantised_formats::forSourceIdentity(
+                        projection.format.native_quantised.codebook_id,
+                        projection.format.native_quantised.is_superblock);
                 if (!source)
                 {
                     throw std::invalid_argument(
-                        "DeviceMoETransferSlotDirectory manifest contains an uncatalogued NativeVNNI source format");
+                        "DeviceMoETransferSlotDirectory manifest contains an uncatalogued NativeQuantised source format");
                 }
 
                 /*

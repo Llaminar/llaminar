@@ -7,12 +7,40 @@
  * selected by each lookup rather than relabeling it from later live state.
  * One explicit stage registry owns every runner; remote endpoints cannot be
  * replaced by an anonymous rank runner or the nearest local layer scope.
+ * Global checkpoint envelopes retain one child per local stage; forwarding a
+ * terminal operation unwraps exactly that stage while its nested TP owners,
+ * payload handles and ready events remain independently authenticated.
  *
  * @author David Sanftenberg
  * @date April 2026
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
+ * Hosted activation banks retain the declared residual matrix geometry even
+ * when a smaller request consumes only a prefix of their admitted rows.
  */
 
 #include "GlobalOrchestrator.h"
+#include "OriginalPipelineStageDomain.h"
+#include "HostedPipelineActivationStorage.h"
+#include "../local_execution/orchestrators/PipelineDeviceGeneration.h"
+#include "../../transfer/CapturedTransferChannelProtocol.h"
+#include <cstring>
+#include "../local_execution/engine/PrefillBucketUtils.h"
+#include <type_traits>
+#include "../local_execution/orchestrators/PipelineForwardGraphEdges.h"
+#include "../local_execution/orchestrators/PipelineActivationFanout.h"
+#include "planning/PipelineTransferMemory.h"
+#include "planning/PlanningPublication.h"
+#include "utils/PerfStatsCollector.h"
+#include "transfer/CapturedTransferChannel.h"
+#include "transfer/TransferEngine.h"
+#include <nlohmann/json.hpp>
+#include <limits>
+#include <array>
+#include "../moe/MoEOverlayPipelineStageBinding.h"
+#include "../moe/MoEOverlayResidencyAuthority.h"
 #include "../local_execution/orchestrators/IRankOrchestrator.h"
 #include "../global_pp/GlobalPPRankPlanBuilder.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
@@ -25,7 +53,6 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
-#include <cstring>
 #include <optional>
 
 namespace llaminar2
@@ -198,6 +225,11 @@ namespace llaminar2
         }
 
         entries_.push_back(std::move(entry));
+    }
+
+    void StageRunnerRegistry::releaseAllAfterTerminalDrain()
+    {
+        entries_.clear();
     }
 
     bool StageRunnerRegistry::empty() const
@@ -1075,6 +1107,9 @@ namespace llaminar2
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_updates);
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_promotions);
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_demotions);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_utility_returns);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_utility_keeps);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_utility_probes);
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_observe_recommendations);
             sum(&PrefixRuntimeStateSnapshot::prefill_chunk_schedules);
             sum(&PrefixRuntimeStateSnapshot::prefill_chunk_successful_schedules);
@@ -1246,6 +1281,23 @@ namespace llaminar2
                                           ? PrefixStateProvenance::LogicalCheckpoint
                                           : PrefixStateProvenance::PayloadCheckpoint);
         return aggregate;
+    }
+
+    const PrefixStateSnapshot *StageRunnerRegistry::prefixCheckpointForRunner(
+        const PrefixStateSnapshot &snapshot, const IInferenceRunner &runner) const
+    {
+        if (!snapshot.valid || snapshot.participant_snapshots.size() != entries_.size())
+            return nullptr;
+        for (size_t index = 0; index < entries_.size(); ++index)
+        {
+            if (entries_[index].runner.get() != &runner)
+                continue;
+            const auto &child = snapshot.participant_snapshots[index];
+            if (!child.valid || child.cached_tokens != snapshot.cached_tokens)
+                return nullptr;
+            return &child;
+        }
+        return nullptr;
     }
 
     bool StageRunnerRegistry::restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx)
@@ -1474,12 +1526,8 @@ namespace llaminar2
     void StageActivationRouter::ensureActivationBufferSize(std::shared_ptr<TensorBase> &activation_buffer,
                                                            size_t num_elements)
     {
-        if (!activation_buffer || activation_buffer->numel() != num_elements)
-        {
-            activation_buffer = std::make_shared<FP32Tensor>(std::vector<size_t>{num_elements});
-            LOG_DEBUG("StageActivationRouter: allocated activation buffer with "
-                      << num_elements << " elements");
-        }
+        if(!activation_buffer || activation_buffer->numel()<num_elements)
+            throw std::logic_error("Hosted pipeline transfer exceeds its original cold-admitted activation bank");
     }
 
     bool StageActivationRouter::executeTransfer(const RankTransferAction &action,
@@ -1488,13 +1536,26 @@ namespace llaminar2
                                                 int rank,
                                                 int last_seq_len,
                                                 int d_model,
-                                                std::shared_ptr<TensorBase> &activation_buffer) const
+                                                std::shared_ptr<TensorBase> &activation_buffer,
+                                                ForwardExecutionPhase phase) const
     {
         if (action.direction == RankTransferAction::Direction::NONE)
             return true;
 
         const auto &mpi_log = debugEnv().mpi_logging;
         const size_t count = transferElementCount(last_seq_len, d_model);
+        const size_t bytes = count * sizeof(float);
+        const auto recordOutgoing = [&](DeviceId source, const char *transport)
+        {
+            // The original sender or local handoff records only a completed
+            // live payload, after its host copy and any MPI send have succeeded.
+            PerfStatsCollector::addCounterWithSequence(
+                "transfer", "hosted_pipeline_activation_bytes", static_cast<double>(bytes),
+                {static_cast<std::uint64_t>(last_seq_len), static_cast<std::uint64_t>(bytes)},
+                phase == ForwardExecutionPhase::Prefill ? "prefill" : "decode", source.toString(),
+                {{"source_stage", std::to_string(action.from_stage)},
+                 {"consumer_stage", std::to_string(action.to_stage)}, {"transport", transport}});
+        };
 
         if (action.direction == RankTransferAction::Direction::LOCAL_HANDOFF)
         {
@@ -1524,8 +1585,15 @@ namespace llaminar2
             }
 
             ensureActivationBufferSize(activation_buffer, count);
-            std::memmove(activation_buffer->mutable_data(), hidden->data(), count * sizeof(float));
+            const auto copied = TransferEngine::instance().copyActivation(
+                hidden, activation_buffer.get(), DeviceId::cpu(), bytes);
+            if (!copied.success)
+            {
+                LOG_ERROR("StageActivationRouter: exact local handoff failed: " << copied.error);
+                return false;
+            }
             destination_runner->setHiddenState(activation_buffer.get());
+            recordOutgoing(source_runner->primaryDeviceId(), "local");
 
             LOG_DEBUG("StageActivationRouter: rank " << rank
                       << " LOCAL_HANDOFF " << count << " floats stage "
@@ -1558,7 +1626,23 @@ namespace llaminar2
                 return false;
             }
 
-            const float *send_data = hidden->data();
+            const float *send_data = nullptr;
+            if (source_runner->primaryDeviceId().is_gpu())
+            {
+                ensureActivationBufferSize(activation_buffer, count);
+                const auto copied = TransferEngine::instance().copyActivation(
+                    hidden, activation_buffer.get(), DeviceId::cpu(), bytes);
+                if (!copied.success)
+                {
+                    LOG_ERROR("StageActivationRouter: exact MPI send staging failed: " << copied.error);
+                    return false;
+                }
+                send_data = activation_buffer->data();
+            }
+            else
+            {
+                send_data = hidden->data();
+            }
             if (mpi_log.log_collectives)
             {
                 LOG_DEBUG("[MPI] rank " << rank << " SEND " << count
@@ -1593,6 +1677,7 @@ namespace llaminar2
                           << "): " << e.what());
                 return false;
             }
+            recordOutgoing(source_runner->primaryDeviceId(), "mpi");
             return true;
         }
 
@@ -1762,18 +1847,17 @@ namespace llaminar2
                 is_pipeline_tail_ = true;
         }
 
-        // Allocate activation transfer buffer for PP (if we have any transfers)
-        if (!rank_plan_.transferActions().empty() && config_.d_model > 0)
-        {
-            // Buffer size: max_seq_len * d_model floats
-            // Use a conservative max_seq_len estimate; will be resized on demand
-            // For now: create a 1D FP32 tensor sized to d_model (single token decode)
-            // The actual transfer count is determined at runtime from the hidden state
-            activation_buffer_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(config_.d_model)});
-
-            LOG_DEBUG("GlobalOrchestrator: allocated activation buffer ["
-                      << config_.d_model << "] for PP transfers");
+        if(!requiresOriginalRankGPUTransport() &&
+           HostedPipelineActivationStorage::requiresBank(config_.topology, rank_plan_)) {
+            if(!config_.physical_memory || config_.physical_memory->worldRank()!=config_.rank)
+                throw std::invalid_argument("Hosted pipeline activation requires its original rank PMA");
+            const auto root=HostedPipelineActivationStorage::forRows(config_.hosted_activation_rows,config_.d_model);
+            // The original allocator owns capacity, while the model owns row
+            // geometry. Flattening this bank loses the residual stride required
+            // by the next stage's exact-live activation copy contract.
+            activation_buffer_=std::make_shared<FP32Tensor>(
+                std::vector<std::size_t>{static_cast<std::size_t>(config_.hosted_activation_rows),
+                    static_cast<std::size_t>(config_.d_model)},root.allocate(config_.physical_memory));
         }
 
         LOG_DEBUG("GlobalOrchestrator: pipeline_head=" << is_pipeline_head_
@@ -1781,14 +1865,439 @@ namespace llaminar2
                  << " tail_rank=" << tail_rank_);
     }
 
+    GlobalOrchestrator::~GlobalOrchestrator()
+    {
+        if (rank_active_command_) abortOriginalRankGenerationCommand();
+        // The follower retains native completion fences borrowing the original
+        // graph/workspace owners. Close that service before either the pipeline
+        // pool or the stage registry releases those owners.
+        rank_transaction_follower_.reset();
+        if (rank_generation_) rank_generation_->retireForwardOnlyBeforeStageRelease();
+        if(config_.original_cpu_domains) {
+            // Original CPU retirement is a native domain collective. All actual
+            // local graph/worker/completion borrowers must disappear first;
+            // ordinary context RAII cannot discharge this admitted duty.
+            rank_generation_.reset();
+            stage_runners_.releaseAllAfterTerminalDrain();
+            config_.stage_runners.clear();
+            try {config_.original_cpu_domains->retireAfterGraphRelease();}
+            catch(...) {std::terminate();}
+        }
+    }
+
+    bool GlobalOrchestrator::materializeServingGraphFamilyWithoutLaunch(
+        const ServingGraphFamilyMaterializationPlan &plan)
+    {
+        if (!requiresOriginalRankGPUTransport()) {
+            if(!plan.valid()) return false;
+            if (hosted_serving_family_plan_ && !hosted_serving_family_plan_->sameCaptureIdentity(plan))
+                throw std::invalid_argument("Hosted pipeline changed its original retained serving family");
+            const auto actions=rank_plan_.executeStages();
+            if(actions.empty()) return false;
+            for(const auto* action:actions) {
+                auto* entry=stage_runners_.entryForStage(action->stage_id);
+                if(!entry || !entry->runner) return false;
+                auto child=plan;
+                child.pipeline_hidden_input=action->has_embedding?nullptr:activation_buffer_.get();
+                if(!action->has_embedding && !child.pipeline_hidden_input)
+                    throw std::logic_error("Hosted pipeline child lost its original stable activation input");
+                if(!entry->runner->materializeServingGraphFamilyWithoutLaunch(child)) return false;
+            }
+            hosted_serving_family_plan_ = plan;
+            return true;
+        }
+        prepareOriginalRankPipelinePorts(plan);
+        if (!rank_generation_)
+        {
+            std::vector<PipelineDeviceGeneration::RankStageBinding> originals;
+            for (const auto *action : rank_plan_.executeStages())
+            {
+                auto *entry = stage_runners_.entryForStage(action->stage_id);
+                if (!entry || !entry->runner)
+                    throw std::logic_error("Original global cohort lost a declared stage runner");
+                originals.push_back({entry->runner.get(), action});
+            }
+            rank_generation_ = std::make_unique<PipelineDeviceGeneration>(config_.topology,
+                rank_plan_, originals, rank_forward_edges_);
+        }
+        if (!rank_generation_->prepareServing(plan)) return false;
+        prepareOriginalRankGenerationService();
+        return true;
+    }
+
+    bool GlobalOrchestrator::supportsPrefillChunkSchedule(int seq_len) const
+    {
+        if (seq_len <= 0) return false;
+        if (requiresOriginalRankGPUTransport() &&
+            (!rank_generation_ || !rank_generation_->prefillPrepared())) return false;
+        for (const auto *action : rank_plan_.executeStages())
+        {
+            const auto *entry = stage_runners_.entryForStage(action->stage_id);
+            if (!entry || !entry->runner || !entry->runner->supportsPrefillChunkSchedule(seq_len)) return false;
+        }
+        return true;
+    }
+
+    bool GlobalOrchestrator::forwardPrefillChunkSchedule(const int *tokens, int seq_len,
+        const PrefillChunkSchedulerPolicy &policy, int pad_token_id, bool allow_padded_execution)
+    {
+        if (!supportsPrefillChunkSchedule(seq_len) || !tokens) return false;
+        if (requiresOriginalRankGPUTransport())
+            return rank_generation_->prefill(tokens, seq_len, policy, pad_token_id, allow_padded_execution);
+        if(config_.topology.numStages()==1) {
+            auto* runner=stage_runners_.defaultRunner();
+            return runner && runner->forwardPrefillChunkSchedule(tokens,seq_len,policy,pad_token_id,allow_padded_execution);
+        }
+        const auto schedule = planPrefillChunkSchedule(policy);
+        if (!schedule || schedule.chunks.empty() || policy.real_token_count != seq_len ||
+            policy.real_token_start != get_position())
+            return false;
+        for (const auto &chunk : schedule.chunks)
+        {
+            const int offset = chunk.token_offset - policy.real_token_start;
+            if (offset < 0 || chunk.real_count <= 0 || offset > seq_len - chunk.real_count ||
+                chunk.real_count > config_.hosted_activation_rows)
+                return false;
+            // Preserve the original retained prefill shape at every child.
+            // A one-row tail is still prefill; auto-forward would select decode.
+            const auto widths = policy.width_policy == PrefillChunkWidthPolicy::ExactRetained
+                ? exactPrefillGraphWidths(chunk.bucket_seq_len) : std::vector<int>{chunk.bucket_seq_len};
+            auto child = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+                widths, chunk.token_offset, chunk.real_count, policy.width_policy);
+            // The parent has already resolved cumulative maintenance windows.
+            // A child executes one chunk, so its real-count threshold carries
+            // that original decision without restarting the parent's interval.
+            child.min_rebalance_interval_tokens = chunk.rebalance_allowed_after ? chunk.real_count : 0;
+            child.max_rebalance_interval_tokens = chunk.rebalance_required_after ? chunk.real_count : 0;
+            if (!forwardHosted(tokens + offset, chunk.real_count, ForwardExecutionPhase::Prefill, &child,
+                               pad_token_id, allow_padded_execution))
+                return false;
+        }
+        return true;
+    }
+
+    bool GlobalOrchestrator::requiresOriginalRankGPUTransport() const noexcept
+    {
+        return config_.topology.stages.size() > 1 &&
+            std::all_of(config_.topology.stages.begin(), config_.topology.stages.end(), [](const auto &stage) {
+                return !stage.devices.empty() && std::all_of(stage.devices.begin(), stage.devices.end(),
+                    [](const auto &member) { return member.toLocalDeviceId().is_gpu(); });
+            });
+    }
+
+    void GlobalOrchestrator::validateOriginalRankGPUTransportContext(const std::shared_ptr<IMPIContext> &original) const
+    {
+        if (!requiresOriginalRankGPUTransport() || !original || !config_.original_mpi_ctx ||
+            original.get() != config_.mpi_ctx || original.get() != config_.original_mpi_ctx.get() ||
+            original.owner_before(config_.original_mpi_ctx) || config_.original_mpi_ctx.owner_before(original) ||
+            original->rank() != config_.rank || original->world_size() != config_.world_size ||
+            config_.topology.world_size != original->world_size() || !original->clusterInventory())
+            throw std::invalid_argument("Global GPU pipeline requires its exact original shared MPI/rank publication");
+        for (const auto *action : rank_plan_.executeStages())
+        {
+            const auto *entry = stage_runners_.entryForStage(action->stage_id);
+            if (!entry || !entry->original_mpi_ctx || entry->original_mpi_ctx.get() != original.get() ||
+                entry->original_mpi_ctx.owner_before(original) || original.owner_before(entry->original_mpi_ctx))
+                throw std::invalid_argument("Global GPU pipeline stage substituted its original MPI owner");
+        }
+    }
+
+    void GlobalOrchestrator::bindOriginalRankGPUTransportSession(const std::shared_ptr<IMPIContext> &original,
+        std::shared_ptr<CapturedTransferRankSession> session)
+    {
+        validateOriginalRankGPUTransportContext(original);
+        if (!session || !rank_boundaries_.empty() || !rank_forward_edges_.empty() || rank_port_family_ ||
+            (rank_transfer_session_ && (rank_transfer_session_.get() != session.get() ||
+                rank_transfer_session_.owner_before(session) || session.owner_before(rank_transfer_session_))))
+            throw std::invalid_argument("Global GPU pipeline cannot replace its cold original transport session");
+        session->requireOriginalContext(original);
+        rank_transfer_session_ = std::move(session);
+    }
+
+    void GlobalOrchestrator::prepareOriginalRankPipelinePorts(const ServingGraphFamilyMaterializationPlan &plan)
+    {
+        // OR's distinct validate/bind initialization phases already proved
+        // this actual shared context on every rank. Never construct an alias
+        // when that original owner is absent; no safe collective is possible.
+        const auto mpi = config_.original_mpi_ctx;
+        if (!mpi) throw std::invalid_argument("Global pipeline lost its previously validated original MPI owner");
+        const auto count = config_.topology.stages.size();
+        const bool reuse = rank_port_family_.has_value();
+        std::vector<std::optional<PipelineDeviceGeneration::RankStageEndpoint>> local;
+        std::vector<std::array<int, 3>> envelope; // Immutable cold observations, not a live byte ledger.
+        exchangePlanningSamples(mpi, [&](int ranks) {
+            const auto text = nlohmann::json{plan.prefill_bucket_rows, plan.prefill_pad_token_id,
+                int(plan.main_decode_graph)}.dump();
+            return std::vector<std::vector<std::uint8_t>>(ranks, std::vector<std::uint8_t>(text.begin(), text.end()));
+        }, [&](auto declaration) {
+            // Every fallible local role/session/family check participates in
+            // this existing consensus BEFORE any peer enters channel setup.
+            validateOriginalRankGPUTransportContext(mpi);
+            if (!rank_transfer_session_ || !plan.valid() || plan.pipeline_hidden_input)
+                throw std::invalid_argument("Global GPU pipeline requires its original session and complete root serving family");
+            rank_transfer_session_->requireOriginalContext(mpi);
+            if (nlohmann::json::parse(declaration) != nlohmann::json{plan.prefill_bucket_rows,
+                    plan.prefill_pad_token_id, int(plan.main_decode_graph)})
+                throw std::invalid_argument("Global pipeline original serving declaration disagrees");
+            if (reuse)
+            {
+                if (!rank_port_family_->sameCaptureIdentity(plan))
+                    throw std::logic_error("Global pipeline cannot rebind its retained serving geometry/ports");
+                return std::vector<std::uint8_t>{'R'};
+            }
+            if (!rank_boundaries_.empty() || !rank_forward_edges_.empty())
+                throw std::logic_error("Failed original pipeline port setup cannot be reused as a ready family");
+            local.resize(count);
+            envelope.resize(count);
+            size_t members = 0;
+            for (const auto *action : rank_plan_.executeStages())
+            {
+                if (action->devices.size() > std::numeric_limits<size_t>::max() - members)
+                    throw std::overflow_error("Global pipeline local member count overflow");
+                members += action->devices.size();
+            }
+            rank_forward_edges_.reserve(members); // No allocation may follow publication of an installed DGO pointer.
+            nlohmann::json observation = nlohmann::json::array();
+            for (const auto *action : rank_plan_.executeStages())
+            {
+                if (action->stage_id < 0 || size_t(action->stage_id) >= count)
+                    throw std::invalid_argument("Global pipeline has a foreign original stage ID");
+                auto *entry = stage_runners_.entryForStage(action->stage_id);
+                if (!entry || !entry->runner)
+                    throw std::invalid_argument("Global pipeline omitted its actual local runner");
+                auto endpoint = PipelineDeviceGeneration::inspectOriginalRankStage(*entry->runner, *action);
+                if (endpoint.row_capacity <= 0 || endpoint.verifier_rows <= 0 || endpoint.residual_width <= 0 ||
+                    endpoint.memory->worldRank() != mpi->rank() ||
+                    endpoint.leader != action->devices.front().toLocalDeviceId())
+                    throw std::invalid_argument("Global pipeline cold endpoint changed its original authority or rows");
+                local[size_t(action->stage_id)] = endpoint;
+                observation.push_back({action->stage_id, endpoint.row_capacity, endpoint.verifier_rows, endpoint.residual_width});
+            }
+            const auto text = observation.dump();
+            return std::vector<std::uint8_t>(text.begin(), text.end());
+        }, [&](auto receipts) {
+            for (const auto &receipt : receipts)
+                if ((receipt.bytes.size() == 1 && receipt.bytes[0] == 'R') != reuse)
+                    throw std::invalid_argument("Global pipeline peers disagree on original retained port lifecycle");
+            if (reuse) return;
+            std::vector<bool> seen(count, false);
+            for (const auto &receipt : receipts)
+                for (const auto &row : nlohmann::json::parse(receipt.bytes))
+                {
+                    if (!row.is_array() || row.size() != 4)
+                        throw std::invalid_argument("Global pipeline cold endpoint observation is incomplete");
+                    const int stage = row.at(0).template get<int>();
+                    if (stage < 0 || size_t(stage) >= count || seen[size_t(stage)] ||
+                        config_.topology.stages[size_t(stage)].owning_rank != receipt.discovery_rank)
+                        throw std::invalid_argument("Global pipeline cold observation has foreign or duplicate original stage ownership");
+                    seen[size_t(stage)] = true;
+                    envelope[size_t(stage)] = {row.at(1).template get<int>(), row.at(2).template get<int>(), row.at(3).template get<int>()};
+                }
+            if (std::find(seen.begin(), seen.end(), false) != seen.end())
+                throw std::invalid_argument("Global pipeline lacks an original endpoint observation");
+        });
+        if (reuse) return;
+        exchangePlanningArtifact(mpi, PlanningArtifact::TransferSamples, [&] {
+            const auto text = nlohmann::json(envelope).dump();
+            return std::vector<std::uint8_t>(text.begin(), text.end());
+        }, [&](auto wire) {
+            envelope = nlohmann::json::parse(wire).template get<std::vector<std::array<int, 3>>>();
+            if (envelope.size() != count || std::any_of(envelope.begin(), envelope.end(), [&](const auto &rows) {
+                    return rows[0] <= 0 || rows[1] <= 0 || rows[2] <= 0 ||
+                        rows[1] != envelope.front()[1] || rows[2] != envelope.front()[2] ||
+                        *std::max_element(plan.prefill_bucket_rows.begin(), plan.prefill_bucket_rows.end()) > rows[0];
+                }))
+                throw std::invalid_argument("Global pipeline serving family exceeds an original stage envelope");
+            rank_boundaries_.resize(count - 1);
+            rank_graph_capacity_rows_ = 0;
+            for (const auto &capacity : envelope)
+                rank_graph_capacity_rows_ = std::max(rank_graph_capacity_rows_, std::max(capacity[0], capacity[1]));
+            rank_draft_capacity_ = envelope.front()[1] - 1;
+        });
+        std::vector<std::array<std::optional<CapturedTransferRankPlan>, 2>> declarations;
+        std::vector<PipelineTransferMemory> geometries;
+        exchangePlanningSamples(mpi, [&](int ranks) {
+            return std::vector<std::vector<std::uint8_t>>(ranks, std::vector<std::uint8_t>{1});
+        }, [&](auto wire) {
+            if (wire.size() != 1 || wire[0] != 1)
+                throw std::invalid_argument("Original pipeline boundary setup declaration disagrees");
+            declarations.resize(count - 1);
+            geometries.reserve(count - 1);
+            const auto inventory = mpi->clusterInventory();
+            for (size_t boundary = 0; boundary + 1 < count; ++boundary)
+            {
+                const auto &source = config_.topology.stages[boundary];
+                const auto &target = config_.topology.stages[boundary + 1];
+                const auto *edge = config_.topology.transferBetween(int(boundary), int(boundary + 1));
+                if (!edge || edge->physicalConnection().locality() == RankConnectionLocality::CrossNode ||
+                    source.is_global_tp || target.is_global_tp || source.devices.empty() || target.devices.empty())
+                    throw std::invalid_argument("Original captured GPU pipeline requires authenticated node-local single-rank stages");
+                geometries.push_back(PipelineTransferMemory::forRows(size_t(envelope[boundary][2]),
+                    size_t(envelope[boundary][0]), size_t(envelope[boundary][1])));
+                if (source.owning_rank != target.owning_rank)
+                    for (size_t reverse = 0; reverse < 2; ++reverse)
+                    {
+                        const auto &producer = reverse ? target : source;
+                        const auto &consumer = reverse ? source : target;
+                        declarations[boundary][reverse] = CapturedTransferRankPlan::fromInventory(*inventory,
+                            {rank_transfer_session_->originalGeneration(), 2 * boundary + (reverse ? 2 : 1)},
+                            {producer.owning_rank, producer.devices.front().toLocalDeviceId()},
+                            {consumer.owning_rank, consumer.devices.front().toLocalDeviceId()},
+                            reverse ? geometries.back().metadata_capacity_bytes : geometries.back().activation_capacity_bytes,
+                            reverse ? CapturedTransferEndpoint::Consumer : CapturedTransferEndpoint::Producer);
+                    }
+            }
+            return std::vector<std::uint8_t>{1};
+        }, [](auto receipts) {
+            for (const auto &receipt : receipts)
+                if (receipt.bytes.size() != 1 || receipt.bytes[0] != 1)
+                    throw std::invalid_argument("Original pipeline boundary declaration omitted a rank");
+        });
+        auto &transfer = TransferEngine::instance();
+        for (size_t boundary = 0; boundary + 1 < count; ++boundary)
+        {
+            const auto &source = config_.topology.stages[boundary];
+            const auto &target = config_.topology.stages[boundary + 1];
+            const auto geometry = geometries[boundary];
+            for (const bool reverse : {false, true})
+            {
+                const auto producer = reverse ? boundary + 1 : boundary;
+                const auto consumer = reverse ? boundary : boundary + 1;
+                const auto &producer_stage = config_.topology.stages[producer];
+                const auto &consumer_stage = config_.topology.stages[consumer];
+                auto &channel = reverse ? rank_boundaries_[boundary].metadata : rank_boundaries_[boundary].activation;
+                const size_t capacity = reverse ? geometry.metadata_capacity_bytes : geometry.activation_capacity_bytes;
+                if (source.owning_rank != target.owning_rank)
+                {
+                    const auto &declaration = *declarations[boundary][reverse ? 1 : 0];
+                    const auto role = declaration.localRole(mpi->rank());
+                    const auto member = role ? (*role == CapturedTransferEndpoint::Producer ? producer : consumer) : count;
+                    channel = transfer.createRankCapturedTransferChannel(declaration, rank_transfer_session_,
+                        role ? local[member]->memory : nullptr, role ? local[member]->setup_stream : nullptr);
+                }
+                else
+                {
+                    // Same-rank domains use the same original channel body and
+                    // admitted authority, never a host FP32 activation bounce.
+                    exchangePlanningSamples(mpi, [&](int ranks) {
+                        return std::vector<std::vector<std::uint8_t>>(ranks, std::vector<std::uint8_t>{1});
+                    }, [&](auto wire) {
+                        if (wire.size() != 1 || wire[0] != 1)
+                            throw std::invalid_argument("Original local pipeline boundary declaration disagrees");
+                        if (mpi->rank() == source.owning_rank)
+                        {
+                            if (!local[producer] || !local[consumer] || local[producer]->memory != local[consumer]->memory)
+                                throw std::invalid_argument("Same-rank pipeline stages lost their one original PMA");
+                            channel = transfer.createCapturedTransferChannel(*local[boundary]->memory, DeviceId::cpu(),
+                                local[producer]->leader, local[producer]->setup_stream,
+                                local[consumer]->leader, local[consumer]->setup_stream, capacity);
+                        }
+                        return std::vector<std::uint8_t>{1};
+                    }, [](auto receipts) {
+                        for (const auto &receipt : receipts)
+                            if (receipt.bytes.size() != 1 || receipt.bytes[0] != 1)
+                                throw std::invalid_argument("Original local pipeline boundary setup omitted an endpoint");
+                    });
+                }
+            }
+        }
+        // A second setup consensus contains all fallible member/bank creation.
+        // No rank begins graph capture while another rank has unready aliases.
+        exchangePlanningSamples(mpi, [&](int ranks) {
+            return std::vector<std::vector<std::uint8_t>>(ranks, std::vector<std::uint8_t>{1});
+        }, [&](auto wire) {
+            if (wire.size() != 1 || wire[0] != 1)
+                throw std::invalid_argument("Original pipeline port installation declaration disagrees");
+            for (const auto *action : rank_plan_.executeStages())
+            {
+                const auto stage = size_t(action->stage_id);
+                auto *entry = stage_runners_.entryForStage(action->stage_id);
+                PipelineForwardGraphEdges::CapturedDomain ports{
+                    .stage_index = stage, .stage_count = count,
+                    .activation_in = stage ? rank_boundaries_[stage - 1].activation : nullptr,
+                    .activation_out = stage + 1 < count ? rank_boundaries_[stage].activation : nullptr,
+                    .metadata_in = stage + 1 < count ? rank_boundaries_[stage].metadata : nullptr,
+                    .metadata_out = stage ? rank_boundaries_[stage - 1].metadata : nullptr};
+                auto installed = PipelineDeviceGeneration::installOriginalRankStageGenerationEdges(*entry->runner, *action, ports);
+                for (auto &owner : installed) rank_forward_edges_.push_back(std::move(owner));
+            }
+            if (PerfStatsCollector::isRecordFamilyEnabled("forward_graph", "original_rank_pipeline_activation_capacity"))
+                for (size_t boundary = 0; boundary < rank_boundaries_.size(); ++boundary)
+                    if (const auto &channel = rank_boundaries_[boundary].activation; channel)
+                        PerfStatsCollector::addCounter("forward_graph", "original_rank_pipeline_activation_capacity",
+                            double(channel->capacityBytes()), "setup", {},
+                            {{"source_stage", std::to_string(boundary)},
+                             {"consumer_stage", std::to_string(boundary + 1)},
+                             {"source_rank", std::to_string(config_.topology.stages[boundary].owning_rank)},
+                             {"consumer_rank", std::to_string(config_.topology.stages[boundary + 1].owning_rank)},
+                             {"local_rank", std::to_string(mpi->rank())},
+                             {"embedding_width", std::to_string(config_.d_model)},
+                             {"residual_width", std::to_string(envelope[boundary][2])},
+                             {"admitted_source_rows", std::to_string(envelope[boundary][0])},
+                             {"retained_verifier_rows", std::to_string(envelope[boundary][1])},
+                             {"actual_capacity_bytes", std::to_string(channel->capacityBytes())},
+                             {"extent_kind", "storage_capacity_only"}});
+            rank_port_family_ = plan; // Any metadata allocation failure still joins this setup consensus.
+            return std::vector<std::uint8_t>{1};
+        }, [](auto receipts) {
+            for (const auto &receipt : receipts)
+                if (receipt.bytes.size() != 1 || receipt.bytes[0] != 1)
+                    throw std::invalid_argument("Original pipeline port installation omitted a participant");
+        });
+    }
+
     // =========================================================================
     // Core Inference API
     // =========================================================================
 
+    bool GlobalOrchestrator::forwardPrefill(const int *tokens, int seq_len)
+    {
+        if (!tokens || seq_len <= 0) return false;
+        const auto &family = requiresOriginalRankGPUTransport() ? rank_port_family_ : hosted_serving_family_plan_;
+        if (!family)
+        {
+            const bool has_gpu = std::any_of(config_.topology.stages.begin(), config_.topology.stages.end(),
+                [](const auto &stage) {
+                    return std::any_of(stage.devices.begin(), stage.devices.end(),
+                        [](const auto &device) { return device.toLocalDeviceId().is_gpu(); });
+                });
+            if (has_gpu)
+                throw std::logic_error("GPU pipeline prefill lost its original retained serving family");
+            return forwardHosted(tokens, seq_len, ForwardExecutionPhase::Prefill);
+        }
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            family->prefill_bucket_rows, get_position(), seq_len);
+        return forwardPrefillChunkSchedule(tokens, seq_len, policy, family->prefill_pad_token_id, true);
+    }
+
     bool GlobalOrchestrator::forward(const int *tokens, int seq_len)
     {
         last_seq_len_ = seq_len;
+        if (requiresOriginalRankGPUTransport())
+        {
+            if (!rank_service_ready_ || !rank_generation_ || !tokens || seq_len <= 0 || rank_active_command_)
+                throw std::logic_error("Original GPU request input requires cold serving ownership outside a generation command");
+            if (seq_len == 1)
+            {
+                if (!rank_generation_->forwardDecodeInput(tokens[0])) return false;
+                PerfStatsCollector::addCounter("forward_graph", "pipeline_scalar_input_transactions", 1.0,
+                    "decode", "rank", {{"boundary_authority", "captured_original_rank_pipeline_edges"},
+                        {"state_transition", "main_only"}, {"world_rank", std::to_string(config_.rank)}});
+                return true;
+            }
+            const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+                rank_port_family_->prefill_bucket_rows, get_position(), seq_len);
+            return rank_generation_->prefill(tokens, seq_len, policy, rank_port_family_->prefill_pad_token_id, true);
+        }
 
+        return forwardHosted(tokens, seq_len,
+            seq_len > 1 ? ForwardExecutionPhase::Prefill : ForwardExecutionPhase::Decode);
+    }
+
+    bool GlobalOrchestrator::forwardHosted(const int *tokens, int seq_len, ForwardExecutionPhase phase,
+        const PrefillChunkSchedulerPolicy *prefill, int pad_token_id, bool allow_padding)
+    {
+        last_seq_len_ = seq_len;
         for (const auto &step : rank_plan_.steps)
         {
             switch (step.type)
@@ -1797,7 +2306,7 @@ namespace llaminar2
             {
                 if (step.stage_action.role == RankStageAction::Role::EXECUTE)
                 {
-                    if (!executeStage(step.stage_action, tokens, seq_len))
+                    if (!executeStage(step.stage_action, tokens, seq_len, phase, prefill, pad_token_id, allow_padding))
                     {
                         LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
                                   << " failed to execute stage " << step.stage_action.stage_id);
@@ -1811,7 +2320,7 @@ namespace llaminar2
             {
                 if (step.transfer_action.direction != RankTransferAction::Direction::NONE)
                 {
-                    if (!executeTransfer(step.transfer_action))
+                    if (!executeTransfer(step.transfer_action, phase))
                     {
                         LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
                                   << " failed transfer (peer=" << step.transfer_action.peer_rank
@@ -1936,6 +2445,29 @@ namespace llaminar2
             return false;
         }
         return local_success;
+    }
+
+    bool StageRunnerRegistry::admitSparseQueryExecutionProgramAll(const DeviceGenerationAdmissionRequest &request)
+    {
+        if (!request.valid() || entries_.empty()) return false;
+        for (const auto &entry : entries_)
+            if (!entry.runner || !entry.runner->admitSparseQueryExecutionProgram(request)) return false;
+        return true;
+    }
+
+    void StageRunnerRegistry::endSparseQueryExecutionProgramAll() noexcept
+    {
+        for (const auto &entry : entries_) if (entry.runner) entry.runner->endSparseQueryExecutionProgram();
+    }
+
+    bool GlobalOrchestrator::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        return stage_runners_.admitSparseQueryExecutionProgramAll(request);
+    }
+
+    void GlobalOrchestrator::endSparseQueryExecutionProgram() noexcept
+    {
+        stage_runners_.endSparseQueryExecutionProgramAll();
     }
 
     int GlobalOrchestrator::get_position() const
@@ -2067,6 +2599,20 @@ namespace llaminar2
         return stage_runners_.configureMTPRequestStopTokensAll(stop_tokens);
     }
 
+    bool GlobalOrchestrator::publishMTPDirectTokenHistory(int target_sample_slot,
+        MTPDirectTokenHistoryDisposition disposition)
+    {
+        if (target_sample_slot != 0 ||
+            (disposition != MTPDirectTokenHistoryDisposition::NewlyEmitted &&
+             disposition != MTPDirectTokenHistoryDisposition::AlreadyPublished))
+            return false;
+        // Only the declared vocabulary-tail owner samples and owns generated
+        // history. Other ranks must not manufacture a scalar source or shadow.
+        if (!is_pipeline_tail_) return true;
+        IInferenceRunner *tail = stage_runners_.pipelineTailRunner();
+        return tail && tail->publishMTPDirectTokenHistory(target_sample_slot, disposition);
+    }
+
     bool GlobalOrchestrator::configureMTPRequestPenaltyPolicy(
         const MTPRequestPenaltyPolicy &policy)
     {
@@ -2075,6 +2621,7 @@ namespace llaminar2
 
     bool GlobalOrchestrator::setComputeAllPositionLogits(bool enabled)
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().setComputeAllPositionLogits(enabled);
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.setComputeAllPositionLogitsAll(enabled);
@@ -2084,6 +2631,7 @@ namespace llaminar2
         bool enabled,
         int row_count)
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().setComputeRowIndexedAllPositionLogits(enabled, row_count);
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.setComputeRowIndexedAllPositionLogitsAll(
@@ -2094,6 +2642,7 @@ namespace llaminar2
     bool GlobalOrchestrator::setMTPSpecVerifierInputPlan(
         const MTPSpecDecodeVerifierInputPlan &plan)
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().setMTPSpecVerifierInputPlan(plan);
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.setMTPSpecVerifierInputPlanAll(plan);
@@ -2101,6 +2650,7 @@ namespace llaminar2
 
     void GlobalOrchestrator::clearMTPSpecVerifierInputPlan()
     {
+        if (requiresOriginalRankGPUTransport()) { generationTail().clearMTPSpecVerifierInputPlan(); return; }
         stage_runners_.clearMTPSpecVerifierInputPlanAll();
     }
 
@@ -2201,8 +2751,8 @@ namespace llaminar2
 
     std::string GlobalOrchestrator::mtpDecodeUnsupportedReason() const
     {
-        if (config_.topology.numStages() != 1)
-            return "MTP decode is not enabled for GlobalPP topologies";
+        if (config_.topology.numStages() != 1 && !requiresOriginalRankGPUTransport())
+            return "MTP global pipeline requires original GPU stage owners and captured rank transport";
         return stage_runners_.mtpDecodeUnsupportedReasonAll();
     }
 
@@ -2224,7 +2774,25 @@ namespace llaminar2
     PrefixLookupResult GlobalOrchestrator::lookupPrefix(
         const std::vector<int32_t> &tokens)
     {
-        return stage_runners_.lookupPrefixAll(tokens);
+        auto local = stage_runners_.lookupPrefixAll(tokens);
+        if (requiresOriginalRankGPUTransport())
+        {
+            // Prefix admission is host-owned immutable metadata. Every actual
+            // rank restores the same safe prefix extent from its own retained
+            // payload plan; no remote handles or cache payloads cross ranks.
+            const std::array<int32_t, 2> observation{local.hit() ? local.cached_tokens : 0, local.block_size};
+            std::vector<std::array<int32_t, 2>> observations(config_.world_size);
+            config_.original_mpi_ctx->allgather_bytes(observation.data(), observations.data(), sizeof(observation));
+            int common = observation[0];
+            for (const auto &other : observations)
+            {
+                if (other[0] < 0 || (other[0] > 0 && other[1] != local.block_size))
+                    throw std::logic_error("Original rank prefix admission has incompatible cache geometry");
+                common = std::min(common, other[0]);
+            }
+            local = local.clampedTo(common);
+        }
+        return local;
     }
 
     PrefixRestoreMetadata GlobalOrchestrator::prefixRestoreMetadata(const PrefixLookupResult &hit) const
@@ -2266,6 +2834,7 @@ namespace llaminar2
 
     int GlobalOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().sampleGreedyFromMTPLogitsOnDevice();
         int32_t token = -1;
 
         if (is_pipeline_tail_)
@@ -2297,6 +2866,7 @@ namespace llaminar2
 
     int GlobalOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().sampleGreedyFromAllPositionLogitsOnDevice(row);
         int32_t token = -1;
 
         if (is_pipeline_tail_)
@@ -2365,6 +2935,7 @@ namespace llaminar2
     bool GlobalOrchestrator::requiresMPICoordinatedDecodeSampling(
         const SamplingParams &params) const
     {
+        if (requiresOriginalRankGPUTransport()) return false;
         // Every rank must enter sampleGreedyOnDevice's terminal-token Bcast.
         // Stochastic CPU sampling consumes only the tail's complete host row.
         return params.is_greedy();
@@ -2372,6 +2943,7 @@ namespace llaminar2
 
     int GlobalOrchestrator::sampleGreedyOnDevice()
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().sampleGreedyOnDevice();
         int32_t token = -1;
         const auto &mpi_log = debugEnv().mpi_logging;
 
@@ -2426,6 +2998,7 @@ namespace llaminar2
 
     int GlobalOrchestrator::sampleOnDevice(const SamplingParams &params)
     {
+        if (requiresOriginalRankGPUTransport()) return generationTail().sampleOnDevice(params);
         int32_t token = -1;
 
         if (is_pipeline_tail_)
@@ -2566,7 +3139,8 @@ namespace llaminar2
 
     DeviceId GlobalOrchestrator::primaryDeviceId() const
     {
-        const IInferenceRunner *runner = stage_runners_.defaultRunner();
+        const IInferenceRunner *runner = is_pipeline_tail_ ?
+            stage_runners_.pipelineTailRunner() : stage_runners_.defaultRunner();
         return runner ? runner->primaryDeviceId() : DeviceId::cpu();
     }
 
@@ -2623,6 +3197,46 @@ namespace llaminar2
     int GlobalOrchestrator::pipelineDepth() const { return config_.topology.numStages(); }
     const GlobalPPRankPlan &GlobalOrchestrator::rankPlan() const { return rank_plan_; }
     const GlobalPPTopology &GlobalOrchestrator::topology() const { return config_.topology; }
+
+    void GlobalOrchestrator::requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const
+    {
+        if (frontier != MoEPipelineOwnershipValidation::OwnersBound &&
+            frontier != MoEPipelineOwnershipValidation::ServingMaterialized)
+            throw std::invalid_argument("Global MoE pipeline has an unknown setup frontier");
+        const auto actions = rank_plan_.executeStages();
+        if (actions.empty() || actions.size() != stage_runners_.size())
+            throw std::logic_error("Global MoE pipeline lost its complete local stage inventory");
+        for (const auto *action : actions)
+        {
+            const auto *entry = stage_runners_.entryForStage(action->stage_id);
+            if (!entry || !entry->runner || !entry->moe_runtime || !entry->pp_stage_config)
+                throw std::logic_error("Global MoE pipeline stage has no original prepared runtime owner");
+            const auto spec=std::find_if(config_.topology.stages.begin(),config_.topology.stages.end(),
+                [&](const auto& stage){return stage.stage_id==action->stage_id;});
+            if(spec==config_.topology.stages.end()) throw std::logic_error("Global expert stage lost its original domain");
+            const auto original=OriginalPipelineStageDomain::borrow(*spec,*action);
+            if(action->is_global_tp && (!entry->global_tp_ctx ||
+                entry->global_tp_ctx->worldRanks()!=spec->participating_ranks ||
+                entry->global_tp_ctx->myIndex()!=action->tp_rank_in_domain ||
+                entry->global_tp_ctx->localDevice()!=action->device))
+                throw std::logic_error("CPU pipeline stage lost its original MPI/NUMA domain context");
+            entry->moe_runtime->requireDestination(*entry->pp_stage_config,original.participants,
+                original.weights,original.backend,entry->moe_runtime->owners().authority->maintenanceMode());
+            entry->moe_runtime->requireRuntimeOwner(*entry->runner, frontier);
+        }
+    }
+
+    bool GlobalOrchestrator::setMoEOverlayCollectiveRequestGeneration(uint64_t generation_id)
+    {
+        if (generation_id == 0 || stage_runners_.empty()) return false;
+        for (const auto *action : rank_plan_.executeStages())
+        {
+            auto *entry = stage_runners_.entryForStage(action->stage_id);
+            if (!entry || !entry->runner || !entry->moe_runtime ||
+                !entry->runner->setMoEOverlayCollectiveRequestGeneration(generation_id)) return false;
+        }
+        return true;
+    }
 
     size_t GlobalOrchestrator::stageRunnerCount() const
     {
@@ -2700,8 +3314,8 @@ namespace llaminar2
     // Internal: Execute Stage
     // =========================================================================
 
-    bool GlobalOrchestrator::executeStage(const RankStageAction &action,
-                                          const int *tokens, int seq_len)
+    bool GlobalOrchestrator::executeStage(const RankStageAction &action, const int *tokens, int seq_len,
+        ForwardExecutionPhase phase, const PrefillChunkSchedulerPolicy *prefill, int pad_token_id, bool allow_padding)
     {
         if (action.is_global_tp)
         {
@@ -2719,9 +3333,15 @@ namespace llaminar2
             return false;
         }
 
-        // Pipeline head stages consume tokens directly. Middle/tail stages should
-        // already have hidden state populated by a preceding transfer/handoff.
-        return runner->forward(action.has_embedding ? tokens : nullptr, seq_len);
+        // Nonembedding native stages also admit the actual token row for
+        // their captured consumers. The graph still takes its hidden input
+        // from the preceding original transfer.
+        if (prefill)
+            return runner->forwardPrefillChunkSchedule(tokens, seq_len, *prefill, pad_token_id, allow_padding);
+        if (phase == ForwardExecutionPhase::Prefill)
+            return runner->forwardPrefill(tokens, seq_len);
+        return runner->forward(action.has_embedding || runner->primaryDeviceId().is_gpu() ? tokens : nullptr,
+                               seq_len);
     }
 
     bool GlobalOrchestrator::executeGroupedMTPVerifierStage(
@@ -2746,7 +3366,7 @@ namespace llaminar2
     // Internal: Execute Transfer
     // =========================================================================
 
-    bool GlobalOrchestrator::executeTransfer(const RankTransferAction &action)
+    bool GlobalOrchestrator::executeTransfer(const RankTransferAction &action, ForwardExecutionPhase phase)
     {
         StageActivationRouter router;
         return router.executeTransfer(action,
@@ -2755,7 +3375,7 @@ namespace llaminar2
                                       config_.rank,
                                       last_seq_len_,
                                       config_.d_model,
-                                      activation_buffer_);
+                                      activation_buffer_, phase);
     }
 
     // =========================================================================
@@ -2815,6 +3435,1234 @@ namespace llaminar2
     void GlobalOrchestrator::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
     {
         stage_runners_.collectPrefixCacheShutdownAll(shutdown);
+    }
+
+
+    namespace
+    {
+        /** @brief Original immutable command provenance precedes its ordered policy/model transactions. */
+        struct OriginalRankGenerationCommandWire
+        {
+            uint32_t abi = 2; ///< Reject incompatible command provenance/placement layouts.
+            MoEOverlayInferenceCommandIdentity command; ///< Existing source-owned command identity.
+            int base = -1; ///< Completed initial scheduler boundary, never a live KV mirror.
+        };
+
+        /** @brief Versioned immutable policy envelope; no device-owned state or pointers cross this boundary. */
+        struct OriginalRankGenerationAdmissionWire
+        {
+            uint32_t abi = 1;
+            uint32_t admitted = 0;
+            int budget = 0;
+            int base = -1;
+            sampling_math::DeviceGenerationAdmissionKind kind{};
+            sampling_math::DeviceGenerationLeadingRowDisposition leading{};
+            DeviceGenerationSamplingMode sampling{};
+            sampling_math::DeviceGenerationPolicy policy{};
+        };
+
+        /** @brief Publish one fixed immutable host-owned command/policy/terminal object on the original context.
+         * @tparam T Trivially copyable versioned metadata with no device pointers.
+         * @param context Original admitted MPI owner, never an alias communicator.
+         * @param source Real vocabulary-tail world rank.
+         * @param value Source-owned immutable metadata, overwritten only at other ranks.
+         */
+        template<class T>
+        void broadcastOriginalRankMetadata(const std::shared_ptr<IMPIContext> &context, int source, T &value)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            std::array<int32_t, (sizeof(T) + sizeof(int32_t) - 1) / sizeof(int32_t)> wire{};
+            if (context->rank() == source) std::memcpy(wire.data(), &value, sizeof(T));
+            context->broadcast_int32(wire.data(), wire.size(), source);
+            if (context->rank() != source) std::memcpy(&value, wire.data(), sizeof(T));
+        }
+    }
+
+    void GlobalOrchestrator::prepareOriginalRankGenerationService()
+    {
+        if (rank_service_ready_) return;
+        if (!rank_generation_ || !rank_generation_->prefillPrepared() || !rank_transfer_session_ ||
+            !config_.original_mpi_ctx || rank_graph_capacity_rows_ <= 0 || rank_draft_capacity_ < 0)
+            throw std::logic_error("Original rank generation service requires its complete cold graph/transport owners");
+        const auto original = config_.original_mpi_ctx;
+        validateOriginalRankGPUTransportContext(original);
+        // Every rank derives the same graph-stable namespace from the actual
+        // topology, retained serving geometry and original admitted session.
+        // Local workspace identities remain independently checked by receipts.
+        uint64_t fingerprint = 1469598103934665603ULL;
+        const auto topology = config_.topology.toString();
+        for (const unsigned char byte : topology) fingerprint = (fingerprint ^ byte) * 1099511628211ULL;
+        for (const int bucket : rank_port_family_->prefill_bucket_rows)
+            fingerprint = (fingerprint ^ uint64_t(bucket)) * 1099511628211ULL;
+        const auto session = rank_transfer_session_->originalGeneration();
+        const auto slots = moeOverlayInferenceTransactionSlotCount(rank_draft_capacity_);
+        rank_transaction_slot_capacity_ = slots;
+        rank_generation_->prepareOriginalRankCompletionSlots(slots);
+
+        std::vector<int> followers;
+        for (const auto &stage : config_.topology.stages)
+            if (stage.owning_rank != tail_rank_ &&
+                std::find(followers.begin(), followers.end(), stage.owning_rank) == followers.end())
+                followers.push_back(stage.owning_rank);
+        for (const int follower : followers)
+        {
+            if (config_.rank != tail_rank_ && config_.rank != follower) continue;
+            auto channel = std::make_shared<MoEOverlayMPIInferenceTransactionChannel>(
+                MoEOverlayMPIInferenceTransactionChannel::Config{
+                    .mpi_ctx = original, .source_world_rank = tail_rank_,
+                    .target_world_rank = follower, .send_slot_count = slots});
+            const MoEOverlayInferenceTransactionProtocol::Config protocol{
+                .topology = {.workspace_generation = session,
+                    .topology_fingerprint_low = fingerprint,
+                    .topology_fingerprint_high = fingerprint ^ session ^ 0x72616e6b50504735ULL,
+                    .source_world_rank = tail_rank_, .target_world_rank = follower},
+                .slot_count = slots, .max_request_count = 1,
+                .max_rows_per_request = rank_graph_capacity_rows_, .max_mtp_draft_depth = rank_draft_capacity_};
+            if (config_.rank == tail_rank_)
+                rank_publishers_.push_back(std::make_shared<MoEOverlayInferenceTransactionPublisher>(
+                    MoEOverlayInferenceTransactionPublisher::Config{.channel = std::move(channel), .protocol = protocol}));
+            else
+                rank_transaction_follower_ = std::make_unique<MoEOverlayInferenceTransactionFollower>(
+                    MoEOverlayInferenceTransactionFollower::Config{
+                        .channel = std::move(channel), .executor = rank_generation_.get(), .protocol = protocol,
+                        .retired_decode_progress_sink = [this](uint64_t count, std::string *error) {
+                            return !rank_retired_decode_progress_sink_ || rank_retired_decode_progress_sink_(count, error);
+                        }});
+        }
+        if (is_pipeline_tail_)
+        {
+            rank_tail_capabilities_[0] = generationTail().supportsMTPSidecarSampleFusion() ? 1 : 0;
+            rank_tail_capabilities_[1] = generationTail().supportsMTPSidecarLogitsStreamHandoff() ? 1 : 0;
+            rank_tail_capabilities_[2] = generationTail().supportsMTPDeviceDraftTokenInput() ? 1 : 0;
+            rank_tail_capabilities_[3] = generationTail().supportsMTPSidecarPreservesMainState() ? 1 : 0;
+            rank_tail_capabilities_[4] = generationTail().supportsLogicalMTPVerifierBaseCheckpoint() ? 1 : 0;
+            rank_tail_capabilities_[5] = generationTail().supportsMTPShiftedRowReuseFromSidecar() ? 1 : 0;
+            rank_tail_capabilities_[6] = generationTail().requiresMTPDecodeEquivalentVerifierReplay() ? 1 : 0;
+            rank_tail_capabilities_[7] = generationTail().supportsMTPSpecStatePublication() ? 1 : 0;
+            rank_tail_capabilities_[8] = generationTail().supportsDeviceResidentMTPSpecStatePublication() ? 1 : 0;
+            rank_tail_capabilities_[9] = generationTail().supportsGreedyAllPositionBatchOutcomeOnDevice() ? 1 : 0;
+            rank_tail_capabilities_[10] = generationTail().supportsRowLocalAllPositionPenaltyApplication() ? 1 : 0;
+            rank_tail_capabilities_[11] = generationTail().supportsDeviceStochasticMTPVerification() ? 1 : 0;
+        }
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, rank_tail_capabilities_);
+        if (is_pipeline_tail_) rank_tail_verifier_capability_ = generationTail().mtpVerifierRowCapability();
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, rank_tail_verifier_capability_);
+        rank_pending_transactions_.resize(rank_publishers_.size());
+        rank_deferred_transactions_.resize(rank_publishers_.size());
+        for (auto &lane : rank_deferred_transactions_) lane.reserve(slots);
+
+        if (is_pipeline_tail_)
+            rank_generation_->bindOriginalRankTransactionCallbacks(
+                [this](auto role, int rows, int depth) { return publishOriginalRankTransaction(role, rows, depth); },
+                [this](uint64_t frontier) { return retireOriginalRankTransaction(frontier); });
+        else
+        {
+            if (!rank_transaction_follower_)
+                throw std::logic_error("Original non-tail rank lost its actual source transaction lane");
+            rank_generation_->rank_receive_admission_ = [this](std::string *error) {
+                if (!rank_active_command_ || rank_admission_published_) return false;
+                OriginalRankGenerationAdmissionWire wire;
+                broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, wire);
+                if (wire.abi != 1 || wire.admitted != 1) return false;
+                const DeviceGenerationAdmissionRequest admission{
+                    .request_count = 1, .max_new_tokens = wire.budget, .kind = wire.kind,
+                    .depth_policy = wire.policy, .initial_leading_row_disposition = wire.leading,
+                    .initial_target_counts = DeviceGenerationInitialTargetCounts(std::vector<int>{wire.base})};
+                if (!admission.valid() || !rank_generation_->beginOriginalRankFollowerCommand(admission, wire.sampling, error))
+                    return false;
+                if (wire.base < rank_admission_base_) return false;
+                rank_response_admission_base_ = wire.base;
+                rank_admission_budget_ = wire.budget;
+                rank_admission_published_ = true;
+                return true;
+            };
+        }
+        rank_service_ready_ = true;
+    }
+
+    bool GlobalOrchestrator::originalRankGenerationFollower() const noexcept
+    {
+        return rank_service_ready_ && !is_pipeline_tail_ && rank_transaction_follower_ != nullptr;
+    }
+
+    uint64_t GlobalOrchestrator::originalRankRequestGeneration() const
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_)
+            throw std::logic_error("Original request generation belongs only to the admitted vocabulary-tail source");
+        return rank_generation_->originalRankRequestGeneration();
+    }
+
+    MoEOverlayInferenceCommandIdentity GlobalOrchestrator::originalRankCommandIdentity(uint64_t command_id) const
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_)
+            throw std::logic_error("Original command identity belongs only to the admitted vocabulary-tail source");
+        return rank_generation_->originalRankCommandIdentity(command_id);
+    }
+
+    void GlobalOrchestrator::beginOriginalRankChannelInvocations()
+    {
+        if (!rank_active_command_ || rank_channels_admitted_)
+            throw std::logic_error("Original rank channels have missing or overlapping parent admission");
+        rank_channels_admitted_ = true; // Any partial admission owes cancellation of every admitted direction.
+        const CapturedTransferInvocation invocation{rank_active_command_->request_generation, rank_active_command_->command_id};
+        auto &transfer = TransferEngine::instance();
+        for (const auto &boundary : rank_boundaries_)
+            for (const auto &channel : {boundary.activation, boundary.metadata})
+                if (channel) transfer.beginCapturedTransferInvocation(channel, invocation);
+    }
+
+    bool GlobalOrchestrator::finishOriginalRankChannelInvocations()
+    {
+        if (!rank_active_command_ || !rank_channels_admitted_) return false;
+        const CapturedTransferInvocation invocation{rank_active_command_->request_generation, rank_active_command_->command_id};
+        auto &transfer = TransferEngine::instance();
+        for (const auto &boundary : rank_boundaries_)
+            for (const auto &channel : {boundary.activation, boundary.metadata})
+                if (channel && transfer.finishCapturedTransferInvocation(channel, invocation) !=
+                        CapturedTransferInvocationRetirement::Completed) return false;
+        rank_channels_admitted_ = false;
+        return true;
+    }
+
+    bool GlobalOrchestrator::beginOriginalRankGenerationCommand(
+        const MoEOverlayInferenceCommandIdentity &command, int admission_base, DeviceGenerationSamplingMode sampling)
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_ || !command.valid() ||
+            rank_active_command_ || admission_base < 0 || !isValidDeviceGenerationSamplingMode(sampling)) return false;
+        if (command != originalRankCommandIdentity(command.command_id)) return false;
+        rank_active_command_ = command;
+        rank_admission_base_ = admission_base;
+        rank_generation_sampling_mode_ = sampling;
+        rank_admission_budget_ = 0;
+        rank_retired_decode_scheduler_frontier_ = 0;
+        rank_admission_published_ = false;
+        rank_terminal_observation_.reset();
+        OriginalRankGenerationCommandWire publication{.command = command, .base = admission_base};
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, publication);
+        beginOriginalRankChannelInvocations();
+        for (const auto &publisher : rank_publishers_)
+            if (!publisher->beginCommand(command)) return false;
+        return true;
+    }
+
+    bool GlobalOrchestrator::publishOriginalRankAdmission(const DeviceGenerationAdmissionRequest &request)
+    {
+        if (!rank_active_command_ || !is_pipeline_tail_ || rank_admission_published_ ||
+            !request.valid() || request.request_count != 1 || !request.initial_target_counts ||
+            request.initial_target_counts->values().front() < rank_admission_base_) return false;
+        OriginalRankGenerationAdmissionWire wire{
+            .admitted = 1, .budget = request.max_new_tokens, .base = request.initial_target_counts->values().front(),
+            .kind = request.kind, .leading = request.initial_leading_row_disposition,
+            .sampling = request.ordinary_sampling && !request.ordinary_sampling->is_greedy() ?
+                DeviceGenerationSamplingMode::Stochastic : DeviceGenerationSamplingMode::Greedy,
+            .policy = request.depth_policy};
+        // Speculative admission has no ordinary sampler law: its already-frozen
+        // outcome topology is selected by the source materialization call below.
+        if (!request.depth_policy.isOrdinary())
+            wire.sampling = rank_generation_sampling_mode_;
+        if (!publishOriginalRankTransaction(MoEOverlayInferenceGraphRole::GenerationAdmission, 1, -1)) return false;
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, wire);
+        if (!retireOriginalRankTransaction(rank_retired_decode_scheduler_frontier_)) return false;
+        rank_admission_published_ = true;
+        rank_response_admission_base_ = wire.base;
+        rank_admission_budget_ = request.max_new_tokens;
+        return true;
+    }
+
+    bool GlobalOrchestrator::publishOriginalRankTransaction(MoEOverlayInferenceGraphRole role, int rows, int depth)
+    {
+        if (!is_pipeline_tail_ || !rank_active_command_ ||
+            (!rank_admission_published_ && role != MoEOverlayInferenceGraphRole::GenerationAdmission &&
+             role != MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation &&
+             role != MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken) ||
+            rank_transaction_pending_ || rows <= 0) return false;
+        if (!progressOriginalRankTransactions(false)) return false;
+        // Ring pressure is the only nonterminal retirement boundary. Retain
+        // every old slot until its actual native ACK; never synthesize completion
+        // from a source enqueue or an unrelated stream's scheduler ticket.
+        for (size_t i = 0; i < rank_deferred_transactions_.size(); ++i)
+        {
+            auto &lane = rank_deferred_transactions_[i];
+            if (lane.size() == rank_transaction_slot_capacity_)
+            {
+                if (!rank_publishers_[i]->retire(lane.front())) return false;
+                lane.erase(lane.begin());
+            }
+        }
+        const auto placement = originalRankCommandIdentity(rank_active_command_->command_id);
+        if (placement.request_generation != rank_active_command_->request_generation ||
+            placement.placement_identity_kind != rank_active_command_->placement_identity_kind ||
+            placement.initial_placement_epoch < rank_active_command_->initial_placement_epoch) return false;
+        const MoEOverlayInferenceExecutionDescriptor descriptor{
+            .graph_role = role, .logical_step_id = 0,
+            .placement_epoch = placement.initial_placement_epoch,
+            .request_count = 1, .logical_rows_per_request = rows,
+            .physical_rows_per_request = rows, .draft_depth = role == MoEOverlayInferenceGraphRole::MTPGroupedVerifier ? depth : -1,
+            .sidecar_depth = -1, .retired_decode_progress_tokens = rank_retired_decode_scheduler_frontier_};
+        // Every remote lane receives its exact descriptor before any local
+        // model/transport body is allowed to enqueue. No endpoint waits here.
+        rank_transaction_pending_ = true;
+        for (size_t i = 0; i < rank_publishers_.size(); ++i)
+        {
+            rank_pending_transactions_[i] = rank_publishers_[i]->publish(descriptor);
+            if (!rank_pending_transactions_[i].ok) return false;
+        }
+        return true;
+    }
+
+    bool GlobalOrchestrator::retireOriginalRankTransaction(uint64_t scheduler_frontier)
+    {
+        if (scheduler_frontier < rank_retired_decode_scheduler_frontier_) return false;
+        if (!rank_transaction_pending_)
+        {
+            rank_retired_decode_scheduler_frontier_ = scheduler_frontier;
+            return true;
+        }
+        for (size_t i = 0; i < rank_publishers_.size(); ++i)
+        {
+            if (!rank_pending_transactions_[i].ok ||
+                rank_deferred_transactions_[i].size() == rank_transaction_slot_capacity_) return false;
+            rank_deferred_transactions_[i].push_back(rank_pending_transactions_[i]);
+        }
+        for (auto &transaction : rank_pending_transactions_) transaction = {};
+        rank_transaction_pending_ = false;
+        rank_retired_decode_scheduler_frontier_ = scheduler_frontier;
+        return progressOriginalRankTransactions(false);
+    }
+
+    bool GlobalOrchestrator::progressOriginalRankTransactions(bool terminal)
+    {
+        for (size_t i = 0; i < rank_deferred_transactions_.size(); ++i)
+        {
+            auto &lane = rank_deferred_transactions_[i];
+            for (auto it = lane.begin(); it != lane.end();)
+            {
+                if (terminal)
+                {
+                    if (!rank_publishers_[i]->retire(*it)) return false;
+                    it = lane.erase(it);
+                    continue;
+                }
+                const auto progress = rank_publishers_[i]->tryRetire(*it);
+                if (progress == MoEOverlayInferenceCompletionFenceProgress::Failed) return false;
+                if (progress == MoEOverlayInferenceCompletionFenceProgress::Ready) it = lane.erase(it);
+                else ++it;
+            }
+        }
+        return !terminal || rank_generation_->retireOriginalRankCompletions(nullptr);
+    }
+
+    bool GlobalOrchestrator::serviceOriginalRankGenerationCommand(
+        OriginalRankGenerationTerminal *terminal, std::string *error)
+    {
+        if (!originalRankGenerationFollower() || !terminal || rank_active_command_) return false;
+        OriginalRankGenerationCommandWire publication;
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, publication);
+        if (publication.abi != 2 || publication.base < 0 || !publication.command.valid()) return false;
+        const auto command = publication.command;
+        rank_active_command_ = command;
+        beginOriginalRankChannelInvocations();
+        rank_admission_published_ = false;
+        rank_admission_base_ = publication.base;
+        rank_response_admission_base_ = -1;
+        rank_admission_budget_ = 0;
+        const auto followed = rank_transaction_follower_->runOneCommand(command);
+        if (!followed.ok)
+        {
+            if (error) *error = followed.error;
+            return false;
+        }
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, *terminal);
+        if (terminal->abi != 1 || terminal->request_generation != command.request_generation ||
+            terminal->command_id != command.command_id ||
+            terminal->published_state_commit_count < 0 || terminal->cached_tokens < 0 ||
+            terminal->admission_base < 0 || terminal->admission_budget < 0 ||
+            !sampling_math::valid_device_generation_leading_row_disposition(terminal->next_leading_row_disposition))
+            return false;
+        if (rank_admission_published_)
+        {
+            if (terminal->admission_base != rank_admission_base_ || terminal->admission_budget != rank_admission_budget_ ||
+                !rank_generation_->finishOriginalRankFollowerCommand(terminal->published_state_commit_count -
+                        (rank_response_admission_base_ - rank_admission_base_),
+                    terminal->cached_tokens, error)) return false;
+        }
+        else
+        {
+            const auto cached = rank_generation_->observeOriginalRankKVTerminal(error);
+            if (!cached || *cached != terminal->cached_tokens) return false;
+        }
+        if (!finishOriginalRankChannelInvocations()) return false;
+        rank_active_command_.reset();
+        return true;
+    }
+
+    bool GlobalOrchestrator::completeOriginalRankGenerationCommand(bool model_stopped,
+        sampling_math::DeviceGenerationLeadingRowDisposition terminal_leading)
+    {
+        if (!is_pipeline_tail_ || !rank_active_command_ || rank_transaction_pending_ ||
+            !progressOriginalRankTransactions(true)) return false;
+        if (!rank_admission_published_)
+        {
+            const auto cached = rank_generation_->observeOriginalRankKVTerminal(nullptr);
+            if (!cached || *cached < rank_admission_base_) return false;
+            rank_terminal_observation_ = OriginalRankGenerationTerminal{
+                .admission_base = rank_admission_base_, .admission_budget = 0,
+                .published_state_commit_count = *cached - rank_admission_base_, .cached_tokens = *cached,
+                .next_leading_row_disposition = terminal_leading,
+                .model_stopped = model_stopped};
+        }
+        if (!rank_terminal_observation_) return false;
+        for (const auto &publisher : rank_publishers_)
+            if (!publisher->complete(publisher->currentPlacementEpoch(), rank_retired_decode_scheduler_frontier_)) return false;
+        auto observation = *rank_terminal_observation_;
+        observation.request_generation = rank_active_command_->request_generation;
+        observation.command_id = rank_active_command_->command_id;
+        observation.next_leading_row_disposition = terminal_leading;
+        observation.model_stopped = model_stopped;
+        broadcastOriginalRankMetadata(config_.original_mpi_ctx, tail_rank_, observation);
+        if (!finishOriginalRankChannelInvocations()) return false;
+        rank_active_command_.reset();
+        rank_terminal_observation_.reset();
+        return true;
+    }
+
+    void GlobalOrchestrator::abortOriginalRankGenerationCommand() noexcept
+    {
+        if (!rank_active_command_) return;
+        const CapturedTransferInvocation invocation{rank_active_command_->request_generation, rank_active_command_->command_id};
+        // Both directions are cancelled before any native completion join or
+        // protocol teardown. Cancellation is absorbing; no failed graph or
+        // channel can be retried under a new local counter.
+        auto &transfer = TransferEngine::instance();
+        for (const auto &boundary : rank_boundaries_)
+            for (const auto &channel : {boundary.activation, boundary.metadata})
+                if (channel)
+                    try { (void)transfer.cancelCapturedTransferInvocation(channel, invocation); }
+                    catch (...) { LOG_ERROR("Original rank directed-channel cancellation failed"); }
+        if (is_pipeline_tail_)
+            for (const auto &publisher : rank_publishers_)
+                try { (void)publisher->abort(publisher->currentPlacementEpoch(), 1); }
+                catch (...) { LOG_ERROR("Original rank source abort publication failed"); }
+    }
+
+    IInferenceRunner &GlobalOrchestrator::generationTail()
+    {
+        auto *tail = stage_runners_.pipelineTailRunner();
+        if (!is_pipeline_tail_ || !tail)
+            throw std::logic_error("Original GPU generation execution requires the actual local vocabulary-tail authority");
+        return *tail;
+    }
+
+    const IInferenceRunner &GlobalOrchestrator::generationTail() const
+    {
+        auto *tail = stage_runners_.pipelineTailRunner();
+        if (!is_pipeline_tail_ || !tail)
+            throw std::logic_error("Original GPU generation execution requires the actual local vocabulary-tail authority");
+        return *tail;
+    }
+
+    bool GlobalOrchestrator::forwardBatchWithDeviceTokenIds(const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len)
+    {
+        return generationTail().forwardBatchWithDeviceTokenIds(token_batches, token_ids_device, padded_seq_len);
+    }
+    const void * GlobalOrchestrator::prepareMTPVerifierInputTokensOnDevice(int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens)
+    {
+        return generationTail().prepareMTPVerifierInputTokensOnDevice(first_token, first_draft_slot, draft_token_count, total_verifier_input_tokens);
+    }
+    const void * GlobalOrchestrator::prepareMTPVerifierInputTokenBatchOnDevice(const DeviceMTPVerifierInputBatchRequest *requests,
+            int request_count,
+            int logical_padded_seq_len)
+    {
+        return generationTail().prepareMTPVerifierInputTokenBatchOnDevice(requests, request_count, logical_padded_seq_len);
+    }
+    const void * GlobalOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromHostRow(const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count)
+    {
+        return generationTail().prepareMTPVerifierInputTokensOnDeviceFromHostRow(verifier_tokens, total_verifier_input_tokens, draft_token_count);
+    }
+    bool GlobalOrchestrator::forwardMTPForDeviceSampling(int32_t draft_condition_token)
+    {
+        return generationTail().forwardMTPForDeviceSampling(draft_condition_token);
+    }
+    bool GlobalOrchestrator::supportsMTPSidecarSampleFusion() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[0] != 0;
+    }
+    bool GlobalOrchestrator::supportsMTPSidecarLogitsStreamHandoff() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[1] != 0;
+    }
+    bool GlobalOrchestrator::supportsMTPDeviceDraftTokenInput() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[2] != 0;
+    }
+    bool GlobalOrchestrator::supportsMTPSidecarPreservesMainState() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[3] != 0;
+    }
+    bool GlobalOrchestrator::supportsLogicalMTPVerifierBaseCheckpoint() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[4] != 0;
+    }
+    bool GlobalOrchestrator::supportsMTPShiftedRowReuseFromSidecar() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[5] != 0;
+    }
+    bool GlobalOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[6] != 0;
+    }
+    bool GlobalOrchestrator::supportsMTPSpecStatePublication() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[7] != 0;
+    }
+    bool GlobalOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[8] != 0;
+    }
+    bool GlobalOrchestrator::publishAcceptedMTPSpecState(const MTPSpecStepPlan &plan,
+            std::string *error)
+    {
+        return generationTail().publishAcceptedMTPSpecState(plan, error);
+    }
+    bool GlobalOrchestrator::publishAcceptedMTPSpecStateBatch(const MTPSpecStepPlanBatch &plans,
+            std::string *error)
+    {
+        return generationTail().publishAcceptedMTPSpecStateBatch(plans, error);
+    }
+    bool GlobalOrchestrator::forwardMTPFromLastDraftForDeviceSampling(int32_t draft_condition_token,
+            int position_id)
+    {
+        return generationTail().forwardMTPFromLastDraftForDeviceSampling(draft_condition_token, position_id);
+    }
+    bool GlobalOrchestrator::forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(int draft_sample_slot,
+            int position_offset)
+    {
+        return generationTail().forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(draft_sample_slot, position_offset);
+    }
+    bool GlobalOrchestrator::forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(int target_sample_slot)
+    {
+        return generationTail().forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(target_sample_slot);
+    }
+    bool GlobalOrchestrator::forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot(int target_sample_slot,
+            int draft_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot(target_sample_slot, draft_sample_slot, out_token);
+    }
+    bool GlobalOrchestrator::forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index)
+    {
+        return generationTail().forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(logical_state, request_index);
+    }
+    bool GlobalOrchestrator::forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int draft_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(logical_state, request_index, draft_sample_slot, out_token);
+    }
+    bool GlobalOrchestrator::forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token)
+    {
+        return generationTail().forwardMTPAndSampleGreedy(draft_condition_token, out_token);
+    }
+    bool GlobalOrchestrator::forwardMTPAndSampleGreedyToDeviceDraftSlot(int32_t draft_condition_token,
+            int draft_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().forwardMTPAndSampleGreedyToDeviceDraftSlot(draft_condition_token, draft_sample_slot, out_token);
+    }
+    bool GlobalOrchestrator::forwardMTPBatchAndSampleGreedy(const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens)
+    {
+        return generationTail().forwardMTPBatchAndSampleGreedy(draft_condition_tokens, position_ids, request_batch, out_tokens);
+    }
+    bool GlobalOrchestrator::advanceMTPRequestBatchConditionOnDevice(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds)
+    {
+        return generationTail().advanceMTPRequestBatchConditionOnDevice(logical_state, request_batch, params, stochastic_position_seeds);
+    }
+    bool GlobalOrchestrator::forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            int first_draft_slot,
+            int slot_stride)
+    {
+        return generationTail().forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(logical_state, request_batch, first_draft_slot, slot_stride);
+    }
+    bool GlobalOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy(const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens)
+    {
+        return generationTail().forwardMTPBatchFromLastDraftAndSampleGreedy(draft_condition_tokens, position_ids, request_batch, out_tokens);
+    }
+    bool GlobalOrchestrator::forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            int first_condition_slot,
+            int condition_slot_stride,
+            int position_offset,
+            int first_draft_slot,
+            int draft_slot_stride)
+    {
+        return generationTail().forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(logical_state, request_batch, first_condition_slot, condition_slot_stride, position_offset, first_draft_slot, draft_slot_stride);
+    }
+    bool GlobalOrchestrator::forwardMTPFromLastDraftAndSampleGreedy(int32_t draft_condition_token,
+            int position_id,
+            int32_t *out_token)
+    {
+        return generationTail().forwardMTPFromLastDraftAndSampleGreedy(draft_condition_token, position_id, out_token);
+    }
+    bool GlobalOrchestrator::forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(int32_t draft_condition_token,
+            int position_id,
+            int draft_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(draft_condition_token, position_id, draft_sample_slot, out_token);
+    }
+    bool GlobalOrchestrator::forwardMTPFromDeviceDraftAtLivePositionAndSampleGreedyToDeviceDraftSlot(int draft_condition_sample_slot,
+            int position_offset,
+            int draft_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().forwardMTPFromDeviceDraftAtLivePositionAndSampleGreedyToDeviceDraftSlot(draft_condition_sample_slot, position_offset, draft_sample_slot, out_token);
+    }
+    bool GlobalOrchestrator::flushPendingMTPWork()
+    {
+        return generationTail().flushPendingMTPWork();
+    }
+    void GlobalOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)
+    {
+        if(requiresOriginalRankGPUTransport())
+            generationTail().setMTPAllPositionVerifierSyncDeferralEnabled(enabled);
+        else
+            stage_runners_.setMTPAllPositionVerifierSyncDeferralAll(enabled);
+    }
+    void GlobalOrchestrator::setMTPMainDecodeSyncDeferralEnabled(bool enabled)
+    {
+        if(requiresOriginalRankGPUTransport())
+            generationTail().setMTPMainDecodeSyncDeferralEnabled(enabled);
+        else
+            stage_runners_.setMTPMainDecodeSyncDeferralAll(enabled);
+    }
+    void StageRunnerRegistry::setMTPAllPositionVerifierSyncDeferralAll(bool enabled)
+    {
+        // Hosted CPU ranks enter the same forward command even when their
+        // vocabulary stage is remote. Each real local graph owns its ordering.
+        for(auto& entry:entries_)
+            entry.runner->setMTPAllPositionVerifierSyncDeferralEnabled(enabled);
+    }
+    void StageRunnerRegistry::setMTPMainDecodeSyncDeferralAll(bool enabled)
+    {
+        for(auto& entry:entries_)
+            entry.runner->setMTPMainDecodeSyncDeferralEnabled(enabled);
+    }
+    bool GlobalOrchestrator::commitMTPInitialShiftedRowFromDeviceOutcome(const PrefixStateSnapshot &checkpoint,
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            bool allow_speculative_discard)
+    {
+        auto &tail = generationTail();
+        const auto *tail_checkpoint = stage_runners_.prefixCheckpointForRunner(checkpoint, tail);
+        if (!tail_checkpoint)
+        {
+            LOG_ERROR("[GlobalOrchestrator] Initial shifted MTP commit requires its exact local stage checkpoint envelope");
+            return false;
+        }
+        // Global capture wraps local stage runners once. The terminal Rank
+        // runner must receive its own untouched checkpoint, whose inner TP
+        // cardinality and per-participant ready/source identity remain intact.
+        return tail.commitMTPInitialShiftedRowFromDeviceOutcome(
+            *tail_checkpoint, outcome, request_index, allow_speculative_discard);
+    }
+    bool GlobalOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard)
+    {
+        return generationTail().commitMTPShiftedRowFromDeviceTargetSample(target_sample_slot, already_appended_tokens, allow_speculative_discard);
+    }
+    bool GlobalOrchestrator::commitMTPShiftedRowFromDeviceResidentLogicalState(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int already_appended_tokens,
+            bool allow_speculative_discard)
+    {
+        return generationTail().commitMTPShiftedRowFromDeviceResidentLogicalState(logical_state, request_index, already_appended_tokens, allow_speculative_discard);
+    }
+    bool GlobalOrchestrator::commitMTPShiftedRowsFromDeviceOutcome(const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int already_appended_tokens,
+            int max_state_commit_rows,
+            int main_forward_token_count,
+            bool allow_speculative_discard)
+    {
+        return generationTail().commitMTPShiftedRowsFromDeviceOutcome(outcome, request_index, already_appended_tokens, max_state_commit_rows, main_forward_token_count, allow_speculative_discard);
+    }
+    bool GlobalOrchestrator::publishesFullVocabularyMTPLogits() const
+    {
+        return generationTail().publishesFullVocabularyMTPLogits();
+    }
+    bool GlobalOrchestrator::sampleGreedyFromMTPLogitsToDeviceDraftSlot(int draft_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().sampleGreedyFromMTPLogitsToDeviceDraftSlot(draft_sample_slot, out_token);
+    }
+    bool GlobalOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows(int start_row,
+            int row_count,
+            int32_t *out_tokens)
+    {
+        return generationTail().sampleGreedyFromAllPositionLogitsOnDeviceRows(start_row, row_count, out_tokens);
+    }
+    bool GlobalOrchestrator::supportsGreedyAllPositionBatchOutcomeOnDevice() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[9] != 0;
+    }
+    bool GlobalOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out)
+    {
+        return generationTail().verifyGreedyAllPositionBatchOutcomeOnDevice(draft_tokens, draft_token_count, stop_tokens, stop_token_count, out);
+    }
+    bool GlobalOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        return generationTail().verifyGreedyAllPositionBatchOutcomeOnDeviceResident(draft_tokens, draft_token_count, stop_tokens, stop_token_count, out_handle);
+    }
+    bool GlobalOrchestrator::prepareGreedyAllPositionBatchOutcomeGraph(int verifier_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            const MTPRequestPenaltyPolicy &penalty_policy)
+    {
+        return generationTail().prepareGreedyAllPositionBatchOutcomeGraph(verifier_token_count, stop_tokens, stop_token_count, penalty_policy);
+    }
+    bool GlobalOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(const DeviceGreedyBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        return generationTail().verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(requests, request_count, out_handle);
+    }
+    DeviceResidentLogicalSequenceStateHandle GlobalOrchestrator::deviceResidentLogicalSequenceState() const
+    {
+        return generationTail().deviceResidentLogicalSequenceState();
+    }
+    bool GlobalOrchestrator::observeDeviceResidentNextConditionTokens(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_count,
+            int32_t *out_tokens)
+    {
+        return generationTail().observeDeviceResidentNextConditionTokens(logical_state, request_count, out_tokens);
+    }
+    bool GlobalOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(int target_sample_slot,
+            int32_t *out_token)
+    {
+        return generationTail().sampleGreedyFromMainLogitsToDeviceTargetSlot(target_sample_slot, out_token);
+    }
+    int GlobalOrchestrator::sampleOnDeviceAtLogicalPosition(const SamplingParams &params,
+            int logical_position)
+    {
+        return generationTail().sampleOnDeviceAtLogicalPosition(params, logical_position);
+    }
+    bool GlobalOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(int request_count,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds)
+    {
+        return generationTail().publishMainLogitsBatchSamplesToDeviceResidentState(request_count, params, stochastic_position_seeds);
+    }
+    std::vector<MoEOverlayDeviceControllerRuntimeBinding> GlobalOrchestrator::moeOverlayDeviceControllerRuntimeBindings() const
+    {
+        return generationTail().moeOverlayDeviceControllerRuntimeBindings();
+    }
+    bool GlobalOrchestrator::applyPenaltiesOnDevice(const LogitPenaltyBatch &penalties,
+                                            int vocab_size)
+    {
+        // Hosted CPU greedy sampling is collective even though only the tail
+        // owns logits. A non-tail rank has no row to mutate, but must remain a
+        // successful participant so it enters the existing token broadcast.
+        // Original GPU generation retains its strict local-tail authority.
+        if (!requiresOriginalRankGPUTransport() && !is_pipeline_tail_)
+            return true;
+        return generationTail().applyPenaltiesOnDevice(penalties, vocab_size);
+    }
+    bool GlobalOrchestrator::applyPenaltiesToMTPLogitsOnDevice(const LogitPenaltyBatch &penalties,
+                                                       int vocab_size)
+    {
+        return generationTail().applyPenaltiesToMTPLogitsOnDevice(penalties, vocab_size);
+    }
+    bool GlobalOrchestrator::applyPenaltiesToAllPositionLogitsOnDeviceRow(int row,
+            const LogitPenaltyBatch &penalties,
+            int vocab_size)
+    {
+        return generationTail().applyPenaltiesToAllPositionLogitsOnDeviceRow(row, penalties, vocab_size);
+    }
+    bool GlobalOrchestrator::applyDeviceOwnedMTPPenaltiesToLogitRows(DeviceLogitsSource source,
+            int row_count,
+            const MTPRequestPenaltyPolicy &penalty_policy)
+    {
+        return generationTail().applyDeviceOwnedMTPPenaltiesToLogitRows(source, row_count, penalty_policy);
+    }
+    bool GlobalOrchestrator::applyDeviceOwnedMTPBranchPenaltiesToLogits(int prior_draft_count,
+            const MTPRequestPenaltyPolicy &penalty_policy)
+    {
+        return generationTail().applyDeviceOwnedMTPBranchPenaltiesToLogits(prior_draft_count, penalty_policy);
+    }
+    bool GlobalOrchestrator::supportsRowLocalAllPositionPenaltyApplication() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[10] != 0;
+    }
+    bool GlobalOrchestrator::supportsDeviceStochasticMTPVerification() const
+    {
+        return rank_service_ready_ && rank_tail_capabilities_[11] != 0;
+    }
+    bool GlobalOrchestrator::buildStochasticDistributionOnDevice(DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size)
+    {
+        return generationTail().buildStochasticDistributionOnDevice(source, row, buffer, slot, params, vocab_size);
+    }
+    bool GlobalOrchestrator::buildStochasticDistributionsOnDevice(DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size)
+    {
+        return generationTail().buildStochasticDistributionsOnDevice(source, first_row, buffer, first_slot, row_count, params, vocab_size);
+    }
+    bool GlobalOrchestrator::buildCapturedStochasticVerifierTargetDistributions(int row_count,
+            const SamplingParams &params,
+            const MTPRequestPenaltyPolicy &penalty_policy,
+            int vocab_size)
+    {
+        return generationTail().buildCapturedStochasticVerifierTargetDistributions(row_count, params, penalty_policy, vocab_size);
+    }
+    bool GlobalOrchestrator::buildStochasticProbabilityRowsOnDevice(DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size)
+    {
+        return generationTail().buildStochasticProbabilityRowsOnDevice(source, first_row, buffer, first_slot, row_count, params, vocab_size);
+    }
+    bool GlobalOrchestrator::buildStochasticProcessedLogitRowsOnDevice(DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size)
+    {
+        return generationTail().buildStochasticProcessedLogitRowsOnDevice(source, first_row, buffer, first_slot, row_count, params, vocab_size);
+    }
+    int GlobalOrchestrator::sampleStochasticDraftProposalOnDevice(DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold)
+    {
+        return generationTail().sampleStochasticDraftProposalOnDevice(source, row, slot, params, vocab_size, threshold);
+    }
+    bool GlobalOrchestrator::publishCapturedMTPDraftToken(int row,
+            int slot,
+            const MTPRequestPenaltyPolicy &penalty_policy)
+    {
+        return generationTail().publishCapturedMTPDraftToken(row, slot, penalty_policy);
+    }
+    bool GlobalOrchestrator::sampleStochasticDraftProposalOnDeviceDeferred(DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold)
+    {
+        return generationTail().sampleStochasticDraftProposalOnDeviceDeferred(source, row, slot, params, vocab_size, threshold);
+    }
+    DeviceStochasticTargetSampleSlotHandle GlobalOrchestrator::deviceStochasticTargetSampleProducerSlot(int slot)
+    {
+        return generationTail().deviceStochasticTargetSampleProducerSlot(slot);
+    }
+    DeviceStochasticTargetSampleSlotHandle GlobalOrchestrator::deviceStochasticTargetSampleBroadcastDestinationSlot(int slot)
+    {
+        return generationTail().deviceStochasticTargetSampleBroadcastDestinationSlot(slot);
+    }
+    bool GlobalOrchestrator::recordStochasticTargetSampleSlotReadyFromDevice(int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending)
+    {
+        return generationTail().recordStochasticTargetSampleSlotReadyFromDevice(slot, producer_stream, verifier_consumer_pending);
+    }
+    bool GlobalOrchestrator::stageStochasticDraftTokensForDeviceVerification(const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot)
+    {
+        return generationTail().stageStochasticDraftTokensForDeviceVerification(draft_tokens, draft_token_count, first_draft_slot);
+    }
+    bool GlobalOrchestrator::stageStochasticTargetTokenForDeviceSampling(int32_t target_token,
+            int target_sample_slot)
+    {
+        return generationTail().stageStochasticTargetTokenForDeviceSampling(target_token, target_sample_slot);
+    }
+    bool GlobalOrchestrator::publishForcedDeviceResidentConditionToken(int32_t token,
+            int target_sample_slot)
+    {
+        return generationTail().publishForcedDeviceResidentConditionToken(token, target_sample_slot);
+    }
+    bool GlobalOrchestrator::publishDeviceResidentConditionTokenToTargetSampleSlot(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int target_sample_slot)
+    {
+        return generationTail().publishDeviceResidentConditionTokenToTargetSampleSlot(logical_state, request_index, target_sample_slot);
+    }
+    int GlobalOrchestrator::sampleStochasticDistributionOnDevice(DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold)
+    {
+        return generationTail().sampleStochasticDistributionOnDevice(buffer, slot, threshold);
+    }
+    bool GlobalOrchestrator::sampleStochasticDistributionOnDeviceDeferred(DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold)
+    {
+        return generationTail().sampleStochasticDistributionOnDeviceDeferred(buffer, slot, threshold);
+    }
+    const void * GlobalOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens)
+    {
+        return generationTail().prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(first_target_sample_slot, first_draft_slot, draft_token_count, total_verifier_input_tokens);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsOnDevice(int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out)
+    {
+        return generationTail().verifyStochasticDistributionsOnDevice(target_slot, draft_slot, draft_token, accept_threshold, residual_threshold, out);
+    }
+    bool GlobalOrchestrator::verifyStochasticProbabilityRowOnDevice(int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_logical_position,
+            DeviceSpeculativeVerifyResult *out)
+    {
+        return generationTail().verifyStochasticProbabilityRowOnDevice(target_slot, draft_slot, draft_token, accept_threshold, inverse_sample_seed, inverse_sample_logical_position, out);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsBatchOnDevice(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out)
+    {
+        return generationTail().verifyStochasticDistributionsBatchOnDevice(first_target_slot, first_draft_slot, draft_tokens, accept_thresholds, residual_thresholds, row_count, out);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDevice(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            bool use_vllm_probability_rejection)
+    {
+        return generationTail().verifyStochasticDistributionsBatchOutcomeOnDevice(first_target_slot, first_draft_slot, draft_tokens, accept_thresholds, residual_thresholds, row_count, first_token, stop_tokens, stop_token_count, bonus_target_slot, bonus_threshold, out, inverse_sample_seed, inverse_sample_first_logical_position, use_vllm_probability_rejection);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            bool use_vllm_probability_rejection)
+    {
+        return generationTail().verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(first_target_slot, first_draft_slot, draft_tokens, accept_thresholds, residual_thresholds, row_count, first_target_sample_slot, stop_tokens, stop_token_count, bonus_target_slot, bonus_threshold, out, inverse_sample_seed, inverse_sample_first_logical_position, use_vllm_probability_rejection);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceResident(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            bool use_vllm_probability_rejection)
+    {
+        return generationTail().verifyStochasticDistributionsBatchOutcomeOnDeviceResident(first_target_slot, first_draft_slot, draft_tokens, accept_thresholds, residual_thresholds, row_count, first_token, stop_tokens, stop_token_count, bonus_target_slot, bonus_threshold, out_handle, inverse_sample_seed, inverse_sample_first_logical_position, use_vllm_probability_rejection);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            bool use_vllm_probability_rejection)
+    {
+        return generationTail().verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(first_target_slot, first_draft_slot, draft_tokens, accept_thresholds, residual_thresholds, row_count, first_target_sample_slot, stop_tokens, stop_token_count, bonus_target_slot, bonus_threshold, out_handle, inverse_sample_seed, inverse_sample_first_logical_position, use_vllm_probability_rejection);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDevice(const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes)
+    {
+        return generationTail().verifyStochasticDistributionsRequestBatchOutcomesOnDevice(requests, request_count, outcomes);
+    }
+    bool GlobalOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        return generationTail().verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(requests, request_count, out_handle);
+    }
+    bool GlobalOrchestrator::observeDeviceGenerationDispatchTicket(sampling_math::DeviceGenerationDispatchTicket *out_ticket)
+    {
+        return generationTail().observeDeviceGenerationDispatchTicket(out_ticket);
+    }
+    bool GlobalOrchestrator::beginHostScheduledDeviceGenerationAdvance(const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t *out_fragment_count)
+    {
+        return generationTail().beginHostScheduledDeviceGenerationAdvance(ticket, out_fragment_count);
+    }
+    bool GlobalOrchestrator::submitHostScheduledDeviceGenerationFragment(const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t fragment_index)
+    {
+        return generationTail().submitHostScheduledDeviceGenerationFragment(ticket, fragment_index);
+    }
+    bool GlobalOrchestrator::finishHostScheduledDeviceGenerationAdvance(const sampling_math::DeviceGenerationDispatchTicket &ticket)
+    {
+        return generationTail().finishHostScheduledDeviceGenerationAdvance(ticket);
+    }
+    bool GlobalOrchestrator::submitHostScheduledDeviceGenerationAdvance(const sampling_math::DeviceGenerationDispatchTicket &ticket)
+    {
+        return generationTail().submitHostScheduledDeviceGenerationAdvance(ticket);
+    }
+    bool GlobalOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(const DeviceSpeculativeOutcomeHandle &handle,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes)
+    {
+        return generationTail().copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, outcomes);
+    }
+
+    bool GlobalOrchestrator::beginDeviceResidentGeneration(const DeviceGenerationAdmissionRequest &request)
+    {
+        return rank_service_ready_ && is_pipeline_tail_ && publishOriginalRankAdmission(request) && rank_generation_->begin(request);
+    }
+
+    DeviceGenerationExecutionPolicy GlobalOrchestrator::deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology topology) const noexcept
+    {
+        (void)topology;
+        return rank_service_ready_ ? DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions :
+            DeviceGenerationExecutionPolicy::Unsupported;
+    }
+
+    bool GlobalOrchestrator::materializeDeviceResidentGeneration(int request_count, int draft_depth, DeviceGenerationLoopTopology topology, DeviceGenerationSamplingMode sampling_mode)
+    {
+        return rank_service_ready_ && is_pipeline_tail_ && sampling_mode == rank_generation_sampling_mode_ &&
+            rank_generation_->materialize(request_count, draft_depth, topology, sampling_mode);
+    }
+
+    bool GlobalOrchestrator::prepareDeviceResidentGenerationContinuation(DeviceGenerationSamplingMode sampling_mode)
+    {
+        return rank_service_ready_ && is_pipeline_tail_ && sampling_mode == rank_generation_sampling_mode_ &&
+            rank_generation_->prepareContinuation(sampling_mode);
+    }
+
+    bool GlobalOrchestrator::launchDeviceResidentGeneration()
+    {
+        return rank_service_ready_ && is_pipeline_tail_ && rank_generation_->launch();
+    }
+
+    bool GlobalOrchestrator::finishDeviceResidentGeneration(DeviceGenerationTerminalResult *result)
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_ || !rank_active_command_ ||
+            !rank_generation_->finish(result) || !result || !result->valid() || result->requests.size() != 1 ||
+            !rank_generation_->originalTerminalCachedTokens()) return false;
+        const auto &row = result->requests.front();
+        const int cached = *rank_generation_->originalTerminalCachedTokens();
+        if (rank_response_admission_base_ < rank_admission_base_ || cached < rank_response_admission_base_ ||
+            cached - rank_response_admission_base_ != row.published_state_commit_count) return false;
+        rank_terminal_observation_ = OriginalRankGenerationTerminal{
+            .admission_base = rank_admission_base_, .admission_budget = rank_admission_budget_,
+            .published_state_commit_count = cached - rank_admission_base_,
+            .cached_tokens = *rank_generation_->originalTerminalCachedTokens(),
+            .next_leading_row_disposition = row.next_leading_row_disposition, .model_stopped = row.model_stopped};
+        return true;
+    }
+
+    bool GlobalOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds(const int *token_shadow, const void *token_ids_device, int seq_len)
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_ || seq_len < 2 ||
+            !publishOriginalRankTransaction(MoEOverlayInferenceGraphRole::MTPGroupedVerifier, seq_len, seq_len - 1)) return false;
+        // The remote verifier remains live through the later accepted-state
+        // publication. Retiring here would deadlock its reverse metadata wait.
+        return rank_generation_->forwardMTPVerifier(seq_len, [&](IInferenceRunner &tail) {
+            return tail.forwardGroupedMTPVerifierWithDeviceTokenIds(token_shadow, token_ids_device, seq_len);
+        });
+    }
+
+    bool GlobalOrchestrator::advanceMTPMainConditionFromDeviceResidentLogicalState(int32_t token_shadow, const DeviceResidentLogicalSequenceStateHandle &logical_state, MTPConditionForwardPurpose purpose, int request_index)
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_ ||
+            !publishOriginalRankTransaction(moeOverlayPipelineConditionGraphRole(purpose), 1, -1)) return false;
+        if (!rank_generation_->forwardMTPCondition(purpose, [&](IInferenceRunner &tail) {
+                return tail.advanceMTPMainConditionFromDeviceResidentLogicalState(token_shadow, logical_state, purpose, request_index);
+            }) || !rank_generation_->completeOriginalRankSourceTransaction(moeOverlayPipelineConditionGraphRole(purpose), nullptr)) return false;
+        return retireOriginalRankTransaction(rank_retired_decode_scheduler_frontier_);
+    }
+
+    bool GlobalOrchestrator::advanceMTPMainConditionFromDeviceTargetSample(int32_t token_shadow, int target_sample_slot, MTPConditionForwardPurpose purpose)
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_ ||
+            !publishOriginalRankTransaction(moeOverlayPipelineConditionGraphRole(purpose), 1, -1)) return false;
+        if (!rank_generation_->forwardMTPCondition(purpose, [&](IInferenceRunner &tail) {
+                return tail.advanceMTPMainConditionFromDeviceTargetSample(token_shadow, target_sample_slot, purpose);
+            }) || !rank_generation_->completeOriginalRankSourceTransaction(moeOverlayPipelineConditionGraphRole(purpose), nullptr)) return false;
+        return retireOriginalRankTransaction(rank_retired_decode_scheduler_frontier_);
+    }
+
+    bool GlobalOrchestrator::publishAcceptedMTPSpecStateBatchFromDeviceOutcome(const DeviceSpeculativePublicationRequest &request, std::string *error)
+    {
+        if (!rank_service_ready_ || !is_pipeline_tail_ || !rank_transaction_pending_ ||
+            !rank_generation_->publishMTPOutcome(request, error) ||
+            !rank_generation_->completeOriginalRankSourceTransaction(MoEOverlayInferenceGraphRole::MTPGroupedVerifier, error)) return false;
+        return retireOriginalRankTransaction(rank_retired_decode_scheduler_frontier_);
+    }
+
+    bool GlobalOrchestrator::advanceOrdinaryMainConditionFromDeviceResidentLogicalState(int32_t token_shadow, const DeviceResidentLogicalSequenceStateHandle &logical_state, int request_index)
+    {
+        (void)token_shadow;
+        // Forced ordinary conditions have their own existing no-sampling
+        // one-shot owner. They must never masquerade as response-loop decode.
+        // Its source/follower command role is intentionally separate from an
+        // ordinary sampler transaction; no host token is uploaded here.
+        const DeviceGenerationAdmissionRequest admission{
+            .request_count = 1, .max_new_tokens = 0,
+            .depth_policy = sampling_math::DeviceGenerationPolicy::forwardOnly(),
+            .initial_leading_row_disposition = sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted,
+            .initial_target_counts = DeviceGenerationInitialTargetCounts(std::vector<int>{rank_admission_base_})};
+        if (!rank_service_ready_ || !is_pipeline_tail_ || !rank_active_command_ ||
+            !publishOriginalRankAdmission(admission) ||
+            !publishOriginalRankTransaction(MoEOverlayInferenceGraphRole::OrdinaryForwardOnly, 1, -1) ||
+            !rank_generation_->advanceOrdinaryCondition(logical_state, request_index) ||
+            !rank_generation_->originalTerminalCachedTokens() ||
+            !retireOriginalRankTransaction(rank_retired_decode_scheduler_frontier_)) return false;
+        rank_terminal_observation_ = OriginalRankGenerationTerminal{
+            .admission_base = rank_admission_base_, .admission_budget = 0,
+            .published_state_commit_count = 1,
+            .cached_tokens = *rank_generation_->originalTerminalCachedTokens(),
+            .next_leading_row_disposition = sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse};
+        return true;
+    }
+
+    MTPVerifierRowCapability GlobalOrchestrator::mtpVerifierRowCapability() const
+    {
+        return rank_service_ready_ ? rank_tail_verifier_capability_ : MTPVerifierRowCapability{};
+    }
+
+
+    ServingGraphPreparationKind GlobalOrchestrator::servingGraphPreparationKind() const noexcept
+    {
+        if (requiresOriginalRankGPUTransport())
+        {
+            for (const auto *action : rank_plan_.executeStages())
+            {
+                const auto *entry = stage_runners_.entryForStage(action->stage_id);
+                if (!entry || !entry->runner || entry->runner->servingGraphPreparationKind() !=
+                        ServingGraphPreparationKind::NativeDeviceExecutableFamily)
+                    return ServingGraphPreparationKind::Unresolved;
+            }
+            return ServingGraphPreparationKind::NativeDeviceExecutableFamily;
+        }
+        if(config_.topology.numStages()>1) {
+            // A real host pipeline declares the lifecycle of every original
+            // local child. Native GPU composition retains its separate complete
+            // captured contract above; CPU stages never imply CPU capture.
+            const bool cpu_only=std::all_of(config_.topology.stages.begin(),config_.topology.stages.end(),[](const auto& stage){
+                const auto& members=stage.is_global_tp?stage.per_rank_devices:stage.devices;
+                return !members.empty() && std::all_of(members.begin(),members.end(),[](const auto& member){return member.isCPU();});
+            });
+            if(cpu_only && !stage_runners_.empty()) {
+                for(const auto* action:rank_plan_.executeStages()) {
+                    const auto* entry=stage_runners_.entryForStage(action->stage_id);
+                    if(!entry || !entry->runner || entry->runner->servingGraphPreparationKind()!=ServingGraphPreparationKind::EagerHostGraph)
+                        return ServingGraphPreparationKind::Unresolved;
+                }
+                return ServingGraphPreparationKind::EagerHostGraph;
+            }
+        }
+        const auto *runner = stage_runners_.defaultRunner();
+        return config_.topology.numStages() == 1 && runner ? runner->servingGraphPreparationKind() :
+            ServingGraphPreparationKind::Unresolved;
+    }
+
+    bool GlobalOrchestrator::forwardRestoredPrefixMTPDecodeBridge(const RestoredPrefixMTPDecodeBridgeRequest &request)
+    {
+        if (!requiresOriginalRankGPUTransport())
+            return config_.topology.numStages() == 1 && generationTail().forwardRestoredPrefixMTPDecodeBridge(request);
+        if (!rank_service_ready_ || rank_active_command_ ||
+            !rank_generation_->restoredPrefixMTPDecodeBridge(request)) return false;
+        // Count the admitted scalar suffix once per original process, after
+        // its actual captured participant transactions have been submitted.
+        PerfStatsCollector::addCounter("forward_graph", "pipeline_scalar_input_transactions", 1.0,
+            "decode", "rank", {{"boundary_authority", "captured_original_rank_pipeline_edges"},
+                {"state_transition", rank_draft_capacity_ > 0 ? "main_and_shifted_mtp" : "main_only"},
+                {"world_rank", std::to_string(config_.rank)}});
+        return true;
+    }
+
+    void GlobalOrchestrator::bindOriginalRankRetiredDecodeProgressSink(MoEOverlayRetiredDecodeProgressSink sink)
+    {
+        if (!sink || rank_active_command_ || rank_retired_decode_progress_sink_)
+            throw std::logic_error("Original rank maintenance notification requires one inactive process-local sink");
+        rank_retired_decode_progress_sink_ = std::move(sink);
     }
 
 } // namespace llaminar2

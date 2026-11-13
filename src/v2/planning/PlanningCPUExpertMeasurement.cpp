@@ -3,8 +3,8 @@
  * @brief Real source weights, canonical preparation, and one complete CPU FFN.
  *
  * Source reads and packing are bounded by one requested payload. Every payload
- * is claimed before its allocation, and declaration order retires all engines
- * before their claims. Only immutable completed observations leave this scope.
+ * is claimed before its allocation; actual prepared backings retain their
+ * own claims. Only immutable completed observations leave this scope.
  * The existing startup service producer owns invocation workspace and timing,
  * so planning does not introduce a parallel expert execution implementation.
  */
@@ -59,9 +59,10 @@ namespace llaminar2
                 result.preparation[i] = CPUWeightPreparationMemory::sourceNative(
                     result.formats[i], result.matrices[i].n, result.matrices[i].k);
                 addBytes(result.prepared_bytes, result.preparation[i].persistent_bytes);
-                result.staging_bytes = std::max({result.staging_bytes,
-                    origin == PlanningSampleOrigin::LocalGGUF ? result.matrices[i].source_bytes : size_t{0},
-                    result.preparation[i].temporary_bytes});
+                // Native reads populate the final sample directly. Only the
+                // real packer's simultaneous scratch belongs to staging.
+                result.staging_bytes = std::max(result.staging_bytes,
+                    result.preparation[i].temporary_bytes);
             }
             return result;
         }
@@ -93,7 +94,8 @@ namespace llaminar2
                 {.rows = rows, .n = static_cast<int>(description.matrices[projection].n),
                  .k = static_cast<int>(description.matrices[projection].k), .workers = workers,
                  .execution = execution, .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
-        builder.add(resource, PhysicalMemoryOwner::ModelSourcePayload, description.source_bytes);
+        for (const auto &matrix : description.matrices)
+            builder.add(resource, PhysicalMemoryOwner::ModelSourcePayload, matrix.physicalBytes());
         builder.add(resource, PhysicalMemoryOwner::RoutedExpertWeights, description.prepared_bytes);
         builder.add(resource, PhysicalMemoryOwner::WeightLoadStaging, description.staging_bytes);
         builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace,
@@ -118,25 +120,23 @@ namespace llaminar2
         if (workers <= 0 || omp_get_thread_limit() < workers)
             throw std::invalid_argument("CPU expert sampling worker budget exceeds the OpenMP team limit");
 
-        // Leases are declared before engines. The enclosing loaded sample owns
-        // all source bytes through preparation, execution and engine retirement.
-        std::vector<PhysicalMemoryAllocationLease> prepared_claims;
+        // The loaded sample owns source bytes. Final engine storage owns its
+        // admission lease, including any execution views retained from it.
         std::array<std::shared_ptr<ITensorGemm>, 3> engines;
         const auto inputs = request.projections();
         using llaminar::v2::kernels::KernelFactory;
         for (size_t i = 0; i < inputs.size(); ++i)
         {
-            prepared_claims.push_back(memory->claimNewAllocation(device,
-                PhysicalMemoryOwner::RoutedExpertWeights, description.preparation[i].persistent_bytes));
-            std::optional<PhysicalMemoryAllocationLease> packing_claim;
-            if (description.preparation[i].temporary_bytes)
-                packing_claim.emplace(memory->claimNewAllocation(device,
-                    PhysicalMemoryOwner::WeightLoadStaging, description.preparation[i].temporary_bytes));
             // A const shared borrow is kept inside the source-sample scope;
             // it cannot escape its PMA owner through a returned tensor view.
-            engines[i] = KernelFactory::prepareExpertGemmLocal(sample.tensor(i).shared_from_this(), device);
+            // The native packer owns its actual admitted scratch root and
+            // source transaction. A wrapper lease would charge those same
+            // physical bytes twice. Floating preparation declares no scratch.
+            engines[i] = KernelFactory::prepareExpertGemmLocal(sample.tensor(i).shared_from_this(),device,
+                KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
+                    memory,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local()));
             if (!engines[i] || !engines[i]->hasWeights() ||
-                engines[i]->packedWeightBytes() != description.preparation[i].persistent_bytes)
+                engines[i]->packedWeightBytes() != description.preparation[i].persistent_payload_bytes)
                 throw std::runtime_error("CPU expert preparation disagrees with its admitted native payload");
         }
 
@@ -144,8 +144,7 @@ namespace llaminar2
             description.matrices[0].k, description.matrices[0].n, description.prepared_bytes,
             description.formats, request, {}};
         const MoEOverlayPreparedExpertPayload payload{engines[0], engines[1], engines[2]};
-        for (const auto phase : {ExpertHistogramSource::DecodeToken, ExpertHistogramSource::PrefillChunk,
-                                ExpertHistogramSource::GroupedVerifier})
+        for (const auto phase : kPlanningExpertStartupPhases)
         {
             const int rows = MoEOverlayCPUServiceMeasurement::rowsForPhase(phase);
             const uint64_t elapsed = MoEOverlayCPUServiceMeasurement::measurePrepared(

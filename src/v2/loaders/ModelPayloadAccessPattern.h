@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "WeightIdentity.h"
+
 namespace llaminar2
 {
 
@@ -20,7 +22,7 @@ namespace llaminar2
      */
     enum class ModelPayloadAccessPattern
     {
-        /** The mapped GGUF is the long-lived dense CPU weight authority. */
+        /** Final populated weights remain CPU-resident; their source mappings stay demand-paged. */
         DenseCpuResident,
 
         /** Payload pages are transient staging input for device preparation. */
@@ -29,6 +31,27 @@ namespace llaminar2
         /** Only explicitly selected tensor or expert slices are materialized. */
         SparseSelection,
     };
+
+    /**
+     * @brief Resolve source mapping density from its immutable semantic ownership.
+     * @param requested Consumer's existing dense, staging or selected access policy.
+     * @param role One source role authenticated by the parsed tensor inventory.
+     * @return Selected mapping for a separately owned row table; otherwise requested.
+     *
+     * A CPU graph may populate ordinary final weights while its GGUF also
+     * contains a separately admitted RAM or bounded-mmap row table. Source-wide
+     * cache warmup must not read that independent table before its owner exists.
+     * The resolver retains this warmup distinction; low-level source mappings
+     * are always demand-paged, independent of final consumer placement.
+     */
+    [[nodiscard]] constexpr ModelPayloadAccessPattern resolveModelPayloadAccessPattern(
+        ModelPayloadAccessPattern requested, WeightRole role) noexcept
+    {
+        return requested == ModelPayloadAccessPattern::DenseCpuResident &&
+                       role == WeightRole::ImmutableRowTable
+                   ? ModelPayloadAccessPattern::SparseSelection
+                   : requested;
+    }
 
     /**
      * @brief Return a stable diagnostic name for a payload access pattern.

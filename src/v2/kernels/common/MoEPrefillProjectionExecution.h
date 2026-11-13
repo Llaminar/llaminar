@@ -23,6 +23,8 @@
 #include "WorkspaceOverwriteContract.h"
 
 #include <stdexcept>
+#include <cstdint>
+#include <utility>
 
 namespace llaminar2
 {
@@ -31,6 +33,133 @@ namespace llaminar2
     {
         TokenRows, ///< One ordered sum for each physical token and output column.
         OriginalRouteRows ///< One contribution for each original token/top-k slot.
+    };
+
+    /**
+     * @brief Capture-time provenance of the grouping producer, never live counts.
+     *
+     * Unspecified and selected-route publications cannot certify an all-route
+     * measurement, even when a particular replay happens to contain all routes.
+     */
+    enum class MoEPrefillRouteScope : std::uint8_t
+    {
+        Unspecified, ///< No successful all-route grouping producer is bound.
+        AllRoutes, ///< The ordinary unmasked grouping producer owns every route.
+        SelectedRoutes ///< A mask or published runtime assignment may select routes.
+    };
+
+    /**
+     * @brief Own static grouping-origin publication for one kernel instance.
+     *
+     * This records which setup producer successfully enqueued a grouping, not
+     * its live rows, experts or device counts. Beginning a replacement revokes
+     * prior provenance immediately. Failure, exception and abandoned setup keep
+     * it unspecified; only a completed producer may publish its fixed origin.
+     */
+    class MoEPrefillGroupingProvenance final
+    {
+    public:
+        /** @brief Start with no successfully bound grouping producer. */
+        MoEPrefillGroupingProvenance() = default;
+        /** @brief Producer provenance cannot be copied to another kernel owner. */
+        MoEPrefillGroupingProvenance(const MoEPrefillGroupingProvenance &) = delete;
+        /** @brief Rebinding an owner must invalidate rather than copy provenance. */
+        MoEPrefillGroupingProvenance &operator=(const MoEPrefillGroupingProvenance &) = delete;
+
+        /** @brief Revoke provenance when grouping buffers or their owner change. */
+        void invalidate() noexcept { scope_ = MoEPrefillRouteScope::Unspecified; }
+
+        /** @return The last successfully published static producer's origin. */
+        [[nodiscard]] MoEPrefillRouteScope scope() const noexcept { return scope_; }
+
+        /** @brief One noncopyable setup publication; it never owns device work. */
+        class Preparation final
+        {
+        public:
+            /** @brief One setup transaction has exactly one publication owner. */
+            Preparation(const Preparation &) = delete;
+            /** @brief A live setup transaction cannot be reassigned. */
+            Preparation &operator=(const Preparation &) = delete;
+
+            /** @brief Failed or abandoned setup cannot retain old provenance. */
+            ~Preparation()
+            {
+                if (owner_)
+                {
+                    owner_->invalidate();
+                    owner_->preparing_ = false;
+                }
+            }
+
+            /**
+             * @brief Publish only after the entire grouping producer succeeded.
+             * @throws std::logic_error if a consumed preparation is reused.
+             * @note Invocation success means enqueued on its existing stream;
+             *       no device count is inspected and no completion wait is added.
+             */
+            void publish() &&
+            {
+                if (!owner_)
+                    throw std::logic_error("grouped MoE origin publication already consumed");
+                owner_->scope_ = scope_;
+                owner_->preparing_ = false;
+                owner_ = nullptr;
+            }
+
+        private:
+            friend class MoEPrefillGroupingProvenance;
+            /**
+             * @brief Revoke the prior producer before any replacement can fail.
+             * @param owner Kernel-instance metadata receiving this publication.
+             * @param scope Fixed origin selected by the typed producer factory.
+             * @throws std::logic_error before altering an already active owner.
+             */
+            Preparation(MoEPrefillGroupingProvenance &owner, MoEPrefillRouteScope scope)
+                : owner_(&owner), scope_(scope)
+            {
+                if (owner.preparing_)
+                    throw std::logic_error("grouped MoE origin preparation overlaps an active producer");
+                owner.preparing_ = true;
+                owner.invalidate();
+            }
+            MoEPrefillGroupingProvenance *owner_;
+            MoEPrefillRouteScope scope_;
+        };
+
+        /**
+         * @return An unpublished transaction for ordinary unmasked grouping.
+         * @throws std::logic_error if another producer still owns preparation.
+         */
+        [[nodiscard]] Preparation beginAllRoutes()
+        {
+            return Preparation(*this, MoEPrefillRouteScope::AllRoutes);
+        }
+
+        /**
+         * @return An unpublished transaction for a mask-selected grouping.
+         * @throws std::logic_error if another producer still owns preparation.
+         */
+        [[nodiscard]] Preparation beginSelectedRoutes()
+        {
+            return Preparation(*this, MoEPrefillRouteScope::SelectedRoutes);
+        }
+
+    private:
+        MoEPrefillRouteScope scope_ = MoEPrefillRouteScope::Unspecified;
+        bool preparing_ = false; ///< Exactly one setup publication owns this instance.
+    };
+
+    /**
+     * @brief Meaning of the already-installed complete-operation measurements.
+     *
+     * This is a qualification of existing corpus rows, not a new phase policy.
+     * Unmeasured transactions retain the unchanged generic geometry and their
+     * original arithmetic key. New operation families need independent evidence.
+     */
+    enum class MoEPrefillMeasuredOperation : std::uint8_t
+    {
+        Unmeasured,
+        CompleteFullWidthTokenRowsAllRoutes
     };
 
     /** @brief One explicit projection transaction, without implicit replay. */
@@ -84,6 +213,34 @@ namespace llaminar2
 
         /** @return Physical down-descriptor width and compact output stride. */
         [[nodiscard]] int columnCount() const noexcept { return column_count_; }
+
+        /**
+         * @brief Qualify the operation represented by existing complete corpora.
+         * @param layout Actual down publication target, not allocation shape.
+         * @param scope Immutable provenance of the current grouping producer.
+         * @return The installed complete-operation identity only for full-width
+         *         gate/up plus down, token publication and unmasked all routes.
+         * @throws std::invalid_argument for an unknown layout or scope.
+         * @note A full-width down-only operation is still not a complete FFN.
+         *       This decision never reads mutable route counts or changes K.
+         */
+        [[nodiscard]] MoEPrefillMeasuredOperation measuredOperation(
+            MoEPrefillOutputLayout layout, MoEPrefillRouteScope scope) const
+        {
+            if (layout != MoEPrefillOutputLayout::TokenRows &&
+                layout != MoEPrefillOutputLayout::OriginalRouteRows)
+                throw std::invalid_argument("unknown grouped MoE measured publication layout");
+            if (scope != MoEPrefillRouteScope::Unspecified &&
+                scope != MoEPrefillRouteScope::AllRoutes &&
+                scope != MoEPrefillRouteScope::SelectedRoutes)
+                throw std::invalid_argument("unknown grouped MoE measured route scope");
+            return phase_ == Phase::Complete && first_column_ == 0 &&
+                           column_count_ == model_columns_ &&
+                           layout == MoEPrefillOutputLayout::TokenRows &&
+                           scope == MoEPrefillRouteScope::AllRoutes
+                       ? MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes
+                       : MoEPrefillMeasuredOperation::Unmeasured;
+        }
 
         /**
          * @brief Describe all down-output elements that this producer must define.

@@ -1357,6 +1357,10 @@ namespace llaminar2
 
     bool TensorBase::releaseDeviceMemory()
     {
+        // Structural views never own an allocation to release. In particular,
+        // a base-qualified call must not silently succeed on dormant view fields.
+        if (transferStorageOwner() != this)
+            throw std::logic_error("Device storage must be released through its canonical owner, not a view");
         // Ensure host has current data
         if (!ensureOnHost())
         {

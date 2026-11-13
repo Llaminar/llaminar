@@ -215,7 +215,7 @@ namespace llaminar2
     struct MoEOverlayDistributedResidencyProposalHeader
     {
         static constexpr std::uint32_t kMagic = 0x504F4F4Du; // "MOOP"
-        static constexpr std::uint32_t kABIVersion = 2u;
+        static constexpr std::uint32_t kABIVersion = 3u;
         static constexpr std::size_t kWireBytes = 96u;
 
         std::uint32_t magic = kMagic;
@@ -423,6 +423,15 @@ namespace llaminar2
         virtual MoEOverlayResidencyWaveProgress poll(
             std::vector<MoEOverlayDistributedResidencyVote> *votes,
             std::string *error = nullptr) = 0;
+
+        /**
+         * @brief Fatally stop this original distributed domain after physical staging fails.
+         * @param diagnostic Original local physical failure, retained before any vote.
+         *
+         * A peer may still require this rank's payload progress and cannot reach
+         * stage consensus. This operation never returns or claims clean drain.
+         */
+        [[noreturn]] virtual void failPhysicalStage(const std::string &diagnostic) noexcept = 0;
 
         /** @return Whether this lane owns no in-flight exchange. */
         [[nodiscard]] virtual bool idle() const noexcept = 0;

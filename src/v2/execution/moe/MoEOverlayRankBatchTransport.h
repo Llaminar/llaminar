@@ -22,6 +22,7 @@
 #pragma once
 
 #include "MoEOverlaySparseCollective.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 
 #include <mpi.h>
 
@@ -38,6 +39,7 @@
 
 namespace llaminar2
 {
+    class MoEOverlayActivationBatchInventory;
     class IMPIContext;
 
     /** @brief Physical transport selected for one rank-batched MoE boundary. */
@@ -117,6 +119,19 @@ namespace llaminar2
         int source_world_rank,
         int target_world_rank,
         MoEOverlayCollectiveDirection direction);
+
+    /**
+     * @brief Name one real-rank GPU endpoint group without inventing MPI ranks.
+     * @param tier_index Original routed tier index.
+     * @param domain_ordinal Original expert domain index.
+     * @param original_world_rank Same actual rank owning both endpoint roles.
+     * @param participant_ids Strictly increasing target participant identifiers.
+     * @return Canonical identity consumed by the original channel registry.
+     * @throws std::invalid_argument for absent, duplicate or malformed metadata.
+     */
+    [[nodiscard]] std::string makeMoEOverlayRankLocalGPUChannelIdentity(
+        int tier_index, int domain_ordinal, int original_world_rank,
+        std::span<const int> participant_ids);
 
     /**
      * @brief Model-lifetime wire buffers and codec for one remote rank group.
@@ -360,6 +375,14 @@ namespace llaminar2
     class MoEOverlayRankBatchTransportRegistry final
     {
     public:
+        /** @brief Retain the same selected source declaration before any channel is published.
+         * @param inventory Original selected admission's immutable main/predictor source inventory.
+         * @throws std::logic_error For rebinding or publication after channel construction.
+         */
+        void installActivationBatchInventory(std::shared_ptr<const MoEOverlayActivationBatchInventory> inventory);
+        /** @return Same original declaration, with no reconstruction or native state. */
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activationBatchInventory()const;
+
         /**
          * @brief Install one fully constructed transport under its channel identity.
          * @param channel_identity Canonical value returned by
@@ -387,12 +410,38 @@ namespace llaminar2
             int target_world_rank,
             std::span<const int> participant_ids) const;
 
+        /**
+         * @brief Inspect the original rank-pair channels before any graph/cache creator.
+         * @param source_world_rank Original continuation authority rank.
+         * @param target_world_rank Original auxiliary owner rank.
+         * @param complete_endpoint_ids Complete admitted original auxiliary endpoint set.
+         * @return Uniform native geometry, or absent for the explicit legacy host-ordered policy.
+         * @throws std::logic_error For mixed native declarations, duplicate/foreign/missing native endpoints.
+         */
+        [[nodiscard]] std::optional<MoEOverlayInferenceOriginalSlotGeometry> originalNativeSlotGeometryFor(
+            int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const;
+        /**
+         * @brief Bind the SAME original publisher domain to that complete cold rank-pair projection.
+         * @param domain Actual same original protocol roster; geometry/topology must match every channel.
+         * @param source_world_rank Original continuation authority rank.
+         * @param target_world_rank Original auxiliary owner rank.
+         * @param complete_endpoint_ids Same complete admitted endpoint set inspected above.
+         * @throws std::logic_error For absent/mismatched native declaration or original authority.
+         */
+        void bindOriginalNativeSlotsFor(std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+            int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const;
+
         /** @return Number of immutable channels installed during preflight. */
         [[nodiscard]] std::size_t size() const;
 
     private:
+        struct OriginalNativeProjection;
+        /** @brief Validate only original registry/config metadata while mutex_ is held. */
+        OriginalNativeProjection originalNativeProjectionLocked(int source_world_rank,int target_world_rank,
+            std::span<const int> complete_endpoint_ids) const;
         /** Protects setup publication from concurrent graph construction. */
         mutable std::mutex mutex_;
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory_;
         /** Exact canonical identity to process-local transport lifetime. */
         std::unordered_map<
             std::string,

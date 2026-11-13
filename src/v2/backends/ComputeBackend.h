@@ -57,6 +57,8 @@ namespace llaminar2
         int pcie_gen = 0;          // PCIe generation (3, 4, 5, ...)
         bool degraded = false;     // True if effective < max speed or width
         std::string bottleneck_bdf; // BDF of upstream bridge causing bottleneck (empty if none)
+        /// Original sysfs PCI ancestors, nearest bridge first; absent means unobserved.
+        std::vector<std::string> upstream_bdfs;
 
         double bandwidth_gbps() const // Effective bandwidth in GB/s (per direction)
         {
@@ -230,6 +232,8 @@ namespace llaminar2
         std::string pci_bus_address;
         /// Observed device-wide last-level cache; zero means unavailable, not zero-sized hardware.
         size_t last_level_cache_bytes = 0;
+        /// Driver-native ISA target, including feature suffixes; empty means unobserved.
+        std::string native_isa;
     };
 
     /**

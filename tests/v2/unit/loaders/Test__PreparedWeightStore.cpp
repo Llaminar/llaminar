@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/PreparedDeviceAllocationLedger.h"
@@ -698,8 +699,11 @@ TEST(Test__PreparedWeightStore, ResolvesSlicedGemmKernelByPreparedRef)
     auto binding = makeStoreBinding(13, "blk.0.ffn_down.weight", DeviceId::cpu());
     binding.tensor = tensor.get();
 
-    auto ref = store.registerPreparedForTest(
-        binding, PreparedWeightKind::CpuPackedGemm, DeviceId::cpu());
+    const std::array<const TensorBase *, 1> full{tensor.get()};
+    const std::array<test::CPUPreparedStoreTestSlice, 1> slices{{{tensor.get(), 0, 512}}};
+    test::admitCPUPreparedStoreForTest(store, full, DeviceId::cpu(),
+        PhysicalMemoryOwner::PrimaryModelWeights, slices);
+    auto ref = store.prepareGemm(binding);
 
     auto *first = store.slicedGemmKernel(ref, 0, 512);
     ASSERT_NE(first, nullptr);
@@ -822,4 +826,82 @@ TEST(Test__PreparedWeightStore, RegistrationRejectsRealKernelPrecisionMismatchBe
         EXPECT_TRUE(store.contains(ref));
         EXPECT_TRUE(tensor.hasPreparedDeviceState());
     }
+}
+
+#include "PreparedCPUWeightTensorLifecycle.inc"
+
+/** @test Candidate replacement removes old names/tensors and retains only actual sole store owners. */
+TEST(Test__PreparedWeightStore, IndexedAdoptionReplacementResetAndAliasLifetime)
+{
+    using Factory=llaminar::v2::kernels::KernelFactory;
+    const auto device=DeviceId::cpu();
+    PreparedWeightStore store(ModelContextId{99});
+    auto first=std::make_shared<FP32Tensor>(std::vector<size_t>{8,8});
+    auto replacement=std::make_shared<FP32Tensor>(std::vector<size_t>{8,8});
+    auto query=std::make_shared<FP32Tensor>(std::vector<size_t>{8,8});
+    const auto registerOwner=[&](uint64_t id,const char* name,const auto& tensor){
+        auto b=makeStoreBinding(id,name,device);b.tensor_owner=tensor;b.tensor=tensor.get();
+        auto h=std::make_shared<Factory::PreparedGemmHandle>();h->tensor=b.tensor;h->device_id=device;
+        h->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();
+        std::weak_ptr weak=h;
+        store.registerPreparedGemmHandle(b,PreparedWeightKind::CpuPackedGemm,device,std::move(h));
+        return weak;
+    };
+    const auto request=[&](uint64_t id,const char* name,TensorBase* tensor){
+        auto b=makeStoreBinding(id,name,device);b.tensor=tensor;
+        b.prepared=PreparedWeightRef{ModelContextId{99},id,PreparedWeightKind::CpuPackedGemm,device};return b;
+    };
+    auto old=registerOwner(8001,"old.weight",first);
+    auto live=registerOwner(8001,"new.weight",replacement);
+    EXPECT_TRUE(old.expired());
+    auto staleName=request(8002,"old.weight",query.get());
+    auto staleTensor=request(8003,"unrelated.weight",first.get());
+    EXPECT_FALSE(store.adoptPreparedGemmForBinding(staleName,device));
+    EXPECT_FALSE(store.adoptPreparedGemmForBinding(staleTensor,device));
+    auto byName=request(8004,"new.weight",query.get());
+    ASSERT_TRUE(store.adoptPreparedGemmForBinding(byName,device));
+    auto byTensor=request(8005,"other-name.weight",replacement.get());
+    ASSERT_TRUE(store.adoptPreparedGemmForBinding(byTensor,device));
+    EXPECT_EQ(store.size(),3u);
+    EXPECT_FALSE(live.expired());
+    // A failed replacement cannot erase either original lookup membership.
+    auto invalid=makeStoreBinding(8001,"invalid.weight",device);invalid.tensor=replacement.get();
+    EXPECT_THROW(store.registerPreparedForTest(invalid,PreparedWeightKind::None,device),std::runtime_error);
+    auto afterFailure=request(8006,"new.weight",query.get());
+    EXPECT_TRUE(store.adoptPreparedGemmForBinding(afterFailure,device));
+    store.clear();EXPECT_TRUE(live.expired());
+    auto afterClear=request(8007,"new.weight",query.get());
+    EXPECT_FALSE(store.adoptPreparedGemmForBinding(afterClear,device));
+    auto next=registerOwner(8001,"next.weight",replacement);
+    auto afterReinsert=request(8008,"next.weight",query.get());
+    ASSERT_TRUE(store.adoptPreparedGemmForBinding(afterReinsert,device));
+    store.releaseAllPreparedState();EXPECT_TRUE(next.expired());
+    auto afterRelease=request(8009,"next.weight",query.get());
+    EXPECT_FALSE(store.adoptPreparedGemmForBinding(afterRelease,device));
+}
+
+/** @test A matching bucket is only a candidate; exact kind/device and complete slice/arithmetic still decide adoption. */
+TEST(Test__PreparedWeightStore, IndexedCandidatesKeepKindDeviceAndOriginalIdentity)
+{
+    using Factory=llaminar::v2::kernels::KernelFactory;
+    PreparedWeightStore store(ModelContextId{99});
+    FP32Tensor source(std::vector<size_t>{8,8}),other(std::vector<size_t>{8,8});
+    auto original=makeStoreBinding(8101,"indexed.weight",DeviceId::cpu());original.tensor=&source;
+    auto handle=std::make_shared<Factory::PreparedGemmHandle>();handle->tensor=&source;handle->device_id=DeviceId::cpu();
+    handle->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();
+    store.registerPreparedGemmHandle(original,PreparedWeightKind::CpuPackedGemm,DeviceId::cpu(),std::move(handle));
+    for(unsigned defect=0;defect<6;++defect){
+        auto b=makeStoreBinding(8102+defect,original.identity.canonical_name,DeviceId::cpu());b.tensor=&other;
+        b.prepared=PreparedWeightRef{ModelContextId{99},b.binding_id,PreparedWeightKind::CpuPackedGemm,DeviceId::cpu()};
+        auto device=DeviceId::cpu();
+        if(defect==0)b.prepared->kind=PreparedWeightKind::CudaInt8PackedGemm;
+        if(defect==1)device=DeviceId::cuda(0);
+        if(defect==2)b.floating_operand_precision=FloatingActivationOperandPrecision::FP32;
+        if(defect==3){b.slice.row_start=1;b.slice.row_count=7;}
+        if(defect==4)b.identity.model_id=ModelContextId{100};
+        if(defect==5){b.binding_id=original.binding_id;b.identity.canonical_name="collision.weight";}
+        if(defect>=4)EXPECT_THROW(store.adoptPreparedGemmForBinding(b,device),std::runtime_error);
+        else EXPECT_FALSE(store.adoptPreparedGemmForBinding(b,device));
+    }
+    EXPECT_EQ(store.size(),1u);
 }

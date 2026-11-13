@@ -5,15 +5,21 @@
  * Implements IMoEKernel for CPU execution using ISA-dispatched vector
  * primitives (AVX2/AVX-512). This is the reference implementation;
  * GPU implementations (CUDA/ROCm) can override for device-native execution.
- * Typed half router gates consume half-rounded hidden operands with FP32
- * accumulation, retaining original FP32 hidden/Q8 authority for the experts.
+ * Typed FP16 gates consume half-rounded hidden operands; native BF16 gates
+ * retain FP32 hidden operands and widen weights in registers. Both use fixed
+ * FP32 accumulation and preserve original hidden/Q8 authority for the experts.
+ * Serial workspace publication borrows no competing cache: setup moves its
+ * declared physical backing into the kernel, which keeps that address across
+ * partial and repeated publication until the final owner retires.
  */
 
 #pragma once
 
+#include <optional>
 #include "../../IMoEKernel.h"
 #include "../CPUKernelBase.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/AlignedVector.h"
 
 #include <span>
 #include <vector>
@@ -48,7 +54,7 @@ namespace llaminar2
          * Each row is then finalized by one worker using the same softmax,
          * top-k ordering, summation, and normalization as M=1 decode. The
          * method also publishes canonical Q8_1 hidden rows for the paired
-         * NativeVNNI expert consumer.
+         * NativeQuantised expert consumer.
          *
          * @param hidden Contiguous FP32 hidden rows `[seq_len, d_model]`.
          * @param gate_weights FP32 router matrix `[num_experts, d_model]`.
@@ -75,8 +81,20 @@ namespace llaminar2
          * one backend where @p host_result is a production output rather than
          * an obsolete GPU mirror. A physical FP16 gate selects half-RNE hidden
          * and half weights with fixed FP32 accumulation. Expert Q8 publication
-         * still consumes the original FP32 hidden; the raw float route stays Native. FP16 gate tensors select physical half A/B
-         * with FP32 accumulation; the raw float route() interface stays Native.
+         * still consumes the original FP32 hidden. Native BF16 gates widen
+         * original weight words in registers and retain FP32 hidden operands.
+         * Neither 16-bit path creates an FP32 weight cache.
+         * @param hidden Original FP32 hidden matrix with at least seq_len rows.
+         * @param gate_weights Typed FP32, FP16 or BF16 matrix [num_experts,d_model].
+         * @param seq_len Positive live row count, independent of retained capacity.
+         * @param d_model Common hidden/weight row width.
+         * @param num_experts Number of router output columns.
+         * @param top_k Positive retained expert count no greater than num_experts.
+         * @param normalize_weights Whether selected probabilities sum to one.
+         * @param output_indices FP32 tensor receiving exactly seq_len*top_k IDs.
+         * @param output_weights FP32 tensor receiving matching probabilities.
+         * @param host_result Authoritative CPU route and original-hidden Q8 publication.
+         * @return True after joined routing and publication; false for an invalid contract.
          */
         bool routeWithTensors(
             ITensor *hidden, ITensor *gate_weights,
@@ -86,6 +104,11 @@ namespace llaminar2
             MoERoutingResult &host_result) override;
 
         /** @brief Acquire the current CPU-owned ExpertOverlay placement epoch. */
+        /** @brief Execute the original arena's captured finite parent Arm/Close action. */
+        bool runMoEOverlayEpochParentAction(const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control, DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochParentAction action) override;
+
         bool acquireMoEOverlayEpoch(
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,
@@ -161,7 +184,7 @@ namespace llaminar2
         /**
          * @brief Return the router-owned Q8_1 rows for the next grouped expert pass.
          *
-         * CPU NativeVNNI expert projections consume Q8_1 activations.  Routing
+         * CPU NativeQuantised expert projections consume Q8_1 activations.  Routing
          * and expert execution therefore share one canonical transform instead
          * of quantizing the same hidden row again for every routed expert.  A
          * publication is valid only for the exact FP32 source address, requested
@@ -184,7 +207,7 @@ namespace llaminar2
          * @brief Publish canonical Q8_1 rows received across a host boundary.
          *
          * ExpertOverlay routing may execute on a GPU while a participant-local
-         * NativeVNNI expert executes on CPU. The fixed-capacity ticket carries
+         * NativeQuantised expert executes on CPU. The fixed-capacity ticket carries
          * the authoritative FP32 rows, so the CPU boundary must perform the
          * same one-time canonical transform normally owned by CPU route(). This
          * is an explicit transport adaptation, not a missing-publication
@@ -201,40 +224,79 @@ namespace llaminar2
             int d_model);
 
         /**
-         * @brief Publish transported rows directly in expert-major route order.
+         * @brief Invocation borrow authenticated by original compact routing maps.
          *
-         * A heterogeneous CPU endpoint already knows its stable expert-major
-         * route schedule before it prepares NativeVNNI input. Materializing a
-         * row-major Q8_1 tensor and then gathering those same bytes performs an
-         * avoidable second activation pass. This transport-specific operation
-         * applies the canonical Q8_1 transform directly into caller-owned
-         * expert-major storage. Repeated source indices deliberately produce
-         * repeated byte-identical rows; no quantized value is shared or
-         * arithmetically combined.
+         * Construction consumes the retired expert-to-local permutation as
+         * scratch. The original route map and its inverse prove one destination
+         * for each owned route. Distinct ordered compact source IDs then imply
+         * one representative per source without quadratic duplicate searches.
+         * Borrowed maps must remain immutable until synchronous publication
+         * returns; the stage's serial invocation lease owns that lifetime.
+         */
+        class RouterQ8ExpertMajorSchedule
+        {
+        public:
+            /**
+             * @brief Derive unique representatives from the original route authority.
+             * @param source_rows Authoritative source index for each live destination.
+             * @param retired_expert_to_local Original permutation, overwritten by representatives;
+             *        must not overlap any of the read-only metadata spans.
+             * @param original_to_local Original compact row/top-k slot to local slot, or -1.
+             * @param local_to_expert Inverse local-slot to expert-major destination map.
+             * @param top_k Original positive route width.
+             * @param compact_source_rows Ordered distinct source IDs, or nullopt for identity rows.
+             * @param source_capacity Admitted source extent, never the quantization work count.
+             * @return A validated invocation borrow, or nullopt before any payload write.
+             * @details Work is linear in the live original slots and destinations.
+             */
+            static std::optional<RouterQ8ExpertMajorSchedule> fromOriginalRoutes(
+                std::span<const int> source_rows,
+                std::span<int> retired_expert_to_local,
+                std::span<const int> original_to_local,
+                std::span<const int> local_to_expert,
+                int top_k,
+                std::optional<std::span<const int>> compact_source_rows,
+                int source_capacity);
+        private:
+            friend class CPUMoEKernel;
+            /** @brief Retain only validated const invocation borrows. */
+            RouterQ8ExpertMajorSchedule(std::span<const int> sources,
+                                       std::span<const int> representatives)
+                : source_rows_(sources), representatives_(representatives) {}
+            std::span<const int> source_rows_;
+            std::span<const int> representatives_;
+        };
+
+        /**
+         * @brief Quantize each live source once into its final expert-major owner.
          *
-         * This method revokes any ordinary row-major publication owned by this
-         * kernel. It is not a fallback for a missing CPU router publication;
-         * only a stage with the typed transported-row policy may call it.
+         * Revokes ordinary row-major publication. The first workshare produces
+         * representative rows; its barrier precedes disjoint duplicate copies.
+         * No inactive source-capacity row or unused destination block is read
+         * or written, and no temporary payload/allocation is needed. Inside
+         * an active OpenMP team every member calls this boundary collectively;
+         * tiny publications reuse that team rather than replaying serial stores.
          *
-         * @param source Authoritative contiguous transported FP32 rows.
-         * @param source_rows Number of valid rows in @p source.
-         * @param d_model Logical FP32 values per source row.
-         * @param expert_major_source_rows Source row index for each output row.
-         * @param destination Caller-owned expert-major Q8_1 block storage.
-         * @return True after every selected row is published exactly once.
+         * @param source Authoritative transported FP32 row base.
+         * @param source_rows Admitted source-row capacity, used only for bounds.
+         * @param d_model Logical values per source row.
+         * @param schedule Exact live source and representative destination maps.
+         * @param destination Caller-owned expert-major Q8 block storage.
+         * @return True for a complete publication or empty live schedule; false
+         *         for malformed input before any destination byte is written.
          */
         bool publishTransportedRouterQ8HiddenExpertMajor(
             const float *source,
             int source_rows,
             int d_model,
-            std::span<const int> expert_major_source_rows,
+            RouterQ8ExpertMajorSchedule schedule,
             std::span<Q8_1Block> destination);
 
         /**
-         * @brief Reserve and first-touch transported-router publication storage.
+         * @brief Validate capacity of the setup-bound router publication root.
          *
          * Serial ExpertOverlay graph families know their maximum compact row
-         * geometry during setup. Reserving here prevents the first production
+         * geometry during setup. Checking the frozen root prevents the first production
          * request from changing the CPU kernel's memory topology.
          *
          * @param rows Maximum positive compact row count.
@@ -242,6 +304,22 @@ namespace llaminar2
          * @return True when the complete Q8_1 publication fits the reservation.
          */
         bool reserveRouterQ8HiddenCapacity(int rows, int d_model);
+
+        /**
+         * @brief Install the setup-declared final router publication backing.
+         * @param storage Shared actual admitted backing; graph-local publication metadata stays here.
+         * @note Rebinding the same owner preserves publication; changing owner invalidates it.
+         * @throws std::invalid_argument If no publication capacity is supplied.
+         */
+        void bindRouterQ8HiddenStorage(std::shared_ptr<AlignedVector<Q8_1Block>> storage);
+
+        /** @brief Adopt an already-admitted root without copying its payload. */
+        void bindRouterQ8HiddenStorage(AlignedVector<Q8_1Block> storage)
+        {
+            bindRouterQ8HiddenStorage(
+                std::make_shared<AlignedVector<Q8_1Block>>(std::move(storage)));
+        }
+
 
         // =================================================================
         // ITensorKernel interface
@@ -259,10 +337,11 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Route already prepared FP32 or FP16 gates without a weight cache.
+         * @brief Route prepared FP32, FP16 or BF16 gates without a weight cache.
          * @param hidden Original FP32 rows retained as the expert-Q8 publication source.
          * @param gate_weights Contiguous N-by-K bytes in exactly @p gate_type.
-         * @param gate_type FP32 selects old arithmetic; FP16 selects half A/B + FP32 tree.
+         * @param gate_type FP32 selects native dots; FP16 rounds A to half;
+         *        BF16 widens B with unchanged FP32 A. Both 16-bit paths use a fixed tree.
          * @param seq_len Positive row count; @p d_model and @p num_experts are matrix K/N.
          * @param top_k Unique retained experts per row.
          * @param normalize_weights Normalize the selected original per-row probabilities.
@@ -276,10 +355,10 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
-         * @brief Quantize and publish runtime-M router inputs for NativeVNNI experts.
+         * @brief Quantize and publish runtime-M router inputs for NativeQuantised experts.
          *
          * The implementation deliberately uses the same Q8_1 block primitives
-         * as serial NativeVNNI decode.  Keeping this transform in the router
+         * as serial NativeQuantised decode.  Keeping this transform in the router
          * makes grouped expert execution both economical and byte-equivalent.
          */
         bool publishRouterQ8Hidden(
@@ -308,7 +387,7 @@ namespace llaminar2
             Q8_1Block *destination,
             size_t destination_blocks);
 
-        std::vector<Q8_1Block> router_q8_hidden_; ///< Canonical contiguous verifier rows.
+        std::shared_ptr<AlignedVector<Q8_1Block>> router_q8_hidden_; ///< Actual declared backing; publication metadata remains graph-local.
         const float *router_q8_hidden_source_ = nullptr; ///< FP32 producer identity.
         int router_q8_hidden_rows_ = 0; ///< Number of published rows.
         int router_q8_hidden_d_model_ = 0; ///< Published row width.

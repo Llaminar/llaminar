@@ -28,6 +28,7 @@
  * @see NCCLCoordinator, RCCLCoordinator for coordinator implementations
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 
 #include "collective/backends/NCCLBackend.h"
@@ -948,6 +949,8 @@ TEST_F(Test__RCCLBackendCoordinatorIntegration, AllreduceFailsWithWrongBufferCou
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

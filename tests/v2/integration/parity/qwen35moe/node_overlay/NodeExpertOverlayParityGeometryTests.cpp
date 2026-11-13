@@ -1011,12 +1011,10 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         .cycle_size = 2u,
         .direction = MoEOptimizationMovementDirection::Promotion,
         .axis = MoEOptimizationMovementAxis::TierResidency,
-        .source_participant = 1,
-        .destination_participant = 0,
+        .source = MoEOptimizationMovementEndpoint::whole(1, DeviceId::cpu(), (false) ? std::optional<int>{-1} : std::nullopt),
+        .destination = MoEOptimizationMovementEndpoint::whole(0, DeviceId::cuda(0), (false) ? std::optional<int>{-1} : std::nullopt),
         .source_priority = 1,
         .destination_priority = 0,
-        .source_device = DeviceId::cpu(),
-        .destination_device = DeviceId::cuda(0),
     });
     const MoEOptimizationStatus after_certification{
         .authority = MoEOptimizationAuthority::Host,
@@ -1100,16 +1098,14 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                     ? MoEOptimizationMovementDirection::Promotion
                     : MoEOptimizationMovementDirection::Demotion,
             .axis = MoEOptimizationMovementAxis::TierResidency,
-            .source_participant = cycle_index == 0u ? 1 : 0,
-            .destination_participant = cycle_index == 0u ? 0 : 1,
+            .source = MoEOptimizationMovementEndpoint::whole(cycle_index == 0u ? 1 : 0, cycle_index == 0u
+                                 ? DeviceId::rocm(0)
+                                 : DeviceId::cuda(0), (false) ? std::optional<int>{-1} : std::nullopt),
+            .destination = MoEOptimizationMovementEndpoint::whole(cycle_index == 0u ? 0 : 1, cycle_index == 0u
+                                      ? DeviceId::cuda(0)
+                                      : DeviceId::rocm(0), (false) ? std::optional<int>{-1} : std::nullopt),
             .source_priority = cycle_index == 0u ? 1 : 0,
             .destination_priority = cycle_index == 0u ? 0 : 1,
-            .source_device = cycle_index == 0u
-                                 ? DeviceId::rocm(0)
-                                 : DeviceId::cuda(0),
-            .destination_device = cycle_index == 0u
-                                      ? DeviceId::cuda(0)
-                                      : DeviceId::rocm(0),
         };
     };
 
@@ -1267,15 +1263,13 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             .cycle_size = 2u,
             .direction = direction,
             .axis = axis,
-            .source_participant = 0,
-            .destination_participant = 1,
+            .source = MoEOptimizationMovementEndpoint::whole(0, DeviceId::cpu(), (false) ? std::optional<int>{-1} : std::nullopt),
+            .destination = MoEOptimizationMovementEndpoint::whole(1, DeviceId::cpu(), (false) ? std::optional<int>{-1} : std::nullopt),
             .source_priority =
                 direction == MoEOptimizationMovementDirection::Promotion
                     ? 1
                     : 0,
             .destination_priority = 0,
-            .source_device = DeviceId::cpu(),
-            .destination_device = DeviceId::cpu(),
         };
     };
 

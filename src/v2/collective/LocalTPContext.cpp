@@ -15,6 +15,7 @@
  */
 
 #include "LocalTPContext.h"
+#include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "DeviceCountedAllGather.h"
 #include "AllreducePrecisionPolicy.h"
 #include "NativeReduceScatterContract.h"
@@ -642,6 +643,9 @@ namespace llaminar2
         fp16_scratch_memory_leases_.resize(devices_.size());
         graph_capture_boundary_device_words_.assign(devices_.size(), nullptr);
         graph_capture_boundary_memory_leases_.resize(devices_.size());
+        host_allgather_inputs_.resize(devices_.size());
+        host_allgather_outputs_.resize(devices_.size());
+        host_allgather_seen_.assign(devices_.size(), false);
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
@@ -681,6 +685,7 @@ namespace llaminar2
 
     LocalTPContext::~LocalTPContext()
     {
+        retireOriginalNativeContextBorrows();
         abortBackendAfterGraphOwnersReleased();
         releaseGraphCaptureBoundaryDeviceWords();
         releaseFp16ScratchBuffers();
@@ -707,14 +712,27 @@ namespace llaminar2
 
     void LocalTPContext::requestAbort()
     {
+        std::unique_lock<std::mutex> lock(host_allgather_mutex_);
+        publishAbortWithHostGatherLock(lock);
+    }
+
+    void LocalTPContext::publishAbortWithHostGatherLock(
+        std::unique_lock<std::mutex> &lock)
+    {
+        if (!lock.owns_lock() || lock.mutex() != &host_allgather_mutex_)
+            throw std::logic_error("LocalTP abort publication requires its owning HOST gather lock");
         const bool was_set = abort_requested_.exchange(true, std::memory_order_acq_rel);
+        // Publish and wake under the exact predicate mutex, then consume the
+        // lock before tracing/logging or waking unrelated rendezvous owners.
+        host_allgather_cv_.notify_all();
+        lock.unlock();
         if (was_set)
         {
             LOG_TRACE("[LocalTPContext] Fatal cancellation was already published");
             return;
         }
 
-        LOG_ERROR("[LocalTPContext] Fatal cancellation published; communicator abort is deferred "
+        LOG_ERROR("[LocalTPContext] Fatal cancellation published; communicator destruction is deferred "
                   "until native graph owners are released"
                   << " context_id=" << context_id_
                   << " context=" << static_cast<const void *>(this));
@@ -746,6 +764,25 @@ namespace llaminar2
         barrier_cv_.notify_all();
         grouped_onstream_allreduce_cv_.notify_all();
         graph_capture_boundary_cv_.notify_all();
+
+        // Readiness publishes the original backend and its immutable communicator
+        // handles. Never take a collective/native launch mutex here: a peer may
+        // be inside GROUP launch waiting for the participant that just failed.
+        // This uses only existing absorbing abort words, after releasing the
+        // HOST predicate lock and waking every original host rendezvous.
+        if (backend_initialized_.load(std::memory_order_acquire) && backend_impl_ &&
+            (backend_ == CollectiveBackendType::NCCL || backend_ == CollectiveBackendType::RCCL) &&
+            backend_impl_->isMultiGpuSingleProcess())
+        {
+            bool original_ready = true;
+            for (int participant = 0; participant < degree(); ++participant)
+                original_ready = original_ready && backend_impl_->nativeCompletionAuthority(participant).valid();
+            if (original_ready && !backend_impl_->signalNativeCompletionAbort())
+            {
+                LOG_ERROR("Original native cancellation failed after host admission closed; graph borrowers remain live");
+                std::terminate();
+            }
+        }
     }
 
     void LocalTPContext::abortBackendAfterGraphOwnersReleased() noexcept
@@ -1754,99 +1791,120 @@ namespace llaminar2
     // CPU-Only Barrier-Synchronized Allgather
     // =========================================================================
 
-    bool LocalTPContext::allgatherCpuBarrier(const TensorBase *local_shard, TensorBase *global_tensor)
+    bool LocalTPContext::allgatherHostIndexed(
+        std::span<const std::byte> local_send, std::span<std::byte> full_receive,
+        int participant, const std::string &stage_name)
     {
-        const int num_participants = degree();
-
-        // NOTE: For CPU TP, all tensors have the same generic home_device "CPU"
-        // (no NUMA distinction), so we cannot determine device_index from the tensor.
-        // We use arrival_order for slot assignment. This means shard ordering depends
-        // on thread arrival order, which is non-deterministic.
-        // In practice, this method is currently dead code for LOCAL CPU TP because
-        // RankOrchestrator::gatherLogits() handles LM head vocab gathering
-        // directly at the orchestrator level, bypassing LocalTPContext::allgather().
-        // If this method is ever used in a context where shard ordering matters,
-        // a thread-safe device identification mechanism will be needed.
-
-        std::unique_lock<std::mutex> lock(barrier_mutex_);
-        uint64_t my_generation = barrier_generation_.load();
-        int arrival_order = barrier_count_.fetch_add(1);
-
-        if (arrival_order == 0)
+        const size_t members = devices_.size();
+        // CPU address-space membership is explicit; no physical CPU ordinal or
+        // arrival order may substitute for the caller's logical participant.
+        const bool cpu_members = std::all_of(devices_.begin(), devices_.end(),
+            [](const GlobalDeviceAddress &address) { return address.toLocalDeviceId().is_cpu(); });
+        bool unique_members = true;
+        for (size_t first = 0; first < members; ++first)
+            for (size_t second = 0; second < first; ++second)
+                unique_members = unique_members && devices_[first] != devices_[second];
+        const auto valid_range = [](const void *pointer, size_t bytes) {
+            return bytes == 0 || (pointer && bytes <= std::numeric_limits<uintptr_t>::max() -
+                reinterpret_cast<uintptr_t>(pointer));
+        };
+        if (backend_ != CollectiveBackendType::HOST || !cpu_members || !unique_members || members == 0 ||
+            participant < 0 || static_cast<size_t>(participant) >= members || stage_name.empty() ||
+            local_send.size() > std::numeric_limits<size_t>::max() / members ||
+            full_receive.size() != local_send.size() * members ||
+            !valid_range(local_send.data(), local_send.size()) ||
+            !valid_range(full_receive.data(), full_receive.size()) ||
+            (members > 1 && (!backend_initialized_ || !backend_impl_)))
         {
-            barrier_tensors_.clear();
-            barrier_tensors_.resize(num_participants, nullptr);
-            barrier_element_count_ = local_shard->numel(); // elements per shard
-            barrier_stage_name_ = "allgather_cpu";
-            LOG_DEBUG("LocalTPContext::allgatherCpuBarrier: First arrival, "
-                      << "shard_elements=" << local_shard->numel()
-                      << ", waiting for " << (num_participants - 1) << " more CPU devices");
+            LOG_ERROR("Indexed HOST allgather rejected participant/span/backend geometry stage=" << stage_name);
+            requestAbort();
+            return false;
         }
-
-        // Store the shard using arrival_order (const_cast safe: we only read from it)
-        barrier_tensors_[arrival_order] = const_cast<TensorBase *>(local_shard);
-
-        if (arrival_order + 1 < num_participants)
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+            collective_timeout_policy::effectiveCollectTimeoutMs(debugEnv().tp_collect_timeout_ms));
+        std::unique_lock<std::mutex> lock(host_allgather_mutex_);
+        const auto fail = [&](const char *reason) {
+            const size_t arrivals = host_allgather_arrivals_;
+            publishAbortWithHostGatherLock(lock);
+            LOG_ERROR("Indexed HOST allgather " << reason << " stage=" << stage_name
+                << " participant=" << participant << " arrivals=" << arrivals << "/" << members);
+            return false;
+        };
+        // All previous readers must have left before a fast participant may
+        // reuse its same compact/gathered workspace for the next transaction.
+        if (!host_allgather_cv_.wait_until(lock, deadline, [&] {
+                return !host_allgather_ready_ || abort_requested_.load(std::memory_order_acquire); }))
+            return fail("departure timeout");
+        if (abort_requested_.load(std::memory_order_acquire)) return false;
+        if (host_allgather_arrivals_ == 0)
         {
-            const int barrier_timeout_ms =
-                collective_timeout_policy::effectiveCollectTimeoutMs(
-                    debugEnv().tp_collect_timeout_ms);
-
-            bool completed = barrier_cv_.wait_for(
-                lock,
-                std::chrono::milliseconds(barrier_timeout_ms),
-                [this, my_generation]()
-                                                  { return barrier_generation_.load() > my_generation; });
-
-            if (!completed)
+            host_allgather_bytes_ = local_send.size();
+            host_allgather_stage_ = stage_name;
+        }
+        if (host_allgather_stage_ != stage_name || host_allgather_bytes_ != local_send.size() ||
+            host_allgather_seen_[participant])
+            return fail("duplicate participant or mismatched operation");
+        host_allgather_seen_[participant] = true;
+        host_allgather_inputs_[participant] = local_send;
+        host_allgather_outputs_[participant] = full_receive;
+        ++host_allgather_arrivals_;
+        if (host_allgather_arrivals_ == members)
+        {
+            const auto overlaps = [](const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
+                if (!a_bytes || !b_bytes) return false;
+                const auto left = reinterpret_cast<uintptr_t>(a), right = reinterpret_cast<uintptr_t>(b);
+                return left < right + b_bytes && right < left + a_bytes;
+            };
+            // Validate the whole borrowed set before the first publication.
+            // In-place/aliased receives could overwrite a peer's still-live
+            // send bytes; distinct output owners must remain independent.
+            for (size_t output = 0; output < members; ++output)
             {
-                LOG_ERROR("LocalTPContext::allgatherCpuBarrier: TIMEOUT after "
-                          << barrier_timeout_ms << "ms");
-                barrier_count_.store(0);
-                barrier_generation_.fetch_add(1);
-                barrier_tensors_.clear();
-                barrier_stage_name_.clear();
-                barrier_element_count_ = 0;
-                lock.unlock();
-                barrier_cv_.notify_all();
-                return false;
+                const auto destination = host_allgather_outputs_[output];
+                for (size_t input = 0; input < members; ++input)
+                    if (overlaps(destination.data(), destination.size(),
+                            host_allgather_inputs_[input].data(), host_allgather_inputs_[input].size()))
+                        return fail("input/output alias");
+                for (size_t prior = 0; prior < output; ++prior)
+                    if (overlaps(destination.data(), destination.size(),
+                            host_allgather_outputs_[prior].data(), host_allgather_outputs_[prior].size()))
+                        return fail("output/output alias");
             }
-
-            // After barrier release, the last arrival has already written
-            // the gathered result to its own global_tensor. In typical LOCAL TP
-            // usage, all threads share the same combined_logits_ buffer through
-            // the orchestrator, so no additional copy is needed.
-            return barrier_result_;
+            if (host_allgather_bytes_)
+                for (const auto destination : host_allgather_outputs_)
+                    for (size_t input = 0; input < members; ++input)
+                        std::memcpy(destination.data() + input * host_allgather_bytes_,
+                            host_allgather_inputs_[input].data(), host_allgather_bytes_);
+            host_allgather_ready_ = true;
+            host_allgather_departures_ = members;
+            host_allgather_cv_.notify_all();
         }
-
-        // =================================================================
-        // LAST ARRIVAL: Concatenate all shards
-        // =================================================================
-        size_t shard_elements = barrier_element_count_;
-
-        LOG_DEBUG("LocalTPContext::allgatherCpuBarrier: All " << num_participants
-                                                              << " CPU devices arrived, gathering "
-                                                              << shard_elements << " elements each");
-
-        // Concatenate all shards into global_tensor
-        float *output = global_tensor->mutable_data();
-        for (int i = 0; i < num_participants; ++i)
+        else if (!host_allgather_cv_.wait_until(lock, deadline, [&] {
+                return host_allgather_ready_ || abort_requested_.load(std::memory_order_acquire); }))
+            return fail("arrival timeout");
+        if (abort_requested_.load(std::memory_order_acquire)) return false;
+        if (--host_allgather_departures_ == 0)
         {
-            const float *shard_data = barrier_tensors_[i]->data();
-            std::memcpy(output + (i * shard_elements), shard_data, shard_elements * sizeof(float));
+            host_allgather_arrivals_ = 0;
+            host_allgather_ready_ = false;
+            host_allgather_stage_ = {};
+            std::fill(host_allgather_seen_.begin(), host_allgather_seen_.end(), false);
+            std::fill(host_allgather_inputs_.begin(), host_allgather_inputs_.end(), std::span<const std::byte>{});
+            std::fill(host_allgather_outputs_.begin(), host_allgather_outputs_.end(), std::span<std::byte>{});
+            host_allgather_cv_.notify_all();
         }
-
-        barrier_result_ = true;
-        barrier_tensors_.clear();
-        barrier_stage_name_.clear();
-        barrier_element_count_ = 0;
-        barrier_count_.store(0);
-        barrier_generation_.fetch_add(1);
-
-        LOG_DEBUG("LocalTPContext::allgatherCpuBarrier: CPU allgather completed");
-
         lock.unlock();
-        barrier_cv_.notify_all();
+        if (PerfStatsCollector::isDomainEnabled("tp_host_allgather_runtime"))
+        {
+            const PerfStatsCollector::Tags tags{{"stage", stage_name},
+                {"participant", std::to_string(participant)}, {"degree", std::to_string(members)},
+                {"backend", "HOST"}, {"order", "declared_participant"}, {"extent", "exact_live_bytes"}};
+            PerfStatsCollector::addCounter("tp_host_allgather_runtime", "calls", 1.0, {}, "CPU", tags);
+            PerfStatsCollector::addCounter("tp_host_allgather_runtime", "send_bytes",
+                static_cast<double>(local_send.size()), {}, "CPU", tags);
+            PerfStatsCollector::addCounter("tp_host_allgather_runtime", "receive_bytes",
+                static_cast<double>(full_receive.size()), {}, "CPU", tags);
+        }
         return true;
     }
 
@@ -1882,14 +1940,11 @@ namespace llaminar2
             return true;
         }
 
-        // CPU-only TP: Use barrier-synchronized host-memory allgather
+        // Coarse CPU tensor identity cannot identify NUMA participants. The
+        // indexed host API owns the first-class implementation; never infer
+        // deterministic shard order from arrival or publish only one output.
         if (backend_ == CollectiveBackendType::HOST && degree() > 1)
-        {
-            // Release the main mutex before entering barrier (barrier has its own mutex)
-            // to avoid deadlock: all threads must arrive at barrier, but mutex_ is exclusive.
-            lock.unlock();
-            return allgatherCpuBarrier(local_shard, global_tensor);
-        }
+            throw std::invalid_argument("CPU LocalTP allgather requires allgatherHostIndexed and an exact participant");
 
         /*
          * The streamless allgather backend API cannot expose the producer
@@ -1938,13 +1993,41 @@ namespace llaminar2
      * duplicate arrivals, or timeout so later collectives do not limp onward in a
      * poisoned state.
      */
-    bool LocalTPContext::graphCaptureBoundaryRendezvous(
+    bool LocalTPContext::graphCaptureBoundaryRendezvous(const std::string& name,int index,int timeout)
+    {return graphCaptureBoundaryRendezvousImpl(name,index,timeout,nullptr);}
+    bool LocalTPContext::graphCaptureBoundaryRendezvous(const std::string& name,int index,int timeout,
+        LocalTPCaptureSourceDefinition& definition)
+    {return graphCaptureBoundaryRendezvousImpl(name,index,timeout,&definition);}
+
+    bool LocalTPContext::graphCaptureBoundaryRendezvousImpl(
         const std::string &boundary_name,
         int device_index,
-        int timeout_ms)
+        int timeout_ms, LocalTPCaptureSourceDefinition* definition)
     {
-        if (degree() <= 1)
+        const auto valid_definition=[&]{
+            if(!definition)return true;
+            definition->result.reset();
+            if(device_index<0 || device_index>=degree() || !definition->domain.source.is_gpu() || !definition->domain.authority ||
+               boundary_name.find(":phase=capture_end:")==std::string::npos)return false;
+            const auto source=std::find_if(devices_.begin(),devices_.end(),[&](const auto& device){
+                return device.toLocalDeviceId()==definition->domain.source;});
+            if(source==devices_.end())return false;
+            const auto source_index=static_cast<int>(source-devices_.begin());
+            if(bool(definition->publication)!=(device_index==source_index))return false;
+            if(definition->publication){
+                definition->publication->requireDefinition();
+                if(definition->publication->originalSource().device()!=definition->domain.source ||
+                   definition->publication->definition().domain!=definition->domain)return false;
+            }
             return true;
+        };
+        try{if(!valid_definition()){requestAbort();return false;}}
+        catch(...){requestAbort();return false;}
+        if (degree() <= 1){
+            if(definition && abort_requested_.load(std::memory_order_acquire))return false;
+            if(definition)definition->result=definition->publication;
+            return !definition || bool(definition->result);
+        }
 
         if (device_index < 0 || device_index >= degree())
         {
@@ -1968,6 +2051,9 @@ namespace llaminar2
             graph_capture_boundary_name_.clear();
             graph_capture_boundary_error_.clear();
             graph_capture_boundary_seen_.clear();
+            graph_capture_source_definition_.reset();
+            graph_capture_source_domain_={};
+            graph_capture_source_exchange_=false;
             ++graph_capture_boundary_generation_;
         };
 
@@ -1996,9 +2082,16 @@ namespace llaminar2
 
         auto depart_generation = [&]() -> bool
         {
-            const bool result = graph_capture_boundary_ready_ &&
+            bool result = graph_capture_boundary_ready_ &&
                                 graph_capture_boundary_result_ &&
                                 !abort_requested_.load(std::memory_order_acquire);
+            if(result && definition){
+                try{
+                    if(!graph_capture_source_definition_)throw std::logic_error("Missing original source definition");
+                    graph_capture_source_definition_->requireDefinition();
+                    definition->result=graph_capture_source_definition_;
+                }catch(...){fail_generation("retired source definition boundary="+boundary_name);return false;}
+            }
             ++graph_capture_boundary_departures_;
             if (graph_capture_boundary_departures_ >= degree())
             {
@@ -2022,6 +2115,8 @@ namespace llaminar2
             graph_capture_boundary_name_ = boundary_name;
             graph_capture_boundary_error_.clear();
             graph_capture_boundary_seen_.assign(static_cast<size_t>(degree()), false);
+            graph_capture_source_exchange_=definition!=nullptr;
+            if(definition)graph_capture_source_domain_=definition->domain;
         }
         else if (graph_capture_boundary_name_ != boundary_name)
         {
@@ -2029,6 +2124,15 @@ namespace llaminar2
                             (graph_capture_boundary_name_.empty() ? std::string("(none)") : graph_capture_boundary_name_) +
                             " actual=" + (boundary_name.empty() ? std::string("(none)") : boundary_name));
             return false;
+        }
+
+        if(graph_capture_source_exchange_!=(definition!=nullptr) ||
+           (definition && graph_capture_source_domain_!=definition->domain)){
+            fail_generation("source definition phase/domain mismatch boundary="+boundary_name);return false;
+        }
+        if(definition && definition->publication){
+            if(graph_capture_source_definition_){fail_generation("duplicate original source definition boundary="+boundary_name);return false;}
+            graph_capture_source_definition_=definition->publication;
         }
 
         if (graph_capture_boundary_seen_[static_cast<size_t>(device_index)])
@@ -2105,6 +2209,9 @@ namespace llaminar2
             }
         }
 
+        if(definition && !graph_capture_source_definition_){
+            fail_generation("missing original source definition boundary="+boundary_name);return false;
+        }
         graph_capture_boundary_result_ = true;
         graph_capture_boundary_ready_ = true;
         if (debugEnv().tp_collective_contract_trace)
@@ -2120,19 +2227,27 @@ namespace llaminar2
         return depart_generation();
     }
 
-    bool LocalTPContext::graphCaptureBoundaryOnStream(
+    bool LocalTPContext::graphCaptureBoundaryOnStream(const std::string& name,int index,void* stream,int timeout)
+    {return graphCaptureBoundaryOnStreamImpl(name,index,stream,timeout,nullptr);}
+    bool LocalTPContext::graphCaptureBoundaryOnStream(const std::string& name,int index,void* stream,int timeout,
+        LocalTPCaptureSourceDefinition& definition)
+    {return graphCaptureBoundaryOnStreamImpl(name,index,stream,timeout,&definition);}
+
+    bool LocalTPContext::graphCaptureBoundaryOnStreamImpl(
         const std::string &boundary_name,
         int device_index,
         void *stream,
-        int timeout_ms)
+        int timeout_ms,LocalTPCaptureSourceDefinition* definition)
     {
+        if(definition && (boundary_name.find(":phase=capture_end:")==std::string::npos ||
+            reinterpret_cast<std::uintptr_t>(stream)<=2)){requestAbort();return false;}
         if (!stream)
         {
             throw std::invalid_argument(
                 "LocalTPContext::graphCaptureBoundaryOnStream requires a non-null GPU stream");
         }
         if (degree() <= 1)
-            return true;
+            return definition?graphCaptureBoundaryRendezvousImpl(boundary_name,device_index,timeout_ms,definition):true;
         if (device_index < 0 || device_index >= degree())
         {
             LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: invalid slot "
@@ -2235,10 +2350,10 @@ namespace llaminar2
                 return false;
             }
 
-            if (!graphCaptureBoundaryRendezvous(
+            if (!graphCaptureBoundaryRendezvousImpl(
                     boundary_name + ":ticket_observed",
                     device_index,
-                    timeout_ms))
+                    timeout_ms,definition))
             {
                 return false;
             }
@@ -2329,10 +2444,10 @@ namespace llaminar2
             return false;
         }
 
-        if (!graphCaptureBoundaryRendezvous(
+        if (!graphCaptureBoundaryRendezvousImpl(
                 boundary_name + ":device_fence_enqueued",
                 device_index,
-                timeout_ms))
+                timeout_ms,definition))
         {
             return false;
         }
@@ -3316,6 +3431,79 @@ namespace llaminar2
             send_count,
             dtype,
             isGraphCaptureActive());
+        return true;
+    }
+
+    /** @copydoc ILocalTPContext::signalNativeCompletionAbort */
+    bool LocalTPContext::signalNativeCompletionAbort()
+    {
+        if (!backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess()) return false;
+        // Close future host admissions without destroying native graph borrowers.
+        requestAbort();
+        return backend_impl_->signalNativeCompletionAbort();
+    }
+
+    /** @copydoc ILocalTPContext::nativeCompletionAuthority */
+    NativeCompletionAuthority LocalTPContext::nativeCompletionAuthority(int participant)
+    {
+        if (abort_requested_.load(std::memory_order_acquire) || participant < 0 || participant >= degree() || !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+            throw std::logic_error("Native completion requires the original initialized local communicator participant");
+        auto original = backend_impl_->nativeCompletionAuthority(participant);
+        if (!original.valid())
+            throw std::logic_error("Native library cannot provide original completed-byte authority");
+        return original;
+    }
+
+    /** @copydoc ILocalTPContext::nativeTransferBytesOnStream */
+    bool LocalTPContext::nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes, NativeByteEdge edge, int participant, void* stream,
+        const std::string& stage_name)
+    {
+        if (abort_requested_.load(std::memory_order_acquire) || !payload || reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (!edge.contains(degree(),participant) || !bytes.participantValid(degree(), participant, edge.producer())) ||
+            !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTP addressed bytes rejected its original native operands stage=" << stage_name);
+            return false;
+        }
+        const auto result = backend_impl_->nativeTransferBytesOnStream(payload, bytes, edge, participant, stream);
+        if (!result)
+        {
+            LOG_ERROR("LocalTP addressed bytes failed stage=" << stage_name
+                << " backend_error=" << result.message());
+            requestAbort();
+            return false;
+        }
+        return true;
+    }
+
+    /** @copydoc ILocalTPContext::nativeBroadcastBytesOnStream */
+    bool LocalTPContext::nativeBroadcastBytesOnStream(const void* send, void* receive,
+        const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
+        const std::string& stage_name)
+    {
+        if (abort_requested_.load(std::memory_order_acquire) || !send || !receive || reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !bytes.participantValid(degree(), participant, root) ||
+            !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTP byte Broadcast rejected its original native operands stage=" << stage_name);
+            return false;
+        }
+        const auto result = backend_impl_->nativeBroadcastBytesOnStream(send, receive, bytes, root, participant, stream);
+        if (!result)
+        {
+            LOG_ERROR("LocalTP byte Broadcast failed stage=" << stage_name
+                << " backend_error=" << result.message());
+            requestAbort();
+            return false;
+        }
         return true;
     }
 
@@ -5422,6 +5610,7 @@ namespace llaminar2
         for (std::size_t i = 0; i < devices_.size(); ++i)
             if (fabric->devices()[i] != devices_[i].toLocalDeviceId())
                 throw std::invalid_argument("LocalTP counted fabric membership differs from its communicator");
+        fabric->requireOriginalContext(*this);
         counted_allgather_ = std::move(fabric);
     }
 

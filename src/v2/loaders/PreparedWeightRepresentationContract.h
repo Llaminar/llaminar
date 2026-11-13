@@ -13,6 +13,8 @@
 #pragma once
 
 #include "WeightIdentity.h"
+#include "execution/config/RuntimeConfig.h"
+#include <stdexcept>
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "tensors/TensorType.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
@@ -39,10 +41,71 @@ namespace llaminar2
      * projection matrices retain their native codebooks by default. The explicit
      * source-aware overloads may derive FP32 GDN or half-RNE GDN/router weights
      * before capture; planner and loader consume that identical decision.
+     * Model-owned FP32 scalar/operator roles retain the same storage precision
+     * under every global loading policy without changing activation arithmetic.
      */
     class PreparedWeightRepresentationContract
     {
     public:
+        /**
+         * @brief Resolve the final CPU consumer precision from original source and registered execution intent.
+         * @param role Semantic owner of storage intent, independent of activation arithmetic.
+         * @param original Original scalar/codebook before any conversion.
+         * @param requested Existing global policy; conversions apply to original floating sources.
+         * @param execution Same role/name/architecture representation resolved below.
+         * @param operand Same registered operand intent, including already-correct FP16/FP32 sources.
+         * @return Native for already-correct model operands and unchanged codebooks;
+         *         otherwise the exact authorized scalar conversion.
+         * @throws std::invalid_argument For unknown or inconsistent precision/operand tags.
+         * @note This never selects a second quantized codebook for an existing native source.
+         */
+        [[nodiscard]] static constexpr WeightPrecision resolveCPUWeightPrecision(
+            WeightRole role,TensorType original,WeightPrecision requested,ModelPreparedWeightRepresentation execution,
+            FloatingActivationOperandPrecision operand=FloatingActivationOperandPrecision::Native)
+        {
+            switch(requested) {
+            case WeightPrecision::NATIVE:case WeightPrecision::CONVERT_TO_FP32:
+            case WeightPrecision::CONVERT_TO_FP16:case WeightPrecision::CONVERT_TO_BF16:
+            case WeightPrecision::CONVERT_TO_INT8:break;
+            default:throw std::invalid_argument("Unknown original CPU weight precision policy");
+            }
+            switch(execution) {
+            case ModelPreparedWeightRepresentation::FP16:
+            case ModelPreparedWeightRepresentation::FP32:
+            case ModelPreparedWeightRepresentation::SourceNative:break;
+            default:throw std::invalid_argument("Unknown original CPU execution representation");
+            }
+            // A native FP32 source still carries a storage obligation even
+            // though resolve() requires no conversion. This does not select
+            // FP32 activation arithmetic for a shared-expert gate GEMM.
+            if (isImmutableFP32WeightRole(role) || role == WeightRole::SharedExpertInputGate) {
+                if (execution == ModelPreparedWeightRepresentation::FP16 ||
+                    (operand != FloatingActivationOperandPrecision::Native &&
+                     operand != FloatingActivationOperandPrecision::FP32))
+                    throw std::invalid_argument("CPU FP32 weight storage and execution intent disagree");
+                return original == TensorType::FP32 ? WeightPrecision::NATIVE : WeightPrecision::CONVERT_TO_FP32;
+            }
+            // SourceNative may mean that a registered model operand already
+            // has its required scalar. Preserve that intent instead of letting
+            // an unrelated global conversion override the model's arithmetic.
+            switch(operand) {
+            case FloatingActivationOperandPrecision::FP16RNE:
+                if(execution==ModelPreparedWeightRepresentation::FP32)
+                    throw std::invalid_argument("CPU execution and operand precision disagree");
+                return original==TensorType::FP16?WeightPrecision::NATIVE:WeightPrecision::CONVERT_TO_FP16;
+            case FloatingActivationOperandPrecision::FP32:
+                if(execution==ModelPreparedWeightRepresentation::FP16)
+                    throw std::invalid_argument("CPU execution and operand precision disagree");
+                return original==TensorType::FP32?WeightPrecision::NATIVE:WeightPrecision::CONVERT_TO_FP32;
+            case FloatingActivationOperandPrecision::Native:break;
+            default:throw std::invalid_argument("Unknown original CPU operand precision");
+            }
+            if(execution==ModelPreparedWeightRepresentation::FP16)return WeightPrecision::CONVERT_TO_FP16;
+            if(execution==ModelPreparedWeightRepresentation::FP32)return WeightPrecision::CONVERT_TO_FP32;
+            return original==TensorType::FP32 || original==TensorType::FP16 || original==TensorType::BF16
+                ? requested:WeightPrecision::NATIVE;
+        }
+
         /**
          * @brief Authenticate one projection in the registered Qwen35 GDN schema.
          * @param role Existing semantic source role, never inferred from shape.
@@ -57,7 +120,7 @@ namespace llaminar2
         [[nodiscard]] static constexpr bool isGDNProjectionSource(
             WeightRole role, std::string_view name, std::string_view architecture) noexcept
         {
-            if (architecture != "qwen35" && architecture != "qwen35moe") return false;
+            if (architecture != "qwen35" && architecture != "qwen35moe" && architecture != "qwen4exp") return false;
             if (!name.starts_with("blk.")) return false;
             const auto end = name.find('.', 4);
             if (end == std::string_view::npos || end == 4) return false;
@@ -89,7 +152,7 @@ namespace llaminar2
             if (!isGDNProjectionSource(role, name, architecture))
                 return GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16MoEAlphaBeta)
-                return architecture == "qwen35moe" && role == WeightRole::GDNAlphaBetaProjection ?
+                return (architecture == "qwen35moe" || architecture == "qwen4exp") && role == WeightRole::GDNAlphaBetaProjection ?
                     GDNProjectionArithmetic::FP16 : GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16AlphaBeta)
                 return role == WeightRole::GDNAlphaBetaProjection ?
@@ -110,8 +173,9 @@ namespace llaminar2
         [[nodiscard]] static constexpr ModelPreparedWeightRepresentation resolve(
             WeightRole role, TensorType source_type, std::string_view name,
             std::string_view architecture, GDNProjectionArithmetic arithmetic,
-            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::Native)
+            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
+            router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::NativeHadamard32)
             {
                 // Rotation must precede the FIRST quantization. Dequantizing a
@@ -151,8 +215,9 @@ namespace llaminar2
         [[nodiscard]] static constexpr ModelPreparedWeightRepresentation resolve(
             WeightRole role, std::string_view source_format, std::string_view name,
             std::string_view architecture, GDNProjectionArithmetic arithmetic,
-            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::Native)
+            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
+            router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::NativeHadamard32)
             {
                 // Rotation must precede the FIRST quantization. Dequantizing a
@@ -193,8 +258,9 @@ namespace llaminar2
         [[nodiscard]] static constexpr FloatingActivationOperandPrecision operandPrecision(
             WeightRole role, std::string_view name, std::string_view architecture,
             GDNProjectionArithmetic arithmetic,
-            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::Native) noexcept
+            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
+            router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::FP16)
                 return FloatingActivationOperandPrecision::FP16RNE;
             const auto effective = effectiveGDNArithmetic(role, name, architecture, arithmetic);
@@ -217,7 +283,7 @@ namespace llaminar2
         {
             if (source_type == TensorType::FP32)
                 return ModelPreparedWeightRepresentation::SourceNative;
-            if (role == WeightRole::SharedExpertInputGate)
+            if (isImmutableFP32WeightRole(role) || role == WeightRole::SharedExpertInputGate)
                 return ModelPreparedWeightRepresentation::FP32;
             if (role == WeightRole::GDNAlphaBetaProjection &&
                 source_type == TensorType::Q8_0)
@@ -246,7 +312,7 @@ namespace llaminar2
                 source_format == "F32" || source_format == "FP32";
             if (source_is_fp32)
                 return ModelPreparedWeightRepresentation::SourceNative;
-            if (role == WeightRole::SharedExpertInputGate)
+            if (isImmutableFP32WeightRole(role) || role == WeightRole::SharedExpertInputGate)
                 return ModelPreparedWeightRepresentation::FP32;
             if (role == WeightRole::GDNAlphaBetaProjection &&
                 source_format == "Q8_0")

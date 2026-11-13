@@ -10,13 +10,14 @@
  * Key design:
  * - Each layer is tagged as either KV_CACHE or GDN_STATE
  * - KV cache layers delegate to the existing IKVCache implementation
- * - GDN state layers manage their own recurrence + conv state tensors
+ * - GDN state layers own complete CPU checkpoint/history + conv state tensors
  * - The manager does NOT own the IKVCache; it wraps one provided externally
  */
 
 #pragma once
 
 #include "IHybridCacheManager.h"
+#include "kernels/CPUGDNStateLayout.h"
 
 #include <memory>
 #include <string>
@@ -42,7 +43,7 @@ namespace llaminar2
      * @brief Per-layer GDN state (recurrence + short conv)
      *
      * This is small and persistent across decode steps:
-     * - Recurrence state: [n_heads, head_dim, head_dim] (delta-rule S matrix)
+     * - Recurrence state: complete fixed-epoch CPU checkpoint and raw history
      * - Conv state: [n_heads, conv_kernel-1, head_dim] (causal conv history)
      */
     struct GDNLayerState
@@ -51,7 +52,7 @@ namespace llaminar2
         int head_dim = 0;
         int conv_kernel_size = 0;
 
-        /// Recurrence state S: [n_heads, head_dim, head_dim] (FP32)
+        /// Complete CPUGDNStateLayout bank; snapshots never flush pending history.
         std::vector<float> recurrence_state;
 
         /// Short convolution state: [n_heads, (conv_kernel-1), head_dim] (FP32)
@@ -60,9 +61,7 @@ namespace llaminar2
         /// Initialize (zero-fill) all state
         void initialize()
         {
-            const size_t s_size = static_cast<size_t>(n_heads) *
-                                  static_cast<size_t>(head_dim) *
-                                  static_cast<size_t>(head_dim);
+            const size_t s_size = CPUGDNStateLayout(n_heads,head_dim,head_dim).floats();
             recurrence_state.assign(s_size, 0.0f);
 
             if (conv_kernel_size > 1)

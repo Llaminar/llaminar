@@ -2,12 +2,14 @@
 #include <gtest/gtest.h>
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/WeightShardGeometry.h"
+#include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
+#include "memory/CPUStorageRoot.h"
 #include "planning/ModelMemoryProfile.h"
 #include "loaders/WeightSlicer.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
@@ -22,7 +24,7 @@
  * @file Test__WeightMemoryEstimator.cpp
  * @brief Unit coverage for native, GPU, and CPU weight memory sizing rules.
  *
- * The tests lock planner constants for GGUF block layouts and GPU native-VNNI
+ * The tests lock planner constants for GGUF block layouts and GPU native-quantised
  * packed payload layouts. They intentionally use synthetic profiles so memory
  * planning can be validated without loading multi-gigabyte model files.
  */
@@ -283,15 +285,15 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                     EXPECT_EQ(bytes.native_bytes, down.native_bytes / static_cast<size_t>(degree));
                     if (device.is_gpu())
                     {
-                        if (const auto *native = native_vnni_formats::forQuantType(format.quant_type))
+                        if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                         {
-                            const auto pool = nativeVnniPackedRegionSizes(65, local_k, *native);
+                            const auto pool = nativeQuantisedPackedRegionSizes(65, local_k, *native);
                             const size_t expected = align(pool.payload_bytes) + align(pool.scales_bytes) +
                                 align(pool.mins_bytes) + align(pool.emins_bytes);
                             EXPECT_EQ(bytes.device_bytes, expected) << device.to_string();
                             if (degree == 2)
                             {
-                                const auto truncated = nativeVnniPackedRegionSizes(
+                                const auto truncated = nativeQuantisedPackedRegionSizes(
                                     d.elements() / down.K, down.K, *native);
                                 EXPECT_GT(expected, align(truncated.payload_bytes) + align(truncated.scales_bytes) +
                                     align(truncated.mins_bytes) + align(truncated.emins_bytes));
@@ -302,8 +304,8 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                                 static_cast<size_t>(d.elements() * format.bytes_per_weight));
                     }
                     else
-                        EXPECT_EQ(bytes.device_bytes, static_cast<size_t>(d.elements() *
-                            WeightMemoryEstimator::getCPUPackedBytesPerWeight(format.quant_type)));
+                        EXPECT_EQ(bytes.device_bytes, CPUWeightPreparationMemory::sourceNative(
+                            format.quant_type,d.matrix()->rows,d.matrix()->columns).persistent_bytes);
                 }
             }
         }
@@ -518,9 +520,9 @@ TEST(MoEExpertProjectionOwnership, AllFormatsRetainExactIndependentProjectionGeo
                         size_t expected_bytes = 0;
                         if (instances > 0)
                         {
-                            if (const auto *native = native_vnni_formats::forQuantType(format.quant_type))
+                            if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                             {
-                                const auto packed = nativeVnniPackedRegionSizes(rows * instances, k, *native);
+                                const auto packed = nativeQuantisedPackedRegionSizes(rows * instances, k, *native);
                                 expected_bytes = align(packed.payload_bytes) + align(packed.scales_bytes) +
                                     align(packed.mins_bytes) + align(packed.emins_bytes);
                             }
@@ -688,7 +690,7 @@ TEST(Test__WeightMemoryEstimator, CUDAPackedBytesPerWeight_SmallK)
     EXPECT_LT(bpw, 1.3f);
 }
 
-TEST(Test__WeightMemoryEstimator, GPUPackedBytesPerWeight_UsesNativeVNNIFormat)
+TEST(Test__WeightMemoryEstimator, GPUPackedBytesPerWeight_UsesNativeQuantisedFormat)
 {
     EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q4_0", 4096), 18.0f / 32.0f, 0.001f);
     EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("IQ4_NL", 4096), 18.0f / 32.0f, 0.001f);
@@ -753,7 +755,7 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_CUDAPackedBytesGTNative)
     auto profile = createSimpleProfile();
     auto est = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
 
-    // GPU native-VNNI packed Q8_0 is payload + FP16 scale, matching native Q8_0 size.
+    // GPU native-quantised packed Q8_0 is payload + FP16 scale, matching native Q8_0 size.
     EXPECT_GE(est.device_bytes, est.native_bytes);
 }
 
@@ -1343,12 +1345,27 @@ TEST(Test__WeightMemoryEstimator, PipelineGlobalComponentsAreNotReplicatedByLaye
                 EXPECT_EQ(middle.lm_head_bytes, 0u);
                 EXPECT_EQ(middle.prepared_embedding_bytes, 0u);
                 EXPECT_GT(terminal.lm_head_bytes, 0u);
-                if (!tied || device.is_gpu())
-                    EXPECT_EQ(entry.device_bytes + terminal.device_bytes, full.device_bytes);
-                else
-                    // Distinct CPU stages cannot share the full model's tied source.
+                const auto original_type = tensorTypeFromName(format.quant_type);
+                ASSERT_TRUE(original_type);
+                const bool floating = *original_type == TensorType::FP32 || *original_type == TensorType::FP16 ||
+                    *original_type == TensorType::BF16;
+                if (device.is_cpu() && tied && !floating)
+                {
+                    // Native lookup retains original encoded bytes; output
+                    // execution owns a distinct final VNNI root even in full PP1.
+                    const auto lookup = NativeEmbeddingLayout::forSource(*original_type,256,256);
+                    EXPECT_EQ(entry.prepared_embedding_bytes,
+                        CPUStoragePlacement::local().physicalBytes<uint8_t>(lookup.byte_size));
+                    EXPECT_EQ(terminal.tied_lm_head_bytes,
+                        CPUWeightPreparationMemory::sourceNative(format.quant_type,256,256).persistent_bytes);
+                }
+                if (tied && device.is_cpu() && floating)
+                    // Only floating full-model lookup/output borrow the same
+                    // final raw owner. Separate pipeline stages own two roots.
                     EXPECT_EQ(entry.device_bytes + terminal.device_bytes,
                               full.device_bytes + terminal.tied_lm_head_bytes);
+                else
+                    EXPECT_EQ(entry.device_bytes + terminal.device_bytes, full.device_bytes);
             }
 }
 
@@ -1390,6 +1407,7 @@ TEST(Test__WeightMemoryEstimator, ContinuationResidencyCountsDenseSharedAndExact
             profile.expert_count,
             {2, 4});
 
+    const auto placement = CPUStoragePlacement::local();
     const auto estimate = WeightMemoryEstimator::estimate(
         profile,
         DeviceId::cpu(),
@@ -1397,23 +1415,31 @@ TEST(Test__WeightMemoryEstimator, ContinuationResidencyCountsDenseSharedAndExact
         1,
         0,
         1,
-        residency);
+        residency, {}, WeightComponentScope::EmbeddingAndTerminal, placement);
 
-    size_t expected = 0;
+    size_t expected_native = 0, expected_final = 0;
     for (const auto &tensor : profile.tensors)
     {
         if (!isSyntheticRoutedExpertTensor(tensor.name))
         {
-            expected += tensor.native_bytes;
+            expected_native += tensor.native_bytes;
+            expected_final += placement.physicalBytes<float>(tensor.elements);
             continue;
         }
         const int selected = tensor.layer_index == 0 ? 2 : 4;
-        expected += tensor.native_bytes * static_cast<size_t>(selected) /
-                    static_cast<size_t>(profile.expert_count);
+        expected_native += tensor.native_bytes * static_cast<size_t>(selected) /
+                           static_cast<size_t>(profile.expert_count);
+        // The common writer commits each selected expert separately. Round
+        // that actual matrix root before multiplying its independent owners.
+        expected_final += placement.physicalBytes<float>(
+            tensor.elements / static_cast<size_t>(profile.expert_count)) * static_cast<size_t>(selected);
     }
-    EXPECT_EQ(estimate.native_bytes, expected);
-    EXPECT_EQ(estimate.device_bytes, expected)
-        << "F32 CPU preparation must preserve the exact selected byte count";
+    EXPECT_EQ(estimate.native_bytes, expected_native);
+    EXPECT_EQ(estimate.device_bytes, expected_final);
+    // The two 100×32 vocabulary matrices are 12,800 useful bytes each, but
+    // independently retained local roots have allocator-rounded capacity.
+    // Logical native inventory must never be mistaken for that live footprint.
+    EXPECT_GT(expected_final, expected_native);
     EXPECT_LT(estimate.device_bytes, profile.total_native_bytes);
 }
 
@@ -1466,3 +1492,30 @@ TEST(Test__WeightMemoryEstimator, SelectedResidencyRejectsModelGeometryDrift)
             wrong_denominator),
         std::invalid_argument);
 }
+
+/** @test Native row capacity never changes any participant's ordinary prepared-weight estimate. */
+TEST(Test__WeightMemoryEstimator, NgramTableIsExcludedFromEveryPreparedWeightBackend)
+{
+    auto profile = createSimpleProfile();
+    const auto baseline = profile;
+    TensorSizeInfo table;
+    table.name = "per_layer_token_embd.weight";
+    table.elements = 320001536ull * 160;
+    table.K = 160;
+    table.native_bytes = 320001536ull * 90;
+    table.quant_type = "IQ4_NL";
+    table.layer_index = -1;
+    profile.tensors.insert(profile.tensors.begin(), table);
+    profile.total_native_bytes += table.native_bytes;
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto before = WeightMemoryEstimator::estimate(baseline, device);
+        const auto after = WeightMemoryEstimator::estimate(profile, device);
+        EXPECT_EQ(after.native_bytes, before.native_bytes);
+        EXPECT_EQ(after.device_bytes, before.device_bytes);
+        EXPECT_EQ(after.prepared_embedding_bytes, before.prepared_embedding_bytes);
+        EXPECT_EQ(after.lm_head_bytes, before.lm_head_bytes);
+    }
+}
+
+#include "CPUExactWeightFootprintContract.inc"

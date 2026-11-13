@@ -13,15 +13,21 @@
  * Production setup supplies the authenticated GGUF layer manifest, inventory
  * limits, and the already-resolved fixed graph/KV bytes.  Tests can therefore
  * exhaust every codebook, topology, and failure mode without occupying a GPU.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Joint tensor-sharded tiers retain logical expert quotas while every original
+ * CPU participant is charged its own native source fragment. Source geometry
+ * is immutable metadata; PMA remains the sole physical-byte authority.
  */
 
 #pragma once
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
+#include "MoEExpertShardCohort.h"
 #include "MoEOverlayHostDemandMemoryPlan.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 
 #include <cstddef>
@@ -34,6 +40,10 @@
 
 namespace llaminar2
 {
+    class MoEOverlayActivationBatchInventory;
+    struct MoEOverlayPhysicalLaneDemandPlan;
+
+    struct CPUSerialExpertStorageAdmission;
     /** @brief Whether a tier's live quota is setup-resolved or explicitly fixed. */
     enum class MoEOverlayLiveQuotaMode : std::uint8_t
     {
@@ -48,6 +58,7 @@ namespace llaminar2
         Replicated = 1,  ///< One complete copy on every tier participant.
         /** Movable gate/up owners plus every expert's fixed full-K down slice. */
         GateUpOwnedDownColumns = 2,
+        TensorSharded = 3, ///< Every logical expert jointly owns one exact native F fragment per participant.
     };
 
     /**
@@ -66,6 +77,7 @@ namespace llaminar2
         {
         case MoEOverlayTierCopyPolicy::Apportioned:
         case MoEOverlayTierCopyPolicy::Replicated:
+        case MoEOverlayTierCopyPolicy::TensorSharded:
             return DeviceMoEProjectionSet::CompleteExpert;
         case MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns:
             return DeviceMoEProjectionSet::GateUp;
@@ -205,6 +217,8 @@ namespace llaminar2
         std::vector<int> fixed_live_experts_per_layer;
         std::vector<int> max_live_experts_per_layer;
         std::vector<MoEOverlayTierCapacityParticipant> participants;
+        /** Original source-bound layer cohorts; present only for TensorSharded. */
+        std::vector<std::shared_ptr<const MoEExpertShardCohort>> shard_cohorts;
     };
 
     /** @brief Complete pure input required to resolve one model's live quotas. */
@@ -227,7 +241,7 @@ namespace llaminar2
     /**
      * @brief Exact allocated bytes for one declared movable projection family.
      *
-     * CPU bytes are the final NativeVNNI interleaved representation. GPU live
+     * CPU bytes are the final NativeQuantised interleaved representation. GPU live
      * bytes are the migration-stable separated representation that can remain
      * resident after a CPU round trip. GPU shadow bytes match the deliberately
      * all-format-capable inactive slot allocated by the physical fabric.
@@ -258,6 +272,8 @@ namespace llaminar2
         std::vector<int> live_experts_per_layer;
         /** Participant-major `[participant][layer]` physical live-copy counts. */
         std::vector<std::vector<int>> participant_live_copies;
+        /** Retained immutable source geometry; counts above are fragments for joint tiers. */
+        std::vector<std::shared_ptr<const MoEExpertShardCohort>> shard_cohorts;
     };
 
     /** @brief Auditable memory BOM for one unique physical resource. */
@@ -392,7 +408,15 @@ namespace llaminar2
     /** @brief Immutable capacity result consumed by placement and admission. */
     struct MoEOverlayResolvedCapacityPlan
     {
+        /** Selected original source roster; process-local metadata, never serialized as live authority. */
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory;
+        /** Same source-scoped passive GPU incidence/choice declaration consumed by materialization. */
+        std::shared_ptr<const MoEOverlayPhysicalLaneDemandPlan> physical_gpu_lane_demand;
+        /// CPU declaration identities retained verbatim through setup and model reuse.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         int num_experts = 0;
+        /** Concrete setup decisions for each rank that actually owns PLE. */
+        std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> ngram_table_placements;
         /** Rank-local ingress geometry; reused with retained prepared-weight admission. */
         std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
         /** Bounded native-directory cache grant, carried into retained plans. */
@@ -413,6 +437,45 @@ namespace llaminar2
             const std::string &resource_id) const noexcept;
     };
 
+    class MoEOverlayCapacityAdmission;
+    /**
+     * @brief Frozen higher-priority row/quota result, deliberately not allocatable.
+     *
+     * Row and replica searches retain this value. Only admit() creates the one
+     * final certificate after setup-only table selection has completed. Explicit
+     * fixed-head storage participates in complete-BOM row feasibility without
+     * changing that candidate's expert grants. Automatic table placement remains
+     * below frozen rows and quotas; its failure cannot reopen their search.
+     */
+    class MoEOverlayCapacityDraft final
+    {
+    public:
+        /** @return Complete immutable higher-priority PMA plan, without ngrams. */
+        const PhysicalMemoryPlan &physicalPlan() const noexcept;
+        /** @return Exact number of authored disjoint stages. */
+        std::size_t stageCount() const noexcept;
+        /**
+         * @brief Extend frozen owners and publish one final physical certificate.
+         * @param tables Setup-authenticated actual PLE requests, at most one per rank.
+         * @return Complete stage quota/resource views sharing the same final certificate.
+         * @throws std::invalid_argument For duplicate/foreign source or consumer identity.
+         * @throws std::runtime_error If explicit/Automatic table candidates cannot fit.
+         * @throws std::overflow_error If final canonical owner arithmetic overflows.
+         */
+        std::vector<MoEOverlayResolvedCapacityPlan> admit(
+            std::span<const ImmutableRowTableAdmissionRequest> tables = {}) const;
+    private:
+        friend class MoEOverlayCapacityResolver;
+        friend class MoEOverlayCapacityAdmission;
+        struct Impl;
+        /** @brief Only the quota resolver may seal owned publication metadata. */
+        explicit MoEOverlayCapacityDraft(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
+        /** @brief Attach already-selected replica grants without re-running a quota decision. */
+        MoEOverlayCapacityDraft withReplicaGrants(
+            std::span<const std::optional<MoEOverlayReplicaCacheCapacity>> grants) const;
+        std::shared_ptr<const Impl> impl_;
+    };
+
     /**
      * @brief Resolve exact prepared-weight footprints and priority quotas.
      *
@@ -423,6 +486,15 @@ namespace llaminar2
     class MoEOverlayCapacityResolver final
     {
     public:
+        /**
+         * @brief Freeze exact higher-priority quotas without constructing a final certificate.
+         * @param stages Complete disjoint stage contributions and immutable quota policies.
+         * @return Owned immutable draft whose source input references do not escape this call.
+         * @throws MoEOverlayCapacityExhausted If higher-priority obligations cannot fit.
+         * @throws std::invalid_argument For malformed stage geometry or ownership.
+         */
+        static MoEOverlayCapacityDraft resolvePipelineDraft(
+            std::span<const MoEOverlayCapacityResolverInput> stages);
         /**
          * @brief Build one complete immutable capacity plan.
          * @param input Authenticated model manifest, physical BOM, and tiers.

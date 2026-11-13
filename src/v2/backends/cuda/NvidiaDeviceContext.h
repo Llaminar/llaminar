@@ -12,8 +12,11 @@
  */
 
 #pragma once
+#include "backends/NativeAuxiliaryStreamOwnership.h"
 
+#include "backends/PreparedGPUWorkerThread.h"
 #include "../IWorkerGPUContext.h"
+#include "../GPUDeviceProcessLifetime.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -29,6 +32,7 @@
 
 namespace llaminar2
 {
+    namespace test { struct NativeContextSourceLifecycleDiagnosticAccess; }
 
     /**
      * @class NvidiaDeviceContext
@@ -61,7 +65,7 @@ namespace llaminar2
      * - Stream/event/handle accessors must only be called from within submitted work
      * - deviceOrdinal(), deviceName(), isInitialized() are thread-safe (read-only)
      */
-    class NvidiaDeviceContext : public IWorkerGPUContext
+    class NvidiaDeviceContext : public IWorkerGPUContext, private GPUProjectionResourceOperations
     {
     public:
         /**
@@ -112,12 +116,31 @@ namespace llaminar2
         void *createStream() override;
         void destroyStream(void *stream) override;
         void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) override;
+        /** @copydoc IWorkerGPUContext::prepareBatchCaptureDependencies */
+        std::shared_ptr<GPUCaptureDependencyRoster> prepareBatchCaptureDependencies(
+            std::size_t,std::size_t,const PreparedGPUContextUsePermit&) override;
+        /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+        void *getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+            const PreparedGPUContextUsePermit &original,bool *created = nullptr) override;
+        /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream(const std::string &,GPUAuxiliaryStreamSchedulingClass,const PreparedGPUContextUsePermit &,bool *) */
+        void *getOrCreateAdmittedAuxiliaryStream(const std::string &name,GPUAuxiliaryStreamSchedulingClass scheduling_class,
+            const PreparedGPUContextUsePermit &original,bool *created = nullptr) override;
         /** @copydoc IWorkerGPUContext::getOrCreateAuxiliaryStream(const std::string &, GPUAuxiliaryStreamSchedulingClass, bool *) */
         void *getOrCreateAuxiliaryStream(
             const std::string &name,
             GPUAuxiliaryStreamSchedulingClass scheduling_class,
             bool *created = nullptr) override;
         void resetAuxiliaryStreams() override;
+        /** @copydoc IWorkerGPUContext::prepareProjectionResources */
+        void prepareProjectionResources() override;
+        /** @copydoc IWorkerGPUContext::acquireProjectionSubmission */
+        [[nodiscard]] GPUProjectionSubmission acquireProjectionSubmission(
+            void *root, GPUProjectionSubmissionKind kind, bool native_capturing = false) override;
+        /** @copydoc IWorkerGPUContext::assertProjectionResourcesRetirable */
+        void assertProjectionResourcesRetirable() override;
+        /** @copydoc IWorkerGPUContext::beginProjectionResourcesRetirement */
+        void beginProjectionResourcesRetirement() override;
+
 
         // =========================================================================
         // IWorkerGPUContext Interface - Event Access (worker-thread-only)
@@ -172,6 +195,15 @@ namespace llaminar2
         bool debugSynchronize() override;
 
     private:
+        friend struct test::NativeContextSourceLifecycleDiagnosticAccess;
+        friend class PreparedGPUContextFactory;
+        /** @brief Original constructor body with an exact source-admitted worker stack. */
+        NvidiaDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> stack);
+
+        /** Declared first so native admission retires last, after worker cleanup and all resource members. */
+        GPUDeviceProcessLifetime::NativeContextLease process_lifetime_lease_;
+        /** Source-birth program policy, immutable before worker publication; ordinary workers retain zero. */
+        const std::size_t source_native_program_stack_bytes_;
         // =========================================================================
         // Worker Thread Management
         // =========================================================================
@@ -218,14 +250,30 @@ namespace llaminar2
         // GPU State (owned by worker thread)
         // =========================================================================
 
+        /** Exact context-owned resources; opaque storage remains PMA-admitted. */
+        GPUProjectionResources projection_resources_{this, GPUProjectionStreamCount::Eight};
+        /** @copydoc GPUProjectionResourceOperations::createProjectionStream */
+        void *createProjectionStream() override;
+        /** @copydoc GPUProjectionResourceOperations::createProjectionEvent */
+        void *createProjectionEvent() override;
+        /** @copydoc GPUProjectionResourceOperations::destroyProjectionStream */
+        bool destroyProjectionStream(void *stream) noexcept override;
+        /** @copydoc GPUProjectionResourceOperations::destroyProjectionEvent */
+        bool destroyProjectionEvent(void *event) noexcept override;
         cudaStream_t default_stream_ = nullptr;
-        std::unordered_map<std::string, cudaStream_t> auxiliary_streams_;
+        /** @brief Actual native handle and its original commitment share one owner record. */
+        struct AuxiliaryStreamRecord {
+            cudaStream_t stream=nullptr;
+            std::unique_ptr<NativeAuxiliaryStreamOwnership> ownership;
+        };
+        std::unordered_map<std::string, AuxiliaryStreamRecord> auxiliary_streams_;
         /** Immutable scheduling class paired with every named stream. */
         std::unordered_map<
             std::string,
             GPUAuxiliaryStreamSchedulingClass>
             auxiliary_stream_scheduling_classes_;
         std::mutex auxiliary_streams_mutex_;
+        std::shared_ptr<GPUCaptureDependencyRoster> batch_capture_dependencies_; ///< Actual internal construction edges only.
 
         /**
          * @brief Number of independently leasable inter-stream handoff events.
@@ -257,7 +305,7 @@ namespace llaminar2
         // Worker Thread
         // =========================================================================
 
-        std::thread worker_thread_;
+        PreparedGPUWorkerThread worker_thread_;
         /// Immutable identity published before the context reports initialized.
         std::thread::id worker_thread_id_{};
         std::atomic<bool> running_{false};

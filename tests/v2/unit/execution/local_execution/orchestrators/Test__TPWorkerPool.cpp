@@ -21,6 +21,17 @@
 
 namespace llaminar2::test
 {
+    /** @brief Observe only the existing mutex-owned callback/collector frontier; grants no execution authority. */
+    struct TPWorkerPoolCallbackLifecycleAccess {
+        static bool retiring(TPWorkerPool& pool) {
+            std::lock_guard lock(pool.mutex_);return pool.active_collectors_ != 0;
+        }
+        static bool failurePublishedWithResult(TPWorkerPool& pool) {
+            std::lock_guard lock(pool.mutex_);
+            return pool.failure_callback_generation_ == pool.collected_generation_;
+        }
+    };
+
     namespace
     {
         using namespace std::chrono_literals;
@@ -43,6 +54,124 @@ namespace llaminar2::test
             }
         }
     } // namespace
+
+    namespace
+    {
+        /** @return Actual native mask, independent of the production scope. */
+        cpu_set_t observedWorkerMask()
+        {
+            cpu_set_t result;
+            CPU_ZERO(&result);
+            if (sched_getaffinity(0, sizeof(result), &result) != 0)
+                throw std::runtime_error("Cannot observe worker affinity");
+            return result;
+        }
+
+        /** @return Initial rank's admitted places, independently enumerated for this test. */
+        cpu_set_t expectedWorkerPartition()
+        {
+            if (omp_get_proc_bind() == omp_proc_bind_false) return observedWorkerMask();
+            cpu_set_t result;
+            CPU_ZERO(&result);
+            // Registered bound tests start at the initial host level, where
+            // all runtime places form the original participant partition.
+            for (int place = 0; place < omp_get_num_places(); ++place)
+            {
+                std::vector<int> cpus(static_cast<size_t>(omp_get_place_num_procs(place)));
+                omp_get_place_proc_ids(place, cpus.data());
+                for (const int cpu : cpus) CPU_SET(cpu, &result);
+            }
+            return result;
+        }
+    }
+
+    TEST(TPWorkerAffinity, IntentUsesActualDevicesAndPreservesComputeScopes)
+    {
+        using Intent = TPWorkerHostPlacement;
+        using Scope = TPWorkerHostScope;
+        const std::array cuda{DeviceId::cuda(0), DeviceId::cuda(1)};
+        const std::array rocm{DeviceId::rocm(0), DeviceId::rocm(3)};
+        const std::array cpu{DeviceId::cpu(), DeviceId::cpu()};
+        const std::array mixed{DeviceId::rocm(0), DeviceId::cpu()};
+        const std::array vendors{DeviceId::rocm(0), DeviceId::cuda(0)};
+        EXPECT_EQ(tpWorkerHostPlacement(cuda, Scope::FlatRank), Intent::IndependentGPUControl);
+        EXPECT_EQ(tpWorkerHostPlacement(rocm, Scope::FlatRank), Intent::IndependentGPUControl);
+        EXPECT_EQ(tpWorkerHostPlacement(cpu, Scope::FlatRank), Intent::InheritedCompute);
+        EXPECT_EQ(tpWorkerHostPlacement(mixed, Scope::FlatRank), Intent::InheritedCompute);
+        EXPECT_EQ(tpWorkerHostPlacement(vendors, Scope::FlatRank), Intent::InheritedCompute);
+        EXPECT_EQ(tpWorkerHostPlacement(rocm, Scope::PipelineOrComposed), Intent::InheritedCompute);
+        EXPECT_THROW(tpWorkerHostPlacement(cuda, static_cast<Scope>(99)), std::invalid_argument);
+        EXPECT_THROW(tpWorkerHostPlacement({}, Scope::FlatRank), std::invalid_argument);
+        const std::array invalid{DeviceId::invalid()};
+        EXPECT_THROW(tpWorkerHostPlacement(invalid, Scope::FlatRank), std::invalid_argument);
+    }
+
+    TEST(TPWorkerAffinity, ActualParticipantsAndAbortWorkerRetainPartitionWhileParentRestores)
+    {
+        const auto parent = observedWorkerMask();
+        const auto partition = expectedWorkerPartition();
+        const int team = omp_get_max_threads();
+        // Callback observation owners outlive the pool's actual worker join,
+        // including an early assertion return before callback completion.
+        std::promise<cpu_set_t> abort_worker;
+        auto observed_abort = abort_worker.get_future();
+        TPWorkerPool pool(2, TPWorkerHostPlacement::IndependentGPUControl);
+        const auto after_construction = observedWorkerMask();
+        EXPECT_TRUE(CPU_EQUAL(&parent, &after_construction));
+        for (int generation = 0; generation < 3; ++generation)
+        {
+            pool.dispatch([&](size_t) {
+                const auto actual = observedWorkerMask();
+                return CPU_EQUAL(&actual, &partition);
+            });
+            expectSuccessfulGeneration(pool.collectAll(2000));
+        }
+        pool.setFailureCallback([&] { abort_worker.set_value(observedWorkerMask()); });
+        pool.dispatch([](size_t index) { return index != 0; });
+        const auto failed = pool.collectAll(2000);
+        ASSERT_EQ(failed.size(), 2u);
+        EXPECT_TRUE(failed[0].completed);
+        EXPECT_FALSE(failed[0].success);
+        ASSERT_EQ(observed_abort.wait_for(2s), std::future_status::ready);
+        const auto callback_mask = observed_abort.get();
+        EXPECT_TRUE(CPU_EQUAL(&callback_mask, &partition));
+        const auto after = observedWorkerMask();
+        EXPECT_TRUE(CPU_EQUAL(&parent, &after));
+        EXPECT_EQ(omp_get_max_threads(), team);
+    }
+
+    TEST(TPWorkerAffinity, InheritedComputeAndScopeUnwindPreserveExactCallerMask)
+    {
+        const auto parent = observedWorkerMask();
+        TPWorkerPool pool(2, TPWorkerHostPlacement::InheritedCompute);
+        pool.dispatch([&](size_t) {
+            const auto actual = observedWorkerMask();
+            return CPU_EQUAL(&actual, &parent);
+        });
+        expectSuccessfulGeneration(pool.collectAll(2000));
+        EXPECT_THROW(([] {
+            const ScopedOpenMPPartitionAffinity scope;
+            throw std::runtime_error("controlled construction unwind");
+        }()), std::runtime_error);
+        const auto after = observedWorkerMask();
+        EXPECT_TRUE(CPU_EQUAL(&parent, &after));
+        EXPECT_THROW(TPWorkerPool(2, static_cast<TPWorkerHostPlacement>(99)), std::invalid_argument);
+    }
+
+    TEST(TPWorkerAffinity, ScopeRejectsActiveComputeBeforeChangingItsPlace)
+    {
+        bool rejected = false, preserved = false;
+#pragma omp parallel num_threads(1)
+        {
+            const auto original = observedWorkerMask();
+            try { const ScopedOpenMPPartitionAffinity scope; }
+            catch (const std::runtime_error &) { rejected = true; }
+            const auto after = observedWorkerMask();
+            preserved = CPU_EQUAL(&original, &after);
+        }
+        EXPECT_TRUE(rejected);
+        EXPECT_TRUE(preserved);
+    }
 
     /**
      * @brief A terminal worker completion wakes every observer of its generation.
@@ -207,3 +336,64 @@ namespace llaminar2::test
     }
 
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Participant completion cannot retire a still-running source callback or its delayed captured destructor. */
+TEST(Test__TPWorkerPool, CollectedFailureCallbackRetiresOriginalCaptureBeforeReplacement)
+{
+    TPWorkerPool pool(2);
+    std::promise<void> entered,release_callback,destruction_started,release_destruction;
+    auto entered_future=entered.get_future();auto callback_gate=release_callback.get_future().share();
+    auto destruction_future=destruction_started.get_future();auto destruction_gate=release_destruction.get_future().share();
+    std::atomic<bool> destroyed{false};std::atomic<unsigned> ordinary_aborts{0};
+    struct OriginalCapture {
+        std::promise<void>& entered;std::shared_future<void> release;std::atomic<bool>& destroyed;
+        OriginalCapture(std::promise<void>& entered,std::shared_future<void> release,std::atomic<bool>& destroyed)
+            :entered(entered),release(std::move(release)),destroyed(destroyed) {}
+        ~OriginalCapture(){entered.set_value();release.wait();destroyed.store(true,std::memory_order_release);}
+    };
+    auto original=std::make_shared<OriginalCapture>(destruction_started,destruction_gate,destroyed);
+    const std::weak_ptr<OriginalCapture> lifetime=original;
+    pool.setFailureCallback([original,&entered,callback_gate]{entered.set_value();callback_gate.wait();});
+    original.reset();
+    std::future<void> retired;bool callback_released=false,destruction_released=false;
+    struct Cleanup {
+        std::promise<void>& callback;std::promise<void>& destruction;bool& callback_released;bool& destruction_released;std::future<void>& retired;
+        ~Cleanup(){if(!callback_released)callback.set_value();if(!destruction_released)destruction.set_value();if(retired.valid())retired.wait();}
+    } cleanup{release_callback,release_destruction,callback_released,destruction_released,retired};
+    pool.dispatch([](std::size_t participant){return participant != 0;});
+    const auto results=pool.collectAll();ASSERT_EQ(results.size(),2u);
+    EXPECT_TRUE(TPWorkerPoolCallbackLifecycleAccess::failurePublishedWithResult(pool));
+    entered_future.get(); // Real callback is active even though original participant results are already collected.
+    retired=std::async(std::launch::async,[&]{pool.retireFailureCallback([&]{ordinary_aborts.fetch_add(1);});});
+    while (!TPWorkerPoolCallbackLifecycleAccess::retiring(pool) &&
+        retired.wait_for(std::chrono::seconds(0)) != std::future_status::ready) std::this_thread::yield();
+    ASSERT_TRUE(TPWorkerPoolCallbackLifecycleAccess::retiring(pool));
+    EXPECT_EQ(retired.wait_for(std::chrono::seconds(0)),std::future_status::timeout);
+    EXPECT_THROW(pool.dispatch([](std::size_t){return true;}),std::logic_error);
+    EXPECT_FALSE(lifetime.expired());
+    release_callback.set_value();callback_released=true;
+    destruction_future.get(); // Last source capture is destroying, not merely removed from the mutable slot.
+    EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+    EXPECT_EQ(retired.wait_for(std::chrono::seconds(0)),std::future_status::timeout);
+    release_destruction.set_value();destruction_released=true;retired.get();
+    EXPECT_TRUE(destroyed.load(std::memory_order_acquire));EXPECT_TRUE(lifetime.expired());
+    pool.dispatch([](std::size_t){return false;});(void)pool.collectAll();
+    pool.retireFailureCallback([&]{ordinary_aborts.fetch_add(1);});
+    EXPECT_EQ(ordinary_aborts.load(),1u); // Ordinary TP abort remains installed after source-specific withdrawal.
+}
+/** @test Every collected failure generation owns its callback before replacement; stale source captures cannot cross rearm. */
+TEST(Test__TPWorkerPool, CallbackRetirementFencesEveryCollectedFailureGeneration)
+{
+    TPWorkerPool pool(2);std::atomic<unsigned> original_calls{0},ordinary_calls{0};
+    for (unsigned generation=0;generation<20;++generation) {
+        pool.setFailureCallback([&]{original_calls.fetch_add(1,std::memory_order_release);});
+        pool.dispatch([](std::size_t participant){return participant != 0;});
+        (void)pool.collectAll();
+        EXPECT_TRUE(TPWorkerPoolCallbackLifecycleAccess::failurePublishedWithResult(pool));
+        pool.retireFailureCallback([&]{ordinary_calls.fetch_add(1,std::memory_order_release);});
+        EXPECT_EQ(original_calls.load(std::memory_order_acquire),generation+1u);
+        EXPECT_EQ(ordinary_calls.load(std::memory_order_acquire),0u);
+    }
+}
+}

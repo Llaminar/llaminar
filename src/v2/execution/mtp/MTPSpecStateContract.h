@@ -108,7 +108,9 @@ namespace llaminar2
          * sidecars restore that speculative row away, then explicitly publish
          * the same row from the verifier-base terminal hidden before this plan
          * reaches the KV publisher. In both cases, true means publication may
-         * use the ordinary shifted target `target_cached_tokens - (depth + 1)`.
+         * use the target projected by the cache's immutable model origin:
+         * ordinary `max(0,target_cached_tokens-depth-1)`, QFN depth0 the exact
+         * primary target including the visible token-zero seed.
          */
         bool reuse_initial_mtp_shifted_kv_row = true;
 

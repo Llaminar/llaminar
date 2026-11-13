@@ -19,6 +19,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include "memory/BufferArena.h"
+#include "transfer/TransferEngine.h"
 #include "tensors/Tensors.h"
 
 #ifdef HAVE_ROCM
@@ -27,6 +28,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <exception>
+#include <stdexcept>
+#include <utility>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -35,6 +41,41 @@ using namespace llaminar2;
 namespace
 {
 #ifdef HAVE_ROCM
+    /**
+     * @brief Close the original raw native capture before propagating any body exception.
+     * @param stream Exact fixture-owned nondefault capture stream.
+     * @param graph Original native graph output; no extra graph/event is created.
+     * @param body Actual stage recording, including unchanged fatal assertions.
+     */
+    template<class Body>
+    void recordGraphOnStream(hipStream_t stream, hipGraph_t *graph, Body &&body)
+    {
+        GraphCaptureGuard capture;
+        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+        std::exception_ptr primary;
+        try
+        {
+            std::forward<Body>(body)();
+        }
+        catch (...)
+        {
+            primary = std::current_exception();
+        }
+        const auto ended = hipStreamEndCapture(stream, graph);
+        if (primary || ::testing::Test::HasFatalFailure())
+        {
+            if (*graph)
+            {
+                EXPECT_EQ(hipGraphDestroy(*graph), hipSuccess);
+                *graph = nullptr;
+            }
+            if (primary)
+                std::rethrow_exception(primary);
+            return;
+        }
+        ASSERT_EQ(ended, hipSuccess);
+    }
+
     /**
      * @brief Simulate a preceding library stage that temporarily binds another GPU.
      *
@@ -97,6 +138,9 @@ namespace
             }
         }
         hidden->ensureOnDevice(device, stream);
+        // Direct fixtures own the same cold input frontier as the executor.
+        // An upload's event must be joined before capture even on the same stream.
+        TransferEngine::requireDeviceInput(hidden.get(), device, stream);
         return hidden;
     }
 
@@ -263,12 +307,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
 
@@ -340,14 +381,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedFixedDeviceRowUsesDeviceOnlyCo
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-            hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(
         hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
@@ -441,18 +477,30 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedCheckpointReadsResidentPrefill
         stage.graphLaunchPreparationPolicy(),
         GraphLaunchPreparationPolicy::None);
 
+    // A failed recording must close its native scope before stack-owned
+    // tensor cleanup. Preserve the primary exception rather than a later free.
+    hipGraph_t rejected_graph = nullptr;
+    try
+    {
+        recordGraphOnStream(stream, &rejected_graph, [] {
+            throw std::runtime_error("original row checkpoint recording failure");
+        });
+        ADD_FAILURE() << "Recording exception was lost";
+    }
+    catch (const std::runtime_error &error)
+    {
+        EXPECT_STREQ(error.what(), "original row checkpoint recording failure");
+    }
+    EXPECT_EQ(rejected_graph, nullptr);
+    hipStreamCaptureStatus capture_status;
+    ASSERT_EQ(hipStreamIsCapturing(stream, &capture_status), hipSuccess);
+    ASSERT_EQ(capture_status, hipStreamCaptureStatusNone);
+
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(
-            hipStreamBeginCapture(
-                stream,
-                hipStreamCaptureModeGlobal),
-            hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(
         hipGraphInstantiate(
@@ -698,12 +746,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
 
@@ -778,14 +823,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedFixedContiguousRowsAreByteExac
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-            hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(
         hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
@@ -875,12 +915,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
 
@@ -993,14 +1030,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-            hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(
         hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
@@ -1061,20 +1093,23 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
         GTEST_SKIP() << "No ROCm device available";
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
 
+    for(const auto origin:{MTPShiftedCacheOrigin::SuccessorPairsOnly,MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero})
+    for(const int d_model:{32,10240}) {
+    SCOPED_TRACE(static_cast<int>(origin));
+    SCOPED_TRACE(d_model);
     const DeviceId device = DeviceId::rocm(0);
     constexpr int seq_capacity = 24;
-    constexpr int d_model = 32;
     constexpr int request_index = 1;
     constexpr int selected_row_count = 3;
     const int32_t initial_stride = 10;
     const std::vector<int32_t> initial_lengths{7, 8};
     const int32_t initial_main_count = 20;
-    const int32_t initial_shifted_count = 14;
+    const int32_t initial_shifted_count = 14+(origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero?1:0);
     const std::vector<int> initial_rows{12, 13, 14};
     const int32_t replay_stride = 8;
     const std::vector<int32_t> replay_lengths{5, 6};
     const int32_t replay_main_count = 31;
-    const int32_t replay_shifted_count = 28;
+    const int32_t replay_shifted_count = 28+(origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero?1:0);
     const std::vector<int> replay_rows{11, 12, 13};
 
     hipStream_t stream = nullptr;
@@ -1149,6 +1184,7 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
 
     HiddenStateRowsSelectStage::Params params;
     params.device_id = device;
+    params.shifted_cache_origin=origin;
     params.input = hidden.get();
     params.output = scratch.get();
     params.seq_len = seq_capacity;
@@ -1184,14 +1220,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-            hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(
         hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
@@ -1231,6 +1262,7 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
     EXPECT_EQ(hipFree(main_count_device), hipSuccess);
     EXPECT_EQ(hipFree(shifted_count_device), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    }
 #endif
 }
 
@@ -1278,6 +1310,7 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
         -1.0f);
     ASSERT_TRUE(packed->allocateOnDevice(device, stream));
     ASSERT_TRUE(archive->ensureOnDevice(device, stream));
+    TransferEngine::requireDeviceInput(archive.get(), device, stream);
 
     int32_t *input_tokens = nullptr;
     int32_t *input_positions = nullptr;
@@ -1358,13 +1391,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    {
-        GraphCaptureGuard guard;
-        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-                  hipSuccess);
+    ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
         ASSERT_TRUE(stage.execute(nullptr));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-    }
+    }));
     ASSERT_NE(graph, nullptr);
     size_t graph_node_count = 0;
     ASSERT_EQ(
@@ -1491,5 +1520,204 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
     EXPECT_EQ(hipFree(main_count), hipSuccess);
     EXPECT_EQ(hipFree(shifted_count), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+
+/** @test Retained copies preserve absent rows, physical padding and scalar request-zero authority. */
+TEST(Test__ROCmHiddenStateRowSelectStage, CapturedPublicationSentinelStridesAndResetAreByteExact)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    hipStream_t stream = nullptr;
+    hipStream_t prior_producer = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    ASSERT_EQ(hipStreamCreate(&prior_producer), hipSuccess);
+    const auto device = DeviceId::rocm(0);
+    for (int width : {11, 6, 5, 248320, 82773})
+    {
+        constexpr int source_rows = 8;
+        constexpr int output_rows = 3;
+        const int source_stride = width + 4;
+        const int destination_stride = width + 7;
+        auto input = makeHiddenStates(source_rows, source_stride, device, stream);
+        FP32Tensor output({output_rows, static_cast<size_t>(destination_stride)}, DeviceId::cpu());
+        ASSERT_TRUE(output.allocateOnDevice(device, stream));
+        std::vector<float> expected(output_rows * destination_stride, -777.0f);
+        std::vector<float> actual(expected.size());
+        constexpr const char *key = "publication_original_device_rows";
+        WorkspaceRequirements requirements;
+        requirements.buffers.push_back({key, output_rows * sizeof(int), alignof(int), true});
+        DeviceWorkspaceManager workspace(device, 1024);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        auto *rows = static_cast<int *>(workspace.getBuffer(key));
+        ASSERT_NE(rows, nullptr);
+        HiddenStateRowsSelectStage::Params params;
+        params.device_id = device;
+        params.input = input.get();
+        params.output = &output;
+        params.seq_len = source_rows;
+        params.d_model = width;
+        params.selected_row_count = output_rows;
+        params.selected_row_indices = {0, 1, 2};
+        params.device_row_index_source = HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
+        params.external_device_row_indices = rows;
+        params.row_copy_policy = {
+            NegativeRowSelectionPolicy::PreserveDestination, source_stride, destination_stride};
+        if (width == 11)
+        {
+            auto ambiguous = params.row_copy_policy;
+            ambiguous.fixed_first_row = 0;
+            EXPECT_FALSE(rocm::launchRowsSelectFP32(static_cast<const float *>(input->gpu_data_ptr()),
+                static_cast<float *>(output.gpu_data_ptr()), rows, source_rows, width, output_rows, stream, ambiguous));
+            auto invalid = params.row_copy_policy;
+            invalid.negative_rows = static_cast<NegativeRowSelectionPolicy>(999);
+            EXPECT_FALSE(rocm::launchRowsSelectFP32(static_cast<const float *>(input->gpu_data_ptr()),
+                static_cast<float *>(output.gpu_data_ptr()), rows, source_rows, width, output_rows, stream, invalid));
+            // Valid owners and stream, but impossible indexing must reject before native launch.
+            EXPECT_FALSE(rocm::launchRowsSelectFP32(static_cast<const float *>(input->gpu_data_ptr()),
+                static_cast<float *>(output.gpu_data_ptr()), rows, source_rows,
+                std::numeric_limits<int>::max(), 2, stream));
+        }
+        HiddenStateRowsSelectStage stage(params);
+        stage.setGPUStream(stream);
+        const std::array<int, 3> initial{-1, 0, 3};
+        ASSERT_EQ(hipMemcpyAsync(rows, initial.data(), sizeof(initial), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(output.gpu_data_ptr(), expected.data(), expected.size() * 4,
+            hipMemcpyHostToDevice, prior_producer), hipSuccess);
+        // PreserveDestination reads its prior value. Join that exact Tensor
+        // producer event to this capture stream before recording the consumer.
+        TransferEngine::publishDeviceWrite(&output, device, prior_producer);
+        TransferEngine::requireDeviceInput(&output, device, stream);
+        ASSERT_TRUE(stage.execute(nullptr));
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t executable = nullptr;
+        ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &graph, [&]() {
+        ASSERT_TRUE(stage.execute(nullptr));
+    }));
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0), hipSuccess);
+        const auto original_graph = graph;
+        const auto original_executable = executable;
+        const std::array<std::array<int, 3>, 4> trajectory{{{-1, 0, 3}, {2, -1, 1}, {-1, -1, -1}, {3, 1, 0}}};
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            // Reset original data only; retained topology and physical pointers stay fixed.
+            if (replay % 4 == 0)
+            {
+                std::fill(expected.begin(), expected.end(), float(-777 - replay));
+                ASSERT_EQ(hipMemcpyAsync(output.gpu_data_ptr(), expected.data(), expected.size() * 4,
+                    hipMemcpyHostToDevice, stream), hipSuccess);
+            }
+            const auto &selected = trajectory[replay % 4];
+            ASSERT_EQ(hipMemcpyAsync(rows, selected.data(), sizeof(selected), hipMemcpyHostToDevice, stream), hipSuccess);
+            for (int row = 0; row < output_rows; ++row)
+                if (selected[row] >= 0)
+                    std::copy_n(input->data() + selected[row] * source_stride, width,
+                        expected.data() + row * destination_stride);
+            ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(actual.data(), output.gpu_data_ptr(), actual.size() * 4,
+                hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess); // Explicit test observation only.
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * 4), 0)
+                << "width=" << width << " replay=" << replay;
+            EXPECT_EQ(graph, original_graph);
+            EXPECT_EQ(executable, original_executable);
+        }
+        ASSERT_EQ(hipGraphExecDestroy(executable), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+        // Different immutable policies have separate captures. Legacy negative
+        // rows still clamp to zero; fixed rows retain strided row-zero publication.
+        for (bool fixed : {false, true})
+        {
+            auto alternate = params;
+            alternate.row_copy_policy.negative_rows = NegativeRowSelectionPolicy::ClampToFirst;
+            const std::array<int, 3> selected{-1, 99, 1};
+            if (fixed)
+            {
+                alternate.device_row_index_source = HiddenStateRowsSelectStage::DeviceRowIndexSource::FixedContiguousRange;
+                alternate.fixed_contiguous_row_start = 0;
+                alternate.external_device_row_indices = nullptr;
+            }
+            else
+                ASSERT_EQ(hipMemcpyAsync(rows, selected.data(), sizeof(selected), hipMemcpyHostToDevice, stream), hipSuccess);
+            HiddenStateRowsSelectStage other(alternate);
+            other.setGPUStream(stream);
+            ASSERT_TRUE(other.execute(nullptr));
+            hipGraph_t alternate_graph = nullptr;
+            hipGraphExec_t alternate_exec = nullptr;
+            ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &alternate_graph, [&]() {
+        ASSERT_TRUE(other.execute(nullptr));
+    }));
+            ASSERT_EQ(hipGraphInstantiate(&alternate_exec, alternate_graph, nullptr, nullptr, 0), hipSuccess);
+            for (int row = 0; row < output_rows; ++row)
+            {
+                const int source = fixed ? row : row == 0 ? 0 : row == 1 ? source_rows - 1 : 1;
+                std::copy_n(input->data() + source * source_stride, width, expected.data() + row * destination_stride);
+            }
+            ASSERT_EQ(hipGraphLaunch(alternate_exec, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(actual.data(), output.gpu_data_ptr(), actual.size() * 4,
+                hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * 4), 0) << "fixed=" << fixed;
+            ASSERT_EQ(hipGraphExecDestroy(alternate_exec), hipSuccess);
+            ASSERT_EQ(hipGraphDestroy(alternate_graph), hipSuccess);
+        }
+        // The canonical logits owner is ONE row even when the source contains
+        // multiple request groups. It reads only the base request-zero index.
+        FP32Tensor canonical({1, static_cast<size_t>(destination_stride)}, DeviceId::cpu());
+        ASSERT_TRUE(canonical.allocateOnDevice(device, stream));
+        auto scalar = params;
+        scalar.output = &canonical;
+        scalar.selected_row_count = 1;
+        scalar.selected_row_indices = {0};
+        HiddenStateRowsSelectStage request_zero(scalar);
+        request_zero.setGPUStream(stream);
+        std::vector<float> scalar_expected(destination_stride, -811.0f);
+        std::vector<float> scalar_actual(destination_stride);
+        const std::array<int, 3> request_indices{2, 3, 1};
+        ASSERT_EQ(hipMemcpyAsync(rows, request_indices.data(), sizeof(request_indices), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(canonical.gpu_data_ptr(), scalar_expected.data(), scalar_expected.size() * 4,
+            hipMemcpyHostToDevice, prior_producer), hipSuccess);
+        TransferEngine::publishDeviceWrite(&canonical, device, prior_producer);
+        TransferEngine::requireDeviceInput(&canonical, device, stream);
+        ASSERT_TRUE(request_zero.execute(nullptr));
+        hipGraph_t scalar_graph = nullptr;
+        hipGraphExec_t scalar_exec = nullptr;
+        ASSERT_NO_FATAL_FAILURE(recordGraphOnStream(stream, &scalar_graph, [&]() {
+        ASSERT_TRUE(request_zero.execute(nullptr));
+    }));
+        ASSERT_EQ(hipGraphInstantiate(&scalar_exec, scalar_graph, nullptr, nullptr, 0), hipSuccess);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            const std::array<int, 3> selected{replay == 1 ? -1 : 2, 3, 1};
+            ASSERT_EQ(hipMemcpyAsync(rows, selected.data(), sizeof(selected), hipMemcpyHostToDevice, stream), hipSuccess);
+            if (replay == 1)
+            {
+                std::fill(scalar_expected.begin(), scalar_expected.end(), -912.0f);
+                ASSERT_EQ(hipMemcpyAsync(canonical.gpu_data_ptr(), scalar_expected.data(), scalar_expected.size() * 4,
+                    hipMemcpyHostToDevice, prior_producer), hipSuccess);
+                TransferEngine::publishDeviceWrite(&canonical, device, prior_producer);
+                TransferEngine::requireDeviceInput(&canonical, device, stream);
+            }
+            else
+                std::copy_n(input->data() + 2 * source_stride, width, scalar_expected.data());
+            ASSERT_EQ(hipGraphLaunch(scalar_exec, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(scalar_actual.data(), canonical.gpu_data_ptr(), scalar_actual.size() * 4,
+                hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            EXPECT_EQ(std::memcmp(scalar_actual.data(), scalar_expected.data(), scalar_actual.size() * 4), 0);
+        }
+        ASSERT_EQ(hipGraphExecDestroy(scalar_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(scalar_graph), hipSuccess);
+    }
+    ASSERT_EQ(hipStreamDestroy(prior_producer), hipSuccess);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }

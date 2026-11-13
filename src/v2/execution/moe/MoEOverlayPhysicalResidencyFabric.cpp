@@ -12,6 +12,11 @@
  */
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
+#include "backends/NativeContextPreparation.h"
+#include "MoEOverlayPhysicalProjectionPieces.h"
+#include "MoEOverlayPhysicalLaneDemand.h"
+#include "MoEOverlayPhysicalRemotePieceOrdinals.h"
+#include "MoEExpertOverlayPreparationPlan.h"
 
 #include "CpuExpertSlotPool.h"
 #include "ExpertPreparedMemoryGeometry.h"
@@ -27,7 +32,7 @@
 #include "loaders/ModelLoader.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "memory/NUMAAllocator.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "utils/PerfStatsCollector.h"
@@ -54,6 +59,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <numeric>
 #include <pthread.h>
 #include <sched.h>
 #include <span>
@@ -141,13 +147,14 @@ namespace llaminar2
                          expert < resident_mask.size();
                          ++expert)
                     {
-                        const auto *owner = canonical_owner_map.ownerFor(
-                            bank.first_model_layer + static_cast<int>(layer),
-                            static_cast<int>(expert));
-                        if (!owner ||
-                            resident_mask[expert] !=
-                                (owner->owner_participant ==
-                                 bank.participant_id))
+                        const auto *owner = canonical_owner_map.placementFor(
+                            bank.first_model_layer + static_cast<int>(layer), static_cast<int>(expert));
+                        const auto target = owner ? MoEExpertPlacementTarget::fromPlacement(*owner) : std::nullopt;
+                        bool member = false;
+                        if (target)
+                            for (size_t index = 0; index < target->participantCount(); ++index)
+                                member = member || target->participantId(index) == bank.participant_id;
+                        if (!target || resident_mask[expert] != member)
                         {
                             return false;
                         }
@@ -163,9 +170,19 @@ namespace llaminar2
         }
     }
 
-    std::vector<MoEOverlayLayerWeightManifest>
-    buildMoEOverlayLayerWeightManifestFromGGUF(
-        const GGUFModel &model,
+    /**
+     * @brief Validate one native source contract through its immutable descriptor resolver.
+     * @tparam Resolve Allocation-free descriptor resolver for the declared source authority.
+     * @param resolve Returns the original native descriptor or null for an absent name.
+     * @param num_layers Number of contiguous owned global layer identities.
+     * @param num_experts Exact expert count required in every source projection.
+     * @param first_model_layer First global source identity owned by this interval.
+     * @return Validated native projection contracts without reading tensor payloads.
+     * @throws std::invalid_argument For malformed intervals or incompatible metadata.
+     */
+    template<class Resolve>
+    static std::vector<MoEOverlayLayerWeightManifest> buildExpertSourceManifest(
+        const Resolve &resolve,
         int num_layers,
         int num_experts,
         int first_model_layer)
@@ -180,9 +197,9 @@ namespace llaminar2
         const auto source_format = [](GGUFTensorType type)
             -> ExpertWeightFormat
         {
-            const auto native = [](const NativeVnniFormatInfo &format)
+            const auto native = [](const NativeQuantisedFormatInfo &format)
             {
-                return ExpertWeightFormat::nativeVnni({
+                return ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock,
                     .present = true,
@@ -191,45 +208,45 @@ namespace llaminar2
             switch (type)
             {
             case GGUFTensorType::Q4_0:
-                return native(native_vnni_formats::Q4_0);
+                return native(native_quantised_formats::Q4_0);
             case GGUFTensorType::Q4_1:
-                return native(native_vnni_formats::Q4_1);
+                return native(native_quantised_formats::Q4_1);
             case GGUFTensorType::Q5_0:
-                return native(native_vnni_formats::Q5_0);
+                return native(native_quantised_formats::Q5_0);
             case GGUFTensorType::Q5_1:
-                return native(native_vnni_formats::Q5_1);
+                return native(native_quantised_formats::Q5_1);
             case GGUFTensorType::Q8_0:
-                return native(native_vnni_formats::Q8_0);
+                return native(native_quantised_formats::Q8_0);
             case GGUFTensorType::Q2_K:
-                return native(native_vnni_formats::Q2_K);
+                return native(native_quantised_formats::Q2_K);
             case GGUFTensorType::Q3_K:
-                return native(native_vnni_formats::Q3_K);
+                return native(native_quantised_formats::Q3_K);
             case GGUFTensorType::Q4_K:
-                return native(native_vnni_formats::Q4_K);
+                return native(native_quantised_formats::Q4_K);
             case GGUFTensorType::Q5_K:
-                return native(native_vnni_formats::Q5_K);
+                return native(native_quantised_formats::Q5_K);
             case GGUFTensorType::Q6_K:
-                return native(native_vnni_formats::Q6_K);
+                return native(native_quantised_formats::Q6_K);
             case GGUFTensorType::Q8_K:
-                return native(native_vnni_formats::Q8_K);
+                return native(native_quantised_formats::Q8_K);
             case GGUFTensorType::IQ2_XXS:
-                return native(native_vnni_formats::IQ2_XXS);
+                return native(native_quantised_formats::IQ2_XXS);
             case GGUFTensorType::IQ2_XS:
-                return native(native_vnni_formats::IQ2_XS);
+                return native(native_quantised_formats::IQ2_XS);
             case GGUFTensorType::IQ3_XXS:
-                return native(native_vnni_formats::IQ3_XXS);
+                return native(native_quantised_formats::IQ3_XXS);
             case GGUFTensorType::IQ1_S:
-                return native(native_vnni_formats::IQ1_S);
+                return native(native_quantised_formats::IQ1_S);
             case GGUFTensorType::IQ4_NL:
-                return native(native_vnni_formats::IQ4_NL);
+                return native(native_quantised_formats::IQ4_NL);
             case GGUFTensorType::IQ3_S:
-                return native(native_vnni_formats::IQ3_S);
+                return native(native_quantised_formats::IQ3_S);
             case GGUFTensorType::IQ2_S:
-                return native(native_vnni_formats::IQ2_S);
+                return native(native_quantised_formats::IQ2_S);
             case GGUFTensorType::IQ4_XS:
-                return native(native_vnni_formats::IQ4_XS);
+                return native(native_quantised_formats::IQ4_XS);
             case GGUFTensorType::IQ1_M:
-                return native(native_vnni_formats::IQ1_M);
+                return native(native_quantised_formats::IQ1_M);
             case GGUFTensorType::F32:
                 return ExpertWeightFormat::floating(TensorType::FP32);
             case GGUFTensorType::F16:
@@ -263,7 +280,7 @@ namespace llaminar2
                 const std::string name =
                     "blk." + std::to_string(layer_idx) + "." +
                     projections[role].suffix;
-                const GGUFTensorInfo *tensor = model.findTensor(name);
+                const GGUFTensorInfo *tensor = resolve(name);
                 const ExpertWeightFormat format =
                     tensor ? source_format(tensor->type)
                            : ExpertWeightFormat{};
@@ -309,6 +326,24 @@ namespace llaminar2
         return result;
     }
 
+    std::vector<MoEOverlayLayerWeightManifest>
+    buildMoEOverlayLayerWeightManifestFromGGUF(const GGUFModel &model,
+        int num_layers, int num_experts, int first_model_layer)
+    {
+        return buildExpertSourceManifest([&model](const std::string &name) {
+            return model.findTensor(name);
+        }, num_layers, num_experts, first_model_layer);
+    }
+
+    std::vector<MoEOverlayLayerWeightManifest>
+    buildMoEOverlayLayerWeightManifestFromLoader(const ModelLoader &loader,
+        int num_layers, int num_experts, int first_model_layer)
+    {
+        return buildExpertSourceManifest([&loader](const std::string &name) {
+            return loader.tensorInfo(name);
+        }, num_layers, num_experts, first_model_layer);
+    }
+
     namespace
     {
         /** Gate/up/down roles in the canonical wire and bank order. */
@@ -350,6 +385,69 @@ namespace llaminar2
             }
             throw std::invalid_argument(
                 "ExpertOverlay physical fabric received an unknown projection role");
+        }
+
+        /**
+         * @brief Select a genuine engine from either closed participant-bank arm.
+         * @param layer Existing immutable member bank, never a raw source mirror.
+         * @param expert Original full-model logical expert coordinate.
+         * @param projection Original semantic role.
+         * @return Actual prepared engine retaining its original physical root.
+         */
+        std::shared_ptr<ITensorGemm> projectionEngine(
+            const MoEOverlayParticipantLayerBank &layer, std::size_t expert,
+            ExpertTierWeightProjection projection)
+        {
+            if (!layer.cpu_fragment_family)
+                return projectionEngine(layer.experts.at(expert), projection);
+            const auto &fragment = layer.cpu_fragments.at(expert);
+            if (!layer.cpu_fragment_family->accepts(fragment, static_cast<int>(expert)))
+                throw std::invalid_argument("Physical source fragment changed its original member family");
+            switch (projection)
+            {
+            case ExpertTierWeightProjection::Gate: return fragment.gate();
+            case ExpertTierWeightProjection::Up: return fragment.up();
+            case ExpertTierWeightProjection::Down: return fragment.down();
+            }
+            throw std::invalid_argument("Unknown original CPU fragment projection role");
+        }
+
+        /** @brief Original authored full-model dimensions; no scalar owner shadow. */
+        struct OriginalFabricGeometry
+        {
+            int first_layer, layers, experts;
+            int firstModelLayer() const noexcept { return first_layer; }
+            int layerCount() const noexcept { return layers; }
+            int expertCount() const noexcept { return experts; }
+        };
+        /**
+         * @brief Read the constructor-authenticated original geometry arm.
+         * @param config Same fabric source, preparation and snapshot authorities.
+         * @return Original full E and layer interval, including an empty tier quota.
+         * @throws std::invalid_argument For missing or inconsistent original preparation/plan.
+         */
+        OriginalFabricGeometry originalFabricGeometry(
+            const MoEOverlayPhysicalResidencyFabric::Config &config)
+        {
+            const auto &snapshot = *config.initial_snapshot;
+            if (!snapshot.valid())
+                throw std::invalid_argument("Physical fabric requires an authenticated source snapshot");
+            const OriginalFabricGeometry geometry{
+                snapshot.firstModelLayer(), snapshot.layerCount(), snapshot.expertCount()};
+            if (snapshot.ownershipKind() == MoEOverlayResidencyOwnershipKind::WholeExperts)
+                return geometry;
+            const auto source = snapshot.originalProjectionPreparation();
+            const auto &registered = config.registry->projectionPreparation();
+            if (!source || !registered || source.get() != registered.get() ||
+                source.owner_before(registered) || registered.owner_before(source) ||
+                !source->cpuJointOwnerMap())
+                throw std::invalid_argument("Physical CPU cohort fabric lost its same original preparation or full source plan");
+            // The snapshot's sealed original definition owns geometry; the
+            // fabric authenticates its registry binding rather than reparsing
+            // a second live placement into a parallel shape authority.
+            source->cpuJointOwnerMap()->requireLayerGeometry(
+                geometry.layers, geometry.experts, geometry.first_layer);
+            return geometry;
         }
 
         /** @brief Participant/layer identity for one inactive destination pool. */
@@ -682,6 +780,149 @@ namespace llaminar2
             std::atomic<std::uint64_t> peak_{0};
         };
 
+        /** @brief Full contiguous final storage, with no representation padding. */
+        struct CompleteCPUCopy {};
+        /** @brief Same original native intersection in two independent final roots. */
+        struct NativeCPUCopy
+        {
+            ExpertTierWeightCPUStorageLayout source, destination;
+            std::shared_ptr<std::mutex> encoded_write_mutex;
+        };
+        /** @brief Exact floating row spans, retaining each root's original stride. */
+        struct FloatingCPUCopy
+        {
+            ExpertTierWeightProjectionIntersection intersection;
+            size_t element_bytes;
+        };
+        using CPUCopyGeometry = std::variant<CompleteCPUCopy, NativeCPUCopy, FloatingCPUCopy>;
+
+        /** @brief Quote only actual logical/encoded bytes for one existing worker job. */
+        size_t cpuCopyBytes(const CPUCopyGeometry &shape, size_t complete_bytes)
+        {
+            return std::visit([&](const auto &copy) -> size_t {
+                using T = std::decay_t<decltype(copy)>;
+                if constexpr (std::is_same_v<T, CompleteCPUCopy>) return complete_bytes;
+                else if constexpr (std::is_same_v<T, NativeCPUCopy>)
+                    return copy.source.chunkBytes(copy.source.unit_count);
+                else return size_t(copy.intersection.rows()) * copy.intersection.columns() * copy.element_bytes;
+            }, shape);
+        }
+
+        /** @brief Validate final root extents before reserving or releasing a worker wave. */
+        bool validCPUCopy(const CPUCopyGeometry &shape, std::span<const uint8_t> source,
+            std::span<uint8_t> destination)
+        {
+            if (source.empty() || destination.empty()) return false;
+            const auto x = reinterpret_cast<uintptr_t>(source.data()), y = reinterpret_cast<uintptr_t>(destination.data());
+            if (!x || !y || source.size() > std::numeric_limits<uintptr_t>::max() - x ||
+                destination.size() > std::numeric_limits<uintptr_t>::max() - y ||
+                (x < y + destination.size() && y < x + source.size())) return false;
+            return std::visit([&](const auto &copy) {
+                using T = std::decay_t<decltype(copy)>;
+                if constexpr (std::is_same_v<T, CompleteCPUCopy>) return source.size() == destination.size();
+                else if constexpr (std::is_same_v<T, NativeCPUCopy>)
+                    return copy.source.valid() && copy.destination.valid() && copy.encoded_write_mutex &&
+                        copy.source.N == copy.destination.N && copy.source.K == copy.destination.K &&
+                        copy.source.cpu_codebook_id == copy.destination.cpu_codebook_id &&
+                        copy.source.cpu_is_asymmetric == copy.destination.cpu_is_asymmetric &&
+                        copy.source.cpu_is_superblock == copy.destination.cpu_is_superblock &&
+                        copy.source.cpu_encoding == copy.destination.cpu_encoding &&
+                        copy.source.wire_columns_per_unit == copy.destination.wire_columns_per_unit &&
+                        source.size() == copy.source.cpuStorageBytes() && destination.size() == copy.destination.cpuStorageBytes();
+                else
+                {
+                    const auto &a = copy.intersection.source(), &b = copy.intersection.destination();
+                    return !copy.intersection.empty() && (copy.element_bytes == 2 || copy.element_bytes == 4) &&
+                        size_t(a.rows) * a.columns * copy.element_bytes == source.size() &&
+                        size_t(b.rows) * b.columns * copy.element_bytes == destination.size();
+                }
+            }, shape);
+        }
+
+        /**
+         * @brief Copy one bounded live chunk with no intermediate payload allocation.
+         * @param shape Typed original layout, shared by admission and this actual job.
+         * @param source Immutable original final source root.
+         * @param destination Existing final candidate root.
+         * @param offset Previously copied LIVE bytes, not a resident-root offset.
+         * @param capacity Maximum useful bytes this worker may copy before cancellation.
+         * @return Actual copied bytes; native chunk boundaries remain complete encoded units.
+         */
+        size_t copyCPUChunk(const CPUCopyGeometry &shape, std::span<const uint8_t> source,
+            std::span<uint8_t> destination, size_t offset, size_t capacity)
+        {
+            return std::visit([&](const auto &copy) -> size_t {
+                using T = std::decay_t<decltype(copy)>;
+                if constexpr (std::is_same_v<T, CompleteCPUCopy>)
+                {
+                    const auto bytes = std::min(capacity, source.size() - offset);
+                    std::memcpy(destination.data() + offset, source.data() + offset, bytes);
+                    return bytes;
+                }
+                else if constexpr (std::is_same_v<T, NativeCPUCopy>)
+                {
+                    const auto first = expertTierWireUnitAt(copy.source, offset);
+                    const auto units = std::min({copy.source.unit_count - first,
+                        copy.source.maximum_units_per_chunk, copy.destination.maximum_units_per_chunk});
+                    const auto bytes = copy.source.chunkBytes(units, first);
+                    if (units == 0 || bytes > capacity ||
+                        !copyExpertTierCPUWeightChunk(copy.source, source, copy.destination, destination,
+                            first, units, copy.encoded_write_mutex.get()))
+                        throw std::runtime_error("Physical CPU worker rejected its original native intersection");
+                    return bytes;
+                }
+                else
+                {
+                    const auto &overlap = copy.intersection;
+                    const size_t row_bytes = size_t(overlap.columns()) * copy.element_bytes;
+                    const size_t row = offset / row_bytes, column_byte = offset % row_bytes;
+                    const size_t bytes = std::min(capacity, row_bytes - column_byte);
+                    const size_t from = ((size_t(overlap.sourceRowOrigin()) + row) * overlap.source().columns +
+                        overlap.sourceColumnOrigin()) * copy.element_bytes + column_byte;
+                    const size_t to = ((size_t(overlap.destinationRowOrigin()) + row) * overlap.destination().columns +
+                        overlap.destinationColumnOrigin()) * copy.element_bytes + column_byte;
+                    std::memcpy(destination.data() + to, source.data() + from, bytes);
+                    return bytes;
+                }
+            }, shape);
+        }
+
+        /**
+         * @brief Bind actual prepared native roots to the canonical CPU-only plane mapper.
+         * @param source Actual immutable CPU prepared source metadata.
+         * @param destination Actual final inactive CPU engine metadata.
+         * @param intersection Same original overlap used by the wave's piece record.
+         * @param capacity Existing worker bounded-copy quantum.
+         * @param write_mutex Same final-role native write authority shared by all pieces.
+         * @return Validated independent source/destination strides without staging.
+         */
+        NativeCPUCopy nativeCPUCopyGeometry(
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &destination,
+            const ExpertTierWeightProjectionIntersection &intersection, size_t capacity,
+            std::shared_ptr<std::mutex> write_mutex)
+        {
+            const auto format = [&](const auto &root) {
+                ExpertTierWeightCPUStorageLayout traits{
+                    .cpu_codebook_id = root.codebook_id,
+                    .cpu_is_asymmetric = uint8_t(root.is_asymmetric),
+                    .cpu_is_superblock = uint8_t(root.is_superblock),
+                    .cpu_encoding = root.encoding, .cpu_data_stride = uint32_t(root.data_stride),
+                    .cpu_block_stride = uint32_t(root.interleaved_block_stride)};
+                const size_t column_bytes = traits.cpu_block_stride / 64;
+                if (!column_bytes || capacity < column_bytes || capacity > UINT32_MAX)
+                    throw std::invalid_argument("CPU native worker capacity cannot contain one exact encoded column");
+                traits.wire_columns_per_unit = unsigned(std::min(size_t(64), capacity / column_bytes));
+                return traits;
+            };
+            if (source.N != intersection.source().rows || source.K != intersection.source().columns ||
+                destination.N != intersection.destination().rows || destination.K != intersection.destination().columns)
+                throw std::invalid_argument("CPU native worker roots changed original local dimensions");
+            return {cpuExpertTierStorageLayoutForIntersection(format(source), intersection.source(), intersection, uint32_t(capacity)),
+                cpuExpertTierStorageLayoutForIntersection(format(destination), intersection.destination(), intersection, uint32_t(capacity)),
+                std::move(write_mutex)};
+        }
+
         /** @brief One setup-owned asynchronous CPU/NUMA projection-copy worker. */
         class CpuCopyLane final
         {
@@ -798,12 +1039,11 @@ namespace llaminar2
                 std::shared_ptr<CpuCopyWaveGate> gate,
                 std::shared_ptr<ITensorGemm> source_engine,
                 std::shared_ptr<ITensorGemm> destination_engine,
-                std::string *error = nullptr) noexcept
+                std::string *error = nullptr, CPUCopyGeometry geometry = CompleteCPUCopy{}) noexcept
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 const State state = state_.load(std::memory_order_acquire);
-                if (!initialization_ok_ || stopping_ || source.empty() ||
-                    source.size() != destination.size() || !gate ||
+                if (!initialization_ok_ || stopping_ || !validCPUCopy(geometry, source, destination) || !gate ||
                     !source_engine || !destination_engine ||
                     state == State::Pending || state == State::Failed)
                 {
@@ -826,6 +1066,7 @@ namespace llaminar2
                 pending_job_.emplace(Job{
                     .source = source,
                     .destination = destination,
+                    .geometry = std::move(geometry),
                     .gate = std::move(gate),
                     .source_engine = std::move(source_engine),
                     .destination_engine = std::move(destination_engine),
@@ -902,6 +1143,7 @@ namespace llaminar2
             {
                 std::span<const std::uint8_t> source;
                 std::span<std::uint8_t> destination;
+                CPUCopyGeometry geometry;
                 std::shared_ptr<CpuCopyWaveGate> gate;
                 std::shared_ptr<ITensorGemm> source_engine;
                 std::shared_ptr<ITensorGemm> destination_engine;
@@ -970,24 +1212,21 @@ namespace llaminar2
                     const auto started_at = std::chrono::steady_clock::now();
                     std::uint64_t host_nanoseconds = 0;
                     std::size_t offset = 0;
+                    const auto live_bytes = cpuCopyBytes(job->geometry, job->source.size());
                     bool cancelled = !released;
                     try
                     {
-                        while (!cancelled && offset < job->source.size())
+                        while (!cancelled && offset < live_bytes)
                         {
                             cancelled = cancel_requested_.load(
                                 std::memory_order_acquire);
                             if (cancelled)
                                 break;
-                            const std::size_t bytes = std::min(
-                                config_.chunk_bytes,
-                                job->source.size() - offset);
-                            const auto copy_started_at =
-                                std::chrono::steady_clock::now();
-                            std::memcpy(
-                                job->destination.data() + offset,
-                                job->source.data() + offset,
-                                bytes);
+                            const auto copy_started_at = std::chrono::steady_clock::now();
+                            const auto bytes = copyCPUChunk(job->geometry, job->source, job->destination,
+                                offset, config_.chunk_bytes);
+                            if (bytes == 0 || bytes > live_bytes - offset)
+                                throw std::runtime_error("CPU projection worker failed to advance exact live bytes");
                             const auto copy_elapsed =
                                 std::chrono::duration_cast<
                                     std::chrono::nanoseconds>(
@@ -1013,7 +1252,7 @@ namespace llaminar2
                             PerfStatsCollector::addCounter(
                                 "moe_overlay_residency",
                                 "cpu_native_copy_bytes",
-                                static_cast<double>(job->source.size()),
+                                static_cast<double>(live_bytes),
                                 "maintenance",
                                 config_.perf_device,
                                 {{"lane", config_.lane_name},
@@ -1043,7 +1282,7 @@ namespace llaminar2
                                             std::memory_order_relaxed) +
                                         1,
                                     .bytes = static_cast<std::uint64_t>(
-                                        job->source.size()),
+                                        live_bytes),
                                     .wall_nanoseconds =
                                         static_cast<std::uint64_t>(
                                             std::max<std::int64_t>(
@@ -1159,59 +1398,53 @@ namespace llaminar2
         };
 
         /**
-         * @brief Destination endpoint that publishes one exact prepared engine.
+         * @brief Destination endpoint that finalizes storage before original operation completion.
          *
          * Final bytes remain owned and validated by the wrapped device-specific
-         * endpoint. Publication occurs only after that endpoint reports complete
+         * endpoint. Storage finalization occurs only after that endpoint reports complete
          * and accepts its own finalization edge, so the candidate RCU bank can
          * never observe a partially received projection.
          */
-        class PublishingRemoteProjectionDestination final
+        class FinalizingRemoteProjectionDestination final
             : public IMoEOverlayRemoteProjectionDestinationEndpoint
         {
         public:
-            /** @brief Retain storage, arrival authority, role, and engine alias. */
-            PublishingRemoteProjectionDestination(
-                std::shared_ptr<
-                    IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
-                std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
-                ExpertTierWeightProjection projection,
+            /**
+             * @brief Retain original final storage and its reserved engine alias.
+             * @param storage Original destination endpoint owning physical finalization.
+             * @param engine Genuine engine alias over the reserved destination bytes.
+             */
+            FinalizingRemoteProjectionDestination(
+                std::shared_ptr<IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
                 std::shared_ptr<ITensorGemm> engine)
-                : storage_(std::move(storage)),
-                  arrival_(std::move(arrival)),
-                  projection_(projection),
-                  engine_(std::move(engine))
+                : storage_(std::move(storage)), engine_(std::move(engine))
             {
-                if (!storage_ || !arrival_ || !engine_)
+                if (!storage_ || !engine_)
                 {
                     throw std::invalid_argument(
-                        "ExpertOverlay remote publication endpoint requires complete ownership");
+                        "ExpertOverlay remote finalization endpoint requires complete ownership");
                 }
             }
 
             /**
              * @brief Retain a deferred engine provider for manifest-shaped GPU arrivals.
+             * @param storage Original endpoint owning manifest validation and final storage.
+             * @param engine_provider Returns that endpoint's actual finalized engine.
              *
              * A remote GPU sender's live physical format is known only after
              * manifest authentication. The wrapped GPU endpoint creates the
-             * exact engine alias then; this provider retrieves it at the final
-             * publication edge without guessing a canonical representation.
+             * exact engine alias then; this provider retrieves it at the original
+             * finalization edge without guessing a canonical representation.
              */
-            PublishingRemoteProjectionDestination(
-                std::shared_ptr<
-                    IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
-                std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
-                ExpertTierWeightProjection projection,
+            FinalizingRemoteProjectionDestination(
+                std::shared_ptr<IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
                 std::function<std::shared_ptr<ITensorGemm>()> engine_provider)
-                : storage_(std::move(storage)),
-                  arrival_(std::move(arrival)),
-                  projection_(projection),
-                  engine_provider_(std::move(engine_provider))
+                : storage_(std::move(storage)), engine_provider_(std::move(engine_provider))
             {
-                if (!storage_ || !arrival_ || !engine_provider_)
+                if (!storage_ || !engine_provider_)
                 {
-                    throw std::invalid_argument(
-                        "ExpertOverlay deferred remote publication endpoint requires complete ownership");
+                    throw std::invalid_argument("ExpertOverlay deferred remote finalization "
+                                                "endpoint requires complete ownership");
                 }
             }
 
@@ -1245,10 +1478,11 @@ namespace llaminar2
                 return storage_->complete();
             }
 
-            /** @brief Finalize storage, then publish the engine exactly once. */
+            /** @brief Finalize original storage so the original transport operation may finish; do not publish
+             * arrival. */
             bool publishFinal(std::string *error) noexcept override
             {
-                if (published_)
+                if (finalized_)
                 {
                     if (error)
                         error->clear();
@@ -1283,20 +1517,13 @@ namespace llaminar2
                             "ExpertOverlay remote destination completed without an executable engine";
                     return false;
                 }
-                if (!arrival_->publish(projection_, engine_, error))
-                    return false;
-                published_ = true;
+                finalized_ = true;
                 return true;
             }
 
-            /** @brief Poison an unpublished arrival and abort exact storage work. */
+            /** @brief Abort exact storage work; the outer operation poisons candidate arrival. */
             void abort() noexcept override
             {
-                if (!published_)
-                {
-                    (void)arrival_->fail(
-                        "ExpertOverlay remote projection was aborted before publication");
-                }
                 storage_->abort();
             }
 
@@ -1307,15 +1534,18 @@ namespace llaminar2
                 return storage_->pollAbort(error);
             }
 
+            /** @return Actual finalized engine, retained without granting candidate visibility. */
+            std::shared_ptr<ITensorGemm> preparedEngine() const noexcept
+            {
+                return finalized_ ? engine_ : nullptr;
+            }
+
         private:
             std::shared_ptr<
                 IMoEOverlayRemoteProjectionDestinationEndpoint> storage_;
-            std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival_;
-            ExpertTierWeightProjection projection_ =
-                ExpertTierWeightProjection::Gate;
             std::shared_ptr<ITensorGemm> engine_;
             std::function<std::shared_ptr<ITensorGemm>()> engine_provider_;
-            bool published_ = false;
+            bool finalized_ = false;
         };
 
         /**
@@ -1361,7 +1591,8 @@ namespace llaminar2
                 ExpertTierGpuMutableProjectionView gpu_destination,
                 ExpertTierSourceReadiness source_readiness,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                std::shared_ptr<std::mutex> encoded_write_mutex = {})
                 : direction_(direction),
                   layout_(layout),
                   gpu_source_(gpu_source),
@@ -1388,6 +1619,8 @@ namespace llaminar2
                     throw std::runtime_error(
                         "ExpertOverlay admitted GPU/CPU wave exhausted its pre-materialized parallel lane pool");
                 }
+                try { lane_->lane()->bindCPUEncodedWriteOwnership(std::move(encoded_write_mutex)); }
+                catch (...) { lane_->release(this); throw; }
                 owns_lane_ = true;
             }
 
@@ -1401,6 +1634,7 @@ namespace llaminar2
              * @param source_readiness Installed old-epoch ordering proof.
              * @param source_engine Pins the immutable source slot.
              * @param destination_engine Pins the inactive destination slot.
+             * @param intersection Original-coordinate overlap between independently strided roots.
              *
              * Floating representations are byte-identical on CPU and GPU, so
              * this operation streams bounded chunks without a repack kernel.
@@ -1415,14 +1649,15 @@ namespace llaminar2
                 std::span<const std::uint8_t> cpu_source,
                 ExpertTierSourceReadiness source_readiness,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                std::optional<ExpertTierWeightProjectionIntersection> intersection = std::nullopt)
                 : direction_(direction),
                   cpu_destination_(cpu_destination),
                   cpu_source_(cpu_source),
                   gpu_floating_(gpu_floating),
                   source_readiness_(source_readiness),
                   source_engine_(std::move(source_engine)),
-                  destination_engine_(std::move(destination_engine))
+                  destination_engine_(std::move(destination_engine)), floating_intersection_(std::move(intersection))
             {
                 const bool contiguous_direction =
                     direction_ == Direction::GpuToCpuContiguous ||
@@ -1433,11 +1668,21 @@ namespace llaminar2
                         : cpu_source_.size();
                 if (!lane_pool || !contiguous_direction ||
                     !gpu_floating_.valid() ||
-                    cpu_bytes != gpu_floating_.bytes || !source_engine_ ||
+                    (!floating_intersection_ && cpu_bytes != gpu_floating_.bytes) || !source_engine_ ||
                     !destination_engine_)
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay admitted floating GPU/CPU operation has incomplete ownership");
+                }
+                if (floating_intersection_)
+                {
+                    const auto &overlap = *floating_intersection_;
+                    const auto &gpu = direction_ == Direction::GpuToCpuContiguous ? overlap.source() : overlap.destination();
+                    const auto &cpu = direction_ == Direction::GpuToCpuContiguous ? overlap.destination() : overlap.source();
+                    const auto element = ExpertWeightFormat::floating(gpu_floating_.type).floatingElementBytes();
+                    if (overlap.empty() || gpu.rows != gpu_floating_.n || gpu.columns != gpu_floating_.k ||
+                        size_t(cpu.rows) * cpu.columns * element != cpu_bytes)
+                        throw std::invalid_argument("Floating physical operation changed original independent root geometry");
                 }
                 lane_ = lane_pool->tryAcquire(this);
                 if (!lane_)
@@ -1445,6 +1690,8 @@ namespace llaminar2
                     throw std::runtime_error(
                         "ExpertOverlay admitted floating GPU/CPU wave exhausted its pre-materialized parallel lane pool");
                 }
+                try { lane_->lane()->bindCPUEncodedWriteOwnership({}); }
+                catch (...) { lane_->release(this); throw; }
                 owns_lane_ = true;
             }
 
@@ -1491,13 +1738,21 @@ namespace llaminar2
                             &start_error);
                         break;
                     case Direction::GpuToCpuContiguous:
-                        started = lane_->lane()->startGpuToCpuContiguous(
-                            gpu_floating_, cpu_destination_,
-                            source_readiness_, &start_error);
+                        // The whole GPU root and CPU shard retain different
+                        // strides. Forward the same checked overlap used to
+                        // admit this operation instead of copying whole storage.
+                        started = floating_intersection_
+                            ? lane_->lane()->startGpuToCpuContiguous(
+                                  gpu_floating_, cpu_destination_, source_readiness_,
+                                  *floating_intersection_, &start_error)
+                            : lane_->lane()->startGpuToCpuContiguous(
+                                  gpu_floating_, cpu_destination_, source_readiness_,
+                                  &start_error);
                         break;
                     case Direction::CpuToGpuContiguous:
-                        started = lane_->lane()->startCpuToGpuContiguous(
-                            cpu_source_, gpu_floating_, &start_error);
+                        started = floating_intersection_
+                            ? lane_->lane()->startCpuToGpuContiguous(cpu_source_, gpu_floating_, *floating_intersection_, &start_error)
+                            : lane_->lane()->startCpuToGpuContiguous(cpu_source_, gpu_floating_, &start_error);
                         break;
                     }
                     if (!started)
@@ -1511,6 +1766,8 @@ namespace llaminar2
                                 : std::move(start_error),
                             error);
                     }
+                    // Capture the protocol quote before polling completion or releasing this lane.
+                    quoted_bytes_ = lane_->lane()->quotedPayloadBytes();
                     started_ = true;
                 }
 
@@ -1587,7 +1844,12 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual bound lane quote captured before completion, independent of measurement_. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Relinquish exact shared-lane ownership once. */
             void releaseLane() noexcept
             {
@@ -1605,6 +1867,7 @@ namespace llaminar2
             std::span<const std::uint8_t> cpu_source_;
             ExpertTierGpuMutableProjectionView gpu_destination_;
             ContiguousFloatingPointWeightDescriptor gpu_floating_;
+            std::optional<ExpertTierWeightProjectionIntersection> floating_intersection_;
             ExpertTierSourceReadiness source_readiness_;
             std::shared_ptr<ITensorGemm> source_engine_;
             std::shared_ptr<ITensorGemm> destination_engine_;
@@ -1739,6 +2002,8 @@ namespace llaminar2
                                 : std::move(start_error),
                             error);
                     }
+                    // Capture the protocol quote before polling completion or releasing this lane.
+                    quoted_bytes_ = lane_->lane()->quotedPayloadBytes();
                     started_ = true;
                 }
 
@@ -1809,7 +2074,12 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual bound lane quote captured before completion, independent of measurement_. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Return the shared blob lane to its directed edge. */
             void releaseLane() noexcept
             {
@@ -1959,6 +2229,8 @@ namespace llaminar2
                                 : std::move(start_error),
                             error);
                     }
+                    // Capture the protocol quote before polling completion or releasing this lane.
+                    quoted_bytes_ = lane_->lane()->quotedPayloadBytes();
                     started_ = true;
                 }
 
@@ -2029,7 +2301,12 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual bound lane quote captured before completion, independent of measurement_. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Return the shared peer lane to its directed edge. */
             void releaseLane() noexcept
             {
@@ -2078,20 +2355,21 @@ namespace llaminar2
                 std::span<std::uint8_t> destination,
                 std::shared_ptr<CpuCopyWaveGate> wave_gate,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                CPUCopyGeometry geometry = CompleteCPUCopy{})
                 : source_(source),
                   destination_(destination),
                   wave_gate_(std::move(wave_gate)),
                   source_engine_(std::move(source_engine)),
-                  destination_engine_(std::move(destination_engine))
+                  destination_engine_(std::move(destination_engine)), geometry_(std::move(geometry))
             {
-                if (!lane_pool || source_.empty() ||
-                    source_.size() != destination_.size() || !wave_gate_ ||
+                if (!lane_pool || !validCPUCopy(geometry_, source_, destination_) || !wave_gate_ ||
                     !source_engine_ || !destination_engine_)
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay CPU copy requires exact final storage and ownership");
                 }
+                quoted_bytes_ = cpuCopyBytes(geometry_, source_.size());
                 lane_ = lane_pool->tryAcquire(this);
                 if (!lane_)
                 {
@@ -2134,7 +2412,7 @@ namespace llaminar2
                             wave_gate_,
                             source_engine_,
                             destination_engine_,
-                            &start_error))
+                            &start_error, geometry_))
                     {
                         if (lane_->lane()->quiescent())
                             releaseLane();
@@ -2216,7 +2494,13 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Same exact native-plane/floating-row quote used by the CPU worker, not observed bytes. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override
+            { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Return the dedicated worker to its exact address edge. */
             void releaseLane() noexcept
             {
@@ -2232,6 +2516,7 @@ namespace llaminar2
             std::shared_ptr<CpuCopyWaveGate> wave_gate_;
             std::shared_ptr<ITensorGemm> source_engine_;
             std::shared_ptr<ITensorGemm> destination_engine_;
+            CPUCopyGeometry geometry_;
             std::optional<ExpertTierProjectionTransferMeasurement>
                 measurement_;
             std::string failure_;
@@ -2757,6 +3042,94 @@ namespace llaminar2
             std::size_t layer_arrival_capacity = 0;
         };
 
+        /**
+         * @brief Represent existing whole-owner work through checked intersection coverage.
+         * @param rows Actual original projection N, without storage padding.
+         * @param columns Actual original projection K.
+         * @return One full original overlap, not capacity-sized wire work.
+         */
+        ExpertTierWeightProjectionIntersection wholeProjectionIntersection(int rows, int columns)
+        {
+            const MoEExpertProjectionOwnership::Projection whole{
+                MoEProjectionResidence::ExpertOwner, rows, columns, 0, rows, 0, columns};
+            return ExpertTierWeightProjectionIntersection::between(whole, whole);
+        }
+
+        /**
+         * @brief Same original member bank retained until every real source piece drains.
+         *
+         * The piece count is completion protocol state, never a live byte or
+         * capacity ledger. Releasing at the last Ready/abort-drained edge lets
+         * the existing RCU old-reader retirement proceed before wave destruction.
+         */
+        struct RetainedPhysicalSourceMember
+        {
+            std::shared_ptr<MoEOverlayParticipantResidency> endpoint;
+            MoEOverlayParticipantBankLease bank;
+            std::array<std::shared_ptr<ITensorGemm>, 3> engines;
+            std::atomic<std::size_t> pending{0};
+            /** @brief Release the original read lease exactly at the last quiescent piece. */
+            void completePiece() noexcept
+            {
+                const auto previous = pending.fetch_sub(1, std::memory_order_acq_rel);
+                if (previous == 0) std::terminate();
+                if (previous == 1) bank = {};
+            }
+        };
+
+        /** @brief Preserve one original source member across its actual lane/MPI operation. */
+        class SourceMemberRetainedOperation final : public IMoEOverlayTierTransferOperation
+        {
+        public:
+            /** @param operation Original real operation, including its abort/drain semantics.
+             * @param source SAME source bank state shared by all of this member's pieces. */
+            SourceMemberRetainedOperation(std::unique_ptr<IMoEOverlayTierTransferOperation> operation,
+                std::shared_ptr<RetainedPhysicalSourceMember> source)
+                : operation_(std::move(operation)), source_(std::move(source))
+            {
+                if (!operation_ || !source_ || source_->pending.load() == 0)
+                    throw std::invalid_argument("Physical source retention requires its actual operation and original member");
+            }
+            /** @brief Delegate normal progress and release only after real Ready. */
+            MoEOverlayResidencyWaveProgress poll(std::string *error) noexcept override
+            { return observe(operation_->poll(error)); }
+            /** @brief Preserve original asynchronous cancellation. */
+            void abort() noexcept override { operation_->abort(); }
+            /** @brief Delegate abort drain and release only after genuine quiescence. */
+            MoEOverlayResidencyWaveProgress pollAbort(std::string *error) noexcept override
+            { return observe(operation_->pollAbort(error)); }
+            /** @return Original per-lane measurement without aggregation or changed attribution. */
+            std::optional<ExpertTierProjectionTransferMeasurement> completedMeasurement() const noexcept override
+            { return operation_->completedMeasurement(); }
+            /** @return Same underlying bound quote; source retention does not replace byte authority. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override
+            { return operation_->quotedPayloadBytes(); }
+        private:
+            /** @brief Consume this operation's one terminal completion edge. */
+            MoEOverlayResidencyWaveProgress observe(MoEOverlayResidencyWaveProgress progress) noexcept
+            {
+                if (progress == MoEOverlayResidencyWaveProgress::Ready && !complete_)
+                { complete_ = true; source_->completePiece(); }
+                return progress;
+            }
+            std::unique_ptr<IMoEOverlayTierTransferOperation> operation_;
+            std::shared_ptr<RetainedPhysicalSourceMember> source_;
+            bool complete_ = false;
+        };
+
+        /** @brief Actual final-role storage shared by all of its independent physical pieces. */
+        struct DestinationProjectionStorage
+        {
+            std::shared_ptr<ITensorGemm> engine;
+            std::shared_ptr<std::mutex> encoded_write_mutex = std::make_shared<std::mutex>();
+        };
+        /** @brief Coverage completion and storage are separate to avoid a shared-owner cycle. */
+        struct DestinationProjectionGroup
+        {
+            std::shared_ptr<DestinationProjectionStorage> storage;
+            std::shared_ptr<MoEOverlayPreparedProjectionCompletion> completion;
+        };
+
         /** @brief Complete local destination reservation for one migration. */
         struct ReservedDestination
         {
@@ -2858,7 +3231,7 @@ namespace llaminar2
                 staging_capacity_bytes < layout.cpu_block_stride)
             {
                 throw std::runtime_error(
-                    "ExpertOverlay staging capacity cannot hold one CPU NativeVNNI unit");
+                    "ExpertOverlay staging capacity cannot hold one CPU NativeQuantised unit");
             }
             return static_cast<std::uint32_t>(std::min<std::size_t>(
                 layout.unit_count,
@@ -2867,8 +3240,8 @@ namespace llaminar2
 
         /** @brief Require identical final CPU representations before NUMA copy. */
         void requireCompatibleCpuWeights(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &destination)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &destination)
         {
             if (source.N != destination.N || source.K != destination.K ||
                 source.N_padded != destination.N_padded ||
@@ -2897,7 +3270,7 @@ namespace llaminar2
             std::uint8_t payload_bytes,
             bool is_asymmetric,
             bool has_emins,
-            NativeVnniSourceIdentity source_identity)
+            NativeQuantisedSourceIdentity source_identity)
         {
             if (projection.spec.N != N || projection.spec.K != K ||
                 projection.spec.payload_bytes_per_block < payload_bytes ||
@@ -2908,14 +3281,14 @@ namespace llaminar2
                     "ExpertOverlay GPU shadow slot cannot represent an arriving projection");
             }
 
-            DeviceNativeVNNIMatrixDesc descriptor;
-            descriptor.payload = projection.slot.d_native_vnni_payload;
-            descriptor.scales = projection.slot.d_native_vnni_scales;
+            DeviceNativeQuantisedMatrixDesc descriptor;
+            descriptor.payload = projection.slot.d_native_quantised_payload;
+            descriptor.scales = projection.slot.d_native_quantised_scales;
             descriptor.mins = is_asymmetric
-                                  ? projection.slot.d_native_vnni_mins
+                                  ? projection.slot.d_native_quantised_mins
                                   : nullptr;
             descriptor.emins = has_emins
-                                   ? projection.slot.d_native_vnni_emins
+                                   ? projection.slot.d_native_quantised_emins
                                    : nullptr;
             descriptor.n = N;
             descriptor.k = K;
@@ -2956,7 +3329,7 @@ namespace llaminar2
             DeviceId device,
             const GpuExpertPackedDescriptor &descriptor,
             std::shared_ptr<void> lifetime,
-            NativeVnniSourceIdentity source_identity)
+            NativeQuantisedSourceIdentity source_identity)
         {
             if (!lifetime || !source_identity.present)
                 throw std::invalid_argument(
@@ -2976,7 +3349,7 @@ namespace llaminar2
                     descriptor.blocks_per_row,
                     std::move(lifetime),
                     source_identity,
-                    NativeVnniReusableDeviceAllocationFormat{
+                    NativeQuantisedReusableDeviceAllocationFormat{
                         .payload_bytes_per_block =
                             descriptor.allocation_payload_bytes_per_block,
                         .has_mins = descriptor.allocation_has_mins,
@@ -2999,7 +3372,7 @@ namespace llaminar2
                     descriptor.blocks_per_row,
                     std::move(lifetime),
                     source_identity,
-                    NativeVnniReusableDeviceAllocationFormat{
+                    NativeQuantisedReusableDeviceAllocationFormat{
                         .payload_bytes_per_block =
                             descriptor.allocation_payload_bytes_per_block,
                         .has_mins = descriptor.allocation_has_mins,
@@ -3022,7 +3395,7 @@ namespace llaminar2
                 format.floatingElementBytes();
             if (!type || projection.spec.format != format ||
                 projection.spec.N <= 0 || projection.spec.K <= 0 ||
-                !projection.slot.d_native_vnni_payload ||
+                !projection.slot.d_native_quantised_payload ||
                 element_bytes == 0)
             {
                 throw std::runtime_error(
@@ -3033,7 +3406,7 @@ namespace llaminar2
                 static_cast<std::size_t>(projection.spec.K) *
                 element_bytes;
             ContiguousFloatingPointWeightDescriptor descriptor{
-                .data = projection.slot.d_native_vnni_payload,
+                .data = projection.slot.d_native_quantised_payload,
                 .type = *type,
                 .n = projection.spec.N,
                 .k = projection.spec.K,
@@ -3117,6 +3490,56 @@ namespace llaminar2
                 "ExpertOverlay GPU floating destination backend was not built");
         }
 
+        /**
+         * @brief Create exactly one final native GPU role owner and verify every later piece agrees.
+         * @param storage Same destination-member/role storage, never an independent per-piece engine.
+         * @param device Original exact destination GPU.
+         * @param descriptor Complete final local root descriptor, not compact wire dimensions.
+         * @param lifetime Existing reserved final-slot authority.
+         * @param source Original mathematical codebook identity.
+         * @return Same genuine final engine control block for all pieces.
+         */
+        std::shared_ptr<ITensorGemm> retainNativeGpuDestination(
+            DestinationProjectionStorage &storage, DeviceId device,
+            const GpuExpertPackedDescriptor &descriptor, std::shared_ptr<void> lifetime,
+            NativeQuantisedSourceIdentity source)
+        {
+            if (!storage.engine)
+                storage.engine = makeGpuDestinationEngine(device, descriptor, std::move(lifetime), source);
+            MoEOverlayPreparedWeightSource actual;
+            std::string error;
+            if (!resolveMoEOverlayPreparedWeightSource(storage.engine, device, actual, &error) ||
+                actual.kind != MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeQuantised ||
+                actual.format.native_quantised != source)
+                throw std::invalid_argument("Final GPU role owner changed its original native source identity");
+            const auto &a = actual.gpu_packed, &b = descriptor;
+            if (a.ptrs.d_vnni != b.ptrs.d_vnni || a.ptrs.d_scales != b.ptrs.d_scales ||
+                a.ptrs.d_mins != b.ptrs.d_mins || a.ptrs.d_emins != b.ptrs.d_emins || a.n != b.n || a.k != b.k ||
+                a.blocks_per_row != b.blocks_per_row || a.codebook_id != b.codebook_id ||
+                a.payload_bytes_per_block != b.payload_bytes_per_block || a.is_asymmetric != b.is_asymmetric ||
+                a.has_emins != b.has_emins || a.vnni_bytes != b.vnni_bytes || a.scales_bytes != b.scales_bytes ||
+                a.mins_bytes != b.mins_bytes || a.emins_bytes != b.emins_bytes)
+                throw std::invalid_argument("Physical pieces disagree on one final GPU role allocation/encoding");
+            return storage.engine;
+        }
+
+        /** @brief Retain exactly one final floating GPU root; compact pieces never alter its stride. */
+        std::shared_ptr<ITensorGemm> retainFloatingGpuDestination(
+            DestinationProjectionStorage &storage, DeviceId device,
+            const ContiguousFloatingPointWeightDescriptor &descriptor, std::shared_ptr<void> lifetime)
+        {
+            if (!storage.engine)
+                storage.engine = makeGpuFloatingDestinationEngine(device, descriptor, std::move(lifetime));
+            MoEOverlayPreparedWeightSource actual;
+            std::string error;
+            if (!resolveMoEOverlayPreparedWeightSource(storage.engine, device, actual, &error) ||
+                !actual.format.isFloating() || actual.floating.data != descriptor.data ||
+                actual.floating.n != descriptor.n || actual.floating.k != descriptor.k ||
+                actual.floating.type != descriptor.type || actual.floating.bytes != descriptor.bytes)
+                throw std::invalid_argument("Physical pieces disagree on one final floating GPU role allocation");
+            return storage.engine;
+        }
+
         /** @brief Compare source geometry/provenance independent of execution layout. */
         ProjectionSignature signatureFor(
             const MoEOverlayPreparedWeightSource &source)
@@ -3124,14 +3547,14 @@ namespace llaminar2
             ProjectionSignature signature;
             signature.format = source.format;
             if (source.kind ==
-                    MoEOverlayPreparedWeightSourceKind::CpuNativeVnni)
+                    MoEOverlayPreparedWeightSourceKind::CpuNativeQuantised)
             {
                 signature.N = source.cpu_packed->N;
                 signature.K = source.cpu_packed->K;
             }
             else if (source.kind ==
                      MoEOverlayPreparedWeightSourceKind::
-                         GpuSeparatedNativeVnni)
+                         GpuSeparatedNativeQuantised)
             {
                 signature.N = source.gpu_packed.n;
                 signature.K = source.gpu_packed.k;
@@ -3171,7 +3594,7 @@ namespace llaminar2
         {
             std::vector<AdoptedInitialExpertSlotRecycler::InitialSlot> result;
             result.reserve(residentCount(layer));
-            for (std::size_t expert = 0; expert < layer.experts.size(); ++expert)
+            for (std::size_t expert = 0; expert < layer.resident_mask.size(); ++expert)
             {
                 if (!layer.resident_mask[expert])
                     continue;
@@ -3186,7 +3609,7 @@ namespace llaminar2
                     MoEOverlayPreparedWeightSource source;
                     std::string source_error;
                     if (!resolveMoEOverlayPreparedWeightSource(
-                            projectionEngine(layer.experts[expert], projection),
+                            projectionEngine(layer, expert, projection),
                             device,
                             source,
                             &source_error))
@@ -3222,7 +3645,7 @@ namespace llaminar2
                         {
                             adopted.cpu_destination =
                                 source.engine
-                                    ->exportRetiredCPUNativeVNNIStorage();
+                                    ->exportRetiredCPUNativeQuantisedStorage();
                             if (!source.cpu_packed ||
                                 adopted.cpu_destination.empty() ||
                                 adopted.cpu_destination.data() !=
@@ -3231,7 +3654,7 @@ namespace llaminar2
                                     source.cpu_packed->native_interleaved.size())
                             {
                                 throw std::runtime_error(
-                                    "ExpertOverlay initial CPU NativeVNNI engine cannot expose its exact recyclable final storage");
+                                    "ExpertOverlay initial CPU NativeQuantised engine cannot expose its exact recyclable final storage");
                             }
                         }
                     }
@@ -3247,7 +3670,7 @@ namespace llaminar2
                                 .format = source.format,
                             };
                             projection_slot.slot = {
-                                .d_native_vnni_payload =
+                                .d_native_quantised_payload =
                                     static_cast<std::uint8_t *>(
                                         const_cast<void *>(
                                             source.floating.data)),
@@ -3261,9 +3684,9 @@ namespace llaminar2
                             continue;
                         }
                         const auto *source_format =
-                            native_vnni_formats::forSourceIdentity(
-                                source.format.native_vnni.codebook_id,
-                                source.format.native_vnni.is_superblock);
+                            native_quantised_formats::forSourceIdentity(
+                                source.format.native_quantised.codebook_id,
+                                source.format.native_quantised.is_superblock);
                         if (!source_format)
                         {
                             throw std::runtime_error(
@@ -3286,7 +3709,7 @@ namespace llaminar2
                                 " expert=" + std::to_string(expert) +
                                 " projection=" + projectionName(projection) +
                                 " source_codebook=" +
-                                std::to_string(source.format.native_vnni.codebook_id) +
+                                std::to_string(source.format.native_quantised.codebook_id) +
                                 " observed_payload_bytes_per_block=" +
                                 std::to_string(source.gpu_packed.allocation_payload_bytes_per_block) +
                                 " expected_payload_bytes_per_block=" +
@@ -3315,13 +3738,13 @@ namespace llaminar2
                             .format = source.format,
                         };
                         projection_slot.slot = {
-                            .d_native_vnni_payload =
+                            .d_native_quantised_payload =
                                 source.gpu_packed.ptrs.d_vnni,
-                            .d_native_vnni_scales =
+                            .d_native_quantised_scales =
                                 source.gpu_packed.ptrs.d_scales,
-                            .d_native_vnni_mins =
+                            .d_native_quantised_mins =
                                 source.gpu_packed.ptrs.d_mins,
-                            .d_native_vnni_emins =
+                            .d_native_quantised_emins =
                                 source.gpu_packed.ptrs.d_emins,
                             .payload_bytes =
                                 source.gpu_packed.allocationPayloadBytes(),
@@ -3349,7 +3772,7 @@ namespace llaminar2
             std::span<const std::uint8_t>,
             kMoEOverlayRemoteProjectionRegionCount>
         remoteCpuSourceRegions(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &packed)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &packed)
         {
             return {
                 std::span<const std::uint8_t>(
@@ -3413,9 +3836,12 @@ namespace llaminar2
                 execution_fingerprint,
             const std::vector<MoEOverlayTierMigration> &migrations,
             std::size_t migration_index,
-            ExpertTierWeightProjection projection)
+            const MoEOverlayPhysicalProjectionPiece &piece,
+            const MoEExpertOwnerMap &topology)
         {
             const auto &migration = migrations[migration_index];
+            const auto &source = *topology.participantForId(piece.source_participant);
+            const auto &destination = *topology.participantForId(piece.destination_participant);
             return {
                 .expected_epoch = expected_epoch,
                 .candidate_epoch = candidate_epoch,
@@ -3423,16 +3849,16 @@ namespace llaminar2
                 .migration_index = migration_index,
                 .layer_idx = migration.layer_idx,
                 .expert_id = migration.expert_id,
-                .projection = projection,
+                .projection = piece.projection,
                 .source_participant =
-                    migration.source.owner_participant,
+                    piece.source_participant,
                 .destination_participant =
-                    migration.destination.owner_participant,
-                .source_world_rank = migration.source.owner_world_rank,
+                    piece.destination_participant,
+                .source_world_rank = source.world_rank,
                 .destination_world_rank =
-                    migration.destination.owner_world_rank,
-                .source_device = migration.source.device,
-                .destination_device = migration.destination.device,
+                    destination.world_rank,
+                .source_device = source.device,
+                .destination_device = destination.device,
             };
         }
     } // namespace
@@ -3449,6 +3875,9 @@ namespace llaminar2
             Failed,  ///< First terminal failure is sticky and unrecoverable.
         };
 
+        /** Original authenticated layer metadata retained from model-time pool construction. */
+        std::vector<MoEOverlayLayerWeightManifest> original_layer_manifests;
+        MoEOverlayPhysicalLaneDemandPlan lane_demand_plan;
         std::map<EndpointLayerKey, EndpointLayerPool> endpoint_pools;
         std::map<EdgeKey, std::shared_ptr<SharedWeightLanePool>> weight_lanes;
         std::map<EdgeKey, std::shared_ptr<SharedBlobLanePool>> blob_lanes;
@@ -3548,12 +3977,61 @@ namespace llaminar2
             };
         }
 
+        /** @return Existing immutable cached directed fact; this never probes a native backend. */
+        std::optional<bool> observedGpuPeerAccess(DeviceId destination,DeviceId source)
+        {
+            return DeviceManager::instance().peerAccessAvailable(destination,source);
+        }
+
+        /**
+         * @brief Authenticate the complete original source/choice declaration before pool creators.
+         * @param config Original source/PMA setup, with no live ownership or byte decisions.
+         * @param impl Retains the exact validated declaration for all later creators.
+         * @throws std::exception For missing/foreign source geometry or changed directed evidence.
+         */
+        void authenticatePhysicalLaneDemand(const MoEOverlayPhysicalResidencyFabric::Config& config,
+            MoEOverlayPhysicalResidencyFabric::Impl& impl)
+        {
+            if(!config.initial_snapshot->placement_plan)
+                throw std::logic_error("Physical lane setup lost the original declared topology");
+            const int world_rank=config.memory_authority->worldRank();
+            const auto lane_scope=config.remote_projection_transport
+                ?MoEOverlayPhysicalLaneScope::communicator(config.remote_projection_transport->worldSize())
+                :MoEOverlayPhysicalLaneScope::rankLocal(world_rank);
+            impl.lane_demand_plan=configuredMoEOverlayLaneDemand(*config.initial_snapshot->placement_plan,
+                impl.original_layer_manifests,originalFabricGeometry(config).expertCount(),lane_scope,
+                config.maximum_concurrent_cycles,config.maximum_cycles_per_layer);
+            const auto local_ids=config.registry->localParticipantIds();
+            std::map<DeviceId,size_t> actual_gpu_streams;
+            for(const auto id:local_ids) {
+                const auto endpoint=config.registry->endpoint(id);
+                if(!endpoint)throw std::logic_error("Physical stream owner is missing its original local endpoint");
+                if(endpoint->device().is_gpu()) {
+                    auto& count=actual_gpu_streams[endpoint->device()];
+                    count=checkedMoEOverlayLaneAdd(count,config.maximum_execution_streams);
+                }
+            }
+            const auto declared_streams=MoEOverlayCapacityAdmission::executionStreamCounts(
+                *config.initial_snapshot->placement_plan,world_rank,config.maximum_execution_streams);
+            if(actual_gpu_streams!=declared_streams)
+                throw std::invalid_argument("Physical movement GPU cohort differs from its original bound participant roster");
+            impl.lane_demand_plan.original_execution_streams=declared_streams;
+            const bool local_gpu=!actual_gpu_streams.empty();
+            if(local_gpu) {
+                if(declared_streams.empty())throw std::invalid_argument("Physical GPU stream owners are not bound to their original PMA rank");
+                requireOriginalMoEOverlayGpuDemand(config.physical_gpu_lane_demand.get(),impl.lane_demand_plan,
+                    world_rank,observedGpuPeerAccess);
+                impl.lane_demand_plan=*config.physical_gpu_lane_demand;
+            }
+        }
+
         /** @brief Materialize every local endpoint/layer from one model manifest. */
         void materializeEndpointPools(
             const MoEOverlayPhysicalResidencyFabric::Config &config,
             MoEOverlayPhysicalResidencyFabric::Impl &impl)
         {
-            const auto local_ids = config.registry->localParticipantIds();
+
+            const auto local_ids=config.registry->localParticipantIds();
             std::map<int, LayerProjectionSignatures> model_signatures;
             std::map<
                 int,
@@ -3562,7 +4040,7 @@ namespace llaminar2
             std::vector<MoEOverlayDeviceInitialPhysicalSlot>
                 initial_device_slots;
 
-            const auto &ownership = config.initial_snapshot->layered_ownership;
+            const auto ownership = originalFabricGeometry(config);
             if (!config.layer_weight_manifest.empty())
             {
                 if (config.layer_weight_manifest.size() !=
@@ -3608,7 +4086,7 @@ namespace llaminar2
             {
                 const auto endpoint = config.registry->endpoint(participant_id);
                 const auto *participant =
-                    config.initial_snapshot->owner_map.participantForId(
+                    config.initial_snapshot->placementOwnerMap().participantForId(
                         participant_id);
                 const auto bank = endpoint
                                       ? endpoint->acquire(
@@ -3628,54 +4106,79 @@ namespace llaminar2
                 }
                 initial_banks.emplace(participant_id, bank);
 
-                for (int layer_idx = endpoint->firstModelLayer();
-                     layer_idx < endpoint->endModelLayer();
-                     ++layer_idx)
+                for (int layer_idx = endpoint->firstModelLayer(); layer_idx < endpoint->endModelLayer(); ++layer_idx)
                 {
-                    const auto &layer =
-                        bank->layerForModelLayer(layer_idx);
-                    for (std::size_t expert = 0;
-                         expert < layer.experts.size();
-                         ++expert)
+                    const auto &layer = bank->layerForModelLayer(layer_idx);
+                    std::optional<MoEOverlayLayerWeightManifest> local_fragment;
+                    if (layer.cpu_fragment_family)
                     {
-                        if (!layer.resident_mask[expert])
-                            continue;
-                        initial_device_slots.push_back({
-                            .key = {
-                                .participant_id = participant_id,
-                                .layer_idx = layer_idx,
-                                .expert_id = static_cast<int>(expert),
-                            },
-                            .entered_epoch =
-                                config.initial_snapshot->epoch,
-                            .bootstrap_allocation = true,
-                            .payload = layer.experts[expert],
-                        });
+                        const auto &family = *layer.cpu_fragment_family;
+                        const auto source_preparation = config.initial_snapshot->originalProjectionPreparation();
+                        const auto &prepared = family.preparation();
+                        if (!endpoint->device().is_cpu() || !source_preparation ||
+                            prepared.get() != source_preparation.get() ||
+                            prepared.owner_before(source_preparation) || source_preparation.owner_before(prepared) ||
+                            !family.cohort() || family.participantIndex() >= family.cohort()->participants().size() ||
+                            family.cohort()->participants()[family.participantIndex()].participant_id != participant_id ||
+                            family.cohort()->source().layer_idx != layer_idx ||
+                            family.cohort()->ownership(family.participantIndex()).geometry().experts != ownership.expertCount())
+                            throw std::invalid_argument("Physical initial CPU fragment bank lost its original preparation/member geometry");
+                        for (const auto &projection : family.cohort()->source().projections)
+                            mergeProjectionSignature(model_signatures, layer_idx, projection.projection,
+                                {.N = projection.N, .K = projection.K, .format = projection.format});
+                        local_fragment = family.cohort()->localManifest(family.participantIndex());
+                    }
+                    for (std::size_t expert = 0; expert < layer.resident_mask.size(); ++expert)
+                    {
+                        if (!layer.resident_mask[expert]) continue;
+                        if (!local_fragment)
+                            initial_device_slots.push_back({
+                                .key = {.participant_id = participant_id, .layer_idx = layer_idx,
+                                    .expert_id = static_cast<int>(expert)},
+                                .entered_epoch = config.initial_snapshot->epoch,
+                                .bootstrap_allocation = true, .payload = layer.experts.at(expert)});
                         for (const auto projection : kProjections)
                         {
                             MoEOverlayPreparedWeightSource source;
                             std::string source_error;
                             if (!resolveMoEOverlayPreparedWeightSource(
-                                    projectionEngine(
-                                        layer.experts[expert], projection),
-                                    endpoint->device(),
-                                    source,
-                                    &source_error))
+                                    projectionEngine(layer, expert, projection), endpoint->device(), source, &source_error))
+                                throw std::runtime_error(source_error.empty()
+                                    ? "ExpertOverlay initial engine cannot source migration" : source_error);
+                            const auto signature = signatureFor(source);
+                            if (local_fragment)
                             {
-                                throw std::runtime_error(
-                                    source_error.empty()
-                                        ? "ExpertOverlay initial engine cannot source migration"
-                                        : source_error);
+                                const auto local = std::find_if(local_fragment->projections.begin(), local_fragment->projections.end(),
+                                    [projection](const auto &entry) { return entry.projection == projection; });
+                                if (local == local_fragment->projections.end() || signature.N != local->N ||
+                                    signature.K != local->K || signature.format != local->format)
+                                    throw std::invalid_argument("Physical CPU source engine differs from original member-local manifest");
                             }
-                            mergeProjectionSignature(
-                                model_signatures,
-                                layer_idx,
-                                projection,
-                                signatureFor(source));
+                            else mergeProjectionSignature(model_signatures, layer_idx, projection, signature);
                         }
                     }
                 }
             }
+
+            // Retain the already authenticated source contract once. This is
+            // immutable geometry, not a second live residency or byte ledger.
+            for (const auto &[layer, _] : model_signatures)
+            {
+                const auto signatures = requireLayerSignatures(model_signatures, layer);
+                MoEOverlayLayerWeightManifest source{.layer_idx = layer};
+                for (const auto role : kProjections)
+                {
+                    const auto index = projectionIndex(role);
+                    source.projections[index] = {.projection = role,
+                        .N = signatures[index].N, .K = signatures[index].K,
+                        .format = signatures[index].format};
+                }
+                impl.original_layer_manifests.push_back(std::move(source));
+            }
+
+            // The preceding pass is declarative source authentication only.
+            // Reject changed GPU incidence before any shadow/event/stream creator.
+            authenticatePhysicalLaneDemand(config,impl);
 
             /*
              * From this point onward the device path resolves sources through
@@ -3690,11 +4193,11 @@ namespace llaminar2
                         .local_participant_ids = local_ids,
                         .initial_slots = std::move(initial_device_slots),
                         .first_model_layer =
-                            config.initial_snapshot->layered_ownership.firstModelLayer(),
+                            ownership.firstModelLayer(),
                         .num_layers = static_cast<std::uint32_t>(
-                            config.initial_snapshot->layered_ownership.layerCount()),
+                            ownership.layerCount()),
                         .num_experts = static_cast<std::uint32_t>(
-                            config.initial_snapshot->layered_ownership.expertCount()),
+                            ownership.expertCount()),
                     });
 
             /*
@@ -3710,7 +4213,7 @@ namespace llaminar2
             {
                 const auto endpoint = config.registry->endpoint(participant_id);
                 const auto *participant =
-                    config.initial_snapshot->owner_map.participantForId(
+                    config.initial_snapshot->placementOwnerMap().participantForId(
                         participant_id);
                 const auto bank_found = initial_banks.find(participant_id);
                 if (!endpoint || !participant ||
@@ -3732,8 +4235,16 @@ namespace llaminar2
                      layer_idx < endpoint->endModelLayer();
                      ++layer_idx)
                 {
-                    const auto signatures = requireLayerSignatures(
-                        model_signatures, layer_idx);
+                    auto signatures = requireLayerSignatures(model_signatures, layer_idx);
+                    const auto &member_layer = bank_found->second->layerForModelLayer(layer_idx);
+                    if (member_layer.cpu_fragment_family)
+                    {
+                        const auto &family = *member_layer.cpu_fragment_family;
+                        const auto local = family.cohort()->localManifest(family.participantIndex());
+                        for (const auto &projection : local.projections)
+                            signatures[projectionIndex(projection.projection)] = {
+                                .N = projection.N, .K = projection.K, .format = projection.format};
+                    }
                     layers_by_geometry[ExpertGeometryKey{signatures}]
                         .push_back(layer_idx);
                 }
@@ -3853,7 +4364,7 @@ namespace llaminar2
                                 .K = signature.K,
                                 .format = signature.format,
                             };
-                            if (signature.format.isNativeVnni())
+                            if (signature.format.isNativeQuantised())
                             {
                                 /*
                                  * Expanded CPU arrivals need 32 payload bytes;
@@ -3865,7 +4376,7 @@ namespace llaminar2
                                 spec.is_asymmetric = true;
                                 spec.has_emins = true;
                                 spec.codebook_id =
-                                    canonicalDeviceVnniCodebookId(signature.format.native_vnni);
+                                    canonicalDeviceVnniCodebookId(signature.format.native_quantised);
                             }
                             specs.push_back(std::move(spec));
                         }
@@ -3920,41 +4431,30 @@ namespace llaminar2
                    projectionName(key.projection);
         }
 
-        /**
-         * @brief Decide whether one exact GPU edge may use direct device access.
-         *
-         * Same-device copies are ordinary D2D operations.  A different-device
-         * edge is direct only when the destination (which owns the transfer
-         * stream) can address the source allocation.  Missing topology is a
-         * setup error rather than permission to discover an implicit runtime
-         * fallback while inference is live.
-         */
-        bool gpuEdgeUsesDirectPeer(DeviceId source, DeviceId destination)
-        {
-            if (!source.is_gpu() || !destination.is_gpu() ||
-                source.type != destination.type)
-            {
-                return false;
-            }
-            if (source == destination)
-                return true;
-            const auto access = DeviceManager::instance().peerAccessAvailable(
-                destination,
-                source);
-            if (!access.has_value())
-            {
-                throw std::runtime_error(
-                    "ExpertOverlay could not resolve directed peer access for " +
-                    destination.to_string() + " -> " + source.to_string());
-            }
-            return *access;
-        }
+
 
         /** @brief Materialize every independently runnable local/remote GPU lane. */
         void materializeTransferLanes(
             const MoEOverlayPhysicalResidencyFabric::Config &config,
             MoEOverlayPhysicalResidencyFabric::Impl &impl)
         {
+            const int world_rank=config.memory_authority->worldRank();
+            const auto gpuEdgeUsesDirectPeer=[&](DeviceId source,DeviceId destination){
+                if(!source.is_gpu() || !destination.is_gpu())return false;
+                return admittedMoEOverlayDirectGpuPeer(impl.lane_demand_plan,source,destination);
+            };
+            const auto lane_counts=impl.lane_demand_plan.materializedCounts();
+            const auto count=[&](MoEOverlayPhysicalLaneKey key){const auto found=lane_counts.find(key);
+                return found==lane_counts.end()?size_t{0}:found->second;};
+            const auto local_count=[&](DeviceId source,DeviceId destination,ExpertTierWeightProjection role){
+                return count({.kind=MoEOverlayPhysicalLaneKind::LocalDevice,.world_rank=world_rank,
+                    .source=source,.destination=destination,.projection=role});};
+            const auto local_total=[&](DeviceId source,DeviceId destination){size_t total=0;
+                for(const auto role:kProjections)total=checkedMoEOverlayLaneAdd(total,local_count(source,destination,role));return total;};
+            const auto remote_count=[&](DeviceId device,RemoteGpuLaneRole direction,ExpertTierWeightProjection role){
+                return count({.kind=direction==RemoteGpuLaneRole::Source?MoEOverlayPhysicalLaneKind::RemoteSource:MoEOverlayPhysicalLaneKind::RemoteDestination,
+                    .world_rank=world_rank,.source=direction==RemoteGpuLaneRole::Source?device:DeviceId::invalid(),
+                    .destination=direction==RemoteGpuLaneRole::Destination?device:DeviceId::invalid(),.projection=role});};
             const auto local_ids = config.registry->localParticipantIds();
             std::map<DeviceId, std::size_t> participant_multiplicity;
             std::map<GlobalDeviceAddress, std::size_t>
@@ -3963,7 +4463,7 @@ namespace llaminar2
             {
                 const auto endpoint = config.registry->endpoint(participant_id);
                 const auto *participant =
-                    config.initial_snapshot->owner_map.participantForId(
+                    config.initial_snapshot->placementOwnerMap().participantForId(
                         participant_id);
                 if (!endpoint || !participant)
                     throw std::logic_error(
@@ -3987,27 +4487,14 @@ namespace llaminar2
                 return multiplicity * config.maximum_concurrent_cycles;
             };
 
-            const auto physicalStreamCount = [&](std::size_t multiplicity)
-            {
-                if (multiplicity == 0u ||
-                    config.maximum_execution_streams == 0u ||
-                    multiplicity >
-                        std::numeric_limits<std::size_t>::max() /
-                            config.maximum_execution_streams)
-                {
-                    throw std::overflow_error(
-                        "ExpertOverlay physical stream-pool geometry overflowed");
-                }
-                return multiplicity * config.maximum_execution_streams;
-            };
+            const auto& execution_stream_counts=impl.lane_demand_plan.original_execution_streams;
 
             /*
-             * One physical participant can take part once in every admitted
-             * cycle. Gate/up/down projections and source/destination roles are
-             * separate logical operations, but multiplying HIP/CUDA streams by
-             * those roles does not create additional hardware queues. Bind all
-             * compatible operations to the same typed participant/cycle lane;
-             * their staging and completion events remain independent.
+             * A complete placement target can take part once in a canonical
+             * cycle, but its original members may require several real pieces.
+             * Staging and command identities consume the shared piece plan.
+             * Execution streams retain the declared physical stream policy;
+             * multiplying pieces does not create additional hardware queues.
              */
             std::map<
                 DeviceId,
@@ -4022,9 +4509,10 @@ namespace llaminar2
                     device,
                     TransferEngine::instance()
                         .allocatePersistentTransferExecutionLanes(
-                            physicalStreamCount(multiplicity),
+                            execution_stream_counts.at(device),
                             device,
-                            "moe_overlay_physical_fabric"));
+                            "moe_overlay_physical_fabric",
+                            GPUDeviceContextPool::instance().retainExistingPreparedContext(device,config.memory_authority)));
             }
             const auto executionLane = [&execution_lanes](
                                            DeviceId device,
@@ -4074,6 +4562,7 @@ namespace llaminar2
                                   destination_multiplicity] :
                      participant_multiplicity)
                 {
+                    if(!local_total(source_device,destination_device))continue;
                     if (!source_device.is_gpu() ||
                         !destination_device.is_gpu() ||
                         (source_device == destination_device &&
@@ -4083,23 +4572,16 @@ namespace llaminar2
                     {
                         continue;
                     }
-                    const std::size_t lane_count = parallelLaneCount(
-                        source_device == destination_device
-                            ? source_multiplicity
-                            : std::min(
-                                  source_multiplicity,
-                                  destination_multiplicity));
+                    const std::size_t projection_lanes=local_total(source_device,destination_device);
                     constexpr std::size_t slots_per_lane = 2u;
-                    if (lane_count >
-                        std::numeric_limits<std::size_t>::max() /
-                            slots_per_lane /
-                            kProjections.size())
+                    if (projection_lanes >
+                        std::numeric_limits<std::size_t>::max() / slots_per_lane)
                     {
                         throw std::overflow_error(
                             "ExpertOverlay retained progress edge geometry overflowed");
                     }
                     const std::size_t edge_slots =
-                        lane_count * slots_per_lane * kProjections.size();
+                        projection_lanes * slots_per_lane;
                     addProgressSlots(source_device, edge_slots);
                     addProgressSlots(destination_device, edge_slots);
                 }
@@ -4117,14 +4599,20 @@ namespace llaminar2
                     const auto gpu = source.is_gpu() ? source : destination;
                     if (!gpu.is_cuda())
                         continue; // HIP uses the independently progressing SDMA mechanism.
-                    const auto count = parallelLaneCount(std::min(source_count, destination_count));
-                    addProgressSlots(gpu, count * kProjections.size() * 2u);
+                    const auto operations=local_total(source,destination);
+                    if(operations>std::numeric_limits<size_t>::max()/2u)throw std::overflow_error("Local mapped lane demand overflow");
+                    addProgressSlots(gpu,operations*2u);
                 }
             }
             if (config.remote_projection_transport)
                 for (const auto &[device, count] : participant_multiplicity)
-                    if (device.is_cuda())
-                        addProgressSlots(device, parallelLaneCount(count) * kProjections.size() * 4u);
+                    if (device.is_cuda()) {
+                        size_t operations=0;
+                        for(const auto role:kProjections)for(const auto direction:{RemoteGpuLaneRole::Source,RemoteGpuLaneRole::Destination})
+                            operations=checkedMoEOverlayLaneAdd(operations,remote_count(device,direction,role));
+                        if(operations>std::numeric_limits<size_t>::max()/2u)throw std::overflow_error("Remote mapped lane demand overflow");
+                        addProgressSlots(device,operations*2u);
+                    }
 
             for (const auto &[device, slot_capacity] : progress_slot_demand)
             {
@@ -4211,17 +4699,15 @@ namespace llaminar2
                      * returned expert from a shadow slot into a loader-era
                      * allocation without synchronizing the device.
                      */
-                    const std::size_t lane_count = parallelLaneCount(
-                        source_device == destination_device
-                            ? source_multiplicity
-                            : std::min(
-                                  source_multiplicity,
-                                  destination_multiplicity));
+                    std::size_t maximum_role_lanes=0;
+                    for(const auto role:kProjections)maximum_role_lanes=std::max(maximum_role_lanes,local_count(source_device,destination_device,role));
                     maximum_parallel_lanes = std::max(
-                        maximum_parallel_lanes, lane_count);
+                        maximum_parallel_lanes, maximum_role_lanes);
 
                     for (const auto projection : kProjections)
                     {
+                        const size_t lane_count=local_count(source_device,destination_device,projection);
+                        if(!lane_count)continue;
                         const EdgeKey key{
                             .source = source_device,
                             .destination = destination_device,
@@ -4447,19 +4933,21 @@ namespace llaminar2
                      * during inference unless two logical participants share
                      * this address and an ordinary cycle legitimately uses it.
                      */
-                    const std::size_t lane_count = parallelLaneCount(
-                        source_address == destination_address
-                            ? source_multiplicity
-                            : std::min(
-                                  source_multiplicity,
-                                  destination_multiplicity));
+                    size_t maximum_role_lanes=0;
+                    const auto cpu_count=[&](ExpertTierWeightProjection role){return count({
+                        .kind=MoEOverlayPhysicalLaneKind::LocalCPUWorker,.world_rank=world_rank,
+                        .source=source_address.toLocalDeviceId(),.destination=destination_address.toLocalDeviceId(),
+                        .source_address=source_address,.destination_address=destination_address,.projection=role});};
+                    for(const auto role:kProjections)maximum_role_lanes=std::max(maximum_role_lanes,cpu_count(role));
                     maximum_parallel_cpu_lanes = std::max(
-                        maximum_parallel_cpu_lanes, lane_count);
+                        maximum_parallel_cpu_lanes, maximum_role_lanes);
                     maximum_parallel_lanes = std::max(
-                        maximum_parallel_lanes, lane_count);
+                        maximum_parallel_lanes, maximum_role_lanes);
 
                     for (const auto projection : kProjections)
                     {
+                        const size_t lane_count=cpu_count(projection);
+                        if(!lane_count)continue;
                         const CpuAddressEdgeKey key{
                             .source = source_address,
                             .destination = destination_address,
@@ -4515,24 +5003,24 @@ namespace llaminar2
                 return;
 
             /*
-             * Cross-rank edges are not known until histogram-driven placement
-             * chooses a transaction. Each logical participant on a local GPU
-             * can appear once per closed cycle, so every role owns that exact
-             * multiplicity times the concurrent-cycle cap.
+             * Actual cross-rank fanout and the existing retained role ports
+             * are separate requirements in the same immutable setup plan.
+             * Every independently writable piece gets a real lane; neither a
+             * cohort's absent scalar owner nor storage capacity is its extent.
              */
             for (const auto &[device, multiplicity] : participant_multiplicity)
             {
                 if (!device.is_gpu())
                     continue;
-                const std::size_t lane_count = parallelLaneCount(multiplicity);
-                maximum_parallel_lanes = std::max(
-                    maximum_parallel_lanes, lane_count);
                 for (const auto projection : kProjections)
                 {
                     for (const auto role : {
                              RemoteGpuLaneRole::Source,
                              RemoteGpuLaneRole::Destination})
                     {
+                        const size_t lane_count=remote_count(device,role,projection);
+                        if(!lane_count)continue;
+                        maximum_parallel_lanes=std::max(maximum_parallel_lanes,lane_count);
                         const RemoteGpuLaneKey key{
                             .device = device,
                             .projection = projection,
@@ -4552,7 +5040,8 @@ namespace llaminar2
                                 .allocatePersistentTransferStagingSlices(
                                     config.staging_capacity_bytes,
                                     lane_count,
-                                    device);
+                                    device,
+                                    HostTransferAccess::CrossProcessReadable);
                         for (std::size_t lane_index = 0;
                              lane_index < lane_count;
                              ++lane_index)
@@ -4688,6 +5177,9 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay physical fabric requires the rank-bound memory authority, registry, and valid initial snapshot");
         }
+        if (config.initial_snapshot->ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments &&
+            config.inventory_authority != MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry)
+            throw std::invalid_argument("CPU cohort fabric requires its original participant-registry physical authority");
         if (config.registry->initialEpoch() !=
                 config.initial_snapshot->epoch ||
             !config.registry->allInitialBanksReady())
@@ -4695,9 +5187,16 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay physical fabric requires complete matching initial banks");
         }
+        for(const auto id:config.registry->localParticipantIds()) {
+            const auto endpoint=config.registry->endpoint(id);
+            if(endpoint && endpoint->device().is_gpu() &&
+                (!config.physical_gpu_lane_demand || config.physical_gpu_lane_demand->original_rank!=config.memory_authority->worldRank()))
+                throw std::invalid_argument("Physical GPU fabric requires its original rank-bound admitted lane declaration");
+        }
         if (config.shadow_slots_per_endpoint_layer == 0 ||
             config.staging_capacity_bytes == 0 ||
             config.maximum_concurrent_cycles == 0 ||
+            config.maximum_cycles_per_layer == 0 ||
             config.maximum_execution_streams == 0 ||
             config.maximum_execution_streams >
                 config.maximum_concurrent_cycles)
@@ -4720,7 +5219,7 @@ namespace llaminar2
                  config.registry->localParticipantIds())
             {
                 const auto *participant =
-                    config.initial_snapshot->owner_map.participantForId(
+                    config.initial_snapshot->placementOwnerMap().participantForId(
                         participant_id);
                 if (!participant || !participant->world_rank_known ||
                     participant->world_rank != local_world_rank)
@@ -4807,7 +5306,9 @@ namespace llaminar2
             transaction.migrations,
             transaction.migration_cycles,
             transaction.shadow_requirements,
+            transaction.candidate.get(),
             nullptr,
+            &transaction,
             local_destination_participants);
     }
 
@@ -4856,7 +5357,9 @@ namespace llaminar2
             batch.migrations,
             batch.migration_cycles,
             batch.shadow_requirements,
+            nullptr,
             &batch,
+            nullptr,
             local_destination_participants);
         if (prepared.status != MoEOverlayResidencyStageStartStatus::Started)
         {
@@ -4880,7 +5383,9 @@ namespace llaminar2
         const std::vector<MoEOverlayTierMigration> &migrations,
         const std::vector<MoEOverlayTierMigrationCycle> &migration_cycles,
         const std::vector<MoEOverlayTierShadowRequirement> &shadow_requirements,
+        const MoEOverlayResidencySnapshot *candidate,
         const MoEOverlayDevicePhysicalMovementBatch *device_batch,
+        const MoEOverlayResidencyTransaction *original_transaction,
         const std::vector<int> &local_destination_participants)
     {
         MoEOverlayParticipantPreparedTransfers result;
@@ -4930,50 +5435,106 @@ namespace llaminar2
                                    : 0;
         bool has_remote_migrations = false;
 
-        /*
-         * A distributed fabric requires exact participant-to-rank membership.
-         * This prevents a moved GPU or CPU domain from being inferred from an
-         * ordinal: topology intent decides ownership, and the registry must
-         * materialize every participant assigned to this rank and no others.
-         */
-        for (const auto &migration : migrations)
+        // Normalize each logical edge once. Every subsequent physical demand
+        // and operation uses this original role/member order, never the absent
+        // scalar owner of a cohort or allocation-capacity sized work.
+        std::vector<std::vector<MoEOverlayPhysicalProjectionPiece>> physical_pieces;
+        std::vector<std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>> measurement_geometries;
+        MoEOverlayPhysicalRemotePieceOrdinals remote_piece_ordinals;
+        try
         {
-            const bool source_local = is_local_participant(
-                migration.source.owner_participant);
-            const bool destination_local = is_local_participant(
-                migration.destination.owner_participant);
-            if (!remote_transport)
+            physical_pieces.reserve(migrations.size());
+            measurement_geometries.reserve(migrations.size());
+            for (const auto &migration : migrations)
             {
-                if (!source_local || !destination_local)
+                const auto source = std::find_if(impl_->original_layer_manifests.begin(), impl_->original_layer_manifests.end(),
+                    [&](const auto &entry) { return entry.layer_idx == migration.layer_idx; });
+                if (source == impl_->original_layer_manifests.end())
+                    return fail("Physical movement lost its original authenticated layer source");
+                const auto geometry = makePhysicalMoEOverlayMeasurementGeometry(migration, *source,
+                    originalFabricGeometry(config_).expertCount(), config_.initial_snapshot->placementOwnerMap());
+                physical_pieces.push_back(physicalMoEOverlayProjectionPieces(geometry->targets().first, geometry->targets().second));
+                measurement_geometries.push_back(geometry);
+            }
+            remote_piece_ordinals = physicalMoEOverlayRemotePieceOrdinals(physical_pieces,
+                config_.initial_snapshot->placementOwnerMap(), remote_transport ? world_size : 1);
+        }
+        catch (const std::exception &error)
+        {
+            return fail(error.what());
+        }
+        // Cohort calibration borrows the genuine shadow-only transaction. Its
+        // live map is unchanged, so it must not enter the candidate-placement
+        // arrival producer or manufacture a placement change to pass that guard.
+        const bool has_cohort = std::any_of(migrations.begin(), migrations.end(),
+            [](const auto &edge) { return edge.source.shard_cohort || edge.destination.shard_cohort; });
+        if (has_cohort && purpose == MoEOverlayResidencyTransactionPurpose::EconomyCalibration)
+        {
+            if (device_batch || !original_transaction || !original_transaction->valid() ||
+                original_transaction->purpose != purpose || original_transaction->expected_epoch != expected_epoch ||
+                original_transaction->candidate.get() != candidate || candidate->epoch != candidate_epoch ||
+                &original_transaction->migrations != &migrations)
+                return fail("CPU cohort calibration requires its exact original unpublishable shadow transaction");
+        }
+        else if (has_cohort && purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange &&
+                 purpose != MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration)
+            return fail("CPU cohort physical movement has an unsupported transaction purpose");
+
+        try
+        {
+            requireSimpleMoEOverlayPhysicalCycles(migrations, migration_cycles);
+            const auto lane_scope=remote_transport
+                ?MoEOverlayPhysicalLaneScope::communicator(world_size)
+                :MoEOverlayPhysicalLaneScope::rankLocal(config_.memory_authority->worldRank());
+            MoEOverlayPhysicalLaneCounts actual_demand;
+            for (size_t index = 0; index < migrations.size(); ++index)
+            {
+                const auto source = std::find_if(impl_->original_layer_manifests.begin(), impl_->original_layer_manifests.end(),
+                    [&](const auto &entry) { return entry.layer_idx == migrations[index].layer_idx; });
+                if (source == impl_->original_layer_manifests.end())
+                    throw std::logic_error("Physical movement lost its original layer manifest");
+                const auto demand = physicalMoEOverlayLaneCounts(physical_pieces[index], migrations[index], *source,
+                    originalFabricGeometry(config_).expertCount(), config_.initial_snapshot->placementOwnerMap(),
+                    lane_scope);
+                for (const auto &[key, count] : demand)
+                    actual_demand[key] = checkedMoEOverlayLaneAdd(actual_demand[key], count);
+            }
+            requireFitsMoEOverlayLaneDemand(impl_->lane_demand_plan, actual_demand);
+        }
+        catch (const std::exception &error)
+        {
+            return fail(error.what());
+        }
+        for (const auto &pieces : physical_pieces)
+            for (const auto &piece : pieces)
+            {
+                const auto &source = *config_.initial_snapshot->placementOwnerMap().participantForId(piece.source_participant);
+                const auto &destination = *config_.initial_snapshot->placementOwnerMap().participantForId(piece.destination_participant);
+                const bool source_local = is_local_participant(source.participant_id);
+                const bool destination_local = is_local_participant(destination.participant_id);
+                if (!remote_transport)
                 {
-                    return fail(
-                        "ExpertOverlay transaction contains a remote endpoint but no remote projection transport is installed");
+                    if (!source_local || !destination_local)
+                        return fail("ExpertOverlay transaction contains a remote endpoint but no remote projection transport is installed");
+                    continue;
                 }
-                continue;
+                if (!source.world_rank_known || !destination.world_rank_known ||
+                    source.world_rank < 0 || source.world_rank >= world_size ||
+                    destination.world_rank < 0 || destination.world_rank >= world_size)
+                    return fail("ExpertOverlay distributed movement requires exact in-range world-rank ownership");
+                if (source_local != (source.world_rank == world_rank) ||
+                    destination_local != (destination.world_rank == world_rank))
+                    return fail("ExpertOverlay local participant registry disagrees with distributed rank ownership");
+                has_remote_migrations = has_remote_migrations || source.world_rank != destination.world_rank;
             }
 
-            if (!migration.source.owner_world_rank_known ||
-                !migration.destination.owner_world_rank_known ||
-                migration.source.owner_world_rank < 0 ||
-                migration.source.owner_world_rank >= world_size ||
-                migration.destination.owner_world_rank < 0 ||
-                migration.destination.owner_world_rank >= world_size)
-            {
-                return fail(
-                    "ExpertOverlay distributed movement requires exact in-range world-rank ownership");
-            }
-            if (source_local !=
-                    (migration.source.owner_world_rank == world_rank) ||
-                destination_local !=
-                    (migration.destination.owner_world_rank == world_rank))
-            {
-                return fail(
-                    "ExpertOverlay local participant registry disagrees with distributed rank ownership");
-            }
-            has_remote_migrations = has_remote_migrations ||
-                migration.source.owner_world_rank !=
-                    migration.destination.owner_world_rank;
-        }
+        // The current device-only physical ledger contains complete GPU/CPU
+        // owners, not CPU fragment payloads. Heterogeneous CPU-cohort plans use
+        // their original host participant-registry authority; never manufacture
+        // a scalar owner or a host mirror to enter a different policy.
+        if (device_batch && std::any_of(migrations.begin(), migrations.end(), [](const auto &edge) {
+                return edge.source.shard_cohort || edge.destination.shard_cohort; }))
+            return fail("Device physical ledger does not carry a CPU fragment ownership arm");
 
         if (migration_cycles.size() >
             config_.maximum_concurrent_cycles)
@@ -4991,53 +5552,27 @@ namespace llaminar2
         std::map<EdgeKey, std::size_t> local_lane_demand;
         std::map<CpuAddressEdgeKey, std::size_t> cpu_copy_lane_demand;
         std::map<RemoteGpuLaneKey, std::size_t> remote_gpu_lane_demand;
-        for (const auto &migration : migrations)
-        {
-            const bool source_local = is_local_participant(
-                migration.source.owner_participant);
-            const bool destination_local = is_local_participant(
-                migration.destination.owner_participant);
-            for (const auto projection : kProjections)
+        for (const auto &pieces : physical_pieces)
+            for (const auto &piece : pieces)
             {
-                if (source_local && destination_local &&
-                    migration.source.device.is_cpu() &&
-                    migration.destination.device.is_cpu())
-                {
+                const auto &source = *config_.initial_snapshot->placementOwnerMap().participantForId(piece.source_participant);
+                const auto &destination = *config_.initial_snapshot->placementOwnerMap().participantForId(piece.destination_participant);
+                const bool source_local = is_local_participant(source.participant_id);
+                const bool destination_local = is_local_participant(destination.participant_id);
+                const auto projection = piece.projection;
+                if (source_local && destination_local && source.device.is_cpu() && destination.device.is_cpu())
                     ++cpu_copy_lane_demand[CpuAddressEdgeKey{
-                        .source = migration.source.address,
-                        .destination = migration.destination.address,
-                        .projection = projection,
-                    }];
-                }
+                        .source = source.address, .destination = destination.address, .projection = projection}];
                 else if (source_local && destination_local)
-                {
                     ++local_lane_demand[EdgeKey{
-                        .source = migration.source.device,
-                        .destination = migration.destination.device,
-                        .projection = projection,
-                    }];
-                }
-                if (has_remote_migrations && source_local &&
-                    !destination_local && migration.source.device.is_gpu())
-                {
+                        .source = source.device, .destination = destination.device, .projection = projection}];
+                if (has_remote_migrations && source_local && !destination_local && source.device.is_gpu())
                     ++remote_gpu_lane_demand[RemoteGpuLaneKey{
-                        .device = migration.source.device,
-                        .projection = projection,
-                        .role = RemoteGpuLaneRole::Source,
-                    }];
-                }
-                if (has_remote_migrations && !source_local &&
-                    destination_local &&
-                    migration.destination.device.is_gpu())
-                {
+                        .device = source.device, .projection = projection, .role = RemoteGpuLaneRole::Source}];
+                if (has_remote_migrations && !source_local && destination_local && destination.device.is_gpu())
                     ++remote_gpu_lane_demand[RemoteGpuLaneKey{
-                        .device = migration.destination.device,
-                        .projection = projection,
-                        .role = RemoteGpuLaneRole::Destination,
-                    }];
-                }
+                        .device = destination.device, .projection = projection, .role = RemoteGpuLaneRole::Destination}];
             }
-        }
         for (const auto &[edge, demand] : local_lane_demand)
         {
             std::size_t capacity = 0;
@@ -5202,8 +5737,9 @@ namespace llaminar2
             }
         }
 
-        std::vector<ReservedDestination> destinations(
-            migrations.size());
+        std::vector<std::map<int, ReservedDestination>> destinations(migrations.size());
+        std::vector<std::map<int, std::shared_ptr<MoEOverlayPreparedExpertArrival>>> destination_arrivals(migrations.size());
+        std::vector<std::map<int, std::shared_ptr<RetainedPhysicalSourceMember>>> source_members(migrations.size());
         try
         {
             for (std::size_t migration_index = 0;
@@ -5212,21 +5748,95 @@ namespace llaminar2
             {
                 const auto &migration =
                     migrations[migration_index];
-                if (!is_local_participant(
-                        migration.destination.owner_participant))
+                const auto target = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+                const auto origin = MoEExpertPlacementTarget::fromPlacement(migration.source);
+                if (!target || !origin) throw std::invalid_argument("Physical wave lost its original placement alternatives");
+                for (size_t member = 0; member < target->participantCount(); ++member)
                 {
-                    continue;
+                    const int participant = target->participantId(member);
+                    if (!is_local_participant(participant)) continue;
+                    auto &pool = requireEndpointPool(*impl_, participant, migration.layer_idx);
+                    destinations[migration_index].emplace(participant,
+                        reserveDestination(pool, migration.layer_idx, migration.expert_id, candidate_epoch));
+                    std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival;
+                    if (migration.destination.shard_cohort)
+                    {
+                        std::string arrival_error;
+                        if (!candidate || candidate->epoch != candidate_epoch)
+                            throw std::invalid_argument("CPU fragment reservation requires its actual original candidate epoch");
+                        if (purpose == MoEOverlayResidencyTransactionPurpose::EconomyCalibration)
+                            arrival = config_.registry->prepareCPUJointCalibrationArrival(*original_transaction,
+                                migration_index, participant, &arrival_error);
+                        else
+                            arrival = config_.registry->prepareCPUJointArrival(*candidate, participant,
+                                migration.layer_idx, migration.expert_id, &arrival_error);
+                        if (!arrival) throw std::invalid_argument(arrival_error);
+                    }
+                    else arrival = std::make_shared<MoEOverlayPreparedExpertArrival>();
+                    destination_arrivals[migration_index].emplace(participant, std::move(arrival));
                 }
-                auto &pool = requireEndpointPool(
-                    *impl_,
-                    migration.destination.owner_participant,
-                    migration.layer_idx);
-                destinations[migration_index] = reserveDestination(
-                    pool,
-                    migration.layer_idx,
-                    migration.expert_id,
-                    candidate_epoch);
+                if (!device_batch)
+                    for (size_t member = 0; member < origin->participantCount(); ++member)
+                    {
+                        const int participant = origin->participantId(member);
+                        if (!is_local_participant(participant)) continue;
+                        auto source = std::make_shared<RetainedPhysicalSourceMember>();
+                        source->endpoint = config_.registry->endpoint(participant);
+                        source->bank = source->endpoint ? source->endpoint->acquire(expected_epoch)
+                                                       : MoEOverlayParticipantBankLease{};
+                        if (!source->endpoint || !source->bank ||
+                            !source->bank->containsModelLayer(migration.layer_idx) || migration.expert_id < 0 ||
+                            migration.expert_id >= source->endpoint->numExperts())
+                            throw std::invalid_argument("Physical wave cannot retain its exact original source member epoch");
+                        const auto &layer = source->bank->layerForModelLayer(migration.layer_idx);
+                        if (bool(layer.cpu_fragment_family) != bool(migration.source.shard_cohort))
+                            throw std::invalid_argument("Physical source bank has a different whole/cohort ownership arm");
+                        if (layer.cpu_fragment_family)
+                        {
+                            const auto &actual = layer.cpu_fragment_family->cohort();
+                            const auto &expected = migration.source.shard_cohort;
+                            const auto member = layer.cpu_fragment_family->participantIndex();
+                            if (!actual || actual.get() != expected.get() || actual.owner_before(expected) ||
+                                expected.owner_before(actual) || member >= actual->participants().size() ||
+                                actual->participants()[member].participant_id != participant)
+                                throw std::invalid_argument("Physical source bank lost its SAME original cohort/member identity");
+                        }
+                        if (!layer.resident_mask.at(size_t(migration.expert_id)))
+                            throw std::invalid_argument("Physical source expert is absent from its original epoch bank");
+                        for (const auto role : kProjections)
+                            source->engines[projectionIndex(role)] = projectionEngine(layer, size_t(migration.expert_id), role);
+                        const auto count = std::count_if(physical_pieces[migration_index].begin(), physical_pieces[migration_index].end(),
+                            [participant](const auto &piece) { return piece.source_participant == participant; });
+                        if (count <= 0) throw std::invalid_argument("Physical source member has no actual projection work");
+                        source->pending.store(size_t(count));
+                        source_members[migration_index].emplace(participant, std::move(source));
+                    }
             }
+        }
+        catch (const std::exception &error)
+        {
+            return fail(error.what());
+        }
+
+        std::vector<std::map<int, std::array<DestinationProjectionGroup, 3>>> destination_groups(migrations.size());
+        try
+        {
+        for (size_t index = 0; index < migrations.size(); ++index)
+            for (const auto &[participant, arrival] : destination_arrivals[index])
+                for (const auto role : kProjections)
+                {
+                    auto &group = destination_groups[index][participant][projectionIndex(role)];
+                    group.storage = std::make_shared<DestinationProjectionStorage>();
+                    auto &reserved = destinations[index].at(participant);
+                    if (reserved.cpu) group.storage->engine = cpuProjection(*reserved.cpu, role).engine;
+                    std::vector<ExpertTierWeightProjectionIntersection> coverage;
+                    for (const auto &piece : physical_pieces[index])
+                        if (piece.destination_participant == participant && piece.projection == role)
+                            coverage.push_back(piece.intersection);
+                    group.completion = std::make_shared<MoEOverlayPreparedProjectionCompletion>(std::move(coverage),
+                        arrival, role, [storage = group.storage] { return storage->engine; });
+                }
+
         }
         catch (const std::exception &error)
         {
@@ -5237,14 +5847,17 @@ namespace llaminar2
         struct RemoteOperationTarget
         {
             std::size_t migration_index = 0;
-            std::size_t projection_index = 0;
+            std::size_t operation_index = 0;
+            std::size_t piece_index = 0;
+            std::shared_ptr<MoEOverlayPreparedProjectionCompletion> completion;
         };
         std::vector<MoEOverlayMPIRemoteProjectionBinding> remote_bindings;
         std::vector<RemoteOperationTarget> remote_targets;
         if (has_remote_migrations)
         {
-            const auto remote_projection_count =
-                migrations.size() * kProjections.size();
+            size_t remote_projection_count = 0;
+            for (const auto &pieces : physical_pieces)
+                remote_projection_count = checkedMoEOverlayLaneAdd(remote_projection_count, pieces.size());
             remote_bindings.reserve(remote_projection_count);
             remote_targets.reserve(remote_projection_count);
         }
@@ -5274,91 +5887,56 @@ namespace llaminar2
                 const auto &migration =
                     migrations[migration_index];
                 auto &prepared = result.migrations[migration_index];
-                const bool source_local = is_local_participant(
-                    migration.source.owner_participant);
-                const bool destination_local = is_local_participant(
-                    migration.destination.owner_participant);
-                const bool crosses_world_rank = remote_transport &&
-                    migration.source.owner_world_rank !=
-                        migration.destination.owner_world_rank;
-
-                std::shared_ptr<MoEOverlayParticipantResidency> source_endpoint;
-                MoEOverlayParticipantBankLease source_bank;
-                std::optional<MoEOverlayPreparedExpertPayload>
-                    device_source_payload;
-                const MoEOverlayPreparedExpertPayload *source_payload = nullptr;
-                if (source_local)
+                const auto &pieces = physical_pieces[migration_index];
+                prepared.operations.resize(pieces.size());
+                prepared.measurement_geometry = std::move(measurement_geometries[migration_index]);
+                const auto destination_target = *MoEExpertPlacementTarget::fromPlacement(migration.destination);
+                for (size_t member = 0; member < destination_target.participantCount(); ++member)
                 {
-                    if (device_batch)
-                    {
-                        std::string source_error;
-                        device_source_payload =
-                            impl_->device_slot_ledger->sourcePayload(
-                                *device_batch,
-                                {
-                                    .participant_id =
-                                        migration.source.owner_participant,
-                                    .layer_idx = migration.layer_idx,
-                                    .expert_id = migration.expert_id,
-                                },
-                                &source_error);
-                        if (!device_source_payload)
-                        {
-                            throw std::runtime_error(
-                                source_error.empty()
-                                    ? "ExpertOverlay device slot ledger cannot resolve the local source"
-                                    : std::move(source_error));
-                        }
-                        source_payload = &*device_source_payload;
-                    }
-                    else
-                    {
-                        source_endpoint = config_.registry->endpoint(
-                            migration.source.owner_participant);
-                        source_bank = source_endpoint
-                                          ? source_endpoint->acquire(
-                                                expected_epoch)
-                                          : MoEOverlayParticipantBankLease{};
-                        if (!source_endpoint || !source_bank ||
-                            !source_bank->containsModelLayer(migration.layer_idx) ||
-                            migration.expert_id < 0 ||
-                            migration.expert_id >=
-                                source_endpoint->numExperts())
-                        {
-                            throw std::runtime_error(
-                                "ExpertOverlay physical fabric cannot acquire the exact local source epoch");
-                        }
-                        source_payload = &source_bank->layerForModelLayer(migration.layer_idx)
-                                              .experts[static_cast<std::size_t>(migration.expert_id)];
-                    }
-                    if (!source_payload->complete())
-                    {
-                        throw std::runtime_error(
-                            "ExpertOverlay migration source is not resident in its old epoch bank");
-                    }
+                    const int participant = destination_target.participantId(member);
+                    const auto arrival = destination_arrivals[migration_index].find(participant);
+                    if (arrival != destination_arrivals[migration_index].end())
+                        prepared.destination_arrivals.push_back({participant, arrival->second});
                 }
-
-                if (destination_local)
+                for (size_t operation_index = 0; operation_index < pieces.size(); ++operation_index)
                 {
-                    prepared.destination_arrival =
-                        std::make_shared<MoEOverlayPreparedExpertArrival>();
-                }
-
-                /* A same-rank edge owned elsewhere still occupies global shape. */
-                if (!crosses_world_rank && !source_local)
-                {
-                    for (const auto projection : kProjections)
-                    {
-                        prepared.projections[projectionIndex(projection)] =
-                            std::make_unique<
-                                ReadyPhysicalProjectionOperation>();
-                    }
-                    continue;
-                }
-
-                for (const auto projection : kProjections)
-                {
+                    const auto &piece = pieces[operation_index];
+                    const auto projection = piece.projection;
                     const auto projection_index = projectionIndex(projection);
+                    const auto &source_participant = *config_.initial_snapshot->placementOwnerMap().participantForId(piece.source_participant);
+                    const auto &destination_participant = *config_.initial_snapshot->placementOwnerMap().participantForId(piece.destination_participant);
+                    const bool source_local = is_local_participant(piece.source_participant);
+                    const bool destination_local = is_local_participant(piece.destination_participant);
+                    const bool crosses_world_rank = remote_transport && source_participant.world_rank != destination_participant.world_rank;
+                    prepared.operations[operation_index] = {.projection = projection,
+                        .destination_participant = piece.destination_participant, .source_participant = piece.source_participant};
+                    prepared.operations[operation_index].requires_local_measurement = source_local || destination_local;
+                    prepared.operations[operation_index].observer_world_rank = source_local || destination_local
+                        ? config_.memory_authority->worldRank() : -1;
+                    const auto destination_arrival = destination_local ? destination_arrivals[migration_index].at(piece.destination_participant) : nullptr;
+                    DestinationProjectionGroup *const destination_group = destination_local
+                        ? &destination_groups[migration_index].at(piece.destination_participant)[projection_index] : nullptr;
+                    const auto completion_piece = static_cast<size_t>(std::count_if(pieces.begin(), pieces.begin() + operation_index,
+                        [&](const auto &previous) { return previous.projection == projection &&
+                            previous.destination_participant == piece.destination_participant; }));
+                    std::optional<MoEOverlayPreparedExpertPayload> device_source_payload;
+                    const auto source_engine_for_role = [&]() -> std::shared_ptr<ITensorGemm>
+                    {
+                        if (!source_local) throw std::logic_error("A nonlocal physical source has no local engine permit");
+                        if (!device_batch)
+                            return source_members[migration_index].at(piece.source_participant)->engines[projection_index];
+                        std::string source_error;
+                        device_source_payload = impl_->device_slot_ledger->sourcePayload(*device_batch,
+                            {.participant_id = piece.source_participant, .layer_idx = migration.layer_idx,
+                                .expert_id = migration.expert_id}, &source_error);
+                        if (!device_source_payload) throw std::invalid_argument(source_error);
+                        return projectionEngine(*device_source_payload, projection);
+                    };
+                    if (!crosses_world_rank && !source_local)
+                    {
+                        prepared.operations[operation_index].operation = std::make_unique<ReadyPhysicalProjectionOperation>();
+                        continue;
+                    }
 
                     if (crosses_world_rank)
                     {
@@ -5371,25 +5949,25 @@ namespace llaminar2
                             candidate_epoch,
                             *remote_execution_fingerprint,
                             migrations,
-                            migration_index,
-                            projection);
+                            migration_index, piece,
+                            config_.initial_snapshot->placementOwnerMap());
                         MoEOverlayMPIRemoteProjectionBinding binding{
-                            .lane_index =
-                                migration_index * kProjections.size() +
-                                projection_index,
+                            // Complete-wave ordinal is identical on source,
+                            // receiver and uninvolved ranks, before any local filtering.
+                            .lane_index = remote_piece_ordinals.by_migration.at(migration_index).at(operation_index).value(),
                             .identity = identity,
                             .purpose = purpose,
                         };
 
+                        std::shared_ptr<MoEOverlayPreparedProjectionCompletion> remote_completion;
                         if (source_local)
                         {
-                            auto source_engine = projectionEngine(
-                                *source_payload, projection);
+                            auto source_engine = source_engine_for_role();
                             MoEOverlayPreparedWeightSource source;
                             std::string source_error;
                             if (!resolveMoEOverlayPreparedWeightSource(
                                     source_engine,
-                                    migration.source.device,
+                                    source_participant.device,
                                     source,
                                     &source_error))
                             {
@@ -5399,7 +5977,7 @@ namespace llaminar2
                                         : std::move(source_error));
                             }
 
-                            if (migration.source.device.is_cpu())
+                            if (source_participant.device.is_cpu())
                             {
                                 if (source.format.isFloating())
                                 {
@@ -5408,7 +5986,7 @@ namespace llaminar2
                                             identity,
                                             source.floating,
                                             static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes));
+                                                config_.staging_capacity_bytes)).forFloatingIntersection(piece.intersection);
                                     binding.source = std::make_shared<
                                         MoEOverlayHostRemoteProjectionSource>(
                                         manifest,
@@ -5418,7 +5996,7 @@ namespace llaminar2
                                                     source.floating.data),
                                                 source.floating.bytes)),
                                         source_engine);
-                                    if (migration.destination.device.is_cpu())
+                                    if (destination_participant.device.is_cpu())
                                         ++local_remote_cpu_operations;
                                     else
                                         ++local_remote_gpu_cpu_operations;
@@ -5426,16 +6004,16 @@ namespace llaminar2
                                 else if (!source.cpu_packed)
                                 {
                                     throw std::runtime_error(
-                                        "ExpertOverlay remote CPU source lost final NativeVNNI storage");
+                                        "ExpertOverlay remote CPU source lost final NativeQuantised storage");
                                 }
-                                else if (migration.destination.device.is_cpu())
+                                else if (destination_participant.device.is_cpu())
                                 {
                                     const auto manifest =
                                         makeMoEOverlayRemoteCpuProjectionManifest(
                                             identity,
                                             *source.cpu_packed,
                                             static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes));
+                                                config_.staging_capacity_bytes)).forCPUIntersection(piece.intersection);
                                     binding.source = std::make_shared<
                                         MoEOverlayHostRemoteProjectionSource>(
                                         manifest,
@@ -5453,7 +6031,7 @@ namespace llaminar2
                                             migration.layer_idx,
                                             migration.expert_id,
                                             projection,
-                                            1);
+                                            1).forIntersection(piece.intersection);
                                     const auto maximum_units =
                                         maximumUnitsPerChunk(
                                             probe,
@@ -5465,7 +6043,7 @@ namespace llaminar2
                                             migration.layer_idx,
                                             migration.expert_id,
                                             projection,
-                                            maximum_units);
+                                            maximum_units).forIntersection(piece.intersection);
                                     const auto manifest =
                                         makeMoEOverlayRemoteCpuProjectionManifest(
                                             identity,
@@ -5484,7 +6062,7 @@ namespace llaminar2
                             else
                             {
                                 const RemoteGpuLaneKey lane_key{
-                                    .device = migration.source.device,
+                                    .device = source_participant.device,
                                     .projection = projection,
                                     .role = RemoteGpuLaneRole::Source,
                                 };
@@ -5507,19 +6085,19 @@ namespace llaminar2
                                             identity,
                                             source.floating,
                                             static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes));
-                                    if (migration.destination.device.is_cpu())
+                                                config_.staging_capacity_bytes)).forFloatingIntersection(piece.intersection);
+                                    if (destination_participant.device.is_cpu())
                                         ++local_remote_gpu_cpu_operations;
                                     else
                                         ++local_remote_gpu_blob_operations;
                                 }
-                                else if (migration.destination.device.is_cpu())
+                                else if (destination_participant.device.is_cpu())
                                 {
                                     const auto *source_format =
-                                        native_vnni_formats::forSourceIdentity(
-                                            source.format.native_vnni
+                                        native_quantised_formats::forSourceIdentity(
+                                            source.format.native_quantised
                                                 .codebook_id,
-                                            source.format.native_vnni
+                                            source.format.native_quantised
                                                 .is_superblock);
                                     if (!source_format)
                                         throw std::runtime_error(
@@ -5532,7 +6110,7 @@ namespace llaminar2
                                             migration.layer_idx,
                                             migration.expert_id,
                                             projection,
-                                            1);
+                                            1).forIntersection(piece.intersection);
                                     const auto maximum_units =
                                         maximumUnitsPerChunk(
                                             probe,
@@ -5545,7 +6123,7 @@ namespace llaminar2
                                             migration.layer_idx,
                                             migration.expert_id,
                                             projection,
-                                            maximum_units);
+                                            maximum_units).forIntersection(piece.intersection);
                                     manifest =
                                         makeMoEOverlayRemoteCpuProjectionManifest(
                                             identity,
@@ -5560,7 +6138,7 @@ namespace llaminar2
                                         makeMoEOverlayRemoteGpuProjectionManifest(
                                             identity,
                                             source.gpu_packed,
-                                            source.format.native_vnni,
+                                            source.format.native_quantised,
                                             static_cast<std::uint32_t>(
                                                 config_.staging_capacity_bytes));
                                     ++local_remote_gpu_blob_operations;
@@ -5594,10 +6172,10 @@ namespace llaminar2
 
                         if (destination_local)
                         {
-                            if (migration.destination.device.is_cpu())
+                            if (destination_participant.device.is_cpu())
                             {
                                 auto &lease =
-                                    *destinations[migration_index].cpu;
+                                    *destinations[migration_index].at(piece.destination_participant).cpu;
                                 const auto &destination = cpuProjection(
                                     lease, projection);
                                 auto destination_engine = destination.engine;
@@ -5609,7 +6187,7 @@ namespace llaminar2
                                             destination_floating);
                                 const auto *destination_packed =
                                     destination_engine
-                                        ->exportCPUNativeVNNIPackedWeights();
+                                        ->exportCPUNativeQuantisedPackedWeights();
                                 if (destination_is_floating ==
                                     (destination_packed != nullptr))
                                 {
@@ -5638,27 +6216,25 @@ namespace llaminar2
                                             "ExpertOverlay remote floating CPU destination disagrees with its final slot");
                                     }
                                     expected_manifest =
-                                        makeMoEOverlayRemoteFloatingProjectionManifest(
+                                        makeMoEOverlayRemoteFloatingDestinationProjectionManifest(
                                             identity,
-                                            destination_floating,
+                                            destination_floating, piece.intersection,
                                             static_cast<std::uint32_t>(
                                                 config_.staging_capacity_bytes));
                                     destination_regions =
                                         remoteContiguousDestinationRegions(
                                             destination.destination_bytes);
-                                    if (migration.source.device.is_cpu())
+                                    if (source_participant.device.is_cpu())
                                         ++local_remote_cpu_operations;
                                     else
                                         ++local_remote_gpu_cpu_operations;
                                 }
-                                else if (migration.source.device.is_cpu())
+                                else if (source_participant.device.is_cpu())
                                 {
                                     expected_manifest =
-                                        makeMoEOverlayRemoteCpuProjectionManifest(
-                                            identity,
-                                            *destination_packed,
-                                            static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes));
+                                        makeMoEOverlayRemoteCpuDestinationProjectionManifest(
+                                            identity, *destination_packed, piece.intersection,
+                                            static_cast<std::uint32_t>(config_.staging_capacity_bytes));
                                     destination_regions =
                                         remoteCpuDestinationRegions(
                                             destination.destination_bytes);
@@ -5667,7 +6243,7 @@ namespace llaminar2
                                 else
                                 {
                                     const auto *source_format =
-                                        native_vnni_formats::forSourceIdentity(
+                                        native_quantised_formats::forSourceIdentity(
                                             destination_packed->codebook_id,
                                             destination_packed->is_superblock);
                                     if (!source_format)
@@ -5676,13 +6252,13 @@ namespace llaminar2
                                     const auto probe =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
-                                            destination_packed->N,
-                                            destination_packed->K,
+                                            piece.intersection.source().rows,
+                                            piece.intersection.source().columns,
                                             expected_epoch,
                                             migration.layer_idx,
                                             migration.expert_id,
                                             projection,
-                                            1);
+                                            1).forIntersection(piece.intersection);
                                     const auto maximum_units =
                                         maximumUnitsPerChunk(
                                             probe,
@@ -5690,13 +6266,13 @@ namespace llaminar2
                                     const auto stream =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
-                                            destination_packed->N,
-                                            destination_packed->K,
+                                            piece.intersection.source().rows,
+                                            piece.intersection.source().columns,
                                             expected_epoch,
                                             migration.layer_idx,
                                             migration.expert_id,
                                             projection,
-                                            maximum_units);
+                                            maximum_units).forIntersection(piece.intersection);
                                     expected_manifest =
                                         makeMoEOverlayRemoteCpuProjectionManifest(
                                             identity,
@@ -5718,25 +6294,29 @@ namespace llaminar2
                                     destination_regions,
                                     destination_engine,
                                     expected_manifest,
-                                    match_policy);
-                                binding.destination = std::make_shared<
-                                    PublishingRemoteProjectionDestination>(
-                                    std::move(storage),
-                                    prepared.destination_arrival,
-                                    projection,
-                                    std::move(destination_engine));
+                                    match_policy, destination_group->storage->encoded_write_mutex);
+                                auto finalized =
+                                    std::make_shared<FinalizingRemoteProjectionDestination>(
+                                        std::move(storage), std::move(destination_engine));
+                                binding.destination = finalized;
+                                const auto rows = destination_is_floating ? destination_floating.n
+                                                                          : destination_packed->N;
+                                const auto columns = destination_is_floating
+                                                         ? destination_floating.k
+                                                         : destination_packed->K;
+                                remote_completion = destination_group->completion;
                             }
                             else
                             {
                                 auto &lease =
-                                    *destinations[migration_index].gpu;
+                                    *destinations[migration_index].at(piece.destination_participant).gpu;
                                 const auto destination_slot = gpuProjection(
                                     lease, projection);
                                 const auto slot_lifetime = lease.lifetime;
                                 const auto destination_format =
                                     destination_slot.spec.format;
                                 const auto destination_device =
-                                    migration.destination.device;
+                                    destination_participant.device;
                                 const RemoteGpuLaneKey lane_key{
                                     .device = destination_device,
                                     .projection = projection,
@@ -5758,39 +6338,32 @@ namespace llaminar2
                                         [destination_slot,
                                          destination_device,
                                          slot_lifetime,
-                                         destination_format](
+                                         destination_format,
+                                         intersection = piece.intersection,
+                                         role_storage = destination_group->storage](
                                             const MoEOverlayRemoteProjectionManifest &
                                                 manifest,
                                             MoEOverlayGpuRemoteProjectionDestinationBinding *
                                                 output,
                                             std::string *error) -> bool
                                 {
+                                    if (!output || !manifest.matchesGpuDestinationProjection(
+                                            intersection, destination_format,
+                                            destination_slot.spec.N, destination_slot.spec.K))
+                                    {
+                                        if (error) *error = destination_format.isFloating()
+                                            ? "Remote floating ExpertOverlay GPU arrival differs from the model projection contract"
+                                            : "Remote ExpertOverlay GPU arrival differs from the model projection contract";
+                                        return false;
+                                    }
                                     if (destination_format.isFloating())
                                     {
-                                        if (!output ||
-                                            !manifest
-                                                 .carriesFloatingBytes() ||
-                                            manifest.N !=
-                                                destination_slot.spec.N ||
-                                            manifest.K !=
-                                                destination_slot.spec.K ||
-                                            manifest.format_kind !=
-                                                destination_format.kind)
-                                        {
-                                            if (error)
-                                                *error =
-                                                    "Remote floating ExpertOverlay GPU arrival differs from the model projection contract";
-                                            return false;
-                                        }
                                         auto descriptor =
                                             makeGpuFloatingDestinationDescriptor(
                                                 destination_slot,
                                                 destination_format);
-                                        auto engine =
-                                            makeGpuFloatingDestinationEngine(
-                                                destination_device,
-                                                descriptor,
-                                                slot_lifetime);
+                                        auto engine = retainFloatingGpuDestination(*role_storage,
+                                            destination_device, descriptor, slot_lifetime);
                                         *output = {
                                             .floating_descriptor = descriptor,
                                             .engine = std::move(engine),
@@ -5801,40 +6374,20 @@ namespace llaminar2
                                     }
 
                                     const auto source_identity =
-                                        destination_format.native_vnni;
-                                    if (!output ||
-                                        (!manifest.carriesGpuBytes() &&
-                                         !manifest.carriesCpuBytes()) ||
-                                        manifest.N !=
-                                            destination_slot.spec.N ||
-                                        manifest.K !=
-                                            destination_slot.spec.K ||
-                                        manifest.source_codebook_id !=
-                                            source_identity.codebook_id ||
-                                        (manifest.source_is_superblock != 0) !=
-                                            source_identity.is_superblock)
-                                    {
-                                        if (error)
-                                            *error =
-                                                "Remote ExpertOverlay GPU arrival differs from the model projection contract";
-                                        return false;
-                                    }
+                                        destination_format.native_quantised;
                                     auto descriptor =
                                         makeGpuDestinationDescriptor(
                                             destination_slot,
-                                            manifest.N,
-                                            manifest.K,
+                                            destination_slot.spec.N,
+                                            destination_slot.spec.K,
                                             manifest.gpu_codebook_id,
                                             manifest
                                                 .gpu_payload_bytes_per_block,
                                             manifest.gpu_is_asymmetric != 0,
                                             manifest.gpu_has_emins != 0,
                                             source_identity);
-                                    auto engine = makeGpuDestinationEngine(
-                                        destination_device,
-                                        descriptor,
-                                        slot_lifetime,
-                                        source_identity);
+                                    auto engine = retainNativeGpuDestination(*role_storage,
+                                        destination_device, descriptor, slot_lifetime, source_identity);
                                     *output = {
                                         .descriptor = descriptor,
                                         .engine = std::move(engine),
@@ -5849,16 +6402,13 @@ namespace llaminar2
                                     lane->second[lane_index],
                                     std::move(factory),
                                     slot_lifetime);
-                                binding.destination = std::make_shared<
-                                    PublishingRemoteProjectionDestination>(
-                                    gpu_storage,
-                                    prepared.destination_arrival,
-                                    projection,
-                                    [gpu_storage]()
-                                    {
-                                        return gpu_storage->preparedEngine();
-                                    });
-                                if (migration.source.device.is_cpu())
+                                auto finalized =
+                                    std::make_shared<FinalizingRemoteProjectionDestination>(
+                                        gpu_storage,
+                                        [gpu_storage]() { return gpu_storage->preparedEngine(); });
+                                binding.destination = finalized;
+                                remote_completion = destination_group->completion;
+                                if (source_participant.device.is_cpu())
                                     ++local_remote_gpu_cpu_operations;
                                 else
                                     ++local_remote_gpu_blob_operations;
@@ -5867,19 +6417,20 @@ namespace llaminar2
 
                         remote_targets.push_back({
                             .migration_index = migration_index,
-                            .projection_index = projection_index,
+                            .operation_index = operation_index,
+                            .piece_index = completion_piece,
+                            .completion = std::move(remote_completion),
                         });
                         remote_bindings.push_back(std::move(binding));
                         continue;
                     }
 
-                    auto source_engine = projectionEngine(
-                        *source_payload, projection);
+                    auto source_engine = source_engine_for_role();
                     MoEOverlayPreparedWeightSource source;
                     std::string source_error;
                     if (!resolveMoEOverlayPreparedWeightSource(
                             source_engine,
-                            migration.source.device,
+                            source_participant.device,
                             source,
                             &source_error))
                     {
@@ -5890,17 +6441,17 @@ namespace llaminar2
                     std::unique_ptr<IMoEOverlayTierTransferOperation>
                         physical_operation;
                     const EdgeKey edge{
-                        .source = migration.source.device,
-                        .destination = migration.destination.device,
+                        .source = source_participant.device,
+                        .destination = destination_participant.device,
                         .projection = projection,
                     };
                     std::shared_ptr<SharedCpuCopyLanePool> cpu_copy_lane;
-                    if (migration.source.device.is_cpu() &&
-                        migration.destination.device.is_cpu())
+                    if (source_participant.device.is_cpu() &&
+                        destination_participant.device.is_cpu())
                     {
                         const CpuAddressEdgeKey cpu_edge{
-                            .source = migration.source.address,
-                            .destination = migration.destination.address,
+                            .source = source_participant.address,
+                            .destination = destination_participant.address,
                             .projection = projection,
                         };
                         const auto found = impl_->cpu_copy_lanes.find(cpu_edge);
@@ -5910,9 +6461,9 @@ namespace llaminar2
                         cpu_copy_lane = found->second;
                     }
 
-                    if (migration.destination.device.is_cpu())
+                    if (destination_participant.device.is_cpu())
                     {
-                        auto &lease = *destinations[migration_index].cpu;
+                        auto &lease = *destinations[migration_index].at(piece.destination_participant).cpu;
                         const auto &destination = cpuProjection(
                             lease, projection);
                         destination_engine = destination.engine;
@@ -5926,17 +6477,17 @@ namespace llaminar2
                                 !destination_floating.valid() ||
                                 source.floating.type !=
                                     destination_floating.type ||
-                                source.floating.n != destination_floating.n ||
-                                source.floating.k != destination_floating.k ||
-                                source.floating.bytes !=
-                                    destination_floating.bytes ||
+                                source.floating.n != piece.intersection.source().rows ||
+                                source.floating.k != piece.intersection.source().columns ||
+                                destination_floating.n != piece.intersection.destination().rows ||
+                                destination_floating.k != piece.intersection.destination().columns ||
                                 destination.destination_bytes.data() !=
                                     destination_floating.data)
                             {
                                 throw std::runtime_error(
                                     "ExpertOverlay CPU floating destination disagrees with the model projection contract");
                             }
-                            if (migration.source.device.is_cpu())
+                            if (source_participant.device.is_cpu())
                             {
                                 physical_operation =
                                     std::make_unique<AdmittedCpuCopyOperation>(
@@ -5948,7 +6499,9 @@ namespace llaminar2
                                         destination.destination_bytes,
                                         cpu_copy_wave_gate,
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine,
+                                        FloatingCPUCopy{piece.intersection,
+                                            ExpertWeightFormat::floating(source.floating.type).floatingElementBytes()});
                                 ++local_cpu_copy_operations;
                             }
                             else
@@ -5969,7 +6522,7 @@ namespace llaminar2
                                             publishedResidencyBank(
                                                 expected_epoch),
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine, piece.intersection);
                                 ++local_gpu_cpu_operations;
                             }
                         }
@@ -5977,15 +6530,17 @@ namespace llaminar2
                         {
                         const auto *destination_packed =
                             destination_engine
-                                ->exportCPUNativeVNNIPackedWeights();
+                                ->exportCPUNativeQuantisedPackedWeights();
                         if (!destination_packed)
                             throw std::runtime_error(
                                 "ExpertOverlay CPU destination engine cannot export final storage");
 
-                        if (migration.source.device.is_cpu())
+                        if (source_participant.device.is_cpu())
                         {
-                            requireCompatibleCpuWeights(
-                                *source.cpu_packed, *destination_packed);
+                            if (source.cpu_packed->codebook_id != destination_packed->codebook_id ||
+                                source.cpu_packed->is_superblock != destination_packed->is_superblock ||
+                                source.cpu_packed->encoding != destination_packed->encoding)
+                                throw std::invalid_argument("CPU rectangle movement cannot change original native format");
                             physical_operation =
                                 std::make_unique<AdmittedCpuCopyOperation>(
                                     cpu_copy_lane,
@@ -5997,15 +6552,18 @@ namespace llaminar2
                                     destination.destination_bytes,
                                     cpu_copy_wave_gate,
                                     source_engine,
-                                    destination_engine);
+                                    destination_engine,
+                                    nativeCPUCopyGeometry(*source.cpu_packed, *destination_packed,
+                                        piece.intersection, config_.staging_capacity_bytes,
+                                        destination_group->storage->encoded_write_mutex));
                             ++local_cpu_copy_operations;
                         }
                         else
                         {
                             const auto *source_format =
-                                native_vnni_formats::forSourceIdentity(
-                                    source.format.native_vnni.codebook_id,
-                                    source.format.native_vnni.is_superblock);
+                                native_quantised_formats::forSourceIdentity(
+                                    source.format.native_quantised.codebook_id,
+                                    source.format.native_quantised.is_superblock);
                             if (!source_format)
                                 throw std::runtime_error(
                                     "ExpertOverlay GPU source lost catalogued provenance");
@@ -6017,7 +6575,7 @@ namespace llaminar2
                                     migration.layer_idx,
                                     migration.expert_id,
                                     projection,
-                                    1);
+                                    1).forIntersection(piece.intersection);
                             const auto maximum_units = maximumUnitsPerChunk(
                                 probe,
                                 config_.staging_capacity_bytes);
@@ -6029,7 +6587,7 @@ namespace llaminar2
                                     migration.layer_idx,
                                     migration.expert_id,
                                     projection,
-                                    maximum_units);
+                                    maximum_units).forIntersection(piece.intersection);
                             const auto lane = impl_->weight_lanes.find(edge);
                             if (lane == impl_->weight_lanes.end())
                                 throw std::runtime_error(
@@ -6047,14 +6605,14 @@ namespace llaminar2
                                     ExpertTierSourceReadiness::publishedResidencyBank(
                                         expected_epoch),
                                     source_engine,
-                                    destination_engine);
+                                    destination_engine, destination_group->storage->encoded_write_mutex);
                             ++local_gpu_cpu_operations;
                         }
                         }
                     }
                     else
                     {
-                        auto &lease = *destinations[migration_index].gpu;
+                        auto &lease = *destinations[migration_index].at(piece.destination_participant).gpu;
                         const auto &destination_slot = gpuProjection(
                             lease, projection);
                         GpuExpertPackedDescriptor destination_descriptor;
@@ -6065,12 +6623,9 @@ namespace llaminar2
                                 makeGpuFloatingDestinationDescriptor(
                                     destination_slot,
                                     source.format);
-                            destination_engine =
-                                makeGpuFloatingDestinationEngine(
-                                    migration.destination.device,
-                                    destination_floating,
-                                    lease.lifetime);
-                            if (migration.source.device.is_cpu())
+                            destination_engine = retainFloatingGpuDestination(*destination_group->storage,
+                                destination_participant.device, destination_floating, lease.lifetime);
+                            if (source_participant.device.is_cpu())
                             {
                                 const auto cpu_source =
                                     std::span<const std::uint8_t>(
@@ -6093,7 +6648,7 @@ namespace llaminar2
                                             publishedResidencyBank(
                                                 expected_epoch),
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine, piece.intersection);
                                 ++local_gpu_cpu_operations;
                             }
                             else if (const auto peer_lane =
@@ -6127,8 +6682,8 @@ namespace llaminar2
                                             expected_epoch),
                                         source_engine,
                                         destination_engine);
-                                if (migration.source.device.type ==
-                                    migration.destination.device.type)
+                                if (source_participant.device.type ==
+                                    destination_participant.device.type)
                                 {
                                     ++local_same_backend_gpu_operations;
                                 }
@@ -6138,7 +6693,7 @@ namespace llaminar2
                                 }
                             }
                         }
-                        else if (migration.source.device.is_cpu())
+                        else if (source_participant.device.is_cpu())
                         {
                             const auto probe =
                                 makeCpuToGpuExpertTierWeightStreamManifest(
@@ -6147,7 +6702,7 @@ namespace llaminar2
                                     migration.layer_idx,
                                     migration.expert_id,
                                     projection,
-                                    1);
+                                    1).forIntersection(piece.intersection);
                             const auto maximum_units = maximumUnitsPerChunk(
                                 probe,
                                 config_.staging_capacity_bytes);
@@ -6158,23 +6713,21 @@ namespace llaminar2
                                     migration.layer_idx,
                                     migration.expert_id,
                                     projection,
-                                    maximum_units);
+                                    maximum_units).forIntersection(piece.intersection);
                             const auto layout = manifest.deviceLayout();
                             destination_descriptor =
                                 makeGpuDestinationDescriptor(
                                     destination_slot,
-                                    layout.N,
-                                    layout.K,
+                                    layout.gpu_N,
+                                    layout.gpu_K,
                                     layout.gpu_codebook_id,
                                     layout.gpu_payload_bytes_per_block,
                                     layout.gpu_is_asymmetric != 0,
                                     layout.gpu_has_emins != 0,
-                                    source.format.native_vnni);
-                            destination_engine = makeGpuDestinationEngine(
-                                migration.destination.device,
-                                destination_descriptor,
-                                lease.lifetime,
-                                source.format.native_vnni);
+                                    source.format.native_quantised);
+                            destination_engine = retainNativeGpuDestination(*destination_group->storage,
+                                destination_participant.device, destination_descriptor, lease.lifetime,
+                                source.format.native_quantised);
                             const auto lane = impl_->weight_lanes.find(edge);
                             if (lane == impl_->weight_lanes.end())
                                 throw std::runtime_error(
@@ -6211,12 +6764,10 @@ namespace llaminar2
                                         .payload_bytes_per_block,
                                     source.gpu_packed.is_asymmetric,
                                     source.gpu_packed.has_emins,
-                                    source.format.native_vnni);
-                            destination_engine = makeGpuDestinationEngine(
-                                migration.destination.device,
-                                destination_descriptor,
-                                lease.lifetime,
-                                source.format.native_vnni);
+                                    source.format.native_quantised);
+                            destination_engine = retainNativeGpuDestination(*destination_group->storage,
+                                destination_participant.device, destination_descriptor, lease.lifetime,
+                                source.format.native_quantised);
 
                             if (const auto peer_lane =
                                     impl_->peer_lanes.find(edge);
@@ -6249,8 +6800,8 @@ namespace llaminar2
                                             expected_epoch),
                                         source_engine,
                                         destination_engine);
-                                if (migration.source.device.type ==
-                                    migration.destination.device.type)
+                                if (source_participant.device.type ==
+                                    destination_participant.device.type)
                                 {
                                     ++local_same_backend_gpu_operations;
                                 }
@@ -6262,13 +6813,13 @@ namespace llaminar2
                         }
                     }
 
-                    prepared.projections[projection_index] =
-                        std::make_unique<
-                            MoEOverlayPreparedProjectionOperation>(
-                            std::move(physical_operation),
-                            prepared.destination_arrival,
-                            projection,
-                            std::move(destination_engine));
+                    if (!destination_group) throw std::logic_error("Local physical destination lost its original role completion");
+                    if (destination_group->storage->engine && destination_group->storage->engine.get() != destination_engine.get())
+                        throw std::logic_error("Physical pieces attempted to replace an already reserved final role engine");
+                    destination_group->storage->engine = destination_engine;
+                    prepared.operations[operation_index].operation =
+                        std::make_unique<MoEOverlayPreparedProjectionOperation>(
+                            std::move(physical_operation), destination_group->completion, completion_piece);
                 }
             }
 
@@ -6300,10 +6851,13 @@ namespace llaminar2
                      remote_index < remote_targets.size();
                      ++remote_index)
                 {
-                    const auto target = remote_targets[remote_index];
-                    result.migrations[target.migration_index]
-                        .projections[target.projection_index] =
-                        std::move(remote_wave.operations[remote_index]);
+                    const auto &target = remote_targets[remote_index];
+                    auto operation = std::move(remote_wave.operations[remote_index]);
+                    if (target.completion)
+                        operation = std::make_unique<MoEOverlayPreparedProjectionOperation>(
+                            std::move(operation), target.completion, target.piece_index);
+                    result.migrations[target.migration_index].operations[target.operation_index].operation =
+                        std::move(operation);
                 }
             }
         }
@@ -6312,9 +6866,40 @@ namespace llaminar2
             return fail(error.what());
         }
 
+        // Every constructor and reserveWave above is an inert reservation:
+        // CPU workers, GPU lanes and MPI requests start only on first poll,
+        // after the caller's complete-wave consensus. A setup failure therefore
+        // returns an unsubmitted cleanup prefix and can release local bank
+        // readers without any active copy. Only Started work escapes this
+        // scope and must retain its exact bank through Ready or abort drain.
+        try
+        {
+        if (!device_batch)
+            for (size_t index = 0; index < result.migrations.size(); ++index)
+                for (auto &piece : result.migrations[index].operations)
+                {
+                    const auto source = source_members[index].find(piece.source_participant);
+                    if (source != source_members[index].end())
+                        piece.operation = std::make_unique<SourceMemberRetainedOperation>(
+                            std::move(piece.operation), source->second);
+                }
+
+        }
+        catch (const std::exception &error)
+        {
+            return fail(error.what());
+        }
+
+        size_t actual_projection_operations = 0;
+        for (const auto &pieces : physical_pieces)
+        {
+            if (pieces.size() > std::numeric_limits<size_t>::max() - actual_projection_operations)
+                return fail("Physical expert piece population overflows size_t");
+            actual_projection_operations += pieces.size();
+        }
         result.status = MoEOverlayResidencyStageStartStatus::Started;
         impl_->projection_operations_prepared.fetch_add(
-            migrations.size() * kProjections.size(),
+            actual_projection_operations,
             std::memory_order_relaxed);
         impl_->cpu_copy_operations.fetch_add(
             local_cpu_copy_operations, std::memory_order_relaxed);
@@ -6340,8 +6925,7 @@ namespace llaminar2
             config_.perf_device,
             {{"migrations", std::to_string(migrations.size())},
              {"projections",
-              std::to_string(
-                  migrations.size() * kProjections.size())},
+              std::to_string(actual_projection_operations)},
              {"cpu_parallel_copy_operations",
               std::to_string(local_cpu_copy_operations)},
              {"remote_cpu_endpoints",
@@ -6384,8 +6968,16 @@ namespace llaminar2
                     local_ids.begin(),
                     local_ids.end(),
                     migration.destination.owner_participant);
-                const auto &arrival =
-                    prepared.migrations[index].destination_arrival;
+                const auto &keyed = prepared.migrations[index].destination_arrivals;
+                if (keyed.size() != (local_destination ? 1u : 0u) ||
+                    (local_destination &&
+                     (keyed.front().participant_id != migration.destination.owner_participant ||
+                      !keyed.front().arrival || keyed.front().arrival->isCPUJointFragment())))
+                {
+                    if (error) *error = "ExpertOverlay whole-device staging requires its exact singleton arrival";
+                    return false;
+                }
+                const auto arrival = local_destination ? keyed.front().arrival : nullptr;
                 if (!local_destination)
                 {
                     if (arrival)
@@ -6524,31 +7116,17 @@ namespace llaminar2
         std::uint64_t recycled = 0;
         for (const auto &migration : migrations)
         {
-            /* A missing endpoint means this rank does not own the source. */
-            if (!config_.registry->endpoint(
-                    migration.source.owner_participant))
+            const auto target = MoEExpertPlacementTarget::fromPlacement(migration.source);
+            if (!target) std::terminate();
+            for (size_t member = 0; member < target->participantCount(); ++member)
             {
-                continue;
-            }
-
-            const auto found = impl_->endpoint_pools.find({
-                migration.source.owner_participant,
-                migration.layer_idx,
-            });
-            if (found == impl_->endpoint_pools.end() ||
-                !found->second.geometry_pool ||
-                !found->second.geometry_pool->adopted_slots)
-            {
-                /* Local topology disappearing after publication is unrecoverable. */
-                std::terminate();
-            }
-            if (found->second.geometry_pool->adopted_slots
-                    ->retireBootstrapAssignment(
-                        migration.layer_idx,
-                        migration.expert_id,
-                        retired_epoch))
-            {
-                ++recycled;
+                const int participant = target->participantId(member);
+                if (!config_.registry->endpoint(participant)) continue;
+                const auto found = impl_->endpoint_pools.find({participant, migration.layer_idx});
+                if (found == impl_->endpoint_pools.end() || !found->second.geometry_pool ||
+                    !found->second.geometry_pool->adopted_slots) std::terminate();
+                if (found->second.geometry_pool->adopted_slots->retireBootstrapAssignment(
+                        migration.layer_idx, migration.expert_id, retired_epoch)) ++recycled;
             }
         }
 
@@ -6663,10 +7241,14 @@ namespace llaminar2
             MoEOverlayReusableContextSeal result;
             result.source_epoch = published_epoch;
             result.canonical_owner_map =
-                config_.initial_snapshot->owner_map;
+                config_.initial_snapshot->placementOwnerMap();
             const auto participant_ids =
                 config_.registry->localParticipantIds();
             result.local_banks.reserve(participant_ids.size());
+            // One actual installed source borrow per participant spans every
+            // physical compaction/completion/drain below. It is not a new
+            // inference ticket or a host mirror of global selection.
+            std::map<int, MoEOverlayParticipantBankLease> seal_source_banks;
 
             /*
              * Materialize the exact terminal inventory from its typed owner.
@@ -6702,6 +7284,7 @@ namespace llaminar2
                             " from the host participant-bank authority");
                     }
                     result.local_banks.push_back(*bank);
+                    seal_source_banks.emplace(participant_id, std::move(bank));
                 }
             }
             else if (config_.inventory_authority ==
@@ -6729,7 +7312,7 @@ namespace llaminar2
                     const auto endpoint =
                         config_.registry->endpoint(participant_id);
                     const auto *participant =
-                        config_.initial_snapshot->owner_map.participantForId(
+                        config_.initial_snapshot->placementOwnerMap().participantForId(
                             participant_id);
                     if (!endpoint || !participant ||
                         endpoint->device() != participant->device)
@@ -6811,7 +7394,7 @@ namespace llaminar2
                 const int participant_id = canonical.participant_id;
                 const auto endpoint = config_.registry->endpoint(participant_id);
                 const auto *participant =
-                    config_.initial_snapshot->owner_map.participantForId(
+                    config_.initial_snapshot->placementOwnerMap().participantForId(
                         participant_id);
                 if (!endpoint || !participant ||
                     !canonical.valid(
@@ -6830,7 +7413,7 @@ namespace llaminar2
                 {
                     auto &layer = canonical.layerForModelLayer(layer_idx);
                     const auto expected_mask =
-                        config_.initial_snapshot->owner_map
+                        config_.initial_snapshot->placementOwnerMap()
                             .expertMaskForParticipant(
                                 layer_idx,
                                 participant_id,
@@ -6863,9 +7446,10 @@ namespace llaminar2
                         {
                             continue;
                         }
-                        const auto &payload = layer.experts.at(
-                            static_cast<std::size_t>(expert_id));
-                        if (!payload.complete())
+                        const bool complete = layer.cpu_fragment_family
+                            ? layer.cpu_fragment_family->accepts(layer.cpu_fragments.at(size_t(expert_id)), expert_id)
+                            : layer.experts.at(size_t(expert_id)).complete();
+                        if (!complete)
                         {
                             return fail(
                                 "ExpertOverlay reusable-context seal found an incomplete resident payload");
@@ -7019,7 +7603,7 @@ namespace llaminar2
                 const auto endpoint =
                     config_.registry->endpoint(bank.participant_id);
                 const auto *participant =
-                    config_.initial_snapshot->owner_map.participantForId(
+                    config_.initial_snapshot->placementOwnerMap().participantForId(
                         bank.participant_id);
                 if (!endpoint || !participant)
                 {
@@ -7056,8 +7640,11 @@ namespace llaminar2
                             continue;
                         }
 
-                        const auto source_payload = layer.experts.at(
-                            static_cast<std::size_t>(expert_id));
+                        std::array<std::shared_ptr<ITensorGemm>, 3> source_engines;
+                        for (const auto role : kProjections)
+                            source_engines[projectionIndex(role)] = projectionEngine(layer, size_t(expert_id), role);
+                        const auto projection_set = layer.cpu_fragment_family ? DeviceMoEProjectionSet::CompleteExpert
+                            : layer.experts.at(size_t(expert_id)).projections();
                         std::array<std::shared_ptr<ITensorGemm>, 3> destination_engines{};
                         std::vector<std::unique_ptr<
                             IMoEOverlayTierTransferOperation>> operations;
@@ -7079,8 +7666,7 @@ namespace llaminar2
                                 kProjections.size());
                             for (const auto projection : kProjections)
                             {
-                                auto source_engine = projectionEngine(
-                                    source_payload, projection);
+                                auto source_engine = source_engines[projectionIndex(projection)];
                                 MoEOverlayPreparedWeightSource source;
                                 std::string source_error;
                                 if (!resolveMoEOverlayPreparedWeightSource(
@@ -7130,15 +7716,23 @@ namespace llaminar2
                                     return fail(
                                         "ExpertOverlay reusable-context CPU compaction lane was not materialized at setup");
                                 }
-                                operations.push_back(
-                                    std::make_unique<
-                                        AdmittedCpuCopyOperation>(
-                                        lane->second,
-                                        source_bytes,
-                                        target.destination_bytes,
-                                        gate,
-                                        source_engine,
-                                        target.engine));
+                                CPUCopyGeometry copy_geometry = CompleteCPUCopy{};
+                                if (source.cpu_packed)
+                                {
+                                    const auto *packed = target.engine->exportCPUNativeQuantisedPackedWeights();
+                                    if (!packed) return fail("Canonical CPU compaction changed original native storage");
+                                    const auto owned = layer.cpu_fragment_family
+                                        ? layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex())
+                                            .projection(projection == ExpertTierWeightProjection::Gate ? WeightRole::MoEExpertGate
+                                                : projection == ExpertTierWeightProjection::Up ? WeightRole::MoEExpertUp : WeightRole::MoEExpertDown)
+                                        : wholeProjectionIntersection(source.cpu_packed->N, source.cpu_packed->K).source();
+                                    copy_geometry = nativeCPUCopyGeometry(*source.cpu_packed, *packed,
+                                        ExpertTierWeightProjectionIntersection::between(owned, owned),
+                                        config_.staging_capacity_bytes, std::make_shared<std::mutex>());
+                                }
+                                operations.push_back(std::make_unique<AdmittedCpuCopyOperation>(lane->second,
+                                    source_bytes, target.destination_bytes, gate, source_engine, target.engine,
+                                    std::move(copy_geometry)));
                                 set_projection(
                                     destination_engines,
                                     projection,
@@ -7159,8 +7753,7 @@ namespace llaminar2
                             }
                             for (const auto projection : kProjections)
                             {
-                                auto source_engine = projectionEngine(
-                                    source_payload, projection);
+                                auto source_engine = source_engines[projectionIndex(projection)];
                                 MoEOverlayPreparedWeightSource source;
                                 std::string source_error;
                                 if (!resolveMoEOverlayPreparedWeightSource(
@@ -7220,12 +7813,12 @@ namespace llaminar2
                                                 .payload_bytes_per_block,
                                             source.gpu_packed.is_asymmetric,
                                             source.gpu_packed.has_emins,
-                                            source.format.native_vnni);
+                                            source.format.native_quantised);
                                     target_engine = makeGpuDestinationEngine(
                                         bank.device,
                                         descriptor,
                                         destination->lifetime,
-                                        source.format.native_vnni);
+                                        source.format.native_quantised);
                                     operations.push_back(
                                         std::make_unique<
                                             AdmittedPeerOperation>(
@@ -7246,20 +7839,48 @@ namespace llaminar2
                         }
 
                         std::string operation_error;
-                        auto destination_payload = MoEOverlayPreparedExpertPayload::fromProjections(
-                            source_payload.projections(), std::move(destination_engines));
-                        if (!destination_payload.ready() ||
-                            !complete_operations(
-                                operations, &operation_error))
+                        std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival;
+                        if (layer.cpu_fragment_family)
                         {
-                            return fail(
-                                operation_error.empty()
-                                    ? "ExpertOverlay reusable-context compaction produced an incomplete destination payload"
-                                    : std::move(operation_error));
+                            const auto borrow = seal_source_banks.find(bank.participant_id);
+                            if (borrow == seal_source_banks.end())
+                                return fail("CPU fragment terminal compaction lost its original published-bank borrow");
+                            arrival = config_.registry->prepareCPUJointArrivalFromInstalledBank(borrow->second,
+                                bank.participant_id, layer_idx, expert_id, &operation_error);
+                            if (!arrival) return fail(operation_error);
                         }
-                        layer.experts.at(
-                            static_cast<std::size_t>(expert_id)) =
-                            std::move(destination_payload);
+                        else arrival = std::make_shared<MoEOverlayPreparedExpertArrival>(projection_set);
+                        for (const auto role : kProjections)
+                        {
+                            const auto index = projectionIndex(role);
+                            MoEOverlayPreparedWeightSource original;
+                            if (!resolveMoEOverlayPreparedWeightSource(source_engines[index], bank.device,
+                                    original, &operation_error)) return fail(operation_error);
+                            const auto signature = signatureFor(original);
+                            const auto owned = layer.cpu_fragment_family
+                                ? layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex())
+                                    .projection(role == ExpertTierWeightProjection::Gate ? WeightRole::MoEExpertGate
+                                        : role == ExpertTierWeightProjection::Up ? WeightRole::MoEExpertUp : WeightRole::MoEExpertDown)
+                                : wholeProjectionIntersection(signature.N, signature.K).source();
+                            auto completion = std::make_shared<MoEOverlayPreparedProjectionCompletion>(
+                                std::vector{ExpertTierWeightProjectionIntersection::between(owned, owned)}, arrival, role,
+                                [engine = destination_engines[index]] { return engine; });
+                            operations[index] = std::make_unique<MoEOverlayPreparedProjectionOperation>(
+                                std::move(operations[index]), std::move(completion), 0);
+                        }
+                        if (!complete_operations(operations, &operation_error)) return fail(operation_error);
+                        if (layer.cpu_fragment_family)
+                        {
+                            MoEOverlayPreparedCPUFragmentPayload fragment;
+                            if (!arrival->completeCPUFragment(fragment, &operation_error)) return fail(operation_error);
+                            layer.setResidentCPUFragment(expert_id, std::move(fragment));
+                        }
+                        else
+                        {
+                            MoEOverlayPreparedExpertPayload payload;
+                            if (!arrival->completePayload(payload, &operation_error)) return fail(operation_error);
+                            layer.setResidentExpert(expert_id, std::move(payload));
+                        }
                         ++result.compacted_shadow_experts;
                     }
                 }

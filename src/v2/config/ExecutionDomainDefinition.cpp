@@ -139,7 +139,7 @@ namespace llaminar2
         if (eq_pos == std::string::npos)
         {
             throw std::invalid_argument("Invalid " + options.context + " spec: '" + spec +
-                                        "' (expected name=devices[;scope=...][;backend=...][;routed_compute=...][;routed_phase=...][;routed_decode_assignment=...][;routed_prefill_assignment=...])");
+                                        "' (expected name=devices[;scope=...][;backend=...][;expert_compute=...][;expert_phase=...][;expert_decode_assignment=...][;expert_prefill_assignment=...])");
         }
 
         ExecutionDomainDefinition domain;
@@ -220,35 +220,35 @@ namespace llaminar2
             {
                 domain.ranks = parseRankList(value, "ranks");
             }
-            else if (key == "routed_compute")
+            else if (key == "expert_compute")
             {
                 if (!options.allow_routed_expert_compute)
-                    throw std::invalid_argument(options.context + " does not accept routed_compute=<policy>");
+                    throw std::invalid_argument(options.context + " does not accept expert_compute=<policy>");
                 auto compute = parseRoutedExpertComputePolicy(value);
                 if (!compute)
-                    throw std::invalid_argument("Invalid " + options.context + " routed compute policy: '" + value + "'");
+                    throw std::invalid_argument("Invalid " + options.context + " expert compute policy: '" + value + "'");
                 domain.routed_compute_policy = *compute;
                 saw_routed_compute = true;
             }
-            else if (key == "routed_decode_assignment")
+            else if (key == "expert_decode_assignment")
             {
                 auto assignment = parseRoutedExpertAssignmentPolicy(value);
                 if (!assignment)
-                    throw std::invalid_argument("Invalid " + options.context + " routed decode assignment policy: '" + value + "'");
+                    throw std::invalid_argument("Invalid " + options.context + " expert decode assignment policy: '" + value + "'");
                 domain.routed_decode_assignment_policy = *assignment;
             }
-            else if (key == "routed_prefill_assignment")
+            else if (key == "expert_prefill_assignment")
             {
                 auto assignment = parseRoutedExpertAssignmentPolicy(value);
                 if (!assignment)
-                    throw std::invalid_argument("Invalid " + options.context + " routed prefill assignment policy: '" + value + "'");
+                    throw std::invalid_argument("Invalid " + options.context + " expert prefill assignment policy: '" + value + "'");
                 domain.routed_prefill_assignment_policy = *assignment;
             }
-            else if (key == "routed_phase")
+            else if (key == "expert_phase")
             {
                 auto phase = parseRoutedExpertPhasePolicy(value);
                 if (!phase)
-                    throw std::invalid_argument("Invalid " + options.context + " routed phase policy: '" + value + "'");
+                    throw std::invalid_argument("Invalid " + options.context + " expert phase policy: '" + value + "'");
                 domain.routed_phase_policy = *phase;
             }
             else
@@ -260,7 +260,7 @@ namespace llaminar2
         if (options.require_scope && !saw_scope)
             throw std::invalid_argument(options.context + " '" + domain.name + "' is missing scope=<auto|single|rank_local|node_local>");
         if (options.require_routed_expert_compute && !saw_routed_compute)
-            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing routed_compute=<replicated|apportioned|tensor-sharded>");
+            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing expert_compute=<replicated|apportioned|tensor-sharded>");
 
         return domain;
     }
@@ -296,7 +296,10 @@ namespace llaminar2
 
     bool ExecutionDomainDefinition::supportsRoutedExpertTensorSharding() const
     {
-        return isDomainScopedTP() && hasMultipleParticipants();
+        // A single original CPU owns the complete matrix: TP1 is the exact
+        // degenerate tensor partition, not a policy switch or a fake cohort.
+        return (participants.size()==1 && participants.front().isCPU()) ||
+            (isDomainScopedTP() && hasMultipleParticipants());
     }
 
     bool ExecutionDomainDefinition::samePhysicalParticipants(const ExecutionDomainDefinition &other) const
@@ -363,7 +366,7 @@ namespace llaminar2
         if (routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
             !supportsWholeExpertApportionment())
         {
-            errors.push_back("Domain '" + name + "' uses routed_compute=apportioned but has no participants");
+            errors.push_back("Domain '" + name + "' uses expert_compute=apportioned but has no participants");
         }
 
         const bool apportioned_prefill_over_replicated_weights =
@@ -393,8 +396,8 @@ namespace llaminar2
         {
             errors.push_back(
                 "Domain '" + name +
-                "' uses routed_phase=prefill-apportioned-decode-replicated "
-                "but routed_compute is not replicated");
+                "' uses expert_phase=prefill-apportioned-decode-replicated "
+                "but expert_compute is not replicated");
         }
 
         if (routed_phase_policy ==
@@ -403,7 +406,7 @@ namespace llaminar2
         {
             errors.push_back(
                 "Domain '" + name +
-                "' uses routed_phase=prefill-apportioned-decode-replicated "
+                "' uses expert_phase=prefill-apportioned-decode-replicated "
                 "but is not a multi-participant domain-scoped TP domain");
         }
 
@@ -437,17 +440,17 @@ namespace llaminar2
         };
         validate_assignment(
             routed_decode_assignment_policy,
-            "routed_decode_assignment",
+            "expert_decode_assignment",
             false);
         validate_assignment(
             routed_prefill_assignment_policy,
-            "routed_prefill_assignment",
+            "expert_prefill_assignment",
             true);
 
         if (routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
             !supportsRoutedExpertTensorSharding())
         {
-            errors.push_back("Domain '" + name + "' uses routed_compute=tensor-sharded but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses expert_compute=tensor-sharded but is neither CPU TP1 nor a multi-participant domain-scoped TP domain");
         }
 
         return errors;
@@ -461,7 +464,7 @@ namespace llaminar2
             return routed_compute_policy;
         if (scope == ExecutionDomainScope::AUTO)
             throw std::invalid_argument("Domain '" + name +
-                "' requires inventory-bound scope before automatic routed compute resolution");
+                "' requires inventory-bound scope before automatic expert compute resolution");
 
         // Arithmetic/row-assignment intent is independent from topology. LLEP
         // needs complete residents; it must not receive a down-column shard.
@@ -523,22 +526,22 @@ namespace llaminar2
         if (backend != CollectiveBackendType::AUTO)
             oss << " backend=" << collectiveBackendTypeToString(backend);
         if (routed_compute_policy != RoutedExpertComputePolicy::Unspecified)
-            oss << " routed_compute="
+            oss << " expert_compute="
                 << routedExpertComputePolicyToString(routed_compute_policy);
         if (routed_phase_policy != RoutedExpertPhasePolicy::Unspecified)
-            oss << " routed_phase="
+            oss << " expert_phase="
                 << routedExpertPhasePolicyToString(routed_phase_policy);
         if (routed_decode_assignment_policy !=
             RoutedExpertAssignmentPolicy::Unspecified)
         {
-            oss << " routed_decode_assignment="
+            oss << " expert_decode_assignment="
                 << routedExpertAssignmentPolicyToString(
                        routed_decode_assignment_policy);
         }
         if (routed_prefill_assignment_policy !=
             RoutedExpertAssignmentPolicy::Unspecified)
         {
-            oss << " routed_prefill_assignment="
+            oss << " expert_prefill_assignment="
                 << routedExpertAssignmentPolicyToString(
                        routed_prefill_assignment_policy);
         }

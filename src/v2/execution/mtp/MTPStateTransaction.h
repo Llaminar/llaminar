@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "MTPShiftedCacheOrigin.h"
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
@@ -27,6 +28,7 @@ namespace llaminar2
         int logical_tokens = 0;
         int main_kv_tokens = 0;
         int shifted_mtp_kv_tokens = 0;
+        MTPShiftedCacheOrigin shifted_origin=MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Frozen model convention, never a count mirror.
         int position = 0;
         bool has_terminal_hidden = false;
         bool has_terminal_logits = false;
@@ -279,8 +281,9 @@ namespace llaminar2
      *
      * A verifier base can already own the shifted row for its first input. In
      * that case replay must reuse the resident row. Once main decode advances,
-     * shifted state trails by one and the next replay row must append exactly
-     * one shifted entry.
+     * replay appends exactly one shifted entry. Successor-pair caches append
+     * at shifted=main-1 and reuse at shifted=main. QFN's visible token-zero
+     * seed shifts these coordinates: append at shifted=main, reuse at main+1.
      */
     enum class MTPShiftedReplayRowAction
     {
@@ -325,7 +328,23 @@ namespace llaminar2
         explicit operator bool() const { return ok; }
     };
 
-    int expectedShiftedMTPTokens(int logical_tokens);
+    int expectedShiftedMTPTokens(int logical_tokens, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly);
+
+    /**
+     * @brief Derive the next host-owned condition position from its exact shifted checkpoint.
+     * @param shifted_rows Committed depth-zero rows owned by the saved CPU checkpoint.
+     * @param origin Authenticated model convention retained in that checkpoint.
+     * @return The absolute main condition coordinate accepted by the shifted-row appender.
+     * @throws std::invalid_argument For negative counts or an unknown origin.
+     * @throws std::overflow_error When the condition coordinate is unrepresentable.
+     *
+     * QFN keeps its token-zero bootstrap, so shifted row 11 is condition position
+     * 11. Successor-only families omit that row and use position 12. A universal
+     * +1 therefore invents a missing QFN row on budget-limited direct emission.
+     * This derives a coordinate from an immutable checkpoint; it is not a second
+     * cache count or permission to synthesize/truncate missing state.
+     */
+    int mtpShiftedAppendPosition(int shifted_rows, MTPShiftedCacheOrigin origin);
 
     /**
      * @brief Plan the largest verifier prefix that is serial-visible this step.
@@ -359,7 +378,7 @@ namespace llaminar2
      */
     MTPShiftedReplayRowPlan planMTPShiftedReplayRow(
         int main_cached_tokens,
-        int shifted_cached_tokens);
+        int shifted_cached_tokens, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
     /**
      * @brief Create a payload-free verifier-base snapshot for the MTP fast path.
@@ -372,7 +391,7 @@ namespace llaminar2
      * invariants; callers must still keep a real rollback checkpoint for
      * failure paths until verifier state is fully isolated in speculative slots.
      */
-    PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens);
+    PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
     MTPStateValidationResult validateCommittedMTPDecodeState(
         const MTPDecodeStateStamp &state,

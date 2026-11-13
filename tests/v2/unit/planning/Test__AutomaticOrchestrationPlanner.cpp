@@ -6,17 +6,25 @@
  * The model directory, candidate compiler, memory authority and apply codec
  * are real production components. No tensor payload or accelerator is used.
  */
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/AutomaticOrchestrationPlanner.h"
+#include "planning/PlanningAdmissionPreparation.h"
+#include "planning/PlanningMemoryQuoteReuse.h"
+#include "planning/ObservedPeerGrouping.h"
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/AutomaticPlanningStartup.h"
+#include "backends/PreparedGPUWorkerThread.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <set>
+#include <omp.h>
+#include <thread>
 
 using namespace llaminar2;
 
@@ -69,7 +77,20 @@ namespace
     OrchestrationCandidateMemoryPolicy memory()
     {
         return {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-            .maximum_cached_prefill_buckets = 8};
+            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(2)};
+    }
+
+    /** @return Explicit recorded declarations for synthetic hardware; never query native providers. */
+    PlanningNativeContextBudgets nativeBudgets(const ClusterInventory& observed)
+    {
+        PlanningNativeContextBudgets result;
+        const auto program=GPUWorkerStackProgram::originalDefaults();
+        for(const auto& rank:observed.ranks){
+            auto& declarations=result[rank.rank];
+            for(const auto& gpu:rank.gpus)declarations.push_back({{gpu.type,gpu.local_device_id},gpu.uuid,
+                program.stackBytes(),program.guardBytes(),program.pageBytes(),64,64});
+        }
+        return result;
     }
 
     /** @return Identity of the deliberately smaller, later-observed choice. */
@@ -172,7 +193,8 @@ TEST(AutomaticOrchestrationPlanner, StartupSearchSharesPolicyAndPreservesDiscove
             EXPECT_EQ(context.workload(), OrchestrationPlanningWorkload(64, 64));
             EXPECT_EQ(context.request().mpi_procs, observed.world_size);
             return evaluate;
-        });
+        },collectPlanningHostServiceBudgets,
+        [](const AutomaticPlanningPreparation& context){return nativeBudgets(context.inventory());});
     ASSERT_TRUE(startup.root_selection);
     const auto &winner = *startup.root_selection;
     EXPECT_EQ(preparations, 1u);
@@ -235,12 +257,14 @@ TEST(AutomaticOrchestrationPlanner, RequestHorizonCanMakeTensorParallelFasterTha
             const bool tp = candidate.strategy() == OrchestrationStrategy::TensorParallel;
             return OrchestrationCostEstimate(work, tp ? 1.0 : 0.8, tp ? 0.02 : 0.03, "synthetic phase costs");
         };
+        auto startup_memory=OrchestrationCandidateMemoryPolicy::fromStartup();
+        startup_memory.native_context_budgets=nativeBudgets(inventory(backend));
         config.automatic_planning.workload = OrchestrationPlanningWorkload(64, 1);
         const auto short_request = AutomaticOrchestrationPlanner::select(config, source, inventory(backend),
-            OrchestrationCandidateMemoryPolicy::fromStartup(), *config.automatic_planning.workload, cost);
+            startup_memory, *config.automatic_planning.workload, cost);
         config.automatic_planning.workload = OrchestrationPlanningWorkload(64, 128);
         const auto long_request = AutomaticOrchestrationPlanner::select(config, source, inventory(backend),
-            OrchestrationCandidateMemoryPolicy::fromStartup(), *config.automatic_planning.workload, cost);
+            startup_memory, *config.automatic_planning.workload, cost);
         EXPECT_EQ(short_request.cost().workload(), OrchestrationPlanningWorkload(64, 1));
         EXPECT_EQ(long_request.cost().workload(), *config.automatic_planning.workload);
         EXPECT_FALSE(long_request.candidate().config().automatic_planning.specified());
@@ -642,6 +666,13 @@ TEST(AutomaticOrchestrationPlanner, MultiTierOverlayAdmissionAndSelection)
         gpu.uuid = "rocm-" + gpu.uuid;
         gpu.numa_node = 4;
     }
+    // These fixture domains have observed no direct peer edges. Supply the
+    // complete directed matrices: absent discovery is not negative evidence.
+    auto &cuda_rank = observed.ranks.front();
+    cuda_rank.p2p_cuda_count = static_cast<int>(cuda_rank.gpus.size());
+    cuda_rank.p2p_cuda.assign(cuda_rank.gpus.size() * cuda_rank.gpus.size(), false);
+    rocm_rank.p2p_rocm_count = static_cast<int>(rocm_rank.gpus.size());
+    rocm_rank.p2p_rocm.assign(rocm_rank.gpus.size() * rocm_rank.gpus.size(), false);
     observed.ranks.push_back(std::move(rocm_rank));
     observed.world_size = 2;
     observed.buildNodeAggregations();
@@ -682,4 +713,387 @@ TEST(AutomaticOrchestrationPlanner, MultiTierOverlayAdmissionAndSelection)
     EXPECT_TRUE(plan.domains[2].participants.front().isCPU());
     const auto saved = serializeOrchestrationConfig(selected.candidate().config());
     EXPECT_EQ(serializeOrchestrationConfig(deserializeOrchestrationConfig(saved)), saved);
+}
+
+namespace {
+/** @return Original sparse, interleaved endpoints with two observed local PCI islands. */
+RankInventory peerIslands(std::size_t count=8)
+{
+    RankInventory rank;
+    rank.rank=0;rank.node_id=0;rank.hostname="peer-host";rank.cpu.numa_node=3;
+    rank.cpu.memory_bytes=rank.cpu.free_memory_bytes=128ull<<30;
+    rank.cpu_cores=rank.cpu.compute_units=8;rank.cpu_worker_threads=2;rank.numa_nodes=1;
+    const std::array ordinals{91,7,53,2,87,11,61,3,103,17,121,19};
+    for(std::size_t i=0;i<count;++i) {
+        DeviceInfo gpu;
+        gpu.type=DeviceType::ROCm;gpu.local_device_id=ordinals.at(i);gpu.uuid="card-"+std::to_string(i);
+        gpu.numa_node=3;gpu.memory_bytes=64ull<<30;gpu.free_memory_bytes=48ull<<30;gpu.compute_units=64;
+        gpu.native_isa="gfx906:sramecc+:xnack-";
+        gpu.pcie_upstream_bdfs={i%2?"0000:af:00.0":"0000:86:00.0","0000:80:00.0"};
+        rank.gpus.push_back(std::move(gpu));
+    }
+    rank.p2p_rocm_count=static_cast<int>(count);rank.p2p_rocm.assign(count*count,true);
+    return rank;
+}
+/** @return Original group endpoint sets independent of semantic stage order. */
+std::set<std::set<int>> groupOrdinals(const std::vector<std::vector<DeviceId>>& groups)
+{
+    std::set<std::set<int>> result;
+    for(const auto& group:groups) {std::set<int> ids;for(auto id:group) ids.insert(id.ordinal);result.insert(std::move(ids));}
+    return result;
+}
+}
+
+TEST(ObservedPeerGrouping, AllAccessibleSparseInterleavedIslandsKeepOriginalFourPlusFour)
+{
+    auto rank=peerIslands();
+    std::vector<DeviceId> eligible;
+    for(const auto& gpu:rank.gpus) eligible.push_back({gpu.type,gpu.local_device_id});
+    const std::array<std::size_t,2> sizes{4,4};
+    const auto groups=ObservedPeerGrouping(rank).select(eligible,sizes);
+    EXPECT_EQ(groupOrdinals(groups),(std::set<std::set<int>>{{91,53,87,61},{7,2,11,3}}));
+    // Shuffle both discovery order and matrix positions, preserving the actual
+    // complete graph. UUID authority, not ordinal/discovery adjacency, wins ties.
+    std::reverse(rank.gpus.begin(),rank.gpus.end());
+    std::reverse(eligible.begin(),eligible.end());
+    EXPECT_EQ(ObservedPeerGrouping(rank).select(eligible,sizes),groups);
+}
+
+TEST(ObservedPeerGrouping, MutualFactsNeverInventAsymmetricPartialMissingOrCrossDomainEdges)
+{
+    auto rank=peerIslands(4);
+    const DeviceId a{DeviceType::ROCm,91},b{DeviceType::ROCm,7},c{DeviceType::ROCm,53},d{DeviceType::ROCm,2};
+    rank.p2p_rocm.assign(16,false);
+    rank.p2p_rocm[0*4+1]=true; // One directed edge never establishes mutual access.
+    rank.p2p_rocm[0*4+2]=rank.p2p_rocm[2*4+0]=true;
+    const ObservedPeerGrouping facts(rank);
+    EXPECT_FALSE(facts.mutuallyAccessible(a,b));EXPECT_TRUE(facts.mutuallyAccessible(a,c));
+    EXPECT_EQ(facts.quality(std::array{a,b,c}).fully_connected_pairs,0u);
+    EXPECT_EQ(facts.quality(std::array{a,b,c}).mutual_pairs,1u);
+    EXPECT_EQ(groupOrdinals(facts.select(std::array{a,b,c,d},std::array<std::size_t,2>{2,2})),
+        (std::set<std::set<int>>{{91,53},{7,2}}));
+    auto shuffled=rank;
+    std::reverse(shuffled.gpus.begin(),shuffled.gpus.end());
+    for(std::size_t i=0;i<4;++i) for(std::size_t j=0;j<4;++j)
+        shuffled.p2p_rocm[i*4+j]=rank.p2p_rocm[(3-i)*4+(3-j)];
+    EXPECT_EQ(groupOrdinals(ObservedPeerGrouping(shuffled).select(std::array{d,c,b,a},std::array<std::size_t,2>{2,2})),
+        (std::set<std::set<int>>{{91,53},{7,2}}));
+    rank.p2p_rocm.clear();
+    EXPECT_EQ(ObservedPeerGrouping(rank).quality(std::array{a,c}),ObservedPeerGroupQuality{});
+    // Missing capability still permits a real homogeneous native CCL group.
+    EXPECT_EQ(ObservedPeerGrouping(rank).select(std::array{a,b,c,d},std::array<std::size_t,1>{4}).front().size(),4u);
+    rank.p2p_rocm.assign(15,true); // Structurally incomplete observation is unknown.
+    EXPECT_FALSE(ObservedPeerGrouping(rank).mutuallyAccessible(a,c));
+    rank.p2p_rocm.assign(16,true);
+    rank.gpus[2].numa_node=7;
+    EXPECT_FALSE(ObservedPeerGrouping(rank).mutuallyAccessible(a,c));
+    EXPECT_THROW(ObservedPeerGrouping(rank).select(std::array{a,c},std::array<std::size_t,1>{2}),std::invalid_argument);
+    rank.gpus[2].numa_node=3;rank.gpus[2].type=DeviceType::CUDA;
+    const DeviceId cuda{DeviceType::CUDA,53};
+    EXPECT_FALSE(ObservedPeerGrouping(rank).mutuallyAccessible(a,cuda));
+    EXPECT_THROW(ObservedPeerGrouping(rank).select(std::array{a,cuda},std::array<std::size_t,1>{2}),std::invalid_argument);
+}
+
+TEST(ObservedPeerGrouping, RequestedSizesAndDeterministicTiesHaveNoMachineCardinalityConstants)
+{
+    for(std::size_t count=1;count<=11;++count) {
+        auto rank=peerIslands(count);
+        std::vector<DeviceId> eligible;for(const auto& gpu:rank.gpus) eligible.push_back({gpu.type,gpu.local_device_id});
+        std::vector<std::size_t> sizes(count/3,3);if(count%3) sizes.push_back(count%3);
+        const auto selected=ObservedPeerGrouping(rank).select(eligible,sizes);
+        ASSERT_EQ(selected.size(),sizes.size());
+        std::set<DeviceId> distinct;
+        for(std::size_t i=0;i<sizes.size();++i) {EXPECT_EQ(selected[i].size(),sizes[i]);distinct.insert(selected[i].begin(),selected[i].end());}
+        EXPECT_EQ(distinct.size(),count);
+        // Remove locality and capability facts: legal native groups retain
+        // deterministic UUID tie order without fabricated P2P eligibility.
+        rank.p2p_rocm.clear();for(auto& gpu:rank.gpus) gpu.pcie_upstream_bdfs.clear();
+        const auto unobserved=ObservedPeerGrouping(rank).select(eligible,sizes);
+        std::reverse(eligible.begin(),eligible.end());
+        EXPECT_EQ(ObservedPeerGrouping(rank).select(eligible,sizes),unobserved);
+    }
+    const auto rank=peerIslands(2);const ObservedPeerGrouping facts(rank);
+    EXPECT_THROW(facts.select(std::array{DeviceId::rocm(91)},std::array<std::size_t,1>{0}),std::invalid_argument);
+    EXPECT_THROW(facts.select(std::array{DeviceId::rocm(91)},std::array<std::size_t,1>{2}),std::invalid_argument);
+    EXPECT_THROW(facts.select(std::array{DeviceId::rocm(91),DeviceId::rocm(91)},std::array<std::size_t,1>{1}),std::invalid_argument);
+}
+
+TEST(AutomaticOrchestrationPlanner, ObservedPeerIslandsChooseActualOriginalDenseFourPlusFourAfterAdmission)
+{
+    test::PlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    ClusterInventory observed;observed.world_size=1;observed.ranks.push_back(peerIslands());observed.buildNodeAggregations();
+    auto config=request(source,DeviceType::ROCm);
+    config.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::PipelineParallel};
+    config.automatic_planning.device_counts={{DeviceType::ROCm,8}};
+    config.kv_cache_precision="fp32";config.prefill_max_bucket_size=64;
+    std::size_t candidates=0,nonlocal=0;
+    const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+        [&](const AdmittedOrchestrationCandidate& candidate,const auto& work) {
+            ++candidates;
+            const auto& domains=candidate.config().domain_definitions;
+            const bool balanced=domains.size()==2 && domains[0].devices.size()==4 && domains[1].devices.size()==4;
+            if(balanced) {
+                std::vector<DeviceId> ids;for(const auto& address:domains[0].devices) ids.push_back({address.device_type,address.device_ordinal});
+                nonlocal+=ObservedPeerGrouping(observed.ranks[0]).quality(ids).negative_hops < -12;
+            }
+            return OrchestrationCostEstimate(work,balanced?1:2,.01,"synthetic equal containing-native-group proxy across partitions");
+        });
+    EXPECT_GT(candidates,1u);EXPECT_GT(nonlocal,0u);
+    std::vector<std::vector<DeviceId>> actual;
+    for(const auto& domain:selected.candidate().config().domain_definitions) {
+        std::vector<DeviceId> ids;for(const auto& address:domain.devices) ids.push_back({address.device_type,address.device_ordinal});
+        actual.push_back(std::move(ids));
+    }
+    EXPECT_EQ(groupOrdinals(actual),(std::set<std::set<int>>{{91,53,87,61},{7,2,11,3}}));
+}
+
+TEST(AutomaticOrchestrationPlanner, ObservedPeerPreferencePreservesBetterCostAndNativeNoPeerCandidates)
+{
+    test::PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(bool available:{false,true}) {
+        auto rank=peerIslands(3);
+        if(!available) rank.p2p_rocm.clear();
+        ClusterInventory observed;observed.world_size=1;observed.ranks.push_back(rank);observed.buildNodeAggregations();
+        auto config=request(source,DeviceType::ROCm);
+        config.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::TensorParallel};
+        config.automatic_planning.device_counts={{DeviceType::ROCm,2}};
+        config.kv_cache_precision="fp32";
+        std::size_t priced=0;
+        const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+            [&](const AdmittedOrchestrationCandidate& candidate,const auto& work) {
+                ++priced;std::set<int> ids;for(const auto& p:candidate.devicePlans()) ids.insert(p.device.ordinal);
+                return OrchestrationCostEstimate(work,ids==std::set<int>{91,7}?.5:1,.01,"synthetic strictly better qualified cost dominates physical preference");
+            });
+        EXPECT_EQ(priced,3u);
+        std::set<int> ids;for(const auto& p:selected.candidate().devicePlans()) ids.insert(p.device.ordinal);
+        EXPECT_EQ(ids,(std::set<int>{91,7}));
+    }
+}
+
+TEST(AutomaticOrchestrationPlanner, ObservedPeerPreferenceCannotBypassPhysicalCapacityAdmission)
+{
+    test::PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    auto rank=peerIslands(3);
+    rank.p2p_rocm.assign(9,false);rank.p2p_rocm[2]=rank.p2p_rocm[6]=true;
+    rank.gpus[2].free_memory_bytes=1; // The only eligible peer edge cannot fit its source tensors.
+    ClusterInventory observed;observed.world_size=1;observed.ranks.push_back(rank);observed.buildNodeAggregations();
+    auto config=request(source,DeviceType::ROCm);
+    config.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::TensorParallel};
+    config.automatic_planning.device_counts={{DeviceType::ROCm,2}};config.kv_cache_precision="fp32";
+    const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+        [](const auto&,const auto& work){return OrchestrationCostEstimate(work,1,.01,"synthetic equal admitted service");});
+    EXPECT_GT(selected.counts().capacity_rejected,0u);
+    std::set<int> ids;for(const auto& p:selected.candidate().devicePlans()) ids.insert(p.device.ordinal);
+    EXPECT_EQ(ids,(std::set<int>{91,7}));
+}
+
+TEST(ObservedPeerGrouping, UUIDAliasesRejectContradictoryOriginalISAAndPCIAncestry)
+{
+    for(bool isa:{false,true}) {
+        ClusterInventory observed;observed.world_size=2;
+        observed.ranks.push_back(peerIslands(2));observed.ranks.push_back(observed.ranks.front());
+        observed.ranks[1].rank=1;observed.ranks[1].local_rank=1;
+        EXPECT_NO_THROW(observed.buildNodeAggregations());
+        if(isa) observed.ranks[1].gpus[0].native_isa="gfx1100";
+        else observed.ranks[1].gpus[0].pcie_upstream_bdfs={"0000:ff:00.0"};
+        EXPECT_THROW(observed.buildNodeAggregations(),std::invalid_argument);
+    }
+}
+
+/** @test Stage eligibility retains the uniform API's original island and UUID tie order. */
+TEST(ObservedPeerGrouping, StageEligibilityRetainsUniformAPIResultsAndStableIslandTies)
+{
+    for(const bool missing:{false,true}) {
+        auto rank=peerIslands();
+        if(missing) {rank.p2p_rocm.clear();for(auto& gpu:rank.gpus)gpu.pcie_upstream_bdfs.clear();}
+        std::vector<DeviceId> eligible;
+        for(const auto& gpu:rank.gpus)eligible.emplace_back(gpu.type,gpu.local_device_id);
+        for(const auto sizes:{std::vector<std::size_t>{4,4},std::vector<std::size_t>{1,2},
+                std::vector<std::size_t>{2,1},std::vector<std::size_t>{3,5},std::vector<std::size_t>{1,3,4}}) {
+            const ObservedPeerGrouping grouping(rank);
+            const auto legacy=grouping.select(eligible,sizes);
+            std::vector<ObservedPeerStageRequest> request;
+            for(const auto size:sizes)request.push_back({size,eligible});
+            const auto constrained=grouping.select(request);
+            ASSERT_TRUE(constrained);EXPECT_EQ(*constrained,legacy);
+            if(!missing && sizes==std::vector<std::size_t>{4,4})
+                EXPECT_EQ(groupOrdinals(*constrained),(std::set<std::set<int>>{{91,53,87,61},{7,2,11,3}}));
+            std::reverse(eligible.begin(),eligible.end());
+            // request spans still refer to the same stable vector allocation.
+            const auto reordered=grouping.select(request);
+            ASSERT_TRUE(reordered);EXPECT_EQ(*reordered,legacy);
+        }
+    }
+}
+
+/** @test The one canonical search distinguishes infeasibility from malformed metadata and prunes only impossible suffixes. */
+TEST(ObservedPeerGrouping, StageEligibilityKeepsTypedInfeasibilityAndExactLargeCohorts)
+{
+    auto rank=peerIslands(4);
+    const DeviceId a=DeviceId::rocm(91),b=DeviceId::rocm(7),c=DeviceId::rocm(53);
+    const std::array wide{a,b};const std::array only_a{a};const std::array other{b,c};
+    const ObservedPeerGrouping grouping(rank);
+    const std::array request{ObservedPeerStageRequest{1,wide},ObservedPeerStageRequest{1,only_a}};
+    const auto selected=grouping.select(request);
+    ASSERT_TRUE(selected);EXPECT_EQ(*selected,(std::vector<std::vector<DeviceId>>{{b},{a}}));
+    const std::array impossible{ObservedPeerStageRequest{1,only_a},ObservedPeerStageRequest{1,only_a},
+        ObservedPeerStageRequest{1,other}};
+    EXPECT_FALSE(grouping.select(impossible));
+    const std::array zero{ObservedPeerStageRequest{0,only_a}};
+    EXPECT_THROW((void)grouping.select(zero),std::invalid_argument);
+    const std::array overflow{ObservedPeerStageRequest{std::numeric_limits<std::size_t>::max(),only_a},
+        ObservedPeerStageRequest{1,wide}};
+    EXPECT_THROW((void)grouping.select(overflow),std::invalid_argument);
+    const std::array duplicate{a,a};const std::array invalid{ObservedPeerStageRequest{1,duplicate}};
+    EXPECT_THROW((void)grouping.select(invalid),std::invalid_argument);
+    const std::array absent{DeviceId::rocm(666)};const std::array unknown{ObservedPeerStageRequest{1,absent}};
+    EXPECT_THROW((void)grouping.select(unknown),std::invalid_argument);
+    rank.gpus[1].uuid=rank.gpus[0].uuid;
+    EXPECT_THROW((void)grouping.select(request),std::invalid_argument);
+
+    // One exact 65-device stage has a single feasible subset. Remaining-suffix
+    // pruning avoids enumerating its exponentially many impossible omissions;
+    // no participant mask, heuristic or small-count specialization is needed.
+    auto large=peerIslands(1);large.gpus.clear();large.p2p_rocm.clear();large.p2p_rocm_count=65;
+    std::vector<DeviceId> eligible;
+    for(int index=0;index<65;++index) {
+        DeviceInfo gpu;gpu.type=DeviceType::ROCm;gpu.local_device_id=1000+index*3;
+        gpu.numa_node=large.cpu.numa_node;gpu.uuid="large-original-"+std::to_string(index);
+        eligible.emplace_back(gpu.type,gpu.local_device_id);large.gpus.push_back(std::move(gpu));
+    }
+    const ObservedPeerGrouping exact(large);
+    const std::array large_request{ObservedPeerStageRequest{65,eligible}};
+    const auto large_selected=exact.select(large_request);
+    ASSERT_TRUE(large_selected);ASSERT_EQ(large_selected->size(),1u);EXPECT_EQ(large_selected->front().size(),65u);
+    EXPECT_EQ(exact.select(eligible,std::array<std::size_t,1>{65}),*large_selected);
+}
+
+/** @test Pure source/quote reuse preserves the exhaustive oracle and cannot authorize a changed capacity. */
+TEST(AutomaticOrchestrationPlanner, PreparedAdmissionMatchesExhaustiveOracleAndFreshCapacity)
+{
+    test::PlanningGGUFFixture file(true,false);PlanningModelSource source(file.path());
+    const OrchestrationPlanningWorkload workload(32,16);
+    for(const size_t device_count:{4u,8u})
+    {
+        auto observed=inventory(DeviceType::ROCm);
+        auto &rank=observed.ranks.front();rank.gpus.clear();
+        for(size_t index=0;index<device_count;++index)
+            rank.gpus.push_back({.type=DeviceType::ROCm,.local_device_id=static_cast<int>(index*3+2),
+                .memory_bytes=128ull<<30,.free_memory_bytes=120ull<<30,.compute_units=64,
+                .uuid="recorded-peer-"+std::to_string(index),.numa_node=rank.cpu.numa_node});
+        rank.p2p_rocm_count=static_cast<int>(device_count);rank.p2p_rocm.assign(device_count*device_count,true);
+        observed.buildNodeAggregations();
+        auto config=request(source,DeviceType::ROCm);
+        config.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::PipelineParallel};
+        config.automatic_planning.device_counts=std::vector{AutomaticBackendDeviceCount{DeviceType::ROCm,4}};
+        config.automatic_planning.pipeline_stage_widths=std::vector{2,2};
+        config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        config.routed_expert_compute_policy=RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        auto policy=memory();
+        const auto evaluate=[&](const AdmittedOrchestrationCandidate &candidate,const OrchestrationPlanningWorkload &work) {
+            std::uint64_t score=1;
+            for(const auto &device:candidate.devicePlans())
+            {
+                const auto found=std::find_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto &gpu){return gpu.local_device_id==device.device.ordinal;});
+                if(found==rank.gpus.end())throw std::logic_error("Oracle lost recorded original endpoint");
+                score+=std::uint64_t{1}<<(static_cast<size_t>(found-rank.gpus.begin())+device_count*device.first_layer);
+            }
+            return OrchestrationCostEstimate(work,double(score)*1e-6,double(score)*1e-9,"synthetic exhaustive decision oracle, not measured speed");
+        };
+        double oracle_cost=std::numeric_limits<double>::infinity();std::string oracle_config;size_t count=0;
+        visitAutomaticOrchestrationCandidates(config,source.metadata(),observed,[&](auto proposal) {
+            auto admitted=AdmittedOrchestrationCandidate::admit(std::move(proposal),source,policy);
+            ASSERT_EQ(admitted.config().pp_stage_definitions.size(),2u);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[0].first_layer,0);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[0].last_layer,0);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[1].first_layer,1);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[1].last_layer,1);
+            const auto cost=evaluate(admitted,workload);++count;
+            if(cost.requestSeconds()<oracle_cost){oracle_cost=cost.requestSeconds();oracle_config=serializeOrchestrationConfig(admitted.config());}
+        });
+        const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,policy,workload,evaluate);
+        EXPECT_DOUBLE_EQ(selected.cost().requestSeconds(),oracle_cost);
+        EXPECT_EQ(serializeOrchestrationConfig(selected.candidate().config()),oracle_config);
+        EXPECT_EQ(selected.counts().proposed,count);
+        EXPECT_EQ(count,device_count==4?6u:420u); // Physical rosters remain exhaustive; layer counts are fixed.
+        // All four endpoints are mandatory in this smaller search. Reusing
+        // source/shape quotes cannot reuse an earlier physical certificate.
+        if(device_count==4)
+        {
+            rank.gpus.front().free_memory_bytes=1;observed.buildNodeAggregations();
+            EXPECT_THROW(AutomaticOrchestrationPlanner::select(config,source,observed,policy,workload,evaluate),PhysicalMemoryCapacityExhausted);
+        }
+    }
+}
+
+/** @test Bounded parallel admission preserves serial winners, failure order and original callback ownership. */
+TEST(AutomaticOrchestrationPlanner, ParallelAdmissionPreservesSerialSelectionAndCallbackOrder)
+{
+    struct RestoreOMP {
+        int threads=omp_get_max_threads(),dynamic=omp_get_dynamic();
+        ~RestoreOMP(){omp_set_num_threads(threads);omp_set_dynamic(dynamic);}
+    } restore;
+    test::PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    auto observed=inventory(DeviceType::ROCm);auto &rank=observed.ranks.front();
+    const auto original=rank.gpus.front();rank.gpus.clear();
+    for(int index=0;index<7;++index) {
+        auto gpu=original;gpu.local_device_id=2+3*index;gpu.uuid="parallel-original-"+std::to_string(index);
+        if(index%3==1)gpu.free_memory_bytes=1;
+        rank.gpus.push_back(std::move(gpu));
+    }
+    rank.p2p_rocm_count=7;rank.p2p_rocm.assign(49,true);observed.buildNodeAggregations();
+    const auto config=request(source,DeviceType::ROCm);const auto caller=std::this_thread::get_id();
+    struct Result {std::string winner;std::vector<std::string> callbacks;OrchestrationSelectionCounts counts;};
+    const auto run=[&](int budget,bool dynamic) {
+        omp_set_num_threads(budget);omp_set_dynamic(dynamic);
+        Result result;
+        const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+            [&](const auto &candidate,const auto &work) {
+                EXPECT_EQ(std::this_thread::get_id(),caller);EXPECT_EQ(omp_get_thread_num(),0);
+                EXPECT_GE(omp_get_num_threads(),1);EXPECT_LE(omp_get_num_threads(),budget);
+                const int ordinal=candidate.devicePlans().front().device.ordinal;
+                result.callbacks.push_back("evaluate:"+std::to_string(ordinal));
+                return OrchestrationCostEstimate(work,1+ordinal*.001,.01,"serial callback decision oracle");
+            },[&](auto strategy,std::string_view why) {
+                EXPECT_EQ(std::this_thread::get_id(),caller);EXPECT_EQ(omp_get_thread_num(),0);
+                result.callbacks.push_back("reject:"+std::to_string(int(strategy))+":"+std::string(why));
+            });
+        result.winner=serializeOrchestrationConfig(selected.candidate().config());result.counts=selected.counts();return result;
+    };
+    const auto serial=run(1,false);const auto parallel=run(3,false);const auto dynamic=run(3,true);
+    ASSERT_EQ(serial.counts.proposed,7u);EXPECT_GT(serial.counts.capacity_rejected,0u);EXPECT_GT(serial.counts.evaluated,0u);
+    for(const auto *result:{&parallel,&dynamic}) {
+        EXPECT_EQ(result->winner,serial.winner);EXPECT_EQ(result->callbacks,serial.callbacks);
+        EXPECT_EQ(result->counts.proposed,serial.counts.proposed);
+        EXPECT_EQ(result->counts.capacity_rejected,serial.counts.capacity_rejected);
+        EXPECT_EQ(result->counts.evaluated,serial.counts.evaluated);
+    }
+}
+
+/** @test Task/callback exceptions retire worker-local quote owners before the next independent search. */
+TEST(AutomaticOrchestrationPlanner, ParallelAdmissionRetiresAfterCapacityAndCallbackFailures)
+{
+    struct RestoreOMP {
+        int threads=omp_get_max_threads(),dynamic=omp_get_dynamic();
+        ~RestoreOMP(){omp_set_num_threads(threads);omp_set_dynamic(dynamic);}
+    } restore;
+    omp_set_dynamic(false);omp_set_num_threads(3);
+    test::PlanningGGUFFixture file;PlanningModelSource source(file.path());const auto config=request(source,DeviceType::ROCm);
+    const auto observed=inventory(DeviceType::ROCm);
+    auto zero=memory();
+    auto no_capacity=config;no_capacity.max_gpu_memory_mb=0;
+    size_t evaluated=0,rejected=0;
+    EXPECT_THROW(AutomaticOrchestrationPlanner::select(no_capacity,source,observed,zero,{64,128},
+        [&](const auto&,const auto &work){++evaluated;return OrchestrationCostEstimate(work,1,.01,"must not evaluate rejected capacity");},
+        [&](auto,std::string_view){++rejected;}),PhysicalMemoryCapacityExhausted);
+    EXPECT_EQ(evaluated,0u);EXPECT_EQ(rejected,2u);
+    EXPECT_THROW(AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+        [&](const auto&,const auto&)->OrchestrationCostEstimate {throw std::runtime_error("original evaluator failure");}),std::runtime_error);
+    EXPECT_THROW(AutomaticOrchestrationPlanner::select(no_capacity,source,observed,memory(),{64,128},
+        [](const auto&,const auto &work){return OrchestrationCostEstimate(work,1,.01,"capacity callback fixture");},
+        [](auto,std::string_view){throw std::runtime_error("original rejection callback failure");}),std::runtime_error);
+    const auto recovered=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+        [](const auto&,const auto &work){return OrchestrationCostEstimate(work,1,.01,"fresh original worker scopes");});
+    EXPECT_EQ(recovered.counts().evaluated,2u);
 }

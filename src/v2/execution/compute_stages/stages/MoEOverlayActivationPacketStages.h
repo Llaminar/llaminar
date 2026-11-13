@@ -13,7 +13,9 @@
  * lifecycle cannot be confused: continuation dispatch pack, follower dispatch
  * consume, follower return pack, and continuation return consume. Their mapped
  * pointers are model-lifetime graph identity and must outlive every retained
- * parent transaction that imports these stages.
+ * parent transaction that imports these stages. Original native slots add a
+ * captured stage-zero handoff and post-payload retirement, with their fixed
+ * roster and family geometry included in each stage's capture identity.
  */
 
 #pragma once
@@ -33,6 +35,10 @@ namespace llaminar2
     class IBackend;
     class IMoEKernel;
     class TensorBase;
+    class PhysicalMemoryAuthority;
+    class PreparedGPUContextUsePermit;
+    class GPUCaptureDependencyRoster;
+    class MoEOverlayActivationBatchStorage;
 
     /**
      * @brief Pack one planner-targeted sparse dispatch packet on continuation.
@@ -57,6 +63,8 @@ namespace llaminar2
             TensorBase *routing_weights = nullptr;
             /** Ticket, banks, and geometry resolved from one runtime table. */
             MoEOverlayRoutePlacementDeviceBinding placement{};
+            /** Fixed original CPU cohort/member geometry, empty for whole-owner lanes. */
+            MoEOverlayJointRouteTarget joint_route_target{};
             const std::int32_t *active_row_count_device = nullptr;
             std::optional<BufferId> hidden_buffer_id;
             std::optional<BufferId> routing_indices_buffer_id;
@@ -75,10 +83,18 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue deterministic row-major route compaction. */
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_DISPATCH_PACK. */
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         /** @return Stable diagnostic operation name. */
         std::string name() const override;
         /** @return Whether CUDA/ROCm supplies the packet kernel. */
@@ -129,7 +145,7 @@ namespace llaminar2
      * auxiliary streams. Stage zero joins only the lane-local admission writes
      * before allowing the main graph to advance: a reusable return signal from
      * the preceding transaction must not bypass acquisition of the new grant.
-     * Bulk copies and later stages remain asynchronous. The consumer acquires each mapped
+     * Payload writes and later stages remain asynchronous. The consumer acquires each mapped
      * return timeline directly on its own graph stream. The mapped timeline is
      * therefore the sole return-completion authority across both complete and
      * heterogeneously segmented graphs; no backend event crosses a native
@@ -154,15 +170,23 @@ namespace llaminar2
             std::vector<MoEOverlayMappedActivationDeviceLane> lanes,
             std::int32_t physical_rows,
             std::uint32_t stage_ordinal,
-            std::int32_t model_layer_index);
+            std::int32_t model_layer_index,
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority);
 
-        /** @brief Destroy layer-owned events; auxiliary streams remain context-owned. */
+        /** @brief Release graph borrows; actual internal events and streams remain context-owned. */
         ~MoEOverlayActivationLaneBatchState();
 
         MoEOverlayActivationLaneBatchState(
             const MoEOverlayActivationLaneBatchState &) = delete;
         MoEOverlayActivationLaneBatchState &operator=(
             const MoEOverlayActivationLaneBatchState &) = delete;
+
+        /** @return Same original ledger used by the production source and shared resource declaration. */
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory()const noexcept{return physical_memory_authority_;}
+        /** @return Original source/context permit retained through all captured stage users. */
+        const PreparedGPUContextUsePermit& originalContext()const;
+        /** @return Prepared context-owned internal events, never external publication receipts. */
+        const std::shared_ptr<GPUCaptureDependencyRoster>& captureDependencies()const noexcept{return capture_dependencies_;}
 
         /** @return Exact planner-selected continuation device. */
         [[nodiscard]] DeviceId device() const noexcept { return device_; }
@@ -270,6 +294,9 @@ namespace llaminar2
             void *ready_event = nullptr;
         };
 
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
+        std::unique_ptr<PreparedGPUContextUsePermit> original_context_;
+        std::shared_ptr<GPUCaptureDependencyRoster> capture_dependencies_;
         DeviceId device_ = DeviceId::invalid();
         std::vector<MoEOverlayMappedActivationDeviceLane> lanes_;
         std::int32_t physical_rows_ = 0;
@@ -313,6 +340,8 @@ namespace llaminar2
             TensorBase *routing_indices = nullptr;
             TensorBase *routing_weights = nullptr;
             MoEOverlayRoutePlacementDeviceBinding placement{};
+            /** Fixed cohort/member geometry in the transaction's exact canonical lane order. */
+            std::vector<MoEOverlayJointRouteTarget> joint_route_targets;
             const std::int32_t *active_row_count_device = nullptr;
             std::optional<BufferId> hidden_buffer_id;
             std::optional<BufferId> routing_indices_buffer_id;
@@ -328,10 +357,18 @@ namespace llaminar2
         /** @return Immutable topology and tensor bindings used by this batch. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue fused decode or a non-blocking side-stream fork. */
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_DISPATCH_PACK. */
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         /** @return Stable batch-stage diagnostic name. */
         std::string name() const override;
         /** @return Whether CUDA/ROCm provides the batch kernel. */
@@ -369,10 +406,15 @@ namespace llaminar2
         /** @brief Materialize the persistent device descriptor array once. */
         bool prepareDescriptors(void *stream);
 
+        /** @brief Materialize original rank-pair target descriptors before capture. */
+        bool prepareSharedRowGroups(void* stream);
+        bool shared_row_groups_prepared_ =
+            false; ///< Cold proof for the immutable original lane roster.
+
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
         /** Graph-transaction-owned immutable launch descriptors. */
-        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+        std::shared_ptr<MoEOverlayActivationBatchStorage>
             descriptor_storage_;
         /** Setup proof covering every main or persistent lane stream. */
         bool grant_initialization_joined_ = false;
@@ -416,9 +458,17 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue descriptor validation and fixed-capacity expansion. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         std::string name() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
@@ -474,9 +524,17 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue compact return publication in dispatch row order. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         std::string name() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
@@ -529,9 +587,17 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue descriptor validation and deterministic FP32 fold. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         std::string name() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
@@ -594,10 +660,18 @@ namespace llaminar2
         /** @return Immutable canonical lane order and accumulator binding. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue parallel gather and deterministic fold. */
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_RETURN_CONSUME. */
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         /** @return Stable batch-stage diagnostic name. */
         std::string name() const override;
         /** @return Whether CUDA/ROCm provides both kernels. */
@@ -638,9 +712,9 @@ namespace llaminar2
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
         /** Persistent planner-ordered launch descriptors for either batch geometry. */
-        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+        std::shared_ptr<MoEOverlayActivationBatchStorage>
             descriptor_storage_;
         /** One device word per lane, published only after authentication. */
-        std::shared_ptr<MoEOverlayPersistentGraphStorage> lane_valid_;
+        std::shared_ptr<MoEOverlayActivationBatchStorage> lane_valid_;
     };
 } // namespace llaminar2

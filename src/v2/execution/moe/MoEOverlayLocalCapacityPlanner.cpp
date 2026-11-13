@@ -8,17 +8,49 @@
  * codebook-specific live and shadow expert bytes are added only by
  * MoEOverlayCapacityResolver. Pipeline groups share one fixed-owner assembly:
  * process archive backing is counted once and parent transfer endpoints remain
- * explicit even after each child has its own expert topology.
+ * explicit even after each child has its own expert topology. Generation
+ * domains and parent roles remain admission inputs through child projection.
+ *
+ * Ordinary single-domain native QFN TP shares original consumer declarations
+ * with weight construction; separately retained dense/overlay families keep
+ * their explicit full-bank demand and never recover from a selected-mode error.
+ * CPU serial storage declarations survive admission and runtime projection.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
+#include "planning/PlanningMemoryQuoteReuse.h"
+#include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
 #include "MoEOverlayLocalCapacityPlanner.h"
+#include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
+#include "MoEOverlayActivationBatchResources.h"
+#include "transfer/TransferEngine.h"
+#include "MoEOverlayPhysicalLaneDemand.h"
+#include "ExpertTierGpuPeerTransferLane.h"
+#include "DeviceMoEOverlayEpochArena.h"
+#include "loaders/NativeWeightLoadStaging.h"
+#include "backends/NativeContextPreparation.h"
+#include "utils/DebugEnv.h"
 #include "planning/RankMemoryPlanInputs.h"
+#include "planning/RankHardwareOwnership.h"
+#include "planning/ResolvedRankOrchestration.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
+#include "MoEOverlayNoPeerResidency.h"
 #include "collective/LocalTPCollectiveInventory.h"
+#include "collective/DeviceCountedAllGather.h"
+#include "collective/NativeCPUCollectiveProgram.h"
+#include "collective/backends/ShmemSpinBackend.h"
+#include "MoEExpertOwnerMap.h"
 
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "config/BackendSelector.h"
@@ -245,8 +277,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay physical resource identity requires a bound rank and device");
         }
+        // DeviceId::toString intentionally renders every CPU as "CPU" for
+        // logs. Distributed budget identities must retain its exact NUMA
+        // ordinal, just like the typed rank/device allocator join key.
         return "overlay-rank=" + std::to_string(world_rank) +
-               ";device=" + device.toString();
+               ";device=" + device.toString() +
+               (device.is_cpu() ? ":" + std::to_string(device.ordinal) : "");
     }
 
     std::vector<MoEOverlayContinuationShard>
@@ -351,6 +387,88 @@ namespace llaminar2
 
     namespace
     {
+        /** @brief Cold immutable declaration only; the existing runner owns the one real domain/context. */
+        struct CPUJointFixedDeclaration {
+            NativeCPUCollectiveProgram program;
+            std::shared_ptr<const MoEExpertShardCohort> cohort;
+            std::optional<size_t> member;
+        };
+        /** @brief Resolve original native source before quotas, never through a whole-owner map.
+         * All retained layer classes must share the same physical serial H/localF
+         * and original membership. Exact per-layer source authority stays with
+         * preparation/registry leases rather than this allocation declaration.
+         */
+        std::optional<CPUJointFixedDeclaration> cpuJointFixedDeclaration(
+            const MoEOverlayLocalCapacityPlannerInput& input) {
+            const auto& plan=*input.overlay_plan;
+            if(!MoEExpertOwnerMap::usesCPUJointFragments(plan))return std::nullopt;
+            const RoutedExpertDomain* joint=nullptr;int ordinal=-1;
+            for(size_t d=0;d<plan.domains.size();++d) {
+                const auto& domain=plan.domains[d];
+                if(domain.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded || domain.participants.size()<=1 ||
+                   std::none_of(plan.routed_tiers.begin(),plan.routed_tiers.end(),[&](const auto& tier){return tier.domain==domain.name;}) ||
+                   std::none_of(domain.participants.begin(),domain.participants.end(),[](const auto& address){return address.isCPU();}))continue;
+                if(joint)throw std::invalid_argument("CPU joint first execution requires one original CPU shard domain/context");
+                if(domain.scope!=ExecutionDomainScope::NODE_LOCAL || (domain.participants.size()<2 || domain.participants.size()>static_cast<size_t>(std::numeric_limits<int>::max())) ||
+                   domain.world_ranks.size()!=domain.participants.size() ||
+                   !std::all_of(domain.participants.begin(),domain.participants.end(),[](const auto& address){return address.isCPU();}))
+                    throw std::invalid_argument("CPU joint fixed geometry requires original bound NODE_LOCAL CPU membership");
+                if(d>size_t(std::numeric_limits<int>::max()))throw std::overflow_error("CPU joint original domain ordinal exceeds native identity");
+                joint=&domain;ordinal=static_cast<int>(d);
+            }
+            if(!joint)return std::nullopt;
+            if(!input.cluster_inventory || input.original_expert_manifest.empty())
+                throw std::invalid_argument("CPU joint fixed geometry requires original source manifest and cluster membership before quotas");
+            if(joint->name==plan.continuation_domain && !input.original_cpu_stage_program)
+                throw std::invalid_argument("CPU joint continuation requires its original admitted CPU pipeline stage program");
+            std::vector<MoEExpertShardCohort::Participant> members;
+            for(const auto& declared:MoEExpertOwnerMap::declaredParticipants(plan,{.reject_tensor_sharded_domains=false}))
+                if(declared.domain_name==joint->name) {
+                    if(!declared.world_rank_known || declared.domain_participant_index!=static_cast<int>(members.size()))
+                        throw std::invalid_argument("CPU joint fixed geometry lost original participant order/rank");
+                    members.push_back({declared.participant_id,declared.world_rank,declared.address});
+                }
+            if(members.size()!=joint->participants.size())
+                throw std::invalid_argument("CPU joint first execution requires one original routed tier for its source cohort");
+            for(size_t i=0;i<members.size();++i) {
+                const auto& actual=input.cluster_inventory->getRank(members[i].world_rank);
+                if(actual.rank!=members[i].world_rank || (actual.cpu.type!=DeviceType::CPU || actual.cpu.local_device_id!=0) ||
+                   (actual.cpu.numa_node>=0 && actual.cpu.numa_node!=members[i].address.numa_node))
+                    throw std::invalid_argument("CPU joint fixed geometry differs from original rank/NUMA inventory");
+                if(input.cluster_inventory->connectionBetweenRanks(members.front().world_rank,members[i].world_rank).locality()==RankConnectionLocality::CrossNode)
+                    throw std::invalid_argument("CPU joint NODE_LOCAL cohort crosses original physical node membership");
+            }
+            std::set<int> expected;
+            for(int i=0;i<input.graph_family.main_layer_count;++i)expected.insert(input.graph_family.first_model_layer+i);
+            expected.insert(input.graph_family.mtp_source_layers.begin(),input.graph_family.mtp_source_layers.end());
+            std::vector<MoEOverlayLayerWeightManifest> retained;
+            for(const auto& layer:input.original_expert_manifest)if(expected.contains(layer.layer_idx))retained.push_back(layer);
+            if(retained.size()!=expected.size())throw std::invalid_argument("CPU joint fixed geometry omitted/duplicated original retained source layers");
+            const auto& profile=*input.model_profile;
+            auto cohort=CPUJointExpertRouteStorageLayout::checkedSerialCohort(retained,
+                {.experts=profile.expert_count,.model_columns=profile.d_model,.intermediate_columns=profile.expert_feed_forward_length},members);
+            std::vector<NativeCPUCollectiveProgram::Participant> native_members;
+            std::vector<DeviceId> devices;
+            std::optional<size_t> local;
+            for(size_t i=0;i<members.size();++i) {
+                native_members.push_back({members[i].world_rank,members[i].address});devices.push_back(DeviceId::cpu());
+                if(members[i].world_rank==input.rank_plan->rank)local=i;
+            }
+            auto program=NativeCPUCollectiveProgram::expertShardRoutePartials(ordinal,
+                BackendSelector::resolve(joint->backend,devices),native_members);
+            if(input.original_cpu_stage_program) {
+                const auto& original=input.original_cpu_stage_program->nativeProgram();
+                if(original.backend()!=program.backend() || original.participants().size()!=native_members.size() ||
+                    !std::equal(native_members.begin(),native_members.end(),original.participants().begin()) ||
+                    !input.rank_plan->usesGlobalTP() ||
+                    input.original_cpu_stage_program->scope().first_layer!=input.rank_plan->first_layer ||
+                    input.original_cpu_stage_program->scope().last_layer!=input.rank_plan->last_layer+1)
+                    throw std::invalid_argument("CPU pipeline fixed source changed its original stage collective program");
+                program=original;
+            }
+            return CPUJointFixedDeclaration{std::move(program),std::move(cohort),local};
+        }
+
         /** @brief Distinct stage owners awaiting the shared MemoryPlanner transaction. */
         struct PreparedLocalCapacity
         {
@@ -358,17 +476,20 @@ namespace llaminar2
             std::set<DeviceId> resource_devices;
             std::set<DeviceId> endpoint_devices;
             MoEOverlayActivationChannelPlan activation_channel_plan;
+            std::optional<CPUJointFixedDeclaration> cpu_joint;
         };
 
         /**
          * @brief Translate immutable stage policy into exact fixed allocation owners.
          * @param input Complete stage policy and source metadata.
          * @param transfer Parent-authenticated local pipeline edges, absent outside PP.
+         * @param fixed_ple_pipeline Original storage/reader topology for the explicit fixed PP policy.
          * @return Device inputs and non-graph owners without a fit decision.
          */
         PreparedLocalCapacity prepareFixedOwners(
             const MoEOverlayLocalCapacityPlannerInput &input,
-            const std::optional<PipelineStageTransferMemory> &transfer)
+            const std::optional<PipelineStageTransferMemory> &transfer,
+            const std::shared_ptr<const ImmutableFixedHeadPipelineProjection>& fixed_ple_pipeline)
         {
             if (!input.model_profile || !input.rank_plan ||
                 !input.overlay_plan || !input.rank_inventory)
@@ -381,13 +502,23 @@ namespace llaminar2
             const auto &overlay_plan = *input.overlay_plan;
             const auto &inventory = *input.rank_inventory;
             const auto &family = input.graph_family;
+            // Preserve original routed sidecars even when the source's published
+            // block_count describes main layers only. The profile is the sole
+            // authority for the ordinary-inline versus separate-source contract.
+            const int main_layers = profile.mainLayerCount();
+            const int total_layers = profile.totalLayerCount();
             if (!family.valid() || family.first_model_layer != overlay_plan.first_model_layer ||
-                family.first_model_layer >= profile.n_layers ||
-                family.routedLayerCapacity() > profile.n_layers - family.first_model_layer)
+                family.first_model_layer >= main_layers ||
+                family.routedLayerCapacity() > total_layers - family.first_model_layer)
                 throw std::invalid_argument("ExpertOverlay fixed memory requires its exact retained routed graph interval");
+            // Match the storage-policy projection: a singleton stage cannot
+            // move an expert, so it has no transaction-demand bank. This is
+            // admission geometry only; runtime still seals complete residency.
+            // Every movable host authority retains its exact evidence owner.
             const bool needs_host_demand =
                 overlay_plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
-                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
+                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                !MoEOverlayNoPeerResidency::hasNoPeerTopology(overlay_plan);
             if (needs_host_demand != input.host_demand_memory.has_value())
                 throw std::invalid_argument(
                     "ExpertOverlay host Dynamic capacity requires exactly its routing-evidence BOM; other authorities must not allocate a host mirror");
@@ -420,10 +551,45 @@ namespace llaminar2
                             rank_plan.runtime.mtp)));
             }
 
+            auto cpu_joint=cpuJointFixedDeclaration(input);
+            if(cpu_joint && !input.original_cpu_stage_program && (transfer || rank_plan.usesLocalPP() || rank_plan.usesPipelineParallel()))
+                throw std::invalid_argument("CPU joint pipeline execution has no original shared context handoff; ordinary PP is unchanged");
             const auto bound =
                 MoEOverlayCapacityAdmission::boundParticipants(overlay_plan);
             const auto continuation_shards =
                 MoEOverlayLocalCapacityPlanner::continuationShards(rank_plan, input.rank_execution_kind);
+            DeviceGenerationDomainDeclaration actual_generation;
+            switch (input.generation_domain)
+            {
+            case DeviceGenerationExecutionDomain::HostedBoundary:
+                actual_generation.requireHostedBoundary();
+                break;
+            case DeviceGenerationExecutionDomain::NativeDomain:
+                break;
+            default:
+                throw std::invalid_argument("ExpertOverlay fixed memory has an unknown generation domain");
+            }
+            if (input.generation_parent_role != MTPGenerationParentRole::Controller &&
+                input.generation_parent_role != MTPGenerationParentRole::PipelineFollower)
+                throw std::invalid_argument("ExpertOverlay fixed memory has an unknown generation parent owner");
+            for (const auto &participant : bound) actual_generation.observe(participant.device.type);
+            for (const auto &shard : continuation_shards) actual_generation.observe(shard.device.type);
+            if (actual_generation.domain() != input.generation_domain)
+                throw std::invalid_argument("ExpertOverlay fixed memory underdeclares its mixed generation boundary");
+            // Every native consumer shares this input's captured graph plan.
+            // Check uniformity before a common inventory is converted to bytes.
+            std::optional<MTPVerifierGraphFamily> gpu_family;
+            const auto authenticateFamily = [&](DeviceId device)
+            {
+                if (!device.is_gpu()) return;
+                const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                    declaredDeviceGenerationExecutionPolicy(device.type, input.generation_domain)));
+                if (gpu_family && *gpu_family != family)
+                    throw std::invalid_argument("ExpertOverlay fixed memory has nonuniform GPU verifier owners");
+                gpu_family = family;
+            };
+            for (const auto &participant : bound) authenticateFamily(participant.device);
+            for (const auto &shard : continuation_shards) authenticateFamily(shard.device);
             if (!continuation_shards.empty() &&
                 (rank_plan.first_layer != family.first_model_layer ||
                  rank_plan.last_layer != family.first_model_layer + family.main_layer_count - 1))
@@ -437,7 +603,7 @@ namespace llaminar2
              * the channel planner so capacity admission and runtime preflight
              * cannot silently classify a same-tier peer differently. */
             const bool has_remote_activation_participant =
-                MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+                MoEOverlayActivationChannelPlanner::requiresActivationChannels(
                     overlay_plan);
             MoEOverlayActivationChannelPlan activation_channel_plan;
             if (has_remote_activation_participant)
@@ -459,6 +625,7 @@ namespace llaminar2
                         .top_k = profile.expert_used_count,
                         .graph_family_count =
                             input.activation_graph_family_count,
+                        .original_native_slots = input.original_native_slots,
                     });
             }
             std::set<DeviceId> endpoint_devices;
@@ -478,7 +645,7 @@ namespace llaminar2
                 }
             }
             std::set<DeviceId> resource_devices = endpoint_devices;
-            if (input.require_host_memory_authority || needs_host_demand)
+            if (input.require_host_memory_authority || needs_host_demand || cpu_joint || !input.original_cpu_pipeline_programs.empty())
                 resource_devices.insert(DeviceId::cpu());
             for (const auto &charge : activation_channel_plan.staging_charges)
             {
@@ -487,12 +654,17 @@ namespace llaminar2
             }
 
             const std::vector<int> no_routed_experts(
-                static_cast<std::size_t>(profile.n_layers), 0);
+                // Entries stay global-source indexed, including source48. Every
+                // routed parent receives an explicit zero residency in this fixed
+                // contribution; quotas charge its experts in the same PMA later.
+                static_cast<std::size_t>(total_layers), 0);
             const DenseParallelPolicy continuation_dense_policy =
                 overlay_plan.continuation_domain_spec.effectiveDensePolicy();
             const bool continuation_uses_dense_tp =
                 denseParallelPolicyEnablesTP(continuation_dense_policy);
             std::vector<DevicePlanConfig> configs;
+            // One immutable route authority is shared by all continuation shards.
+            std::shared_ptr<const DeviceCountedAllGatherTopology> projection_topology;
             const auto makeConfig = [&](
                 DeviceId device,
                 int shard_index,
@@ -502,8 +674,24 @@ namespace llaminar2
                 const auto [total_bytes, available_bytes] =
                     inventoryMemory(inventory, device);
                 DevicePlanConfig config;
+                config.native_ordering_events=input.native_ordering_events;
+                config.native_pipeline_maintenance_budget = input.native_pipeline_maintenance_budget && device.is_gpu() &&
+                    role == DeviceExecutionMemoryRole::ContinuationGraph;
                 config.world_rank = rank_plan.rank;
                 config.device = device;
+                // Concrete attention policy is resolved once after this input is fully authored.
+                config.qfn_hc_up_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_hc_up_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
+                config.qfn_gdn_output_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_gdn_output_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
+                config.qfn_fa_output_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_fa_output_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
+                config.qfn_gdn_qkv_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_gdn_qkv_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
                 config.device_total_bytes = total_bytes;
                 config.device_free_bytes = usableMemory(
                     available_bytes, device, input);
@@ -530,6 +718,7 @@ namespace llaminar2
                         .device_bytes = load_geometry.staging_bytes,
                         .host_bytes = load_geometry.host_staging_bytes,
                     };
+                    config.ordinary_weight_load_geometry = load_geometry;
                 }
                 config.device_compute_units =
                     inventoryComputeUnits(inventory, device);
@@ -538,7 +727,7 @@ namespace llaminar2
                  * Overlay capacity is resolved only after each rank has created
                  * its production backend contexts.  Local CUDA admission can
                  * therefore ask the kernel's dispatch authority for the exact
-                 * NativeVNNI scratch envelope instead of relying on the older
+                 * NativeQuantised scratch envelope instead of relying on the older
                  * device-free graph-family floor.  Remote ranks perform the same
                  * calculation against their own local devices.
                  */
@@ -547,15 +736,30 @@ namespace llaminar2
                 {
                     config.graph_snapshot_memory =
                         input.graph_snapshot_memory;
+                    if (config.graph_snapshot_memory.valid())
+                    {
+                        const auto &mtp = rank_plan.runtime.mtp;
+                        const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                            declaredDeviceGenerationExecutionPolicy(device.type, input.generation_domain)));
+                        const auto query_programs = profile.sparseQueryProgramCount();
+                        const MTPGraphOwnerPlan graph_owners(mtp, family, input.generation_parent_role, query_programs);
+                        const auto arenas = ServingSnapshotArenaInventory::ordinary(
+                            true, graph_owners.retainsGraphCapacity(), graph_owners.sidecarGraphSlots(),
+                            graph_owners.retainsGraphCapacity() ? graph_owners.requestCapacity() : 0u, query_programs);
+                        // PreparedInactive retains both lean and diagnostic executables,
+                        // but lean graphs contain no snapshot arena. One frozen
+                        // diagnostic namespace owns the role populations above.
+                        config.graph_snapshot_memory.serving_arenas = arenas;
+                        config.graph_snapshot_memory.retained_main_forward_arena_count = arenas.mainOwners();
+                        config.graph_snapshot_memory.retained_forward_arena_count = arenas.allOwners();
+                    }
                     if (config.graph_snapshot_memory.effective_kv)
                     {
                         // Segments import into retained forward parents. Charge
                         // those independent identities, never every segment or
                         // rank ticket, plus the separately retained sidecars.
-                        const auto &graphs = input.captured_graph_plan.resident_executables;
                         config.graph_snapshot_memory.effective_kv->retained_arena_count =
-                            graphs.model_graph_identity_count * graphs.model_graph_topology_variant_count +
-                            MTPGraphOwnerPlan(rank_plan.runtime.mtp).sidecarGraphSlots();
+                            config.graph_snapshot_memory.retained_forward_arena_count;
                     }
                 }
                 config.shard_index = shard_index;
@@ -566,6 +770,7 @@ namespace llaminar2
                     role == DeviceExecutionMemoryRole::ContinuationGraph &&
                     rank_plan.has_embedding;
                 config.batch_size = rank_plan.runtime.batch_size;
+                config.ordinary_terminal_projection = rank_plan.runtime.ordinary_terminal_projection;
                 config.max_seq_len = rank_plan.runtime.max_seq_len;
                 config.activation_seq_len =
                     input.resident_graph_rows > 0 &&
@@ -619,8 +824,10 @@ namespace llaminar2
                         PrefixCacheStorageMode::Device;
                 if (device.is_gpu() &&
                     (owns_host_prefix_tier ||
-                     config.weight_load_staging.host_bytes != 0u))
+                     config.weight_load_staging.host_bytes != 0u || profile.flash_next.has_value()))
                 {
+                    // Match the actual rank-local host allocator. NUMA binding
+                    // controls placement, not DeviceId's CPU ordinal.
                     const auto [host_total, host_available] =
                         inventoryMemory(inventory, DeviceId::cpu());
                     config.associated_host_memory = PhysicalMemoryResource{
@@ -662,6 +869,45 @@ namespace llaminar2
                     config.mtp_enabled
                         ? config.mtp_target_query_rows
                         : 1);
+                if(device.is_cpu() && config.serial_routed_expert_participant_count>0)
+                {
+                    const auto &capture=debugEnv().execution;
+                    if(capture.prefill_graph_max_cached_buckets<=int(kExpertOverlayPrefillGraphIdentityReserve))
+                        throw std::invalid_argument("CPU serial admission has no retained prefill identity budget");
+                    auto admission=std::make_shared<CPUSerialExpertStorageAdmission>();
+                    admission->allocator={rank_plan.rank,device};
+                    for(const auto &endpoint:bound)
+                        if(endpoint.world_rank==rank_plan.rank && endpoint.device==device)
+                            admission->participant_ids.push_back(endpoint.participant_id);
+                    std::sort(admission->participant_ids.begin(),admission->participant_ids.end());
+                    for(const auto &controller:continuation_shards)
+                        admission->controller_devices.push_back(controller.device);
+                    if(admission->controller_devices.empty()) admission->controller_devices.push_back(device);
+                    std::sort(admission->controller_devices.begin(),admission->controller_devices.end());
+                    admission->controller_devices.erase(std::unique(admission->controller_devices.begin(),
+                        admission->controller_devices.end()),admission->controller_devices.end());
+                    std::optional<CPUJointExpertRouteStorageLayout> joint_routes;
+                    if(cpu_joint) {
+                        if(!cpu_joint->member || admission->participant_ids.size()!=1 ||
+                           admission->participant_ids.front()!=cpu_joint->cohort->participants()[*cpu_joint->member].participant_id)
+                            throw std::invalid_argument("CPU joint fixed roots require their sole original local participant");
+                        joint_routes.emplace(cpu_joint->cohort,*cpu_joint->member,
+                            static_cast<size_t>(std::max(overlay_segment_rows,config.mtp_enabled?config.mtp_target_query_rows:1)),profile.expert_used_count);
+                    }
+                    const bool canonical_routes=!joint_routes || joint_routes->isRoot();
+                    const int local_intermediate=joint_routes?joint_routes->intermediate():profile.expert_feed_forward_length;
+                    admission->envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(device,
+                        overlay_segment_rows,config.mtp_enabled?config.mtp_target_query_rows:1,
+                        profile.d_model,profile.expert_used_count,capture.prefill_graph_bucket_sizes,
+                        capture.prefill_graph_min_seq,
+                        size_t(capture.prefill_graph_max_cached_buckets)-kExpertOverlayPrefillGraphIdentityReserve,
+                        canonical_routes,
+                        continuation_shards.empty()?CPUSerialExpertFamilyPolicy::PublishedSchedule:
+                            CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,
+                        local_intermediate,profile.expert_count,std::move(joint_routes));
+                    config.cpu_serial_expert_storage=std::move(admission);
+                    config.concurrent_workspace_owners=config.cpu_serial_expert_storage->controller_devices.size();
+                }
                 config.execution_role = role;
                 if (role == DeviceExecutionMemoryRole::ContinuationGraph)
                 {
@@ -678,9 +924,18 @@ namespace llaminar2
                                     throw std::invalid_argument("Projection staging requires exact rank-local membership");
                                 std::vector<DeviceId> devices;
                                 for (const auto &address : domain.participants) devices.push_back(address.toLocalDeviceId());
-                                config.projection_peer_access = localTPPeerAccessCoverage(inventory, devices);
+                                if (!projection_topology)
+                                    projection_topology = std::make_shared<const DeviceCountedAllGatherTopology>(
+                                        DeviceCountedAllGatherTopology::resolve(inventory, devices));
+                                config.projection_exchange_topology = projection_topology;
                             }
                         }
+                    // Dense replicas borrow the prepared predictor experts from
+                    // this frozen overlay instead of owning raw expert parents.
+                    config.mtp_routed_expert_weight_authority =
+                        overlay_plan.usesExpertOverlayAuthority()
+                            ? MTPRoutedExpertWeightAuthority::ExpertOverlay
+                            : MTPRoutedExpertWeightAuthority::SidecarParticipant;
                     config.additional_weight_sets =
                         resolveAdditionalPersistentWeightSets(
                             overlay_plan.continuation_domain_spec
@@ -695,6 +950,7 @@ namespace llaminar2
                                   profile.expert_count, no_routed_experts)
                         : DeviceWeightResidency::selectedRoutedExpertsOnly(
                               profile.expert_count, no_routed_experts);
+                resolveQwenSparseAttentionDeviceProgram(profile, config, rank_plan.runtime);
                 return config;
             };
 
@@ -704,7 +960,7 @@ namespace llaminar2
              * TensorParallelConfig rather than reimplementing remainder or GQA
              * replication rules in the capacity planner.
              */
-            const auto bindRankLocalTPAssignment = [&profile](
+            const auto bindRankLocalTPAssignment = [&profile,&rank_plan,&overlay_plan](
                 DevicePlanConfig &config,
                 const std::vector<GlobalDeviceAddress> &participants,
                 const std::vector<float> &configured_weights)
@@ -720,14 +976,16 @@ namespace llaminar2
                 if (weights.empty())
                     weights.assign(devices.size(), 1.0f);
 
-                const auto assignments =
-                    TensorParallelConfig::proportionalSplit(
-                        devices,
-                        weights,
-                        profile.n_heads,
-                        profile.n_kv_heads,
-                        profile.d_ff,
-                        profile.vocab_size);
+                const bool complete_main=overlay_plan.domains.size()==1 &&
+                    rank_plan.usesLocalTP() && !rank_plan.usesLocalPP() &&
+                    !rank_plan.usesGlobalTP() && !rank_plan.prev_rank && !rank_plan.next_rank &&
+                    rank_plan.first_layer==0 && (rank_plan.last_layer<0 || rank_plan.last_layer==profile.mainLayerCount()-1);
+                std::optional<TensorParallelAssignmentDeclaration> source;
+                if(profile.architecture=="qwen4exp")source=resolveProfileTPDeclaration(profile,
+                    complete_main?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                    rank_plan.runtime.mtp,overlay_plan.continuation_domain_spec.effectiveDensePolicy(),devices);
+                const auto assignments=source?source->partition(devices,weights,profile.d_ff,profile.vocab_size):
+                    TensorParallelConfig::proportionalSplit(devices,weights,profile.n_heads,profile.n_kv_heads,profile.d_ff,profile.vocab_size);
                 config.bindTensorParallelAssignment(
                     assignments.forRank(config.shard_index));
             };
@@ -817,7 +1075,7 @@ namespace llaminar2
                             .total_bytes = total,
                             .admission_available_bytes = usableMemory(available, DeviceId::cpu(), input)};
                     }
-                    transfer->bind(config);
+                    transfer->bind(config,input.resident_graph_rows);
                 }
                 resource_devices.insert(config.device);
                 configs.push_back(std::move(config));
@@ -835,8 +1093,78 @@ namespace llaminar2
                     DeviceExecutionMemoryRole::RoutedExpertParticipant));
             }
 
+            const auto ngram_topology = fixed_ple_pipeline
+                ? ImmutableRowTableTPTopology::HomogeneousPipelineRankLocal
+                : immutableRowTableTPTopology(profile, rank_plan);
+            if (fixed_ple_pipeline) {
+                for (auto& config : configs) {
+                    if (config.execution_role != DeviceExecutionMemoryRole::ContinuationGraph)
+                        continue;
+                    const PhysicalMemoryAllocatorIdentity identity{config.world_rank, config.device};
+                    (void)fixed_ple_pipeline->owner(identity);
+                    config.ngram_fixed_head_pipeline = fixed_ple_pipeline;
+                }
+            }
+            if(profile.flash_next)
+            {
+                const auto layer=static_cast<int>(profile.flash_next->ple_decoder_layer);
+                for(auto &config:configs)
+                    if(config.execution_role==DeviceExecutionMemoryRole::ContinuationGraph&&
+                        config.first_layer<=layer&&(config.last_layer<0||config.last_layer>=layer))
+                    {
+                        config.ngram_tp_topology=ngram_topology;
+                        config.ngram_execution_policy=rank_plan.runtime.ngram_table_policy;
+                    if (rank_plan.runtime.ngram_table_policy.isGPUAdaptive())
+                        config.ngram_gpu_peer_access = ImmutableRowTableDirectedTransportPolicy::observe(
+                            rank_plan.runtime.ngram_table_policy.gpu_adaptive.placement, inventory);
+                        config.ngram_lookup_schedule=rank_plan.runtime.ngram_lookup_schedule;
+                        config.ngram_host_placement=ImmutableRowTableHostPlacement::fromObservedNUMANode(rank_plan.numa_node);
+                        config.ngram_table_placement=rank_plan.runtime.ngram_table_placement;
+                    }
+            }
+            for(auto& config:configs)if(config.device.is_cpu()) {
+                const auto joint=config.cpu_serial_expert_storage
+                    ? config.cpu_serial_expert_storage->envelope->admitted()->jointRoutes():std::optional<CPUJointExpertRouteStorageLayout>{};
+                if(joint)config.native_source_placement=joint->packed().placement();
+                else if(input.native_source_placement)config.native_source_placement=*input.native_source_placement;
+                if(!input.gpu_weight_load)continue;
+                if(!joint && !input.native_source_placement)
+                    throw std::invalid_argument("Fresh CPU source staging requires its original loader allocation placement");
+                config.native_weight_load_staging=quoteCPUWeightSourceStaging(profile,config,input.gpu_weight_load->policy,
+                    input.weight_precision,config.native_source_placement);
+                config.weight_load_staging.host_bytes=config.native_weight_load_staging
+                    ? config.native_weight_load_staging->physical_bytes:0;
+            }
+            // CPU service demand belongs to this same fixed-owner transaction,
+            // before expert quotas or lowest-priority table placement. Reused
+            // runtime plans retain their original declaration session unchanged.
+            if (rank_plan.runtime.retained_host_services) {
+                if (rank_plan.runtime.retained_host_services->worldRank() != rank_plan.rank)
+                    throw std::logic_error("ExpertOverlay CPU services crossed original rank authority");
+                for (auto& config : configs)
+                    config.retained_host_services = rank_plan.runtime.retained_host_services;
+            } else {
+                if (!input.cluster_inventory)
+                    throw std::invalid_argument("ExpertOverlay CPU services require the original cluster topology");
+                (void)MemoryPlanner::declareRetainedHostServices(profile, configs, rank_plan.rank,
+                    &overlay_plan, *input.cluster_inventory, input.retained_host_services);
+            }
+            // This SAME fixed-owner assembly precedes the ORIGINAL global expert
+            // quota resolver. Native birth must never spend a post-quota slack estimate.
+            for(auto& config:configs){
+                config.native_context_preparation=rank_plan.runtime.native_context_preparation;
+                if(!config.native_context_preparation)continue;
+                const auto& source=config.native_context_preparation;
+                if(source->memory()->worldRank()!=rank_plan.rank)throw std::logic_error("ExpertOverlay source crossed original rank authority");
+                if(config.device.is_gpu()){
+                    const auto& original=source->originalResource(config.device);
+                    config.device_total_bytes=original.total_bytes;config.device_free_bytes=original.admission_available_bytes;
+                }
+                if(config.associated_host_memory)config.associated_host_memory=source->originalResource(DeviceId::cpu());
+            }
             return {.device_inputs = std::move(configs), .resource_devices = std::move(resource_devices),
-                .endpoint_devices = std::move(endpoint_devices), .activation_channel_plan = std::move(activation_channel_plan)};
+                .endpoint_devices = std::move(endpoint_devices), .activation_channel_plan = std::move(activation_channel_plan),
+                .cpu_joint=std::move(cpu_joint)};
         }
 
         /**
@@ -844,11 +1172,14 @@ namespace llaminar2
          * @param input Exact source policy retained during the common transaction.
          * @param prepared Validated stage device/channel ownership.
          * @param fixed_memory This stage's distinct MemoryPlanner contribution.
+         * @param quote_original_process_pool Whether this group first owns the original native CPU process pool.
+         * @param quoted_native_contexts Already contributed physical birth identities across this shared group.
          * @return Bound fixed contribution consumed by joint expert admission.
          */
         MoEOverlayLocalCapacityPlannerResult completeFixedOwners(
             const MoEOverlayLocalCapacityPlannerInput &input,
-            PreparedLocalCapacity prepared, MemoryPlan fixed_memory)
+            PreparedLocalCapacity prepared, MemoryPlan fixed_memory,bool quote_original_process_pool,
+            std::set<std::pair<int,DeviceId>>& quoted_native_contexts)
         {
             const auto &profile = *input.model_profile;
             const auto &rank_plan = *input.rank_plan;
@@ -859,6 +1190,7 @@ namespace llaminar2
             MoEOverlayLocalCapacityPlannerResult result;
             result.resident_graph_rows = input.resident_graph_rows;
             result.host_demand_memory = input.host_demand_memory;
+            result.activation_batch_inventory = input.activation_batch_inventory;
             result.activation_channel_plan =
                 std::move(prepared.activation_channel_plan);
             result.fixed_memory_plan = std::move(fixed_memory);
@@ -871,6 +1203,12 @@ namespace llaminar2
             for (const auto &device_plan : result.fixed_memory_plan.devices)
             {
                 resource_devices.insert(device_plan.device());
+                // Admission can reject a row before a completed physical plan
+                // exists. Keep its original per-owner contribution available at
+                // DEBUG in optimized builds: TRACE is compiled out there, which
+                // otherwise hides Auto/Apply ownership differences behind one
+                // aggregate fixed-byte count. This cold diagnostic reads the
+                // canonical BOM only; it creates no parallel accounting ledger.
                 LOG_DEBUG(
                     "[MoEOverlayCapacity] fixed component BOM device="
                     << device_plan.device().toString()
@@ -893,6 +1231,258 @@ namespace llaminar2
                 physical_plan_builder.add(device_plan.bom());
             }
 
+            if(input.require_native_context_budgets && input.native_context_budgets.empty() &&
+                std::any_of(resource_devices.begin(),resource_devices.end(),[](DeviceId d){return d.is_gpu();}))
+                throw std::invalid_argument("Automatic admission omitted native GPU birth budget");
+            if (!input.native_context_budgets.empty()) {
+                if (rank_plan.runtime.native_context_preparation)
+                    throw std::logic_error("Native birth budget cannot duplicate its live source declaration");
+                const auto [host_total,host_available]=inventoryMemory(inventory,DeviceId::cpu());
+                const PhysicalMemoryResource host{rank_plan.rank,DeviceId::cpu(),host_total,usableMemory(host_available,DeviceId::cpu(),input)};
+                std::vector<PhysicalMemoryResource> devices;
+                for(const auto device:resource_devices)if(device.is_gpu() && quoted_native_contexts.emplace(rank_plan.rank,device).second){
+                    const auto [total,available]=inventoryMemory(inventory,device);
+                    devices.push_back({rank_plan.rank,device,total,usableMemory(available,device,input)});
+                }
+                const auto native_bom = planningNativeContextBOM(input.native_context_budgets, host, devices);
+                for (const auto& row : native_bom.resources()) physical_plan_builder.add(row);
+            }
+
+            const auto &overlay_plan=*input.overlay_plan;
+            // One named movement pool per actual physical participant on this
+            // original rank; layer/source/cache count never multiplies streams.
+            if(MoEOverlayCapacityAdmission::selectMigrationStorage(overlay_plan,rank_plan.runtime.moe_rebalance.mode)==
+                MoEOverlayMigrationStorageKind::PhysicalResidencyFabric) {
+                const auto counts=MoEOverlayCapacityAdmission::executionStreamCounts(overlay_plan,rank_plan.rank,
+                    std::max<std::size_t>(1,rank_plan.runtime.moe_rebalance.resolvedMigrationExecutionStreams()));
+                const auto [host_total,host_available]=inventoryMemory(inventory,DeviceId::cpu());
+                const PhysicalMemoryResource host{rank_plan.rank,DeviceId::cpu(),host_total,
+                    usableMemory(host_available,DeviceId::cpu(),input)};
+                for(const auto& [device,count]:counts){
+                    const auto [total,available]=inventoryMemory(inventory,device);
+                    const auto quote=TransferEngine::persistentTransferExecutionLanesBOM(count,host,
+                        {rank_plan.rank,device,total,usableMemory(available,device,input)});
+                    for(const auto& resource:quote.resources())physical_plan_builder.add(resource);
+                }
+                if(!counts.empty()) {
+                    std::set<int> expected;
+                    for(int layer=0;layer<family.main_layer_count;++layer)expected.insert(family.first_model_layer+layer);
+                    expected.insert(family.mtp_source_layers.begin(),family.mtp_source_layers.end());
+                    std::vector<MoEOverlayLayerWeightManifest> manifest;
+                    for(const auto& layer:input.original_expert_manifest)if(expected.contains(layer.layer_idx))manifest.push_back(layer);
+                    if(manifest.size()!=expected.size())
+                        throw std::invalid_argument("Physical GPU lane admission omitted/duplicated its original retained source manifests");
+                    const int world=input.cluster_inventory?input.cluster_inventory->world_size:1;
+                    const auto scope=world>1?MoEOverlayPhysicalLaneScope::communicator(world):MoEOverlayPhysicalLaneScope::rankLocal(rank_plan.rank);
+                    auto demand=std::make_shared<MoEOverlayPhysicalLaneDemandPlan>(configuredMoEOverlayLaneDemand(
+                        overlay_plan,manifest,profile.expert_count,scope,
+                        std::max<std::size_t>(1,rank_plan.runtime.moe_rebalance.migration_transfer_slots),
+                        std::max<std::size_t>(1,rank_plan.runtime.moe_rebalance.dynamic_max_swaps_per_layer)));
+                    demand->original_execution_streams=counts;
+                    bindOriginalMoEOverlayGpuChoices(*demand,rank_plan.rank,[&](DeviceId accessor,DeviceId allocation){
+                        return originalMoEOverlayDirectedPeerAccess(inventory,accessor,allocation);});
+                    result.physical_gpu_lane_demand=demand;
+                    for(const auto& [device,count]:originalMoEOverlayPeerEventCounts(*demand)) {
+                        const auto [total,available]=inventoryMemory(inventory,device);
+                        // Both canonical production fabric creators enable economy timing.
+                        // Quote actual operation owners; shared stream count is independent.
+                        const auto one=ExpertTierGpuPeerTransferLane::nativeEventsBOM(host,
+                            {rank_plan.rank,device,total,usableMemory(available,device,input)},true);
+                        for(const auto& resource:one.resources()) {
+                            PhysicalMemoryBOMBuilder scaled(resource.resource());
+                            for(size_t index=0;index<PhysicalMemoryBOM::ownerCount();++index){
+                                const auto owner=static_cast<PhysicalMemoryOwner>(index);const auto bytes=resource.bytes(owner);
+                                if(bytes && count>std::numeric_limits<size_t>::max()/bytes)
+                                    throw std::overflow_error("Physical peer event population quote overflows");
+                                if(bytes)scaled.add(owner,count*bytes);
+                            }
+                            physical_plan_builder.add(scaled.build());
+                        }
+                    }
+                }
+            }
+
+            // Batch storage belongs to each actual retained model source and
+            // routed layer. Channel family count prices mappings, not those
+            // independently constructed immutable descriptor roots.
+            std::map<DeviceId, std::vector<MoEOverlayNodeLocalActivationChannelPlan>> batch_channels;
+            std::set<DeviceId> local_grant_gpus;
+            std::set<DeviceId> cold_publication_priced;
+            for (const auto& channel : result.activation_channel_plan.channels)
+                if (channel.source_world_rank == rank_plan.rank && channel.source_device.is_gpu())
+                    batch_channels[channel.source_device].push_back(channel);
+            for (const auto& channel : result.activation_channel_plan.channels)
+            {
+                const auto collect = [&](std::span<const MoEOverlayActivationLocalLaneBinding> lanes) {
+                    for (const auto& lane : lanes) if (lane.device.is_gpu()) local_grant_gpus.insert(lane.device);
+                };
+                if (channel.source_world_rank == rank_plan.rank) collect(channel.source_lanes);
+                if (channel.target_world_rank == rank_plan.rank) collect(channel.target_lanes);
+            }
+            if (!batch_channels.empty() && !input.activation_batch_inventory)
+                throw std::invalid_argument("Mapped Batch continuation requires its original retained source inventory");
+            for (const auto& [device, channels] : batch_channels)
+            {
+                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                const PhysicalMemoryResource host{.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
+                    .total_bytes = host_total,
+                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
+                const auto [total, available] = inventoryMemory(inventory, device);
+                const PhysicalMemoryResource gpu{.world_rank = rank_plan.rank, .device = device,
+                    .total_bytes = total, .admission_available_bytes = usableMemory(available, device, input)};
+                const auto add = [&](const PhysicalMemoryPlan& contribution) {
+                    for (const auto& resource : contribution.resources()) physical_plan_builder.add(resource);
+                };
+                bool has_async_batch = false;
+                for (const auto& source : input.activation_batch_inventory->sources())
+                    for (std::size_t ordinal = 0; ordinal < source.model_layers.size(); ++ordinal)
+                    {
+                        // Named replaceable cache slots own one active shape.
+                        // Row one and wide layouts have different immutable
+                        // roots, so the shared resource factory supplies their
+                        // per-owner peak, rather than assuming max rows is max bytes.
+                        const auto quoted = source.physical_rows == 0
+                            ? MoEOverlayActivationBatchResources::variableSourceBOM(channels, source.maximum_rows,
+                                static_cast<std::uint32_t>(ordinal), host, gpu)
+                            : MoEOverlayActivationBatchResources::bom(channels, source.physical_rows,
+                                static_cast<std::uint32_t>(ordinal), host, gpu);
+                        if (!quoted.resources().empty() && source.maximum_rows > 1) has_async_batch = true;
+                        add(quoted);
+                    }
+                if (has_async_batch)
+                {
+                    add(MoEOverlayActivationBatchResources::sharedLaneStreamsBOM(channels, host, gpu));
+                    cold_publication_priced.insert(device);
+                }
+            }
+            // Every GPU grant has one original cold publication event. Source
+            // asynchronous Batch rosters already include that same event;
+            // target-only and scalar-only contexts still own it exactly once.
+            for (const auto device : local_grant_gpus)
+            {
+                if (cold_publication_priced.contains(device)) continue;
+                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                const PhysicalMemoryResource host{.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
+                    .total_bytes = host_total,
+                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
+                const auto [total, available] = inventoryMemory(inventory, device);
+                const PhysicalMemoryResource gpu{.world_rank = rank_plan.rank, .device = device,
+                    .total_bytes = total, .admission_available_bytes = usableMemory(available, device, input)};
+                const auto cold_publication = MoEOverlayActivationBatchResources::coldPublicationBOM(host, gpu);
+                for (const auto& resource : cold_publication.resources())
+                    physical_plan_builder.add(resource);
+            }
+
+            if (input.overlay_plan->observed_route_transport &&
+                input.overlay_plan->observed_route_transport->requiresMappedExchange())
+            {
+                const auto& plan = *input.overlay_plan;
+                const auto continuation = std::find_if(plan.domains.begin(), plan.domains.end(),
+                    [&](const auto& domain) { return domain.name == plan.continuation_domain; });
+                if (continuation == plan.domains.end() || continuation->owner_rank < 0)
+                    throw std::invalid_argument("Mapped route admission lost its original continuation owner");
+                if (continuation->owner_rank == rank_plan.rank) {
+                    std::vector<DeviceId> devices;
+                    for (const auto& member:continuation->participants) devices.push_back(member.toLocalDeviceId());
+                    const auto root_index = plan.continuation_domain_spec.logical_root_participant;
+                    if (root_index < 0 || std::size_t(root_index) >= devices.size())
+                        throw std::invalid_argument("Mapped route admission has no original logical root");
+                    const auto root = devices[root_index];
+                    const auto rows = OrdinaryTerminalProjectionCapacity::checkedFlattenedRows(rank_plan.runtime.batch_size,
+                        input.resident_graph_rows > 0 ? input.resident_graph_rows :
+                        resolveActivationBufferSeqLen(rank_plan.runtime.max_seq_len, root));
+                    const auto declaration = MoEOverlayNodeLocalRouteExchange::declareStorage(
+                        {.devices=devices,.root_device=root,.identity="continuation:"+continuation->name},
+                        rows, profile.expert_used_count, profile.d_model);
+                    const auto [ht,ha] = inventoryMemory(inventory,DeviceId::cpu());
+                    const auto [gt,ga] = inventoryMemory(inventory,root);
+                    const auto bom = declaration.bom(
+                        {rank_plan.rank,DeviceId::cpu(),ht,usableMemory(ha,DeviceId::cpu(),input)},
+                        {rank_plan.rank,root,gt,usableMemory(ga,root,input)});
+                    for (const auto& resource:bom.resources()) physical_plan_builder.add(resource);
+                }
+            }
+
+            if (input.original_native_slots)
+            {
+                const auto expected = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                    *input.overlay_plan, *input.cluster_inventory, family);
+                if (expected != input.original_native_slots)
+                    throw std::invalid_argument("Follower terminal BOM changed its original retained slot geometry");
+                const auto cache_count = MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
+                    input.activation_channel_row_capacity, family, input.activation_prefill_graph_rows);
+                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                const PhysicalMemoryResource host{
+                    .world_rank = rank_plan.rank, .device = DeviceId::cpu(),
+                    .total_bytes = host_total,
+                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
+                bool terminal_holder_priced=false;
+                for (const auto& channel : result.activation_channel_plan.channels)
+                {
+                    if (channel.target_world_rank != rank_plan.rank) continue;
+                    for (const auto& endpoint : channel.target_lanes)
+                    {
+                        if (!endpoint.device.is_gpu())
+                            throw std::invalid_argument("Native follower terminals require original GPU endpoints");
+                        const auto [total, available] = inventoryMemory(inventory, endpoint.device);
+                        const PhysicalMemoryResource gpu{
+                            .world_rank = rank_plan.rank, .device = endpoint.device,
+                            .total_bytes = total,
+                            .admission_available_bytes = usableMemory(available, endpoint.device, input)};
+                        for (std::size_t cache = 0; cache < cache_count; ++cache)
+                        {
+                            if(!terminal_holder_priced){
+                                physical_plan_builder.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+                                    PreparedFollowerCaptureTerminalOwner::physicalBytes());
+                                terminal_holder_priced=true;
+                            }
+                            physical_plan_builder.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+                                PreparedFollowerCaptureTerminalPopulation::physicalBytes(*input.original_native_slots));
+                            // Preserve the original certificate origin for both programs.
+                            // Slot zero is the existing cache event; only K-1 are additional.
+                            for (const auto program : {
+                                NativeOrderingEventProgram::captureSubmissionRetirement(),
+                                NativeOrderingEventProgram::retainedCaptureTerminals(*input.original_native_slots)})
+                            {
+                                const auto events = input.native_ordering_events.bom(program, host, gpu);
+                                for (const auto& contribution : events.resources())
+                                    physical_plan_builder.add(contribution);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Setup probes execute serially through one original reusable
+            // calibration graph owner per GPU. Scratch and native handles retire
+            // before the next class/phase; the one ProcessRuntime slot remains.
+            size_t gpu_service_host_bytes = 0;
+            std::map<DeviceId, size_t> gpu_service_device_bytes;
+            const bool dynamic_gpu_service =
+                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                !MoEOverlayNoPeerResidency::hasNoPeerTopology(*input.overlay_plan) &&
+                std::any_of(endpoint_devices.begin(), endpoint_devices.end(),
+                    [](DeviceId device) { return device.is_gpu(); });
+            if (dynamic_gpu_service)
+            {
+                if (!resource_devices.contains(DeviceId::cpu()))
+                    throw std::invalid_argument("Dynamic GPU service requires its original CPU authority");
+                for (const auto device : endpoint_devices)
+                {
+                    if (!device.is_gpu()) continue;
+                    const auto invocation = PlanningMemoryQuoteReuse::preparedExpertService(profile,
+                        {.source_tensor_index = PlanningMemoryQuoteReuse::sourceIndex(profile), .device = device, .device_compute_units = inventoryComputeUnits(inventory, device),
+                         .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                         .first_layer = family.first_model_layer,
+                         .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1,
+                         .apportioned_routed_experts = true});
+                    const auto allocation = MoEOverlayCPUServiceMeasurement::gpuAllocationBytes(
+                        {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation);
+                    gpu_service_host_bytes = std::max(gpu_service_host_bytes, allocation.host_bytes);
+                    gpu_service_device_bytes.emplace(device, allocation.device_bytes);
+                }
+            }
+
             for (const DeviceId device : resource_devices)
             {
                 const auto [total_bytes, available_bytes] =
@@ -907,17 +1497,88 @@ namespace llaminar2
                 const std::size_t activation_staging_bytes =
                     result.activation_channel_plan.stagingBytesFor(
                         rank_plan.rank, device);
-                const std::size_t captured_graph_bytes =
-                    device.is_gpu()
-                        ? estimateCapturedGraphExecutableBytes(
-                              device,
-                              input.captured_graph_plan.resident_executables)
-                        : 0u;
+                auto captured_inventory = input.captured_graph_plan.resident_executables;
+                const auto continuation = std::find_if(result.device_inputs.begin(), result.device_inputs.end(),
+                    [&](const auto &config) { return config.device == device &&
+                        config.execution_role == DeviceExecutionMemoryRole::ContinuationGraph; });
+                if (device.is_gpu() && continuation != result.device_inputs.end())
+                {
+                    const auto query_programs = profile.sparseQueryProgramCount();
+                    // Routed-only resources own no response controller or dense
+                    // resident-input forward. Sampling children belong only to
+                    // an actual tail; shared MTP parent capacity is counted once.
+                    const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        device,
+                        input.graph_family.max_mtp_draft_depth > 0,
+                        declaredDeviceGenerationExecutionPolicy(device.type, input.generation_domain),
+                        input.generation_parent_role,
+                        query_programs) +
+                        OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(query_programs,
+                            continuation->pipeline_forward_only_graph_owner);
+                    if (ordinary > std::numeric_limits<std::size_t>::max() - captured_inventory.auxiliary_executable_count)
+                        throw std::overflow_error("ExpertOverlay ordinary native owner inventory overflows");
+                    captured_inventory.auxiliary_executable_count += ordinary;
+                }
+                if(device.is_gpu() && endpoint_devices.contains(device) &&
+                   rank_plan.runtime.moe_rebalance.mode==MoERebalanceRuntimeMode::Dynamic &&
+                   input.overlay_plan->authority_execution==MoEOverlayAuthorityExecutionKind::DeviceResident &&
+                   !MoEOverlayNoPeerResidency::hasNoPeerTopology(*input.overlay_plan) &&
+                   input.cluster_inventory && input.cluster_inventory->world_size==1) {
+                    // One original epoch arena per physical participant, shared
+                    // by its serial main/MTP families. Arm/End are retained
+                    // helper recipes, not new per-request captures.
+                    if(captured_inventory.auxiliary_executable_count > std::numeric_limits<std::size_t>::max()-2u)
+                        throw std::overflow_error("Finite epoch parent graph inventory overflows");
+                    captured_inventory.auxiliary_executable_count += 2u;
+                }
+                // An original source contributes birth rows for EVERY local
+                // pipeline stage. Those rows retain their source-owned bytes,
+                // but do not turn another stage's GPU into a consumer of this
+                // stage's captured model family. Only actual routed endpoints
+                // or continuation participants materialize these executables.
+                const bool owns_stage_graphs = device.is_gpu() &&
+                    (endpoint_devices.contains(device) || continuation != result.device_inputs.end());
+                const std::size_t captured_graph_bytes = owns_stage_graphs
+                    ? estimateCapturedGraphExecutableBytes(device, captured_inventory) : 0u;
+                // Keep source births distinct from the retained model family:
+                // saved Apply must quote both through the same original BOM.
+                std::size_t source_graph_bytes = 0;
+                if (rank_plan.runtime.native_context_preparation)
+                    if (const auto *source = rank_plan.runtime.native_context_preparation->mandatoryBOM().find(
+                            {rank_plan.rank, device}))
+                        source_graph_bytes = source->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
+                LOG_DEBUG("[MoEOverlayCapacity] captured inventory rank=" << rank_plan.rank
+                    << " device=" << device.toString()
+                    << " identities=" << captured_inventory.model_graph_identity_count
+                    << " variants=" << captured_inventory.model_graph_topology_variant_count
+                    << " auxiliary=" << captured_inventory.auxiliary_executable_count
+                    << " helpers=" << captured_inventory.bounded_helper_executable_count
+                    << " owns_stage_graphs=" << owns_stage_graphs
+                    << " overlay_graph_bytes=" << captured_graph_bytes
+                    << " source_mandatory_graph_bytes=" << source_graph_bytes);
+                if(device==DeviceId::cpu()) {
+                    const auto* program=input.original_cpu_stage_program
+                        ? &input.original_cpu_stage_program->nativeProgram()
+                        : (prepared.cpu_joint?&prepared.cpu_joint->program:nullptr);
+                    if(quote_original_process_pool && (program || !input.original_cpu_pipeline_programs.empty()))
+                        NativeCPUCollectiveProgram::contributeProcessPoolBOM(physical_plan_builder,resource);
+                    if(program) {
+                        const auto members=program->participants();
+                        const auto member=std::find_if(members.begin(),members.end(),
+                            [&](const auto& value){return value.world_rank==rank_plan.rank;});
+                        if(member!=members.end()) {
+                            program->contributeDomainBOM(physical_plan_builder,resource,rank_plan.rank);
+                            if(member==members.begin() && program->backend()==CollectiveBackendType::UPI)
+                                physical_plan_builder.add(resource,PhysicalMemoryOwner::ActivationTransportStaging,
+                                    ShmemSpinArena::allocationGeometry(static_cast<int>(members.size())).mapped_bytes);
+                        }
+                    }
+                }
                 PhysicalMemoryBOMBuilder additions(resource);
                 // Startup probes reuse one serial scratch family on each CPU
                 // resource. Price it before automatic expert capacity fills RAM;
                 // serving and probe workspaces are independent physical owners.
-                size_t cpu_service_bytes = 0;
+                size_t prepared_service_bytes = 0;
                 if (device.is_cpu() &&
                     endpoint_devices.contains(device) &&
                     rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
@@ -927,17 +1588,54 @@ namespace llaminar2
                     // input row through the same sparse-participant requirement factory.
                     auto singleton = profile;
                     singleton.expert_used_count = 1;
-                    const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(singleton,
-                        {.device = device, .device_compute_units = inventory.cpuWorkerThreads(),
-                         .cpu_execution = inventory.cpu_execution,
-                         .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
-                         .first_layer = family.first_model_layer,
-                         .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1});
-                    cpu_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
-                        {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation_bytes);
+                    const WorkspaceMemoryGeometry probe_geometry{
+                        .device = device, .device_compute_units = inventory.cpuWorkerThreads(),
+                        .cpu_execution = inventory.cpu_execution,
+                        .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                        .first_layer = family.first_model_layer,
+                        .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1};
+                    if (prepared.cpu_joint && prepared.cpu_joint->member)
+                    {
+                        const auto &joint = *prepared.cpu_joint;
+                        const auto member = *joint.member;
+                        const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
+                            singleton, probe_geometry, joint.cohort->ownership(member));
+                        // One original domain runs these phases serially. Admit
+                        // its actual fragment, packed rows, rooted fold and start
+                        // release roots; no whole-expert or member-price alias.
+                        for (const auto phase : {ExpertHistogramSource::DecodeToken,
+                                                ExpertHistogramSource::PrefillChunk,
+                                                ExpertHistogramSource::GroupedVerifier})
+                            prepared_service_bytes = std::max(prepared_service_bytes,
+                                MoEOverlayCPUServiceMeasurement::cpuJointAllocationBytes(
+                                    joint.cohort, member, phase, invocation_bytes));
+                    }
+                    else
+                    {
+                        const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(singleton, probe_geometry);
+                        prepared_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
+                            {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation_bytes);
+                    }
+                }
+                if (device == DeviceId::cpu())
+                    prepared_service_bytes = std::max(prepared_service_bytes, gpu_service_host_bytes);
+                if (const auto probe = gpu_service_device_bytes.find(device);
+                    probe != gpu_service_device_bytes.end())
+                {
+                    prepared_service_bytes = probe->second;
+                    const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                    const auto service_graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
+                        {.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
+                         .total_bytes = host_total, .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)},
+                        resource);
+                    for (const auto& contribution : service_graph_bom.resources())
+                        physical_plan_builder.add(contribution);
                 }
                 additions
-                    .add(PhysicalMemoryOwner::ExecutionWorkspace, cpu_service_bytes)
+                    .add(PhysicalMemoryOwner::ExecutionWorkspace, prepared_service_bytes)
+                    .add(PhysicalMemoryOwner::ExecutionWorkspace,
+                        device.is_gpu() && endpoint_devices.contains(device)
+                            ? DeviceMoEOverlayEpochArena::allocationBytesForSlots(1u) : 0u)
                     // One host histogram/mailbox family per rank, regardless of
                     // how many CPU or GPU expert endpoints share that process.
                     .add(PhysicalMemoryOwner::ExecutionWorkspace,
@@ -975,11 +1673,13 @@ namespace llaminar2
          * @brief Retain shared backing identity across one or many fixed owner groups.
          * @param inputs Immutable full-model policy and owned scope for each group.
          * @param transfers Exact parent edges, or empty for an ordinary single group.
+         * @param fixed_ple_pipeline Original explicit PP fixed source roles, if requested.
          * @return Matching per-group contributions; no live memory is materialized.
          */
         std::vector<MoEOverlayLocalCapacityPlannerResult> planFixedGroups(
             std::span<const MoEOverlayLocalCapacityPlannerInput> inputs,
-            std::span<const PipelineStageTransferMemory> transfers)
+            std::span<const PipelineStageTransferMemory> transfers,
+            const std::shared_ptr<const ImmutableFixedHeadPipelineProjection>& fixed_ple_pipeline = {})
         {
             if (inputs.empty() || !inputs.front().model_profile ||
                 (!transfers.empty() && transfers.size() != inputs.size()))
@@ -993,16 +1693,42 @@ namespace llaminar2
                 if (inputs[index].model_profile != inputs.front().model_profile)
                     throw std::invalid_argument("ExpertOverlay stage groups must retain the same complete source metadata authority");
                 prepared.push_back(prepareFixedOwners(inputs[index], transfers.empty()
-                    ? std::nullopt : std::optional(transfers[index])));
+                    ? std::nullopt : std::optional(transfers[index]), fixed_ple_pipeline));
                 configs.push_back(std::move(prepared.back().device_inputs));
+            }
+            // Every pipeline stage binds services through one parent ModelContext.
+            // Preserve an already shared session. Otherwise merge distinct authored
+            // sessions before pricing; duplicate instance keys are an invalid
+            // topology, never permission to coalesce independent worker storage.
+            std::vector<std::shared_ptr<const RetainedHostServiceDeclarations>> sessions;
+            for (const auto& group : configs) for (const auto& config : group) {
+                if (!config.retained_host_services)
+                    throw std::logic_error("Fixed-owner group omitted original CPU service declarations");
+                if (std::find(sessions.begin(), sessions.end(), config.retained_host_services) == sessions.end())
+                    sessions.push_back(config.retained_host_services);
+            }
+            if (sessions.size() > 1) {
+                RetainedHostServiceDeclarations::Builder combined(inputs.front().rank_plan->rank);
+                for (const auto& session : sessions)
+                    for (const auto key : session->instances())
+                        combined.add(key, session->program(key));
+                const auto shared = std::move(combined).freeze();
+                for (auto& group : configs) for (auto& config : group)
+                    config.retained_host_services = shared;
             }
             auto fixed = MemoryPlanner::planGroups(*inputs.front().model_profile, configs);
             std::vector<MoEOverlayLocalCapacityPlannerResult> result;
             result.reserve(inputs.size());
+            bool original_process_pool_quoted=false;
+            std::set<std::pair<int,DeviceId>> quoted_native_contexts;
             for (size_t index = 0; index < inputs.size(); ++index)
             {
+                const bool has_original_program=prepared[index].cpu_joint.has_value() ||
+                    inputs[index].original_cpu_stage_program || !inputs[index].original_cpu_pipeline_programs.empty();
+                const bool quote_pool=has_original_program && !original_process_pool_quoted;
+                original_process_pool_quoted|=has_original_program;
                 prepared[index].device_inputs = std::move(configs[index]);
-                result.push_back(completeFixedOwners(inputs[index], std::move(prepared[index]), std::move(fixed[index])));
+                result.push_back(completeFixedOwners(inputs[index],std::move(prepared[index]),std::move(fixed[index]),quote_pool,quoted_native_contexts));
             }
             return result;
         }
@@ -1013,6 +1739,39 @@ namespace llaminar2
     {
         auto groups = planFixedGroups(std::span(&input, 1), {});
         return std::move(groups.front());
+    }
+
+    std::vector<MoEOverlayLocalCapacityPlannerResult> MoEOverlayLocalCapacityPlanner::planPipeline(
+        const ResolvedRankOrchestration &topology, std::span<const MoEOverlayLocalCapacityPlannerInput> stages)
+    {
+        if (!topology.globalPipeline())
+            return planPipeline(topology.rankPlan(), stages);
+        const auto &parent = topology.rankPlan();
+        const auto &claims = topology.pipelineStages();
+        if (stages.empty() || claims.size() != stages.size())
+            throw std::invalid_argument("Global MoE fixed memory requires every local stage claim");
+        std::vector<PipelineStageTransferMemory> transfers;
+        for (size_t index = 0; index < claims.size(); ++index)
+        {
+            const auto &claim = claims[index];
+            const auto &input = stages[index];
+            const auto *rank = input.rank_plan;
+            if (!rank || rank->rank != parent.rank || rank->usesLocalPP() ||
+                (rank->usesGlobalTP() && (!input.original_cpu_stage_program ||
+                    input.original_cpu_stage_program->stageId()!=claim.stageId())) || rank->usesPipelineParallel() || rank->first_layer != claim.scope().first_layer ||
+                rank->last_layer != claim.scope().last_layer - 1 ||
+                rank->has_embedding != claim.scope().has_embedding || rank->has_lm_head != claim.scope().has_lm_head ||
+                input.resident_graph_rows <= 0 || input.resident_graph_rows != stages.front().resident_graph_rows ||
+                input.activation_channel_row_capacity <= 0 ||
+                input.activation_channel_row_capacity != stages.front().activation_channel_row_capacity ||
+                input.generation_domain != claim.scope().generation_domain ||
+                input.generation_parent_role != (claim.scope().has_lm_head
+                    ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower))
+                throw std::invalid_argument("Global MoE fixed input differs from its original local stage claim");
+            transfers.push_back(PipelineStageTransferMemory::forGlobalStage(
+                *topology.globalPipeline(), parent.rank, claim.stageId()));
+        }
+        return planFixedGroups(stages, transfers);
     }
 
     std::vector<MoEOverlayLocalCapacityPlannerResult> MoEOverlayLocalCapacityPlanner::planPipeline(
@@ -1032,6 +1791,13 @@ namespace llaminar2
         {
             transfers.push_back(PipelineStageTransferMemory::forStage(parent, index));
             const auto &input = stages[index];
+            const auto parent_domain = declaredRankDeviceGenerationDomain(parent);
+            const auto expected_parent_role = index + 1u < count
+                ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
+            if ((parent_domain == DeviceGenerationExecutionDomain::HostedBoundary &&
+                 input.generation_domain != DeviceGenerationExecutionDomain::HostedBoundary) ||
+                input.generation_parent_role != expected_parent_role)
+                throw std::invalid_argument("ExpertOverlay fixed pipeline loses its parent generation domain or transaction owner");
             const auto *rank = input.rank_plan;
             if (!rank || rank->rank != parent.rank || rank->usesLocalPP() || rank->usesGlobalTP() || rank->usesPipelineParallel() ||
                 input.resident_graph_rows <= 0 || input.resident_graph_rows != stages.front().resident_graph_rows ||
@@ -1053,7 +1819,42 @@ namespace llaminar2
                 if (owned[member].device != expected[member].toLocalDeviceId())
                     throw std::invalid_argument("ExpertOverlay pipeline continuation order differs from its parent");
         }
-        return planFixedGroups(stages, transfers);
+        std::shared_ptr<const ImmutableFixedHeadPipelineProjection> fixed_ple_pipeline;
+        if (parent.runtime.ngram_table_policy.isFixedHeadSharded()) {
+            const auto* profile = stages.front().model_profile;
+            const auto* inventory = stages.front().rank_inventory;
+            if (!profile || !profile->flash_next || !inventory || inventory->rank != parent.rank)
+                throw std::invalid_argument("Fixed PLE pipeline requires its original QFN source and rank inventory");
+            const auto layer = static_cast<int>(profile->flash_next->ple_decoder_layer);
+            int reader_stage = -1;
+            std::set<std::string> uuids;
+            std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> roster;
+            for (std::size_t stage = 0; stage < count; ++stage) {
+                const auto& nested = parent.local_pp_stage_tp_info;
+                const auto members = nested.empty() || nested[stage].devices.empty()
+                    ? std::vector<GlobalDeviceAddress>{parent.local_pp_devices[stage]} : nested[stage].devices;
+                auto& group = roster.emplace_back();
+                if (layer >= parent.local_pp_layer_boundaries[stage] &&
+                    layer < parent.local_pp_layer_boundaries[stage + 1])
+                    reader_stage = static_cast<int>(stage);
+                for (const auto& member : members) {
+                    const auto device = member.toLocalDeviceId();
+                    if (!device.is_gpu() || member.hostname != inventory->hostname ||
+                        (member.numa_node >= 0 && member.numa_node != inventory->cpu.numa_node))
+                        throw std::invalid_argument("Fixed PLE pipeline has a foreign original GPU address");
+                    requireRankLocalGPUOwnership(*inventory, device, "Fixed PLE pipeline storage");
+                    const auto physical = std::find_if(inventory->gpus.begin(), inventory->gpus.end(),
+                        [&](const auto& gpu) { return gpu.type == device.type && gpu.local_device_id == device.ordinal; });
+                    if (physical->uuid.empty() || !uuids.insert(physical->uuid).second)
+                        throw std::invalid_argument("Fixed PLE pipeline aliases a physical GPU");
+                    group.push_back({parent.rank, device});
+                }
+            }
+            fixed_ple_pipeline = std::make_shared<const ImmutableFixedHeadPipelineProjection>(
+                ImmutableFixedHeadPipelineProjection::checked(parent.rank, reader_stage,
+                    profile->flash_next->ple_heads, stages.front().resident_graph_rows, roster));
+        }
+        return planFixedGroups(stages, transfers, fixed_ple_pipeline);
     }
 
 } // namespace llaminar2

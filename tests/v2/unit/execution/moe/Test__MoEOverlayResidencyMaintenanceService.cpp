@@ -16,9 +16,14 @@
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
 #include "execution/moe/MoEOverlayMPIResidencyProposalPublisher.h"
 #include "utils/ObservedExpertDemandFixture.h"
+#include "utils/ActiveProgressContinuationReplayFixture.h"
 
 #include <gtest/gtest.h>
+#include <omp.h>
+#include "utils/ScopedCallerThreadAffinity.h"
+#include <sched.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -183,7 +188,7 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
@@ -193,7 +198,7 @@ namespace llaminar2::test
                 {.participant_id = 2,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
-            };
+            });
             return profile;
         }
 
@@ -210,10 +215,7 @@ namespace llaminar2::test
                 {
                     if (source == destination)
                         continue;
-                    profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = 0,
+                    profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = 0},
                         .transfer_and_repack_ns = 1,
                         .inference_interference_ns = 0,
                     });
@@ -394,6 +396,21 @@ namespace llaminar2::test
                 ControlledTransport *owner_ = nullptr;
             };
 
+            /** @brief Metadata-only original transaction identity, retaining no reader or payload. */
+            struct StagedIdentity
+            {
+                uint64_t generation, expected_epoch, forecast, gain, net;
+                std::weak_ptr<const DecodeExpertHistogramWindow> window;
+                std::optional<MoEOverlayResidencyOwnershipKind> ownership_kind;
+                std::vector<int> tiers;
+            };
+            /** @return Exact original staged identities, with weak observation lifetimes. */
+            std::vector<StagedIdentity> stagedIdentities() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return identities_;
+            }
+
             /** @brief Snapshot of synchronized transport observations. */
             struct Observations
             {
@@ -421,7 +438,23 @@ namespace llaminar2::test
                 const MoEOverlayResidencyTransaction &transaction) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                cpu_set_t current;
+                CPU_ZERO(&current);
+                if (sched_getaffinity(0, sizeof(current), &current) != 0)
+                    throw std::runtime_error("Cannot observe actual maintenance worker affinity");
+                begin_mask_ = current;
                 ++begin_calls_;
+                StagedIdentity identity{transaction.histogram_generation, transaction.expected_epoch,
+                    transaction.economy.forecast_fingerprint, transaction.economy.projected_service_gain_ns,
+                    transaction.economy.projected_net_benefit_ns, transaction.histogram_window, std::nullopt, {}};
+                if (transaction.candidate && transaction.candidate->valid())
+                {
+                    identity.ownership_kind = transaction.candidate->ownershipKind();
+                    if (transaction.candidate->placement_plan &&
+                        !transaction.candidate->placement_plan->placements.empty())
+                        identity.tiers = transaction.candidate->placement_plan->placements.front().routed_expert_tier;
+                }
+                identities_.push_back(std::move(identity));
                 const auto *window = transaction.histogram_window.get();
                 if (begin_calls_ == 1)
                 {
@@ -457,6 +490,13 @@ namespace llaminar2::test
                     .status = MoEOverlayResidencyStageStartStatus::Started,
                     .wave = std::make_unique<Wave>(this),
                 };
+            }
+
+            /** @return The scheduler mask observed inside the original worker's transport callback. */
+            std::optional<cpu_set_t> beginMask() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return begin_mask_;
             }
 
             /** @brief Enable or defer destination-slot reservation. */
@@ -538,6 +578,7 @@ namespace llaminar2::test
 
         private:
             friend class Wave;
+            std::vector<StagedIdentity> identities_;
             mutable std::mutex mutex_;
             std::condition_variable cv_;
             bool start_enabled_ = true;
@@ -547,6 +588,7 @@ namespace llaminar2::test
             bool prepare_ready_ = false;
             bool publication_ready_ = false;
             bool fail_start_ = false;
+            std::optional<cpu_set_t> begin_mask_;
             int begin_calls_ = 0;
             int waves_started_ = 0;
             int stage_polls_ = 0;
@@ -819,6 +861,71 @@ namespace llaminar2::test
             return service;
         }
     } // namespace
+
+    /** @brief Actual maintenance callbacks inherit the partition while the construction caller is restored. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, IndependentControlInheritsPartitionAndRestoresCaller)
+    {
+        // Force the known first-place creator even if native fixture discovery
+        // changed its mask; restore the pre-test caller on every exit.
+        const ScopedCallerThreadAffinity test_caller;
+        if (omp_get_proc_bind() != omp_proc_bind_false)
+        {
+            const int place = omp_get_place_num();
+            ASSERT_GE(place, 0);
+            const int width = omp_get_place_num_procs(place);
+            ASSERT_GT(width, 0);
+            std::vector<int> cpus(static_cast<std::size_t>(width));
+            omp_get_place_proc_ids(place, cpus.data());
+            cpu_set_t first_place;
+            CPU_ZERO(&first_place);
+            for (int cpu : cpus)
+            {
+                ASSERT_GE(cpu,0);ASSERT_LT(cpu,CPU_SETSIZE);
+                CPU_SET(cpu, &first_place);
+            }
+            ASSERT_EQ(sched_setaffinity(0, sizeof(first_place), &first_place), 0);
+        }
+        cpu_set_t original;
+        CPU_ZERO(&original);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(original), &original), 0);
+        cpu_set_t expected = original;
+        if (omp_get_proc_bind() != omp_proc_bind_false)
+        {
+            CPU_ZERO(&expected);
+            const int count=omp_get_partition_num_places();
+            ASSERT_GT(count,0);
+            std::vector<int> places(static_cast<std::size_t>(count));
+            omp_get_partition_place_nums(places.data());
+            for (const int place : places)
+            {
+                const int width=omp_get_place_num_procs(place);
+                ASSERT_GT(width,0);
+                std::vector<int> cpus(static_cast<std::size_t>(width));
+                omp_get_place_proc_ids(place, cpus.data());
+                for (int cpu : cpus)
+                {
+                    ASSERT_GE(cpu,0);ASSERT_LT(cpu,CPU_SETSIZE);
+                    CPU_SET(cpu, &expected);
+                }
+            }
+            if(count>1)ASSERT_FALSE(CPU_EQUAL(&original,&expected));
+        }
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStartEnabled(false);
+        auto service = startService(authority, transport);
+        cpu_set_t restored;
+        CPU_ZERO(&restored);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(restored), &restored), 0);
+        EXPECT_TRUE(CPU_EQUAL(&original, &restored));
+        ASSERT_TRUE(waitUntil([&] { return transport->beginMask().has_value(); }));
+        const auto actual = *transport->beginMask();
+        EXPECT_TRUE(CPU_EQUAL(&actual, &expected));
+        service->stopAndDrain(MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(restored), &restored), 0);
+        EXPECT_TRUE(CPU_EQUAL(&original, &restored));
+    }
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,
@@ -2151,6 +2258,225 @@ namespace llaminar2::test
 
         service->stopAndDrain(
             MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+    }
+
+    /** Repeated same-window waves require new work and original reader retirement. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, ActiveProgressContinuationReplayRetiresAndConsumesProgress)
+    {
+        for (const bool distributed : {false, true})
+        for (const uint64_t residency : {0u, 2u})
+        {
+            auto histogram = continuation_replay::histogram();
+            const auto original_generation = histogram->windowGeneration();
+            auto authority = continuation_replay::authority(*histogram, residency);
+            auto transport = std::make_shared<ControlledTransport>();
+            transport->setStageReady(true);
+            transport->setPrepareReady(true);
+            transport->setPublicationReady(true);
+            auto publisher = distributed ? std::make_shared<ImmediateProposalPublisher>(true) : nullptr;
+            MoEOverlayResidencyMaintenanceService service({.authority = authority, .transport = transport,
+                .proposal_publisher = publisher, .idle_poll_interval = 100us});
+            // Destruction drops the real read lease before joining the service.
+            auto old_reader = authority->tryAcquireTicketSnapshot();
+            ASSERT_TRUE(old_reader);
+            service.start();
+            ASSERT_TRUE(waitUntil([&] { return service.stats().committed_waves == 1; }));
+            ASSERT_EQ(authority->pendingRetirementCount(), 1u);
+            const auto checks = authority->stats().checks;
+            service.notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 1});
+            const auto polls = transport->observations().retirement_polls;
+            ASSERT_TRUE(waitUntil([&] { return transport->observations().retirement_polls >= polls + 32; }));
+            EXPECT_EQ(authority->stats().checks, checks);
+            EXPECT_EQ(service.stats().committed_waves, 1u);
+            old_reader.reset();
+            service.notifyMaintenanceProgress();
+            ASSERT_TRUE(waitUntil([&] { return service.stats().committed_waves == 2; }));
+            ASSERT_TRUE(waitUntil([&] { return authority->pendingRetirementCount() == 0; }));
+            EXPECT_GE(transport->observations().retirements, 2);
+            const auto idle_polls = service.stats().poll_iterations;
+            ASSERT_TRUE(waitUntil([&] { return service.stats().poll_iterations >= idle_polls + 32; }));
+            EXPECT_EQ(service.stats().committed_waves, 2u);
+            // One large delta may fund one attempt, never an idle credit queue.
+            service.notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 500});
+            ASSERT_TRUE(waitUntil([&] { return service.stats().committed_waves == 3; }));
+            const auto after_bulk = service.stats().poll_iterations;
+            ASSERT_TRUE(waitUntil([&] { return service.stats().poll_iterations >= after_bulk + 32; }));
+            EXPECT_EQ(service.stats().committed_waves, 3u);
+            service.notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 1});
+            ASSERT_TRUE(waitUntil([&] { return service.stats().committed_waves == 4; }));
+            service.notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 1});
+            ASSERT_TRUE(waitUntil([&] { return service.stats().dynamic_no_movement == 1; }));
+            const auto terminal_checks = authority->stats().checks;
+            service.notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 100});
+            const auto terminal_polls = service.stats().poll_iterations;
+            ASSERT_TRUE(waitUntil([&] { return service.stats().poll_iterations >= terminal_polls + 32; }));
+            EXPECT_EQ(authority->stats().checks, terminal_checks);
+            EXPECT_EQ(histogram->windowSize(), 270);
+            EXPECT_EQ(histogram->windowGeneration(), original_generation + 1u);
+            EXPECT_EQ(histogram->windowTokenCount(), 0u);
+            const auto identities = transport->stagedIdentities();
+            ASSERT_EQ(identities.size(), 4u);
+            const std::array<uint64_t, 8> actual_counts{1, 2, 3, 4, 50, 60, 70, 80};
+            const auto objective = [&](const std::vector<int> &tiers)
+            {
+                std::array<uint64_t, 2> service{};
+                for (size_t expert = 0; expert < tiers.size(); ++expert)
+                    service.at(tiers[expert]) += actual_counts[expert] * (tiers[expert] == 0 ? 20u : 200u);
+                return std::max(service[0], service[1]);
+            };
+            auto before_cost = objective({0, 0, 0, 0, 1, 1, 1, 1});
+            for (size_t i = 0; i < identities.size(); ++i)
+            {
+                ASSERT_TRUE(identities[i].ownership_kind.has_value());
+                EXPECT_EQ(*identities[i].ownership_kind, MoEOverlayResidencyOwnershipKind::WholeExperts);
+                ASSERT_EQ(identities[i].tiers.size(), 8u);
+                const auto after_cost = objective(identities[i].tiers);
+                EXPECT_LT(after_cost, before_cost);
+                EXPECT_EQ(identities[i].gain, before_cost - after_cost);
+                before_cost = after_cost;
+                EXPECT_EQ(identities[i].generation, original_generation);
+                EXPECT_EQ(identities[i].expected_epoch, 1u + i);
+                EXPECT_EQ(identities[i].forecast, identities[0].forecast);
+                EXPECT_GT(identities[i].gain, 0u);
+                EXPECT_GT(identities[i].net, 0u);
+            }
+            EXPECT_EQ(authority->snapshot()->placement_plan->placements.front().routed_expert_tier,
+                (std::vector<int>{1, 1, 1, 1, 0, 0, 0, 0}));
+            service.stopAndDrain(MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+            EXPECT_EQ(authority->pendingRetirementCount(), 0u);
+            EXPECT_TRUE(service.healthy()) << service.failureMessage();
+        }
+    }
+
+    /** New Ready observations replace old heat before progress-funded continuation. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, ActiveProgressContinuationReplayFreshReadyWins)
+    {
+        auto histogram = continuation_replay::histogram();
+        const auto original_generation = histogram->windowGeneration();
+        auto authority = continuation_replay::authority(*histogram);
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true); transport->setPrepareReady(true); transport->setPublicationReady(true);
+        auto service = startService(authority, transport);
+        ASSERT_TRUE(waitUntil([&] { return service->stats().committed_waves == 1; }));
+        transport->setStartEnabled(false);
+        const std::vector<uint64_t> new_counts{80, 70, 60, 50, 4, 3, 2, 1};
+        recordObservedPrefillBatch(*histogram, 0, new_counts);
+        service->notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Prefill, 270});
+        ASSERT_TRUE(waitUntil([&] { return service->state() == MoEOverlayMaintenanceState::Deferred; }));
+        transport->setStartEnabled(true);
+        service->notifyMaintenanceProgress();
+        ASSERT_TRUE(waitUntil([&] { return service->stats().committed_waves == 2; }));
+        const auto identities = transport->stagedIdentities();
+        ASSERT_GE(identities.size(), 2u);
+        EXPECT_EQ(identities[0].generation, original_generation);
+        EXPECT_EQ(identities[1].generation, original_generation + 1u);
+        EXPECT_NE(identities[0].forecast, identities[1].forecast);
+        EXPECT_TRUE(identities[0].window.expired())
+            << "Fresh Ready must release the obsolete PMA demand reference";
+        service->stopAndDrain(MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+    }
+
+    /** A typed witness cannot extend old-bank liveness or replace source/current identity. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, ActiveProgressContinuationReplayAuthorityIdentityAndCadence)
+    {
+        auto histogram = continuation_replay::histogram();
+        const auto original_generation = histogram->windowGeneration();
+        auto authority = continuation_replay::authority(*histogram);
+        auto original = authority->proposeFromHistogram();
+        ASSERT_FALSE(original.empty());
+        EXPECT_THROW((void)authority->retainCommittedObservation(original), std::logic_error);
+        ControlledTransport transport;
+        transport.setStageReady(true); transport.setPrepareReady(true); transport.setPublicationReady(true);
+        auto reader = authority->tryAcquireTicketSnapshot();
+        ASSERT_TRUE(reader);
+        ASSERT_EQ(authority->beginApply(original, transport).status, MoEOverlayResidencyApplyStatus::Started);
+        ASSERT_TRUE(waitUntil([&] { return authority->advanceBackground().status == MoEOverlayResidencyApplyStatus::Published; }));
+        auto observation = authority->retainCommittedObservation(original);
+        EXPECT_TRUE(authority->isCurrentCommittedObservation(observation));
+        EXPECT_THROW((void)authority->reproposeFromCommittedObservation(observation), std::logic_error);
+        auto copied = original;
+        copied.histogram_window = std::make_shared<const DecodeExpertHistogramWindow>(*original.histogram_window);
+        EXPECT_THROW((void)authority->retainCommittedObservation(copied), std::logic_error);
+        reader.reset();
+        original = {}; copied = {};
+        ASSERT_TRUE(waitUntil([&] {
+            (void)authority->advanceBackground(); return authority->pendingRetirementCount() == 0;
+        }));
+        EXPECT_EQ(transport.observations().retirements, 1);
+        const auto window_size = histogram->windowSize();
+        const auto generation = histogram->windowGeneration();
+        auto next = authority->reproposeFromCommittedObservation(observation);
+        ASSERT_TRUE(next);
+        EXPECT_EQ(next->expected_epoch, 2u);
+        EXPECT_EQ(next->histogram_generation, original_generation);
+        EXPECT_EQ(histogram->windowSize(), window_size);
+        EXPECT_EQ(histogram->windowGeneration(), generation);
+        ASSERT_EQ(authority->beginApply(*next, transport).status, MoEOverlayResidencyApplyStatus::Started);
+        ASSERT_TRUE(waitUntil([&] { return authority->advanceBackground().status == MoEOverlayResidencyApplyStatus::Published; }));
+        auto current_observation = authority->retainCommittedObservation(*next);
+        ASSERT_TRUE(waitUntil([&] {
+            (void)authority->advanceBackground(); return authority->pendingRetirementCount() == 0;
+        }));
+        EXPECT_FALSE(authority->isCurrentCommittedObservation(observation));
+        EXPECT_THROW((void)authority->reproposeFromCommittedObservation(observation), std::logic_error);
+        next.reset();
+        auto foreign_histogram = continuation_replay::histogram();
+        auto foreign = continuation_replay::authority(*foreign_histogram);
+        EXPECT_FALSE(foreign->isCurrentCommittedObservation(observation));
+        EXPECT_THROW((void)foreign->reproposeFromCommittedObservation(observation), std::logic_error);
+        const std::vector<uint64_t> fresh{80, 70, 60, 50, 4, 3, 2, 1};
+        recordObservedPrefillBatch(*histogram, 0, fresh);
+        (void)authority->proposeFromHistogram();
+        // Even an unchanged current snapshot cannot reuse superseded evidence.
+        EXPECT_THROW((void)authority->reproposeFromCommittedObservation(current_observation), std::logic_error);
+    }
+
+    /** Admitted retries keep one attempt; shutdown clears dormant continuation work. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, ActiveProgressContinuationReplayDeferredShutdown)
+    {
+        auto histogram = continuation_replay::histogram();
+        auto authority = continuation_replay::authority(*histogram);
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true); transport->setPrepareReady(true); transport->setPublicationReady(true);
+        auto service = startService(authority, transport);
+        ASSERT_TRUE(waitUntil([&] { return service->stats().committed_waves == 1; }));
+        transport->setStartEnabled(false);
+        service->notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 1});
+        ASSERT_TRUE(waitUntil([&] { return service->state() == MoEOverlayMaintenanceState::Deferred; }));
+        const auto checks = authority->stats().checks;
+        service->notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 100});
+        const auto begins = transport->observations().begin_calls;
+        ASSERT_TRUE(waitUntil([&] { return transport->observations().begin_calls >= begins + 16; }));
+        EXPECT_EQ(authority->stats().checks, checks);
+        EXPECT_TRUE(transport->observations().retained_identity);
+        service->stopAndDrain(MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        EXPECT_EQ(service->stats().committed_waves, 1u);
+        EXPECT_EQ(authority->pendingAbortCount(), 0u);
+        EXPECT_EQ(authority->pendingRetirementCount(), 0u);
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+    }
+
+    /** A failed continuation cannot rearm or retry a new decision during shutdown. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, ActiveProgressContinuationReplayFailureTerminates)
+    {
+        auto histogram = continuation_replay::histogram();
+        auto authority = continuation_replay::authority(*histogram);
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true); transport->setPrepareReady(true); transport->setPublicationReady(true);
+        auto service = startService(authority, transport);
+        ASSERT_TRUE(waitUntil([&] { return service->stats().committed_waves == 1; }));
+        transport->setFailStart(true);
+        service->notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 1});
+        ASSERT_TRUE(waitUntil([&] { return !service->healthy(); }));
+        const auto checks = authority->stats().checks;
+        service->notifyInferenceProgress({MoEOverlayInferenceProgressPhase::Decode, 100});
+        service->stopAndDrain(MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        EXPECT_EQ(authority->stats().checks, checks);
+        EXPECT_EQ(service->stats().committed_waves, 1u);
+        EXPECT_EQ(service->stats().fatal_failures, 1u);
+        EXPECT_EQ(authority->pendingRetirementCount(), 0u);
+        EXPECT_EQ(authority->pendingAbortCount(), 0u);
     }
 
 } // namespace llaminar2::test

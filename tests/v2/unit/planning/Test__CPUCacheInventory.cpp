@@ -103,6 +103,10 @@ TEST(CPUCacheInventoryProjection, PartialSocketObservationIsUnknownNotPartialSum
     HardwareInventory inventory;
     inventory.cpu_sockets = {{.socket_id = 0, .numa_node = 3}, {.socket_id = 1, .numa_node = 7}};
     inventory.cpu_last_level_cache_bytes = {{0, 32u << 20}};
+    inventory.cpu_numa_devices = {
+        {3,{.type=ComputeBackendType::CPU,.numa_node=3,.total_memory_bytes=1024,.free_memory_bytes=768,
+            .compute_units=1,.last_level_cache_bytes=32u<<20}},
+        {7,{.type=ComputeBackendType::CPU,.numa_node=7,.total_memory_bytes=1024,.free_memory_bytes=768,.compute_units=1}}};
     EXPECT_EQ(inventory.cpuDevice().last_level_cache_bytes, 0u);
     EXPECT_EQ(inventory.cpuDevice(3).last_level_cache_bytes, 32u << 20);
     EXPECT_EQ(inventory.cpuDevice(7).last_level_cache_bytes, 0u);

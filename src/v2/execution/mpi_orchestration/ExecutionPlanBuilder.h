@@ -118,6 +118,17 @@ namespace llaminar2
             const ModelConfig &model_config,
             const ClusterInventory &cluster_inventory);
 
+        /**
+         * @brief Select the canonical transport for exact orchestration endpoints.
+         * @param devices Ordered physical roots with owning host and NUMA identity.
+         * @return Native GPU, host staging, cross-NUMA UPI, MPI, or AUTO when no transport is needed.
+         * @details This pure projection neither discovers hardware nor initializes
+         * a backend. Admission evidence uses it after independently proving the
+         * actual endpoint identities; TP domains retain their explicit backend.
+         */
+        CollectiveBackendType selectBackend(
+            const std::vector<GlobalDeviceAddress> &devices);
+
     private:
         // =====================================================================
         // Domain Resolution
@@ -209,12 +220,6 @@ namespace llaminar2
         // =====================================================================
         // Backend Selection
         // =====================================================================
-
-        /**
-         * @brief Select collective backend for a set of devices
-         */
-        CollectiveBackendType selectBackend(
-            const std::vector<GlobalDeviceAddress> &devices);
 
         /**
          * @brief Select local TP backend, honoring explicit user/domain backend.

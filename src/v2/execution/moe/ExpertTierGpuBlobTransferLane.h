@@ -2,7 +2,7 @@
  * @file ExpertTierGpuBlobTransferLane.h
  * @brief Persistent packed-expert relay through retained GPU progress epochs.
  *
- * CUDA and ROCm consume the same separated NativeVNNI expert layout, so a
+ * CUDA and ROCm consume the same separated NativeQuantised expert layout, so a
  * GPU edge must preserve the packed bytes instead of decoding and repacking
  * them. Cross-runtime edges cannot portably share events or allocations, while
  * a same-runtime edge without driver-reported peer access must not rely on a
@@ -38,7 +38,7 @@ namespace llaminar2
     /** @brief Named separated-array region carried by one packed blob chunk. */
     enum class ExpertTierGpuBlobRegion : std::uint8_t
     {
-        Payload = 0, ///< Quantized NativeVNNI payload bytes.
+        Payload = 0, ///< Quantized NativeQuantised payload bytes.
         Scales = 1,  ///< FP16 per-block scale bytes.
         Mins = 2,    ///< Optional FP16 per-block minimum bytes.
         Emins = 3,   ///< Optional effective-minimum metadata bytes.
@@ -333,6 +333,10 @@ namespace llaminar2
         {
             return !hasInFlightWork();
         }
+
+        /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
+        [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
+        { return protocol_.totalBytes(); }
 
         /** @brief Return cumulative proof counters for integration assertions. */
         [[nodiscard]] ExpertTierGpuBlobTransferLaneStats stats() const noexcept

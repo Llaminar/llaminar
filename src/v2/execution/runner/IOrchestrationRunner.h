@@ -20,6 +20,7 @@
  */
 
 #pragma once
+#include "snapshots/SnapshotInfo.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
@@ -27,6 +28,8 @@
 #include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../InferenceReadiness.h"
 #include "../moe/MoEOptimizationStatus.h"
+#include "../moe/MoEOverlayInferenceTransaction.h"
+#include <functional>
 #include "../moe/MoEOptimizationMovementTopology.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../transfer/TransferEngine.h"
@@ -692,6 +695,7 @@ namespace llaminar2
          */
         virtual uint64_t moeRuntimeMovementEpoch() const { return 0; }
 
+
         /**
          * @brief Observe adaptive MoE lifecycle state from its sole authority.
          *
@@ -750,6 +754,16 @@ namespace llaminar2
          * @return Reference to the RankExecutionPlan
          */
         virtual const RankExecutionPlan &executionPlan() const = 0;
+
+        /**
+         * @brief Project frozen model/topology keys and the current physical width strategy.
+         * @return Complete actual economics scope, or explicit generic metadata.
+         * Request selection changes only the actual strategy key; retained capacity
+         * and loaded geometry remain immutable. No mutable device values are read.
+         */
+        [[nodiscard]] virtual MTPDepthPolicyScope mtpDepthPolicyScope() const { return {}; }
+        /** @return Why a scalar measured scope is unavailable; generic policy remains unchanged. */
+        [[nodiscard]] virtual const char *mtpDepthPolicyScopeGenericReason() const { return "model_free"; }
 
         /**
          * @brief Get orchestration configuration
@@ -991,6 +1005,22 @@ namespace llaminar2
         }
 
         /**
+         * @brief Declare ordinary terminal output rows before plan compilation.
+         * @param capacity Immutable maximum actual output demand, not prompt capacity.
+         * @return True only while setup can still publish one complete admitted plan.
+         *
+         * Precompiled plans carry this value in RuntimeConfig before construction.
+         * Later all-position/row-indexed selection remains a separate runtime
+         * operation within this frozen demand; it cannot enlarge admission.
+         * This API does not enable projection execution or reserve MTP capacity.
+         */
+        virtual bool setOrdinaryTerminalProjectionCapacity(OrdinaryTerminalProjectionCapacity capacity)
+        {
+            (void)capacity;
+            return false;
+        }
+
+        /**
          * @brief Declare graph-resident diagnostic storage before initialize().
          *
          * The caller that selects checkpoint topology supplies a complete
@@ -1058,6 +1088,9 @@ namespace llaminar2
          * @return Pointer to snapshot data (FP32), or nullptr if key doesn't exist
          */
         virtual const float *getSnapshot(const std::string &key, size_t &out_size) const = 0;
+
+        /** @brief Retrieve a lifetime-retained typed diagnostic publication when available. */
+        virtual SnapshotInfo getSnapshotWithShape(const std::string &key) const { return {}; }
 
         /**
          * @brief Get list of all captured snapshot keys
@@ -1261,6 +1294,29 @@ namespace llaminar2
          * must NOT enable this — they already coordinate inline.
          */
         virtual void setMPICoordinatedMode(bool /*enabled*/) {}
+        /**
+         * @brief Run a finite comparison under the original rank-local device parent.
+         * @param body Actual public requests/resets, not a replacement execution path.
+         * No device-selected epoch is returned or mirrored to host memory.
+         */
+        virtual void withMoEOverlayDevicePlacementScope(const std::function<void()> &body)
+        { (void)body; throw std::logic_error("This original runner has no device-owned finite placement scope"); }
+
+        /**
+         * @brief Run finite complete requests under the original host placement owner.
+         * @param body Synchronous original requests, including public request resets.
+         * @return Original retained parent and completed descendant sequence IDs.
+         * @throws std::logic_error If this runner has no supported host coordinator.
+         * @note This neither selects an epoch nor supports homogeneous device authority.
+         */
+        virtual MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
+            const std::function<void()> &body)
+        {
+            (void)body;
+            throw std::logic_error("Finite host placement scope is unsupported by this runner");
+        }
+
+
     };
 
 } // namespace llaminar2

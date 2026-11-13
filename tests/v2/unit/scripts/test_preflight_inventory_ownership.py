@@ -37,14 +37,45 @@ DEVICE_FREE_TARGETS = frozenset(("v2_test_mtp_graph_construction", "v2_test_devi
                                  "v2_test_device_registry", "v2_test_backend_startup_config",
                                  "v2_test_moe_runtime_table"))
 NATIVE_GRAPH_CASE = "Test__Qwen35MoEGraph.ROCmPhaseSplitDecodeUsesCanonicalRouteSlotAllreduce"
+MTP_TARGET = "v2_test_mtp_graph_construction"
+MTP_NATIVE_CASES = (
+    "GPUSidecarGraphCacheMaterializesAndUsesFullGraphFromFirstInvocation",
+    "GPUDeviceTargetAndDraftSidecarCachesAreIndependent",
+    "GPUShiftedPrefillSidecarPolicyUsesShiftedPrefillContext",
+    "GPUStochasticRequestBatchScratchScalesWithConfiguredCapacity",
+)
+
+
+def selected_by_gtest(test: dict, case: str) -> bool:
+    """Project Google's include/exclude grammar onto an actual native case name."""
+    filters = [arg.partition("=")[2] for arg in test.get("command", [])
+               if arg.startswith("--gtest_filter=")]
+    include, _, exclude = (filters[0] if len(filters) == 1 else "*").partition("-")
+    return (any(fnmatch.fnmatchcase(case, pattern) for pattern in (include or "*").split(":"))
+            and not any(fnmatch.fnmatchcase(case, pattern) for pattern in exclude.split(":")))
+
+
 BUILD: Path
 BACKENDS: list[str]
+
+
+def copy_inventory_row(document: dict, predicate) -> tuple[dict, dict]:
+    """Isolate one adversarial row while retaining every original inventory entry.
+
+    Only the selected row is mutable in these tests. Sharing all other rows
+    avoids repeatedly cloning the complete generated command/property payload.
+    The top-level mapping and tests list are independent, so removal is safe.
+    """
+    tests = list(document["tests"])
+    index = next(index for index, test in enumerate(tests) if predicate(test))
+    tests[index] = copy.deepcopy(tests[index])
+    return {**document, "tests": tests}, tests[index]
 
 
 def validate_inventory(document: dict, backends: list[str]) -> list[str]:
     """Require each actual fixture registration to claim its process-wide resources."""
     selected_targets = frozenset().union(*(TARGETS[backend] for backend in ("common", *backends)))
-    matched, owners = [], set()
+    matched, owners, mtp_native_backends = [], set(), set()
     for test in document["tests"]:
         executables = {Path(argument).name for argument in test.get("command", [])}
         targets = executables & selected_targets
@@ -61,7 +92,38 @@ def validate_inventory(document: dict, backends: list[str]) -> list[str]:
                            for pattern in exclude.split(":"))
             if selected and not excluded:
                 raise ValueError(f"{test['name']} admits a native GPU graph case into Unit")
-        if executables & DEVICE_FREE_TARGETS:
+        mtp_native = MTP_TARGET in executables and any(
+            selected_by_gtest(test, f"{backend}/MTPNativeGraphConstruction.{case}/0")
+            for backend in ("CUDA", "ROCm") for case in MTP_NATIVE_CASES)
+        if mtp_native:
+            if "Unit" in labels or "DeviceFree" in labels:
+                raise ValueError(f"{test['name']} admits a native GPU graph case into Unit/device-free scope")
+            backend = next((name for name in ("CUDA", "ROCm")
+                            if test["name"] == f"V2_Integration_MTPNativeGraphConstruction_{name}"), None)
+            expected_filter = f"--gtest_filter={backend}/MTPNativeGraphConstruction.*"
+            filters = [arg for arg in test.get("command", []) if arg.startswith("--gtest_filter=")]
+            if (backend is None or filters != [expected_filter] or
+                    not {"GPU", backend, "Integration", "ProductionTestPreflight"} <= labels or
+                    ({"CUDA", "ROCm"} & labels) != {backend}):
+                raise ValueError(f"{test['name']} omits exact native MTP backend ownership")
+            environment = properties.get("ENVIRONMENT", [])
+            expected = {"LLAMINAR_FORCE_CPU_ONLY_STARTUP=0",
+                        f"LLAMINAR_SKIP_CUDA_STARTUP={0 if backend == 'CUDA' else 1}",
+                        f"LLAMINAR_SKIP_ROCM_STARTUP={0 if backend == 'ROCm' else 1}"}
+            actual = [entry for entry in environment if entry.partition("=")[0] in
+                      {item.partition("=")[0] for item in expected}]
+            if set(actual) != expected or len(actual) != len(expected):
+                raise ValueError(f"{test['name']} omits exact native MTP startup scope")
+            _, native_lane = _preflight_execution_lane(test["name"], labels, test["command"],
+                                                        properties.get("RESOURCE_LOCK", []))
+            expected_lane = (PreflightExecutionLane.EXCLUSIVE if "FullDeviceInventory" in labels
+                             else PreflightExecutionLane.CUDA_SOCKET if backend == "CUDA"
+                             else PreflightExecutionLane.ROCM_SOCKET)
+            if native_lane is not expected_lane:
+                raise ValueError(f"{test['name']} omits exact native MTP execution scope")
+            mtp_native_backends.add(backend.lower())
+            matched.append(test["name"])
+        if executables & DEVICE_FREE_TARGETS and not mtp_native:
             owners.update(executables & DEVICE_FREE_TARGETS)
             if not labels & {"Unit", "DeviceFree"}:
                 raise ValueError(f"{test['name']} omits device-free ownership")
@@ -79,6 +141,8 @@ def validate_inventory(document: dict, backends: list[str]) -> list[str]:
         if lane is not PreflightExecutionLane.EXCLUSIVE:
             raise ValueError(f"{test['name']} can overlap an unselected GPU vendor")
         matched.append(test["name"])
+    if owners and not set(backends) <= mtp_native_backends:
+        raise ValueError(f"Missing native MTP backend registrations: {sorted(set(backends) - mtp_native_backends)}")
     required = {target for target in selected_targets if not target.startswith("v2_perf_")} | DEVICE_FREE_TARGETS
     if not required <= owners:
         raise ValueError(f"Missing real fixture registrations: {sorted(required - owners)}")
@@ -105,9 +169,8 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
                 if target.startswith("v2_perf_"):
                     continue
                 with self.subTest(target=target):
-                    document = copy.deepcopy(self.document)
-                    selected = next(test for test in document["tests"] if target in
-                                    {Path(argument).name for argument in test.get("command", [])})
+                    document, selected = copy_inventory_row(self.document, lambda test: target in
+                        {Path(argument).name for argument in test.get("command", [])})
                     for property in selected["properties"]:
                         if property["name"] == "LABELS":
                             property["value"] = [label for label in property["value"]
@@ -120,9 +183,8 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
         for replacement in ([], ["LLAMINAR_FORCE_CPU_ONLY_STARTUP=0"],
                             ["LLAMINAR_FORCE_CPU_ONLY_STARTUP=1", "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0"]):
             with self.subTest(replacement=replacement):
-                document = copy.deepcopy(self.document)
-                selected = next(test for test in document["tests"]
-                                if test["name"] == "V2_Unit_DeviceRegistry")
+                document, selected = copy_inventory_row(self.document,
+                    lambda test: test["name"] == "V2_Unit_DeviceRegistry")
                 for property in selected["properties"]:
                     if property["name"] == "ENVIRONMENT":
                         property["value"] = [entry for entry in property["value"]
@@ -135,10 +197,42 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing real fixture registrations"):
             validate_inventory({"tests": []}, BACKENDS)
 
+    def test_mtp_native_selection_cannot_leak_into_unit(self) -> None:
+        """Every native MTP body stays excluded from the real device-free Unit command."""
+        for case in MTP_NATIVE_CASES:
+            for backend in ("CUDA", "ROCm"):
+                document, unit = copy_inventory_row(self.document,
+                    lambda test: test["name"] == "V2_Unit_MTPGraphConstruction")
+                unit["command"] = [arg for arg in unit["command"] if not arg.startswith("--gtest_filter=")]
+                unit["command"].append(f"--gtest_filter={backend}/MTPNativeGraphConstruction.{case}/0")
+                with self.assertRaisesRegex(ValueError, "native GPU graph case into Unit"):
+                    validate_inventory(document, BACKENDS)
+
+    def test_mtp_native_backend_scope_and_presence_are_required(self) -> None:
+        """A hidden backend, broad filter, CPU guard or missing native cell fails closed."""
+        for backend in BACKENDS:
+            native_name = f"V2_Integration_MTPNativeGraphConstruction_{'CUDA' if backend == 'cuda' else 'ROCm'}"
+            for mutation in ("absent", "labels", "filter", "guard"):
+                with self.subTest(backend=backend, mutation=mutation):
+                    document, native = copy_inventory_row(self.document,
+                        lambda test: test["name"] == native_name)
+                    if mutation == "absent":
+                        document["tests"].remove(native)
+                    elif mutation == "filter":
+                        native["command"] = [arg for arg in native["command"] if not arg.startswith("--gtest_filter=")]
+                    else:
+                        for prop in native["properties"]:
+                            if mutation == "labels" and prop["name"] == "LABELS":
+                                prop["value"] = [label for label in prop["value"] if label not in {"CUDA", "ROCm"}]
+                            if mutation == "guard" and prop["name"] == "ENVIRONMENT":
+                                prop["value"] = [entry for entry in prop["value"] if not entry.startswith("LLAMINAR_FORCE_CPU_ONLY_STARTUP=")] + ["LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"]
+                    with self.assertRaisesRegex(ValueError, "native MTP"):
+                        validate_inventory(document, BACKENDS)
+
     def test_native_graph_case_is_excluded_from_unit_and_retained_in_preflight(self) -> None:
         """A mixed fixture must keep native GPU work in its explicit accelerator lane."""
-        document = copy.deepcopy(self.document)
-        unit = next(test for test in document["tests"] if test["name"] == "V2_Unit_Qwen35MoEGraph")
+        document, unit = copy_inventory_row(self.document,
+            lambda test: test["name"] == "V2_Unit_Qwen35MoEGraph")
         unit["command"] = [argument for argument in unit["command"]
                            if not argument.startswith("--gtest_filter=")]
         with self.assertRaisesRegex(ValueError, "native GPU graph case into Unit"):

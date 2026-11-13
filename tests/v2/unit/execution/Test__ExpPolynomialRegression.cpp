@@ -64,7 +64,7 @@ namespace
 TEST(Test__ExpPolynomialRegression, GatedRMSNorm_SiLU_AVX512Path_UniformGates)
 {
     // Use norm_dim >= 16 to ensure the AVX512 path is exercised.
-    // With gate_silu=true, the gate is passed through SiLU before multiplying.
+    // With gate_activation=SiLU, the gate is passed through SiLU before multiplying.
     // We set input=1 and gamma=1 so the output is purely SiLU(gate).
     const size_t norm_dim = 128; // 8 AVX512 iterations of 16 floats
     const int seq_len = 1;
@@ -89,7 +89,7 @@ TEST(Test__ExpPolynomialRegression, GatedRMSNorm_SiLU_AVX512Path_UniformGates)
     params.eps = 1e-6f;
     params.seq_len = seq_len;
     params.norm_dim = static_cast<int>(norm_dim);
-    params.gate_silu = true;
+    params.gate_activation = GatedNormActivation::SiLU;
 
     auto ctx = makeCPUContext();
     GatedRMSNormStage stage(params);
@@ -158,7 +158,7 @@ TEST(Test__ExpPolynomialRegression, GatedRMSNorm_SiLU_AVX512Path_ExtremeValues)
     params.eps = 1e-6f;
     params.seq_len = 1;
     params.norm_dim = static_cast<int>(norm_dim);
-    params.gate_silu = true;
+    params.gate_activation = GatedNormActivation::SiLU;
 
     auto ctx = makeCPUContext();
     GatedRMSNormStage stage(params);
@@ -202,7 +202,7 @@ TEST(Test__ExpPolynomialRegression, GatedRMSNorm_SiLU_MultiRow)
     params.eps = 1e-6f;
     params.seq_len = seq_len;
     params.norm_dim = static_cast<int>(norm_dim);
-    params.gate_silu = true;
+    params.gate_activation = GatedNormActivation::SiLU;
 
     auto ctx = makeCPUContext();
     GatedRMSNormStage stage(params);
@@ -358,7 +358,7 @@ TEST(Test__ExpPolynomialRegression, GatedRMSNorm_SiLU_CompoundingError)
         params.eps = 1e-6f;
         params.seq_len = 1;
         params.norm_dim = static_cast<int>(norm_dim);
-        params.gate_silu = true;
+        params.gate_activation = GatedNormActivation::SiLU;
 
         GatedRMSNormStage stage(params);
         ASSERT_TRUE(stage.execute(ctx.get()));

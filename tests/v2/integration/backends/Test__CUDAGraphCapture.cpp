@@ -29,6 +29,7 @@
 #include "GPUGraphMemoryContractProof.h"
 #include "NativeTimelineImportProof.h"
 #include "NativeDependencyReductionProof.h"
+#include "NativeCaptureStreamReentryProof.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 
 #include <cuda_runtime.h>
@@ -66,6 +67,14 @@ protected:
         return GPUDeviceContextPool::instance().getNvidiaContext(0);
     }
 };
+
+/** @test A legal non-origin stream reentry survives native membership-cycle retirement. */
+TEST_F(Test__CUDAGraphCapture, StreamMembershipCycleRetiresAcyclicCapture)
+{
+    auto* backend=getCUDABackend();
+    ASSERT_NE(backend,nullptr);
+    ctx().submitAndWait([&]{test::proveNativeCaptureStreamReentry(ctx(),*backend,DeviceId::cuda(0));});
+}
 
 /** @test Complete retained imports coexist with in-place local recording fragments. */
 TEST_F(Test__CUDAGraphCapture, OrderedTimelineImportsRetainedNativeWork)
@@ -819,5 +828,91 @@ TEST_F(Test__CUDAGraphCapture, OwnershipTransferViaMove)
             << "Moved-to unique_ptr should own the executable";
         EXPECT_TRUE(dest->launch());
         EXPECT_STREQ(dest->backendName(), "CUDA");
+    });
+}
+
+/** @test Context resources span two separated fork/joins and repeated native replay. */
+TEST_F(Test__CUDAGraphCapture, ProjectionResourcesRetainWholeNativeCapture)
+{
+    ctx().submitAndWait([&] {
+        struct PersistentBytes
+        {
+            unsigned char *value = nullptr;
+            ~PersistentBytes() { if (value && cudaFree(value) != cudaSuccess) std::terminate(); }
+        } bytes;
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&bytes.value), 64), cudaSuccess);
+        ctx().prepareProjectionResources();
+        void *root = ctx().defaultStream();
+        const auto expected_resources = [&] {
+            auto submission = ctx().acquireProjectionSubmission(root, GPUProjectionSubmissionKind::Eager);
+            return submission.resources();
+        }();
+        auto capture = ctx().createGraphCapture(root);
+        ASSERT_TRUE(capture->beginCapture());
+        for (int stage = 0; stage < 2; ++stage)
+        {
+            auto submission = ctx().acquireProjectionSubmission(
+                root, GPUProjectionSubmissionKind::Eager, true);
+            const auto &resources = submission.resources();
+            ASSERT_EQ(cudaEventRecord(static_cast<cudaEvent_t>(resources.quant_ready),
+                static_cast<cudaStream_t>(root)), cudaSuccess);
+            for (int i = 0; i < resources.count; ++i)
+            {
+                ASSERT_EQ(cudaStreamWaitEvent(static_cast<cudaStream_t>(resources.streams[i]),
+                    static_cast<cudaEvent_t>(resources.quant_ready), 0), cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(bytes.value + stage * 32 + i * 4,
+                    (stage + 1) * 0x11 + i, 4,
+                    static_cast<cudaStream_t>(resources.streams[i])), cudaSuccess);
+                ASSERT_EQ(cudaEventRecord(static_cast<cudaEvent_t>(resources.completion[i]),
+                    static_cast<cudaStream_t>(resources.streams[i])), cudaSuccess);
+                ASSERT_EQ(cudaStreamWaitEvent(static_cast<cudaStream_t>(root),
+                    static_cast<cudaEvent_t>(resources.completion[i]), 0), cudaSuccess);
+            }
+        }
+        // Projection scopes have ended, but shared streams still belong to capture.
+        EXPECT_THROW(ctx().assertProjectionResourcesRetirable(), std::logic_error);
+        EXPECT_THROW(ctx().resetAuxiliaryStreams(), std::logic_error);
+        ASSERT_TRUE(capture->endCapture());
+        ctx().assertProjectionResourcesRetirable();
+        ASSERT_TRUE(capture->instantiate());
+        for (int replay = 0; replay < 4; ++replay)
+        {
+            if (replay == 2)
+            {
+                // A completed graph remains alive: named reset cannot recycle
+                // its context-lifetime projection resource identity.
+                ASSERT_NO_THROW(ctx().resetAuxiliaryStreams());
+                auto submission = ctx().acquireProjectionSubmission(root, GPUProjectionSubmissionKind::Eager);
+                EXPECT_EQ(submission.resources().count, expected_resources.count);
+                EXPECT_EQ(submission.resources().streams, expected_resources.streams);
+                EXPECT_EQ(submission.resources().completion, expected_resources.completion);
+                EXPECT_EQ(submission.resources().quant_ready, expected_resources.quant_ready);
+            }
+            ASSERT_EQ(cudaMemsetAsync(bytes.value, 0xa5, 64,
+                static_cast<cudaStream_t>(root)), cudaSuccess);
+            ASSERT_TRUE(capture->launch());
+            std::array<unsigned char, 64> actual{};
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), bytes.value, actual.size(),
+                cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(root)), cudaSuccess);
+            // One terminal test observation; production submission adds no sync.
+            ASSERT_TRUE(ctx().synchronizeStreamChecked(root));
+            for (int stage = 0; stage < 2; ++stage)
+                for (int slot = 0; slot < 8; ++slot)
+                    for (int byte = 0; byte < 4; ++byte)
+                        EXPECT_EQ(actual[stage * 32 + slot * 4 + byte],
+                            (stage + 1) * 0x11 + slot);
+        }
+        capture.reset();
+        // Explicit standalone capture cannot silently use the worker's shared set.
+        CUDAGraphCapture standalone(static_cast<cudaStream_t>(root), 0);
+        ASSERT_TRUE(standalone.beginCapture());
+        EXPECT_THROW(ctx().acquireProjectionSubmission(
+            root, GPUProjectionSubmissionKind::Eager, true), std::logic_error);
+        standalone.reset();
+        ctx().assertProjectionResourcesRetirable();
+        auto aborted = ctx().createGraphCapture(root);
+        ASSERT_TRUE(aborted->beginCapture());
+        aborted->reset();
+        ctx().assertProjectionResourcesRetirable();
     });
 }

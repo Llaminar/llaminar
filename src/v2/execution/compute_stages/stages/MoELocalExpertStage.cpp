@@ -14,9 +14,15 @@
  * builder has established a non-concurrent execution contract.
  * Host route publication partitions independent rows across the socket's team;
  * its joined count publication never changes the canonical numerical fold.
+ * CPU serial roots consume the same typed declarations as admission; the
+ * AlignedVector backing retains PMA claims through every tensor view lifetime.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #include "MoELocalExpertStage.h"
+#include "../../moe/CanonicalMoERouteRecord.h"
+#include "../../moe/CPUExpertShardSourceSelection.h"
 
 #include "MoEExpertComputeStage.h"
 #include "execution/moe/MoEOverlayHostRowWork.h"
@@ -639,7 +645,7 @@ namespace llaminar2
 
     MoELocalExpertSerialBufferArena::MoELocalExpertSerialBufferArena(
         Config config)
-        : device_id_(config.device_id),
+        : physical_memory_authority_(config.physical_memory_authority), device_id_(config.device_id),
           row_capacity_(config.row_capacity),
           d_model_(config.d_model),
           routing_top_k_(config.routing_top_k),
@@ -703,6 +709,24 @@ namespace llaminar2
 
         const size_t d_model = static_cast<size_t>(d_model_);
         const size_t routing_top_k = static_cast<size_t>(routing_top_k_);
+        if(device_id_.is_cpu())
+        {
+            if(!config.cpu_storage_layout || !config.physical_memory_authority)
+                throw std::invalid_argument("CPU serial arena requires its frozen layout and existing PMA");
+            const auto &layout=*config.cpu_storage_layout;
+            cpu_storage_layout_=config.cpu_storage_layout;
+            std::vector<size_t> declared_rows;
+            for(const auto &family:layout.families()) declared_rows.push_back(family.rows);
+            if(layout.allocator()!=device_id_ || layout.maximumRows()!=row_capacity_ ||
+                layout.hiddenWidth()!=d_model_ || layout.routeWidth()!=routing_top_k_ ||
+                declared_rows!=config.row_capacity_buckets || bool(layout.canonical())!=
+                    (config.cpu_canonical_route_storage==CPUCanonicalRouteStoragePolicy::RetainSerialMaximum))
+                throw std::invalid_argument("CPU serial arena construction disagrees with its admitted root declarations");
+            if(bool(layout.grouped())!=(config.cpu_grouped_scratch_storage==CPUGroupedScratchStoragePolicy::RetainSerialMaximum) ||
+                bool(layout.mappedCanonical())!=bool(config.cpu_canonical_route_gpu_consumer) ||
+                (layout.mappedCanonical() && layout.mappedCanonical()->consumer()!=*config.cpu_canonical_route_gpu_consumer))
+                throw std::invalid_argument("CPU serial arena workspace/publication policy differs from its root declarations");
+        }
         families_.reserve(config.row_capacity_buckets.size());
         for (const size_t capacity : config.row_capacity_buckets)
         {
@@ -725,12 +749,14 @@ namespace llaminar2
                 checkedAdd(hidden_bytes, routing_bytes, "compact input bytes"),
                 checkedAdd(routing_bytes, hidden_bytes, "compact output bytes"),
                 "compact family bytes");
+            const auto owned_family_bytes=device_id_.is_cpu()
+                ? config.cpu_storage_layout->families().at(families_.size()).physicalBytes():family_bytes;
             allocation_bytes_ = checkedAdd(
-                allocation_bytes_, family_bytes, "compact arena bytes");
+                allocation_bytes_, owned_family_bytes, "compact arena bytes");
 
             TensorFamily family;
             family.row_capacity = capacity;
-            family.allocation_bytes = family_bytes;
+            family.allocation_bytes = owned_family_bytes;
             if (device_id_.is_gpu())
             {
                 /*
@@ -760,14 +786,26 @@ namespace llaminar2
                         family_bytes,
                         device_id_);
             }
-            family.hidden = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, d_model});
-            family.routing_indices = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, routing_top_k});
-            family.routing_weights = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, routing_top_k});
-            family.output = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, d_model});
+            if(device_id_.is_cpu())
+            {
+                const auto &roots=config.cpu_storage_layout->families().at(families_.size());
+                const auto adopt=[&](const CPUStorageRoot<float>& root,size_t columns)
+                {
+                    return std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,columns},
+                        root.allocate(config.physical_memory_authority),device_id_);
+                };
+                family.hidden=adopt(roots.hidden,d_model);
+                family.routing_indices=adopt(roots.indices,routing_top_k);
+                family.routing_weights=adopt(roots.weights,routing_top_k);
+                family.output=adopt(roots.output,d_model);
+            }
+            else
+            {
+                family.hidden = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,d_model});
+                family.routing_indices = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,routing_top_k});
+                family.routing_weights = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,routing_top_k});
+                family.output = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,d_model});
+            }
 
             const std::string family_prefix =
                 prefix + ".rows" + std::to_string(capacity);
@@ -809,14 +847,14 @@ namespace llaminar2
              * pass or changing floating-point order.
              */
             cpu_canonical_routes_ = std::make_shared<FP32Tensor>(
-                canonical_shape);
+                std::vector<size_t>{route_rows,d_model},
+                config.cpu_storage_layout->canonical()->allocate(config.physical_memory_authority),device_id_);
+
             if (config.cpu_canonical_route_gpu_consumer)
             {
-                const std::array<DeviceId, 1> endpoints{
-                    *config.cpu_canonical_route_gpu_consumer};
                 mapped_cpu_canonical_routes_ =
                     TransferEngine::instance().allocateMappedHostRegion(
-                        canonical_route_bytes, endpoints);
+                        *config.cpu_storage_layout->mappedCanonical(),config.physical_memory_authority);
                 if (!mapped_cpu_canonical_routes_ ||
                     !mapped_cpu_canonical_routes_->isBound() ||
                     !mapped_cpu_canonical_routes_->hasDevice(
@@ -835,13 +873,13 @@ namespace llaminar2
                 prefix + ".cpu_canonical_route_rows");
             allocation_bytes_ = checkedAdd(
                 allocation_bytes_,
-                canonical_route_bytes,
+                config.cpu_storage_layout->canonical()->physicalBytes(),
                 "canonical route arena bytes");
             if (mapped_canonical_route_bytes > 0u)
             {
                 allocation_bytes_ = checkedAdd(
                     allocation_bytes_,
-                    mapped_canonical_route_bytes,
+                    config.cpu_storage_layout->mappedCanonical()->physicalBytes(),
                     "mapped canonical route publication bytes");
                 pinned_transfer_bytes_ = checkedAdd(
                     pinned_transfer_bytes_,
@@ -850,6 +888,17 @@ namespace llaminar2
             }
         }
 
+        if(config.cpu_storage_layout && config.cpu_storage_layout->jointRoutes()) {
+            const auto &joint=*config.cpu_storage_layout->jointRoutes();
+            if(!logical_participant_id_ || joint.cohort()->participants()[joint.member()].participant_id!=*logical_participant_id_)
+                throw std::invalid_argument("CPU joint serial arena changed original logical member");
+            cpu_joint_packed_=std::make_shared<FP32Tensor>(std::vector<size_t>{joint.packed().capacity()},
+                joint.packed().allocate(config.physical_memory_authority),device_id_);
+            if(joint.ranges())cpu_joint_ranges_=joint.ranges()->allocate(config.physical_memory_authority);
+            if(joint.maps())cpu_joint_maps_=joint.maps()->allocate(config.physical_memory_authority);
+            if(joint.required())cpu_joint_required_=joint.required()->allocate(config.physical_memory_authority);
+            allocation_bytes_=checkedAdd(allocation_bytes_,joint.physicalBytes(),"original CPU joint route roots");
+        }
         size_t cpu_grouped_scratch_bytes = 0u;
         if (config.cpu_grouped_scratch_storage ==
             CPUGroupedScratchStoragePolicy::RetainSerialMaximum)
@@ -863,6 +912,10 @@ namespace llaminar2
                         .num_experts = config.num_experts,
                         .routing_top_k = routing_top_k_,
                         .debug_name = prefix + ".cpu_grouped_scratch",
+                        .device_id = device_id_,
+                        .physical_memory_authority = config.physical_memory_authority,
+                        .declared_storage = std::shared_ptr<const CPUGroupedMoESerialWorkspace::StorageLayout>(
+                            config.cpu_storage_layout,&*config.cpu_storage_layout->grouped()),
                     });
             cpu_grouped_scratch_bytes =
                 cpu_grouped_workspace_->allocationBytes();
@@ -980,6 +1033,39 @@ namespace llaminar2
                 .workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads(),
                 .execution = CPUExecutionGeometry::local()};
         }
+        if(params_.device_id.is_cpu() && params_.serial_compact_buffer_arena && params_.physical_memory_authority &&
+            params_.physical_memory_authority!=params_.serial_compact_buffer_arena->physicalMemoryAuthority())
+            throw std::invalid_argument("CPU serial packet and stage dependency name different physical authorities");
+        if(params_.cpu_joint_layer) {
+            const auto nonempty=[](const auto& engines){return std::any_of(engines.begin(),engines.end(),[](auto* e){return e!=nullptr;});};
+            const auto& publication=*params_.cpu_joint_layer;
+            const auto family=publication.family();
+            const auto* layout=params_.serial_compact_buffer_arena?params_.serial_compact_buffer_arena->cpuJointLayout():nullptr;
+            if(publication.bankLease())
+                throw std::invalid_argument("CPU joint graph setup retained an execution bank");
+            if(!family || !family->cohort())
+                throw std::invalid_argument("CPU joint graph setup has no original source family");
+            if(!layout)
+                throw std::invalid_argument("CPU joint graph setup has no admitted serial route layout");
+            if(family->participantIndex()!=layout->member())
+                throw std::invalid_argument("CPU joint graph setup changed its original serial member coordinate");
+            // The serial arena is checked across every retained layer and owns
+            // only shared physical roots. Its representative cohort is NOT the
+            // per-layer source authority; formats/layer lifetimes may differ.
+            // Exact original endpoints and all projection cuts must still match.
+            const auto source_members=family->cohort()->participants();
+            const auto arena_members=layout->cohort()->participants();
+            if(source_members.size()!=arena_members.size() ||
+               !std::equal(source_members.begin(),source_members.end(),arena_members.begin()))
+                throw std::invalid_argument("CPU joint graph setup changed original ordered serial participants");
+            for(size_t member=0;member<source_members.size();++member)
+                if(family->cohort()->ownership(member)!=layout->cohort()->ownership(member))
+                    throw std::invalid_argument("CPU joint graph setup changed original serial projection geometry");
+            if(!params_.cpu_workspace_source || params_.gate_exps || params_.up_exps || params_.down_exps ||
+               nonempty(params_.prepared_gate_gemm) || nonempty(params_.prepared_up_gemm) || nonempty(params_.prepared_down_gemm) ||
+               std::any_of(params_.expert_mask.begin(),params_.expert_mask.end(),[](bool active){return active;}))
+                throw std::invalid_argument("CPU joint graph setup requires source workspace metadata and no epoch engine pointers");
+        }
         if (!params_.input_rows && params_.input_rows_lifetime)
             params_.input_rows = params_.input_rows_lifetime.get();
         if (!params_.output_rows && params_.output_rows_lifetime)
@@ -1009,6 +1095,33 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "MoELocalExpertStage graph entry capacity exceeds its fixed packet view");
+            }
+            if (params_.cpu_joint_route_producer) {
+                const auto &binding=*params_.cpu_joint_route_producer;
+                if(!params_.device_id.is_cpu() || !params_.serial_compact_buffer_arena ||
+                   params_.expert_weight_resolution_policy!=ExpertWeightResolutionPolicy::RegistryOnly ||
+                   !params_.cpu_joint_layer || !params_.cpu_joint_layer->sourceSelection() ||
+                   !binding.valid() || !params_.serial_compact_buffer_arena->cpuJointLayout() ||
+                   params_.serial_compact_buffer_arena->cpuJointPackedRecords()!=binding.packed_rows ||
+                   params_.serial_compact_buffer_arena->cpuJointLayout()->cohort()->participants()[
+                       params_.serial_compact_buffer_arena->cpuJointLayout()->member()].participant_id!=params_.runtime_participant_index ||
+                   params_.cpu_canonical_route_return || params_.cpu_canonical_route_ticket_return ||
+                   params_.return_layout!=MoEOverlayReturnLayout::ParticipantTokenPartials ||
+                   canonical_moe_route_record::recordCapacity(binding.packed_rows->numel(),params_.d_model)<entry_capacity ||
+                   binding.route_slot_capacity<entry_capacity ||
+                   params_.overlay_participant_residency || params_.cpu_current_batch_llep_state)
+                    throw std::invalid_argument("CPU joint producer requires its original static fragment publication and one packed graph root");
+                if(binding.deferred_canonical_ticket) {
+                    const auto& ticket=*binding.deferred_canonical_ticket;
+                    if(!ticket.hasValidConstructionIdentity() || ticket.layerIndex()!=params_.layer_idx ||
+                       ticket.dModel()!=params_.d_model || ticket.routeCapacity()<entry_capacity)
+                        throw std::invalid_argument("CPU joint producer changed its deferred canonical ticket identity");
+                    // This is only the immutable scheduling/region borrow. The
+                    // explicit rooted collective owns the mutable publication.
+                    (void)params_.serial_compact_buffer_arena->mappedCPUCanonicalRoutes(ticket.continuationDevice());
+                }
+            } else if(params_.cpu_joint_layer) {
+                throw std::invalid_argument("CPU joint fragment cannot publish an ordinary weighted/whole-expert return");
             }
             if (params_.cpu_canonical_route_return &&
                 params_.cpu_canonical_route_ticket_return)
@@ -1046,7 +1159,7 @@ namespace llaminar2
                     *params_.cpu_canonical_route_ticket_return;
                 std::shared_ptr<MappedHostTransferRegion>
                     mapped_publication;
-                if (binding.valid() &&
+                if (binding.storage && binding.storage->hasValidConstructionIdentity() &&
                     params_.serial_compact_buffer_arena)
                 {
                     mapped_publication =
@@ -1054,7 +1167,8 @@ namespace llaminar2
                             ->mappedCPUCanonicalRoutes(
                                 binding.storage->continuationDevice());
                 }
-                if (!params_.device_id.is_cpu() || !binding.valid() ||
+                if (!params_.device_id.is_cpu() || !binding.storage ||
+                    !binding.storage->hasValidConstructionIdentity() ||
                     binding.storage->routeCapacity() < entry_capacity ||
                     binding.storage->dModel() != params_.d_model ||
                     binding.storage->layerIndex() != params_.layer_idx ||
@@ -1071,6 +1185,14 @@ namespace llaminar2
                     throw std::invalid_argument(
                         "MoELocalExpertStage canonical ticket return requires CPU execution, matching immutable route geometry, and distinct cached-compute/mapped-publication banks");
                 }
+            }
+            if(params_.device_id.is_cpu() && !params_.serial_compact_buffer_arena)
+            {
+                if(!params_.physical_memory_authority ||
+                    !params_.physical_memory_authority->contains(params_.device_id))
+                    throw std::invalid_argument("CPU per-layer packet requires its exact admitted allocator authority");
+                cpu_compact_packet_layout_=std::make_shared<const CPUCompactPacketStorageLayout>(
+                    CPUCompactPacketStorageLayout::declare(row_capacity,params_.d_model,params_.top_k,params_.device_id));
             }
             if (!ensureCompactCapacity(row_capacity, params_.top_k))
             {
@@ -1104,6 +1226,15 @@ namespace llaminar2
             invocation_up_engines_.resize(expert_count, nullptr);
             invocation_down_engines_.resize(expert_count, nullptr);
             invocation_expert_mask_.resize(expert_count, false);
+            if (params_.cpu_joint_layer)
+            {
+                // The immutable source declares workspace only. Every engine
+                // arrives later with its exact packet-epoch reader.
+                invocation_gate_engines_ = params_.prepared_gate_gemm;
+                invocation_up_engines_ = params_.prepared_up_gemm;
+                invocation_down_engines_ = params_.prepared_down_gemm;
+                invocation_expert_mask_ = params_.expert_mask;
+            }
         }
 
         if (params_.device_id.is_cpu() && params_.input_rows &&
@@ -1260,6 +1391,7 @@ namespace llaminar2
         compute_params.down_exps = registry_only ? nullptr : params_.down_exps;
         compute_params.expert_intermediate = params_.expert_intermediate;
         compute_params.layer_idx = params_.layer_idx;
+        compute_params.cpu_joint_layer=params_.cpu_joint_layer;
         compute_params.expert_mask = invocation_expert_mask_;
         compute_params.routing_indices = compact_routing_indices_.get();
         compute_params.routing_weights = compact_routing_weights_.get();
@@ -1276,9 +1408,9 @@ namespace llaminar2
             compute_params.canonical_route_arithmetic =
                 MoECanonicalRouteArithmeticPolicy::
                     UnweightedExpertRowThenOrderedFMA;
-            compute_params.canonical_route_layout =
-                MoECanonicalRoutePublicationLayout::
-                    DenseOriginalRouteSlots;
+            compute_params.canonical_route_layout = params_.cpu_joint_route_producer
+                ?MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows
+                :MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots;
         }
         compute_params.output_registered_in_arena = false;
         compute_params.cpu_router_q8_input_publication =
@@ -1307,6 +1439,7 @@ namespace llaminar2
         compute_params.prepared_up_gemm = invocation_up_engines_;
         compute_params.prepared_down_gemm = invocation_down_engines_;
         compute_params.prepared_store = params_.prepared_store;
+        compute_params.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
         compute_params.expert_registry = params_.expert_registry;
         compute_params.moe_runtime_table =
             params_.overlay_participant_residency
@@ -1466,6 +1599,7 @@ namespace llaminar2
             compute_params.prepared_up_gemm = invocation_up_engines_;
             compute_params.prepared_down_gemm = invocation_down_engines_;
             compute_params.prepared_store = params_.prepared_store;
+        compute_params.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
             compute_params.expert_registry = params_.expert_registry;
             compute_params.overlay_service_telemetry =
                 params_.overlay_service_telemetry;
@@ -1637,6 +1771,9 @@ namespace llaminar2
 
     void MoELocalExpertStage::resetDeferredInvocation() noexcept
     {
+        last_post_service_ns_ = 0u;
+        if (retained_cpu_compute_stage_)
+            retained_cpu_compute_stage_->clearCompletedCPUActiveExpertView();
         deferred_residency_bank_.reset();
         pending_deferred_replay_ = nullptr;
         deferred_lifecycle_ = DeferredLifecycle::Idle;
@@ -1652,7 +1789,8 @@ namespace llaminar2
     ExpertPackedWeights
     MoELocalExpertStage::cloneCPUCurrentBatchLLEPPreparedExpert(
         int expert_id,
-        uint64_t durable_parent_epoch) const
+        uint64_t durable_parent_epoch,
+        CPUWeightStoragePlacement destination) const
     {
         if (!params_.device_id.is_cpu() ||
             !params_.overlay_participant_residency ||
@@ -1684,9 +1822,9 @@ namespace llaminar2
 
         const auto &engines = layer.experts[expert_index];
         ExpertPackedWeights packed;
-        packed.gate = engines.gate()->cloneWeights();
-        packed.up = engines.up()->cloneWeights();
-        packed.down = engines.down()->cloneWeights();
+        packed.gate = engines.gate()->cloneWeightsTo(destination);
+        packed.up = engines.up()->cloneWeightsTo(destination);
+        packed.down = engines.down()->cloneWeightsTo(destination);
         if (!packed.complete())
         {
             throw std::runtime_error(
@@ -1968,6 +2106,9 @@ namespace llaminar2
             return false;
         }
 
+        if (params.device_id.is_cpu() &&
+            (!params.prepared_store || !params.prepared_store->physicalMemoryAuthority()))
+            throw std::logic_error("CPU local expert preparation requires physical-memory admission");
         MoEWeightContext context{
             params.device_id,
             params.num_experts,
@@ -1998,7 +2139,9 @@ namespace llaminar2
             params.down_slab_ref,
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params.device_id),
+            MoEExpertWeightResolutionPolicy::RawOrPrepared,
+            PhysicalMemoryOwner::RoutedExpertWeights};
 
         if (!MoEExpertWeightService::extractExpertViews(context))
             return false;
@@ -2127,15 +2270,15 @@ namespace llaminar2
 
             DeviceMoEExpertDescriptor desc;
             if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)]
-                     ->exportNativeVNNIMatrixDesc(desc.gate) ||
+                     ->exportNativeQuantisedMatrixDesc(desc.gate) ||
                 !params_.prepared_up_gemm[static_cast<size_t>(expert_id)]
-                     ->exportNativeVNNIMatrixDesc(desc.up) ||
+                     ->exportNativeQuantisedMatrixDesc(desc.up) ||
                 !params_.prepared_down_gemm[static_cast<size_t>(expert_id)]
-                     ->exportNativeVNNIMatrixDesc(desc.down))
+                     ->exportNativeQuantisedMatrixDesc(desc.down))
             {
                 LOG_ERROR("[MoELocalExpertStage] Cannot publish MoE runtime placement bank for layer "
                           << params_.layer_idx << " expert " << expert_id
-                          << ": prepared GEMM engines did not export native-VNNI descriptors");
+                          << ": prepared GEMM engines did not export native-quantised descriptors");
                 return false;
             }
 
@@ -2302,7 +2445,9 @@ namespace llaminar2
             params_.down_slab_ref,
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params_.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params_.device_id),
+            MoEExpertWeightResolutionPolicy::RawOrPrepared,
+            PhysicalMemoryOwner::RoutedExpertWeights};
     }
 
     void MoELocalExpertStage::bindPreparedExpertEnginesForExperts(
@@ -2499,16 +2644,42 @@ namespace llaminar2
             compact_routing_indices_ = family->routing_indices;
             compact_routing_weights_ = family->routing_weights;
             compact_output_ = family->output;
-            compact_canonical_routes_ =
-                preservesCanonicalRouteRows()
-                    ? arena.cpuCanonicalRoutes()
-                    : nullptr;
+            compact_canonical_routes_ = params_.cpu_joint_route_producer
+                ?params_.cpu_joint_route_producer->packed_rows:
+                (preservesCanonicalRouteRows()?arena.cpuCanonicalRoutes():nullptr);
             compact_capacity_ = family->row_capacity;
             compact_routing_top_k_ = arena.routingTopK();
             return compact_hidden_ && compact_routing_indices_ &&
                    compact_routing_weights_ && compact_output_ &&
                    (!preservesCanonicalRouteRows() ||
                     compact_canonical_routes_);
+        }
+
+        if(params_.device_id.is_cpu())
+        {
+            if(!cpu_compact_packet_layout_ || capacity>cpu_compact_packet_layout_->rows ||
+                routing_top_k!=params_.top_k)
+                throw std::logic_error("CPU per-layer packet request exceeds its immutable setup declaration");
+            const auto &layout=*cpu_compact_packet_layout_;
+            if(compact_capacity_)
+            {
+                if(!compact_hidden_ || !compact_routing_indices_ || !compact_routing_weights_ || !compact_output_ ||
+                    compact_capacity_!=layout.rows || compact_routing_top_k_!=params_.top_k)
+                    throw std::logic_error("CPU per-layer packet lost its immutable storage backing");
+                return true;
+            }
+            const auto adopt=[&](const CPUStorageRoot<float>& root,size_t columns) {
+                return std::make_shared<FP32Tensor>(std::vector<size_t>{layout.rows,columns},
+                    root.allocate(params_.physical_memory_authority),params_.device_id);
+            };
+            compact_hidden_=adopt(layout.hidden,static_cast<size_t>(params_.d_model));
+            compact_routing_indices_=adopt(layout.indices,static_cast<size_t>(params_.top_k));
+            compact_routing_weights_=adopt(layout.weights,static_cast<size_t>(params_.top_k));
+            compact_output_=adopt(layout.output,static_cast<size_t>(params_.d_model));
+            compact_canonical_routes_.reset();
+            compact_capacity_=layout.rows;
+            compact_routing_top_k_=params_.top_k;
+            return true;
         }
 
         if (compact_capacity_ >= capacity &&
@@ -2552,6 +2723,9 @@ namespace llaminar2
     bool MoELocalExpertStage::executePacketOnCurrentThread(
         IDeviceContext *ctx)
     {
+        last_post_service_ns_ = 0u;
+        if (retained_cpu_compute_stage_)
+            retained_cpu_compute_stage_->clearCompletedCPUActiveExpertView();
         if (!validateDeviceContext(ctx, params_.device_id, "MoELocalExpertStage"))
             return false;
         if (deferred_lifecycle_ != DeferredLifecycle::Idle)
@@ -2610,7 +2784,21 @@ namespace llaminar2
         output.source_participant = input.target_participant;
         output.target_participant = input.source_participant;
         output.live_row_count = 0;
-        output.layout = params_.return_layout;
+        // A joint producer writes only its packed records. The rooted
+        // successor still owns the declared canonical return layout.
+        if (!params_.cpu_joint_route_producer)
+            output.layout = params_.return_layout;
+        std::optional<MoEOverlayParticipantResidencyRegistry::CPUJointLayer> execution_joint_layer;
+        if(params_.cpu_joint_route_producer) {
+            const auto &publication=*params_.cpu_joint_layer;
+            execution_joint_layer=publication.acquireEpoch(input.residency_epoch);
+            if(!execution_joint_layer || publication.participantId()!=params_.runtime_participant_index ||
+               publication.layer()!=params_.layer_idx || !publication.sourceSelection() ||
+               !canonical_moe_route_record::writeRecordCount(params_.cpu_joint_route_producer->packed_rows->mutable_data(),
+                   params_.cpu_joint_route_producer->packed_rows->numel(),0)) {
+                LOG_ERROR("CPU joint producer received a foreign/retired original fragment packet");return false;
+            }
+        }
 
         const bool economy_timing_enabled =
             params_.overlay_participant_residency &&
@@ -2627,6 +2815,10 @@ namespace llaminar2
 
         MoEOverlayParticipantBankLease execution_residency_bank;
         const MoEOverlayParticipantLayerBank *execution_layer_bank = nullptr;
+        if(execution_joint_layer) {
+            execution_residency_bank=execution_joint_layer->bankLease();
+            execution_layer_bank=&execution_residency_bank->layerForModelLayer(params_.layer_idx);
+        }
         const auto *cpu_llep_state =
             params_.cpu_current_batch_llep_state.get();
         const bool cpu_llep_transaction = cpu_llep_state != nullptr;
@@ -2666,9 +2858,10 @@ namespace llaminar2
                     params_.overlay_participant_residency->device() ||
                 params_.num_experts !=
                     params_.overlay_participant_residency->numExperts() ||
-                params_.layer_idx < 0 ||
-                params_.layer_idx >=
-                    params_.overlay_participant_residency->numLayers())
+                // Sparse packet/stage layers are model-global, whereas the
+                // endpoint retains only its compact owned PP interval.
+                params_.layer_idx < params_.overlay_participant_residency->firstModelLayer() ||
+                params_.layer_idx >= params_.overlay_participant_residency->endModelLayer())
             {
                 LOG_ERROR("[MoELocalExpertStage] Participant residency identity or geometry does not match the local stage");
                 return false;
@@ -3245,14 +3438,17 @@ namespace llaminar2
                             return false;
                         }
                     }
-                    const auto &engines =
-                        execution_layer_bank->experts[expert_index];
-                    invocation_gate_engines_[expert_index] =
-                        transient ? transient->gate.get() : engines.gate().get();
-                    invocation_up_engines_[expert_index] =
-                        transient ? transient->up.get() : engines.up().get();
-                    invocation_down_engines_[expert_index] =
-                        transient ? transient->down.get() : engines.down().get();
+                    if(execution_layer_bank->cpu_fragment_family) {
+                        const auto& fragment=execution_layer_bank->cpu_fragments[expert_index];
+                        invocation_gate_engines_[expert_index]=fragment.gate().get();
+                        invocation_up_engines_[expert_index]=fragment.up().get();
+                        invocation_down_engines_[expert_index]=fragment.down().get();
+                    } else {
+                        const auto& engines=execution_layer_bank->experts[expert_index];
+                        invocation_gate_engines_[expert_index]=transient?transient->gate.get():engines.gate().get();
+                        invocation_up_engines_[expert_index]=transient?transient->up.get():engines.up().get();
+                        invocation_down_engines_[expert_index]=transient?transient->down.get():engines.down().get();
+                    }
                 }
             }
             else
@@ -3361,6 +3557,7 @@ namespace llaminar2
                             .compact_to_source_row =
                                 compact_hidden_source_rows_,
                         },
+                        .cpu_joint_epoch=execution_joint_layer?&*execution_joint_layer:nullptr,
                     }))
             {
                 LOG_ERROR(
@@ -3415,9 +3612,9 @@ namespace llaminar2
                 compute_params.canonical_route_arithmetic =
                     MoECanonicalRouteArithmeticPolicy::
                         UnweightedExpertRowThenOrderedFMA;
-                compute_params.canonical_route_layout =
-                    MoECanonicalRoutePublicationLayout::
-                        DenseOriginalRouteSlots;
+                compute_params.canonical_route_layout = params_.cpu_joint_route_producer
+                    ?MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows
+                    :MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots;
             }
             compute_params.output_registered_in_arena = false;
             compute_params.cpu_router_q8_input_publication =
@@ -3428,6 +3625,7 @@ namespace llaminar2
             compute_params.prepared_up_gemm = invocation_up_engines_;
             compute_params.prepared_down_gemm = invocation_down_engines_;
             compute_params.prepared_store = params_.prepared_store;
+        compute_params.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
             compute_params.expert_registry = params_.expert_registry;
             compute_params.moe_runtime_table = execution_layer_bank
                                                    ? nullptr
@@ -3629,6 +3827,7 @@ namespace llaminar2
             return false;
         }
         const auto &input = *params_.input_rows;
+
         if (deferred_lifecycle_ == DeferredLifecycle::ReadyNoWork)
         {
             resetDeferredInvocation();
@@ -3676,7 +3875,7 @@ namespace llaminar2
 
         const bool publishes_canonical_routes =
             params_.cpu_canonical_route_return.has_value() ||
-            params_.cpu_canonical_route_ticket_return.has_value();
+            params_.cpu_canonical_route_ticket_return.has_value() || params_.cpu_joint_route_producer.has_value();
         const bool canonical_packet = params_.return_layout ==
             MoEOverlayReturnLayout::CanonicalExpertRoutes;
         const float *compact_result = nullptr;
@@ -3735,6 +3934,16 @@ namespace llaminar2
                 "[MoELocalExpertStage] Host-visible compact output is null after publication");
             return fail_completed_packet();
         }
+        // Validate only after the SAME output/native fence above has closed.
+        // Even a corrupt packet cannot release its bank while GPU work borrows
+        // those engines; no changed certificate may relabel completed output.
+        if(deferred_residency_bank_ && deferred_residency_bank_->epoch!=input.residency_epoch){
+            LOG_ERROR("[MoELocalExpertStage] Completion packet changed its exact retained residency bank"
+                << " layer="<<params_.layer_idx<<" participant="<<params_.runtime_participant_index
+                << " retained_epoch="<<deferred_residency_bank_->epoch<<" packet_epoch="<<input.residency_epoch);
+            return fail_completed_packet();
+        }
+
         const auto output_materialized_at = endpoint_detail_enabled
                                                 ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
@@ -3770,7 +3979,35 @@ namespace llaminar2
             }
         }
 
-        if (canonical_packet)
+        if (params_.cpu_joint_route_producer) {
+            const auto &binding=*params_.cpu_joint_route_producer;
+            float *const records=binding.packed_rows->mutable_data();
+            const size_t count=canonical_moe_route_record::readRecordCount(records,binding.packed_rows->numel());
+            bool exact=count==input.live_entry_count && count==active_routes_.size();
+            int32_t prior=-1;
+            for(size_t entry=0;exact && entry<count;++entry) {
+                const auto compact=binding.compact_route_slots[entry],original=binding.original_route_slots[entry];
+                if(compact<0 || original<=prior || static_cast<size_t>(original)>=binding.route_slot_capacity) {exact=false;break;}
+                const size_t row=static_cast<size_t>(compact/params_.top_k),route=static_cast<size_t>(compact%params_.top_k);
+                const size_t source_slot=row*static_cast<size_t>(compact_execution_top_k_)+route;
+                const auto *record=canonical_moe_route_record::record(records,entry,params_.d_model);
+                if(route>=static_cast<size_t>(compact_execution_top_k_) ||
+                   canonical_moe_route_record::readFlatRouteSlot(record,params_.d_model)!=source_slot) {exact=false;break;}
+                if(validate_finite_values)for(int column=0;column<params_.d_model;++column)
+                    if(!std::isfinite(record[column])){exact=false;break;}
+                prior=original;
+            }
+            if(!exact) {
+                LOG_ERROR("CPU joint packed producer lost its exact original route-slot prefix");return fail_completed_packet();
+            }
+            // Native values stay in their original packed bank. Only immutable
+            // compact-slot metadata is translated to the source router's slot.
+            for(size_t entry=0;entry<count;++entry)
+                canonical_moe_route_record::writeFlatRouteSlot(
+                    canonical_moe_route_record::record(records,entry,params_.d_model),params_.d_model,
+                    static_cast<size_t>(binding.original_route_slots[entry]));
+        }
+        else if (canonical_packet)
         {
             // Route filtering may remove earlier CSR entries. The retained
             // input index, not the compact ordinal, names the original slot.
@@ -3886,100 +4123,14 @@ namespace llaminar2
                     return fail_completed_packet();
                 }
 
-                auto *const original_slots =
-                    ticket.originalRouteSlotsHost();
-                auto *const compact_slots =
-                    ticket.compactRouteSlotsHost();
-                float *const contribution_rows =
-                    ticket.contributionRowsHost();
-                const float *const computed_rows = compact_result;
-                const size_t d_model =
-                    static_cast<size_t>(params_.d_model);
-                const auto publish_entry = [&](size_t entry)
-                {
-                    const auto &active_route = active_routes_[entry];
-                    const size_t source_slot =
-                        active_route.compact_row *
-                            static_cast<size_t>(compact_execution_top_k_) +
-                        active_route.route_offset;
-                    original_slots[entry] =
-                        input.original_route_slots_host[entry];
-                    compact_slots[entry] =
-                        static_cast<std::int32_t>(source_slot);
-                    const float *const source_row =
-                        computed_rows + source_slot * d_model;
-                    float *const published_row =
-                        contribution_rows + source_slot * d_model;
-                    const float weight = input.route_weights_host[entry];
-                    for (size_t col = 0; col < d_model; ++col)
-                        published_row[col] = source_row[col] * weight;
-                };
-
-                /*
-                 * Every compact source slot is unique, so publication can use
-                 * the socket's physical cores without changing arithmetic.
-                 * Decode stays serial to avoid paying an OpenMP fork for a
-                 * handful of route rows.
-                 */
-                constexpr size_t kParallelCanonicalPublicationEntries = 8u;
                 if (endpoint_detail_enabled)
-                    canonical_publication_started =
-                        std::chrono::steady_clock::now();
-                if (!omp_in_parallel() &&
-                    input.live_entry_count >=
-                        kParallelCanonicalPublicationEntries)
-                {
-#pragma omp parallel for schedule(static)
-                    for (std::int64_t entry = 0;
-                         entry < static_cast<std::int64_t>(
-                                     input.live_entry_count);
-                         ++entry)
-                    {
-                        publish_entry(static_cast<size_t>(entry));
-                    }
-                }
-                else
-                {
-                    for (size_t entry = 0;
-                         entry < input.live_entry_count;
-                         ++entry)
-                    {
-                        publish_entry(entry);
-                    }
-                }
+                    canonical_publication_started = std::chrono::steady_clock::now();
+                const bool published = publishMoEOverlayCanonicalRouteRows(ticket,*canonical_route_publication,
+                    input,{compact_result,compact_canonical_routes_->numel()},
+                    MoEOverlayCanonicalRouteSourceLayout::compactExecutionRows(compact_execution_top_k_));
                 if (endpoint_detail_enabled)
-                    canonical_publication_completed =
-                        std::chrono::steady_clock::now();
-
-                if (validate_finite_values)
-                {
-                    for (size_t entry = 0;
-                         entry < input.live_entry_count;
-                         ++entry)
-                    {
-                        const size_t source_slot = static_cast<size_t>(
-                            compact_slots[entry]);
-                        const float *const row =
-                            contribution_rows + source_slot * d_model;
-                        for (size_t col = 0; col < d_model; ++col)
-                        {
-                            if (!std::isfinite(row[col]))
-                            {
-                                LOG_ERROR(
-                                    "[MoELocalExpertStage] Non-finite colocated CPU canonical route contribution"
-                                    << " layer=" << params_.layer_idx
-                                    << " participant="
-                                    << params_.runtime_participant_index
-                                    << " entry=" << entry
-                                    << " compact_slot=" << source_slot
-                                    << " col=" << col);
-                                return fail_completed_packet();
-                            }
-                        }
-                    }
-                }
-                if (!canonical_route_publication->publish(
-                        input.live_entry_count))
+                    canonical_publication_completed = std::chrono::steady_clock::now();
+                if (!published)
                 {
                     LOG_ERROR(
                         "[MoELocalExpertStage] Could not release-publish the complete colocated CPU canonical ticket"
@@ -4197,10 +4348,15 @@ namespace llaminar2
                 }
             }
         }
-        output.live_row_count = canonical_packet ? active_routes_.size() : output_input_rows_.size();
+        // A joint down partial is not yet a logical return. The following
+        // explicit cohort collective/publication stage alone closes that edge.
+        output.live_row_count = params_.cpu_joint_route_producer?0u:
+            (canonical_packet?active_routes_.size():output_input_rows_.size());
 
+        const bool post_service_timing_enabled =
+            PerfStatsCollector::isDomainEnabled("moe_overlay_participant_graph");
         const auto service_completed_at =
-            economy_timing_enabled || endpoint_detail_enabled
+            economy_timing_enabled || endpoint_detail_enabled || post_service_timing_enabled
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
         if (economy_timing_enabled)
@@ -4280,7 +4436,17 @@ namespace llaminar2
                 });
         }
 
-        if (profiling_enabled)
+        if (profiling_enabled && params_.device_id.is_cpu())
+        {
+            if (!retained_cpu_compute_stage_)
+                throw std::logic_error("Completed CPU endpoint lost its retained compute owner");
+            MoEExpertOverlayProfiler::recordGraphNativeCPUExpertSorted(
+                params_.layer_idx, input.key.tier_idx, params_.runtime_participant_index,
+                params_.device_id.to_string(), input.live_row_count, active_routes_.size(),
+                output.live_row_count, retained_cpu_compute_stage_->completedCPUActiveExpertIds(),
+                compute_ms);
+        }
+        else if (profiling_enabled)
         {
             std::set<int> active_expert_ids;
             for (const auto &route : active_routes_)
@@ -4297,6 +4463,23 @@ namespace llaminar2
                 std::vector<int>(
                     active_expert_ids.begin(), active_expert_ids.end()),
                 compute_ms);
+        }
+
+        const auto* completed_layer_bank=deferred_residency_bank_
+            ? &deferred_residency_bank_->layerForModelLayer(params_.layer_idx):nullptr;
+        if(completed_layer_bank && completed_layer_bank->cpu_fragment_family &&
+           PerfStatsCollector::isDomainEnabled("moe_overlay_residency")){
+            // The completed route vector is already the invocation's authority.
+            // Fold consecutive equal experts with a scalar; no duplicate counts,
+            // scratch allocation, reordering or changing metadata keys are needed.
+            for(size_t begin=0;begin<active_routes_.size();){
+                const auto expert=active_routes_[begin].expert_id;
+                size_t end=begin+1;
+                while(end<active_routes_.size() && active_routes_[end].expert_id==expert)++end;
+                completed_layer_bank->cpu_fragments.at(size_t(expert)).recordCompletedExecution(
+                    deferred_residency_bank_->epoch,static_cast<std::uint64_t>(end-begin));
+                begin=end;
+            }
         }
 
         /*
@@ -4404,6 +4587,12 @@ namespace llaminar2
                  {"transport", "local"}});
         }
         resetDeferredInvocation();
+        if (post_service_timing_enabled)
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - service_completed_at).count();
+            last_post_service_ns_ = elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0u;
+        }
         return true;
     }
 
@@ -4594,6 +4783,26 @@ namespace llaminar2
             std::max(compact_rows_from_sparse_payload, compact_rows_from_graph_hint);
 
         WorkspaceRequirements reqs;
+        if (params_.device_id.is_cpu())
+        {
+            if (retained_cpu_compute_stage_)
+            {
+                // Project the actual frozen executor's root geometry, not the
+                // GPU route-flattening formula. Serial roots emit no new owner.
+                reqs.cpu_grouped_moe_storage = retained_cpu_compute_stage_->
+                    getWorkspaceRequirements(1, n, k).cpu_grouped_moe_storage;
+            }
+            else if (!params_.cpu_workspace_source)
+            {
+                throw std::logic_error(
+                    "CPU local expert workspace requires its retained executor or explicit source declaration");
+            }
+            // An explicit source-only query has no executor or physical grouped
+            // root to materialize. The canonical projection/SwiGLU factories
+            // below declare future named scratch from those source facts;
+            // execution still requires the independently retained executor.
+        }
+
         if (params_.device_id.is_cuda())
         {
             /*

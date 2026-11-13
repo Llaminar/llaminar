@@ -189,6 +189,8 @@ namespace
         std::set<std::pair<BranchNodeProbe *, BranchNodeProbe *>> edges;
         std::vector<BranchGraphProbe *> cloned_sources;
         int edge_error = 0;
+        int child_error = 0;
+        bool empty_child_on_success = false;
 
         /** @brief Append a stable node without touching any GPU runtime. */
         BranchNodeProbe *add(const std::string &label)
@@ -231,6 +233,8 @@ namespace
         /** @brief Record the exact graph clone request and its predecessors. */
         static Error child(Node *out, Graph graph, const Node *deps, std::size_t count, Graph source)
         {
+            if (graph->child_error) return graph->child_error;
+            if (graph->empty_child_on_success) { *out = nullptr; return success; }
             *out = graph->add(source->name);
             graph->cloned_sources.push_back(source);
             for (std::size_t i = 0; i < count; ++i) graph->edges.emplace(deps[i], *out);
@@ -1322,4 +1326,347 @@ TEST_F(ComputeGraphExecutionTest, RealResidualAddStage_InGraph)
     {
         EXPECT_FLOAT_EQ(output_data[i], 3.0f); // 1.0 + 2.0
     }
+}
+
+/** @test Storage remains parallel to layer0 while Close includes its actual terminal. */
+TEST(NativeParallelGraphBranch, StorageSiblingSharesOpenAndExtendsCloseWithoutSerializingLayer0)
+{
+    BranchGraphProbe body{.name="main"}, storage{.name="storage"};
+    BranchGraphProbe open{.name="open"}, worker{.name="progress"}, close{.name="close"};
+    auto* layer0=body.add("layer0_follower");
+    auto* ple1=body.add("layer1_PLE");
+    auto* terminal=body.add("main_terminal");
+    body.edges={{layer0,ple1},{ple1,terminal}};
+    const std::array siblings{&storage};
+    const auto result=detail::appendNativeParallelBranch<BranchGraphProbeAPI>(&body,{&open,&worker,&close},siblings);
+    ASSERT_EQ(result.error,0);
+    auto* storage_node=body.nodes[3].get();
+    auto* open_node=body.nodes[4].get();
+    auto* worker_node=body.nodes[5].get();
+    auto* close_node=body.nodes[6].get();
+    auto* join=body.nodes[7].get();
+    EXPECT_TRUE(body.edges.contains({open_node,layer0}));
+    EXPECT_TRUE(body.edges.contains({open_node,storage_node}));
+    EXPECT_TRUE(body.edges.contains({open_node,worker_node}));
+    EXPECT_FALSE(body.edges.contains({storage_node,layer0}));
+    EXPECT_FALSE(body.edges.contains({layer0,storage_node}));
+    EXPECT_FALSE(body.edges.contains({close_node,storage_node}));
+    EXPECT_FALSE(body.edges.contains({worker_node,close_node}));
+    EXPECT_TRUE(body.edges.contains({terminal,close_node}));
+    EXPECT_TRUE(body.edges.contains({storage_node,close_node}));
+    EXPECT_TRUE(body.edges.contains({close_node,join}));
+    EXPECT_TRUE(body.edges.contains({worker_node,join}));
+    EXPECT_EQ(body.cloned_sources,(std::vector<BranchGraphProbe*>{&storage,&open,&worker,&close}));
+}
+/** @test Self, absent and duplicate siblings fail before mutation or open publication. */
+TEST(NativeParallelGraphBranch, InvalidFiniteSiblingsCannotPartiallyDecorateParent)
+{
+    BranchGraphProbe body{.name="main"}, storage{.name="storage"};
+    BranchGraphProbe open{.name="open"}, worker{.name="progress"}, close{.name="close"};
+    body.add("original");
+    for (const auto siblings : {std::vector<BranchGraphProbe*>{nullptr},
+            std::vector<BranchGraphProbe*>{&body}, std::vector<BranchGraphProbe*>{&storage,&storage},
+            std::vector<BranchGraphProbe*>{&open}, std::vector<BranchGraphProbe*>{&worker},
+            std::vector<BranchGraphProbe*>{&close}}) {
+        EXPECT_EQ(detail::appendNativeParallelBranch<BranchGraphProbeAPI>(&body,{&open,&worker,&close},siblings).error,BranchGraphProbeAPI::invalid);
+        EXPECT_EQ(body.nodes.size(),1u);
+        EXPECT_TRUE(body.cloned_sources.empty());
+    }
+}
+
+/** @test Native SDMA requires no synthetic Open/Close: main and finite storage retain independent roots/terminals. */
+TEST(NativeParallelGraphBranch, FiniteSiblingWithoutProgressPreservesOriginalMainAndAllTerminals)
+{
+    BranchGraphProbe storage{.name="original_storage"};storage.add("storage_leaf");
+    for(unsigned replay=0;replay<20;++replay){
+        BranchGraphProbe main{.name="main"};auto* first=main.add("layer0");auto* last=main.add("main_terminal");
+        main.edges={{first,last}};const std::array siblings{&storage};
+        ASSERT_EQ(detail::appendNativeFiniteBodySiblings<BranchGraphProbeAPI>(&main,siblings).error,0);
+        ASSERT_EQ(main.nodes.size(),3u);
+        auto* physical=main.nodes.back().get();
+        EXPECT_EQ(main.edges.size(),1u);EXPECT_TRUE(main.edges.contains({first,last}));
+        EXPECT_FALSE(main.edges.contains({physical,first}));EXPECT_FALSE(main.edges.contains({last,physical}));
+        EXPECT_EQ(main.cloned_sources,(std::vector<BranchGraphProbe*>{&storage}));
+        EXPECT_EQ(storage.nodes.size(),1u);EXPECT_TRUE(storage.edges.empty());
+    }
+}
+/** @test All malformed sibling sets reject before the first native import; source definitions are immutable/reusable. */
+TEST(NativeParallelGraphBranch, FiniteSiblingRejectsEmptySelfDuplicateBeforeMutation)
+{
+    BranchGraphProbe main{.name="main"},storage{.name="storage"},empty{.name="empty"};
+    main.add("main_leaf");storage.add("storage_leaf");
+    for(const auto siblings:{std::vector<BranchGraphProbe*>{},std::vector<BranchGraphProbe*>{nullptr},
+        std::vector<BranchGraphProbe*>{&main},std::vector<BranchGraphProbe*>{&storage,&storage},
+        std::vector<BranchGraphProbe*>{&storage,&empty}}){
+        EXPECT_EQ(detail::appendNativeFiniteBodySiblings<BranchGraphProbeAPI>(&main,siblings).error,BranchGraphProbeAPI::invalid);
+        EXPECT_EQ(main.nodes.size(),1u);EXPECT_TRUE(main.cloned_sources.empty());
+    }
+}
+
+/** @test Original rooted gather must finish before any potentially blocking receive. */
+TEST(MoEOverlayRankBatchGraphSchedule, RootedCollectivePrecedesEveryRemoteReceive)
+{
+    for (int peers=1;peers<=8;++peers)
+    for (int repeat=0;repeat<3;++repeat)
+    {
+        ComputeGraph graph;
+        std::vector<MoEOverlayRankBatchGraphLane> remote;
+        int submitted=0; bool produced=false,gathered=false;
+        std::vector<int> returned;
+        auto add=[&](const std::string& name,ComputeStageType type,auto action) {
+            auto stage=std::make_unique<MockComputeStage>(type);
+            stage->setOnExecute(action);
+            graph.addNode(name,std::move(stage),DeviceId::cpu());
+        };
+        // Adversarial insertion: receives appear before their actual producers.
+        for(int i=peers-1;i>=0;--i) {
+            const auto id=std::to_string(7+12*i);
+            add("receive"+id,ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE,
+                [&,i](IDeviceContext*){EXPECT_TRUE(gathered);EXPECT_EQ(submitted,peers);returned.push_back(i);});
+            add("send"+id,ComputeStageType::MOE_RANK_BATCH_DISPATCH,
+                [&](IDeviceContext*){EXPECT_FALSE(produced);++submitted;});
+        }
+        add("local_return",ComputeStageType::MOE_SPARSE_RETURN_REDUCE,
+            [&](IDeviceContext*){EXPECT_TRUE(gathered);EXPECT_EQ(returned.size(),size_t(peers));});
+        add("gather",ComputeStageType::ROOTED_COLLECTIVE,
+            [&](IDeviceContext*){EXPECT_TRUE(produced);EXPECT_EQ(submitted,peers);EXPECT_TRUE(returned.empty());gathered=true;});
+        add("producer",ComputeStageType::MOE_LOCAL_EXPERT,
+            [&](IDeviceContext*){EXPECT_EQ(submitted,peers);EXPECT_FALSE(gathered);produced=true;});
+        add("local_dispatch",ComputeStageType::MOE_SPARSE_DISPATCH,
+            [&](IDeviceContext*){EXPECT_EQ(submitted,peers);});
+        for(int i=0;i<peers;++i){const auto id=std::to_string(7+12*i);remote.push_back({"send"+id,"receive"+id});}
+        const std::array<MoEOverlayLocalExpertGraphLane,1> local{{{"local_dispatch","producer","local_return","gather"}}};
+        wireMoEOverlayRankBatchForkJoin(graph,remote,local);
+        for(auto* stage:graph.getExecutionStages()) ASSERT_TRUE(stage->execute(nullptr));
+        ASSERT_EQ(returned.size(),size_t(peers));
+        for(int i=0;i<peers;++i)EXPECT_EQ(returned[i],i);
+    }
+}
+
+/** @test Missing, aliased and wrongly typed collectives cannot publish partial edges. */
+TEST(MoEOverlayRankBatchGraphSchedule, RejectsInvalidRootedCollectiveBeforeMutation)
+{
+    ComputeGraph graph;
+    for(const auto& [name,type]:std::vector<std::pair<std::string,ComputeStageType>>{
+        {"send",ComputeStageType::MOE_RANK_BATCH_DISPATCH},{"receive",ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE},
+        {"dispatch",ComputeStageType::MOE_SPARSE_DISPATCH},{"producer",ComputeStageType::MOE_LOCAL_EXPERT},
+        {"returned",ComputeStageType::MOE_SPARSE_RETURN_REDUCE},{"gather",ComputeStageType::ROOTED_COLLECTIVE}})
+        graph.addNode(name,std::make_unique<MockComputeStage>(type),DeviceId::cpu());
+    const std::array<MoEOverlayRankBatchGraphLane,1> remote{{{"send","receive"}}};
+    for(const auto& collective:std::vector<std::string>{"missing","send","receive","dispatch","producer","returned"}) {
+        const std::array<MoEOverlayLocalExpertGraphLane,1> local{{{"dispatch","producer","returned",collective}}};
+        EXPECT_THROW(wireMoEOverlayRankBatchForkJoin(graph,remote,local),std::invalid_argument);
+        for(const auto& name:{"send","receive","dispatch","producer","returned","gather"})
+            EXPECT_TRUE(graph.getNode(name)->dependencies.empty())<<name;
+    }
+}
+
+#include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
+#include <type_traits>
+
+/** @test Producers borrow scheduling identity; only the explicit collective can mutate the ticket. */
+TEST(MoEOverlayRankBatchGraphSchedule, ProducerTicketBorrowIsConstCollectiveOwnsPublication)
+{
+    using Producer=MoELocalExpertStage::CPUJointRouteProducerBinding;
+    using Collective=MoECPUExpertShardRouteStage::Params;
+    using Borrow=decltype(Producer::deferred_canonical_ticket);
+    using Publisher=decltype(Collective::original_canonical_ticket);
+    static_assert(std::is_const_v<typename Borrow::element_type>);
+    static_assert(!std::is_const_v<typename Publisher::element_type>);
+    static_assert(std::is_constructible_v<Borrow,Publisher>);
+    static_assert(!std::is_constructible_v<Publisher,Borrow>);
+    EXPECT_TRUE((std::is_const_v<typename Borrow::element_type>));
+}
+
+/** @test Aux forks after Probe while later main units remain runnable and final retirement joins aux. */
+TEST(NativeParallelGraphBranch, CapturedProducerForkDoesNotGateLaterConsumerUnit)
+{
+    for (unsigned replay = 0; replay < 20; ++replay) {
+        BranchGraphProbe main{.name="parent"}, producer{.name="probe_unit"}, aux{.name="aux"};
+        producer.add("original_probe"); aux.add("response_and_maintenance_waiting_for_read");
+        auto* probeExit=main.add("imported_probe_exit");
+        auto* consumer=main.add("later_main_local_read");
+        auto* terminal=main.add("main_terminal");
+        main.edges={{probeExit,consumer},{consumer,terminal}};
+        detail::NativeCapturedFragmentFrontiers<BranchGraphProbe*,BranchNodeProbe*> imports;
+        std::shared_ptr<const void> source=std::make_shared<const std::byte>();
+        const std::array exits{probeExit};
+        imports.remember(&producer,source,&producer,producer.nodes.size(),exits);
+        const auto actual=imports.require(&producer,source,&producer,producer.nodes.size());
+        ASSERT_EQ(actual.size(),1u);
+        const auto appended = detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&main,&aux,actual);
+        ASSERT_EQ(appended.error,0);
+        auto* auxiliary=appended.appended_exit;
+        ASSERT_EQ(auxiliary,main.nodes.back().get());
+        EXPECT_TRUE(main.edges.contains({probeExit,auxiliary}));
+        EXPECT_TRUE(main.edges.contains({probeExit,consumer}));
+        EXPECT_FALSE(main.edges.contains({auxiliary,consumer}));
+        EXPECT_FALSE(main.edges.contains({auxiliary,probeExit}));
+        EXPECT_FALSE(main.edges.contains({terminal,auxiliary}));
+        // With owner service held, all-hit LocalRead can finish while the aux
+        // child is pending. Native parent completion still owns BOTH leaves.
+        std::vector<BranchNodeProbe*> leaves;
+        for(const auto& node:main.nodes) {
+            std::size_t successors=0;BranchGraphProbeAPI::dependents(node.get(),nullptr,&successors);
+            if(!successors)leaves.push_back(node.get());
+        }
+        EXPECT_EQ(leaves,(std::vector<BranchNodeProbe*>{terminal,auxiliary}));
+        imports.attached(&aux,source,&aux,aux.nodes.size(),auxiliary);
+        EXPECT_TRUE(imports.alreadyAttached(&aux,source,&aux));
+    }
+}
+/** @test Cold mapping rejects wrong parent, reset/ABA, changed source geometry, ambiguity and duplicate aux. */
+TEST(NativeParallelGraphBranch, CapturedProducerMappingRejectsStaleForeignAndAmbiguousDefinitions)
+{
+    using Map=detail::NativeCapturedFragmentFrontiers<BranchGraphProbe*,BranchNodeProbe*>;
+    for(unsigned replay=0;replay<20;++replay) {
+        Map parent,foreign;
+        BranchGraphProbe sourceGraph{.name="source"}, aux{.name="aux"}, main{.name="main"};
+        sourceGraph.add("source_node");aux.add("aux_node");auto* exit=main.add("exit");
+        std::shared_ptr<const void> scope=std::make_shared<const std::byte>();
+        const std::array exits{exit};parent.remember(&sourceGraph,scope,&sourceGraph,1,exits);
+        EXPECT_TRUE(foreign.require(&sourceGraph,scope,&sourceGraph,1).empty());
+        EXPECT_TRUE(parent.require(&aux,scope,&sourceGraph,1).empty());
+        EXPECT_TRUE(parent.require(&sourceGraph,scope,&aux,1).empty());
+        EXPECT_TRUE(parent.require(&sourceGraph,scope,&sourceGraph,2).empty());
+        auto changed=std::shared_ptr<const void>(std::make_shared<const std::byte>());
+        EXPECT_TRUE(parent.require(&sourceGraph,changed,&sourceGraph,1).empty());
+        scope.reset();EXPECT_TRUE(parent.require(&sourceGraph,scope,&sourceGraph,1).empty());
+        // Same C++ object and fake native graph address, genuinely new lifetime.
+        scope=std::make_shared<const std::byte>();
+        EXPECT_TRUE(parent.require(&sourceGraph,scope,&sourceGraph,1).empty());
+        parent.clear();parent.remember(&sourceGraph,scope,&sourceGraph,1,exits);
+        parent.remember(&sourceGraph,scope,&sourceGraph,1,exits);
+        EXPECT_TRUE(parent.require(&sourceGraph,scope,&sourceGraph,1).empty());
+        parent.clear();parent.attached(&aux,scope,&aux,aux.nodes.size(),exit);
+        EXPECT_TRUE(parent.alreadyAttached(&aux,scope,&aux));
+        EXPECT_TRUE(parent.alreadyAttached(&sourceGraph,scope,&aux));
+    }
+}
+/** @test Native fork validates complete parent membership before importing any auxiliary node. */
+TEST(NativeParallelGraphBranch, CapturedProducerForkRejectsUnknownOrDuplicateNodesBeforeMutation)
+{
+    BranchGraphProbe main{.name="main"},aux{.name="aux"},foreign{.name="foreign"},empty{.name="empty"};
+    auto* real=main.add("real");auto* wrong=foreign.add("foreign");aux.add("actual_body");
+    for(const auto exits:{std::vector<BranchNodeProbe*>{},std::vector<BranchNodeProbe*>{nullptr},
+                         std::vector<BranchNodeProbe*>{wrong},std::vector<BranchNodeProbe*>{real,real}}) {
+        EXPECT_EQ(detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&main,&aux,exits).error,1);
+        EXPECT_EQ(main.nodes.size(),1u);EXPECT_TRUE(main.cloned_sources.empty());
+    }
+    const std::array exits{real};
+    EXPECT_EQ(detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&main,&empty,exits).error,1);
+    EXPECT_EQ(detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&main,&main,exits).error,1);
+    EXPECT_EQ(main.nodes.size(),1u);EXPECT_TRUE(main.cloned_sources.empty());
+}
+
+
+/**
+ * @test Future work joins the actual prior finite-body exit and accepted-history main exit.
+ * This is the same cold mapping/native append helper used by both SDK backends;
+ * test nodes do not certify a native capture, source receipt or model history.
+ */
+TEST(NativeParallelGraphBranch, FiniteChildJoinRetireAndHistoryAcrossRepeatedReset)
+{
+    using Map = detail::NativeCapturedFragmentFrontiers<BranchGraphProbe*, BranchNodeProbe*>;
+    Map imports;
+    for (unsigned request = 0; request < 20; ++request)
+    {
+        BranchGraphProbe parent{.name="parent"}, probe{.name="probe"}, history{.name="accepted_history"},
+            retired{.name="prior_local_retire"}, future{.name="future_hash_probe"};
+        probe.add("actual_probe");
+        history.add("actual_accepted_history");
+        retired.add("actual_finite_retire_body");
+        future.add("next_actual_hash_probe_body");
+        auto* probeExit = parent.add("imported_probe_exit");
+        auto* historyExit = parent.add("imported_history_exit");
+        auto* laterMain = parent.add("later_main");
+        parent.edges = {{probeExit,historyExit},{historyExit,laterMain}};
+        std::shared_ptr<const void> scope = std::make_shared<const std::byte>();
+        const std::array probeExits{probeExit}, historyExits{historyExit};
+        imports.remember(&probe,scope,&probe,probe.nodes.size(),probeExits);
+        imports.remember(&history,scope,&history,history.nodes.size(),historyExits);
+        const auto local = detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(
+            &parent,&retired,imports.require(&probe,scope,&probe,probe.nodes.size()));
+        ASSERT_EQ(local.error,0);
+        ASSERT_NE(local.appended_exit,nullptr);
+        EXPECT_EQ(local.appended_exit,parent.nodes.back().get());
+        imports.attached(&retired,scope,&retired,retired.nodes.size(),local.appended_exit);
+        const std::array<Map::Definition,2> dependencies{{
+            {&retired,scope,&retired,retired.nodes.size()}, {&history,scope,&history,history.nodes.size()}}};
+        const auto joined = imports.requireJoined(dependencies);
+        ASSERT_EQ(joined,(std::vector<BranchNodeProbe*>{local.appended_exit,historyExit}));
+        const auto next = detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&parent,&future,joined);
+        ASSERT_EQ(next.error,0);
+        ASSERT_NE(next.appended_exit,nullptr);
+        EXPECT_TRUE(parent.edges.contains({local.appended_exit,next.appended_exit}));
+        EXPECT_TRUE(parent.edges.contains({historyExit,next.appended_exit}));
+        EXPECT_FALSE(parent.edges.contains({next.appended_exit,laterMain}));
+        EXPECT_FALSE(parent.edges.contains({local.appended_exit,historyExit}));
+        EXPECT_FALSE(parent.edges.contains({laterMain,next.appended_exit}));
+        imports.attached(&future,scope,&future,future.nodes.size(),next.appended_exit);
+        EXPECT_TRUE(imports.alreadyAttached(&future,scope,&future));
+        EXPECT_TRUE(imports.alreadyAttached(&history,scope,&history)); // An imported main body cannot be appended twice.
+        imports.clear(); // Exact parent reset invalidates both kinds of definition.
+        EXPECT_TRUE(imports.requireJoined(dependencies).empty());
+    }
+}
+
+/** @test Join rejects missing, duplicate, stale, wrong-parent and overlapping original exits before mutation. */
+TEST(NativeParallelGraphBranch, FiniteChildJoinRejectsInvalidOriginalDependencies)
+{
+    using Map = detail::NativeCapturedFragmentFrontiers<BranchGraphProbe*, BranchNodeProbe*>;
+    for (unsigned replay = 0; replay < 20; ++replay)
+    {
+        Map imports, wrongParent;
+        BranchGraphProbe parent{.name="parent"}, source{.name="source"}, prior{.name="prior"},
+            missing{.name="missing"}, body{.name="body"};
+        source.add("source"); prior.add("prior"); body.add("body"); missing.add("missing");
+        auto* mainExit = parent.add("main_exit");
+        auto* priorExit = parent.add("actual_prior_child_exit");
+        std::shared_ptr<const void> scope = std::make_shared<const std::byte>();
+        std::shared_ptr<const void> replacement = std::make_shared<const std::byte>();
+        const std::array mainExits{mainExit};
+        imports.remember(&source,scope,&source,source.nodes.size(),mainExits);
+        imports.attached(&prior,scope,&prior,prior.nodes.size(),priorExit);
+        const Map::Definition main{&source,scope,&source,source.nodes.size()};
+        const Map::Definition child{&prior,scope,&prior,prior.nodes.size()};
+        for (const std::vector<Map::Definition>& invalid : {
+            std::vector<Map::Definition>{}, {main,main}, {{nullptr,scope,&source,1}},
+            {{&missing,scope,&missing,1}}, {{&source,replacement,&source,1}},
+            {{&source,scope,&missing,1}}, {{&source,scope,&source,2}}, {{&prior,scope,&prior,2}}})
+            EXPECT_TRUE(imports.requireJoined(invalid).empty());
+        const std::array actual{main,child};
+        EXPECT_TRUE(wrongParent.requireJoined(actual).empty());
+        ASSERT_EQ(imports.requireJoined(actual).size(),2u);
+        // Different original definitions cannot silently collapse one shared exit.
+        imports.remember(&missing,scope,&missing,1,mainExits);
+        const std::array overlap{main,Map::Definition{&missing,scope,&missing,1}};
+        EXPECT_TRUE(imports.requireJoined(overlap).empty());
+        imports.remember(&source,scope,&source,1,mainExits);
+        EXPECT_TRUE(imports.requireJoined(actual).empty()); // Ambiguous repeated import.
+        EXPECT_EQ(parent.nodes.size(),2u);
+        EXPECT_TRUE(parent.cloned_sources.empty());
+        imports.clear();
+        imports.attached(&prior,scope,&prior,1,priorExit);
+        scope.reset();
+        EXPECT_TRUE(imports.requireJoined(std::array<Map::Definition,1>{{{&prior,replacement,&prior,1}}}).empty());
+    }
+}
+
+/** @test Native append failure never publishes a usable finite child terminal. */
+TEST(NativeParallelGraphBranch, FiniteChildJoinFailureHasNoUsableExit)
+{
+    BranchGraphProbe parent{.name="parent"}, body{.name="body"};
+    auto* original = parent.add("original"); body.add("body");
+    const std::array exits{original};
+    parent.child_error = 17;
+    auto result = detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&parent,&body,exits);
+    EXPECT_EQ(result.error,17); EXPECT_EQ(result.appended_exit,nullptr);
+    parent.child_error = 0;
+    parent.empty_child_on_success = true;
+    result = detail::appendNativeFiniteBodyAfterFrontier<BranchGraphProbeAPI>(&parent,&body,exits);
+    EXPECT_EQ(result.error,BranchGraphProbeAPI::invalid); EXPECT_EQ(result.appended_exit,nullptr);
+    EXPECT_EQ(parent.nodes.size(),1u);
+    EXPECT_TRUE(parent.cloned_sources.empty());
 }

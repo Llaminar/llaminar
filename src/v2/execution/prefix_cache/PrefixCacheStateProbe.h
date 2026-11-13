@@ -10,12 +10,16 @@
  */
 
 #pragma once
+#include "kernels/common/GDNRecurrenceStateLayout.h"
+#include "kernels/CPUGDNStateLayout.h"
 
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/prefix_cache/PrefixCacheStats.h"
 #include "execution/prefix_cache/PrefixMovementEpochSnapshot.h"
 
+#include "kernels/common/SamplingMath.h"
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -268,6 +272,14 @@ namespace llaminar2
     struct PrefixGDNLayerProbe
     {
         int global_layer = 0;
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Physical source format;
+                                                               ///< diagnostic values are canonical
+                                                               ///< key-major.
+        GDNStateStorage recurrence_storage = GDNStateStorage::DeviceDense;
+            ///< Exact arithmetic/storage contract; CPU epoch banks are not dense matrices.
+        std::vector<uint32_t> recurrence_epoch_phase_words;
+            ///< Exact per-head CPU protocol words, retained even in hash-only probes.
         size_t recurrence_values = 0;
         size_t conv_values = 0;
         uint64_t recurrence_hash = 0;
@@ -301,7 +313,9 @@ namespace llaminar2
          * Normal prefix probes only carry hashes so request summaries stay
          * cheap. Setting LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES=1 asks the
          * probe to copy the complete authoritative FP32 bank into these
-         * vectors. On GPU this is the full replicated decode bank exported on
+         * vectors. CPU epoch state retains every physical checkpoint/history
+         * value; only dense device matrices are canonicalized to key-major axes.
+         * On GPU this is the full replicated decode bank exported on
          * the probe's exact stream, never the potentially stale host mirror.
          */
         std::vector<float> recurrence_sample_values;
@@ -336,10 +350,39 @@ namespace llaminar2
         std::string reject_stage_type;
     };
 
+    /**
+     * @brief Immutable scalar continuation observation from the existing packed diagnostic export.
+     * Device bytes and ready-condition disposition have distinct original owners.
+     * The runner attaches disposition only after authenticating the exact current
+     * mailbox generation/epoch and sampling law. Inference never consumes this value.
+     */
+    struct PrefixResidentConditionProbe
+    {
+        DeviceId device = DeviceId::invalid(); ///< Original packed mailbox device.
+        std::uint64_t publication_generation = 0; ///< Exact original event-protected publication.
+        std::uint64_t live_state_epoch = 0; ///< Original mailbox epoch.
+        int target_position = -1; ///< Original committed target position.
+        int next_condition_token = -1; ///< Original packed token, never a response reconstruction.
+        bool publication_ok = false; ///< Original packed publication status.
+        bool stopped = false; ///< Original packed stop status.
+        std::optional<sampling_math::DeviceGenerationLeadingRowDisposition> response_disposition;
+        ///< Original ReadyMTPCondition disposition, absent until exact owner authentication.
+
+        /** @return True only for a valid original, already-emitted, uncommitted continuation row. */
+        [[nodiscard]] bool isAlreadyEmitted() const noexcept
+        {
+            return device.is_gpu() && publication_generation > 0 && live_state_epoch > 0 &&
+                target_position >= 0 && next_condition_token >= 0 && publication_ok && !stopped &&
+                response_disposition == sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+        }
+    };
+
     struct PrefixRuntimeStateSnapshot
     {
         bool initialized = false;
         bool prefill_logits_ready = false;
+        /** Existing deep packed export, scalar only; absent means unavailable, never committed-by-default. */
+        std::optional<PrefixResidentConditionProbe> resident_condition;
         bool has_hidden = false;
         bool has_logits = false;
         std::string architecture;
@@ -405,6 +448,10 @@ namespace llaminar2
         int mtp_observed_verifier_transaction_count = 0;
         /** Exact active draft depth paired with the observed row. */
         int mtp_observed_verifier_draft_depth = 0;
+        /** Original row-zero condition from the same validated committed verifier record.
+         * Absent after reset or when no committed verifier observation exists;
+         * never reconstructed from a sampled or accepted response token. */
+        std::optional<int32_t> mtp_observed_verifier_condition_token;
         /**
          * @brief Draft-token identity of the last committed verifier transaction.
          *
@@ -414,8 +461,8 @@ namespace llaminar2
          * controller state; its transaction ordinal, depth, and token prefix
          * therefore cannot name different transactions. These bytes never
          * participate in controller decisions. The vector contains exactly
-         * `mtp_observed_verifier_draft_depth` draft tokens (the target token is
-         * retained in the device record but intentionally omitted here).
+         * `mtp_observed_verifier_draft_depth` draft tokens. The original row-zero
+         * condition is projected separately from that same device record.
          */
         std::vector<int32_t> mtp_observed_verifier_draft_tokens;
         /**
@@ -440,6 +487,9 @@ namespace llaminar2
         uint64_t mtp_depth_policy_promotions = 0;
         uint64_t mtp_depth_policy_demotions = 0;
         uint64_t mtp_depth_policy_observe_recommendations = 0;
+        uint64_t mtp_depth_policy_utility_probes = 0; ///< Actual reversible comparison events in this observation.
+        uint64_t mtp_depth_policy_utility_keeps = 0; ///< Actual reversible comparison events in this observation.
+        uint64_t mtp_depth_policy_utility_returns = 0; ///< Actual reversible comparison events in this observation.
         int mtp_current_depth = 0;
         int mtp_min_depth = 0;
         int mtp_max_depth = 0;
@@ -521,6 +571,19 @@ namespace llaminar2
         const IKVCache &cache,
         void *stream,
         const PrefixProbeCapturePolicy &capture_policy);
+
+    /**
+     * @brief Canonicalize an explicit diagnostic copy to [head, key, value] coordinates.
+     * @param values Complete observed matrices; never live cache storage.
+     * @param key_width Positive key width.
+     * @param value_width Positive value width, independently validated for rectangular heads.
+     * @param layout Authenticated physical source format.
+     * @throws std::invalid_argument For unknown format or incomplete/overflowing matrix geometry.
+     */
+    void canonicalizeRecurrenceValuesForPrefixProbe(std::vector<float> &values,
+                                                    int key_width,
+                                                    int value_width,
+                                                    GDNRecurrenceStateLayout layout);
 
     uint64_t hashFloatBufferForPrefixProbe(const float *values, size_t count);
     uint64_t hashByteBufferForPrefixProbe(const void *values, size_t bytes);

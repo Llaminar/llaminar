@@ -6,7 +6,7 @@
 #include "CpuExpertSlotPool.h"
 
 #include "ExpertPreparedMemoryGeometry.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "memory/NUMAAllocator.h"
 #include "tensors/TensorClasses.h"
@@ -20,9 +20,9 @@
 
 namespace llaminar2
 {
-    using CpuKernel = cpu::native_vnni::CPUNativeVNNIGemmKernel;
-    using CpuPacked = cpu::native_vnni::CPUNativeVNNIPackedWeights;
-    using CpuEncoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+    using CpuKernel = cpu::native_quantised::CPUNativeQuantisedGemmKernel;
+    using CpuPacked = cpu::native_quantised::CPUNativeQuantisedPackedWeights;
+    using CpuEncoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
 
     /** @brief One stable engine plus the final bytes written by a GPU source. */
     struct CpuExpertSlotPool::PreparedProjection
@@ -96,7 +96,7 @@ namespace llaminar2
         }
 
         /** @brief Validate one projection and return its catalogued source. */
-        const NativeVnniFormatInfo *validateProjectionSpec(
+        const NativeQuantisedFormatInfo *validateProjectionSpec(
             const CpuExpertSlotPool::ProjectionSpec &spec)
         {
             if (spec.N <= 0 || spec.K <= 0 || !spec.format.valid())
@@ -108,11 +108,11 @@ namespace llaminar2
                 return nullptr;
             if ((spec.K % 32) != 0)
                 throw std::invalid_argument(
-                    "CPU NativeVNNI expert slot projection K is not block aligned");
-            const NativeVnniFormatInfo *source =
-                native_vnni_formats::forSourceIdentity(
-                    spec.format.native_vnni.codebook_id,
-                    spec.format.native_vnni.is_superblock);
+                    "CPU NativeQuantised expert slot projection K is not block aligned");
+            const NativeQuantisedFormatInfo *source =
+                native_quantised_formats::forSourceIdentity(
+                    spec.format.native_quantised.codebook_id,
+                    spec.format.native_quantised.is_superblock);
             if (!source)
             {
                 throw std::invalid_argument(
@@ -127,11 +127,11 @@ namespace llaminar2
             std::size_t allocation_alignment,
             bool requires_dedicated_mapping)
         {
-            const NativeVnniFormatInfo *source =
+            const NativeQuantisedFormatInfo *source =
                 validateProjectionSpec(spec);
             if (!source)
                 throw std::invalid_argument(
-                    "CPU NativeVNNI metadata requested for a floating projection");
+                    "CPU NativeQuantised metadata requested for a floating projection");
 
             CpuPacked packed;
             packed.N = spec.N;
@@ -142,11 +142,11 @@ namespace llaminar2
             packed.is_asymmetric = source->is_asymmetric;
             /* Preserve provenance even when execution expands source blocks. */
             packed.is_superblock = source->is_superblock;
-            packed.encoding = cpu::native_vnni::preparedEncodingForSource(*source);
+            packed.encoding = cpu::native_quantised::preparedEncodingForSource(*source);
             packed.data_stride = static_cast<int>(
-                cpu::native_vnni::preparedDataStride(packed.encoding));
+                cpu::native_quantised::preparedDataStride(packed.encoding));
             packed.interleaved_block_stride =
-                cpu::native_vnni::preparedInterleavedBlockStride(
+                cpu::native_quantised::preparedInterleavedBlockStride(
                     packed.encoding,
                     packed.is_asymmetric);
 
@@ -521,7 +521,7 @@ namespace llaminar2
                 materialized_allocation_bytes = checkedByteAdd(
                     materialized_allocation_bytes,
                     allocation_bytes,
-                    "CPU NativeVNNI expert pool");
+                    "CPU NativeQuantised expert pool");
             }
             slots.push_back(std::move(slot));
         }

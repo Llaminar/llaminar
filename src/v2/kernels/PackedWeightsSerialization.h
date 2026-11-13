@@ -23,13 +23,15 @@
 
 #include "IPackedWeights.h"
 #include "cpu/gemm/CPUPackedWeights.h"
-#include "cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "utils/Logger.h"
 
 #include <array>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -69,7 +71,7 @@ struct PackedWeightsHeader
     uint8_t  codebook_id;              //  1B
     uint8_t  payload_bytes;            //  1B
     uint8_t  is_asymmetric;            //  1B
-    uint8_t  prepared_encoding;        //  1B  CPUNativeVNNIEncoding
+    uint8_t  prepared_encoding;        //  1B  CPUNativeQuantisedEncoding
     uint8_t  is_superblock;            //  1B
     uint8_t  has_native_blocks;        //  1B
     int32_t  data_stride;              //  4B
@@ -108,10 +110,10 @@ inline constexpr size_t PACKED_WEIGHT_SECTION_COUNT = 4;
  * after activation rotation. Rejecting unknown ordinals here prevents a
  * transferred expert from reaching a kernel with guessed metadata offsets.
  */
-inline cpu::native_vnni::CPUNativeVNNIEncoding decodePreparedEncoding(
+inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
     uint8_t value)
 {
-    using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+    using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
     switch (value)
     {
     case static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale):
@@ -139,20 +141,20 @@ inline cpu::native_vnni::CPUNativeVNNIEncoding decodePreparedEncoding(
  */
 inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header) noexcept
 {
-    using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+    using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale))
         return header.codebook_id == 11 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 13 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_vnni::preparedDataStride(Encoding::IQ3SExpandedSourceScale)) &&
-               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_vnni::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false)) &&
+               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(Encoding::IQ3SExpandedSourceScale)) &&
+               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_quantised::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false)) &&
                header.has_native_blocks == 0;
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUTSourceScale))
         return header.codebook_id == 4 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 16 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_vnni::preparedDataStride(
+               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(
                    Encoding::NibbleLUTSourceScale)) &&
                header.interleaved_block_stride == static_cast<int32_t>(
-                   cpu::native_vnni::preparedInterleavedBlockStride(Encoding::NibbleLUTSourceScale, false)) &&
+                   cpu::native_quantised::preparedInterleavedBlockStride(Encoding::NibbleLUTSourceScale, false)) &&
                header.has_native_blocks == 0;
     return !(header.codebook_id == 4 && header.is_superblock != 0 &&
              header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUT));
@@ -228,45 +230,25 @@ inline void resizeDirectReceiveSection(
 /**
  * @brief Describe prepared weights without copying their bulk data.
  *
- * @param weights Prepared CPU NativeVNNI weights.
+ * @param weights Prepared CPU NativeQuantised weights.
  * @param descriptor Self-describing scalar metadata and section lengths.
  * @param views Native read-only section addresses.
  * @return `true` when the concrete format is directly transferable.
  */
 inline bool describeTransfer(
-    const IPackedWeights &weights,
+    const cpu::native_quantised::CPUNativeQuantisedPackedWeights &packed,
     PackedWeightsTransferDescriptor &descriptor,
-    PackedWeightsConstSectionViews &views)
+    PackedWeightsConstSectionViews &views,
+    std::span<const uint8_t> native_blocks = {},
+    size_t native_block_size = 0)
 {
-    descriptor = PackedWeightsTransferDescriptor{};
-    views = PackedWeightsConstSectionViews{};
-
-    if (weights.format() != PackedWeightsFormat::CPU_NATIVE_VNNI)
-    {
-        LOG_WARN("[PackedWeightsSerialization] Cannot describe format "
-                 << static_cast<int>(weights.format())
-                 << " (only CPU_NATIVE_VNNI supported)");
-        return false;
-    }
-
-    const auto *cpu_pw =
-        dynamic_cast<const cpu::native_vnni::CPUPackedWeights *>(&weights);
-    if (!cpu_pw)
-    {
-        LOG_WARN("[PackedWeightsSerialization] dynamic_cast to CPUPackedWeights failed");
-        return false;
-    }
-
-    const auto &packed = cpu_pw->packed();
-    const auto *with_nb =
-        dynamic_cast<const cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *>(
-            &weights);
-
+    descriptor = {};
+    views = {};
     auto &header = descriptor.header;
     header.magic = PACKED_WEIGHTS_MAGIC;
     header.version = PACKED_WEIGHTS_VERSION;
     header.format =
-        static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_VNNI);
+        static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED);
     header.N = packed.N;
     header.K = packed.K;
     header.N_padded = packed.N_padded;
@@ -276,24 +258,24 @@ inline bool describeTransfer(
     header.is_asymmetric = packed.is_asymmetric ? 1 : 0;
     header.prepared_encoding = static_cast<uint8_t>(packed.encoding);
     header.is_superblock = packed.is_superblock ? 1 : 0;
-    header.has_native_blocks = with_nb ? 1 : 0;
+    header.has_native_blocks = !native_blocks.empty() ? 1 : 0;
     header.data_stride = packed.data_stride;
     header.interleaved_block_stride = packed.interleaved_block_stride;
     header.native_block_size =
-        with_nb ? static_cast<int32_t>(with_nb->nativeBlockSize()) : 0;
+        static_cast<int32_t>(native_block_size);
     std::memset(header.reserved, 0, sizeof(header.reserved));
 
     auto &sections = descriptor.sections;
     sections.interleaved_size = packed.native_interleaved.size();
     sections.payload_size = packed.payload.size();
     sections.int8_flat_size = packed.int8_flat.size();
-    sections.native_blocks_size = with_nb ? with_nb->nativeBlocks().size() : 0;
+    sections.native_blocks_size = native_blocks.size();
 
     views.data = {
         packed.native_interleaved.data(),
         packed.payload.data(),
         reinterpret_cast<const uint8_t *>(packed.int8_flat.data()),
-        with_nb ? with_nb->nativeBlocks().data() : nullptr,
+        native_blocks.data(),
     };
     views.sizes = {
         static_cast<size_t>(sections.interleaved_size),
@@ -302,6 +284,25 @@ inline bool describeTransfer(
         static_cast<size_t>(sections.native_blocks_size),
     };
     return true;
+}
+
+/** @brief Describe an owning packed object while borrowing its immutable sections. */
+inline bool describeTransfer(
+    const IPackedWeights &weights,
+    PackedWeightsTransferDescriptor &descriptor,
+    PackedWeightsConstSectionViews &views)
+{
+    descriptor = {};
+    views = {};
+    if (weights.format() != PackedWeightsFormat::CPU_NATIVE_QUANTISED)
+        return false;
+    const auto *cpu = dynamic_cast<const cpu::native_quantised::CPUPackedWeights *>(&weights);
+    if (!cpu)
+        return false;
+    const auto *native = dynamic_cast<const cpu::native_quantised::CPUPackedWeightsWithNativeBlocks *>(&weights);
+    return describeTransfer(cpu->packed(), descriptor, views,
+        native ? std::span<const uint8_t>(native->nativeBlocks().data(), native->nativeBlocks().size()) : std::span<const uint8_t>{},
+        native ? native->nativeBlockSize() : 0);
 }
 
 /**
@@ -316,7 +317,8 @@ inline bool describeTransfer(
  * @throws std::length_error when a section cannot be represented locally.
  */
 inline PackedWeightsReceiveTarget allocateTransferTarget(
-    const PackedWeightsTransferDescriptor &descriptor)
+    const PackedWeightsTransferDescriptor &descriptor,
+    std::optional<CPUWeightStoragePlacement> placement = std::nullopt)
 {
     const auto &header = descriptor.header;
     const auto &sections = descriptor.sections;
@@ -324,7 +326,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
         header.version != PACKED_WEIGHTS_VERSION ||
         !validNativeSourceScaleTupleHeader(header) ||
         header.format !=
-            static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_VNNI))
+            static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
     {
         throw std::invalid_argument(
             "Direct packed-weight transfer received invalid format metadata");
@@ -359,7 +361,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
         }
     }
 
-    cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
+    cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
     packed.N = header.N;
     packed.K = header.K;
     packed.N_padded = header.N_padded;
@@ -373,15 +375,18 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     packed.interleaved_block_stride = header.interleaved_block_stride;
     packed.workspace_data_ = nullptr;
 
-    resizeDirectReceiveSection(
-        packed.native_interleaved,
-        static_cast<size_t>(sections.interleaved_size));
-    resizeDirectReceiveSection(
-        packed.payload,
-        static_cast<size_t>(sections.payload_size));
-    resizeDirectReceiveSection(
-        packed.int8_flat,
-        static_cast<size_t>(sections.int8_flat_size));
+    if (placement)
+    {
+        packed.native_interleaved = placement->allocate<uint8_t>(sections.interleaved_size);
+        packed.payload = placement->allocate<uint8_t>(sections.payload_size);
+        packed.int8_flat = placement->allocate<int8_t>(sections.int8_flat_size);
+    }
+    else
+    {
+        resizeDirectReceiveSection(packed.native_interleaved, sections.interleaved_size);
+        resizeDirectReceiveSection(packed.payload, sections.payload_size);
+        resizeDirectReceiveSection(packed.int8_flat, sections.int8_flat_size);
+    }
 
     PackedWeightsReceiveTarget target;
     target.data[0] = packed.native_interleaved.data();
@@ -397,11 +402,10 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
 
     if (header.has_native_blocks != 0)
     {
-        std::vector<uint8_t> native_blocks(
-            static_cast<size_t>(sections.native_blocks_size));
+        auto native_blocks = placement.value_or(CPUWeightStoragePlacement::local()).allocate<uint8_t>(sections.native_blocks_size);
         target.data[3] = native_blocks.data();
         target.weights = std::make_unique<
-            cpu::native_vnni::CPUPackedWeightsWithNativeBlocks>(
+            cpu::native_quantised::CPUPackedWeightsWithNativeBlocks>(
             std::move(packed),
             std::move(native_blocks),
             static_cast<size_t>(header.native_block_size));
@@ -409,7 +413,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     else
     {
         target.weights =
-            std::make_unique<cpu::native_vnni::CPUPackedWeights>(
+            std::make_unique<cpu::native_quantised::CPUPackedWeights>(
                 std::move(packed));
     }
     return target;
@@ -422,14 +426,17 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
  * zeroes immediately before the serializer overwrites every byte.  Ordinary
  * `std::vector` callers retain their existing behavior.
  *
+ * @tparam WeightView Borrowed native packed storage or owning packed object.
  * @tparam ByteBuffer Contiguous byte container with `data()`, `clear()`, and
  *         either `resize()` or `resize_uninitialized()`.
- * @param weights Prepared CPU NativeVNNI weights.
+ * @param weights Prepared CPU NativeQuantised weights.
  * @param buffer Destination buffer, replaced with one complete wire record.
+ * @param placement Optional admitted final wire allocation; retained by aligned storage.
  * @return `true` when the format was serialized completely.
  */
-template <typename ByteBuffer>
-inline bool serializeInto(const IPackedWeights& weights, ByteBuffer& buffer)
+template <typename WeightView, typename ByteBuffer>
+inline bool serializeInto(const WeightView& weights, ByteBuffer& buffer,
+    std::optional<CPUWeightStoragePlacement> placement = std::nullopt)
 {
     PackedWeightsTransferDescriptor descriptor;
     PackedWeightsConstSectionViews views;
@@ -452,10 +459,15 @@ inline bool serializeInto(const IPackedWeights& weights, ByteBuffer& buffer)
     if constexpr (requires(ByteBuffer &candidate, size_t bytes)
                   { candidate.resize_uninitialized(bytes); })
     {
-        buffer.resize_uninitialized(total);
+        if (placement)
+            buffer = placement->template allocate<uint8_t>(total);
+        else
+            buffer.resize_uninitialized(total);
     }
     else
     {
+        if (placement)
+            throw std::invalid_argument("Accounted serialization requires allocation-owning aligned storage");
         buffer.resize(total);
     }
     uint8_t* dst = buffer.data();
@@ -527,7 +539,7 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         return nullptr;
     }
 
-    if (header.format != static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_VNNI))
+    if (header.format != static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
     {
         LOG_WARN("[PackedWeightsSerialization] Unsupported format: " << header.format);
         return nullptr;
@@ -554,8 +566,8 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         return nullptr;
     }
 
-    // Reconstruct CPUNativeVNNIPackedWeights from header + data sections.
-    cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
+    // Reconstruct CPUNativeQuantisedPackedWeights from header + data sections.
+    cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
     packed.N                        = header.N;
     packed.K                        = header.K;
     packed.N_padded                 = header.N_padded;
@@ -608,16 +620,16 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     // Read native_blocks if present.
     if (header.has_native_blocks && sections.native_blocks_size > 0)
     {
-        std::vector<uint8_t> native_blocks(sections.native_blocks_size);
+        auto native_blocks = placement.allocate<uint8_t>(sections.native_blocks_size);
         std::memcpy(native_blocks.data(), src, sections.native_blocks_size);
 
-        return std::make_unique<cpu::native_vnni::CPUPackedWeightsWithNativeBlocks>(
+        return std::make_unique<cpu::native_quantised::CPUPackedWeightsWithNativeBlocks>(
             std::move(packed),
             std::move(native_blocks),
             static_cast<size_t>(header.native_block_size));
     }
 
-    return std::make_unique<cpu::native_vnni::CPUPackedWeights>(std::move(packed));
+    return std::make_unique<cpu::native_quantised::CPUPackedWeights>(std::move(packed));
 }
 
 } // namespace packed_weights_serialization

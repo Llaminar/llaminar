@@ -5,8 +5,13 @@
  * Field visitors use structured bindings as compile-time exhaustiveness checks:
  * adding a member to a configuration aggregate requires updating its document
  * contract. Reads and writes use the same member list, including explicitness
- * and optional policy state. Routed plans retain their compact stage's global
+ * and optional policy state. A missing additive local-hot arm means the original
+ * shared-only intent; explicit C0 remains losslessly distinct. An absent additive
+ * pipeline-stage-width hint retains unconstrained automatic stage geometry. Routed plans retain their compact stage's global
  * layer origin, so saved configurations cannot rebase later PP stages to zero.
+ * Resolved local route policy and its typed diagnostic remain lossless binding
+ * values, not transferable hardware authority: the original inventory binder
+ * must reproduce both before admission or graph construction.
  * This is setup-only value serialization, not a live
  * device-state mirror or a competing physical-memory ledger.
  */
@@ -58,6 +63,10 @@ namespace
     ENUM(MoEHotExpertCacheConfig::Kind, VALUE(Percent), VALUE(Count), VALUE(Off))
     ENUM(MoERebalanceRuntimeMode, VALUE(Off), VALUE(Observe), VALUE(Dynamic))
     ENUM(PrefixCacheStorageMode, VALUE(Disabled), VALUE(Ram), VALUE(Device), VALUE(Tiered))
+    ENUM(AdaptiveGPUCachePlacementMode, VALUE(ConsumerLocal), VALUE(DeclaredRankLocal))
+    ENUM(ImmutableRowTableDistribution, VALUE(Replicated), VALUE(FixedHeadSharded))
+    ENUM(AdaptiveImmutableRowBacking, VALUE(SSD), VALUE(RAM))
+    ENUM(ImmutableRowStoragePreference, VALUE(Automatic), VALUE(VRAM), VALUE(RAM), VALUE(MemoryMapped), VALUE(HostAdaptiveRAMSSD), VALUE(AdaptiveVRAMRAMSSD))
     ENUM(PrefixCacheTerminalStateMode, VALUE(Off), VALUE(Auto), VALUE(Always))
     ENUM(PrefixCacheMoEPolicy, VALUE(Disabled), VALUE(PlacementFingerprint), VALUE(InvalidateOnRebalance))
     ENUM(MTPVerifyMode, VALUE(Greedy), VALUE(SpeculativeSampling))
@@ -65,11 +74,13 @@ namespace
     ENUM(MTPDepthPolicyMode, VALUE(Fixed), VALUE(Observe), VALUE(Dynamic))
     ENUM(MTPDepthPolicyBackend, VALUE(Any), VALUE(CPU), VALUE(CUDA), VALUE(ROCm))
     ENUM(MTPDepthPolicyModelClass, VALUE(Any), VALUE(Dense), VALUE(MoE))
+    ENUM(MTPVerifierPhysicalWidthPolicy, VALUE(BoundedLogicalBucket), VALUE(DynamicDeviceEnvelope), VALUE(ExactLogicalRows))
     ENUM(MTPDepthDefaultsProfile, VALUE(Portable), VALUE(CUDARTX3090), VALUE(ROCmMI50))
     ENUM(MTPSidecarDensePolicy, VALUE(TensorParallel), VALUE(ReplicatedPerParticipant))
     ENUM(MTPTerminalHeadPolicy, VALUE(VocabularySharded), VALUE(MirroredFullVocabulary), VALUE(Automatic))
     ENUM(RoutedExpertPlacementTopology, VALUE(SingleDomain), VALUE(TieredOverlay))
     ENUM(RoutedExpertResidencyPolicy, VALUE(Disabled), VALUE(StaticById), VALUE(HistogramTieredCache), VALUE(ExplicitMasks), VALUE(RoutedTierRebalanced))
+    ENUM(MoEOverlayNodeLocalRouteTransport, VALUE(Unresolved), VALUE(NativeCollective), VALUE(MappedSparse))
     ENUM(MoEOverlayAuthorityExecutionKind, VALUE(Unresolved), VALUE(HostResident), VALUE(DeviceResident))
     ENUM(MoEContinuationDensePolicyIntent, VALUE(Resolved), VALUE(Automatic), VALUE(Explicit))
     ENUM(MoEContinuationActivationLayout, VALUE(ReplicatedHidden), VALUE(RootOnlyHidden), VALUE(ShardedHiddenRequiresGather))
@@ -96,7 +107,7 @@ namespace
 #define MEMBERS(X) X(count)
     RECORD(AutomaticBackendDeviceCount, backend, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(only_strategies) X(prefer_backend) X(prefer_strategy) X(host_participation) X(workload) X(device_counts)
+#define MEMBERS(X) X(only_strategies) X(prefer_backend) X(prefer_strategy) X(host_participation) X(workload) X(device_counts) X(pipeline_stage_widths)
     RECORD(AutomaticOrchestrationOptions, only_backends, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(devices) X(weights) X(backend) X(routed_compute_policy) \
@@ -133,7 +144,35 @@ namespace
     X(disk_budget_bytes) X(disk_dir) X(terminal_state) X(moe_policy)
     RECORD(PrefixCacheRuntimeConfig, enabled, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(backend) X(model_class) X(min_depth) X(max_depth) X(initial_depth) \
+#define MEMBERS(X) X(protected_numerator) X(protected_denominator)
+    RECORD(CpuImmutableRowCachePolicy, aging_accesses, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(cache_physical_byte_limit) X(policy)
+    RECORD(HostAdaptiveRAMSSDRequest, maximum_cache_rows, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(backend) X(ordinal)
+    RECORD(AdaptiveGPUCacheParticipant, world_rank, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(maximum_cache_rows) X(cache_physical_byte_limit)
+    RECORD(AdaptiveGPUCacheOwnerRequest, participant, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(owners) X(coordinator)
+    RECORD(AdaptiveGPUCachePlacementRequest, mode, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(cache_physical_byte_limit) X(policy) X(consumer_overrides)
+    RECORD(AdaptiveGPULocalHotCacheRequest, maximum_cache_rows, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host) X(placement) X(source_backing) X(local_hot_cache)
+    RECORD(AdaptiveVRAMRAMSSDRequest, maximum_gpu_cache_rows, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(window_bytes) X(window_count) X(host_adaptive) X(distribution) X(gpu_adaptive)
+    RECORD(ImmutableRowTablePolicy, storage, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(tp_width) X(pp_stages) X(retained_depth) X(hidden_dim) X(main_layers) \
+    X(expert_count) X(experts_per_token) X(compute_capability_major) X(compute_capability_minor)
+    RECORD(MTPDepthPolicyScope, verifier_width_policy, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(backend) X(model_class) X(scope) X(min_depth) X(max_depth) X(initial_depth) \
     X(window_size) X(min_samples) X(cooldown_steps) X(promote_consecutive_windows) \
     X(use_generated_policy) X(promote_full_accept_rate) X(demote_zero_accept_rate) X(demote_acceptance_rate)
     RECORD(MTPDepthPolicyConfig, mode, MEMBERS)
@@ -162,8 +201,12 @@ namespace
 #define MEMBERS(X) X(expert_ids)
     RECORD(RoutedExpertInitialLayerOrder, layer, MEMBERS)
 #undef MEMBERS
+#define MEMBERS(X) X(decode)
+    RECORD(MoEOverlayNodeLocalRouteTransportPolicy, ordinary_prefill, MEMBERS)
+#undef MEMBERS
 #define MEMBERS(X) X(topology) X(continuation_domain) X(base_model_domain) X(shared_expert_domain) \
-    X(continuation_domain_spec) X(residency_policy) X(authority_execution) X(replica_cache_capacity) \
+    X(continuation_domain_spec) X(residency_policy) X(authority_execution) \
+    X(observed_route_transport) X(observed_route_diagnostic) X(replica_cache_capacity) \
     X(owner_order) X(dense_domains) X(domains) X(routed_tiers) X(initial_layer_order_overrides) \
     X(placements) X(continuation_dense_policy_intent) X(first_model_layer)
     RECORD(MoERoutedExpertPlacementPlan, enabled, MEMBERS)
@@ -173,18 +216,18 @@ namespace
     X(cpu_global_tp_all_local) X(device_map) X(device_map_numa_explicit) X(domain_definitions) \
     X(pp_stage_definitions) X(tp_degree) X(tp_scope) X(tp_devices) X(tp_weights) X(tp_local_degree) \
     X(tp_global_degree) X(pp_degree) X(pp_split) X(cpu_layers) X(cpu_layers_first) X(default_backend) \
-    X(config_file_path) X(topology_string) X(topology_file_path) X(topology_tree) X(model_path) \
+    X(config_file_path) X(topology_string) X(topology_file_path) X(topology_tree) X(model_path) X(shared_predictor) \
     X(max_seq_len) X(prefill_max_bucket_size) X(use_mmap) X(prompt) X(prompt_was_explicitly_provided) X(n_predict) X(batch_size) \
     X(n_threads) X(seed) X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
     X(single_shot_chat) X(system_prompt) X(chat_template_override) X(benchmark_mode) \
-    X(benchmark_json_output_path) X(benchmark_prompt_file_path) X(benchmark_prompt_file_was_provided) \
+    X(benchmark_campaign_path) X(benchmark_campaign_was_provided) X(benchmark_json_output_path) X(benchmark_prompt_file_path) X(benchmark_prompt_file_was_provided) \
     X(serve_mode) X(serve_port) X(serve_host) X(use_fused_attention) X(fused_attention_backend) \
     X(mpi_procs) X(hostfile) X(mpi_dry_run) X(mpi_verbose) X(mpi_no_bootstrap) X(mpi_oversubscribe) \
     X(mpi_profile) X(verbose_level) X(list_devices) X(show_help) X(max_gpu_memory_mb) \
     X(max_cpu_memory_mb) X(moe_shared_experts_gpu) X(moe_sparse_experts_cpu) X(routed_expert_compute_policy) \
     X(routed_expert_owner_order) X(moe_hot_expert_cache) X(moe_routed_prefill) X(moe_rebalance) \
     X(moe_routed_expert_plan) X(activation_precision) X(kv_cache_precision) X(tp_allreduce_precision_override) \
-    X(prefix_cache) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
+    X(prefix_cache) X(ngram_table_policy) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
     X(cpu_compute_fraction) X(disable_gpu_tp) X(disable_cpu_tp) X(min_layers_per_domain)
     RECORD(OrchestrationConfig, planning_mode, MEMBERS)
 #undef MEMBERS
@@ -224,6 +267,17 @@ namespace
         template<class T> void operator()(const char *name, T &value)
         {
             const auto field_path = path + "." + name;
+            // This additive optional arm has no intent in pre-feature shared-only
+            // documents. Every original field remains mandatory and lossless.
+            if constexpr (std::same_as<T, std::optional<AdaptiveGPULocalHotCacheRequest>>)
+                if (json.is_object() && !json.contains(name) && std::string_view(name) == "local_hot_cache")
+                { value.reset(); return; }
+            // Older documents have no authored stage-shape hint. Keep this
+            // additive optional field absent while rejecting every other omission.
+            if constexpr (std::same_as<T, std::optional<std::vector<int>>>)
+                if (path == "$.configuration.automatic_planning" && json.is_object() &&
+                    !json.contains(name) && std::string_view(name) == "pipeline_stage_widths")
+                { value.reset(); return; }
             if (!json.is_object() || !json.contains(name)) invalid(field_path, "missing field");
             value = decode<T>(json.at(name), field_path);
             consumed.emplace(name);
@@ -253,6 +307,7 @@ namespace
             return value;
         }
         else if constexpr (std::same_as<T, std::string>) return value;
+        else if constexpr (std::same_as<T, SharedPredictorGGUFSource>) return encode(value.path(), path);
         else if constexpr (std::same_as<T, ExecutionRankSelection>)
             return encode(value.discoveryRanks(), path);
         else if constexpr (std::same_as<T, OrchestrationPlanningWorkload>)
@@ -274,6 +329,8 @@ namespace
             invalid(path, "recursive topology-tree execution is unimplemented");
         else
         {
+            if constexpr (std::same_as<T, MTPDepthPolicyScope>)
+                if (!value.valid()) invalid(path, "incomplete or invalid frozen learned-policy scope");
             Writer writer{.path = path};
             fields(value, writer);
             return std::move(writer.json);
@@ -321,6 +378,8 @@ namespace
             if (!json.is_string()) invalid(path, "expected string");
             return json.get<std::string>();
         }
+        else if constexpr (std::same_as<T, SharedPredictorGGUFSource>)
+            return SharedPredictorGGUFSource(decode<std::string>(json, path));
         else if constexpr (std::same_as<T, ExecutionRankSelection>)
             return ExecutionRankSelection(decode<std::vector<int>>(json, path));
         else if constexpr (std::same_as<T, OrchestrationPlanningWorkload>)
@@ -374,6 +433,8 @@ namespace
             Reader reader{.json = json, .path = path};
             fields(result, reader);
             reader.finish();
+            if constexpr (std::same_as<T, MTPDepthPolicyScope>)
+                if (!result.valid()) invalid(path, "incomplete or invalid frozen learned-policy scope");
             return result;
         }
     }
@@ -381,6 +442,7 @@ namespace
 
 std::string serializeOrchestrationConfig(const OrchestrationConfig &config)
 {
+    config.ngram_table_policy.validate();
     // A tree string is just as unsupported as its parsed form. Do not emit a
     // document that quietly drops this execution intent on the receiving rank.
     if (!config.topology_string.empty() || !config.topology_file_path.empty())
@@ -416,6 +478,7 @@ OrchestrationConfig deserializeOrchestrationConfig(std::string_view document)
         OrchestrationConfig result;
         reader("configuration", result);
         reader.finish();
+        result.ngram_table_policy.validate();
         if (!result.topology_string.empty() || !result.topology_file_path.empty())
             invalid("$.configuration.topology", "recursive topology-tree execution is unimplemented");
         return result;

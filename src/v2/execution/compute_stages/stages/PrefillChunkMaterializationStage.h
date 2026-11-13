@@ -56,6 +56,7 @@ namespace llaminar2
             int request_row_capacity = 0;
             int bucket_seq_len = 0;
             int pad_token_id = 0;
+            bool require_exact_rows = false; ///< Check device progression against the exact graph width.
             uint64_t capture_identity = 0;
             std::string stage_name = "prefill_chunk_materialization";
         };

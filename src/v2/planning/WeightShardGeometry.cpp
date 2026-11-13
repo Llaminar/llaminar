@@ -6,12 +6,13 @@
  * and DeviceShardingAssignment as production loading. An input shard keeps N
  * intact and reduces K; an output shard does the converse. Expert apportionment
  * changes only the number of complete matrices. An explicit projection-ownership
- * contract may instead retain every expert's down output slice, without changing
- * K; that is never inferred from an ordinary TP fraction. Physical packing remains
+ * contract may instead retain every expert's exact output or compact input
+ * slice; that is never inferred from an ordinary TP fraction. Physical packing remains
  * owned by its existing format contracts and PhysicalMemoryAuthority admission.
  */
 #include "planning/WeightShardGeometry.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/PlanningModelMetadata.h"
 #include "config/GDNHeadAssignment.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "loaders/WeightIdentity.h"
@@ -284,32 +285,64 @@ namespace llaminar2
             sharding_ = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
     }
 
+    WeightSourceStorageView WeightShardGeometryResolver::sourceStorageView(const TensorSizeInfo &tensor) const
+    {
+        return total_shards_ == 1 || sharding_->getModeAndDimension(tensor.name).first == WeightShardingMode::Replicate
+            ? WeightSourceStorageView::WholeOriginal : WeightSourceStorageView::DeclaredSlice;
+    }
+
     WeightShardGeometry WeightShardGeometryResolver::resolve(
         const TensorSizeInfo &tensor,
         const MoEExpertProjectionOwnership &ownership, size_t owned_experts) const
     {
-        const auto role = inferWeightRole(tensor.name);
+        return resolveProjectionClassified(tensor,inferWeightRole(tensor.name),ownership,owned_experts);
+    }
+
+    WeightShardGeometry WeightShardGeometryResolver::resolve(const PlanningClassifiedTensor &tensor,
+        const MoEExpertProjectionOwnership &ownership,size_t owned_experts) const
+    {
+        if(&tensor.profile()!=&profile_)throw std::invalid_argument("Preclassified tensor belongs to another original metadata source");
+        return resolveProjectionClassified(tensor.tensor(),tensor.role(),ownership,owned_experts);
+    }
+
+    WeightShardGeometry WeightShardGeometryResolver::resolveProjectionClassified(const TensorSizeInfo &tensor,WeightRole role,
+        const MoEExpertProjectionOwnership &ownership,size_t owned_experts) const
+    {
         const auto projection = ownership.projection(role);
         if (ownership.geometry().experts != profile_.expert_count)
             throw std::invalid_argument("Projection ownership expert axis disagrees with model metadata");
         // Explicit physical residency bypasses the schema's ordinary TP share.
-        // Then apply the *same* output interval that preparation materializes.
-        auto local = resolve(tensor, ownership.residentExperts(role, owned_experts));
+        // Then apply the same exact N/K rectangle that preparation materializes.
+        // This pure geometry value grants no runtime or movement support.
+        auto local = resolveClassified(tensor,role,ownership.residentExperts(role, owned_experts));
         if (!local.matrix() || local.matrix()->rows != static_cast<size_t>(projection.source_rows) ||
             local.matrix()->columns != static_cast<size_t>(projection.source_columns))
             throw std::invalid_argument("Projection ownership source matrix disagrees with " + tensor.name);
         auto matrix = *local.matrix();
         matrix.rows = static_cast<size_t>(projection.rows);
+        matrix.columns = static_cast<size_t>(projection.columns);
         return {checkedProduct(checkedProduct(matrix.rows, matrix.columns), matrix.instances), matrix};
     }
 
     WeightShardGeometry WeightShardGeometryResolver::resolve(
         const TensorSizeInfo &tensor, std::optional<size_t> resident_experts) const
     {
+        return resolveClassified(tensor,inferWeightRole(tensor.name),resident_experts);
+    }
+
+    WeightShardGeometry WeightShardGeometryResolver::resolve(
+        const PlanningClassifiedTensor &tensor,std::optional<size_t> resident_experts) const
+    {
+        if(&tensor.profile()!=&profile_)throw std::invalid_argument("Preclassified tensor belongs to another original metadata source");
+        return resolveClassified(tensor.tensor(),tensor.role(),resident_experts);
+    }
+
+    WeightShardGeometry WeightShardGeometryResolver::resolveClassified(
+        const TensorSizeInfo &tensor,WeightRole role,std::optional<size_t> resident_experts) const
+    {
         const auto &profile = profile_;
         const auto &assignment = assignment_;
         const int shard_index = shard_index_, total_shards = total_shards_;
-        const WeightRole role = inferWeightRole(tensor.name);
         const bool expert = isRoutedExpertRole(role);
         if (resident_experts && (!expert || profile.expert_count <= 0 ||
                 *resident_experts > static_cast<size_t>(profile.expert_count)))

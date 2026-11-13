@@ -9,10 +9,14 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * A passive borrowed original GGUF directory can authenticate source-derived
+ * declarations without opening the mutable loader or materializing weights.
  */
 
 #pragma once
 
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "../loaders/IModelLoader.h"
 #include "../loaders/IWeightManager.h"
 #include <memory>
@@ -21,6 +25,13 @@
 
 namespace llaminar2
 {
+namespace qwen4exp {class PooledImmutableRetainedParticipants;class PooledImmutableLocalHotPreparedStorage;}
+
+    class HostImmutableRowProvider;
+    class ImmutableLookupSetupObservation;
+    class ResidentImmutableRowTable;
+    class ResolvedImmutableRowTablePlacement;
+    namespace qwen4exp { class ImmutableLookupExecutionBoundary; }
 
     /**
      * @brief Interface for complete model context (loader + weights + metadata)
@@ -56,6 +67,21 @@ namespace llaminar2
     class IModelContext
     {
     public:
+        /** @brief Bind actual selected CPU roles after original final admission, before source/graph materialization. */
+        virtual void bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations>,
+            std::shared_ptr<PhysicalMemoryAuthority>,std::span<const RetainedHostServiceInstance>)
+        { throw std::logic_error("Model context does not own admitted retained CPU service declarations"); }
+        /** @brief Exclusively borrow the same admitted worker across sequential runner lifetimes.
+         * @param consumer Exact original rank/device consumer selected at admission.
+         * @param role Original independently progressing CPU service role.
+         * @param memory Same admitted PMA object and shared ownership control block.
+         * @return Exclusive idle execution borrow retaining the original worker/program/PMA.
+         * @throws std::logic_error For foreign, absent, consumed, busy or concurrently borrowed instances.
+         * @throws std::exception If first native materialization fails; failure stays consumed.
+         */
+        virtual RetainedHostServiceBorrow borrowRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,
+            RetainedHostServiceRole role,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+        { throw std::logic_error("Model context has no original retained CPU service owner"); }
         virtual ~IModelContext() = default;
 
         // =========================================================================
@@ -103,6 +129,15 @@ namespace llaminar2
         virtual std::shared_ptr<IModelLoader> loader() = 0;
 
         /**
+         * @brief Borrow the already-owned complete original GGUF directory without materialization.
+         * @return Context-owned immutable directory, or null only when source metadata is absent.
+         * @note The borrow lasts no longer than this context. This accessor
+         *       performs no load, tensor preparation, allocation or backend query.
+         */
+        virtual const GGUFModel *ggufDirectory() const noexcept { return nullptr; }
+
+
+        /**
          * @brief Get the weight manager interface
          *
          * For production: Returns real WeightManager
@@ -111,6 +146,58 @@ namespace llaminar2
          * @return Shared pointer to weight manager interface
          */
         virtual std::shared_ptr<IWeightManager> weightManager() = 0;
+
+        /**
+         * @brief Shared rank-owned native row service, absent for models without a table.
+         * @return One admitted table shared by every local graph participant.
+         * A row-consuming graph must reject an absent service; ordinary weight
+         * loading is never a substitute for the typed row-store owner.
+         */
+        virtual std::shared_ptr<HostImmutableRowProvider> hostImmutableRowProvider() const { return {}; }
+
+        /**
+         * @brief Borrow the one single-GPU adaptive lookup domain retained by this source.
+         * @param device Exact actual GPU consumer; expert-only endpoints cannot borrow its roots.
+         * @return Original boundary or absent when this model has no adaptive GPU owner.
+         * @note A graph requiring adaptive lookup must reject absence; no other mode substitutes.
+         */
+        virtual std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptiveImmutableLookupBoundary(DeviceId device) const
+        { (void)device;return {}; }
+
+        /** @return Original source-owned remote participant domain, absent only when this layout has no remote owners. */
+        virtual std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId) const { return {}; }
+
+        /**
+         * @brief Borrow this actual compute participant's separately admitted immutable hot rows.
+         * @param device Original consumer endpoint; ownership-only followers have no local hot cache.
+         * @return Same model-lifetime roots, including a mandatory C0 frame; absent for shared-only policy.
+         * @note Presence does not imply a hit or grant a source role. The captured transaction owns pins.
+         */
+        virtual std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> adaptiveImmutableLookupLocalHot(DeviceId) const { return {}; }
+
+        /** @return Historical admitted lookup capacities after complete original setup, never live occupancy. */
+        virtual std::shared_ptr<const ImmutableLookupSetupObservation> immutableLookupSetupObservation()const {return {};}
+
+        /** @return Exact sealed model-owned placement; retained contexts cannot replace its owners/tier. */
+        virtual std::shared_ptr<const ResolvedImmutableRowTablePlacement> resolvedImmutableRowTablePlacement() const
+        { return {}; }
+
+
+        /** @brief Borrow the admitted source-native whole/range GPU owner for this exact consumer.
+         * @param device Exact local GPU named by the resolved table placement.
+         * @return Immutable source owner shared across graph families, absent if not resident here.
+         * Captured consumers must retain the owner through executable retirement.
+         */
+        virtual std::shared_ptr<const ResidentImmutableRowTable> residentImmutableRowTable(DeviceId device) const
+        { (void)device; return {}; }
+
+        /** @brief Observe already-owned immutable GPU bytes for the existing model-retention BOM.
+         * @param device Exact local GPU; no capacity observation or allocation is performed.
+         * @return Actual native range/allocation bytes retained on that device, zero in host modes.
+         */
+        virtual std::size_t residentImmutableRowTableBytes(DeviceId device) const
+        { (void)device; return 0; }
+
 
         // =========================================================================
         // Convenience Hyperparameter Accessors

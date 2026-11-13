@@ -11,11 +11,18 @@
  * 2. Retains a submission view borrowing context-owned hipBLAS handles, so
  *    expert retirement never tears down a library or drains unrelated streams.
  * 3. Handles tensor type introspection in multiply_tensor()
+ * Custom FP32/native16 consumers embed exact immutable addresses directly in
+ * captured arguments; real BLAS/physical-half table consumers retain arena tables.
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmFloatingPointGemmKernel.h"
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
@@ -62,6 +69,32 @@ namespace llaminar2
         namespace
         {
             std::atomic<uint32_t> g_rocm_fp32_gemm_workspace_slice_counter{0};
+            /**
+             * @brief Seal already validated prepared bindings into typed native arguments.
+             * @tparam Weight Original physical FP32 or native16 source word.
+             * @param a Original persistent FP32 input addresses.
+             * @param b Original prepared addresses; legacy table staging stores them opaquely.
+             * @param c Original persistent FP32 output addresses.
+             * @return Independent immutable value snapshot; no vector lifetime is borrowed.
+             * @throws std::invalid_argument For incomplete cardinality/addresses.
+             * @throws std::length_error For more than the canonical eight live entries.
+             */
+            template<class Weight>
+            FixedFloatingProjectionGroup<Weight> capturedProjectionBindings(
+                const std::vector<const float *> &a,const std::vector<const float *> &b,
+                const std::vector<float *> &c)
+            {
+                if (a.empty() || a.size()!=b.size() || a.size()!=c.size())
+                    throw std::invalid_argument("Custom floating projection binding cardinality differs");
+                if (a.size()>floating_gemm_abi::kMaxBatchedProjections)
+                    throw std::length_error("Custom floating projection binding exceeds capture ABI");
+                auto group=FixedFloatingProjectionGroup<Weight>::single(
+                    a[0],reinterpret_cast<const Weight *>(b[0]),c[0]);
+                for (std::size_t i=1;i<a.size();++i)
+                    group.append(a[i],reinterpret_cast<const Weight *>(b[i]),c[i]);
+                return group;
+            }
+
         }
 
         // =====================================================================
@@ -300,6 +333,13 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
+            if (m > 0 && currentProjectionRowWork(m) && C && C->isMapped())
+                throw std::invalid_argument("Decode projection work requires native unmapped output storage");
+
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (!A || !C)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
@@ -356,7 +396,7 @@ namespace llaminar2
                     throw std::invalid_argument("Half operands require declared GDN projection geometry");
                 auto *bank = workspace ? workspace : workspace_;
                 const float *source = d_A + static_cast<size_t>(activation_row_offset) * k;
-                if (m == 1 || VerifierKernelModeScope::active() || fixed_columns || VerifierKernelModeScope::rowsFor(m))
+                if (m == 1 || VerifierKernelModeScope::active() || currentProjectionRowWork(m) || fixed_columns || VerifierKernelModeScope::rowsFor(m))
                 {
                     if (alpha != 1.0f || beta != 0.0f)
                         throw std::invalid_argument("Fixed half projections require the declared unit epilogue");
@@ -456,21 +496,15 @@ namespace llaminar2
                     return false;
                 }
 
-                std::vector<const float *> a_ptrs{d_A};
-                std::vector<const float *> b_ptrs{reinterpret_cast<const float *>(d_weights_)};
-                std::vector<float *> c_ptrs{d_C};
-                if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                if (!validateROCmWorkspaceBinding(effective_workspace,rocm_device_id_,
+                        "ROCmFloatingPointGemmKernel::custom_fp32x16_bindings"))
                     return false;
-
                 const int weight_dtype = (precision_ == Precision::BF16) ? 1 : 0;
                 bool success = rocmFp32x16_batched_projection(
-                    d_batch_A_ptrs_,
-                    d_batch_B_ptrs_,
-                    d_batch_C_ptrs_,
+                    FixedFP32x16ProjectionGroup::single(d_A,static_cast<const std::uint16_t *>(d_weights_),d_C),
                     m,
                     n,
                     k,
-                    1,
                     weight_dtype,
                     rocm_device_id_,
                     gpu_stream_,
@@ -531,27 +565,18 @@ namespace llaminar2
                 requires_small_n_projection &&
                 d_weights_ &&
                 gpu_stream_ &&
-                effective_workspace &&
-                effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS) &&
-                effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS) &&
-                effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS);
+                effective_workspace;
 
             if (can_use_small_n_projection)
             {
-                std::vector<const float *> a_ptrs{d_A};
-                std::vector<const float *> b_ptrs{static_cast<const float *>(d_weights_)};
-                std::vector<float *> c_ptrs{d_C};
-                if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                if (!validateROCmWorkspaceBinding(effective_workspace,rocm_device_id_,
+                        "ROCmFloatingPointGemmKernel::custom_fp32_bindings"))
                     return false;
-
                 bool success = rocmFp32_small_n_batched_projection(
-                    d_batch_A_ptrs_,
-                    d_batch_B_ptrs_,
-                    d_batch_C_ptrs_,
+                    FixedFP32ProjectionGroup::single(d_A,static_cast<const float *>(d_weights_),d_C),
                     m,
                     n,
                     k,
-                    1,
                     rocm_device_id_,
                     gpu_stream_,
                     VerifierKernelModeScope::rowsFor(m));
@@ -746,6 +771,15 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+            for (const auto &projection : projections)
+                if (projection.original_output_slice)
+                    throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
+            // Declarations are validated before work/arithmetic path selection.
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (!input || projections.empty())
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
@@ -762,7 +796,7 @@ namespace llaminar2
                 const bool fixed = std::any_of(projections.begin(), projections.end(),
                     [](const auto &p) { return p.kernel &&
                         FloatingOutputPartitionScope::requiresFixedColumns(*p.kernel, p.n); });
-                if (m == 1 || VerifierKernelModeScope::active() || fixed || VerifierKernelModeScope::rowsFor(m))
+                if (m == 1 || VerifierKernelModeScope::active() || currentProjectionRowWork(m) || fixed || VerifierKernelModeScope::rowsFor(m))
                     return multiply_fused_verifier_rows_decode_equivalent(input, projections, m, k, mpi_ctx, workspace);
                 if (input->native_type() != TensorType::FP32 || m <= 0 || k != static_cast<int>(K_) ||
                     input->numel() < static_cast<size_t>(m) * static_cast<size_t>(k))
@@ -909,9 +943,6 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
-                    return false;
-
                 const int batch_count = static_cast<int>(group_indices.size());
                 /*
                  * GDN alpha/beta projections use the same fixed reduction tree
@@ -930,14 +961,14 @@ namespace llaminar2
 
                 if (use_small_n_fp32)
                 {
+                    if (!validateROCmWorkspaceBinding(effective_workspace,rocm_device_id_,
+                            "ROCmFloatingPointGemmKernel::custom_fused_fp32_bindings"))
+                        return false;
                     if (!rocmFp32_small_n_batched_projection(
-                            d_batch_A_ptrs_,
-                            d_batch_B_ptrs_,
-                            d_batch_C_ptrs_,
+                            capturedProjectionBindings<float>(a_ptrs,b_ptrs,c_ptrs),
                             m,
                             seed.n,
                             k,
-                            batch_count,
                             rocm_device_id_,
                             gpu_stream_,
                     VerifierKernelModeScope::rowsFor(m)))
@@ -965,6 +996,9 @@ namespace llaminar2
                 }
                 else
                 {
+                    // Only the real BLAS consumer requires device pointer tables.
+                    if (!stageBatchedPointers(a_ptrs,b_ptrs,c_ptrs,effective_workspace))
+                        return false;
                     hipblas_kernel_->bindWorkspace(effective_workspace);
                     if (!hipblas_kernel_->executeBatchedOnStream(
                             ExplicitGPUStream{gpu_stream_},
@@ -1045,6 +1079,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
             for (const auto &projection : projections)
                 if (projection.kernel && projection.kernel->floatingActivationOperandPrecision() != operand_precision_)
                     throw std::invalid_argument("Floating verifier group mixes activation operand policies");
@@ -1234,7 +1272,7 @@ namespace llaminar2
                         c_ptrs.push_back(d_output);
                     }
 
-                    if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                    if (half_operands && !stageBatchedPointers(a_ptrs,b_ptrs,c_ptrs,effective_workspace))
                         return false;
 
                     // Both storage families share serial decode's fixed tree.
@@ -1245,21 +1283,18 @@ namespace llaminar2
                             VerifierKernelModeScope::rowsFor(m))
                         : precision_ == Precision::FP32
                         ? rocmFp32_small_n_batched_projection(
-                            d_batch_A_ptrs_, d_batch_B_ptrs_, d_batch_C_ptrs_,
-                            m, seed.n, k, static_cast<int>(group_count),
-                            rocm_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m))
+                            capturedProjectionBindings<float>(a_ptrs,b_ptrs,c_ptrs),
+                            m, seed.n, k,
+                            rocm_device_id_, gpu_stream_, VerifierKernelModeScope::prefixForFloating(m), VerifierKernelModeScope::requestsFor(m))
                         : rocmFp32x16_batched_projection(
-                            d_batch_A_ptrs_,
-                            d_batch_B_ptrs_,
-                            d_batch_C_ptrs_,
+                            capturedProjectionBindings<std::uint16_t>(a_ptrs,b_ptrs,c_ptrs),
                             m,
                             seed.n,
                             k,
-                            static_cast<int>(group_count),
                             weight_dtype,
                             rocm_device_id_,
                             gpu_stream_,
-                            VerifierKernelModeScope::rowsFor(m));
+                            VerifierKernelModeScope::prefixForFloating(m), VerifierKernelModeScope::requestsFor(m));
                     if (!launched)
                     {
                         LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection kernel failed"
@@ -1314,6 +1349,10 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             return run_fixed_order_swiglu_down(
                 gate,
                 up,

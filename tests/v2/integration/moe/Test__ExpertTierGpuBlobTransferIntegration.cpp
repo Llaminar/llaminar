@@ -2,7 +2,7 @@
  * @file Test__ExpertTierGpuBlobTransferIntegration.cpp
  * @brief Real-device CUDA/ROCm packed and floating expert relay proof.
  *
- * The test transfers a production-shaped separated NativeVNNI projection in
+ * The test transfers a production-shaped separated NativeQuantised projection in
  * CUDA-to-ROCm, ROCm-to-CUDA, and same-backend/no-P2P directions, then repeats
  * the cross-backend production lane for contiguous FP16, BF16, and FP32
  * payloads. It validates every byte, exercises the double-buffered async-DMA
@@ -10,6 +10,8 @@
  * while migration remains a background transaction.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
+#include "../../fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -404,8 +406,7 @@ namespace llaminar2
                     .slot_capacity = 2u,
                     .execution_lane_capacity = 2u,
                     .execution_streams =
-                        TransferEngine::instance()
-                            .allocatePersistentTransferExecutionLanes(
+                        ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                 2u,
                                 source_device,
                                 "blob_progress_source:" + identity),
@@ -418,8 +419,7 @@ namespace llaminar2
                     .slot_capacity = 2u,
                     .execution_lane_capacity = 2u,
                     .execution_streams =
-                        TransferEngine::instance()
-                            .allocatePersistentTransferExecutionLanes(
+                        ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                 2u,
                                 destination_device,
                                 "blob_progress_destination:" + identity),
@@ -1203,7 +1203,7 @@ namespace llaminar2
                 .source_device = source_device,
                 .destination_device = destination_device,
             };
-            const NativeVnniSourceIdentity source_identity{
+            const NativeQuantisedSourceIdentity source_identity{
                 .codebook_id = 5,
                 .is_superblock = false,
                 .present = true,
@@ -1223,10 +1223,10 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        manifest.maximum_chunk_bytes,
                                        1u,
-                                       source_device)
+                                       source_device,
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          source_device,
                                          "remote_blob_source:" + direction)
@@ -1243,10 +1243,10 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        manifest.maximum_chunk_bytes,
                                        1u,
-                                       destination_device)
+                                       destination_device,
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          destination_device,
                                          "remote_blob_destination:" + direction)
@@ -1594,10 +1594,10 @@ namespace llaminar2
                                        .allocatePersistentTransferStagingSlices(
                                            manifest.maximum_chunk_bytes,
                                            1u,
-                                           source_device)
+                                           source_device,
+                                           HostTransferAccess::CrossProcessReadable)
                                        .front(),
-                        .execution = TransferEngine::instance()
-                                         .allocatePersistentTransferExecutionLanes(
+                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                              1u,
                                              source_device,
                                              "remote_float_source:" + direction)
@@ -1614,10 +1614,10 @@ namespace llaminar2
                                        .allocatePersistentTransferStagingSlices(
                                            manifest.maximum_chunk_bytes,
                                            1u,
-                                           destination_device)
+                                           destination_device,
+                                           HostTransferAccess::CrossProcessReadable)
                                        .front(),
-                        .execution = TransferEngine::instance()
-                                         .allocatePersistentTransferExecutionLanes(
+                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                              1u,
                                              destination_device,
                                              "remote_float_destination:" + direction)
@@ -1795,71 +1795,71 @@ namespace llaminar2
 #if !defined(HAVE_CUDA)
             GTEST_SKIP() << "CUDA is required";
 #else
-            IBackend *cuda = getCUDABackend();
-            if (!cuda || cuda->deviceCount() < 2)
-                GTEST_SKIP() << "Two CUDA devices are required";
+            // Both unavailable directions are original observations, never
+            // a disabled native edge or an inferred absence. Idle discovery
+            // ranks retain the original setup/retirement consensus.
+            const auto pairFor = [](const RankInventory &rank) {
+                return test::observedNativeDirectedPeerPair(rank, DeviceType::CUDA,
+                    [](DeviceId destination, DeviceId source) -> std::optional<bool> {
+                        const auto forward = DeviceManager::instance().peerAccessAvailable(destination, source);
+                        const auto reverse = DeviceManager::instance().peerAccessAvailable(source, destination);
+                        if (!forward || !reverse)
+                            throw std::invalid_argument("No-peer relay requires both original directed observations");
+                        return !*forward && !*reverse;
+                    });
+            };
+            const std::array families{test::NativeReplayFamily{DeviceType::CUDA, 2}};
+            test::originalRankLocalReplay(std::span<const test::NativeReplayFamily>(families), [&](const auto &) {
+                const auto mpi = MPIContextFactory::global();
+                const auto pair = pairFor(mpi->clusterInventory()->getRank(mpi->rank()));
+                ASSERT_TRUE(pair.has_value());
+                ScopedHeterogeneousBlobPerfStats perf_stats;
+                runHeterogeneousBlobDirection(
+                    (*pair)[0],
+                    (*pair)[1],
+                    1009u,
+                    ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess);
+                runHeterogeneousBlobDirection(
+                    (*pair)[1],
+                    (*pair)[0],
+                    1013u,
+                    ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess);
 
-            DeviceManager &devices = DeviceManager::instance();
-            devices.initialize(-1, false);
-            const auto zero_reads_one = devices.peerAccessAvailable(
-                DeviceId::cuda(0), DeviceId::cuda(1));
-            const auto one_reads_zero = devices.peerAccessAvailable(
-                DeviceId::cuda(1), DeviceId::cuda(0));
-            ASSERT_TRUE(zero_reads_one.has_value());
-            ASSERT_TRUE(one_reads_zero.has_value());
-            if (*zero_reads_one || *one_reads_zero)
-            {
-                GTEST_SKIP()
-                    << "This certificate requires a CUDA pair with no directed "
-                       "peer access; native peer lanes are authoritative here";
-            }
-
-            ScopedHeterogeneousBlobPerfStats perf_stats;
-            runHeterogeneousBlobDirection(
-                DeviceId::cuda(0),
-                DeviceId::cuda(1),
-                1009u,
-                ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess);
-            runHeterogeneousBlobDirection(
-                DeviceId::cuda(1),
-                DeviceId::cuda(0),
-                1013u,
-                ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess);
-
-            double completed = 0.0;
-            for (const auto &record :
-                 PerfStatsCollector::snapshot({"moe_overlay_residency"}))
-            {
-                if (record.kind != PerfStatRecord::Kind::Counter ||
-                    record.name != "gpu_host_relay_transfers_completed")
+                double completed = 0.0;
+                for (const auto &record :
+                     PerfStatsCollector::snapshot({"moe_overlay_residency"}))
                 {
-                    continue;
+                    if (record.kind != PerfStatRecord::Kind::Counter ||
+                        record.name != "gpu_host_relay_transfers_completed")
+                    {
+                        continue;
+                    }
+                    const auto relay_kind = record.tags.find("relay_kind");
+                    const auto background = record.tags.find("background");
+                    const auto blocking = record.tags.find("blocking");
+                    const auto source_transport =
+                        record.tags.find("source_transport");
+                    const auto stream_class =
+                        record.tags.find("stream_class");
+                    if (relay_kind != record.tags.end() &&
+                        relay_kind->second == "same_backend_no_peer" &&
+                        background != record.tags.end() &&
+                        background->second == "true" &&
+                        blocking != record.tags.end() &&
+                        blocking->second == "false" &&
+                        source_transport != record.tags.end() &&
+                        source_transport->second ==
+                            "retained_mapped_progress_epoch" &&
+                        stream_class != record.tags.end() &&
+                        stream_class->second == "latency_critical")
+                    {
+                        completed += record.value;
+                    }
                 }
-                const auto relay_kind = record.tags.find("relay_kind");
-                const auto background = record.tags.find("background");
-                const auto blocking = record.tags.find("blocking");
-                const auto source_transport =
-                    record.tags.find("source_transport");
-                const auto stream_class =
-                    record.tags.find("stream_class");
-                if (relay_kind != record.tags.end() &&
-                    relay_kind->second == "same_backend_no_peer" &&
-                    background != record.tags.end() &&
-                    background->second == "true" &&
-                    blocking != record.tags.end() &&
-                    blocking->second == "false" &&
-                    source_transport != record.tags.end() &&
-                    source_transport->second ==
-                        "retained_mapped_progress_epoch" &&
-                    stream_class != record.tags.end() &&
-                    stream_class->second == "latency_critical")
-                {
-                    completed += record.value;
-                }
-            }
-            EXPECT_EQ(completed, 2.0)
-                << "PerfStats must prove both no-P2P CUDA movements used the "
-                   "non-blocking background host relay";
+                EXPECT_EQ(completed, 2.0)
+                    << "PerfStats must prove both no-P2P CUDA movements used the "
+                       "non-blocking background host relay";
+            }, [&](const RankInventory &rank) { return pairFor(rank).has_value(); });
 #endif
         }
 

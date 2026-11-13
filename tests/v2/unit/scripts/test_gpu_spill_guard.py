@@ -4,7 +4,9 @@
 import importlib.util
 import argparse
 import copy
+import io
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -82,6 +84,49 @@ class LauncherTest(unittest.TestCase):
             ["/usr/bin/ccache", "clang++", "--ccache-skip", "-Xarch_device",
              "--ccache-skip", "-foptimization-record-file=-", "-c", "kernel.hip"])
 
+    def test_final_link_stdout_routing_survives_ccache_classification(self):
+        """The new driver must retain the real linker's stdout option on cache misses."""
+        flags = ["-Xarch_device", "-foptimization-record-file=-", "-Xoffload-linker",
+                 "-plugin-opt=opt-remarks-filename=-", "-c", "kernel.hip"]
+        self.assertEqual(guard.preserve_device_diagnostics(["clang++", *flags]), ["clang++", *flags])
+        self.assertEqual(guard.preserve_device_diagnostics(["ccache", "clang++", *flags]),
+            ["ccache", "clang++", "--ccache-skip", "-Xarch_device", "--ccache-skip",
+             "-foptimization-record-file=-", "--ccache-skip", "-Xoffload-linker",
+             "--ccache-skip", "-plugin-opt=opt-remarks-filename=-", "-c", "kernel.hip"])
+        # Preserve complete native option pairs without enumerating every
+        # future linker/device operand in this diagnostic transport layer.
+        other = ["-Xoffload-linker", "--lto-partitions=2", "-Xarch_device", "-O3"]
+        self.assertEqual(guard.preserve_device_diagnostics(["ccache", "clang++", *other]),
+            ["ccache", "clang++", "--ccache-skip", "-Xoffload-linker", "--ccache-skip",
+             "--lto-partitions=2", "--ccache-skip", "-Xarch_device", "--ccache-skip", "-O3"])
+
+    def test_final_link_stdout_is_required_for_every_target_and_helper_on_replay(self):
+        """Replay actual guard ownership with typed child output, never a compiler certificate."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, sidecar = root / "cached.o", root / "-.opt.ld.yaml"
+            good = (AllocationTest.record("kernel") + AllocationTest.record("helper")) * 2
+            sidecar.write_text(good)
+            args = ["--llvm-bin", "/llvm", "--config", "Release", "--policy-id", "routing", "--",
+                    "ccache", "clang++", "-Xoffload-linker", "-plugin-opt=opt-remarks-filename=-",
+                    "-o", str(output)]
+            kernels = [guard.KernelSpills("kernel", 0, 0)] * 2
+            cases = [(good, 0), (good, 0), ("", 1),
+                     (AllocationTest.record("kernel") + AllocationTest.record("helper"), 1),
+                     (good + AllocationTest.record("helper", [("Spill", 4)]), 1)]
+            for text, expected in cases:
+                output.write_bytes(b"owned final object fixture")
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(expected=expected, stdout_records=len(text)), \
+                        patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, text, "")), \
+                        patch.object(guard, "audit_rocm_object", return_value=kernels), \
+                        patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+                    self.assertEqual(guard.main(args), expected)
+                self.assertEqual(output.exists(), expected == 0)
+                self.assertEqual(sidecar.read_text(), good)  # Never adopt/delete shared sidecar evidence.
+                if expected:
+                    self.assertIn("memory register spills are forbidden", stderr.getvalue())
+
     def test_output_and_response_file(self):
         with tempfile.TemporaryDirectory() as directory:
             response = Path(directory) / "compile.rsp"
@@ -139,6 +184,40 @@ class LauncherTest(unittest.TestCase):
             guard.audit_device_allocations({"kernel": guard.FunctionAllocation(),
                 "other_arch": guard.FunctionAllocation([guard.StackSlot("Spill", 4)])}, kernels)
 
+    @staticmethod
+    def partition_notes(parts):
+        """Preserve actual LLVM LTO note multiplicity rather than merging its records."""
+        return guard.json.dumps([{"NoteSections": [{"NoteSection": {
+            "Notes": [{"AMDGPU Metadata": part} for part in parts]}}]}])
+
+    def audit_partition_notes(self, parts):
+        """Replay actual final-object inspection with only the native inspection tools doubled."""
+        results = [" [7] .hip_fatbin PROGBITS", "",
+                   "hipv4-amdgcn-amd-amdhsa--gfx906\n", "", self.partition_notes(parts)]
+        with patch.object(guard, "run_tool", side_effect=results):
+            return guard.audit_rocm_object(Path("partitioned.o"), Path("/llvm"))
+
+    def test_all_eight_lto_partition_notes_preserve_final_spilling_kernel(self):
+        parts = [metadata(name=f"partition{i}", vgpr="1" if i == 7 else "0") for i in range(8)]
+        kernels = self.audit_partition_notes(parts)
+        self.assertEqual(len(kernels), 8)
+        self.assertEqual(kernels[-1], guard.KernelSpills("partition7", 0, 1))
+        functions = {kernel.name: guard.FunctionAllocation() for kernel in kernels}
+        functions["partition7"] = guard.FunctionAllocation([guard.StackSlot("Spill", 4)])
+        with self.assertRaisesRegex(guard.SpillGuardError, "partition7: 1 memory spill slots"):
+            guard.audit_device_allocations(functions, kernels)
+
+    def test_repeated_kernel_across_lto_notes_is_fatal_even_when_records_agree(self):
+        for last in [metadata(), metadata(vgpr="9")]:
+            with self.subTest(last=last), self.assertRaisesRegex(guard.SpillGuardError, "duplicate final kernel"):
+                self.audit_partition_notes([metadata(), last])
+
+    def test_missing_or_malformed_final_partition_metadata_is_fatal(self):
+        for parts in [[], [metadata(name="first"), None], [metadata(name="first"), "not metadata"],
+                      [metadata(name="first"), metadata(name="last").replace(".vgpr_spill_count: 0", ".vgpr_spill_count: invalid")]]:
+            with self.subTest(parts=parts), self.assertRaises(guard.SpillGuardError):
+                self.audit_partition_notes(parts)
+
     def test_host_only_object(self):
         with patch.object(guard, "run_tool", return_value=" [1] .text PROGBITS"):
             self.assertEqual(guard.audit_rocm_object(Path("host.o"), Path("/llvm")), [])
@@ -147,6 +226,57 @@ class LauncherTest(unittest.TestCase):
         with patch.object(guard, "run_tool", return_value=" [1] __CLANG_OFFLOAD_BUNDLE__hip PROGBITS"):
             with self.assertRaisesRegex(guard.SpillGuardError, "final device-link"):
                 guard.audit_rocm_object(Path("ir.o"), Path("/llvm"))
+
+class InspectionDiagnosticTest(unittest.TestCase):
+    """A native inspection replay supplies evidence without changing acceptance."""
+
+    def test_exact_compile_command_and_private_working_directory_are_preserved(self):
+        command = [sys.executable, str(ROOT / "scripts/build/gpu_spill_guard.py"),
+                   "--llvm-bin", "/sdk/llvm", "--config", "Release", "--policy-id", "v1", "--",
+                   "ccache", "clang++", "--offload-arch=gfx906", "--offload-arch=gfx1100",
+                   "-o", "object with spaces.o", "-c", "source with spaces.hip"]
+        args = argparse.Namespace(ninja="/active/ninja")
+        with patch.object(proof.subprocess, "check_output", return_value=shlex.join(command)), \
+                patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 1, "", "HIP bundle inspection: targets=''")) as replay:
+            diagnostic = proof.failed_hip_inspection(args, Path("/private/build"), "clean")
+        self.assertIn("exit=1", diagnostic)
+        self.assertIn("targets=''", diagnostic)
+        actual = replay.call_args.args[0]
+        self.assertEqual(actual[:2], [sys.executable, "-c"])
+        self.assertEqual(actual[3:], command[2:])
+        self.assertEqual(replay.call_args.kwargs["cwd"], Path("/private/build"))
+
+    def test_ambiguous_or_indirect_launcher_is_rejected(self):
+        command = shlex.join([sys.executable, str(ROOT / "scripts/build/gpu_spill_guard.py"), "--"])
+        for commands in ("", command + "\n" + command, "env " + command):
+            with self.subTest(commands=commands), \
+                    patch.object(proof.subprocess, "check_output", return_value=commands), \
+                    patch.object(proof.subprocess, "run") as replay, \
+                    self.assertRaisesRegex(RuntimeError, "one direct production-guard"):
+                proof.failed_hip_inspection(argparse.Namespace(ninja="ninja"), Path("/build"), "clean")
+            replay.assert_not_called()
+
+    def test_successful_diagnostic_cannot_replace_failed_compilation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / "Release"
+            build.mkdir()
+            report = root / "proof.json"
+            args = argparse.Namespace(report=report, language="HIP", compiler="clang++",
+                                      architectures="gfx906;gfx1100", cmake="cmake", ninja="ninja")
+            with patch.object(proof.tempfile, "TemporaryDirectory") as temporary, \
+                    patch.object(proof.subprocess, "check_output", return_value="clang version"), \
+                    patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], 1, "original compiler failure", "")), \
+                    patch.object(proof, "cases", return_value=[("Release", "clean", "initial")]), \
+                    patch.object(proof, "failed_hip_inspection", return_value="diagnostic exit=0") as replay:
+                temporary.return_value.__enter__.return_value = directory
+                with self.assertRaisesRegex(RuntimeError, "original compiler failure"):
+                    proof.compile_report(args)
+                replay.assert_called_once_with(args, build, "clean")
+            self.assertFalse(report.exists())
+
 
 class AllocationTest(unittest.TestCase):
     """Final frame slot types distinguish memory spills from register moves."""

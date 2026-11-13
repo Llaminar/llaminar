@@ -14,17 +14,23 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "collective/DeviceCountedAllGather.h"
+#include "collective/ILocalTPContext.h"
 #include "collective/LocalTPCollectiveInventory.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/BackendManager.h"
 #include "planning/PlanningObservedResource.h"
 #include "kernels/KernelFactory.h"
 #include "utils/MPIContext.h"
+#include "../../fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include "utils/TestTensorFactory.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <future>
+#include <exception>
 #include <cmath>
 #include <cstring>
+#include <sstream>
+#include <bit>
 #include <map>
 using namespace llaminar2;
 
@@ -125,6 +131,8 @@ std::vector<GraphCaptureDependencyLedger::StagePlan> plan(Participant &p)
 /** @brief Run the exact graph lowering on reversed logical membership and changing live prefixes. */
 void prove(DeviceId first, int degree)
 {
+        test::originalRankLocalReplay(first.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm, degree, [&](const auto &cohort) {
+
     constexpr int capacity = 512, width = 96, experts = 17, top_k = 8;
     const auto mpi = MPIContextFactory::global();
     const auto inventory = mpi->clusterInventory();
@@ -132,16 +140,23 @@ void prove(DeviceId first, int degree)
     const auto &rank = inventory->ranks.at(mpi->rank());
     std::vector<DeviceId> devices;
     for (int p = degree - 1; p >= 0; --p)
-        devices.push_back(first.is_cuda() ? DeviceId::cuda(p) : DeviceId::rocm(p));
-    require(localTPPeerAccessCoverage(rank, devices) == PeerAccessCoverage::None, "Router stage no-P2P admission");
+        devices.push_back(cohort[p]);
+    const auto topology = DeviceCountedAllGatherTopology::resolve(rank, devices);
     const MoERouterRowPacketLayout layout{DeviceRowPartition::balanced(0, degree), capacity, top_k};
     const auto stride = layout.packetBytes();
-    const auto memory = DeviceCountedAllGather::memoryFor(degree, stride);
+    std::vector<GlobalDeviceAddress> native_members;
+    for(const auto device:devices)native_members.push_back(GlobalDeviceAddress::fromLocalDeviceId(device));
+    // The existing original rank owns this complete homogeneous communicator.
+    // It outlives graph owners, packet owners and the collective's borrowed context.
+    auto native_context=createLocalTPContext(native_members,{},devices.front().is_cuda()?
+        CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+    require(bool(native_context),"Router original native collective context");
     PhysicalMemoryPlanBuilder bom;
-    bom.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
-        memory.host_bytes * degree);
-    for (auto device : devices)
+    for (std::size_t member = 0; member < devices.size(); ++member)
     {
+        const auto device = devices[member];
+        const auto memory = topology.memoryFor(member, stride);
+        bom.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging, memory.host_bytes);
         bom.add(planningObservedResource(rank, device), PhysicalMemoryOwner::ActivationTransportStaging, memory.device_bytes);
         bom.add(planningObservedResource(rank, device), PhysicalMemoryOwner::NativeGraphExecutable,
             2 * GPUGraphMemoryContract::reservationBytesPerExecutable(device));
@@ -156,11 +171,18 @@ void prove(DeviceId first, int degree)
         p->worker->submitAndWait([&] { p->stream = p->worker->getOrCreateAuxiliaryStream("router_pipeline"); });
         streams.push_back(p->stream); owners.push_back(std::move(p));
     }
-    auto fabric = DeviceCountedAllGather::create(authority, DeviceId::cpu(), devices, streams, PeerAccessCoverage::None, stride);
+    auto fabric = DeviceCountedAllGather::create(authority, *native_context, DeviceId::cpu(), topology, streams, stride);
+    for (std::size_t from = 0; from < devices.size(); ++from)
+        for (std::size_t to = 0; to < devices.size(); ++to)
+            if (from != to) require(fabric->payloadStorage(from, to) == topology.payloadStorage(from, to),
+                "Router stage actual counted payload storage differs from original peer route");
+    std::vector<std::future<void>> preparation;
     for (int member = 0; member < degree; ++member)
     {
         auto &p = *owners[member];
-        p.worker->submitAndWait([&] {
+        preparation.push_back(p.worker->submitAsync([&, member] {
+            native_context->prepareOriginalNativeParticipant([&] {
+            auto &p=*owners[member];
             p.context = IDeviceContext::create(p.device, 1);
             p.hidden = p.tensor({capacity, width}); p.gate = p.tensor({experts, width}); p.live = p.tensor({1});
             p.indices = p.tensor({capacity, top_k}); p.weights = p.tensor({capacity, top_k});
@@ -232,8 +254,14 @@ void prove(DeviceId first, int degree)
                 recording.finish();
                 require(p.graphs[kind]->instantiate(), "Router pipeline instantiate");
             }
-        });
+            });
+        }));
     }
+    std::exception_ptr preparation_error;
+    for(auto &work:preparation)try{work.get();}catch(...){
+        if(!preparation_error){preparation_error=std::current_exception();(void)native_context->signalNativeCompletionAbort();}
+    }
+    if(preparation_error)std::rethrow_exception(preparation_error);
     int iteration = 0;
     for (const int live : {512, 448, 1, 0, 3, 65, 511, 2, 0, 512})
     {
@@ -252,6 +280,31 @@ void prove(DeviceId first, int degree)
                 require(p.graphs[0]->launch() && p.graphs[1]->launch(), "Router pipeline replay");
             });
         }
+        // Terminal diagnostics retain each source's actual compact packet and
+        // independent full oracle. A receiver-local oracle alone conflates a
+        // heterogeneous arithmetic difference with transfer/publication damage.
+        struct SourceObservation
+        {
+            std::array<std::vector<float>, 2> oracle;
+            std::vector<MoERouterSelectedRoute> packet;
+        };
+        std::vector<SourceObservation> source_observations(degree);
+        for (int source = 0; source < degree; ++source)
+        {
+            auto &p = *owners[source];
+            auto &observation = source_observations[source];
+            p.worker->submitAndWait([&] {
+                const auto span = DeviceRowPartition::balanced(source, degree).resolveFor(capacity, live);
+                observation.packet.resize(std::size_t(span.count) * top_k);
+                observation.oracle[0] = p.read(p.expected_ids->gpu_data_ptr(), capacity * top_k);
+                observation.oracle[1] = p.read(p.expected_weights->gpu_data_ptr(), capacity * top_k);
+                if (!observation.packet.empty())
+                    require(p.backend->deviceToHostOnStream(observation.packet.data(), p.packet->gpu_data_ptr(),
+                        observation.packet.size() * sizeof(MoERouterSelectedRoute), p.device.ordinal, p.stream),
+                        "Router source packet diagnostic readback");
+                require(p.worker->synchronizeStreamChecked(p.stream), "Router source diagnostics completion");
+            });
+        }
         for (int member = 0; member < degree; ++member)
         {
             auto &p = *owners[member];
@@ -260,7 +313,36 @@ void prove(DeviceId first, int degree)
                 {
                     const auto actual = p.read(pair.first->gpu_data_ptr(), capacity * top_k);
                     const auto expected = p.read(pair.second->gpu_data_ptr(), capacity * top_k);
-                    require(std::memcmp(actual.data(), expected.data(), actual.size() * 4) == 0, "Router pipeline selected bits drifted");
+                    if (std::memcmp(actual.data(), expected.data(), actual.size() * 4) != 0)
+                    {
+                        const int column = pair.first == p.weights ? 1 : 0;
+                        std::size_t index = 0;
+                        while (index < actual.size() && std::bit_cast<std::uint32_t>(actual[index]) == std::bit_cast<std::uint32_t>(expected[index])) ++index;
+                        const int row = int(index / top_k);
+                        const int source = DeviceRowPartition::balanced(member, degree).ownerFor(capacity, live, row);
+                        std::ostringstream detail;
+                        detail << "Router pipeline selected bits drifted"
+                            << " receiver=" << p.device.toString() << " receiver_member=" << member
+                            << " replay=" << iteration << " live=" << live << " capacity=" << capacity
+                            << " width=" << width << " experts=" << experts
+                            << " row=" << row << " slot=" << index % top_k
+                            << " column=" << (column ? "weight" : "expert")
+                            << " actual=0x" << std::hex << std::bit_cast<std::uint32_t>(actual[index])
+                            << " receiver_oracle=0x" << std::bit_cast<std::uint32_t>(expected[index]) << std::dec;
+                        if (source >= 0)
+                        {
+                            const auto span = DeviceRowPartition::balanced(source, degree).resolveFor(capacity, live);
+                            const auto &observation = source_observations[source];
+                            const auto &route = observation.packet[(row - span.first) * top_k + index % top_k];
+                            detail << " source=" << owners[source]->device.toString() << " source_member=" << source
+                                << " source_oracle=0x" << std::hex
+                                << std::bit_cast<std::uint32_t>(observation.oracle[column][index])
+                                << " source_packet=0x"
+                                << std::bit_cast<std::uint32_t>(column ? route.weight : route.expert);
+                        }
+                        else detail << " source=inactive_suffix";
+                        throw std::runtime_error(detail.str());
+                    }
                 }
                 const auto owner = DeviceRowPartition::balanced(member, degree);
                 const auto owned = owner.resolveFor(capacity, live);
@@ -294,7 +376,9 @@ void prove(DeviceId first, int degree)
     }
     owners.clear();
     fabric.reset();
-}
+
+        });
+    }
 }
 #ifdef HAVE_CUDA
 /** @test Capture the production CUDA lowerer and prepared router owner. */

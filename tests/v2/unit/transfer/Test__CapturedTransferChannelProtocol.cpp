@@ -278,3 +278,158 @@ TEST(CapturedTransferChannelProtocol, CountedExtentRejectsWrongAuthorityAndOverf
     EXPECT_EQ(Protocol::acquire(Role::Consumer, identity, identity, wrong_key,
         {.epoch = 1, .message = {message.key + 1, 0}}, message, Source::ProducerPublication).status, Status::MessageMismatch);
 }
+
+/** @test Offsets and lengths are one acquired snapshot; channel epochs survive request data resets. */
+TEST(CapturedTransferChannelProtocol, SourceSliceReplayBoundsAndEpochs)
+{
+    Lane lane;
+    constexpr std::uint64_t span = 1024;
+    for (std::uint64_t replay = 0; replay < 256; ++replay)
+    {
+        const auto local = replay % 16; // New request data; the channel epoch never resets.
+        CapturedTransferSourceSlice slice{local * 31, local % 3 ? 1 + local * 7 : 0};
+        if (!slice.live_bytes) slice.byte_offset = span; // Legal empty end-of-region.
+        const auto expected = slice;
+        const auto lease = Protocol::acquire(Role::Producer, identity, identity, lane.producer,
+            lane.consumed, message, CapturedTransferExtentSource::ProducerDevice,
+            slice.live_bytes, slice.byte_offset, span);
+        ASSERT_TRUE(lease.ready()); EXPECT_EQ(lease.epoch, replay + 1);
+        slice = {~std::uint64_t{0}, ~std::uint64_t{0}}; // A later writer cannot change acquired work.
+        EXPECT_EQ(lane.producer.acquired_source_offset, expected.byte_offset);
+        EXPECT_EQ(lane.producer.acquired_message.bytes, expected.live_bytes);
+        ASSERT_TRUE(lane.publishProducer().ready());
+        ASSERT_TRUE(Protocol::acquire(Role::Consumer, identity, identity, lane.consumer,
+            lane.produced, message, CapturedTransferExtentSource::ProducerPublication).ready());
+        EXPECT_EQ(lane.consumer.acquired_source_offset, 0u);
+        EXPECT_EQ(lane.consumer.acquired_message.bytes, expected.live_bytes);
+        ASSERT_TRUE(lane.publishConsumer().ready());
+        EXPECT_EQ(lane.produced.epoch, replay + 1); EXPECT_EQ(lane.consumed.epoch, replay + 1);
+        EXPECT_EQ(lane.producer.acquired_source_offset, 0u);
+    }
+}
+
+/** @test Region overflow, foreign roles and stale peer generations fail before any payload access. */
+TEST(CapturedTransferChannelProtocol, SourceSliceRejectsInvalidBoundsAndStaleEpoch)
+{
+    for (const auto slice : {CapturedTransferSourceSlice{1025, 0}, {1024, 1}, {1000, 25},
+             {0, 129}, {~std::uint64_t{0}, 1}})
+    {
+        Lane lane;
+        EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+            message, CapturedTransferExtentSource::ProducerDevice, slice.live_bytes, slice.byte_offset, 1024).status,
+            Status::InvalidBinding);
+        EXPECT_EQ(lane.producer.phase, CapturedTransferPhase::Failed);
+    }
+    Lane lane;
+    EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+        message, CapturedTransferExtentSource::ProducerDevice, 1, 1, 127).status, Status::InvalidBinding);
+    lane = {};
+    EXPECT_EQ(Protocol::acquire(Role::Consumer, identity, identity, lane.consumer, lane.produced,
+        message, CapturedTransferExtentSource::ProducerPublication, 0, 0, 1024).status, Status::InvalidBinding);
+    lane = {}; lane.consumed.epoch = 2;
+    EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+        message, CapturedTransferExtentSource::ProducerDevice, 1, 31, 1024).status, Status::EpochMismatch);
+}
+
+/** @test Original absolute bank coordinates normalize once without rewriting their source descriptor. */
+TEST(CapturedTransferChannelProtocol, SourceSliceOriginalCoordinateOrigin)
+{
+    Lane lane;
+    ASSERT_TRUE(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+        message, CapturedTransferExtentSource::ProducerDevice, 17, 4007, 1024, 4000).ready());
+    EXPECT_EQ(lane.producer.acquired_source_offset, 7u);
+    lane = {};
+    EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+        message, CapturedTransferExtentSource::ProducerDevice, 17, 3999, 1024, 4000).status, Status::InvalidBinding);
+    lane = {};
+    EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+        message, CapturedTransferExtentSource::ProducerDevice, 1, ~std::uint64_t{0}, 1024,
+        ~std::uint64_t{0}).status, Status::InvalidBinding);
+}
+
+/** @test The native lowering cannot attach a slice to a foreign role, scalar or overflowing region. */
+TEST(CapturedTransferChannelProtocol, SourceSliceBindingRejectsForeignRoleAndCountAddress)
+{
+    CapturedTransferChannelControl control{};
+    CapturedTransferCursor cursor{};
+    CapturedTransferSourceSlice slice{};
+    CapturedTransferChannelDeviceBinding binding{
+        .control = &control, .cursor = &cursor, .expected = identity, .message = message,
+        .role = Role::Producer, .timeout_ticks = 100,
+        .extent_source = CapturedTransferExtentSource::ProducerDevice,
+        .device_extent = &slice.live_bytes, .source_slice = &slice, .source_span_bytes = 1024};
+    EXPECT_TRUE(binding.valid());
+    binding.source_span_bytes = 0; EXPECT_FALSE(binding.valid()); binding.source_span_bytes = 1024;
+    binding.device_extent = &slice.byte_offset; EXPECT_FALSE(binding.valid());
+    binding.device_extent = &slice.live_bytes; binding.source_offset_origin = ~std::uint64_t{0};
+    EXPECT_FALSE(binding.valid()); binding.source_offset_origin = 0;
+    binding.role = Role::Consumer; binding.extent_source = CapturedTransferExtentSource::ProducerPublication;
+    EXPECT_FALSE(binding.valid());
+}
+
+/** @test Parent cancellation is terminal and cannot authenticate another physical owner. */
+TEST(CapturedTransferChannelProtocol, OriginalCancellationNeverMasksForeignPhysicalIdentity)
+{
+    CapturedTransferCursor cursor{};
+    const auto acquire = [&](CapturedTransferChannelIdentity expected, std::uint64_t cancelled)
+    {
+        return Protocol::acquire(Role::Consumer, expected, identity, cursor, {}, message,
+            CapturedTransferExtentSource::FixedMessage, 0, 0, 0, 0, cancelled);
+    };
+    EXPECT_EQ(acquire(identity, identity.nonce).status, Status::Cancelled);
+    EXPECT_EQ(cursor.phase, CapturedTransferPhase::Cancelled);
+    EXPECT_EQ(cursor.completed_epoch, 0u);
+    EXPECT_EQ(acquire(identity, identity.nonce).status, Status::Cancelled);
+    EXPECT_EQ(acquire(identity, 0).status, Status::InvalidPhase);
+    cursor = {};
+    EXPECT_EQ(acquire({identity.nonce + 1, identity.capacity}, identity.nonce).status, Status::InvalidBinding);
+    cursor = {};
+    EXPECT_EQ(acquire(identity, identity.nonce + 1).status, Status::InvalidBinding);
+}
+
+/** @test Original faults win every cancellation interleaving through the actual native decision owner. */
+TEST(CapturedTransferChannelProtocol, OriginalFaultsNeverDrainAsCancellation)
+{
+    for (const auto error : {Status::TimedOut, Status::InvalidPhase, Status::MessageMismatch,
+             Status::InvalidBinding, Status::PeerAborted, Status::EpochMismatch})
+    {
+        for (const auto phase : {CapturedTransferPhase::Idle, CapturedTransferPhase::Acquired,
+                 CapturedTransferPhase::Publishing, CapturedTransferPhase::Failed, CapturedTransferPhase::Cancelled})
+            EXPECT_FALSE(Protocol::drainsCancellation(phase, error, true));
+        CapturedTransferCursor cursor{};
+        CapturedTransferPublication publication{};
+        Protocol::abort(cursor, publication);
+        EXPECT_EQ(Protocol::acquire(Role::Consumer, identity, identity, cursor, {}, message,
+            CapturedTransferExtentSource::FixedMessage, 0, 0, 0, 0, identity.nonce).status, Status::InvalidPhase);
+        EXPECT_EQ(cursor.phase, CapturedTransferPhase::Failed);
+    }
+    EXPECT_FALSE(Protocol::drainsCancellation(CapturedTransferPhase::Failed, Status::Cancelled, true));
+    EXPECT_FALSE(Protocol::drainsCancellation(CapturedTransferPhase::Idle, Status::Cancelled, false));
+    EXPECT_TRUE(Protocol::drainsCancellation(CapturedTransferPhase::Acquired, Status::Cancelled, true));
+}
+
+/** @test Actual native publisher validates original phase/message/epoch before cancellation. */
+TEST(CapturedTransferChannelProtocol, PublisherFaultsPrecedeCancellationAndNeverAdvancePublication)
+{
+    for(const auto source:{CapturedTransferExtentSource::FixedMessage,CapturedTransferExtentSource::ProducerDevice}){
+        for(int fault=0;fault<4;++fault){
+            CapturedTransferCursor cursor{};cursor.phase=CapturedTransferPhase::Acquired;
+            cursor.completed_epoch=5;cursor.acquired_message=message;
+            CapturedTransferPublication publication{};publication.epoch=5;
+            Status expected=Status::Cancelled;
+            if(fault==1){cursor.phase=CapturedTransferPhase::Failed;expected=Status::InvalidPhase;}
+            if(fault==2){++cursor.acquired_message.key;expected=Status::MessageMismatch;}
+            if(fault==3){publication.epoch=4;expected=Status::EpochMismatch;}
+            const auto epoch=publication.epoch;
+            const auto result=Protocol::preparePublication(cursor,publication,message,source,identity.nonce,identity.nonce);
+            EXPECT_EQ(result.status,expected);
+            EXPECT_EQ(publication.epoch,epoch);EXPECT_EQ(cursor.completed_epoch,5u);
+            EXPECT_EQ(Protocol::drainsCancellation(cursor.phase,result.status,true),fault==0);
+        }
+    }
+    CapturedTransferCursor cursor{};cursor.phase=CapturedTransferPhase::Acquired;cursor.acquired_message=message;
+    CapturedTransferPublication publication{};
+    EXPECT_TRUE(Protocol::preparePublication(cursor,publication,message,
+        CapturedTransferExtentSource::FixedMessage,0,identity.nonce).ready());
+    EXPECT_EQ(publication.epoch,1u);
+}

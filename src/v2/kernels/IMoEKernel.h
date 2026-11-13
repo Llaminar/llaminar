@@ -163,6 +163,39 @@ namespace llaminar2
         bool capture_recorded = false;         ///< Producer is recorded in the active capture.
 
         /**
+         * @brief Declare the exact graph-local grouped consumer before planning.
+         * @param rows Immutable physical row extent, not a device live count.
+         * @param width Original FP32 hidden width, divisible by the Q8 block size.
+         * @return False for invalid, conflicting, or post-publication declarations.
+         *
+         * The declaration survives payload revocation. It belongs to this layer
+         * graph only; binding a consumer never changes another graph's program.
+         */
+        [[nodiscard]] bool requireConsumerRows(int rows, int width) noexcept
+        {
+            if (rows <= 0 || width <= 0 || width % 32 != 0 || source_rows)
+                return false;
+            if (required_rows_ != 0)
+                return required_rows_ == rows && required_width_ == width;
+            required_rows_ = rows;
+            required_width_ = width;
+            return true;
+        }
+
+        /** @brief Whether a cold grouped consumer requires original Q8 rows. */
+        [[nodiscard]] bool hasRequiredConsumer() const noexcept
+        {
+            return required_rows_ != 0;
+        }
+
+        /** @brief Check the complete immutable producer geometry. */
+        [[nodiscard]] bool acceptsProducerRows(int rows, int width) const noexcept
+        {
+            return !hasRequiredConsumer() ||
+                   (required_rows_ == rows && required_width_ == width);
+        }
+
+        /**
          * @brief Clear payload provenance while preserving the device binding.
          */
         void clearPayload() noexcept
@@ -175,6 +208,10 @@ namespace llaminar2
             blocks_per_row_capacity = 0;
             capture_recorded = false;
         }
+
+    private:
+        int required_rows_ = 0; ///< Cold graph capacity; never a live-row mirror.
+        int required_width_ = 0; ///< Exact hidden width of the required consumer.
     };
 
     /**
@@ -729,7 +766,7 @@ namespace llaminar2
          * @brief Grouped decode path for routed expert down projections.
          *
          * Implementations may consume per-active-expert gate/up scratch tensors,
-         * native-VNNI down-weight descriptors, and routing weights to produce the
+         * native-quantised down-weight descriptors, and routing weights to produce the
          * final weighted MoE output in routing order. The default returns false so
          * compute stages can fall back to the established per-expert path.
          */
@@ -738,7 +775,7 @@ namespace llaminar2
             ITensor *const *up_tensors,
             const int *expert_ids,
             const float *expert_weights,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_active,
             ITensor *output,
             int d_model,
@@ -774,7 +811,7 @@ namespace llaminar2
          * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -807,8 +844,8 @@ namespace llaminar2
          * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -830,7 +867,7 @@ namespace llaminar2
          * Blank entries represent experts not resident on this participant.
          * Every non-blank entry uses @p weight_format and exact row-major
          * geometry. The returned id occupies the same typed table namespace as
-         * NativeVNNI tables so captured callers cannot accidentally combine
+         * NativeQuantised tables so captured callers cannot accidentally combine
          * descriptor families.
          */
         virtual int uploadGroupedExpertFloatingDownDescriptorTable(
@@ -881,7 +918,7 @@ namespace llaminar2
          */
         virtual bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate)
@@ -903,8 +940,8 @@ namespace llaminar2
          */
         virtual bool updateGroupedExpertGateUpDescriptorTables(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate)
@@ -3303,6 +3340,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Materialize an immutable owner gate/up launch intent during existing cold graph preparation.
+         * @param gateup_desc_table_id Original instance-owned descriptor table.
+         * @param physical_rows Frozen physical token-row count, never a live GPU count.
+         * @param expected_intent Pure declaration identity resolved before graph-cache identity.
+         * @return Exactly the validated intent, or zero for the unchanged default/unselected policy.
+         * @throws std::logic_error If an explicit intent is unsupported or cannot be bound before capture.
+         * @note Default backends perform no work and cannot silently accept a nonzero foreign intent.
+         */
+        virtual std::uint64_t prepareOwnerGateUpCaptureBinding(int gateup_desc_table_id, int physical_rows,
+                                                              std::uint64_t expected_intent)
+        {
+            (void)gateup_desc_table_id; (void)physical_rows;
+            if (expected_intent) throw std::logic_error("backend cannot materialize the explicit owner gate/up launch intent");
+            return 0;
+        }
+
+        /**
+         * @brief Inspect already-bound immutable owner capture identity without native calls or preparation.
+         * @param gateup_desc_table_id Original instance-owned descriptor table.
+         * @param physical_rows Frozen physical rows of this graph.
+         * @return Previously prepared identity, or zero for default/unselected policy.
+         * @throws std::logic_error For a stale/incomplete table binding.
+         * @note Unbound component tables return zero. Graphs must validate their
+         *       declaration with requireOwnerGateUpCaptureBinding; this is host
+         *       metadata, never a GPU/replay observation or resource ledger.
+         */
+        [[nodiscard]] virtual std::uint64_t ownerGateUpCaptureBindingSignature(int gateup_desc_table_id,
+                                                                              int physical_rows) const
+        { (void)gateup_desc_table_id; (void)physical_rows; return 0; }
+
+        /**
+         * @brief Require the graph's declared immutable owner policy before publication or execution.
+         * @param gateup_desc_table_id Original prepared table, never a substituted representative.
+         * @param physical_rows Frozen physical graph rows.
+         * @param expected_intent Graph declaration's nonzero explicit intent, or original unbound zero.
+         * @throws std::logic_error For an absent, foreign or stale declared binding.
+         * @note Pure host validation shared by real graph stages and focused no-enqueue regressions.
+         *       Zero is the original component policy, never a replacement for a declared nonzero graph intent.
+         */
+        void requireOwnerGateUpCaptureBinding(int gateup_desc_table_id, int physical_rows,
+                                              std::uint64_t expected_intent) const
+        {
+            if (ownerGateUpCaptureBindingSignature(gateup_desc_table_id, physical_rows) != expected_intent)
+                throw std::logic_error("owner gate/up binding does not match the graph's immutable declared intent");
+        }
+
+        /**
          * @brief Enqueue one typed projection phase using the ordinary pipeline.
          *
          * Complete execution is the same operation used by the convenience
@@ -3448,6 +3532,33 @@ namespace llaminar2
             return false;
         }
 
+        /** @brief Enqueue one captured lifecycle action on the original device finite parent.
+         * @param launch Exact original worker stream and device policy.
+         * @param control Original arena control carrying its immutable parent binding.
+         * @param status Persistent parent terminal status; never a host epoch mirror.
+         * @param action Arm before children or Close after every child terminal.
+         * @return True only for accepted backend submission; semantic failure is fatal in captured production.
+         */
+        virtual bool runMoEOverlayEpochParentAction(const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control, DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochParentAction action)
+        {
+            (void)launch;(void)control;(void)status;(void)action;return false;
+        }
+
+        /** @brief Device-owned source rearm; CPU host-ordered channels never enter this GPU policy. */
+        virtual bool beginOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,
+            const MoEOverlayOriginalNativeBeginLaunch&) { return false; }
+        /** @brief Exact endpoint post-payload publication on the original stream. */
+        virtual bool retireOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,
+            const MoEOverlayOriginalNativeRetireLaunch&) { return false; }
+        /** @brief Final source batch epilogue after all single-row materializers/publications. */
+        virtual bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,
+            const MoEOverlayActivationSingleRowReturnBatchLaunch&) { return false; }
+        /** @brief Final source batch epilogue after all multi-row materializers/publications. */
+        virtual bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,
+            const MoEOverlayActivationMultiRowReturnBatchLaunch&) { return false; }
+
     };
 
     /**
@@ -3478,6 +3589,7 @@ namespace llaminar2
          */
         std::shared_ptr<MoERouterQ8HiddenPublication> router_q8_publication =
             std::make_shared<MoERouterQ8HiddenPublication>();
+
     };
 
 } // namespace llaminar2

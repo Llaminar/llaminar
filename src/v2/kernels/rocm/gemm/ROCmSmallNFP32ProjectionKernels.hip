@@ -8,6 +8,8 @@
  * hipBLAS shape-dependent accumulation changes in publication-sensitive state.
  * Each output column has the same 256-lane K reduction regardless of physical
  * output width, so narrow shards and a mirrored full vocabulary remain exact.
+ * Custom FP32/native16 consumers retain immutable matrix addresses by value;
+ * pointer-table publication remains only for genuine table consumers.
  * Explicit half activation specializations read only live rows from the existing
  * retained half bank; serial and verifier dispatch share the same arithmetic.
  */
@@ -16,9 +18,12 @@
 #include <hip/hip_fp16.h>
 
 #include "kernels/common/FloatingPointVerifierLaunch.h"
+#include "kernels/common/FloatingProjectionRows.h"
+#include "kernels/rocm/gemm/ROCmFP32ProjectionLoadPolicy.h"
 
 #include <cstdio>
 #include <cstdint>
+#include <type_traits>
 
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 
@@ -127,6 +132,40 @@ namespace
         return false;
     }
 
+    /**
+     * @brief Preserve the original 256-part tree with a native wave64 tail.
+     * @param value Original stride-256 lane accumulator, including zero K tails.
+     * @param scratch Exclusive 256-float CTA storage, populated by every lane.
+     * @return Original reduced result in lane zero; other lanes are not consumed.
+     * @pre Exactly 256 threads enter collectively; no participant returns early.
+     *
+     * LDS retains edges128/64 and their producer barriers. All64 lanes of
+     * the first wave then execute every shuffle; only original owning lanes
+     * perform additions. No multiply or rounded partial is reassociated.
+     */
+    __device__ __forceinline__ float reduceFloating256(float value, float *scratch)
+    {
+        const unsigned lane = threadIdx.x;
+        scratch[lane] = value;
+        __syncthreads();
+        for (unsigned stride = 128; stride >= 64; stride >>= 1)
+        {
+            if (lane < stride) scratch[lane] += scratch[lane + stride];
+            __syncthreads();
+        }
+        if (lane < 64)
+        {
+            value = scratch[lane];
+#pragma unroll
+            for (unsigned stride = 32; stride; stride >>= 1)
+            {
+                const float partner = __shfl_down(value, stride, 64);
+                if (lane < stride) value += partner;
+            }
+        }
+        return value;
+    }
+
     __global__ void fp32_stage_batched_projection_pointers_kernel(
         const Fp32BatchedProjectionPointers ptrs,
         const float **__restrict__ d_A_array,
@@ -143,48 +182,85 @@ namespace
         d_C_array[batch] = ptrs.C[batch];
     }
 
+    /**
+     * @brief Project FP32 operands with the original lane and reduction ownership.
+     * @param projections Immutable input, weight and output bindings per projection.
+     * @param M Admitted physical input/output rows.
+     * @param N Output columns owned by this participant.
+     * @param K Number of original FP32 products in each dot product.
+     * @param row_range Device-owned live-row selection for this invocation.
+     *
+     * @tparam LOAD_PAIRS Compiled scalar, four-pair or eight-pair scheduling.
+     * Each lane consumes k=lane+256*j in ascending order with one accumulator.
+     * Complete load groups expose independent operand requests; scalar tails
+     * preserve partial K without padded reads. Scalar scheduling retains the
+     * original loop. Selection depends only on the immutable captured CTA grid.
+     */
+    template<int LOAD_PAIRS, class Rows>
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32_small_n_batched_projection_kernel(
-            const float *const *__restrict__ d_A_array,
-            const float *const *__restrict__ d_B_array,
-            float *const *__restrict__ d_C_array,
+            llaminar2::FixedFP32ProjectionGroup projections,
             int M,
             int N,
             int K,
-            llaminar2::DeviceRowRange row_range)
+            Rows row_range)
     {
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
         const int batch = static_cast<int>(blockIdx.z);
-        if (m >= row_range.activeRows() || n >= N)
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
             return;
 
-        const float *A = d_A_array[batch];
-        const float *B = d_B_array[batch];
-        float *C = d_C_array[batch];
+        const float *A = projections.input(batch);
+        const float *B = projections.weight(batch);
+        float *C = projections.output(batch);
         if (!A || !B || !C)
             return;
 
+        static_assert(LOAD_PAIRS == 1 || LOAD_PAIRS == 4 || LOAD_PAIRS == 8);
         float sum = 0.0f;
-        for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
+        if constexpr (LOAD_PAIRS == 1)
         {
-            sum += A[static_cast<size_t>(m) * K + k] *
-                   B[static_cast<size_t>(n) * K + k];
+            for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
+            {
+                sum += A[static_cast<size_t>(m) * K + k] *
+                       B[static_cast<size_t>(n) * K + k];
+            }
+        }
+        else
+        {
+            const float *input_row = A + static_cast<size_t>(m) * K;
+            const float *weight_row = B + static_cast<size_t>(n) * K;
+            int k = static_cast<int>(threadIdx.x);
+            constexpr int LOAD_GROUP = LOAD_PAIRS * SMALL_N_FP32_BLOCK;
+            const int grouped_end = K - K % LOAD_GROUP;
+            for (; k < grouped_end; k += LOAD_GROUP)
+            {
+                float input[LOAD_PAIRS];
+                float weight[LOAD_PAIRS];
+#pragma unroll
+                for (int pair = 0; pair < LOAD_PAIRS; ++pair)
+                {
+                    input[pair] = input_row[k + pair * SMALL_N_FP32_BLOCK];
+                    weight[pair] = weight_row[k + pair * SMALL_N_FP32_BLOCK];
+                }
+                // One ordered chain, not independent partial accumulators: grouped rows
+                // and serial decode must retain every original FP32 rounding step.
+#pragma unroll
+                for (int pair = 0; pair < LOAD_PAIRS; ++pair)
+                    sum += input[pair] * weight[pair];
+            }
+            for (; k < K; k += SMALL_N_FP32_BLOCK)
+            {
+                sum += input_row[k] * weight_row[k];
+            }
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        scratch[threadIdx.x] = sum;
-        __syncthreads();
-
-        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-            __syncthreads();
-        }
+        const float reduced = reduceFloating256(sum, scratch);
 
         if (threadIdx.x == 0)
-            C[static_cast<size_t>(m) * N + n] = scratch[0];
+            C[static_cast<size_t>(m) * N + n] = reduced;
     }
 
     /**
@@ -193,27 +269,30 @@ namespace
      * Original FP32 activation storage retains its 256 physical lane mapping.
      * Actual half A/B uses the compact kernel below with the same logical tree.
      * Inactive rows return before dereferencing either operand or output.
+     * Native source encoding is immutable launch policy; specializing it removes
+     * a uniform dtype branch from every K iteration without changing conversion.
+     * @tparam WeightDtype Validated original FP16 or BF16 source encoding.
      */
+    template<SmallProjectionWeightDtype WeightDtype, class Rows>
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32x16_batched_projection_kernel(
-            const float *const *__restrict__ d_A_array,
-            const float *const *__restrict__ d_B_array,
-            float *const *__restrict__ d_C_array,
+            llaminar2::FixedFP32x16ProjectionGroup projections,
             int M,
             int N,
             int K,
-            int weight_dtype,
-            llaminar2::DeviceRowRange row_range)
+            Rows row_range)
     {
+        static_assert(WeightDtype == SMALL_PROJECTION_WEIGHT_FP16 ||
+                      WeightDtype == SMALL_PROJECTION_WEIGHT_BF16);
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
         const int batch = static_cast<int>(blockIdx.z);
-        if (m >= row_range.activeRows() || n >= N)
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
             return;
 
-        const float *A = d_A_array[batch];
-        const uint16_t *B = reinterpret_cast<const uint16_t *>(d_B_array[batch]);
-        float *C = d_C_array[batch];
+        const float *A = projections.input(batch);
+        const uint16_t *B = projections.weight(batch);
+        float *C = projections.output(batch);
         if (!A || !B || !C)
             return;
 
@@ -222,10 +301,11 @@ namespace
         {
             const uint16_t weight_bits =
                 B[static_cast<size_t>(n) * static_cast<size_t>(K) + static_cast<size_t>(k)];
-            const float weight =
-                (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
-                    ? bf16_bits_to_float(weight_bits)
-                    : fp16_bits_to_float(weight_bits);
+            float weight;
+            if constexpr (WeightDtype == SMALL_PROJECTION_WEIGHT_BF16)
+                weight = bf16_bits_to_float(weight_bits);
+            else
+                weight = fp16_bits_to_float(weight_bits);
             const size_t activation_index =
                 static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k);
             // Preserve the original FP32 products, strided lane ownership
@@ -235,18 +315,80 @@ namespace
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        scratch[threadIdx.x] = sum;
-        __syncthreads();
-
-        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-            __syncthreads();
-        }
+        const float reduced = reduceFloating256(sum, scratch);
 
         if (threadIdx.x == 0)
-            C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = scratch[0];
+            C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
+    }
+
+    /**
+     * @brief Reuse at most128 column CTAs for explicitly scoped FP32/native16 work.
+     * @tparam WeightDtype Original FP16 or BF16 source encoding.
+     * @param projections Immutable input/weight/output addresses, one set per batch.
+     * @param M Admitted physical rows; the device publication decides live work.
+     * @param N Independent output columns, each retaining its original dot/tree.
+     * @param K Original reduction width, with unchanged256-lane K ownership.
+     * @param row_range Typed execution-owned row/ranking demand publication.
+     *
+     * Inactive rows return uniformly before operand reads. Active CTAs visit only
+     * their own columns; no partial sum crosses a column or CTA. The reducer's
+     * final wave reads scratch without a closing CTA barrier, so every continuing
+     * CTA explicitly retires those reads before reusing the same LDS bank. The
+     * subtraction guard proves the next signed addition remains below N.
+     * Ordinary prefix/request and unscoped programs retain the original kernel.
+     */
+    template<SmallProjectionWeightDtype WeightDtype>
+    __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
+        void fp32x16_scoped_projection_columns_kernel(
+            llaminar2::FixedFP32x16ProjectionGroup projections,
+            int M,
+            int N,
+            int K,
+            llaminar2::FloatingProjectionRows row_range)
+    {
+        static_assert(WeightDtype == SMALL_PROJECTION_WEIGHT_FP16 ||
+                      WeightDtype == SMALL_PROJECTION_WEIGHT_BF16);
+        int n = static_cast<int>(blockIdx.x);
+        const int m = static_cast<int>(blockIdx.y);
+        const int batch = static_cast<int>(blockIdx.z);
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
+            return;
+
+        const float *A = projections.input(batch);
+        const uint16_t *B = projections.weight(batch);
+        float *C = projections.output(batch);
+        if (!A || !B || !C)
+            return;
+
+        __shared__ float scratch[SMALL_N_FP32_BLOCK];
+        const int column_stride = static_cast<int>(gridDim.x);
+        for (;;)
+        {
+            float sum = 0.0f;
+            for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
+            {
+                const uint16_t weight_bits =
+                    B[static_cast<size_t>(n) * static_cast<size_t>(K) + static_cast<size_t>(k)];
+                float weight;
+                if constexpr (WeightDtype == SMALL_PROJECTION_WEIGHT_BF16)
+                    weight = bf16_bits_to_float(weight_bits);
+                else
+                    weight = fp16_bits_to_float(weight_bits);
+                const size_t activation_index =
+                    static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k);
+                const float activation = A[activation_index];
+                sum += activation * weight;
+            }
+            const float reduced = reduceFloating256(sum, scratch);
+            if (threadIdx.x == 0)
+                C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
+
+            if (N - n <= column_stride)
+                break;
+            // All256 lanes retire the previous column's LDS reads before overwrite.
+            __syncthreads();
+            n += column_stride;
+        }
     }
 
     /**
@@ -264,7 +406,7 @@ namespace
      * @param m Admitted physical rows. @param n Output columns. @param runtime_k Reduction width.
      * @param rows Device-owned live-row range, resolved before any operand load.
      */
-    template<int FixedK = 0>
+    template<int FixedK, class Rows>
     __global__ __launch_bounds__(128)
     void fp16_packed_batched_projection_kernel(
         const float *const *ap,
@@ -273,13 +415,13 @@ namespace
         int m,
         int n,
         int runtime_k,
-        llaminar2::DeviceRowRange rows)
+        Rows rows)
     {
         const int k = FixedK ? FixedK : runtime_k;
         const int col = static_cast<int>(blockIdx.x);
         const int row = static_cast<int>(blockIdx.y);
         const int lane = static_cast<int>(threadIdx.x);
-        if (row >= rows.activeRows() || col >= n)
+        if (!rows.rowIsActiveUniform(row) || col >= n)
             return;
 
         const auto *a = reinterpret_cast<const uint16_t *>(ap[blockIdx.z]);
@@ -297,7 +439,7 @@ namespace
         float first = 0.0f;
         float second = 0.0f;
         int j = 2 * lane;
-        #pragma unroll
+    #pragma unroll
         for (; j + 1 < k; j += SMALL_N_FP32_BLOCK)
         {
             uint32_t aw;
@@ -350,15 +492,15 @@ namespace
      * @param g Validated borrowed input/weight/output owners and column ends.
      * @param runtime_k Positive reduction width. @param rows Device-live row authority.
      */
-    template<int FixedK = 0>
+    template<int FixedK, class Rows>
     __global__ __launch_bounds__(128)
     void short_half_projection_group_kernel(
         llaminar2::FixedHalfProjectionGroup g, int runtime_k,
-        llaminar2::DeviceRowRange rows)
+        Rows rows)
     {
         const int k = FixedK ? FixedK : runtime_k;
         const int row = blockIdx.y, flat = blockIdx.x, lane = threadIdx.x;
-        if (row >= rows.activeRows()) return;
+        if (!rows.rowIsActiveUniform(row)) return;
         int p = 0;
         while (flat >= g.columnEnd(p)) ++p;
         const int first_column = p ? g.columnEnd(p - 1) : 0;
@@ -369,7 +511,7 @@ namespace
                               reinterpret_cast<uintptr_t>(b)) & 3u) == 0;
         float first = 0.0f, second = 0.0f;
         int j = 2 * lane;
-        #pragma unroll
+    #pragma unroll
         for (; j + 1 < k; j += 256)
         {
             uint32_t aw, bw;
@@ -417,6 +559,7 @@ namespace
      * walks a deterministic strided K subsequence, and the block reduction tree
      * is identical for all M values.
      */
+    template<class Rows>
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void floating_swiglu_down_projection_kernel(
             const float *__restrict__ gate,
@@ -427,11 +570,11 @@ namespace
             int N,
             int K,
             int weight_dtype,
-            llaminar2::DeviceRowRange row_range)
+            Rows row_range)
     {
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
-        if (m >= row_range.activeRows() || n >= N)
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
             return;
 
         float sum = 0.0f;
@@ -450,18 +593,10 @@ namespace
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        scratch[threadIdx.x] = sum;
-        __syncthreads();
-
-        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-            __syncthreads();
-        }
+        const float reduced = reduceFloating256(sum, scratch);
 
         if (threadIdx.x == 0)
-            output[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = scratch[0];
+            output[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
     }
 } // namespace
 
@@ -538,134 +673,179 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
  * The former N<=64 restriction described a caller, not a kernel limitation.
  */
 extern "C" bool rocmFp32_small_n_batched_projection(
-    const float *const *d_A_array,
-    const float *const *d_B_array,
-    float *const *d_C_array,
+    llaminar2::FixedFP32ProjectionGroup projections,
     int M,
     int N,
     int K,
-    int batch_count,
     int device_id,
     void *stream,
-    const llaminar2::DeviceRowRange *row_range)
+    const llaminar2::DeviceRowRange *row_range,
+    const llaminar2::DeviceRequestRowRanges *request_rows)
 {
-    if (row_range && row_range->physicalRows() != M)
-        return false;
-    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp32_small_n_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
-            M,
-            N,
-            K,
-            batch_count,
-            stream);
-        return false;
-    }
+    const int batch_count = projections.size();
+    if (M<=0 || (row_range && request_rows) ||
+        (row_range && row_range->physicalRows()!=M) ||
+        (request_rows && request_rows->physicalRows()!=M))return false;
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,request_rows, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp32_small_n_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
+                M,
+                N,
+                K,
+                batch_count,
+                stream);
+            return false;
+        }
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    hipError_t err = hipSetDevice(device_id);
-    if (err != hipSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp32_small_n_batched_projection] hipSetDevice failed: %s\n",
-            hipGetErrorString(err));
-        return false;
-    }
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp32_small_n_batched_projection] hipSetDevice failed: %s\n",
+                hipGetErrorString(err));
+            return false;
+        }
 
-    dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
-    dim3 block(SMALL_N_FP32_BLOCK);
-    hipLaunchKernelGGL(
-        fp32_small_n_batched_projection_kernel,
-        grid,
-        block,
-        0,
-        hip_stream,
-        d_A_array,
-        d_B_array,
-        d_C_array,
-        M,
-        N,
-        K,
-        rows);
+        dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+        dim3 block(SMALL_N_FP32_BLOCK);
+        // The actual chunk cardinality is already sealed in projections. Mutable
+        // live rows cannot change the retained function or dispatch geometry.
+        const auto launch = [&]<int LoadPairs>() {
+            hipLaunchKernelGGL((fp32_small_n_batched_projection_kernel<LoadPairs, Rows>),
+                grid, block, 0, hip_stream, projections, M, N, K, rows);
+        };
+        using LoadPairs = llaminar2::rocm::FP32ProjectionLoadPairs;
+        switch (llaminar2::rocm::selectFP32ProjectionLoadPairs(M, N, batch_count, K))
+        {
+        case LoadPairs::Eight: launch.template operator()<8>(); break;
+        case LoadPairs::Four: launch.template operator()<4>(); break;
+        case LoadPairs::Scalar: launch.template operator()<1>(); break;
+        }
 
-    return complete_kernel_launch(hip_stream, "rocmFp32_small_n_batched_projection");
+        return complete_kernel_launch(hip_stream, "rocmFp32_small_n_batched_projection");
+    });
 }
 
 extern "C" bool rocmFp32x16_batched_projection(
-    const float *const *d_A_array,
-    const float *const *d_B_array,
-    float *const *d_C_array,
+    llaminar2::FixedFP32x16ProjectionGroup projections,
     int M,
     int N,
     int K,
-    int batch_count,
     int weight_dtype,
     int device_id,
     void *stream,
-    const llaminar2::DeviceRowRange *row_range)
+    const llaminar2::DeviceRowRange *row_range,
+    const llaminar2::DeviceRequestRowRanges *request_rows)
 {
-    if (row_range && row_range->physicalRows() != M)
-        return false;
-    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
-        (weight_dtype != SMALL_PROJECTION_WEIGHT_FP16 &&
-         weight_dtype != SMALL_PROJECTION_WEIGHT_BF16) ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp32x16_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d dtype=%d stream=%p\n",
-            M,
-            N,
-            K,
-            batch_count,
-            weight_dtype,
-            stream);
-        return false;
-    }
+    const int batch_count = projections.size();
+    if (M<=0 || (row_range && request_rows) ||
+        (row_range && row_range->physicalRows()!=M) ||
+        (request_rows && request_rows->physicalRows()!=M))return false;
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,request_rows, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
+            (weight_dtype != SMALL_PROJECTION_WEIGHT_FP16 &&
+             weight_dtype != SMALL_PROJECTION_WEIGHT_BF16) ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp32x16_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d dtype=%d stream=%p\n",
+                M,
+                N,
+                K,
+                batch_count,
+                weight_dtype,
+                stream);
+            return false;
+        }
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    hipError_t err = hipSetDevice(device_id);
-    if (err != hipSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp32x16_batched_projection] hipSetDevice failed: %s\n",
-            hipGetErrorString(err));
-        return false;
-    }
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp32x16_batched_projection] hipSetDevice failed: %s\n",
+                hipGetErrorString(err));
+            return false;
+        }
 
-    dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
-    dim3 block(SMALL_N_FP32_BLOCK);
-    hipLaunchKernelGGL(
-        fp32x16_batched_projection_kernel,
-        grid,
-        block,
-        0,
-        hip_stream,
-        d_A_array,
-        d_B_array,
-        d_C_array,
-        M,
-        N,
-        K,
-        weight_dtype,
-        rows);
+        if constexpr (std::is_same_v<Rows, llaminar2::FloatingProjectionRows>)
+        {
+            // Only explicit ranking-demand work shares column CTAs. Its geometry
+            // is immutable capture identity; device live words never choose a grid.
+            constexpr int scoped_column_ctas = 128;
+            const unsigned columns = static_cast<unsigned>(N < scoped_column_ctas ? N : scoped_column_ctas);
+            dim3 scoped_grid(columns, static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+            dim3 scoped_block(SMALL_N_FP32_BLOCK);
+            if (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_scoped_projection_columns_kernel<SMALL_PROJECTION_WEIGHT_BF16>),
+                    scoped_grid, scoped_block, 0, hip_stream, projections, M, N, K, rows);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_scoped_projection_columns_kernel<SMALL_PROJECTION_WEIGHT_FP16>),
+                    scoped_grid, scoped_block, 0, hip_stream, projections, M, N, K, rows);
+            }
+            return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
+        }
 
-    return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
+        else
+        {
+            dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+            dim3 block(SMALL_N_FP32_BLOCK);
+            // Admission above authenticates the original native encoding once. Each
+            // retained graph records its exact specialization; live rows remain device
+            // owned and never participate in this immutable source-format selection.
+            if (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_BF16, Rows>),
+                    grid,
+                    block,
+                    0,
+                    hip_stream,
+                    projections,
+                    M,
+                    N,
+                    K,
+                    rows);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_FP16, Rows>),
+                    grid,
+                    block,
+                    0,
+                    hip_stream,
+                    projections,
+                    M,
+                    N,
+                    K,
+                    rows);
+            }
+
+            return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
+        }
+    });
 }
 
 /**
@@ -688,49 +868,51 @@ extern "C" bool rocmFp16_batched_projection(
 {
     if (row_range && row_range->physicalRows() != M)
         return false;
-    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp16_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
-            M,
-            N,
-            K,
-            batch_count,
-            stream);
-        return false;
-    }
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,nullptr, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (!d_A_array || !d_B_array || !d_C_array ||
+            M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp16_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
+                M,
+                N,
+                K,
+                batch_count,
+                stream);
+            return false;
+        }
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    hipError_t err = hipSetDevice(device_id);
-    if (err != hipSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp16_batched_projection] hipSetDevice failed: %s\n",
-            hipGetErrorString(err));
-        return false;
-    }
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp16_batched_projection] hipSetDevice failed: %s\n",
+                hipGetErrorString(err));
+            return false;
+        }
 
-    dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
-    dim3 block(SMALL_N_FP32_BLOCK / 2);
-    // All widths retain the same canonical lane order; the measured model
-    // widths expose constant loop bounds without limiting generic geometry.
-    const auto launch = [&]<int FixedK>() {
-        hipLaunchKernelGGL((fp16_packed_batched_projection_kernel<FixedK>),
-            grid, block, 0, hip_stream, d_A_array, d_B_array, d_C_array, M, N, K, rows);
-    };
-    if (K == 2048) launch.template operator()<2048>();
-    else if (K == 4096) launch.template operator()<4096>();
-    else launch.template operator()<0>();
+        dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+        dim3 block(SMALL_N_FP32_BLOCK / 2);
+        // All widths retain the same canonical lane order; the measured model
+        // widths expose constant loop bounds without limiting generic geometry.
+        const auto launch = [&]<int FixedK>() {
+            hipLaunchKernelGGL((fp16_packed_batched_projection_kernel<FixedK, Rows>),
+                grid, block, 0, hip_stream, d_A_array, d_B_array, d_C_array, M, N, K, rows);
+        };
+        if (K == 2048) launch.template operator()<2048>();
+        else if (K == 4096) launch.template operator()<4096>();
+        else launch.template operator()<0>();
 
-    return complete_kernel_launch(hip_stream, "rocmFp16_batched_projection");
+        return complete_kernel_launch(hip_stream, "rocmFp16_batched_projection");
+    });
 }
 
 extern "C" bool rocmFloating_swiglu_down_projection(
@@ -748,59 +930,61 @@ extern "C" bool rocmFloating_swiglu_down_projection(
 {
     if (row_range && row_range->physicalRows() != M)
         return false;
-    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
-    if (!d_gate || !d_up || !d_weights || !d_output ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        (weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_FP32 &&
-         weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_FP16 &&
-         weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_BF16) ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFloating_swiglu_down_projection] invalid arguments: gate=%p up=%p weights=%p output=%p M=%d N=%d K=%d dtype=%d stream=%p\n",
-            static_cast<const void *>(d_gate),
-            static_cast<const void *>(d_up),
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,nullptr, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (!d_gate || !d_up || !d_weights || !d_output ||
+            M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            (weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_FP32 &&
+             weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_FP16 &&
+             weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_BF16) ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFloating_swiglu_down_projection] invalid arguments: gate=%p up=%p weights=%p output=%p M=%d N=%d K=%d dtype=%d stream=%p\n",
+                static_cast<const void *>(d_gate),
+                static_cast<const void *>(d_up),
+                d_weights,
+                static_cast<void *>(d_output),
+                M,
+                N,
+                K,
+                weight_dtype,
+                stream);
+            return false;
+        }
+
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFloating_swiglu_down_projection] hipSetDevice failed: %s\n",
+                hipGetErrorString(err));
+            return false;
+        }
+
+        hipLaunchKernelGGL(
+            (floating_swiglu_down_projection_kernel<Rows>),
+            dim3(static_cast<unsigned>(N), static_cast<unsigned>(M), 1),
+            dim3(SMALL_N_FP32_BLOCK),
+            0,
+            hip_stream,
+            d_gate,
+            d_up,
             d_weights,
-            static_cast<void *>(d_output),
+            d_output,
             M,
             N,
             K,
             weight_dtype,
-            stream);
-        return false;
-    }
+            rows);
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    hipError_t err = hipSetDevice(device_id);
-    if (err != hipSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFloating_swiglu_down_projection] hipSetDevice failed: %s\n",
-            hipGetErrorString(err));
-        return false;
-    }
-
-    hipLaunchKernelGGL(
-        floating_swiglu_down_projection_kernel,
-        dim3(static_cast<unsigned>(N), static_cast<unsigned>(M), 1),
-        dim3(SMALL_N_FP32_BLOCK),
-        0,
-        hip_stream,
-        d_gate,
-        d_up,
-        d_weights,
-        d_output,
-        M,
-        N,
-        K,
-        weight_dtype,
-        rows);
-
-    return complete_kernel_launch(hip_stream, "rocmFloating_swiglu_down_projection");
+        return complete_kernel_launch(hip_stream, "rocmFloating_swiglu_down_projection");
+    });
 }
 
 /** @brief Submit validated short-row bindings; see the shared launch ABI contract. */
@@ -810,15 +994,17 @@ extern "C" bool rocmFp16_short_projection_group(
 {
     if (!stream || m <= 0 || m > llaminar2::kShortHalfProjectionMaxRows || k <= 0 ||
         (row_range && row_range->physicalRows() != m)) return false;
-    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(m);
-    if (hipSetDevice(device_id) != hipSuccess) return false;
-    const auto native = static_cast<hipStream_t>(stream);
-    const auto launch = [&]<int K>() {
-        hipLaunchKernelGGL((short_half_projection_group_kernel<K>),
-            dim3(group.totalColumns(), m), dim3(128), 0, native, group, k, rows);
-    };
-    if (k == 2048) launch.template operator()<2048>();
-    else if (k == 4096) launch.template operator()<4096>();
-    else launch.template operator()<0>();
-    return complete_kernel_launch(native, "rocmFp16_short_projection_group");
+    return llaminar2::FloatingProjectionRows::dispatchNative(m,row_range,nullptr, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (hipSetDevice(device_id) != hipSuccess) return false;
+        const auto native = static_cast<hipStream_t>(stream);
+        const auto launch = [&]<int K>() {
+            hipLaunchKernelGGL((short_half_projection_group_kernel<K, Rows>),
+                dim3(group.totalColumns(), m), dim3(128), 0, native, group, k, rows);
+        };
+        if (k == 2048) launch.template operator()<2048>();
+        else if (k == 4096) launch.template operator()<4096>();
+        else launch.template operator()<0>();
+        return complete_kernel_launch(native, "rocmFp16_short_projection_group");
+    });
 }

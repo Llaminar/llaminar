@@ -8,6 +8,9 @@
  * enabling PerfStats. Both GPU device kinds share this public contract.
  */
 #include "execution/moe/NativeMoEMovementArchive.h"
+#include "execution/moe/DeviceMoERebalanceController.h"
+#include "execution/moe/DeviceMoERebalanceWorkspaceContract.h"
+#include "execution/moe/MoEOverlayDeviceEpochProtocol.h"
 #include "execution/moe/NativeMoEMovementRequestIdentity.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/runner/OrchestrationRunner.h"
@@ -108,8 +111,8 @@ namespace llaminar2::test
             const auto &edge = archive.ledger().edges.front();
             EXPECT_TRUE(edge.valid());
             EXPECT_EQ(edge.source_priority, 17);
-            EXPECT_EQ(edge.source_world_rank, 3);
-            EXPECT_EQ(edge.source_device, geometry(rocm).participants[0].device);
+            EXPECT_EQ(edge.source.whole().world_rank.value_or(-1), 3);
+            EXPECT_EQ(edge.source.whole().device, geometry(rocm).participants[0].device);
             EXPECT_EQ(edge.transaction, 9);
             EXPECT_EQ(edge.axis, MoEOptimizationMovementAxis::ParticipantPlacement);
             EXPECT_EQ(edge.activation_count, 90);
@@ -315,7 +318,20 @@ namespace llaminar2::test
         EXPECT_FALSE(runner.moeOptimizationStatus().quiescentBetweenWaves());
         EXPECT_EQ(runner.moeOptimizationMovementLedger().edges, archive.ledger().edges);
         const auto json = moeMovementLedgerJson(runner.moeOptimizationMovementLedger());
-        EXPECT_EQ(json.at("schema"), 2);
+        EXPECT_EQ(json.at("schema"), 4);
+        EXPECT_EQ(json.at("scope"), "model_lifetime");
+        EXPECT_EQ(json.at("edges").size(), 2);
+        // Forward the complete typed identity, including the non-first root's
+        // original rank/device. Estimated edge bytes remain distinct from the
+        // actual6000-byte native completion receipt asserted above.
+        const auto &wire_edge = json.at("edges").at(0);
+        EXPECT_EQ(wire_edge.at("source"), (nlohmann::json{{"kind", "whole"},
+            {"participant", 0}, {"device", "CUDA:1"}, {"world_rank", 3}}));
+        EXPECT_EQ(wire_edge.at("destination"), (nlohmann::json{{"kind", "whole"},
+            {"participant", 1}, {"device", "CUDA:0"}, {"world_rank", 3}}));
+        EXPECT_EQ(wire_edge.at("estimated_weight_bytes"), 8192);
+        EXPECT_FALSE(wire_edge.contains("source_participant"));
+        EXPECT_FALSE(wire_edge.contains("destination_participant"));
         EXPECT_EQ(json.at("economy").at(0).at("policy"), "native_load_spread");
         EXPECT_EQ(json.at("edges").at(0).at("transaction"), 9);
         // Two roots must not silently select the first child or add duplicates.
@@ -359,4 +375,201 @@ namespace llaminar2::test
         EXPECT_TRUE(ticket.matchesLifecycle(3, 7, 1, 2));
         EXPECT_EQ(nativeMoEMovementArchiveRequestEpoch(ticket, 7, 1, 2), 3);
     }
+    /** @test Actual shared device publication body counts no-ops, never skipped/failed work. */
+    TEST(Test__NativeMoEMovementArchive, CompletedDecisionPublisherReplay)
+    {
+        static_assert(sizeof(DeviceMoERebalanceGraphControllerState) == moe_rebalance_abi::kGraphControllerBytes);
+        DeviceMoERebalanceGraphControllerState controller;
+        controller.participant_count = 3; controller.participant_id = 2;
+        DeviceMoERebalanceStatus policy;
+        policy.windows_observed = 1; policy.window_required_slots = 4; policy.window_ready_slots = 4;
+        policy.pre_wave_load_total = 123; policy.dynamic_ownership_swap_rejections = 2;
+        for (std::uint32_t replay = 0; replay < 20; ++replay)
+        {
+            controller.decode_rounds_committed += 3;
+            const auto before = controller.completed_decision;
+            auto failed = policy; failed.status_code = static_cast<uint32_t>(DeviceMoERebalanceStatusCode::InvalidRuntime);
+            auto append = prepareDeviceMoECompletedDecision(controller, failed, 2, 0, 0);
+            EXPECT_EQ(append.disposition, DeviceMoECompletedDecisionDisposition::Invalid);
+            EXPECT_FALSE(commitDeviceMoECompletedDecision(controller.completed_decision, append));
+            EXPECT_EQ(controller.completed_decision, before);
+            auto zero_work = policy; zero_work.status_code = 1; zero_work.windows_observed = 0;
+            zero_work.window_ready_slots = 0; zero_work.skipped_not_ready = 1;
+            append = prepareDeviceMoECompletedDecision(controller, zero_work, 2, 0, 0);
+            ASSERT_EQ(append.disposition, DeviceMoECompletedDecisionDisposition::Inactive);
+            ASSERT_TRUE(commitDeviceMoECompletedDecision(controller.completed_decision, append));
+            EXPECT_EQ(controller.completed_decision, before);
+            append = prepareDeviceMoECompletedDecision(controller, policy, 2, 0, 0);
+            ASSERT_EQ(append.disposition, DeviceMoECompletedDecisionDisposition::Record);
+            EXPECT_EQ(controller.completed_decision, before); // Preparation is not completion.
+            ASSERT_TRUE(commitDeviceMoECompletedDecision(controller.completed_decision, append));
+            EXPECT_FALSE(commitDeviceMoECompletedDecision(controller.completed_decision, append));
+            EXPECT_EQ(controller.completed_decision.completed_windows, replay + 1);
+            EXPECT_EQ(controller.completed_decision.candidate_epoch, 2); // Valid no-op epochs repeat.
+            EXPECT_EQ(controller.completed_decision.routed_observations, 123);
+        }
+        auto overflow = controller; overflow.completed_decision.completed_windows = UINT64_MAX;
+        EXPECT_EQ(prepareDeviceMoECompletedDecision(overflow, policy, 2, 0, 0).disposition,
+            DeviceMoECompletedDecisionDisposition::Invalid);
+        auto malformed = policy; malformed.window_ready_slots = 3;
+        EXPECT_EQ(prepareDeviceMoECompletedDecision(controller, malformed, 2, 0, 0).disposition,
+            DeviceMoECompletedDecisionDisposition::Invalid);
+        malformed = policy; malformed.version--;
+        EXPECT_EQ(prepareDeviceMoECompletedDecision(controller, malformed, 2, 0, 0).disposition,
+            DeviceMoECompletedDecisionDisposition::Invalid);
+        auto singleton = controller; singleton.participant_count = 1; singleton.participant_id = 0;
+        EXPECT_EQ(prepareDeviceMoECompletedDecision(singleton, policy, 2, 0, 0).disposition,
+            DeviceMoECompletedDecisionDisposition::Invalid);
+        // Request reset's native initializer assigns a complete fresh controller.
+        controller = {}; controller.participant_count = 3;
+        policy.dynamic_ownership_swap_accepts = 1; policy.last_epoch = 1;
+        const auto moving = prepareDeviceMoECompletedDecision(controller, policy, 3, 1, 2);
+        ASSERT_TRUE(commitDeviceMoECompletedDecision(controller.completed_decision, moving));
+        EXPECT_EQ(controller.completed_decision.completed_windows, 1);
+        EXPECT_EQ(controller.completed_decision.command_epoch, 1);
+        EXPECT_EQ(controller.completed_decision.command_count, 2);
+        EXPECT_EQ(controller.completed_decision.accepted_cycles, 1);
+    }
+
+    /** @test Immutable public decision evidence retains request identity and cumulative progress. */
+    TEST(Test__NativeMoEMovementArchive, CompletedDecisionResetAndRepeatedTerminalObservation)
+    {
+        NativeMoEMovementArchive archive(geometry());
+        Snapshot empty;
+        DeviceMoERebalanceCompletedDecision receipt{3, 2, 123, 0, 0, 0, 2, 9, 1};
+        const auto observe = [&](std::uint64_t request) {
+            return archive.observe(request, 7, empty.state, {}, {}, receipt);
+        };
+        ASSERT_NO_THROW(observe(41));
+        ASSERT_TRUE(archive.lastDecision());
+        EXPECT_EQ(archive.completedDecisionWindows(), 3);
+        EXPECT_TRUE(archive.lastDecision()->noMovement());
+        EXPECT_EQ(archive.lastDecision()->transaction, 3);
+        EXPECT_EQ(archive.lastDecision()->source_request_epoch, 41);
+        EXPECT_EQ(archive.lastDecision()->snapshot_observations, 123);
+        MoEOptimizationStatus status{.authority = MoEOptimizationAuthority::Device,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = MoEOptimizationActivityState::DeviceOwned,
+            .completed_decision_windows = archive.completedDecisionWindows(), .last_decision = archive.lastDecision()};
+        const auto stamp = status.progressStamp();
+        EXPECT_EQ(moeOptimizationStatusJson(status)["last_decision"]["source_request_epoch"], 41);
+        EXPECT_NO_THROW(observe(41)); EXPECT_EQ(archive.completedDecisionWindows(), 3);
+        EXPECT_EQ(status.progressStamp().relationTo(stamp), MoEOptimizationProgressRelation::Unchanged);
+        ++receipt.completed_windows; receipt.committed_decode_rounds = 12;
+        EXPECT_NO_THROW(observe(41)); EXPECT_EQ(archive.completedDecisionWindows(), 4);
+        status.completed_decision_windows = archive.completedDecisionWindows(); status.last_decision = archive.lastDecision();
+        EXPECT_EQ(status.progressStamp().relationTo(stamp), MoEOptimizationProgressRelation::Advanced);
+        // A no-work new request preserves the prior genuine last decision.
+        receipt = {};
+        EXPECT_NO_THROW(observe(42)); EXPECT_EQ(archive.completedDecisionWindows(), 4);
+        EXPECT_EQ(archive.lastDecision()->source_request_epoch, 41);
+        receipt = {1, 2, 37, 0, 0, 0, 1, 4, 1};
+        EXPECT_NO_THROW(observe(42)); EXPECT_EQ(archive.completedDecisionWindows(), 5);
+        EXPECT_EQ(archive.lastDecision()->transaction, 1); // Request-local ordinal, not invented global txn.
+        EXPECT_EQ(archive.lastDecision()->source_request_epoch, 42);
+        EXPECT_NO_THROW(observe(42)); EXPECT_EQ(archive.completedDecisionWindows(), 5);
+        // Existing non-request-scoped topology/host receipt semantics stay valid.
+        MoEOptimizationDecisionReceipt legacy{.transaction = 1, .candidate_epoch = 1};
+        EXPECT_TRUE(legacy.valid()); EXPECT_EQ(legacy.source_request_epoch, 0);
+        EXPECT_TRUE(legacy.rejected_cycles_observed);
+        legacy.rejected_cycles_observed = false; legacy.rejected_cycles = 1;
+        EXPECT_FALSE(legacy.valid());
+        status.last_decision = legacy;
+        EXPECT_THROW(moeOptimizationStatusJson(status), std::invalid_argument);
+    }
+
+    /** @test Corrupt/stale completion evidence cannot mutate accepted public history. */
+    TEST(Test__NativeMoEMovementArchive, CompletedDecisionMalformedEvidenceIsAtomic)
+    {
+        NativeMoEMovementArchive archive(geometry(true));
+        DeviceMoERebalanceMovementJournalState journal;
+        const DeviceMoERebalanceCompletedDecision original{2, 4, 123, 7, 2, 1, 0, 8, 0};
+        archive.observe(1, 7, journal, {}, {}, original);
+        for (int field = 0; field < 9; ++field)
+        {
+            auto changed = original;
+            switch (field) {
+            case 0: --changed.completed_windows; break;
+            case 1: ++changed.routed_observations; break;
+            case 2: ++changed.command_epoch; break;
+            case 3: ++changed.command_count; break;
+            case 4: ++changed.accepted_cycles; break;
+            case 5: ++changed.rejected_cycles; break;
+            case 6: --changed.committed_decode_rounds; break;
+            case 7: changed.observation_flags = 2; break;
+            case 8: changed.candidate_epoch = 0; break;
+            }
+            EXPECT_THROW(archive.observe(1, 7, journal, {}, {}, changed), std::invalid_argument) << field;
+            EXPECT_EQ(archive.completedDecisionWindows(), 2);
+            EXPECT_EQ(archive.lastDecision()->snapshot_observations, 123);
+        }
+        auto stale = original; ++stale.completed_windows; --stale.candidate_epoch;
+        EXPECT_THROW(archive.observe(1, 7, journal, {}, {}, stale), std::invalid_argument);
+        EXPECT_THROW(archive.observe(2, 7, journal, {}, {}, stale), std::invalid_argument);
+        auto reset = original; reset.completed_windows = 0;
+        EXPECT_THROW(archive.observe(1, 7, journal, {}, {}, reset), std::invalid_argument);
+        EXPECT_THROW(archive.observe(1, 8, journal, {}, {}, original), std::invalid_argument);
+    }
+
+    /** @test Existing canonical workspace BOM admits the complete appended controller ABI. */
+    TEST(Test__NativeMoEMovementArchive, CompletedDecisionUsesCanonicalControllerBOM)
+    {
+        DeviceMoERebalanceConfig config;
+        config.num_layers = 2; config.num_experts = 8; config.participant_count = 3;
+        config.flags |= static_cast<std::uint32_t>(DeviceMoERebalanceFlags::CompletedDynamicDecisions);
+        const auto capacity = DeviceMoERebalanceWorkspaceCapacity::fromRuntime(config, 0, 0,
+            DeviceMoERebalanceStagePhase::PlanCopyApply, DeviceMoERebalanceTransferMode::ResidentOnly);
+        EXPECT_TRUE(hasDeviceMoERebalanceFlag(capacity.flags, DeviceMoERebalanceFlags::CompletedDynamicDecisions));
+        const auto requirements = DeviceMoERebalanceWorkspaceContract::requirements({capacity, 0, "decision_bom"});
+        std::size_t controllers = 0;
+        for (const auto &buffer : requirements.buffers)
+            if (buffer.name == std::string(DeviceMoERebalanceWorkspaceContract::WS_CONTROLLER_STATE) + "_decision_bom") {
+                ++controllers;
+                EXPECT_EQ(buffer.size_bytes, sizeof(DeviceMoERebalanceGraphControllerState));
+                EXPECT_EQ(buffer.size_bytes, 408);
+                EXPECT_EQ(buffer.alignment, 256);
+            }
+        EXPECT_EQ(controllers, 1);
+    }
+
+    /** @test Busy reserve retains moving proof while later scratch describes a skipped new window. */
+    TEST(Test__NativeMoEMovementArchive, CompletedDecisionRetainedMovingProofSurvivesBusyReserve)
+    {
+        DeviceMoEOverlayEpochControl control;
+        MoEOverlayDeviceEpochProtocol::initialize(control, 1);
+        MoEOverlayDeviceEpochProtocol epochs(control);
+        auto held = epochs.tryAcquirePublished(); ASSERT_TRUE(held);
+        ASSERT_TRUE(epochs.reserveCandidate(2)); epochs.markCandidateReady(2);
+        ASSERT_TRUE(epochs.publishReadyCandidate(2).valid());
+        DeviceMoERebalanceGraphControllerState controller; controller.participant_count = 3;
+        controller.decode_rounds_committed = 12;
+        const DeviceMoERebalanceLoadSpreadProof retained{40, 100, 60, 200, 200, 0, 20, 200, 200, 1, 40, 300, 1};
+        EXPECT_FALSE(epochs.reserveCandidate(3)); // Old original inference ticket still pins the bank.
+        EXPECT_EQ(controller.completed_decision.completed_windows, 0);
+        DeviceMoERebalanceStatus later; later.status_code = static_cast<std::uint32_t>(DeviceMoERebalanceStatusCode::WindowNotReady);
+        later.skipped_not_ready = later.skipped_busy_wave = 1;
+        later.pre_wave_load_total = 999; // A different planner pass has no authority over retained commands.
+        EXPECT_EQ(prepareDeviceMoECompletedDecision(controller, later, 3, 7, 2).disposition,
+            DeviceMoECompletedDecisionDisposition::Invalid);
+        ASSERT_TRUE(epochs.release(*held)); ASSERT_TRUE(epochs.tryRetire(1));
+        ASSERT_TRUE(epochs.reserveCandidate(3));
+        const auto append = prepareDeviceMoECompletedOwnershipDecision(controller, retained, 3, 7, 2);
+        ASSERT_EQ(append.disposition, DeviceMoECompletedDecisionDisposition::Record);
+        EXPECT_EQ(controller.completed_decision.completed_windows, 0); // Preparation still is not completion.
+        epochs.markCandidateReady(3); ASSERT_TRUE(epochs.publishReadyCandidate(3).valid());
+        ASSERT_TRUE(commitDeviceMoECompletedDecision(controller.completed_decision, append));
+        EXPECT_FALSE(commitDeviceMoECompletedDecision(controller.completed_decision, append));
+        const auto &receipt = controller.completed_decision;
+        EXPECT_EQ(receipt.completed_windows, 1); EXPECT_EQ(receipt.command_epoch, 7);
+        EXPECT_EQ(receipt.routed_observations, 200); EXPECT_EQ(receipt.accepted_cycles, 1);
+        EXPECT_EQ(receipt.observation_flags & kNativeMoEPlannerRejectionsObserved, 0); // Rejection count was never retained in this proof.
+        NativeMoEMovementArchive archive(geometry());
+        archive.observe(41, 7, {}, {}, {}, receipt);
+        MoEOptimizationStatus status{.authority = MoEOptimizationAuthority::Device,
+            .completed_decision_windows = archive.completedDecisionWindows(), .last_decision = archive.lastDecision()};
+        EXPECT_FALSE(status.last_decision->rejected_cycles_observed);
+        EXPECT_TRUE(moeOptimizationStatusJson(status)["last_decision"]["rejected_cycles"].is_null());
+        EXPECT_EQ(moeOptimizationStatusJson(status)["last_decision"]["rejected_cycles_observed"], false);
+    }
+
 }

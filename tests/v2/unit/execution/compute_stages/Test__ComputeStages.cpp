@@ -591,7 +591,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
  * discovered these persistent maintenance buffers while constructing the
  * serial graph family.  Keep the model geometry, transfer-directory capacity,
  * and Q4_K_XL wire stride explicit here so a later lifecycle refactor cannot
- * silently drop any portion of the 10.5 MB physical claim again.
+ * silently drop any typed scratch or compact payload allocation again.
  */
 TEST_F(ComputeStagesTest,
        MoEDeviceRebalanceWorkspaceContract_CoversQwen35DynamicProductionGeometry)
@@ -626,12 +626,22 @@ TEST_F(ComputeStagesTest,
     const auto requirements =
         DeviceMoERebalanceWorkspaceContract::requirements(binding);
     ASSERT_EQ(requirements.buffers.size(), 21u);
+    const auto *placement_scratch = requirements.find(
+        "moe_rebalance_placement_plan_scratch_qwen35_dynamic_production_geometry");
+    ASSERT_NE(placement_scratch, nullptr);
+    EXPECT_EQ(placement_scratch->size_bytes, sizeof(DeviceMoEPlacementBank));
+    EXPECT_EQ(placement_scratch->size_bytes, moe_runtime_abi::kPlacementBankBytes);
+    WorkspaceRequirements placement_only;
+    placement_only.buffers.push_back(*placement_scratch);
+    // Other buffers retain the exact admitted 256-expert/live-one-slot geometry.
+    // Only the RCU placement generation has the ABI-wide expert capacity.
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
-        12412280u);
+        12348264u + moe_runtime_abi::kPlacementBankBytes +
+            sizeof(DeviceMoERebalanceCompletedDecision));
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
-        12413696u);
+        12349440u + placement_only.total_bytes_with_alignment());
     EXPECT_EQ(
         requirements.total_bytes_with_alignment(),
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding));
@@ -734,7 +744,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjec
 
     auto descFor = [&](uint8_t codebook_id, bool with_mins, bool with_emins)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = &payload;
         desc.scales = &scales;
         desc.mins = with_mins ? &mins : nullptr;
@@ -761,7 +771,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjec
     destination.descriptor.gate = descFor(/*codebook_id=*/4, true, true);
     destination.descriptor.up = descFor(/*codebook_id=*/4, true, true);
     destination.descriptor.down = descFor(/*codebook_id=*/4, true, true);
-    for (DeviceNativeVNNIMatrixDesc *projection : {
+    for (DeviceNativeQuantisedMatrixDesc *projection : {
              &destination.descriptor.gate,
              &destination.descriptor.up,
              &destination.descriptor.down})
@@ -813,7 +823,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
         result.is_asymmetric = has_mins;
         result.has_emins = has_emins;
         result.codebook_id = codebook_id;
-        result.format = ExpertWeightFormat::nativeVnni({
+        result.format = ExpertWeightFormat::nativeQuantised({
             .codebook_id = codebook_id,
             .is_superblock = is_superblock,
             .present = true,
@@ -880,7 +890,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFloatingAndQuantizedCapacityShareOne
     }
     const auto raw_profile = Directory::profileForLayerFormats(layers);
     const auto raw_bytes = Directory::allocationBOM(capacity, raw_profile).payload_bytes;
-    for (const auto &source_format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &source_format : native_quantised_formats::kAllSourceFormats)
     {
         const auto &format = *source_format.metadata;
         std::vector<Directory::ProjectionSpec> quantized;
@@ -889,7 +899,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFloatingAndQuantizedCapacityShareOne
                 .payload_bytes_per_block = format.payload_bytes,
                 .is_asymmetric = format.is_asymmetric, .has_emins = format.has_emins,
                 .codebook_id = format.codebook_id,
-                .format = ExpertWeightFormat::nativeVnni({
+                .format = ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock, .present = true})});
         auto mixed = layers;

@@ -5,6 +5,7 @@
  * Single-process tests (MPI_PROCS 1):
  *   - Arena layout / alignment assertions
  *   - Native shared-memory route detection
+ *   - Replicated cohort live-size selection and public authority boundaries
  *   - AVX-512 reduce correctness
  *
  * Two-process tests (MPI_PROCS 2):
@@ -21,8 +22,13 @@
  * The separately selected ShmemSpinEconomyMPITest suite measures the latency
  * distribution against MPI. CTest registers it as Perf, never as Unit or
  * production preflight: competing compilation or tests invalidate its timing.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <algorithm>
@@ -32,6 +38,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <immintrin.h>
 #include <numeric>
 #include <sys/mman.h>
@@ -42,6 +49,8 @@
 #include "collective/backends/UPIBackend.h"
 #include "collective/DeviceGroup.h"
 #include "collective/GlobalTPContext.h"
+#include "execution/moe/MoEOverlayJointRouteTarget.h"
+#include "execution/moe/MoEOverlaySharedDispatchSelection.h"
 
 using namespace llaminar2;
 
@@ -163,6 +172,95 @@ TEST(Test__ShmemSpinBackend, RootedPublicationTransportPolicyHasExactBoundaries)
             Operation::CompactOutputBroadcast,
             five_row_broadcast_bytes),
         Transport::MPIBandwidth);
+}
+
+namespace
+{
+/** Public callers must not manufacture a replicated-count or transport override. */
+template<class Context>
+concept PublicReplicatedPrefillGather = requires(Context& context,
+    const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+    const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
+    size_t capacity,int root_index,size_t& gathered,const std::string& stage,
+    std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)
+{
+    context.gatherReplicatedCPUExpertPrefillRoutesToRoot(source,packet,owner,local,root,
+        capacity,root_index,gathered,stage,ranges,selected);
+};
+static_assert(!PublicReplicatedPrefillGather<GlobalTPContext>);
+}
+
+/** @test A large declaration never promotes a small remote member's live prefix. */
+TEST(Test__ShmemSpinBackend, ReplicatedPrefillTransportUsesOneFullRemoteChunk)
+{
+    using Policy=CPURootedPublicationTransportPolicy;
+    using Transport=CPURootedPublicationTransport;
+    constexpr size_t chunk=ShmemSpinArena::CHUNK_CAPACITY*sizeof(float);
+    constexpr size_t declaration=64u*1024u*1024u;
+    static_assert(chunk==Policy::kReplicatedParallelGatherMinMemberBytes);
+    for(size_t live:{size_t{0},size_t{1},size_t{256u*1024u},size_t{1024u*1024u},chunk-1u})
+        EXPECT_EQ(Policy::selectReplicatedPrefillGather(declaration,live),Transport::MPIBandwidth);
+    for(size_t live:{chunk,chunk+1u,4u*chunk})
+        EXPECT_EQ(Policy::selectReplicatedPrefillGather(declaration,live),Transport::SharedMemoryParallel);
+    // Root-local alias bytes and arbitrary declaration capacity cannot qualify
+    // the generic, independently variable-count API for a new large shared arm.
+    EXPECT_EQ(Policy::select(CPURootedPublicationOperation::PackedRecordGather,declaration),
+        Transport::MPIBandwidth);
+    EXPECT_EQ(Policy::selectReplicatedPrefillGather(
+        Policy::kPackedGatherSharedMemoryMaxBytes,16u),Transport::SharedMemoryLatency);
+    EXPECT_EQ(Policy::select(CPURootedPublicationOperation::CompactOutputBroadcast,
+        Policy::kBroadcastSharedMemoryMaxBytes+1u),Transport::MPIBandwidth);
+}
+
+/** @test Original cohort resolution gives every member the same nonzero route set.
+ * Replay 2/4/8 members and every root, including empty/partial/chunk/large-to-small.
+ * This invokes the actual portable target and signed-zero decisions used by the
+ * packet producer; native packet/copy replay remains a separate integration gate.
+ */
+TEST(Test__ShmemSpinBackend, ReplicatedPrefillCohortSelectionIsDegreeIndependent)
+{
+    using Policy=CPURootedPublicationTransportPolicy;
+    using Transport=CPURootedPublicationTransport;
+    constexpr size_t width=4097u;
+    constexpr size_t declaration=128u*1024u*1024u;
+    for(int degree:{2,4,8})
+        for(size_t live_routes:{size_t{0},size_t{1},size_t{255},size_t{256},size_t{257},size_t{1024},size_t{1},size_t{0}})
+        {
+            std::array<size_t,8> counts{};
+            for(int member=0;member<degree;++member)
+            {
+                const int participant=7+13*member;
+                const auto lane=MoEOverlayJointRouteTarget::fromOriginalCohort(8,participant,9,4);
+                for(size_t route=0;route<live_routes+4u;++route)
+                {
+                    int word=MoEOverlayRouteTarget::cpuCohort(4).word();
+                    float weight=1.0f;
+                    if(route==live_routes)weight=0.0f;
+                    if(route==live_routes+1u)weight=-0.0f;
+                    if(route==live_routes+2u)word=MoEOverlayRouteTarget::cpuCohort(5).word();
+                    if(route==live_routes+3u)word=MoEOverlayRouteTarget::whole(0).word();
+                    int selected=-99;
+                    ASSERT_TRUE(lane.resolve(3,word,&selected));
+                    if(selected==participant && !moeOverlayJointRouteWeightIsZero(weight))++counts[member];
+                }
+                ASSERT_EQ(counts[member],live_routes);
+            }
+            for(int root=0;root<degree;++root)
+            {
+                const auto policy=Policy::selectReplicatedPrefillGather(declaration,counts[root]*width*sizeof(float));
+                size_t remote_bytes=0;
+                for(int member=0;member<degree;++member)
+                    if(member!=root)
+                    {
+                        EXPECT_EQ(Policy::selectReplicatedPrefillGather(
+                            declaration,counts[member]*width*sizeof(float)),policy);
+                        remote_bytes+=counts[member]*width*sizeof(float);
+                    }
+                EXPECT_EQ(remote_bytes,(size_t(degree)-1u)*live_routes*width*sizeof(float));
+                EXPECT_EQ(policy,live_routes*width*sizeof(float)>=Policy::kReplicatedParallelGatherMinMemberBytes
+                    ? Transport::SharedMemoryParallel : Transport::MPIBandwidth);
+            }
+        }
 }
 
 TEST(Test__ShmemSpinBackend, SharedMemoryPathDetectionIsSizeTotal)
@@ -888,13 +986,13 @@ TEST_F(ShmemSpinMPITest, BasicAllreduce2048)
 
 TEST_F(ShmemSpinMPITest, SharedMemoryNameUnlinkedAfterInitialize)
 {
-    const std::string name = backend_->shmName();
+    const std::string name = backend_->backingPath();
     ASSERT_FALSE(name.empty());
 
     errno = 0;
-    int fd = shm_open(name.c_str(), O_RDWR, 0);
-    EXPECT_EQ(fd, -1) << "ShmemSpinBackend should unlink its POSIX shm name after all ranks map it";
-    EXPECT_EQ(errno, ENOENT) << "Unexpected shm_open errno for unlinked name " << name;
+    int fd = ::open(name.c_str(), O_RDWR | O_NOFOLLOW);
+    EXPECT_EQ(fd, -1) << "ShmemSpinBackend should unlink its exact owned backing name after all ranks map it";
+    EXPECT_EQ(errno, ENOENT) << "Unexpected open errno for unlinked backing " << name;
     if (fd >= 0)
         close(fd);
 }
@@ -918,14 +1016,14 @@ TEST(Test__ShmemSpinBackend, ReinitializeUsesFreshSharedMemoryName)
 
     auto first = create_backend();
     ASSERT_TRUE(first->initialize(group)) << first->lastError();
-    const std::string first_name = first->shmName();
+    const std::string first_name = first->backingPath();
     ASSERT_FALSE(first_name.empty());
     first->shutdown();
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto second = create_backend();
     ASSERT_TRUE(second->initialize(group)) << second->lastError();
-    const std::string second_name = second->shmName();
+    const std::string second_name = second->backingPath();
     ASSERT_FALSE(second_name.empty());
     EXPECT_NE(second_name, first_name)
         << "Reinitializing the same domain must not reuse a deterministic shm name";
@@ -933,48 +1031,30 @@ TEST(Test__ShmemSpinBackend, ReinitializeUsesFreshSharedMemoryName)
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
-TEST(Test__ShmemSpinBackend, LegacyDeterministicNameDoesNotBlockInitialization)
+TEST(Test__ShmemSpinBackend, RootContainedArenaPreservesLiveNeighbor)
 {
-    const int rank = mpiRank();
-    const int size = mpiSize();
-    if (size < 2)
-    {
-        GTEST_SKIP() << "Requires MPI_PROCS >= 2";
-    }
-
-    const int domain_id = 424201;
-    const std::string legacy_name = "/llaminar_shmem_ar_" + std::to_string(domain_id);
-
-    if (rank == 0)
-    {
-        shm_unlink(legacy_name.c_str());
-        int fd = shm_open(legacy_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-        ASSERT_GE(fd, 0) << "Failed to create stale legacy shm object: " << strerror(errno);
-        ASSERT_EQ(ftruncate(fd, 4096), 0) << "Failed to size stale legacy shm object: " << strerror(errno);
-        close(fd);
+    const int rank=mpiRank(),size=mpiSize();
+    if(size<2)GTEST_SKIP()<<"Requires MPI_PROCS >= 2";
+    auto directory=MPISessionOwner::sharedDirectory();
+    ASSERT_TRUE(directory)<<"Actual owner required for shared backing";
+    MPISessionOwner::SharedFile neighbor;
+    if(rank==0) {
+        neighbor=directory->createExclusive("shmem-live-neighbor");
+        ASSERT_EQ(::ftruncate(neighbor.descriptor(),4096),0);
     }
     MPI_Barrier(MPI_COMM_WORLD);
-
-    auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
-    ShmemSpinBackend backend(domain_id, rank, std::move(upi));
-    DeviceGroup group = makeCpuDeviceGroup(size);
-    ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
-    EXPECT_NE(backend.shmName(), legacy_name)
-        << "Backend should use a fresh per-run name instead of the legacy deterministic name";
-
-    float value = static_cast<float>(rank + 1);
-    ASSERT_TRUE(backend.allreduce(&value, 1, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_FLOAT_EQ(value, static_cast<float>(size * (size + 1)) / 2.0f);
-
+    auto upi=std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD,nullptr);
+    ShmemSpinBackend backend(424201,rank,std::move(upi));
+    ASSERT_TRUE(backend.initialize(makeCpuDeviceGroup(size)))<<backend.lastError();
+    EXPECT_NE(backend.backingPath(),directory->path()+"/shmem-live-neighbor");
+    float value=static_cast<float>(rank+1);
+    ASSERT_TRUE(backend.allreduce(&value,1,CollectiveDataType::FLOAT32,CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_FLOAT_EQ(value,static_cast<float>(size*(size+1))/2.0f);
     backend.shutdown();
     MPI_Barrier(MPI_COMM_WORLD);
-
-    if (rank == 0)
-    {
-        errno = 0;
-        int unlink_result = shm_unlink(legacy_name.c_str());
-        EXPECT_TRUE(unlink_result == 0 || errno == ENOENT)
-            << "Failed to cleanup stale legacy shm object: " << strerror(errno);
+    if(rank==0) {
+        EXPECT_NO_THROW(neighbor.requireExtent(4096));
+        EXPECT_TRUE(std::filesystem::exists(neighbor.path()));
     }
     MPI_Barrier(MPI_COMM_WORLD);
 }
@@ -1114,7 +1194,8 @@ TEST_F(
  * @test NativePackedGatherIsSizeTotalAndComposesWithOtherProtocols
  *
  * A production packed route block can exceed the four-megabyte participant
- * slot. This test transfers one multi-chunk block per rank, verifies root-first
+ * slot. NP2/4/8 use the same original backend and complete live rank-major
+ * payload checks. This test transfers one multi-chunk block per rank, verifies root-first
  * participant layout, then alternates allreduce, empty/non-empty gather, and
  * broadcast without barriers. It catches epoch divergence between protocol
  * implementations and stale payload reuse at operation boundaries.
@@ -1123,14 +1204,12 @@ TEST_F(
     ShmemSpinMPITest,
     NativePackedGatherIsSizeTotalAndComposesWithOtherProtocols)
 {
-    if (size_ != 2)
-        GTEST_SKIP() << "Multi-chunk rooted publication economy targets two sockets";
-
     constexpr size_t record_width = 17u;
     const size_t base_records =
         ShmemSpinArena::CHUNK_CAPACITY / record_width + 3u;
     const size_t local_records = base_records + static_cast<size_t>(rank_);
-    const size_t root_capacity = 2u * base_records + 1u;
+    const size_t root_capacity = static_cast<size_t>(size_) * base_records +
+        static_cast<size_t>(size_) * static_cast<size_t>(size_ - 1) / 2u;
     std::vector<float> local(local_records * record_width);
     for (size_t element = 0u; element < local.size(); ++element)
     {
@@ -1159,20 +1238,16 @@ TEST_F(
             local.begin(),
             local.end(),
             gathered.begin()));
-        const size_t peer_offset = local.size();
-        EXPECT_FLOAT_EQ(
-            gathered[peer_offset],
-            static_cast<float>(4u * ShmemSpinArena::CHUNK_CAPACITY));
-        EXPECT_FLOAT_EQ(
-            gathered[peer_offset +
-                     ShmemSpinArena::CHUNK_CAPACITY - 1u],
-            static_cast<float>(
-                5u * ShmemSpinArena::CHUNK_CAPACITY - 1u));
-        EXPECT_FLOAT_EQ(
-            gathered.back(),
-            static_cast<float>(
-                4u * ShmemSpinArena::CHUNK_CAPACITY +
-                (base_records + 1u) * record_width - 1u));
+        size_t offset=local.size();
+        for(int source=1;source<size_;++source)
+        {
+            const size_t elements=(base_records+static_cast<size_t>(source))*record_width;
+            for(size_t element=0;element<elements;++element)
+                ASSERT_EQ(gathered[offset+element],static_cast<float>(
+                    static_cast<size_t>(source)*4u*ShmemSpinArena::CHUNK_CAPACITY+element));
+            offset+=elements;
+        }
+        EXPECT_EQ(offset,gathered.size());
     }
 
     constexpr size_t small_record_width = 3u;
@@ -1189,7 +1264,7 @@ TEST_F(
         EXPECT_FLOAT_EQ(reduced.back(), rank_sum_);
 
         /*
-         * Exercise every two-rank count combination, including repeated
+         * Exercise root/peer count combinations at each supported degree, including repeated
          * all-empty transactions. The asymmetric periods force a participant
          * to move quickly into the next transaction while its peer may still
          * be reading the reusable count slot, which directly regresses the
@@ -1204,22 +1279,20 @@ TEST_F(
             static_cast<float>(1000 * iteration + 100 * rank_ + 2),
             static_cast<float>(1000 * iteration + 100 * rank_ + 3),
         };
-        std::array<float, 2u * small_record_width> root_records{};
-        root_records.fill(-9.0f);
+        std::vector<float> root_records(static_cast<size_t>(size_)*small_record_width,-9.0f);
         gathered_records = 0u;
         ASSERT_TRUE(backend_->gatherVariableFloatRecordsToRoot(
             contributes ? record.data() : nullptr,
             record_count,
             rank_ == 0 ? root_records.data() : nullptr,
-            2u,
+            static_cast<size_t>(size_),
             small_record_width,
             0,
             gathered_records));
         if (rank_ == 0)
         {
-            const size_t expected_records =
-                static_cast<size_t>(iteration % 3 != 0) +
-                static_cast<size_t>(iteration % 2 != 0);
+            const size_t expected_records = static_cast<size_t>(iteration % 3 != 0) +
+                static_cast<size_t>(size_ - 1) * static_cast<size_t>(iteration % 2 != 0);
             EXPECT_EQ(gathered_records, expected_records);
         }
 
@@ -1943,9 +2016,14 @@ TEST_F(ShmemSpinMPITest, SynchronizeWorks)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

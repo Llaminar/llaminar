@@ -11,7 +11,7 @@
  * No performance threshold belongs in this model-free integration gate.
  */
 #include <gtest/gtest.h>
-#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 
 #include <array>
 #include <cstring>
@@ -77,7 +77,7 @@ __global__ void decode(const uint4 *input, uint32_t *output, unsigned count)
     if (index >= count) return;
     int32_t groups[8];
     if constexpr (Surface == LookupSurface::Vector)
-        llaminar2::cuda_native_vnni::decode_groups_vec<4>(
+        llaminar2::cuda_native_quantised::decode_groups_vec<4>(
             reinterpret_cast<const uint8_t *>(input + index), groups);
     else
     {
@@ -87,7 +87,7 @@ __global__ void decode(const uint4 *input, uint32_t *output, unsigned count)
         for (int word = 0; word < 4; ++word)
         {
             uint32_t low, high;
-            llaminar2::cuda_native_vnni::iq4nl_decode_word(words[word], low, high);
+            llaminar2::cuda_native_quantised::iq4nl_decode_word(words[word], low, high);
             groups[word] = static_cast<int32_t>(low);
             groups[word + 4] = static_cast<int32_t>(high);
         }

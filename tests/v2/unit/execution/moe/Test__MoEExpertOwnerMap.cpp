@@ -596,4 +596,31 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 
+    /** The range is the original full scan, including sparse coordinates and reset. */
+    TEST(Test__MoEExpertOwnerMap, CanonicalLayerRangeMatchesWholeOwnerFullScan)
+    {
+        auto plan = disjointRocmPlan(RoutedExpertComputePolicy::Apportioned);
+        plan.first_model_layer = 32;
+        plan.placements = {{.layer = 34, .routed_expert_tier = {0, 1, 0, 1, 0, 1}},
+                           {.layer = 32, .routed_expert_tier = {1, 0, 1, 0, 1, 0}}};
+        // Canonicalization is owned by the builder, not the declaration order.
+        const auto map = MoEExpertOwnerMap::build(plan);
+        for (const int layer : {-1, 0, 31, 32, 33, 34, 35, std::numeric_limits<int>::max()})
+        {
+            std::vector<MoEExpertOwner> expected;
+            for (const auto &owner : map.owners())
+                if (owner.layer_idx == layer) expected.push_back(owner);
+            const auto actual = map.placementsForLayer(layer);
+            ASSERT_EQ(actual.size(), expected.size());
+            EXPECT_EQ(std::vector<MoEExpertOwner>(actual.begin(), actual.end()), expected);
+            for (std::size_t i = 0; i < actual.size(); ++i)
+                EXPECT_EQ(&actual[i], map.placementFor(layer, actual[i].expert_id));
+        }
+        const MoEExpertOwnerMap empty;
+        EXPECT_TRUE(empty.placementsForLayer(32).empty());
+        auto invalid = plan;
+        invalid.placements.push_back(invalid.placements.front());
+        EXPECT_THROW((void)MoEExpertOwnerMap::build(invalid), std::invalid_argument);
+    }
+
 } // namespace llaminar2::test

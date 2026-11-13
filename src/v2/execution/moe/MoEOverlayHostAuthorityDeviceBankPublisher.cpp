@@ -10,11 +10,13 @@
  */
 
 #include "MoEOverlayHostAuthorityDeviceBankPublisher.h"
+#include "MoEOverlayRouteTarget.h"
 
 #include "DeviceMoEExpertDescriptorBuilder.h"
 #include "MoEOverlayDeviceControllerRuntimeBinding.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayResidencyAuthority.h"
+#include "MoEExpertShardCohort.h"
 #include "MoERuntimeTable.h"
 
 #include "backends/BackendManager.h"
@@ -883,8 +885,30 @@ namespace llaminar2
                      expert < binding.expert_count;
                      ++expert)
                 {
+                    const auto &live_owners = candidate_->placementOwnerMap();
+                    const auto *placement = live_owners.placementFor(layer, static_cast<int>(expert));
+                    if (placement && placement->shard_cohort)
+                    {
+                        // A CPU cohort outside this GPU domain is a genuine
+                        // nonlocal route, never a synthetic whole-owner entry.
+                        for (const auto &member : placement->shard_cohort->participants())
+                        {
+                            const auto *original_member = live_owners.participantForId(member.participant_id);
+                            if (!original_member || !original_member->device.is_cpu() ||
+                                original_member->domain_name == participant.domain_name)
+                                throw std::logic_error("GPU placement publication rejects a local or non-CPU shard cohort");
+                        }
+                        if (local_layer.resident_mask[expert])
+                            throw std::logic_error("GPU placement publication cannot retain a CPU cohort payload");
+                        auto &descriptor = update.experts[expert];
+                        descriptor.logical_expert_id = static_cast<std::int32_t>(expert);
+                        descriptor.owner_participant = -1;
+                        update.overlay_route_participant[expert] =
+                            MoEOverlayRouteTarget::cpuCohort(placement->tier_idx).word();
+                        continue;
+                    }
                     const auto *const owner =
-                        candidate_->owner_map.ownerFor(
+                        live_owners.ownerFor(
                             layer,
                             static_cast<int>(expert));
                     if (!owner || owner->owner_participant < 0)
@@ -956,7 +980,7 @@ namespace llaminar2
                             endpointPrefix(
                                 binding.overlay_participant_id,
                                 binding.device) +
-                            "could not export a complete NativeVNNI/FP16/BF16/FP32 expert descriptor");
+                            "could not export a complete NativeQuantised/FP16/BF16/FP32 expert descriptor");
                     }
                     descriptor.logical_expert_id =
                         static_cast<std::int32_t>(expert);
@@ -986,7 +1010,7 @@ namespace llaminar2
                 auto &resource = *endpoint.endpoint;
                 const auto &binding = resource.binding;
                 const auto *const participant =
-                    candidate_->owner_map.participantForId(
+                    candidate_->placementOwnerMap().participantForId(
                         binding.overlay_participant_id);
                 const auto registry_endpoint = state_->config.registry->endpoint(
                     binding.overlay_participant_id);
@@ -1008,7 +1032,7 @@ namespace llaminar2
                     binding.domain_participant_count,
                     0u);
                 for (const auto &member :
-                     candidate_->owner_map.participants())
+                     candidate_->placementOwnerMap().participants())
                 {
                     if (member.domain_name != participant->domain_name)
                         continue;

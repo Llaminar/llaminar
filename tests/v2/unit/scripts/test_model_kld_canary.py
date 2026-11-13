@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_model_kld_canary.py
+#  @brief Preserve KL limits and source/ISA ownership while isolating CI and package fixtures.
 """Device-free adversarial phase/identity/threshold regressions for KL canaries."""
 from pathlib import Path
 import math
@@ -98,6 +100,14 @@ class ModelKLDReportTests(unittest.TestCase):
             cpu_isa='AVX512',corpus_manifest_digest='d'*64,**kwargs)
     def test_complete_valid_report(self):
         self.check(canary_report())
+
+    def test_focused_status_cannot_be_admitted_even_if_other_diagnostic_flags_are_ignored(self):
+        """Published-image consumers refuse every explicit diagnostic marker."""
+        for field,value in [('full_preflight',False),('mode','local_paired_focused_diagnostic'),
+                            ('verdict','DIAGNOSTIC_REQUIRED_GROUPS_GREEN'),
+                            ('status','DIAGNOSTIC_PANEL_COMPLETE')]:
+            report=canary_report();report[field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):self.check(report)
     def test_all_run_identities_and_completed_lifetime_are_required(self):
         for key,value in [('source_revision','b'*40),('image','sha256:'+'2'*64),('cpu_isa','AVX2'),
                           ('corpus_manifest_digest','e'*64),('diagnostic_only',True),('complete',False),('schema',True)]:
@@ -344,6 +354,40 @@ class ModelKLDProductionPathTests(unittest.TestCase):
 
 class ModelKLDLifecycleTests(unittest.TestCase):
     """Failed/unstarted runs retire owned native work before raw-output cleanup."""
+    def test_local_native_subprocess_preserves_only_explicit_device_and_hwloc_selection(self):
+        """The actual local Popen retains selected identities without arbitrary env inheritance."""
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        import tempfile,json
+        import run_model_kld_canaries as runner
+        selected={'ROCR_VISIBLE_DEVICES':'GPU-recorded-mi50-a,GPU-recorded-mi50-b',
+                  'HIP_VISIBLE_DEVICES':'0,1','CUDA_VISIBLE_DEVICES':'',
+                  'GPU_DEVICE_ORDINAL':'0','HWLOC_COMPONENTS':'-gl,-opencl','HOME':'/recorded/user-home'}
+        parent={'PATH':'/usr/bin',**selected,'LD_PRELOAD':'/foreign/preload.so',
+                'LD_LIBRARY_PATH':'/foreign/runtime','HSA_OVERRIDE_GFX_VERSION':'9.0.6',
+                'UNRELATED_PARENT_VALUE':'not-forwarded'}
+        for corpus_v2 in (False,True):
+            with self.subTest(corpus_v2=corpus_v2),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);model=root/'fixture.gguf';model.write_bytes(b'abcd')
+                corpus={'models':{'dense':{'entry':{'model_file':model.name,'model_bytes':4},'workload_path':root/'input.json'}}}
+                args=SimpleNamespace(binary=root/'binary',keep_logits=False)
+                adapter=SimpleNamespace(environment={},paired=None,devices=['cuda:0','rocm:0'],
+                    topology={'id':'recorded','expected_config':{'configuration':{'mpi_procs':1}}},
+                    prepare=lambda *_:(root/'input.json',['--no-mtp']),backends=['cuda','rocm']) if corpus_v2 else None
+                with patch.dict(runner.os.environ,parent,clear=True),patch.object(runner,'physical_workers',return_value=1), \
+                     patch.object(runner.driver,'begin'),patch.object(runner.driver,'finish',return_value=True), \
+                     patch.object(runner,'retire'),patch.object(runner.subprocess,'Popen',side_effect=RuntimeError('recorded Popen boundary')) as launch:
+                    with self.assertRaisesRegex(RuntimeError,'recorded Popen boundary'):
+                        runner.execute_cell(args,corpus,'dense','cuda',model,root/'cell',None,adapter=adapter)
+                actual=launch.call_args.kwargs['env']
+                for key,value in selected.items():self.assertEqual(actual[key],value)
+                for key in ('LD_PRELOAD','HSA_OVERRIDE_GFX_VERSION','UNRELATED_PARENT_VALUE'):
+                    self.assertNotIn(key,actual)
+                self.assertEqual(actual['LD_LIBRARY_PATH'],str(args.binary.parent))
+                if corpus_v2:
+                    receipt=json.loads((root/'cell/controller.json').read_text())
+                    for key,value in selected.items():self.assertEqual(receipt['environment'][key],value)
+
     def test_created_exited_and_live_container_retirement(self):
         from unittest.mock import patch
         import json
@@ -382,7 +426,7 @@ class ModelKLDCITests(unittest.TestCase):
         from types import SimpleNamespace
         import tempfile,json,subprocess
         import run_published_image_suite as suite
-        from test_published_image_suite import image_pair,full_inventory
+        from test_published_image_suite import image_pair,full_inventory,prerequisite_evidence
         from production_artifacts import write_json,digest
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);pair=image_pair();manifest=suite.pipeline.e2e_projection(full_inventory(),pair['source']['revision'])
@@ -405,7 +449,8 @@ class ModelKLDCITests(unittest.TestCase):
                     write_json(lane/'e2e.json',dict(schema=1,image=pair['images'][isa]['id'],source_revision=pair['source']['revision'],
                         manifest_digest=digest(manifest),selected=len(manifest['cells']),correctness_passed=True,
                         cells=[dict(row,outcome='passed',return_code=0) for row in manifest['cells']]))
-            with patch.object(suite,'build_driver',return_value='tools'),patch.object(suite,'run_in_driver',side_effect=execute):
+            with patch.object(suite,'run_e2e_prerequisites',return_value=prerequisite_evidence(pair)), \
+                 patch.object(suite,'build_driver',return_value='tools'),patch.object(suite,'run_in_driver',side_effect=execute):
                 with self.assertRaisesRegex(ValueError,'KL phase failures'):
                     suite.run_e2e(SimpleNamespace(model_kld_canaries=True,models=root,model_ramdisk_root=root),pair,manifest,root)
             self.assertEqual(visited,list(suite.ISAS))
@@ -472,7 +517,8 @@ class ModelKLDPackagingTests(unittest.TestCase):
                     path=root/name;path.parent.mkdir(exist_ok=True);path.write_text('fixture')
                 binary.write_bytes(b'placeholder native observer')
                 inventory=installed.inventory(root);self.assertIn(binary.name,inventory['files'])
-                receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(schema=1,inventory=inventory)))
+                receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(
+                    schema=1,scope=installed.InstalledTestScope.PRODUCTION.value,inventory=inventory)))
                 installed.validate(receipt,root)
                 binary.write_bytes(b'changed binary')
                 with self.assertRaises(ValueError):installed.validate(receipt,root)

@@ -10,6 +10,8 @@
  * - NUMABuffer wrapper
  * - Statistics tracking
  * - Typed final-weight placement rejects invalid identities before allocation
+ * - Actual allocator placement lifecycle checks under scoped syscall/allocation faults
+ * - Native happy-path CPU and memory-policy restoration before publication
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -19,9 +21,16 @@
 #include "memory/NUMAAllocator.h"
 #include "memory/CPUWeightStoragePlacement.h"
 #include "memory/NUMAPageQuery.h"
+#include "utils/Logger.h"
 #include "tensors/AlignedVector.h"
 
 #include <cstdlib>
+#include <algorithm>
+#include <array>
+#include <dlfcn.h>
+#include <limits>
+#include <new>
+#include <numa.h>
 #include <cerrno>
 #include <cstring>
 #include <memory>
@@ -34,6 +43,353 @@
 #include <unistd.h>
 
 using namespace llaminar2;
+
+namespace
+{
+/** @brief Deterministic failures at the actual production placement boundary. */
+enum class PlacementFault
+{
+    None, BeforeBindingAllocation, RecordInsertionAllocation, RejectPolicy, RejectPolicyAndRestoreAffinity,
+    RestoreAffinity, RestorePolicy, ReadAffinity, ReadPolicy,
+    ContradictAffinity, ContradictPolicy
+};
+
+/** @brief Authored NUMA facts plus real caller CPU-mask observations, scoped to one fixture thread. */
+struct PlacementProbe final
+{
+    PlacementFault fault = PlacementFault::None;
+    cpu_set_t incoming{};
+    std::array<unsigned long, 64> nodes{};
+    int mode = MPOL_PREFERRED;
+    int target_node = 0;
+    unsigned affinity_writes = 0;
+    unsigned policy_writes = 0;
+    unsigned borrowed_allocations = 0;
+    bool borrowed = false;
+    bool affinity_restored = false;
+    bool policy_restored = false;
+    bool reject_borrowed_allocations = false;
+    bool fail_next_allocation = false;
+    bool injected_allocation = false;
+    void *storage = nullptr;
+    bool freed_storage = false;
+};
+thread_local PlacementProbe *placement_probe = nullptr;
+
+/** @brief Resolve the selected native operation before fault injection is armed. */
+template<class Function>
+Function nativePlacementSymbol(const char *name) noexcept
+{
+    auto *symbol = dlsym(RTLD_NEXT, name);
+    if (!symbol) std::_Exit(91);
+    return reinterpret_cast<Function>(symbol);
+}
+using NativeAffinityWrite = int (*)(pid_t, size_t, const cpu_set_t *);
+using NativeAffinityRead = int (*)(pid_t, size_t, cpu_set_t *);
+using NativePolicyWrite = long (*)(int, const unsigned long *, unsigned long);
+using NativePolicyRead = long (*)(int *, unsigned long *, unsigned long, void *, unsigned);
+using NativeNodeCPUs = int (*)(int, bitmask *);
+using NativePageQuery = long (*)(int, unsigned long, void **, const int *, int *, int);
+using NativeAlignedAllocation = void *(*)(size_t, size_t);
+using NativeFree = void (*)(void *);
+
+/** @return Exact native scheduler writer, unmodified outside this fixture's TLS scope. */
+NativeAffinityWrite nativeAffinityWrite() noexcept
+{ static const auto f = nativePlacementSymbol<NativeAffinityWrite>("sched_setaffinity"); return f; }
+/** @return Exact native scheduler reader. */
+NativeAffinityRead nativeAffinityRead() noexcept
+{ static const auto f = nativePlacementSymbol<NativeAffinityRead>("sched_getaffinity"); return f; }
+/** @return Selected libnuma policy writer. */
+NativePolicyWrite nativePolicyWrite() noexcept
+{ static const auto f = nativePlacementSymbol<NativePolicyWrite>("set_mempolicy"); return f; }
+/** @return Selected libnuma policy reader. */
+NativePolicyRead nativePolicyRead() noexcept
+{ static const auto f = nativePlacementSymbol<NativePolicyRead>("get_mempolicy"); return f; }
+/** @return Selected topology CPU query. */
+NativeNodeCPUs nativeNodeCPUs() noexcept
+{ static const auto f = nativePlacementSymbol<NativeNodeCPUs>("numa_node_to_cpus"); return f; }
+/** @return Selected physical page query. */
+NativePageQuery nativePageQuery() noexcept
+{ static const auto f = nativePlacementSymbol<NativePageQuery>("move_pages"); return f; }
+/** @return Native allocation without replacing the production storage path. */
+NativeAlignedAllocation nativeAlignedAllocation() noexcept
+{ static const auto f = nativePlacementSymbol<NativeAlignedAllocation>("aligned_alloc"); return f; }
+/** @return Native release without borrowing the allocation fault seam. */
+NativeFree nativeFree() noexcept
+{
+    // free() can run before main. Detect resolver reentry before entering the
+    // C++ initialization guard, so loader bootstrap cannot recurse or hang.
+    static thread_local bool resolving = false;
+    if (resolving)
+    {
+        constexpr char message[] = "Fatal: recursive native free resolution in NUMA fixture\n";
+        const auto written = ::write(STDERR_FILENO, message, sizeof(message) - 1);
+        (void)written;
+        std::_Exit(90);
+    }
+    static const auto function = [&] {
+        resolving = true;
+        const auto result = nativePlacementSymbol<NativeFree>("free");
+        resolving = false;
+        return result;
+    }();
+    return function;
+}
+
+/** @brief Arm only after resolving every delegate; cleanup cannot leave this test caller pinned. */
+class PlacementFaultScope final
+{
+public:
+    /** @brief Author policy/page observations while keeping CPU writes native. */
+    explicit PlacementFaultScope(PlacementProbe &probe) : probe_(probe)
+    {
+        (void)nativeAffinityWrite(); (void)nativeAffinityRead();
+        (void)nativePolicyWrite(); (void)nativePolicyRead(); (void)nativeNodeCPUs();
+        (void)nativePageQuery(); (void)nativeAlignedAllocation(); (void)nativeFree();
+        if (placement_probe || nativeAffinityRead()(0, sizeof(probe_.incoming), &probe_.incoming) != 0)
+            std::_Exit(92);
+        probe_.nodes[0] = 1;
+        placement_probe = &probe_;
+    }
+    /** @brief Retire the seam and repair only fixture-owned resources if an old-code control leaked them. */
+    ~PlacementFaultScope()
+    {
+        placement_probe = nullptr;
+        if (nativeAffinityWrite()(0, sizeof(probe_.incoming), &probe_.incoming) != 0)
+            std::_Exit(93);
+        if (probe_.storage && !probe_.freed_storage) nativeFree()(probe_.storage);
+    }
+    PlacementFaultScope(const PlacementFaultScope &) = delete;
+    PlacementFaultScope &operator=(const PlacementFaultScope &) = delete;
+private:
+    PlacementProbe &probe_;
+};
+
+/** @return A native caller snapshot even on a single-CPU/container partition. */
+cpu_set_t placementCallerMask()
+{
+    cpu_set_t mask{};
+    if (nativeAffinityRead()(0, sizeof(mask), &mask) != 0) std::_Exit(94);
+    return mask;
+}
+} // namespace
+
+/** @brief Observe the actual public allocator's allocation window; unarmed new retains standard semantics. */
+void *operator new(std::size_t bytes)
+{
+    if (auto *probe = placement_probe)
+    {
+        if (probe->borrowed) ++probe->borrowed_allocations;
+        if ((probe->borrowed && probe->reject_borrowed_allocations) || probe->fail_next_allocation ||
+            (probe->fault == PlacementFault::BeforeBindingAllocation && probe->storage && !probe->injected_allocation))
+        {
+            probe->fail_next_allocation = false;
+            probe->injected_allocation = true;
+            throw std::bad_alloc();
+        }
+    }
+    for (;;)
+    {
+        if (void *memory = std::malloc(bytes ? bytes : 1)) return memory;
+        const auto handler = std::get_new_handler();
+        if (!handler) throw std::bad_alloc();
+        handler();
+    }
+}
+/** @brief Pair native global-new storage with the real free path. */
+void operator delete(void *memory) noexcept { std::free(memory); }
+/** @brief Sized deletion preserves the same native release semantics. */
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+
+/** @brief Real allocation, observed only while this fixture owns its calling thread. */
+extern "C" void *aligned_alloc(size_t alignment, size_t bytes) noexcept
+{
+    void *memory = nativeAlignedAllocation()(alignment, bytes);
+    if (placement_probe && !placement_probe->storage) placement_probe->storage = memory;
+    return memory;
+}
+/** @brief Observe exact storage retirement without manufacturing a production accounting ledger. */
+extern "C" void free(void *memory) noexcept
+{
+    if (placement_probe && memory && memory == placement_probe->storage) placement_probe->freed_storage = true;
+    nativeFree()(memory);
+}
+/** @brief All successful CPU writes remain real scheduler operations. */
+extern "C" int sched_setaffinity(pid_t pid, size_t bytes, const cpu_set_t *mask) noexcept
+{
+    auto *probe = placement_probe;
+    if (!probe || pid != 0) return nativeAffinityWrite()(pid, bytes, mask);
+    const bool restoring = probe->affinity_writes++ != 0;
+    if (restoring && (probe->fault == PlacementFault::RestoreAffinity || probe->fault == PlacementFault::RejectPolicyAndRestoreAffinity)) { errno = EIO; return -1; }
+    const int result = nativeAffinityWrite()(pid, bytes, mask);
+    if (result == 0) { probe->borrowed = !restoring; probe->affinity_restored = restoring; }
+    return result;
+}
+/** @brief Native CPU readback, with isolated contradictory/error facts only in death tests. */
+extern "C" int sched_getaffinity(pid_t pid, size_t bytes, cpu_set_t *mask) noexcept
+{
+    const int result = nativeAffinityRead()(pid, bytes, mask);
+    auto *probe = placement_probe;
+    if (!probe || !probe->affinity_restored || result != 0 || pid != 0) return result;
+    if (probe->fault == PlacementFault::ReadAffinity) { errno = EIO; return -1; }
+    if (probe->fault == PlacementFault::ContradictAffinity) CPU_ZERO(mask);
+    return result;
+}
+/** @brief Author a target CPU within the caller's real allowed mask; this injects lifecycle faults, without topology certification. */
+extern "C" int numa_node_to_cpus(int node, bitmask *mask)
+{
+    auto *probe = placement_probe;
+    if (!probe) return nativeNodeCPUs()(node, mask);
+    probe->target_node = node;
+    numa_bitmask_clearall(mask);
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &probe->incoming)) { numa_bitmask_setbit(mask, cpu); return 0; }
+    errno = EINVAL; return -1;
+}
+/** @brief Deterministic policy publication/rejection through the actual production scope. */
+extern "C" long set_mempolicy(int mode, const unsigned long *nodes, unsigned long max_nodes)
+{
+    auto *probe = placement_probe;
+    if (!probe) return nativePolicyWrite()(mode, nodes, max_nodes);
+    const bool restoring = probe->policy_writes++ != 0;
+    if ((!restoring && (probe->fault == PlacementFault::RejectPolicy || probe->fault == PlacementFault::RejectPolicyAndRestoreAffinity)) ||
+        (restoring && probe->fault == PlacementFault::RestorePolicy)) { errno = EIO; return -1; }
+    const size_t words = (max_nodes + sizeof(unsigned long)*8-1)/(sizeof(unsigned long)*8);
+    if (words > probe->nodes.size()) std::_Exit(95);
+    probe->mode = mode; probe->nodes.fill(0);
+    if (nodes) std::copy_n(nodes, words, probe->nodes.begin());
+    probe->policy_restored = restoring;
+    return 0;
+}
+/** @brief Retain and read back authored policy facts; unarmed physical address queries stay native. */
+extern "C" long get_mempolicy(int *mode, unsigned long *nodes, unsigned long max_nodes, void *address, unsigned flags)
+{
+    auto *probe = placement_probe;
+    if (!probe || flags) return nativePolicyRead()(mode, nodes, max_nodes, address, flags);
+    if (probe->policy_restored && probe->fault == PlacementFault::ReadPolicy) { errno = EIO; return -1; }
+    const size_t words = (max_nodes + sizeof(unsigned long)*8-1)/(sizeof(unsigned long)*8);
+    if (words > probe->nodes.size()) std::_Exit(96);
+    if (mode) *mode = probe->mode;
+    if (nodes) std::copy_n(probe->nodes.begin(), words, nodes);
+    if (probe->policy_restored && probe->fault == PlacementFault::ContradictPolicy && mode) *mode = MPOL_DEFAULT;
+    return 0;
+}
+/** @brief Supply controlled page-query facts after the actual first-touch/restore path completes. */
+extern "C" long move_pages(int pid, unsigned long count, void **pages, const int *nodes, int *status, int flags)
+{
+    auto *probe = placement_probe;
+    if (!probe) return nativePageQuery()(pid, count, pages, nodes, status, flags);
+    for (unsigned long i = 0; i < count; ++i) status[i] = probe->target_node;
+    if (probe->fault == PlacementFault::RecordInsertionAllocation) probe->fail_next_allocation = true;
+    return 0;
+}
+
+TEST(Test__NUMAAllocator, FirstTouchPlacementPreparesBeforeBorrowingAndRestoresExactCaller)
+{
+    auto &allocator = NUMAAllocator::instance();
+    const auto incoming = placementCallerMask();
+    for (int lifetime = 0; lifetime < 20; ++lifetime)
+    {
+        PlacementProbe probe;
+        probe.reject_borrowed_allocations = true;
+        bool threw = false;
+        cpu_set_t after{};
+        {
+            PlacementFaultScope scope(probe);
+            try
+            {
+                void *memory = allocator.allocateOnNode(4096, -1, 4096);
+                EXPECT_NE(memory, nullptr);
+                if (memory) allocator.free(memory, 4096);
+            }
+            catch (const std::bad_alloc &) { threw = true; }
+            // Observe old-code failures without also faulting GTest diagnostics.
+            probe.reject_borrowed_allocations = false;
+            after = placementCallerMask();
+            EXPECT_FALSE(probe.borrowed);
+            EXPECT_TRUE(probe.policy_restored);
+            EXPECT_EQ(probe.mode, MPOL_PREFERRED);
+            EXPECT_EQ(probe.nodes[0], 1ul);
+        }
+        EXPECT_FALSE(threw);
+        EXPECT_EQ(probe.borrowed_allocations, 0u);
+        EXPECT_TRUE(CPU_EQUAL(&incoming, &after));
+        EXPECT_TRUE(probe.freed_storage);
+    }
+}
+
+TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresOnlyPublishedCPU)
+{
+    auto &allocator = NUMAAllocator::instance();
+    const auto incoming = placementCallerMask();
+    PlacementProbe probe; probe.fault = PlacementFault::RejectPolicy;
+    cpu_set_t after{};
+    {
+        PlacementFaultScope scope(probe);
+        EXPECT_EQ(allocator.allocateOnNode(4096, -1, 4096), nullptr);
+        after = placementCallerMask();
+        EXPECT_EQ(probe.policy_writes, 1u);
+        EXPECT_FALSE(probe.borrowed);
+        EXPECT_EQ(probe.mode, MPOL_PREFERRED);
+        EXPECT_EQ(probe.nodes[0], 1ul);
+    }
+    EXPECT_TRUE(CPU_EQUAL(&incoming, &after));
+    EXPECT_TRUE(probe.freed_storage);
+}
+
+TEST(Test__NUMAAllocator, FirstTouchPlacementExceptionsReleaseUnpublishedStorage)
+{
+    auto &allocator = NUMAAllocator::instance();
+    const int node = allocator.getCurrentNUMANode();
+    const auto prior_level = Logger::getInstance().getLogLevel();
+    Logger::getInstance().setLogLevel(LogLevel::ERROR);
+    for (const auto fault : {PlacementFault::BeforeBindingAllocation, PlacementFault::RecordInsertionAllocation})
+    {
+        const auto before = allocator.getNodeStats(node).allocated_by_us;
+        const auto incoming = placementCallerMask();
+        PlacementProbe probe; probe.fault = fault;
+        bool threw = false; cpu_set_t after{};
+        {
+            PlacementFaultScope scope(probe);
+            try { (void)allocator.allocateOnNode(4096, -1, 4096); }
+            catch (const std::bad_alloc &) { threw = true; }
+            // Observe old-code failures without also faulting GTest diagnostics.
+            probe.reject_borrowed_allocations = false;
+            after = placementCallerMask();
+            EXPECT_TRUE(probe.freed_storage);
+        }
+        EXPECT_TRUE(threw);
+        EXPECT_TRUE(probe.injected_allocation);
+        EXPECT_TRUE(CPU_EQUAL(&incoming, &after));
+        EXPECT_EQ(allocator.getNodeStats(node).allocated_by_us, before);
+    }
+    Logger::getInstance().setLogLevel(prior_level);
+}
+
+TEST(Test__NUMAAllocator, FirstTouchPlacementRestorationErrorsAndContradictionsAreFatal)
+{
+    for (const auto fault : {PlacementFault::RestoreAffinity, PlacementFault::RestorePolicy,
+                             PlacementFault::ReadAffinity, PlacementFault::ReadPolicy,
+                             PlacementFault::ContradictAffinity, PlacementFault::ContradictPolicy})
+    {
+        EXPECT_DEATH(( [&] {
+            auto &allocator = NUMAAllocator::instance();
+            PlacementProbe probe; probe.fault = fault;
+            PlacementFaultScope scope(probe);
+            void *memory = allocator.allocateOnNode(4096, -1, 4096);
+            if (memory) allocator.free(memory, 4096);
+        }()), "cannot restore exact first-touch caller placement");
+    }
+    // A rejected policy still owns the already-published CPU write. The same
+    // fatal behavior is required while acquire() is rolling that write back.
+    EXPECT_DEATH(( [] {
+        auto &allocator = NUMAAllocator::instance();
+        PlacementProbe probe; probe.fault = PlacementFault::RejectPolicyAndRestoreAffinity;
+        PlacementFaultScope scope(probe);
+        (void)allocator.allocateOnNode(4096, -1, 4096);
+    }()), "cannot restore exact first-touch caller placement");
+}
+
 
 TEST(Test__NUMAAllocator, CPUWeightPlacementRejectsNegativeNodeBeforeAllocation)
 {
@@ -251,6 +607,12 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
                   0, sizeof(incoming_affinity), &incoming_affinity),
               0);
 
+    constexpr unsigned long word_bits = std::numeric_limits<unsigned long>::digits;
+    const unsigned long policy_bits = std::max(word_bits, static_cast<unsigned long>(numa_max_node() + 1));
+    std::vector<unsigned long> incoming_nodes((policy_bits + word_bits - 1) / word_bits, 0);
+    int incoming_mode = MPOL_DEFAULT;
+    ASSERT_EQ(get_mempolicy(&incoming_mode, incoming_nodes.data(), policy_bits, nullptr, 0), 0);
+
     // Repeatedly alternate nodes so recycled resident pages cannot make a
     // policy-only implementation appear correct. Each preparation must also
     // restore the exact launcher/container affinity before returning.
@@ -266,6 +628,11 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
                       0, sizeof(restored_affinity), &restored_affinity),
                   0);
         EXPECT_TRUE(CPU_EQUAL(&incoming_affinity, &restored_affinity));
+        std::vector<unsigned long> restored_nodes(incoming_nodes.size(), 0);
+        int restored_mode = MPOL_DEFAULT;
+        ASSERT_EQ(get_mempolicy(&restored_mode, restored_nodes.data(), policy_bits, nullptr, 0), 0);
+        EXPECT_EQ(restored_mode, incoming_mode);
+        EXPECT_EQ(restored_nodes, incoming_nodes);
 
         // Simulate the transport's full overwrite after preparation.
         std::memset(storage.get(), 0xA5, bytes);

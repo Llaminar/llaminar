@@ -1,46 +1,37 @@
 /**
  * @file mpi_gtest_main.cpp
- * @brief Custom GTest main with background-safe MPI initialization.
+ * @brief MPI integration entrypoint with original production process ownership.
  *
- * Integration binaries use the same MPI_THREAD_MULTIPLE contract as the
- * production runtime. This permits real tests of maintenance/progress threads
- * while remaining compatible with tests that make MPI calls only on main.
- * Process-wide collective and GPU context owners are retired before MPI so a
- * passing test cannot defer device-thread or communicator teardown to static
- * destruction.
+ * The guardian owns process ancestry, and MPIProcessSession owns the actual
+ * MPI_THREAD_MULTIPLE initialization and CPU collective process-pool lifetime.
+ * Native CPU domains borrow that live original session; raw MPI initialization
+ * alone cannot authorize their retained process resources. Canonical shutdown
+ * closes collective admission, retires routers/kernel caches and GPU workers,
+ * proves CPU domain retirement, then finalizes MPI and releases its pool.
  */
 
-#include "backends/GPUDeviceContextPool.h"
-#include "collective/BackendRouter.h"
+#include "app/MPIProcessSession.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 
 #include <gtest/gtest.h>
-#include <mpi.h>
 
+/**
+ * @brief Run the existing MPI integration cases within the original runtime scope.
+ * @param argc Original process arguments, forwarded through guardian and MPI.
+ * @param argv Original process argument vector, then parsed by GTest.
+ * @return Original owned child status or the complete test result.
+ * @throws std::exception For rejected production MPI initialization/shutdown.
+ */
 int main(int argc, char **argv)
 {
-    int provided = MPI_THREAD_SINGLE;
-    const int init_result = MPI_Init_thread(
-        &argc,
-        &argv,
-        MPI_THREAD_MULTIPLE,
-        &provided);
-    if (init_result != MPI_SUCCESS || provided < MPI_THREAD_MULTIPLE)
-        return 2;
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+    // Declared after the GPU lifetime so canonical MPI shutdown clears caches
+    // and workers before finalization; later GPU scope teardown is idempotent.
+    auto mpi_process = llaminar2::MPIProcessSession::initialize(argc, argv);
 
-    // Initialize GTest
     ::testing::InitGoogleTest(&argc, argv);
-
-    // Run all tests
-    const int result = RUN_ALL_TESTS();
-
-    /* Match production parity teardown: context workers and any collective
-     * communicator owners must be joined while MPI and GPU runtimes are live. */
-    llaminar2::GlobalBackendRouter::shutdown();
-    llaminar2::GPUDeviceContextPool::instance().shutdown();
-
-    // Finalize MPI
-    if (MPI_Finalize() != MPI_SUCCESS)
-        return 3;
-
-    return result;
+    return RUN_ALL_TESTS();
 }

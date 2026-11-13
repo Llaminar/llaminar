@@ -10,8 +10,8 @@ batch-memory wait widths; retain the existing ROI decision for finite compute,
 copies and write-only batches. No environment override, larger queue limit,
 extra event, host wait or alternate graph execution path is introduced.
 
-Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
-             (therock-10.0, ROCm Core SDK 10.0.0)
+Pinned base: ROCm/rocm-systems 7da43026e4f2ef7600433c38c820732f7a205d22
+             (therock-10.1, ROCm Core SDK 10.1.0)
 Regression: V2_Integration_HIPGraphWaitConcurrency (flat/child, 32/64-bit)
 
 diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp

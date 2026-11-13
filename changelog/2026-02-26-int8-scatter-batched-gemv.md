@@ -57,7 +57,7 @@ Concatenated N partial buffer layout: `partial[kb * total_N + n_offset[batch] + 
 - Always quantizes activations for M=1 (removed conditional skip)
 - VNNI projections collected into batch arrays during the projection loop
 - Single batched dispatch after loop (QKV batched, Gate/Up batched)
-- Native-VNNI (Q4/IQ4) projections dispatched individually (as before)
+- NativeQuantised (Q4/IQ4) projections dispatched individually (as before)
 - Batch overflow (>8 projections) handled with individual INT8 scatter fallback
 
 **`multiply_tensor`**, **`multiply_fp32_to_fp32`**, **`multiply_fp32_to_fp32_with_bias`**:

@@ -19,6 +19,53 @@
 
 using namespace llaminar2;
 
+/** @brief QFN activation correction cannot restore state produced by the ordinary path. */
+TEST(Test__PrefixCacheFingerprint, FlashNextHCUpActivationSeparatesRestarts)
+{
+    const std::vector<PrefixFingerprintField> base{{"kv_cache_precision", "fp16"}};
+    std::set<uint64_t> keys{hashPrefixFingerprintFields("runtime", base)};
+    for (const auto policy : {QuantizedActivationOperandPrecision::SingleQ8,
+                              QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        auto fields = base;
+        appendQwen4ExpArithmeticFingerprintFields(fields, policy);
+        const auto key = hashPrefixFingerprintFields("runtime", fields);
+        EXPECT_TRUE(keys.insert(key).second);
+        auto restarted = base;
+        appendQwen4ExpArithmeticFingerprintFields(restarted, policy);
+        std::reverse(restarted.begin(), restarted.end());
+        EXPECT_EQ(key, hashPrefixFingerprintFields("runtime", restarted));
+    }
+    EXPECT_EQ(keys.size(), 3u);
+    auto default_fields = base;
+    appendQwen4ExpArithmeticFingerprintFields(default_fields, kDefaultQwen4ExpHCUpActivation);
+    auto explicit_fields = base;
+    appendQwen4ExpArithmeticFingerprintFields(explicit_fields, QuantizedActivationOperandPrecision::TwoTermQ8);
+    auto opt_out_fields = base;
+    appendQwen4ExpArithmeticFingerprintFields(opt_out_fields, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime", default_fields),
+              hashPrefixFingerprintFields("runtime", explicit_fields));
+    EXPECT_NE(hashPrefixFingerprintFields("runtime", default_fields),
+              hashPrefixFingerprintFields("runtime", opt_out_fields));
+}
+
+/** @brief Reject conflicting or invalid arithmetic before mutating compatibility material. */
+TEST(Test__PrefixCacheFingerprint, FlashNextHCUpActivationRejectsDuplicateAuthority)
+{
+    for (const auto name : {"qfn_hc_up_activation", "qfn_hc_up_activation_revision"})
+    {
+        std::vector<PrefixFingerprintField> fields{{name, "previous"}};
+        EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields,
+            QuantizedActivationOperandPrecision::TwoTermQ8), std::invalid_argument);
+        ASSERT_EQ(fields.size(), 1u);
+        EXPECT_EQ(fields.front().value, "previous");
+    }
+    std::vector<PrefixFingerprintField> fields;
+    EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields,
+        static_cast<QuantizedActivationOperandPrecision>(255)), std::invalid_argument);
+    EXPECT_TRUE(fields.empty());
+}
+
 /** @brief Every supported arithmetic pair has a restart-stable metadata identity. */
 TEST(Test__PrefixCacheFingerprint, ProjectionArithmeticSeparatesEveryPrecisionPair)
 {
@@ -43,7 +90,35 @@ TEST(Test__PrefixCacheFingerprint, ProjectionArithmeticSeparatesEveryPrecisionPa
     EXPECT_EQ(keys.size(), 30u);
 }
 
-/** @brief Callers cannot relabel a persisted entry with conflicting arithmetic metadata. */
+/** @brief Changed CPU readout bytes cannot restore prefixes from the old definition. */
+TEST(Test__PrefixCacheFingerprint, CPUFixedEpochRejectsLegacyArithmetic)
+{
+    std::vector<PrefixFingerprintField> current;
+    appendProjectionArithmeticFingerprintFields(current,
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::Native);
+    auto legacy = current;
+    const auto readout = std::find_if(legacy.begin(), legacy.end(), [](const auto &field) {
+        return field.name == "cpu_gdn_readout_arithmetic";
+    });
+    ASSERT_NE(readout, legacy.end());
+    EXPECT_EQ(readout->value, "fixed-epoch8-backward-fma-v1");
+    readout->value = "adjusted-parent-fma-v1";
+    EXPECT_NE(hashPrefixFingerprintFields("runtime", legacy),
+              hashPrefixFingerprintFields("runtime", current));
+    legacy.erase(readout);
+    EXPECT_NE(hashPrefixFingerprintFields("runtime", legacy),
+              hashPrefixFingerprintFields("runtime", current));
+    std::vector<PrefixFingerprintField> restarted;
+    appendProjectionArithmeticFingerprintFields(restarted,
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::Native);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime", current),
+              hashPrefixFingerprintFields("runtime", restarted));
+    std::vector<PrefixFingerprintField> forged{{"cpu_gdn_readout_arithmetic", "old"}};
+    EXPECT_THROW(appendProjectionArithmeticFingerprintFields(forged,
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::Native), std::invalid_argument);
+}
+
+/** @brief Callers cannot forge or duplicate the arithmetic compatibility authority. */
 TEST(Test__PrefixCacheFingerprint, ProjectionArithmeticRejectsDuplicateAuthority)
 {
     for (const auto name : {"projection_arithmetic_revision", "gdn_projection_arithmetic",
@@ -134,7 +209,7 @@ TEST(Test__PrefixCacheFingerprint, ScopedAttentionRecoveryArithmeticIsRepeatable
 {
     const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
         .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
-    constexpr uint64_t recovery_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t recovery_key = 0xb4799c09af74cd7dULL;
     EXPECT_EQ(combinePrefixFingerprintParts(parts), recovery_key);
     EXPECT_EQ(combinePrefixFingerprintParts(parts), combinePrefixFingerprintParts(parts));
 }
@@ -151,7 +226,7 @@ TEST(Test__PrefixCacheFingerprint, ScopedAttentionRecoveryArithmeticIsRepeatable
 TEST(Test__PrefixCacheFingerprint, NativeEmbeddingRejectsV9AndRestartsStably)
 {
     constexpr uint64_t old_lossy_embedding_key = 0x1e2eb47a6b0c05b5ULL;
-    constexpr uint64_t native_source_embedding_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t native_source_embedding_key = 0xb4799c09af74cd7dULL;
     const PrefixFingerprintParts original_process{.model = 1, .tokenizer = 2, .runtime = 3,
         .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
     const uint64_t persisted_current_key = combinePrefixFingerprintParts(original_process);
@@ -177,7 +252,7 @@ TEST(Test__PrefixCacheFingerprint, NativeEmbeddingRejectsV9AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, GDNAdditiveEpsilonRejectsV10AndRestartsStably)
 {
     constexpr uint64_t old_gdn_norm_clamp_key = 0xab525267a6098d45ULL;
-    constexpr uint64_t additive_epsilon_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t additive_epsilon_key = 0xb4799c09af74cd7dULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -198,7 +273,7 @@ TEST(Test__PrefixCacheFingerprint, GDNAdditiveEpsilonRejectsV10AndRestartsStably
 TEST(Test__PrefixCacheFingerprint, FiniteQ8ScaleRejectsV11AndRestartsStably)
 {
     constexpr uint64_t old_unbounded_q8_scale_key = 0xfc4266874f559540ULL;
-    constexpr uint64_t finite_q8_scale_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t finite_q8_scale_key = 0xb4799c09af74cd7dULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -220,7 +295,7 @@ TEST(Test__PrefixCacheFingerprint, FiniteQ8ScaleRejectsV11AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, ResidualArithmeticRejectsV12AndRestartsStably)
 {
     constexpr uint64_t old_residual_arithmetic_key = 0xda62a3544f706d9bULL;
-    constexpr uint64_t current_residual_arithmetic_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t current_residual_arithmetic_key = 0xb4799c09af74cd7dULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -278,10 +353,10 @@ namespace
         return material;
     }
 
-    DeviceNativeVNNIMatrixDesc fakeMatrixDesc(int seed)
+    DeviceNativeQuantisedMatrixDesc fakeMatrixDesc(int seed)
     {
         const auto base = static_cast<uintptr_t>(0x10000 + seed * 0x100);
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x40);
         desc.n = 16;
@@ -511,7 +586,7 @@ TEST(Test__PrefixCacheFingerprint, MoERuntimePlacementChangesKeyButHistogramDoes
 TEST(Test__PrefixCacheFingerprint, OriginalQ6ScaleRejectsV13AndRestartsStably)
 {
     constexpr uint64_t old_rounded_q6_key = 0xe8f93d2b09cca08eULL;
-    constexpr uint64_t source_factor_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t source_factor_key = 0xb4799c09af74cd7dULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -525,7 +600,7 @@ TEST(Test__PrefixCacheFingerprint, OriginalQ6ScaleRejectsV13AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, OriginalIQ2SScaleRejectsV14AndRestartsStably)
 {
     constexpr uint64_t old_rounded_iq2s_key = 0x6d9a77d4f2a0d599ULL;
-    constexpr uint64_t source_factor_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t source_factor_key = 0xb4799c09af74cd7dULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -539,7 +614,7 @@ TEST(Test__PrefixCacheFingerprint, OriginalIQ2SScaleRejectsV14AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, OriginalIQ4XSScaleRejectsV15AndRestartsStably)
 {
     constexpr uint64_t old_derived_half_key = 0x7850c4d9fdfa2764ULL;
-    constexpr uint64_t source_tuple_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t source_tuple_key = 0xb4799c09af74cd7dULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -553,11 +628,262 @@ TEST(Test__PrefixCacheFingerprint, OriginalIQ4XSScaleRejectsV15AndRestartsStably
 TEST(Test__PrefixCacheFingerprint, OriginalIQ3SScaleRejectsV16AndRestartsStably)
 {
     constexpr uint64_t old_derived_half_key=0x8573b84bbc243a1fULL;
-    constexpr uint64_t source_tuple_key=0x5cc5df15e248ed72ULL;
+    constexpr uint64_t source_tuple_key=0xb4799c09af74cd7dULL;
     for(int restart=0;restart<8;++restart) {
         const PrefixFingerprintParts parts{.model=1,.tokenizer=2,.runtime=3,
             .topology=4,.hybrid=5,.moe=6,.mtp=7};
         EXPECT_EQ(combinePrefixFingerprintParts(parts),source_tuple_key);
         EXPECT_NE(combinePrefixFingerprintParts(parts),old_derived_half_key);
+    }
+}
+
+/** @test Independent HC/GDN choices cannot restore each other's prefix state; defaults retain old bytes. */
+TEST(Test__PrefixCacheFingerprint, FlashNextGDNOutputActivationSeparatesRestarts)
+{
+    const auto single = QuantizedActivationOperandPrecision::SingleQ8;
+    const auto two = QuantizedActivationOperandPrecision::TwoTermQ8;
+    std::set<uint64_t> keys;
+    for (const auto hc : {single, two})
+    {
+        std::vector<PrefixFingerprintField> historical;
+        appendQwen4ExpArithmeticFingerprintFields(historical, hc);
+        for (const auto gdn : {single, two})
+        {
+            std::vector<PrefixFingerprintField> fields;
+            appendQwen4ExpArithmeticFingerprintFields(fields, hc, gdn);
+            const auto key = hashPrefixFingerprintFields("runtime", fields);
+            EXPECT_TRUE(keys.insert(key).second);
+            if (gdn == single) EXPECT_EQ(key, hashPrefixFingerprintFields("runtime", historical));
+            std::vector<PrefixFingerprintField> replay;
+            appendQwen4ExpArithmeticFingerprintFields(replay, hc, gdn);
+            EXPECT_EQ(key, hashPrefixFingerprintFields("runtime", replay));
+        }
+    }
+    EXPECT_EQ(keys.size(), 4u);
+    for (const auto name : {"qfn_gdn_output_activation", "qfn_gdn_output_activation_revision"})
+    {
+        std::vector<PrefixFingerprintField> fields{{name, "original"}};
+        EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields, single, two), std::invalid_argument);
+        ASSERT_EQ(fields.size(), 1u);
+        EXPECT_EQ(fields.front().value, "original");
+    }
+    std::vector<PrefixFingerprintField> fields;
+    EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields, single,
+        static_cast<QuantizedActivationOperandPrecision>(255)), std::invalid_argument);
+    EXPECT_TRUE(fields.empty());
+}
+
+/** @test Independent FA correction separates all eight arithmetic identities without changing old default keys. */
+TEST(Test__PrefixCacheFingerprint, FlashNextFAOutputActivationSeparatesRestarts)
+{
+    constexpr auto single=QuantizedActivationOperandPrecision::SingleQ8;
+    constexpr auto two=QuantizedActivationOperandPrecision::TwoTermQ8;
+    std::set<uint64_t> keys;
+    for(const auto hc:{single,two})for(const auto gdn:{single,two})
+    {
+        std::vector<PrefixFingerprintField> historical;
+        appendQwen4ExpArithmeticFingerprintFields(historical,hc,gdn);
+        for(const auto fa:{single,two})
+        {
+            std::vector<PrefixFingerprintField> fields,restart;
+            appendQwen4ExpArithmeticFingerprintFields(fields,hc,gdn,fa);
+            const auto key=hashPrefixFingerprintFields("runtime",fields);
+            EXPECT_TRUE(keys.insert(key).second);
+            appendQwen4ExpArithmeticFingerprintFields(restart,hc,gdn,fa);
+            EXPECT_EQ(key,hashPrefixFingerprintFields("runtime",restart));
+            if(fa==single){EXPECT_EQ(key,hashPrefixFingerprintFields("runtime",historical));}
+        }
+    }
+    EXPECT_EQ(keys.size(),8u);
+    for(const auto name:{"qfn_fa_output_activation","qfn_fa_output_activation_revision"})
+    {
+        std::vector<PrefixFingerprintField> fields{{name,"foreign"}};
+        EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields,single,single,two),std::invalid_argument);
+        ASSERT_EQ(fields.size(),1u);
+    }
+    std::vector<PrefixFingerprintField> fields;
+    EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields,single,single,
+        static_cast<QuantizedActivationOperandPrecision>(255)),std::invalid_argument);
+    EXPECT_TRUE(fields.empty());
+}
+
+/** @test All sixteen independent QFN arithmetic identities retain default compatibility and distinct restart keys. */
+TEST(Test__PrefixCacheFingerprint, FlashNextGDNQKVActivationSeparatesRestarts)
+{
+    constexpr auto single = QuantizedActivationOperandPrecision::SingleQ8;
+    constexpr auto two = QuantizedActivationOperandPrecision::TwoTermQ8;
+    std::set<uint64_t> keys;
+    for (const auto hc : {single, two})
+    for (const auto gdn : {single, two})
+    for (const auto fa : {single, two})
+    {
+        std::vector<PrefixFingerprintField> historical;
+        appendQwen4ExpArithmeticFingerprintFields(historical, hc, gdn, fa);
+        for (const auto qkv : {single, two})
+        {
+            std::vector<PrefixFingerprintField> fields, restart;
+            appendQwen4ExpArithmeticFingerprintFields(fields, hc, gdn, fa, qkv);
+            const auto key = hashPrefixFingerprintFields("runtime", fields);
+            EXPECT_TRUE(keys.insert(key).second);
+            appendQwen4ExpArithmeticFingerprintFields(restart, hc, gdn, fa, qkv);
+            EXPECT_EQ(key, hashPrefixFingerprintFields("runtime", restart));
+            if (qkv == single)
+            {
+                EXPECT_EQ(key, hashPrefixFingerprintFields("runtime", historical));
+            }
+        }
+    }
+    EXPECT_EQ(keys.size(), 16u);
+    for (const auto name : {"qfn_gdn_qkv_activation", "qfn_gdn_qkv_activation_revision"})
+    {
+        std::vector<PrefixFingerprintField> fields{{name, "foreign"}};
+        EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields, single, single, single, two), std::invalid_argument);
+        ASSERT_EQ(fields.size(), 1u);
+    }
+    std::vector<PrefixFingerprintField> fields;
+    EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(fields, single, single, single,
+        static_cast<QuantizedActivationOperandPrecision>(255)), std::invalid_argument);
+    EXPECT_TRUE(fields.empty());
+}
+
+/** @brief Persistent state uses the concrete source policy, preserving explicit native isolation. */
+TEST(Test__PrefixCacheFingerprint, QFNRouterDefaultResolvesBeforeIdentity)
+{
+    const auto identity = [](MoERouterArithmetic requested, std::string_view architecture) {
+        std::vector<PrefixFingerprintField> fields;
+        appendProjectionArithmeticFingerprintFields(fields, kDefaultGDNProjectionArithmetic,
+            resolveMoERouterArithmetic(requested, architecture));
+        return hashPrefixFingerprintFields("runtime", fields);
+    };
+    const auto qfn = identity(MoERouterArithmetic::ModelDefault, "qwen4exp");
+    EXPECT_EQ(qfn, identity(MoERouterArithmetic::FP16, "qwen4exp"));
+    EXPECT_NE(qfn, identity(MoERouterArithmetic::Native, "qwen4exp"));
+    EXPECT_EQ(identity(MoERouterArithmetic::ModelDefault, "qwen35moe"),
+              identity(MoERouterArithmetic::Native, "qwen35moe"));
+    std::vector<PrefixFingerprintField> unresolved;
+    EXPECT_THROW(appendProjectionArithmeticFingerprintFields(unresolved,
+        kDefaultGDNProjectionArithmetic, MoERouterArithmetic::ModelDefault), std::invalid_argument);
+    EXPECT_TRUE(unresolved.empty());
+}
+
+/** @test Uniform preserves historical fields; the admitted split schedule changes identity across stable restarts. */
+TEST(Test__PrefixCacheFingerprint, QFNAttentionPhaseScheduleDefaultAndSplitIdentityAreStable)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    const auto single=QuantizedActivationOperandPrecision::SingleQ8;
+    const std::vector<PrefixFingerprintField> base{{"existing_runtime_authority","retained"}};
+    auto implicit=base;appendQwen4ExpArithmeticFingerprintFields(implicit,kDefaultQwen4ExpHCUpActivation);
+    auto uniform=base;appendQwen4ExpArithmeticFingerprintFields(uniform,kDefaultQwen4ExpHCUpActivation,single,single,single,Schedule::Uniform);
+    auto historical=base;
+    historical.push_back({"qfn_hc_up_activation",std::string(quantizedActivationOperandPrecisionName(kDefaultQwen4ExpHCUpActivation))});
+    historical.push_back({"qfn_hc_up_activation_revision","native-primary-residual-folds-v2"});
+    ASSERT_EQ(implicit.size(),historical.size());ASSERT_EQ(uniform.size(),historical.size());
+    for(std::size_t i=0;i<historical.size();++i){
+        EXPECT_EQ(implicit[i].name,historical[i].name);EXPECT_EQ(implicit[i].value,historical[i].value);
+        EXPECT_EQ(uniform[i].name,historical[i].name);EXPECT_EQ(uniform[i].value,historical[i].value);
+    }
+    auto split=base;appendQwen4ExpArithmeticFingerprintFields(split,kDefaultQwen4ExpHCUpActivation,single,single,single,Schedule::Prefill8Decode33);
+    ASSERT_EQ(split.size(),historical.size()+1);EXPECT_EQ(split.back().name,"qfn_attention_phase_schedule");
+    EXPECT_EQ(split.back().value,std::to_string(static_cast<unsigned>(Schedule::Prefill8Decode33)));
+    const auto ordinary_key=hashPrefixFingerprintFields("runtime",historical);
+    EXPECT_EQ(ordinary_key,hashPrefixFingerprintFields("runtime",uniform));
+    const auto selected_key=hashPrefixFingerprintFields("runtime",split);EXPECT_NE(selected_key,ordinary_key);
+    auto restarted=base;appendQwen4ExpArithmeticFingerprintFields(restarted,kDefaultQwen4ExpHCUpActivation,single,single,single,Schedule::Prefill8Decode33);
+    std::reverse(restarted.begin(),restarted.end());EXPECT_EQ(selected_key,hashPrefixFingerprintFields("runtime",restarted));
+}
+/** @test Unknown schedules and duplicate schedule authorities reject without mutating compatibility fields. */
+TEST(Test__PrefixCacheFingerprint, QFNAttentionPhaseScheduleRejectsUnknownAndDuplicateAuthority)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    const auto single=QuantizedActivationOperandPrecision::SingleQ8;
+    std::vector<PrefixFingerprintField> original{{"existing_runtime_authority","retained"}};
+    EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(original,single,single,single,single,static_cast<Schedule>(255)),std::invalid_argument);
+    ASSERT_EQ(original.size(),1u);EXPECT_EQ(original.front().name,"existing_runtime_authority");EXPECT_EQ(original.front().value,"retained");
+    for(const auto schedule:{Schedule::Uniform,Schedule::Prefill8Decode33}){
+        std::vector<PrefixFingerprintField> duplicate{{"qfn_attention_phase_schedule","foreign"}};
+        EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(duplicate,single,single,single,single,schedule),std::invalid_argument);
+        ASSERT_EQ(duplicate.size(),1u);EXPECT_EQ(duplicate.front().name,"qfn_attention_phase_schedule");EXPECT_EQ(duplicate.front().value,"foreign");
+    }
+}
+
+/** @test Explicit FP16 base separates restart identity; default FP32 retains historical bytes. */
+TEST(Test__PrefixCacheFingerprint, QFNAttentionBaseIdentityIsStableAndRejectsInvalidAuthority)
+{
+    using A=qwen4exp::QwenSparseAttentionArithmetic;
+    std::vector<PrefixFingerprintField> original{{"existing", "retained"}};
+    auto fp32=original;appendQwen4ExpAttentionBaseFingerprintFields(fp32,A::FixedFP32);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime",fp32),hashPrefixFingerprintFields("runtime",original));
+    auto fp16=original;appendQwen4ExpAttentionBaseFingerprintFields(fp16,A::TileFP16WithFP32Totals);
+    auto restart=original;appendQwen4ExpAttentionBaseFingerprintFields(restart,A::TileFP16WithFP32Totals);
+    EXPECT_NE(hashPrefixFingerprintFields("runtime",fp16),hashPrefixFingerprintFields("runtime",fp32));
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime",fp16),hashPrefixFingerprintFields("runtime",restart));
+    for(auto invalid:{A::TileFP16WithFP32Totals33,static_cast<A>(255)}) {
+        auto fields=original;EXPECT_THROW(appendQwen4ExpAttentionBaseFingerprintFields(fields,invalid),std::invalid_argument);
+        ASSERT_EQ(fields.size(),1u);EXPECT_EQ(fields.front().value,"retained");
+    }
+    for(auto policy:{A::FixedFP32,A::TileFP16WithFP32Totals}) {
+        auto duplicate=fp16;EXPECT_THROW(appendQwen4ExpAttentionBaseFingerprintFields(duplicate,policy),std::invalid_argument);
+        EXPECT_EQ(duplicate.size(),fp16.size());
+    }
+}
+
+/** @brief Equal byte geometry cannot alias persisted prefixes across recurrence formats. */
+TEST(Test__PrefixCacheFingerprint,
+     GDNRecurrenceLayoutSeparatesSameSizeStateAndRejectsDuplicateAuthority)
+{
+    using L = GDNRecurrenceStateLayout;
+    PrefixFingerprintMaterial original, transposed;
+    original.hybrid = {{"enabled", "true"}, {"hybrid_state_bytes", "4096"}};
+    transposed.hybrid = original.hybrid;
+    appendGDNStateLayoutFingerprintFields(
+        original.hybrid, L::KeyMajorValueContiguous, L::KeyMajorValueContiguous);
+    appendGDNStateLayoutFingerprintFields(
+        transposed.hybrid, L::KeyMajorValueContiguous, L::ValueMajorKeyContiguous);
+    EXPECT_NE(buildPrefixFingerprintParts(original).hybrid,
+              buildPrefixFingerprintParts(transposed).hybrid);
+    const auto retained = original.hybrid;
+    EXPECT_THROW(appendGDNStateLayoutFingerprintFields(
+                     original.hybrid, L::KeyMajorValueContiguous, L::KeyMajorValueContiguous),
+                 std::invalid_argument);
+    ASSERT_EQ(original.hybrid.size(), retained.size());
+    std::vector<PrefixFingerprintField> invalid;
+    EXPECT_THROW(appendGDNStateLayoutFingerprintFields(
+                     invalid, static_cast<L>(255), L::KeyMajorValueContiguous),
+                 std::invalid_argument);
+    EXPECT_TRUE(invalid.empty());
+}
+
+/** @brief Pure attention and omitted sections contribute no unrelated recurrence identity. */
+TEST(Test__PrefixCacheFingerprint, AbsentRecurrenceSectionsPreserveExistingIdentity)
+{
+    std::vector<PrefixFingerprintField> fields{{"enabled", "false"}};
+    const auto original = fields;
+    appendGDNStateLayoutFingerprintFields(fields, std::nullopt, std::nullopt);
+    ASSERT_EQ(fields.size(), original.size());
+    EXPECT_EQ(fields[0].name, original[0].name);
+    EXPECT_EQ(fields[0].value, original[0].value);
+}
+
+/**
+ * @brief Fence pre-fix grouped CUDA state even when all policy parts match.
+ * @details Frozen keys were independently calculated from FNV-1a, the literal
+ * generation followed by model/tokenizer/runtime/topology/hybrid/moe/mtp names
+ * and little-endian values 1..7. No binary, model or cache payload is hashed.
+ */
+TEST(Test__PrefixCacheFingerprint, CUDAGroupedPhysicalRowsRejectV17AndRestartStably)
+{
+    constexpr uint64_t frozen_v17_key = 0x5cc5df15e248ed72ULL;
+    constexpr uint64_t corrected_v18_key = 0xb4799c09af74cd7dULL;
+    for (int restart = 0; restart < 8; ++restart)
+    {
+        const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
+            .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
+        EXPECT_EQ(combinePrefixFingerprintParts(parts), corrected_v18_key);
+        EXPECT_NE(combinePrefixFingerprintParts(parts), frozen_v17_key);
+        PrefixFingerprintMaterial material;
+        material.runtime = {{"b", "2"}, {"a", "1"}};
+        const auto first = combinePrefixFingerprintParts(buildPrefixFingerprintParts(material));
+        std::reverse(material.runtime.begin(), material.runtime.end());
+        EXPECT_EQ(first, combinePrefixFingerprintParts(buildPrefixFingerprintParts(material)));
     }
 }

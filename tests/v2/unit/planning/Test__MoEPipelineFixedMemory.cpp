@@ -6,7 +6,11 @@
  * metadata and observed resources. No weights, GPU context or prefix payload is
  * allocated. Shared archive backing must appear once while every actual stage
  * cache and channel endpoint remains represented in the joint fixed BOM.
+ * Incoming cross-backend TP stages additionally retain one native live-payload
+ * fanout frame and immutable host operand per member; this ownership is distinct
+ * from the two boundary leaders and never priced on sender-only stages.
  */
+#include "../../fixtures/planning/RecordedHostServicePlanning.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/RankMemoryPlanInputs.h"
@@ -92,7 +96,7 @@ namespace
             inventory.world_size = 1;
             inventory.ranks.resize(1);
             auto &observed = inventory.ranks.front();
-            observed.rank = 0;
+            observed.rank = observed.node_id = observed.local_rank = 0;
             observed.cpu_cores = observed.cpu_worker_threads = 8;
             observed.cpu_execution = test::kSyntheticCPUExecutionGeometry;
             observed.cpu.memory_bytes = observed.cpu.free_memory_bytes = observed.cpu_memory_bytes = 256ULL << 30;
@@ -117,7 +121,9 @@ namespace
                 auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
                 overlay->enabled = true;
                 overlay->topology = RoutedExpertPlacementTopology::SingleDomain;
-                overlay->authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+                overlay->authority_execution = backend == DeviceType::CPU
+                    ? MoEOverlayAuthorityExecutionKind::HostResident
+                    : MoEOverlayAuthorityExecutionKind::DeviceResident;
                 overlay->first_model_layer = rank.first_layer;
                 overlay->base_model_domain = overlay->continuation_domain = overlay->shared_expert_domain = "child";
                 overlay->continuation_domain_spec.domain = "child";
@@ -126,7 +132,8 @@ namespace
                 domain.name = "child";
                 domain.scope = width == 1 ? ExecutionDomainScope::SINGLE : ExecutionDomainScope::RANK_LOCAL;
                 domain.owner_rank = 0;
-                domain.backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                domain.backend = backend == DeviceType::CPU ? CollectiveBackendType::MPI
+                    : backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
                 domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
                 for (int member = 0; member < width; ++member)
                 {
@@ -135,8 +142,9 @@ namespace
                     domain.participants.push_back(address);
                     if (member == 0) rank.primary_device = address;
                     if (width > 1) rank.local_tp_devices.push_back(address);
-                    observed.gpus.push_back({.type = backend, .local_device_id = ordinal,
-                        .memory_bytes = 64ULL << 30, .free_memory_bytes = 64ULL << 30, .compute_units = 60});
+                    if (backend != DeviceType::CPU)
+                        observed.gpus.push_back({.type = backend, .local_device_id = ordinal,
+                            .memory_bytes = 64ULL << 30, .free_memory_bytes = 64ULL << 30, .compute_units = 60});
                 }
                 rank.local_tp_backend = domain.backend;
                 parent.local_pp_devices.push_back(rank.primary_device);
@@ -168,7 +176,9 @@ namespace
                     .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1, .maximum_cached_buckets = 16},
                     .gpu_weight_load = {.maximum_source_bytes = 65536},
                     .pipeline_stage = FactoryPPStageConfig{.first_layer = rank.first_layer, .last_layer = rank.last_layer + 1,
-                        .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head}}, rows);
+                        .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head,
+                        .generation_domain = declaredRankDeviceGenerationDomain(parent)},
+                    .native_source_placement = CPUStoragePlacement::local()}, rows);
                 result.push_back(std::move(projected.local_capacity));
             }
             return result;
@@ -208,7 +218,46 @@ namespace
     };
 }
 
-/** @test The real fixed planner carries all caches and exactly the two channel leaders. */
+/** @test No-peer CPU tails share real joint PMA admission without a demand mirror. */
+TEST(MoEPipelineFixedMemory, NoPeerHostTailRequiresNoRoutingEvidenceAllocation)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const bool mixed_gpu_prefix : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << int(backend) << '/' << mixed_gpu_prefix);
+            std::vector<StageGeometry> stages{{backend, 1}};
+            if (mixed_gpu_prefix)
+                stages.push_back({backend == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA, 1});
+            stages.push_back({DeviceType::CPU, 1});
+            Fixture fixture(stages);
+            const auto inputs = fixture.inputs();
+            for (const auto &input : inputs) EXPECT_FALSE(input.host_demand_memory);
+            const auto fixed = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
+            ASSERT_EQ(fixed.size(), stages.size());
+            for (const auto &stage : fixed) EXPECT_FALSE(stage.host_demand_memory);
+            const auto admitted = fixture.admit(fixed);
+            ASSERT_EQ(admitted.size(), stages.size());
+            ASSERT_TRUE(admitted.front().physical_memory_admission);
+            for (const auto &stage : admitted)
+                EXPECT_EQ(stage.physical_memory_admission, admitted.front().physical_memory_admission);
+            EXPECT_EQ(fixture.ranks.back().runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(fixture.configs.back().moe_routed_expert_plan->authority_execution,
+                MoEOverlayAuthorityExecutionKind::HostResident);
+
+            auto forbidden = inputs;
+            forbidden.back().host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
+                .num_layers = fixture.families.back().routedLayerCapacity(),
+                .num_experts = fixture.model.expert_count, .top_k = fixture.model.expert_used_count,
+                .initial_window_rows = fixture.configs.back().moe_rebalance.window_size,
+                .maximum_window_rows = fixture.configs.back().moe_rebalance.max_window_size,
+                .maximum_invocation_rows = 32,
+                .publication = MoEOverlayDemandPublicationScope::ProcessLocal});
+            EXPECT_THROW((void)test::planPipelineWithRecordedHostServices(fixture.parent, forbidden),
+                std::invalid_argument);
+        }
+}
+
+/** @test The fixed planner carries caches, exact boundary leaders and every receiving TP fanout owner. */
 TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProjection)
 {
     for (const bool reverse : {false, true})
@@ -224,7 +273,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 }
                 Fixture fixture(reverse, width, dense);
                 const auto inputs = fixture.inputs();
-                const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+                const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
                 ASSERT_EQ(plans.size(), 2u);
                 PhysicalMemoryPlanBuilder aggregate;
                 for (size_t stage = 0; stage < 2; ++stage)
@@ -243,6 +292,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                                 ? PipelineBoundarySide::EarlierDomain : PipelineBoundarySide::LaterDomain);
                         }
                         else EXPECT_TRUE(config.captured_pipeline_boundaries.empty());
+                        EXPECT_EQ(config.pipeline_native_activation_fanout, stage == 1 && width > 1);
                     }
                     for (const auto &bom : plans[stage].physical_memory_admission->plan().resources()) aggregate.add(bom);
                 }
@@ -252,15 +302,19 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixHostTier), size_t(2 * width) * (16ULL << 30));
                 EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
                 const auto channel = PipelineTransferMemory::forRows(fixture.model.d_model, 32, 1);
-                EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), channel.host_bytes_per_boundary);
+                const size_t receiving_fanout_members = width > 1 ? size_t(width) : 0u;
+                const size_t transport_host_bytes = channel.host_bytes_per_boundary +
+                    receiving_fanout_members * PipelineTransferMemory::fanoutHostBytes();
+                EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), transport_host_bytes);
                 for (size_t stage = 0; stage < 2; ++stage)
                     for (int member = 0; member < width; ++member)
                     {
                         const auto device = fixture.parent.local_pp_stage_tp_info[stage].devices[member].toLocalDeviceId();
                         const auto *gpu = admitted.plan().find({0, device});
                         ASSERT_NE(gpu, nullptr);
+                        const size_t fanout_bytes = stage == 1 && width > 1 ? PipelineTransferMemory::fanoutDeviceBytes() : 0u;
                         EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                            member == 0 ? channel.device_bytes_per_boundary : 0u);
+                            (member == 0 ? channel.device_bytes_per_boundary : 0u) + fanout_bytes);
                     }
                 const auto complete = fixture.admit(plans);
                 ASSERT_EQ(complete.size(), 2u);
@@ -269,7 +323,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 ASSERT_NE(complete_host, nullptr);
                 EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::PrefixHostTier), size_t(2 * width) * (16ULL << 30));
                 EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
-                EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), channel.host_bytes_per_boundary);
+                EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), transport_host_bytes);
             }
 }
 
@@ -295,7 +349,7 @@ TEST(MoEPipelineFixedMemory, RejectsMissingForeignAndOverflowingStageOwnership)
             case 9: inputs[1].resident_graph_rows *= 2; break;
             case 10: inputs[1].activation_channel_row_capacity *= 2; break;
         }
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+        EXPECT_THROW((void)test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
     }
 }
 
@@ -306,7 +360,7 @@ TEST(MoEPipelineFixedMemory, SharedHostCapacityMustAdmitAllStageContributions)
     auto &host = fixture.inventory.ranks[0];
     host.cpu.memory_bytes = host.cpu.free_memory_bytes = host.cpu_memory_bytes = 48ULL << 30;
     const auto inputs = fixture.inputs();
-    const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+    const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
     ASSERT_EQ(plans.size(), 2u);
     PhysicalMemoryPlanBuilder combined;
     for (const auto &stage : plans)
@@ -377,7 +431,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
         {
             SCOPED_TRACE(::testing::Message() << count << '/' << int(first_backend) << '/' << shape);
             Fixture fixture(shapes[shape]);
-            const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, fixture.inputs());
+            const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, fixture.inputs());
             const auto complete = fixture.admit(plans);
             ASSERT_EQ(complete.size(), shapes[shape].size());
             const auto certificate = complete.front().physical_memory_admission;
@@ -389,6 +443,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
             EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
             const auto channel = PipelineTransferMemory::forRows(fixture.model.d_model, 32, 1);
             size_t cross_backend_boundaries = 0;
+            size_t receiving_fanout_members = 0;
             size_t actual_members = 0;
             for (size_t stage = 0; stage < plans.size(); ++stage)
             {
@@ -400,6 +455,11 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
                 const auto &members = plans[stage].device_inputs;
                 ASSERT_EQ(members.size(), size_t(shapes[shape][stage].width));
                 actual_members += members.size();
+                // Native fanout belongs to each actual receiving TP member,
+                // including a middle stage with an independent outgoing edge.
+                // Authored shape/adjacency supplies the oracle, not the planner's flag.
+                const bool native_fanout = incoming && shapes[shape][stage].width > 1;
+                if (native_fanout) receiving_fanout_members += members.size();
                 for (size_t member = 0; member < members.size(); ++member)
                 {
                     const auto &config = members[member];
@@ -408,14 +468,17 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
                     EXPECT_EQ(config.first_layer, fixture.ranks[stage].first_layer);
                     EXPECT_EQ(config.last_layer, fixture.ranks[stage].last_layer);
                     EXPECT_EQ(config.captured_pipeline_boundaries.size(), member == 0 ? incoming + outgoing : 0);
+                    EXPECT_EQ(config.pipeline_native_activation_fanout, native_fanout);
                     EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                        member == 0 ? size_t(incoming + outgoing) * channel.device_bytes_per_boundary : 0u);
+                        (member == 0 ? size_t(incoming + outgoing) * channel.device_bytes_per_boundary : 0u) +
+                            (native_fanout ? PipelineTransferMemory::fanoutDeviceBytes() : 0u));
                 }
             }
             EXPECT_EQ(actual_members, size_t(count));
             EXPECT_EQ(physical.resources().size(), size_t(count + 1));
             EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                cross_backend_boundaries * channel.host_bytes_per_boundary);
+                cross_backend_boundaries * channel.host_bytes_per_boundary +
+                    receiving_fanout_members * PipelineTransferMemory::fanoutHostBytes());
         }
     }
 }
@@ -430,7 +493,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, AggregateHostBudgetCannotBeReusedByEverySta
     Fixture fixture(stages);
     auto &host = fixture.inventory.ranks[0];
     host.cpu.memory_bytes = host.cpu.free_memory_bytes = host.cpu_memory_bytes = size_t(count - 1) * (16ULL << 30);
-    const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, fixture.inputs());
+    const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, fixture.inputs());
     ASSERT_EQ(plans.size(), size_t(count));
     EXPECT_THROW((void)fixture.admit(plans), PhysicalMemoryCapacityExhausted);
 }
@@ -455,10 +518,60 @@ TEST_P(MoEPipelineMultiDeviceMemory, RejectsForeignMiddleAndTerminalScope)
             case 3: fixture.ranks[count / 2].last_layer++; break;
             case 4: inputs.back().activation_channel_row_capacity++; break;
         }
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+        EXPECT_THROW((void)test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
     }
 }
 
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelineMultiDeviceMemory, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+/** @test The actual parent boundary and nonterminal owner survive stage admission. */
+TEST(MoEPipelineFixedMemory, RejectsLostGenerationBoundaryAndWrongParentOwner)
+{
+    Fixture fixture(false, 1);
+    auto inputs = fixture.inputs();
+    ASSERT_EQ(inputs.size(), 2u);
+    for (const auto &input : inputs)
+        EXPECT_EQ(input.generation_domain, DeviceGenerationExecutionDomain::HostedBoundary);
+    EXPECT_EQ(inputs[0].generation_parent_role, MTPGenerationParentRole::PipelineFollower);
+    EXPECT_EQ(inputs[1].generation_parent_role, MTPGenerationParentRole::Controller);
+    inputs[0].generation_domain = DeviceGenerationExecutionDomain::NativeDomain;
+    EXPECT_THROW(test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
+    inputs = fixture.inputs();
+    inputs[0].generation_parent_role = MTPGenerationParentRole::Controller;
+    EXPECT_THROW(test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
+    inputs = fixture.inputs();
+    inputs[1].generation_domain = static_cast<DeviceGenerationExecutionDomain>(255);
+    EXPECT_THROW(test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
+}
+
+/** @test Per-device ordinary owners reach PMA without inventing tail children on followers. */
+TEST(MoEPipelineFixedMemory, OrdinaryAuxiliaryBOMFollowsActualContinuationRoleAndPolicy)
+{
+    for (const bool mixed : {false, true})
+    {
+        Fixture fixture(std::vector<StageGeometry>{{DeviceType::CUDA,1},
+            {mixed ? DeviceType::ROCm : DeviceType::CUDA,1}});
+        const auto inputs = fixture.inputs();
+        const auto fixed = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
+        ASSERT_EQ(fixed.size(), 2u);
+        for (size_t stage = 0; stage < fixed.size(); ++stage)
+        {
+            const auto device = fixture.ranks[stage].primary_device.toLocalDeviceId();
+            const auto *bill = fixed[stage].physical_memory_admission->plan().find({0,device});
+            const auto *base = fixed[stage].fixed_memory_plan.physicalPlan().find({0,device});
+            ASSERT_NE(bill,nullptr);
+            ASSERT_NE(base,nullptr);
+            auto inventory = inputs[stage].captured_graph_plan.resident_executables;
+            const auto policy = declaredDeviceGenerationExecutionPolicy(device.type, inputs[stage].generation_domain);
+            const auto role = stage == 0 ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
+            const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(device, false, policy, role);
+            EXPECT_EQ(ordinary, mixed && stage == 1 ? 4u : 2u);
+            inventory.auxiliary_executable_count += ordinary +
+                OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant);
+            EXPECT_EQ(bill->bytes(PhysicalMemoryOwner::NativeGraphExecutable),
+                base->bytes(PhysicalMemoryOwner::NativeGraphExecutable) + estimateCapturedGraphExecutableBytes(device,inventory));
+        }
+    }
+}
+
 } // namespace llaminar2

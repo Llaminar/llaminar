@@ -1,0 +1,125 @@
+/**
+ * @file selector-contract.cpp.in
+ * @brief Device-free replay of the exact native queue selector and metadata.
+ *
+ * Only native HSA pointer/depth access and owning Device storage are replaced.
+ * The queue policy and QueueInfo arithmetic are inserted verbatim from the
+ * authenticated native preimages. No accelerator or runtime DSO is loaded.
+ */
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <unordered_set>
+#include <vector>
+using uint = unsigned int;
+struct hsa_queue_t { std::uint64_t id; void* base_address{}; std::uint64_t read{}, write{}; };
+namespace Hsa {
+std::uint64_t queue_load_read_index_relaxed(hsa_queue_t* q) { return q->read; }
+std::uint64_t queue_load_write_index_relaxed(hsa_queue_t* q) { return q->write; }
+}
+#define ClPrint(...) ((void)0)
+class Device {
+public:
+  struct QueuePriority { enum {Low, Normal, High, Total}; };
+  struct Settings { unsigned max_hw_queues_=4, dynamic_queues_=1; bool queue_pipe_dist_=false; } settings_;
+  @@QUEUE_INFO@@
+  @@QUEUE_COMPARE@@
+  std::vector<std::map<hsa_queue_t*, QueueInfo, QueueCompare>> queuePool_{QueuePriority::Total};
+  unsigned numHwPipes_=4;
+  const Settings& settings() const { return settings_; }
+  hsa_queue_t* getQueueFromPool(uint index, bool force=false, hsa_queue_t* preferred=nullptr,
+                              const std::unordered_set<std::uint64_t>* excluded=nullptr);
+};
+@@SELECTOR@@
+namespace {
+int checks=0, failures=0;
+void check(bool ok, const char* name) {
+  ++checks;
+  std::printf("CHECK,%d,%d,%s\n",checks,ok?1:0,name);
+  if (!ok) { ++failures; std::fprintf(stderr,"FAIL %s\n",name); }
+}
+struct OriginalPool {
+  Device device;
+  hsa_queue_t preferred{1}, free{2}, other{3}, dedicated{4};
+  OriginalPool(unsigned mode=1, bool pipes=false) {
+    device.settings_.dynamic_queues_=mode; device.settings_.queue_pipe_dist_=pipes;
+    add(preferred,1,false); add(free,0,false); add(other,3,false); add(dedicated,1,true);
+    // Queue0 is actively blocked; a released queue can retain a coarse apparent
+    // read-pointer depth, so a lower apparent depth is not an idle authority.
+    preferred.write=45; free.write=1000;
+  }
+  void add(hsa_queue_t& q, int refs, bool dedicated_flag) {
+    auto& info=device.queuePool_[0][&q];info.refCount=refs;info.hasDedicatedQueue_=dedicated_flag;
+  }
+  int refs(hsa_queue_t& q) { return device.queuePool_[0].at(&q).refCount; }
+};
+}
+int main() {
+  for (unsigned mode : {0u,1u,2u}) for (bool pipes : {false,true}) {
+    for (int refs : {1,2,7}) {
+      OriginalPool p(mode,pipes);p.device.queuePool_[0][&p.preferred].refCount=refs;
+      const auto size=p.device.queuePool_[0].size();
+      auto* selected=p.device.getQueueFromPool(0,false,&p.preferred);
+      check(selected==&p.free,"shared preferred must not bypass eligible unshared queue");
+      check(p.refs(p.free)==1 && p.refs(p.preferred)==refs,
+            "selection increments only the actual new queue borrow");
+      check(p.device.queuePool_[0].size()==size,"bounded pool is unchanged");
+    }
+    {
+      OriginalPool p(mode,pipes);p.device.queuePool_[0][&p.preferred].refCount=0;
+      auto* selected=p.device.getQueueFromPool(0,false,&p.preferred);
+      check(selected==&p.preferred,"available original preferred affinity survives");
+      check(p.refs(p.preferred)==1 && p.refs(p.free)==0,"preferred owns exactly one new borrow");
+    }
+    {
+      OriginalPool p(mode,pipes);p.device.queuePool_[0][&p.free].refCount=1;
+      check(p.device.getQueueFromPool(0,false,&p.preferred)==&p.preferred,
+            "all shared pool preserves existing preferred hint");
+    }
+    {
+      OriginalPool p(mode,pipes);std::unordered_set<std::uint64_t> excluded{p.preferred.id};
+      check(p.device.getQueueFromPool(0,false,&p.preferred,&excluded)==&p.free,
+            "preferred exclusion remains authoritative");
+    }
+    {
+      OriginalPool p(mode,pipes);std::unordered_set<std::uint64_t> excluded{p.free.id};
+      check(p.device.getQueueFromPool(0,false,&p.preferred,&excluded)==&p.preferred,
+            "excluded unshared alternative cannot withdraw eligible hint");
+    }
+    {
+      OriginalPool p(mode,pipes);hsa_queue_t missing{99};
+      check(p.device.getQueueFromPool(0,false,&missing)==&p.free,
+            "missing hint uses unchanged unshared selection");
+    }
+    {
+      OriginalPool p(mode,pipes);p.device.settings_.max_hw_queues_=5;
+      check(p.device.getQueueFromPool(0,false,&p.preferred)==nullptr,
+            "below configured pool bound still requests ordinary new queue");
+      check(p.refs(p.preferred)==1 && p.refs(p.free)==0,"below bound has no new borrow");
+      check(p.device.getQueueFromPool(0,true,&p.preferred)==&p.free,
+            "forced reuse respects original unshared progress rule");
+    }
+    for (int refs : {0,1}) {
+      OriginalPool p(mode,pipes);p.device.queuePool_[0][&p.preferred].refCount=refs;
+      p.device.queuePool_[0][&p.preferred].hasDedicatedQueue_=true;
+      check(p.device.getQueueFromPool(0,false,&p.preferred)==&p.free,
+            "dedicated preferred does not bypass eligible ordinary queue");
+    }
+    {
+      OriginalPool p(mode,pipes);p.device.queuePool_[0][&p.free].refCount=1;
+      hsa_queue_t foreign_priority{9};
+      p.device.queuePool_[1][&foreign_priority]=Device::QueueInfo{};
+      check(p.device.getQueueFromPool(0,false,&p.preferred)==&p.preferred,
+            "free queue in different priority pool does not affect original hint");
+    }
+    {
+      OriginalPool p(mode,pipes);std::unordered_set<std::uint64_t> excluded{p.free.id,p.other.id,p.dedicated.id};
+      check(p.device.getQueueFromPool(0,false,&p.preferred,&excluded)==&p.preferred,
+            "same-graph exclusion set is preserved exactly");
+    }
+  }
+  std::printf("selector_contract checks=%d failures=%d native_runtime_loaded=0\n",checks,failures);
+  return failures?1:0;
+}

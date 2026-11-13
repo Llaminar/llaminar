@@ -11,6 +11,7 @@
  * @author GitHub Copilot
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -202,6 +203,9 @@ TEST_F(CPURMSNormKernel_Perf, Large_Prefill_128)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     ::testing::InitGoogleTest(&argc, argv);
     MPI_Init(&argc, &argv);
     int result = RUN_ALL_TESTS();

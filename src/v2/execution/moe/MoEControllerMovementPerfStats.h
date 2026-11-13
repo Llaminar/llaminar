@@ -42,20 +42,20 @@ namespace llaminar2
                 (edge.direction == MoEOptimizationMovementDirection::Demotion && edge.destination_priority > edge.source_priority);
             const bool axis = edge.axis == MoEOptimizationMovementAxis::TierResidency ||
                 edge.axis == MoEOptimizationMovementAxis::ParticipantPlacement || edge.axis == MoEOptimizationMovementAxis::Combined;
-            if (!edge.valid() || edge.authority != MoEOptimizationAuthority::Device ||
+            if (!edge.valid() || !edge.source.isWhole() || !edge.destination.isWhole() || edge.authority != MoEOptimizationAuthority::Device ||
                 edge.transaction != publication.transaction || edge.candidate_epoch != publication.candidate_epoch ||
-                !direction || !axis || edge.blocking_inference || edge.estimated_weight_bytes == 0 || edge.source_participant == edge.destination_participant ||
-                !edge.source_device.is_gpu() || !edge.destination_device.is_gpu() ||
-                (edge.source_world_rank_known && edge.source_world_rank < 0) ||
-                (edge.destination_world_rank_known && edge.destination_world_rank < 0) ||
+                !direction || !axis || edge.blocking_inference || edge.estimated_weight_bytes == 0 || edge.source.whole().participant == edge.destination.whole().participant ||
+                !edge.source.whole().device.is_gpu() || !edge.destination.whole().device.is_gpu() ||
+                (edge.source.whole().world_rank.has_value() && edge.source.whole().world_rank.value_or(-1) < 0) ||
+                (edge.destination.whole().world_rank.has_value() && edge.destination.whole().world_rank.value_or(-1) < 0) ||
                 !experts.emplace(edge.layer, edge.expert).second)
                 throw std::invalid_argument("Controller movement edge disagrees with its physical publication");
             promotions += edge.direction == MoEOptimizationMovementDirection::Promotion;
             demotions += edge.direction == MoEOptimizationMovementDirection::Demotion;
             same += edge.direction == MoEOptimizationMovementDirection::SamePriority;
-            cross_rank += edge.source_world_rank_known && edge.destination_world_rank_known &&
-                edge.source_world_rank != edge.destination_world_rank;
-            cross_backend += edge.source_device.type != edge.destination_device.type;
+            cross_rank += edge.source.whole().world_rank.has_value() && edge.destination.whole().world_rank.has_value() &&
+                edge.source.whole().world_rank.value_or(-1) != edge.destination.whole().world_rank.value_or(-1);
+            cross_backend += edge.source.whole().device.type != edge.destination.whole().device.type;
             cycles[edge.cycle_index].push_back(&edge);
         }
         if (promotions != receipt.promotions || demotions != receipt.demotions || same != receipt.same_priority_moves ||
@@ -69,8 +69,8 @@ namespace llaminar2
             {
                 if (edge->cycle_size != members.size() || edge->layer != members.front()->layer)
                     throw std::invalid_argument("Controller movement cycle has inconsistent geometry");
-                ++balance[edge->source_participant];
-                --balance[edge->destination_participant];
+                ++balance[edge->source.whole().participant];
+                --balance[edge->destination.whole().participant];
             }
             for (const auto &[participant, flow] : balance)
                 if (flow != 0)
@@ -125,15 +125,15 @@ namespace llaminar2
                     e.direction == MoEOptimizationMovementDirection::Promotion ? 1u : 2u,
                 e.axis == MoEOptimizationMovementAxis::TierResidency ? 0u :
                     e.axis == MoEOptimizationMovementAxis::ParticipantPlacement ? 1u : 2u,
-                static_cast<std::uint64_t>(e.source_participant), static_cast<std::uint64_t>(e.destination_participant),
+                static_cast<std::uint64_t>(e.source.whole().participant), static_cast<std::uint64_t>(e.destination.whole().participant),
                 static_cast<std::uint64_t>(static_cast<std::int64_t>(e.source_priority)),
                 static_cast<std::uint64_t>(static_cast<std::int64_t>(e.destination_priority)),
-                e.source_device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(e.source_device.ordinal),
-                e.destination_device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(e.destination_device.ordinal),
-                e.source_world_rank_known ? 1u : 0u,
-                e.source_world_rank_known ? static_cast<std::uint64_t>(e.source_world_rank) : 0u,
-                e.destination_world_rank_known ? 1u : 0u,
-                e.destination_world_rank_known ? static_cast<std::uint64_t>(e.destination_world_rank) : 0u,
+                e.source.whole().device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(e.source.whole().device.ordinal),
+                e.destination.whole().device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(e.destination.whole().device.ordinal),
+                e.source.whole().world_rank.has_value() ? 1u : 0u,
+                e.source.whole().world_rank.has_value() ? static_cast<std::uint64_t>(e.source.whole().world_rank.value_or(-1)) : 0u,
+                e.destination.whole().world_rank.has_value() ? 1u : 0u,
+                e.destination.whole().world_rank.has_value() ? static_cast<std::uint64_t>(e.destination.whole().world_rank.value_or(-1)) : 0u,
                 e.estimated_weight_bytes, e.activation_count, 0});
     }
 

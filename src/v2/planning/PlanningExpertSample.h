@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "PlanningModelMetadata.h"
+#include "execution/moe/ExpertHistogramSource.h"
 #include "backends/DeviceId.h"
 #include "tensors/TensorType.h"
 #include <array>
@@ -16,6 +17,10 @@
 
 namespace llaminar2
 {
+    /** @brief Startup ranking models only main-forward work; live per-phase MTP calibration is separate. */
+    inline constexpr std::array kPlanningExpertStartupPhases{
+        ExpertHistogramSource::DecodeToken,ExpertHistogramSource::PrefillChunk};
+
     class PlanningLoadedExpertSample;
     /** @brief Source materialization contract: only a GGUF reader owns transient read storage. */
     enum class PlanningSampleOrigin { LocalGGUF, PublishedPayload };

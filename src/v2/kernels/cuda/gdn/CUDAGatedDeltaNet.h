@@ -19,10 +19,15 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPlanarRecurrence.h"
+#include "kernels/gdn/GDNPreparedRetainedInvocation.h"
+#include "kernels/gdn/GDNCUDADenseCapturePlan.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -144,7 +149,8 @@ namespace llaminar2
          */
         bool bindDeviceState(const GDNDeviceStateBinding &binding) override
         {
-            if (device_state_bound_ || !binding.valid())
+            if (device_state_bound_ || !binding.valid() ||
+                !validGDNRecurrenceStateLayout(binding.recurrence_layout))
                 return false;
 
             gpu_state_ = binding.primary_state;
@@ -154,8 +160,16 @@ namespace llaminar2
             request_state_bank_ = binding.request_state_bank;
             request_state_bank_floats_ = binding.request_state_bank_floats;
             request_state_bank_capacity_ = binding.request_capacity;
+            recurrence_layout_ = binding.recurrence_layout;
             device_state_bound_ = true;
             return true;
+        }
+
+        /** @brief Return the immutable cache-owned physical recurrence format.
+         * @return Format adopted by the one successful state binding. */
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
+        {
+            return recurrence_layout_;
         }
 
         bool resetGPUState(void *stream) override { return resetState(stream); }
@@ -332,6 +346,14 @@ namespace llaminar2
             return hasState(required_state_size);
         }
         bool supportsPaddedPrefillRealLength() const override { return true; }
+        /** @brief Prepare an immutable retained invocation without allocating or rebinding live state.
+         * @param sources Frozen raw merged operands and device live-count owner.
+         * @param binding Actual leased views, physical geometry, owner identity and exact capture stream.
+         * @return Prepared backend program; all borrowed owners must outlive its graphs.
+         * @throws std::invalid_argument For unsupported or incomplete immutable bindings. */
+        std::unique_ptr<gdn::IGDNPreparedRetainedInvocation>
+        prepareRetainedInvocation(const gdn::MergedRecurrenceInput &sources,
+                                  const gdn::GDNRetainedInvocationBinding &binding) const override;
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {
             return device_state_bound_ &&
@@ -403,23 +425,24 @@ namespace llaminar2
             // All pointers are device pointers — pass directly to CUDA kernel.
             // No H2D/D2H copies, no scratch buffer, no stream synchronization.
             // The stage handles coherence (ensureOnDevice/allocateOnDevice).
-            const bool ok = cudaGDN_chunk_forward(
+            const bool ok = launchPlanarRecurrence(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                DeviceRequestRowRanges::fullyActive(seq_len),
+                n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_, verifier_state_capture_size_,
+                verifier_state_capture_rows_);
             return ok;
         }
 
         /**
-         * @brief Execute merged-QKV recurrence through the bound CUDA workspace.
+         * @brief Execute ordinary merged-QKV input on its native CUDA layout path.
          *
-         * Both launches remain on the exact stage stream and are captured as
-         * one ordered graph sequence. No host materialization, allocation, or
-         * synchronization participates in this mandatory layout operation.
+         * Nonidentity M1 reads merged coordinates in one recurrence kernel.
+         * Existing identity and multi-row paths retain their original transform
+         * and recurrence implementation. State and optional verifier snapshots
+         * stay bound to their original native authorities on the stage stream.
+         * No host materialization, allocation or synchronization participates.
          */
         bool chunkForwardMergedQKV(
             const float *merged_qkv, int qkv_stride,
@@ -430,13 +453,58 @@ namespace llaminar2
             int global_v_head_offset, int chunk_size,
             bool use_qk_l2norm) override
         {
+            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+                n_heads <= 0 || d_k <= 0 || d_v <= 0)
+                return false;
+            const auto rows = DeviceRequestRowRanges::fullyActive(seq_len);
+            if (gdnDeinterleaveElementsPerRequest(
+                    rows, n_k_heads, n_heads, d_k, d_v) <= 0)
+                return false;
+            // Coordinate admission above proves these products and their sum.
             const int compact_stride =
                 2 * n_k_heads * d_k + n_heads * d_v;
-            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
-                n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-                qkv_stride != compact_stride)
-            {
+            if (qkv_stride != compact_stride)
                 return false;
+
+            if (seq_len == 1 &&
+                (n_k_heads != n_heads || global_v_head_offset != 0))
+            {
+                cudaGDN_gpu_set_device(device_ordinal_);
+                const std::int64_t state_floats =
+                    std::int64_t{n_heads} * d_k * d_v;
+                if (state_floats > std::numeric_limits<int>::max())
+                    return false;
+                const int required_state_size = static_cast<int>(state_floats);
+                float *live_state = requireState(required_state_size,
+                    "CUDAGatedDeltaNet::chunkForwardMergedQKV");
+                if (!live_state)
+                    return false;
+                float *effective_state = resolveVerifierStateDestination(
+                    required_state_size, stream_);
+                if (!effective_state)
+                    return false;
+                return gdn::launchCUDAMergedRecurrence(
+                    gdn::MergedRecurrenceInput{
+                        .rows = rows,
+                        .key_heads = n_k_heads,
+                        .value_heads = n_heads,
+                        .key_width = d_k,
+                        .value_width = d_v,
+                        .global_value_offset = global_v_head_offset,
+                        .use_qk_l2norm = use_qk_l2norm,
+                        .merged = merged_qkv,
+                        .alpha = alpha,
+                        .beta_raw = beta_raw,
+                        .A_log = A_log,
+                        .dt_bias = dt_bias,
+                        .output = output,
+                        .initial_state = live_state,
+                        .updated_state = effective_state,
+                        .snapshots = verifier_state_capture_,
+                        .snapshot_stride_floats = verifier_state_capture_size_,
+                        .max_snapshot_rows = verifier_state_capture_rows_,
+                        .recurrence_layout = recurrence_layout_,
+                    }, stream_);
             }
 
             float *q = nullptr;
@@ -490,15 +558,14 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            const bool ok = cudaGDN_chunk_forward_effective(
+            if (!device_effective_seq_len) return false;
+            const bool ok = launchPlanarRecurrence(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                device_effective_seq_len,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                DeviceRequestRowRanges::deviceCounted(1, seq_len, device_effective_seq_len),
+                n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_, verifier_state_capture_size_,
+                verifier_state_capture_rows_);
             return ok;
         }
 
@@ -578,7 +645,7 @@ namespace llaminar2
                         std::min(request_seq_len, verifier_state_capture_rows_ - snapshot_base);
                 }
 
-                if (!cudaGDN_chunk_forward(
+                if (!launchPlanarRecurrence(
                         Q + qk_offset,
                         K + qk_offset,
                         V + v_offset,
@@ -593,12 +660,9 @@ namespace llaminar2
                         output + v_offset,
                         request_state,
                         updated_request_state,
-                        request_seq_len, n_heads, head_dim_k, head_dim_v,
-                        use_qk_l2norm,
-                        snapshots,
-                        required_state_size,
-                        snapshot_rows,
-                        device_ordinal_, stream_))
+                        DeviceRequestRowRanges::fullyActive(request_seq_len),
+                        n_heads, head_dim_k, head_dim_v, use_qk_l2norm,
+                        snapshots, required_state_size, snapshot_rows))
                 {
                     return false;
                 }
@@ -657,17 +721,15 @@ namespace llaminar2
                 effective_states = speculative_state_work_;
             }
 
-            return cudaGDN_chunk_forward_batched_effective(
+            return launchPlanarRecurrence(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, request_state_bank_, effective_states,
-                seq_len, request_count, request_seq_len,
-                n_heads, head_dim_k, head_dim_v,
-                use_qk_l2norm,
-                device_request_seq_lens,
+                DeviceRequestRowRanges::deviceCounted(
+                    request_count, request_seq_len, device_request_seq_lens),
+                n_heads, head_dim_k, head_dim_v, use_qk_l2norm,
                 capture_active ? verifier_state_capture_ : nullptr,
                 required_state_size,
-                capture_active ? verifier_state_capture_rows_ : 0,
-                device_ordinal_, stream_);
+                capture_active ? verifier_state_capture_rows_ : 0);
         }
 
         bool recurrent_step(
@@ -697,14 +759,13 @@ namespace llaminar2
             // slightly different GDN state over long generations, which can
             // flip near-tie Qwen3.6 tokens while the chunk-style verifier path
             // remains aligned with PyTorch.
-            const bool ok = cudaGDN_chunk_forward(
+            const bool ok = launchPlanarRecurrence(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
-                /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                DeviceRequestRowRanges::fullyActive(1),
+                n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_, verifier_state_capture_size_,
+                verifier_state_capture_rows_);
             return ok;
         }
 
@@ -972,6 +1033,46 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
     private:
+        /**
+         * @brief Publish original planar operands with the immutable state layout.
+         * @param Q Original raw planar queries; retained prefill scratch where applicable.
+         * @param K Original raw planar keys with the same lifecycle.
+         * @param V Original value rows.
+         * @param alpha Original projected gate scratch.
+         * @param beta_raw Original projected update-gate scratch.
+         * @param A_log Read-only per-head learned decay scale.
+         * @param dt_bias Read-only per-head learned time-step bias.
+         * @param output Exclusive output rows.
+         * @param initial_state Bound live request/head state.
+         * @param updated_state Bound live or speculative terminal state.
+         * @param rows Original request geometry and optional device length authority.
+         * @param heads Participant-local value heads.
+         * @param key_width Supported native64/128 key width.
+         * @param value_width Positive value width, including tail columns.
+         * @param normalize Original raw Q/K normalization policy.
+         * @param snapshots Optional same-format physical post-row state bank.
+         * @param snapshot_stride Exact admitted row stride, including odd padding.
+         * @param snapshot_rows Physical snapshot capacity.
+         * @return Exact typed native admission/enqueue result; no conversion.
+         */
+        bool launchPlanarRecurrence(
+            const float* Q, const float* K, const float* V,
+            const float* alpha, const float* beta_raw,
+            const float* A_log, const float* dt_bias,
+            float* output, const float* initial_state, float* updated_state,
+            DeviceRequestRowRanges rows, int heads, int key_width, int value_width,
+            bool normalize, float* snapshots, int snapshot_stride, int snapshot_rows) const
+        {
+            return gdn::launchCUDAPlanarRecurrence(gdn::PlanarRecurrenceInput{
+                .rows=rows, .heads=heads, .key_width=key_width, .value_width=value_width,
+                .normalize_qk=normalize, .query=Q, .key=K, .value=V,
+                .alpha=alpha, .beta_raw=beta_raw, .A_log=A_log, .dt_bias=dt_bias,
+                .output=output, .initial_state=initial_state, .updated_state=updated_state,
+                .snapshots=snapshots, .snapshot_stride_floats=snapshot_stride,
+                .max_snapshot_rows=snapshot_rows, .recurrence_layout=recurrence_layout_,
+            }, stream_);
+        }
+
         int device_ordinal_;
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
@@ -991,6 +1092,9 @@ namespace llaminar2
         int speculative_state_work_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
         bool device_state_bound_ = false;
+        GDNRecurrenceStateLayout recurrence_layout_ =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Fixed by the one cache binding.
+
 
         bool hasState(int required_state_size) const
         {
@@ -1179,6 +1283,150 @@ namespace llaminar2
             }
             return true;
         }
+
+        /** @brief Immutable backend program; leases and source/kernel lifetimes remain with the stage. */
+        class PreparedRetainedInvocation final : public gdn::IGDNPreparedRetainedInvocation
+        {
+          public:
+            /** @brief Freeze validated canonical banks and native capture identity cold.
+             * @param owner Existing immutable device-state owner.
+             * @param sources Raw source tuple without legacy state/snapshot bindings.
+             * @param binding Caller-leased exact workspace and capture stream.
+             * @param state_size Exact per-request live image size from native geometry. */
+            PreparedRetainedInvocation(const CUDAGatedDeltaNet &owner,
+                                       const gdn::MergedRecurrenceInput &sources,
+                                       const gdn::GDNRetainedInvocationBinding &binding, int state_size)
+                : owner_(owner), binding_(binding), state_size_(state_size),
+                  scalar_(owner.stateForSize(state_size)), packed_(owner.request_state_bank_),
+                  input_(gdn::makeGDNRetainedCaptureInput(
+                      sources, binding, binding.geometry.requests() == 1 ? scalar_ : packed_,
+                      owner.recurrence_layout_,
+                      gdn::GDNDenseCompactArithmetic::CUDAEightPartFusedUpdateV1)),
+                  plan_(gdn::prepareCUDADenseRetentionCapturePlan(
+                      binding.geometry, owner.recurrence_layout_, binding.terminal_kind,
+                      owner.device_ordinal_, binding.capture_stream))
+            {
+                if (!gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {owner.gpu_state_, static_cast<std::size_t>(owner.state_size_)}) ||
+                    !gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {owner.secondary_gpu_state_,
+                                 static_cast<std::size_t>(owner.secondary_state_size_)}) ||
+                    !gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {packed_, owner.request_state_bank_floats_}))
+                    throw std::invalid_argument(
+                        "Retained GDN speculative writes overlap canonical live state");
+            }
+            /** @return Frozen complete native input. */
+            const gdn::GDNDenseCompactCaptureInput &captureInput() const noexcept override
+            {
+                return input_;
+            }
+            /** @return Frozen actual leased views and stable manager identity. */
+            const gdn::GDNRetainedInvocationBinding &binding() const noexcept override { return binding_; }
+            /** @return Exact canonical scalar or packed publication destination. */
+            float *publicationDestination() const noexcept override
+            {
+                return binding_.geometry.requests() == 1 ? scalar_ : packed_;
+            }
+            /** @return Backend, terminal and compiled scheduling identity. */
+            std::uint64_t captureProgramIdentity() const noexcept override
+            {
+                return 256ULL + (static_cast<std::uint64_t>(binding_.terminal_kind) << 4) +
+                       static_cast<std::uint64_t>(plan_.schedule());
+            }
+            /** @brief Authenticate complete immutable backend/source/workspace identity.
+             * @param candidate Proposed reused invocation.
+             * @return Exact identity match, without inspecting device payload. */
+            bool sameCaptureIdentity(
+                const gdn::IGDNPreparedRetainedInvocation &candidate) const noexcept override
+            {
+                const auto *other = dynamic_cast<const PreparedRetainedInvocation *>(&candidate);
+                return other && &owner_ == &other->owner_ && state_size_ == other->state_size_ &&
+                       scalar_ == other->scalar_ && packed_ == other->packed_ &&
+                       gdn::sameGDNRetainedBindingViews(binding_, other->binding_) &&
+                       gdn::sameGDNRetainedCaptureInput(input_, other->input_) &&
+                       plan_.sameBinding(other->plan_);
+            }
+            /** @brief Record the frozen recurrence on its authenticated capture stream.
+             * @return Native submission succeeded; no shared kernel binding is modified. */
+            bool capture() const override
+            {
+                if (!stateBindingCurrent())
+                    return false;
+                cudaGDN_gpu_set_device(owner_.device_ordinal_);
+                return gdn::launchCUDADenseCompactRecurrence(input_, binding_.capture_stream, plan_);
+            }
+            /** @brief Publish under the existing exact device/event authority, possibly on another stream.
+             * @param selection Immutable typed metadata view authenticated by the native whole-plan guard.
+             * @param stream Explicit same-device publication stream with producer-event ordering
+             * established.
+             * @return Publication and the one necessary scalar/request-zero visibility edge succeeded. */
+            bool publish(const gdn::GDNDenseAcceptedSelection &selection, void *stream) const override
+            {
+                if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !stateBindingCurrent() ||
+                    !selection.matchesGeometry(binding_.geometry) ||
+                    !gdn::retainedSelectionDisjointFromState(
+                        selection, {owner_.gpu_state_, static_cast<std::size_t>(owner_.state_size_)}) ||
+                    !gdn::retainedSelectionDisjointFromState(
+                        selection, {owner_.secondary_gpu_state_,
+                                    static_cast<std::size_t>(owner_.secondary_state_size_)}) ||
+                    !gdn::retainedSelectionDisjointFromState(selection,
+                                                             {packed_, owner_.request_state_bank_floats_}))
+                    return false;
+                const gdn::GDNDenseCompactAcceptedPrefixInput publication{input_.transaction, selection,
+                                                                          publicationDestination()};
+                cudaGDN_gpu_set_device(owner_.device_ordinal_);
+                if (!gdn::launchCUDADenseCompactAcceptedPrefix(publication, stream))
+                    return false;
+                if (scalar_ != packed_)
+                {
+                    // R1 owns scalar; R>1 owns packed. Never seed R>1 from a stale scalar.
+                    cudaGDN_gpu_memcpy_async(binding_.geometry.requests() == 1 ? packed_ : scalar_,
+                                             binding_.geometry.requests() == 1 ? scalar_ : packed_,
+                                             static_cast<std::size_t>(state_size_), stream);
+                }
+                return true;
+            }
+
+          private:
+            /** @brief Reject any changed canonical state topology before enqueue.
+             * @return Original immutable bound state owners and request capacity remain valid. */
+            bool stateBindingCurrent() const noexcept
+            {
+                return owner_.device_state_bound_ && owner_.stateForSize(state_size_) == scalar_ &&
+                       owner_.request_state_bank_ == packed_ &&
+                       owner_.supportsRequestLiveStateBank(binding_.geometry.requests(), state_size_);
+            }
+            const CUDAGatedDeltaNet &owner_;
+            const gdn::GDNRetainedInvocationBinding binding_;
+            const int state_size_;
+            float *const scalar_;
+            float *const packed_;
+            const gdn::GDNDenseCompactCaptureInput input_;
+            const gdn::CUDADenseRetentionCapturePlan plan_;
+        };
     };
+
+
+    /** @brief Freeze native geometry over already-bound canonical GPU state.
+     * @param sources Frozen raw inputs; no legacy speculative state bindings.
+     * @param binding Actual workspace views, terminal requirement and exact cold stream.
+     * @return Immutable borrowing invocation; unsupported state/geometry fails before recording.
+     * @throws std::invalid_argument For absent device state or unsupported native dimensions. */
+    inline std::unique_ptr<gdn::IGDNPreparedRetainedInvocation>
+    CUDAGatedDeltaNet::prepareRetainedInvocation(const gdn::MergedRecurrenceInput &sources,
+                                                 const gdn::GDNRetainedInvocationBinding &binding) const
+    {
+        const auto &g = binding.geometry;
+        const auto state_size = g.denseBankFloats() / static_cast<std::size_t>(g.requests());
+        if ((g.keyWidth() != 64 && g.keyWidth() != 128) ||
+            state_size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            !device_state_bound_ ||
+            !supportsRequestLiveStateBank(g.requests(), static_cast<int>(state_size)))
+            throw std::invalid_argument("Prepared retained GDN requires supported geometry and "
+                                        "existing canonical device state");
+        return std::make_unique<PreparedRetainedInvocation>(*this, sources, binding,
+                                                            static_cast<int>(state_size));
+    }
 
 } // namespace llaminar2

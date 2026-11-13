@@ -7,8 +7,12 @@
  * finite completed service, and empty claims on retirement. Measured GB/s is
  * diagnostic output, never a performance threshold in production preflight.
  */
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "planning/PlanningMemoryBandwidthMeasurement.h"
 #include "planning/PlanningHostDeviceMeasurement.h"
+#include "planning/PlanningExecutionMeasurement.h"
+#include "planning/PlanningGPUClockBuffer.h"
+#include "backends/GPUGraphMemoryContract.h"
 #include "planning/PlanningObservedResource.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -16,59 +20,109 @@
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <omp.h>
+#include "planning/RankHardwareOwnership.h"
 
 using namespace llaminar2;
 
 namespace
 {
     /** @brief Prove both copy mechanisms, both directions, failure retirement and exact public bounds. */
-    void proveHostDevice(DeviceId device)
+    void proveHostDevice(DeviceId device, bool require_captured_clock=false)
     {
         const auto mpi = MPIContextFactory::global();
         const auto inventory = mpi->clusterInventory();
         ASSERT_NE(inventory, nullptr);
         const auto &rank = inventory->ranks.at(mpi->rank());
+        const auto local = std::find_if(rank.gpus.begin(), rank.gpus.end(), [&](const auto &gpu) {
+            return gpu.type == device.type && !gpu.uuid.empty() && rankOwnsGPUDevice(rank, gpu);
+        });
+        ASSERT_NE(local, rank.gpus.end()) << "Host-device measurement requires its original NUMA-owned GPU";
+        device = {local->type, local->local_device_id};
+        if (!hasCPUBackend()) initCPUBackend(rank.cpu.numa_node);
         // Odd payload covers vector tails while the collector separately uses
         // the model's bounded activation payload. No throughput gate is imposed.
-        const auto request = PlanningHostDeviceRequest::fromInventory(rank, device, 4099);
+        const auto request = PlanningHostDeviceRequest::fromInventory(*inventory, {rank.rank, device}, {rank.rank}, 4099);
         PhysicalMemoryPlanBuilder builder;
-        PlanningHostDeviceMeasurement::contributeMemory(request, planningObservedResource(rank, DeviceId::cpu()),
-            planningObservedResource(rank, device), builder);
+        PlanningHostDeviceMeasurement::contributeHostMemory(request, planningObservedResource(rank, DeviceId::cpu()), builder);
+        PlanningHostDeviceMeasurement::contributeExecutionMemory(request, planningObservedResource(rank, DeviceId::cpu()), planningObservedResource(rank, device), builder);
         auto memory = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), rank.rank);
+        if(require_captured_clock){
+            EXPECT_EQ(memory->plannedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace),PlanningNativeGPUClockBuffer::hostAllocationBytes(2));
+            EXPECT_EQ(memory->plannedBytes(device,PhysicalMemoryOwner::ExecutionWorkspace),PlanningNativeGPUClockBuffer::deviceAllocationBytes(2));
+            EXPECT_EQ(memory->plannedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable),
+                (PlanningExecutionMeasurement::kPreparedGraphCount+1)*GPUGraphMemoryContract::reservationBytesPerExecutable(device));
+            ::testing::Test::RecordProperty("host_device_original_gpu_uuid",local->uuid);
+            ::testing::Test::RecordProperty("host_device_executor_rank",rank.rank);
+            ::testing::Test::RecordProperty("host_device_first_touch_rank",request.hostRank());
+            ::testing::Test::RecordProperty("host_device_first_touch_numa",request.hostNumaNode());
+        }
         const auto run = [&] {
-            const auto observed = PlanningHostDeviceMeasurement::measure(request, memory);
-            EXPECT_EQ(observed.request, request);
-            EXPECT_NO_THROW(PlanningHostDeviceMeasurement::validate(observed));
-            for (const auto &phase : observed.phases)
+            const auto observed = PlanningHostDeviceMeasurement::collect(request, mpi, memory);
+            ASSERT_TRUE(observed.has_value());
+            EXPECT_EQ(observed->request, request);
+            EXPECT_NO_THROW(PlanningHostDeviceMeasurement::validate(*observed));
+            for (const auto &phase : observed->phases)
             {
                 EXPECT_GT(phase.graph_nodes, 0u);
                 EXPECT_GT(phase.service.unitsPerSecond(), 0);
                 EXPECT_EQ(phase.service.completedWork(), 3.0 * phase.payload_bytes);
+                if(require_captured_clock){
+                    EXPECT_NE(phase.service.provenance().find("sum of captured fixed-device-clock intervals"),std::string::npos);
+                    EXPECT_NE(phase.service.provenance().find("fresh host publication before every invocation"),std::string::npos);
+                }
             }
+            for(const auto allocator:{DeviceId::cpu(),device})
+                for(const auto owner:{PhysicalMemoryOwner::ActivationTransportStaging,
+                    PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryOwner::NativeGraphExecutable}){
+                    EXPECT_EQ(memory->claimedBytes(allocator,owner,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+                    EXPECT_EQ(memory->reservedBytes(allocator,owner),0u);
+                }
         };
-        run();
+        // Serial calibration reuses the original worker stream across complete
+        // captures and byte-proof retirement, without an auxiliary pool lifetime.
+        auto &calibration_worker = GPUDeviceContextPool::instance().getContext(device);
+        void *original_stream = nullptr;
+        calibration_worker.submitAndWait([&] { original_stream = calibration_worker.defaultStream(); });
+        ASSERT_NE(original_stream, nullptr);
+        for (int replay = 0; replay < 2; ++replay)
+        {
+            run();
+            calibration_worker.submitAndWait([&] {
+                EXPECT_EQ(calibration_worker.defaultStream(), original_stream);
+            });
+        }
         for (auto allocator : {DeviceId::cpu(), device})
         {
             EXPECT_EQ(memory->claimedBytes(allocator, PhysicalMemoryOwner::ActivationTransportStaging,
                 PhysicalMemoryMaterializationKind::NewAllocation), 0u);
             EXPECT_EQ(memory->reservedBytes(allocator, PhysicalMemoryOwner::NativeGraphExecutable), 0u);
         }
+        for (const auto allocator : {DeviceId::cpu(), device})
         {
-            auto occupied = memory->reserveNewAllocations(device, PhysicalMemoryOwner::ActivationTransportStaging,
-                memory->plannedBytes(device, PhysicalMemoryOwner::ActivationTransportStaging));
+            auto occupied = memory->reserveNewAllocations(allocator, PhysicalMemoryOwner::ActivationTransportStaging,
+                memory->plannedBytes(allocator, PhysicalMemoryOwner::ActivationTransportStaging));
             EXPECT_THROW(run(), std::exception);
         }
         EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
             PhysicalMemoryMaterializationKind::NewAllocation), 0u);
         auto &worker = GPUDeviceContextPool::instance().getContext(device);
         worker.submitAndWait([&] {
-            EXPECT_THROW(PlanningHostDeviceMeasurement::measure(request, memory), std::invalid_argument);
+            try
+            {
+                (void)PlanningHostDeviceMeasurement::collect(request, mpi, memory);
+                FAIL() << "GPU worker cannot replace the original setup caller";
+            }
+            catch (const std::exception &error)
+            {
+                EXPECT_NE(std::string(error.what()).find("rank setup caller"), std::string::npos);
+            }
         });
         run(); // A pre-allocation failure must not leave a poisoned/reused native binding.
         {
@@ -78,7 +132,7 @@ namespace
             auto gpu_claim = memory->claimNewAllocation(device, PhysicalMemoryOwner::ActivationTransportStaging, request.bulkBytes());
             const std::array devices{device};
             auto mapped = transfer.allocateMappedHostRegion(request.bulkBytes(), devices);
-            const auto lanes = transfer.allocatePersistentTransferExecutionLanes(1, device, "planning_host_device");
+            const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfer,1, device, "planning_host_device");
             worker.submitAndWait([&] {
                 auto scratch = transfer.allocateDeviceTransferBuffer(request.bulkBytes(), device);
                 const auto &lane = lanes.front();
@@ -181,4 +235,15 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_HostDeviceService) { proveHos
 #ifdef HAVE_ROCM
 TEST(PlanningExecutionMeasurementIntegration, ROCm_StreamingBandwidth) { prove(DeviceId::rocm(0)); }
 TEST(PlanningExecutionMeasurementIntegration, ROCm_HostDeviceService) { proveHostDevice(DeviceId::rocm(0)); }
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Captured DMA/mapped service retains late byte publication and repeated original-worker retirement. */
+TEST(PlanningExecutionMeasurementIntegration, CUDA_HostDeviceCapturedClockReplay)
+{proveHostDevice(DeviceId::cuda(0),true);}
+#endif
+#ifdef HAVE_ROCM
+/** @test HIP host-device calibration uses compact device clocks rather than enqueue-spanning events. */
+TEST(PlanningExecutionMeasurementIntegration, ROCm_HostDeviceCapturedClockReplay)
+{proveHostDevice(DeviceId::rocm(0),true);}
 #endif

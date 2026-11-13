@@ -23,6 +23,8 @@ namespace llaminar2
         ITensor *output; ///< Disjoint canonical receive owner, published at the join.
         BufferId input_id; ///< Arena lifetime begins before the producer fork.
         BufferId output_id; ///< Arena lifetime extends through downstream consumers.
+        ITensor *companion_input = nullptr; ///< Optional count acquired on the packet producer frontier.
+        ITensor *observation_inout = nullptr; ///< Optional canonical native receipt, acquired before fork and published only at join.
     };
 
     /**

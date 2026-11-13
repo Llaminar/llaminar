@@ -124,6 +124,13 @@ namespace llaminar2
         /** @brief Decorate the final native body once, including all external waits. */
         bool attach(IGPUGraphCapture &graph) noexcept override
         {
+            return attachWithFiniteBody(graph, {});
+        }
+
+        /** @brief Keep the original service active through every finite storage terminal. */
+        bool attachWithFiniteBody(IGPUGraphCapture& graph,
+            std::span<const IGPUGraphCapture* const> siblings) noexcept override
+        {
             if (state_ != AttachmentState::Prepared || isGraphCaptureActive())
                 return false;
             try
@@ -131,7 +138,7 @@ namespace llaminar2
                 if (!graph.appendParallelBranch({
                         .open = *fragments_[0],
                         .worker = *fragments_[1],
-                        .close = *fragments_[2]}))
+                        .close = *fragments_[2], .body_siblings = siblings}))
                     return false;
                 state_ = AttachmentState::Attached;
                 return true;
@@ -350,7 +357,7 @@ namespace llaminar2
             !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
             unit_count > layout.maximum_units_per_chunk ||
-            staging_capacity < layout.chunkBytes(unit_count))
+            staging_capacity < layout.chunkBytes(unit_count,first_unit))
             throw std::invalid_argument("Packed download exceeds its authenticated geometry or staging");
         if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("Packed transfer slot generation overflowed");
@@ -365,7 +372,7 @@ namespace llaminar2
         work.device_staging = reinterpret_cast<std::uintptr_t>(device_staging);
         pending_generation_ = epoch_->publish(index_, ++next_generation_,
             MappedTransferDirection::DeviceToHost, source.payload,
-            source.payload_bytes, 0u, layout.chunkBytes(unit_count), dependency, &work);
+            source.payload_bytes, 0u, layout.chunkBytes(unit_count,first_unit), dependency, &work);
         pending_ = true;
         return pending_generation_;
     }
@@ -383,7 +390,7 @@ namespace llaminar2
             !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
             unit_count > layout.maximum_units_per_chunk ||
-            staging_capacity < layout.chunkBytes(unit_count))
+            staging_capacity < layout.chunkBytes(unit_count,first_unit))
             throw std::invalid_argument("Packed upload exceeds its authenticated geometry or staging");
         if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("Packed transfer slot generation overflowed");
@@ -398,7 +405,7 @@ namespace llaminar2
         work.device_staging = reinterpret_cast<std::uintptr_t>(device_staging);
         pending_generation_ = epoch_->publish(index_, ++next_generation_,
             MappedTransferDirection::HostToDevice, destination.payload,
-            destination.payload_bytes, 0u, layout.chunkBytes(unit_count),
+            destination.payload_bytes, 0u, layout.chunkBytes(unit_count,first_unit),
             TransferProducerDependency::published(), &work);
         pending_ = true;
         return pending_generation_;

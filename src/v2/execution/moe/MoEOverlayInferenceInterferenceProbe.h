@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -55,6 +56,37 @@ namespace llaminar2
         Ready,   ///< Every operation preceding the event has completed.
         Failed,  ///< The backend rejected the non-blocking event query.
     };
+
+    /**
+     * @brief Retain one recorded native fence's immutable terminal observation.
+     * @tparam Query Nonblocking query of the exact original event and producer identity.
+     * @param observation Original owner's proof; initialize to Pending before each new recording.
+     * @param query Invoked only while completion remains unproven.
+     * @return Pending, or the first terminal Ready/Failed result for this recording.
+     *
+     * Once native completion is proven, later request reset cannot revoke it.
+     * Re-querying an old producer against a new session would instead turn safe
+     * teardown into a false stale-generation failure. Unobserved or newly
+     * recorded work still authenticates its full original identity in @p query.
+     * Shared fence readers retain the first terminal result atomically. This
+     * retains completed-event evidence, never live model/controller state.
+     */
+    template <typename Query>
+    [[nodiscard]] MoEOverlayInferenceCompletionFenceProgress pollRetainedInferenceCompletion(
+        std::atomic<MoEOverlayInferenceCompletionFenceProgress> &observation, Query &&query) noexcept
+    {
+        using Progress = MoEOverlayInferenceCompletionFenceProgress;
+        const auto previous = observation.load(std::memory_order_acquire);
+        if (previous != Progress::Pending) return previous;
+        const auto queried = std::forward<Query>(query)();
+        if (queried != Progress::Pending)
+        {
+            auto expected = Progress::Pending;
+            observation.compare_exchange_strong(expected, queried,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+        return observation.load(std::memory_order_acquire);
+    }
 
     /**
      * @brief Stable setup-owned device event used to close one live sample.

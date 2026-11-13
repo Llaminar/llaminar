@@ -100,8 +100,10 @@ def run_pr_tests(images: dict, directory: Path) -> dict:
                "--build-dir", "build_v2_integration",
                "--installed-build-receipt", "/src/installed-tests.json",
                "--output", "/ci-results/pr-tests"]
+    # Native CPU MPI tests need the same namespace, shared-memory and ptrace
+    # contract as other CPU test runners; this selector exposes no GPU devices.
     launch = ["docker", "run", "--rm", "--name", name,
-              "--user", f"{os.getuid()}:{os.getgid()}",
+              *docker_paths.device_args(image, "CPU", user=f"{os.getuid()}:{os.getgid()}"),
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(directory, "/ci-results", False)]),
               "-w", "/src", image,

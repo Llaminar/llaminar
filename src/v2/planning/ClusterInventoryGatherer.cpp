@@ -186,6 +186,8 @@ namespace llaminar2
             gpu.pcie_max_speed_gts = device.pcie.max_speed_gts;
             gpu.pcie_degraded = device.pcie.degraded;
             gpu.pcie_bottleneck_bdf = device.pcie.bottleneck_bdf;
+            gpu.pcie_upstream_bdfs = device.pcie.upstream_bdfs;
+            gpu.native_isa = device.native_isa;
             rank.gpus.push_back(std::move(gpu));
         }
         projectPeers(rank, DeviceType::CUDA, hardware.cuda_p2p);
@@ -255,13 +257,15 @@ namespace llaminar2
                 omp_get_thread_limit() < omp_get_max_threads())
                 throw std::invalid_argument("Inventory requires a fixed, non-nested CPU execution team");
             location.cpu_worker_threads = omp_get_max_threads();
-            if (distributed)
-            {
-                const auto numa = NUMATopology::detectLocalNUMANode();
-                if (!numa.detection_succeeded || numa.local_numa_node < 0)
-                    throw std::runtime_error("Multi-rank hardware discovery requires exact CPU NUMA affinity");
+            // A one-rank MPI launch is bound too. Observe its actual caller
+            // before driver discovery, exactly as for a distributed rank.
+            // Ambiguous unbound single-process CPU use retains whole-host scope;
+            // it never acquires GPU ownership from a visible card's NUMA ID.
+            const auto numa = NUMATopology::detectLocalNUMANode();
+            if (numa.detection_succeeded && numa.local_numa_node >= 0)
                 location.cpu_numa_node = numa.local_numa_node;
-            }
+            else if (distributed)
+                throw std::runtime_error("Multi-rank hardware discovery requires exact CPU NUMA affinity");
             auto &manager = DeviceManager::instance();
             // Reuse the complete observation even if another startup caller
             // installed a socket-local execution view. Visibility projection

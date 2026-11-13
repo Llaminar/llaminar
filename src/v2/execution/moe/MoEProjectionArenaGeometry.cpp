@@ -12,7 +12,7 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "loaders/WeightIdentity.h"
 #include "planning/ModelMemoryProfile.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <limits>
@@ -58,19 +58,23 @@ MoEProjectionArenaGeometry MoEProjectionArenaGeometry::resolve(
         profile.expert_used_count <= 0 || profile.expert_used_count > profile.expert_count)
         throw std::invalid_argument("MoE projection arena requires complete, divisible native-domain geometry");
 
-    std::vector<bool> seen(static_cast<std::size_t>(profile.n_layers), false);
+    // QFN declares main blocks separately from its trailing predictor; older
+    // families include predictors in n_layers. The canonical projection also
+    // checks malformed counts before either indexing or sizing the arena.
+    const int layers = profile.totalLayerCount();
+    std::vector<bool> seen(static_cast<std::size_t>(layers), false);
     std::size_t packet_words = 0;
     for (const auto &tensor : profile.tensors)
     {
         if (inferWeightRole(tensor.name) != WeightRole::MoEExpertDown) continue;
-        if (tensor.layer_index < 0 || tensor.layer_index >= profile.n_layers || seen[tensor.layer_index] ||
+        if (tensor.layer_index < 0 || tensor.layer_index >= layers || seen[tensor.layer_index] ||
             tensor.K == 0 || tensor.K > std::numeric_limits<std::uint32_t>::max() ||
             tensor.elements != multiply(multiply(profile.d_model, tensor.K), profile.expert_count))
             throw std::invalid_argument("MoE projection arena has missing/duplicate or malformed down geometry");
 
         const bool floating = tensor.quant_type == "F16" || tensor.quant_type == "FP16" ||
             tensor.quant_type == "BF16" || tensor.quant_type == "F32" || tensor.quant_type == "FP32";
-        if (!floating && !native_vnni_formats::forQuantType(tensor.quant_type))
+        if (!floating && !native_quantised_formats::forQuantType(tensor.quant_type))
             throw std::invalid_argument("MoE projection arena has an unsupported down format: " + tensor.quant_type);
         const MoEGroupedIntermediateLayout row{
             floating ? MoEGroupedIntermediateEncoding::FP32 : MoEGroupedIntermediateEncoding::BlockQ8FP32Scales,

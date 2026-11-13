@@ -4,7 +4,7 @@
  *        by the AlignedVector tensor utility.
  *
  * MoE CPU expert preparation uses strict NUMA page-placement checks for the
- * large NativeVNNI interleaved weight buffers stored in AlignedVector.  Those
+ * large NativeQuantised interleaved weight buffers stored in AlignedVector.  Those
  * checks operate at page granularity, so large buffers must begin on a page
  * boundary; otherwise the migration range can accidentally include neighboring
  * heap allocations on the first or last page and fail for reasons unrelated to

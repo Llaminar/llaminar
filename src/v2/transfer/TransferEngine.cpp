@@ -7,10 +7,21 @@
  * exact non-null stream and publish an exact event. Device consumers import
  * that event without blocking the host; host consumers wait only for the event
  * that makes their destination bytes observable. Backend copy functions remain
- * low-level submission mechanisms and never decide tensor coherence.
+ * low-level submission mechanisms and never decide tensor coherence. Explicit
+ * cross-process host consumers retain ordinary registered pages rather than a
+ * backend-private host mapping, with no second payload or copy authority.
  */
 
 #include "transfer/TransferEngine.h"
+#include "execution/moe/GPUExpertTransferBackend.h"
+#include "transfer/PreparedDevicePeerCopy.h"
+#include "backends/ComputeBackend.h"
+#include "backends/ExplicitGPUStream.h"
+#include "backends/NativeAuxiliaryStreamOwnership.h"
+#include "backends/NativeContextPreparation.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "memory/HostRegistrationPageRange.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.h"
 
 #include <algorithm>
 #include <array>
@@ -30,9 +41,11 @@
 #include "backends/IBackend.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
+#include "backends/GPUCaptureDependencyRoster.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/local_execution/device/WorkspaceBufferLease.h"
 #include "tensors/TensorClasses.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
@@ -46,6 +59,88 @@
 
 namespace llaminar2
 {
+    void TransferEngine::initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
+        std::span<const std::byte> source, void *stream) const
+    {
+        const auto device=destination.device();
+        if(isGraphCaptureActive()||source.empty()||!source.data()||
+           !destination.contains(0,source.size())||
+           (device.is_gpu()?reinterpret_cast<std::uintptr_t>(stream)<=2:stream!=nullptr))
+            throw std::invalid_argument("Immutable workspace metadata requires bounded original storage and a setup stream outside capture");
+        if(device.is_cpu()) {
+            std::memcpy(destination.data(),source.data(),source.size());
+            return;
+        }
+        auto *backend=resolveBackend(device);
+        if(!backend||backend!=destination.backend())
+            throw std::runtime_error("Immutable workspace metadata lost its original backend owner");
+        const auto ordinal=device.gpu_ordinal();
+        void *event=backend->createEvent(ordinal);
+        if(!event)throw std::runtime_error("Immutable workspace metadata could not create its setup completion event");
+        if(!backend->hostToDeviceOnStream(destination.data(),source.data(),source.size(),ordinal,stream)) {
+            backend->destroyEvent(event,ordinal);
+            throw std::runtime_error("Immutable workspace metadata upload failed");
+        }
+        // Once a copy is accepted, its source cannot retire without proven
+        // completion. A failed event publication is fatal, not a retryable upload.
+        if(!backend->recordEvent(event,ordinal,stream)||!backend->waitForEvent(event,ordinal)) {
+            LOG_ERROR("Immutable workspace metadata could not authenticate completion of its accepted setup copy");
+            std::terminate();
+        }
+        backend->destroyEvent(event,ordinal);
+    }
+
+    void TransferEngine::initializeDeviceMetadata(DeviceTransferBuffer &destination,size_t offset,
+        std::span<const std::byte> source,void *stream) const
+    {
+        const auto device=destination.device();
+        if(isGraphCaptureActive() || !destination.isBound() || source.empty() || !source.data() ||
+           !destination.contains(offset,source.size()) || reinterpret_cast<std::uintptr_t>(stream)<=2)
+            throw std::invalid_argument("Cold device metadata requires its bounded original buffer and setup stream");
+        auto *backend=resolveBackend(device);
+        if(!backend || backend!=destination.backend_)
+            throw std::logic_error("Cold device metadata lost its original backend");
+        const auto ordinal=device.gpu_ordinal();
+        void *event=backend->createEvent(ordinal);
+        if(!event)throw std::runtime_error("Cold device metadata completion creation failed");
+        if(!backend->hostToDeviceOnStream(destination.mutableDeviceData(offset),source.data(),source.size(),ordinal,stream)) {
+            backend->destroyEvent(event,ordinal);
+            throw std::runtime_error("Cold device metadata upload failed");
+        }
+        // Like workspace initialization, accepted copies retain their setup
+        // source until exact-stream completion; failure cannot unwind that source.
+        if(!backend->recordEvent(event,ordinal,stream) || !backend->waitForEvent(event,ordinal)) {
+            LOG_ERROR("Cold device metadata accepted copy lost completion");std::terminate();
+        }
+        backend->destroyEvent(event,ordinal);
+    }
+
+    void TransferEngine::initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
+        std::span<const std::byte> source,void *stream,GPUCaptureDependencyRoster &resources)const
+    {
+        const auto device=destination.device();
+        if(isGraphCaptureActive() || !device.is_gpu() || device!=resources.device_ ||
+           source.empty() || !source.data() || !destination.contains(0,source.size()) ||
+           reinterpret_cast<std::uintptr_t>(stream)<=2)
+            throw std::invalid_argument("Batch immutable metadata requires bounded original GPU storage and exact cold stream");
+        auto* backend=resolveBackend(device);
+        if(!backend || backend!=destination.backend() || backend!=resources.backend_ || !resources.cold_publication_)
+            throw std::logic_error("Batch immutable metadata lost original publication ownership");
+        // Only a completed copy may release this cold publication lease. It is
+        // separate from the graph-construction event roster and never reaches
+        // a retained external event node or a hot-path synchronization.
+        auto cold_operation=resources.worker_->acquireProjectionSubmission(
+            stream,GPUProjectionSubmissionKind::Eager,false);
+        std::unique_lock publication(resources.cold_publication_mutex_);
+        const auto event=resources.cold_publication_;const auto ordinal=device.gpu_ordinal();
+        if(!backend->hostToDeviceOnStream(destination.data(),source.data(),source.size(),ordinal,stream))
+            throw std::runtime_error("Batch immutable metadata upload failed");
+        if(!backend->recordEvent(event,ordinal,stream) || !backend->waitForEvent(event,ordinal)) {
+            LOG_ERROR("Batch immutable metadata could not authenticate completion of its accepted copy");
+            std::terminate();
+        }
+    }
+
     namespace
     {
         /**
@@ -174,6 +269,8 @@ namespace llaminar2
             return "retired_execution_topology";
         case DeviceMemoryReclamationIntent::ExclusiveModelRetirement:
             return "exclusive_model_retirement";
+        case DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement:
+            return "exclusive_native_context_retirement";
         }
         return "unknown";
     }
@@ -187,7 +284,13 @@ namespace llaminar2
             throw std::overflow_error(
                 "Model device-memory retention BOM overflows size_t");
         }
-        return prepared_weight_bytes + reusable_workspace_bytes;
+        const auto subtotal = prepared_weight_bytes + reusable_workspace_bytes;
+        if (immutable_table_bytes > std::numeric_limits<size_t>::max() - subtotal)
+            throw std::overflow_error("Model immutable-table retention BOM overflows size_t");
+        const auto native=subtotal+immutable_table_bytes;
+        if(immutable_lookup_staging_bytes>std::numeric_limits<size_t>::max()-native)
+            throw std::overflow_error("Model adaptive staging retention BOM overflows size_t");
+        return native+immutable_lookup_staging_bytes;
     }
 
     bool ModelDeviceMemoryRetention::valid() const noexcept
@@ -200,7 +303,11 @@ namespace llaminar2
         {
             return false;
         }
-        return prepared_weight_bytes + reusable_workspace_bytes > 0u;
+        const auto subtotal = prepared_weight_bytes + reusable_workspace_bytes;
+        if(immutable_table_bytes>std::numeric_limits<size_t>::max()-subtotal)return false;
+        const auto native=subtotal+immutable_table_bytes;
+        return immutable_lookup_staging_bytes<=std::numeric_limits<size_t>::max()-native &&
+            native+immutable_lookup_staging_bytes>0u;
     }
 
     DeviceMemoryReclamationRequest
@@ -224,6 +331,27 @@ namespace llaminar2
                 "Exclusive model retirement requires one exact GPU and a positive, representable allocation BOM");
         }
 
+        return beginExclusiveRetirement(retention,
+            DeviceMemoryReclamationIntent::ExclusiveModelRetirement);
+    }
+
+    ExclusiveModelRetirementTicket
+    TransferEngine::beginExclusiveNativeContextRetirement(DeviceId device) const
+    {
+        if (!device.is_gpu())
+            throw std::invalid_argument("Native context retirement requires one exact GPU");
+        return beginExclusiveRetirement({.device=device},
+            DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement);
+    }
+
+    ExclusiveModelRetirementTicket
+    TransferEngine::beginExclusiveRetirement(
+        const ModelDeviceMemoryRetention &retention,
+        DeviceMemoryReclamationIntent intent) const
+    {
+        if (isGraphCaptureActive())
+            throw std::logic_error("Exclusive retirement cannot enter graph capture");
+
         IBackend *const backend = resolveBackend(retention.device);
         if (!backend)
         {
@@ -244,6 +372,13 @@ namespace llaminar2
                      : accounting.diagnostic));
         }
         const size_t expected = retention.totalBytes();
+        if (intent == DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement &&
+            (accounting.active_allocations != 0u || accounting.active_bytes != 0u))
+        {
+            throw std::runtime_error(
+                "Native context retirement requires an empty canonical tensor allocation ledger for " +
+                retention.device.toString());
+        }
         if (accounting.active_bytes < expected)
         {
             std::ostringstream error;
@@ -264,17 +399,20 @@ namespace llaminar2
             "[DeviceMemoryReclamation] begin device="
             << retention.device.toString()
             << " intent="
-            << to_string(DeviceMemoryReclamationIntent::ExclusiveModelRetirement)
+            << to_string(intent)
             << " driver_free_before_owner_release=" << baseline
             << " prepared_weight_bytes=" << retention.prepared_weight_bytes
             << " reusable_workspace_bytes="
             << retention.reusable_workspace_bytes
+            << " immutable_table_bytes=" << retention.immutable_table_bytes
+            << " immutable_lookup_staging_bytes=" << retention.immutable_lookup_staging_bytes
             << " expected_retired_bytes=" << expected
             << " canonical_active_allocations="
             << accounting.active_allocations
             << " canonical_active_bytes=" << accounting.active_bytes);
         return ExclusiveModelRetirementTicket(
             retention,
+            intent,
             baseline,
             accounting.active_allocations,
             accounting.active_bytes);
@@ -467,8 +605,7 @@ namespace llaminar2
              * a fresh generation only to trim it again. */
             DeviceMemoryReclamationReceipt receipt{
                 .device = device,
-                .intent =
-                    DeviceMemoryReclamationIntent::ExclusiveModelRetirement,
+                .intent = ticket.intent_,
                 .expected_retired_bytes = expected_retired_bytes,
                 .driver_free_bytes_before_owner_release =
                     ticket.driver_free_bytes_before_owner_release_,
@@ -505,6 +642,11 @@ namespace llaminar2
                     << receipt.canonical_allocation_bytes_before_runtime_reset;
                 throw std::runtime_error(error.str());
             }
+            // The exact original native handles have retired, and the existing
+            // physical reset receipt above has passed every canonical check.
+            // Discharge only original moved PMA tokens; never resample capacity
+            // or manufacture another allocation ledger at this boundary.
+            context_retirements[index].retireNativeObligationsAfterValidatedReset();
             receipt.retired_context_generation =
                 context_receipt.retired_generation;
             receipt.runtime_reset_invoked = runtime_receipt.reset_invoked;
@@ -842,6 +984,71 @@ namespace llaminar2
         }
     }
 
+    std::shared_ptr<const CapturedDeviceStorageLease>
+    TransferEngine::retainCapturedDeviceStorage(
+        const TensorBase& tensor, DeviceId device, size_t bytes) const
+    {
+        if (isGraphCaptureActive())
+            throw std::logic_error("Captured storage ownership must be acquired before capture");
+        const auto* owner = tensor.transferStorageOwner();
+        const void* pointer = tensor.gpu_data_ptr();
+        if (!owner || !device.is_gpu() || tensor.current_device() != std::optional{device} ||
+            !pointer || !bytes || bytes > tensor.size_bytes())
+            throw std::invalid_argument("Captured tensor has no exact materialized device span");
+        auto lease = std::shared_ptr<CapturedDeviceStorageLease>(new CapturedDeviceStorageLease());
+        lease->storage_owner_ = owner;
+        lease->pointer_ = pointer; lease->bytes_ = bytes; lease->device_ = device;
+        if (owner->isMapped()) {
+            lease->mapped_ = owner->mappedHostTransferRegion();
+            if (!lease->mapped_ || !lease->mapped_->hasDevice(device))
+                throw std::logic_error("Captured mapped tensor lost its original region owner");
+            const auto base = reinterpret_cast<std::uintptr_t>(lease->mapped_->deviceAlias(device));
+            const auto span = reinterpret_cast<std::uintptr_t>(pointer);
+            if (span < base || span-base > lease->mapped_->sizeBytes() ||
+                bytes > lease->mapped_->sizeBytes()-(span-base))
+                throw std::invalid_argument("Captured mapped tensor exceeds its original region");
+        } else {
+            auto* backend = resolveBackend(device);
+            if (!backend) throw std::logic_error("Captured tensor backend is unavailable");
+            lease->native_.emplace(backend->retainNativeAllocation(pointer, bytes, device.gpu_ordinal()));
+            lease->native_backend_ = backend;
+        }
+        return lease;
+    }
+
+    void TransferEngine::requireCapturedDeviceStorage(
+        const CapturedDeviceStorageLease& lease, const TensorBase& tensor,
+        DeviceId device, size_t bytes) const
+    {
+        const auto* owner = tensor.transferStorageOwner();
+        if (!owner || owner != lease.storage_owner_ ||
+            device != lease.device_ || bytes != lease.bytes_ ||
+            tensor.current_device() != std::optional{device} ||
+            tensor.gpu_data_ptr() != lease.pointer_ || bytes > tensor.size_bytes())
+            throw std::logic_error("Captured tensor storage binding changed after preparation");
+        if (lease.mapped_) {
+            if (!owner->isMapped() || owner->mappedHostTransferRegion() != lease.mapped_ ||
+                !lease.mapped_->hasDevice(device))
+                throw std::logic_error("Captured mapped storage owner was replaced");
+        } else {
+            auto* backend = resolveBackend(device);
+            /*
+             * Cold preparation retained the allocator's immutable allocation
+             * token for this exact span/device. Native free/reset must reject
+             * live borrowers under the allocator lifecycle lock, before any
+             * physical release; therefore these bytes cannot be freed and
+             * reused while this lease lives. Reacquiring the same token here
+             * would only repeat a global allocation-registry scan on every
+             * graph signature check. The frozen storage owner above detects
+             * tensor moves/rebinding even when their byte address is unchanged.
+             * This borrow adds neither allocation ownership nor a PMA ledger.
+             */
+            if (!backend || backend != lease.native_backend_ ||
+                owner->isMapped() || !lease.native_)
+                throw std::logic_error("Captured native allocation authority was replaced");
+        }
+    }
+
     void DeviceTransferBuffer::bind(IBackend *backend)
     {
         if (!backend)
@@ -913,6 +1120,11 @@ namespace llaminar2
                device_storage_->contains(offset_, bytes_);
     }
 
+    HostTransferAccess PersistentTransferStagingSlice::hostAccess() const noexcept
+    {
+        return mapped_ ? mapped_->hostAccess() : HostTransferAccess::ProcessLocal;
+    }
+
     void *PersistentTransferStagingSlice::mutablePinnedData() const
     {
         if (!valid())
@@ -935,19 +1147,43 @@ namespace llaminar2
 
     PersistentTransferExecutionLane::PersistentTransferExecutionLane(
         std::shared_ptr<void> pool_lifetime,
+        std::shared_ptr<const PreparedGPUContextUsePermit> original,
         void *stream,
         DeviceId device,
         size_t lane_index) noexcept
-        : pool_lifetime_(std::move(pool_lifetime)),
-          stream_(stream),
+        : authority_(Authority::OriginalPrepared), pool_lifetime_(std::move(pool_lifetime)),
+          original_(std::move(original)),stream_(stream),
           device_(device),
           lane_index_(lane_index)
     {
     }
 
+    PersistentTransferExecutionLane::PersistentTransferExecutionLane(
+        ComponentFixtureTag, std::shared_ptr<void> pool_lifetime, void *stream,
+        DeviceId device, size_t lane_index) noexcept
+        : authority_(Authority::ComponentFixture), pool_lifetime_(std::move(pool_lifetime)),
+          stream_(stream), device_(device), lane_index_(lane_index)
+    {
+    }
+
     bool PersistentTransferExecutionLane::valid() const noexcept
     {
-        return pool_lifetime_ && stream_ && device_.is_gpu();
+        if (!pool_lifetime_ || reinterpret_cast<std::uintptr_t>(stream_) <= 2 || !device_.is_gpu())
+            return false;
+        switch (authority_) {
+        case Authority::OriginalPrepared: return original_ && original_->device()==device_;
+        case Authority::ComponentFixture: return !original_;
+        case Authority::None: return false;
+        }
+        return false;
+    }
+
+    const PreparedGPUContextUsePermit &PersistentTransferExecutionLane::originalContext() const
+    {
+        if(authority_ != Authority::OriginalPrepared || !valid())
+            throw std::logic_error("Persistent transfer execution lane has no original prepared authority (component streams are infrastructure only)");
+        original_->requireWorker(original_->worker());
+        return *original_;
     }
 
     void *PersistentTransferExecutionLane::stream() const
@@ -976,13 +1212,20 @@ namespace llaminar2
         size_t bytes,
         std::span<const DeviceId> devices,
         std::shared_ptr<void> lifetime,
-        BackingKind backing_kind)
+        BackingKind backing_kind,
+        HostTransferAccess host_access)
         : allocation_(allocation),
           bytes_(bytes),
           devices_(devices.begin(), devices.end()),
           lifetime_(std::move(lifetime)),
-          backing_kind_(backing_kind)
+          backing_kind_(backing_kind),
+          host_access_(host_access)
     {
+        if ((host_access != HostTransferAccess::ProcessLocal &&
+             host_access != HostTransferAccess::CrossProcessReadable) ||
+            (backing_kind == BackingKind::BackendAllocation &&
+             host_access != HostTransferAccess::ProcessLocal))
+            throw std::invalid_argument("Mapped backing has an incompatible native host-access contract");
         if (!allocation_ || bytes_ == 0u || devices_.empty() ||
             !lifetime_)
         {
@@ -1115,6 +1358,48 @@ namespace llaminar2
         return found == aliases_.end() ? nullptr : found->backend;
     }
 
+    size_t MappedHostTransferArena::nextBackingBytes(size_t bytes, size_t alignment, size_t committed)
+    {
+        if (!bytes || !alignment) throw std::invalid_argument("Mapped arena requires positive allocation geometry");
+        if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1u))
+            throw std::overflow_error("Mapped arena backing capacity overflow");
+        return TransferEngine::mappedHostRegionAllocationBytes(std::max(bytes + alignment - 1u, committed));
+    }
+
+    size_t MappedHostTransferArena::backingBytes(std::span<const AllocationRequest> requests)
+    {
+        if (requests.empty()) throw std::invalid_argument("Mapped arena declaration cannot be empty");
+        struct Slab { size_t bytes, used; };
+        std::vector<Slab> slabs;
+        size_t committed = 0;
+        const auto page = TransferEngine::mappedHostRegionAllocationBytes(1);
+        for (const auto request : requests) {
+            if (!request.bytes || !request.alignment || page % request.alignment)
+                throw std::invalid_argument("Admitted mapped arena alignment must divide its original page");
+            bool found = false;
+            for (auto slab = slabs.rbegin(); slab != slabs.rend(); ++slab) {
+                const auto remainder = slab->used % request.alignment;
+                const auto padding = remainder ? request.alignment - remainder : 0;
+                if (padding <= slab->bytes - slab->used && request.bytes <= slab->bytes - slab->used - padding) {
+                    slab->used += padding + request.bytes; found = true; break;
+                }
+            }
+            if (found) continue;
+            const auto bytes = nextBackingBytes(request.bytes, request.alignment, committed);
+            if (committed > std::numeric_limits<size_t>::max() - bytes)
+                throw std::overflow_error("Mapped arena total backing overflow");
+            committed += bytes; slabs.push_back({bytes, request.bytes});
+        }
+        return committed;
+    }
+
+    void MappedHostTransferArena::requireDeclarationConsumed() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!memory_ || slice_count_ != declaration_.size())
+            throw std::logic_error("Admitted mapped arena declaration was not completely materialized");
+    }
+
     MappedHostTransferArena::MappedHostTransferArena(
         IBackend *(*backend_resolver)(DeviceId),
         std::span<const DeviceId> devices)
@@ -1178,6 +1463,9 @@ namespace llaminar2
 
         std::lock_guard<std::mutex> lock(mutex_);
         TransferEngine transfer(backend_resolver_);
+        if (memory_ && (slice_count_ >= declaration_.size() ||
+            declaration_[slice_count_].bytes != bytes || declaration_[slice_count_].alignment != alignment))
+            throw std::logic_error("Mapped arena allocation differs from its original admitted sequence");
 
         const auto allocate_from =
             [&](BackingRegion &backing)
@@ -1240,16 +1528,19 @@ namespace llaminar2
                 return slice;
         }
 
-        if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1u))
-        {
-            throw std::overflow_error(
-                "MappedHostTransferArena backing capacity overflow");
+        const auto requested_backing_bytes = nextBackingBytes(bytes, alignment, committed_bytes_);
+        std::shared_ptr<PhysicalMemoryAllocationLease> claim;
+        if (memory_) claim = std::make_shared<PhysicalMemoryAllocationLease>(memory_->claimNewAllocation(
+            DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging, requested_backing_bytes));
+        auto region = transfer.allocateMappedHostRegion(requested_backing_bytes, devices_);
+        if (region) region->allocation_claim_ = std::move(claim);
+        if (memory_ && region && region->isBound()) {
+            const auto page=TransferEngine::mappedHostRegionAllocationBytes(1);
+            if(reinterpret_cast<std::uintptr_t>(region->mutableHostData())%page)
+                throw std::runtime_error("Admitted mapped arena backing violates its declared page alignment");
+            for(const auto device:devices_) if(reinterpret_cast<std::uintptr_t>(region->deviceAlias(device))%page)
+                throw std::runtime_error("Admitted mapped arena alias violates its declared page alignment");
         }
-        const size_t minimum_backing_bytes = bytes + alignment - 1u;
-        const size_t requested_backing_bytes =
-            std::max(minimum_backing_bytes, committed_bytes_);
-        auto region = transfer.allocateMappedHostRegion(
-            requested_backing_bytes, devices_);
         if (!region || !region->isBound())
         {
             throw std::runtime_error(
@@ -1378,7 +1669,8 @@ namespace llaminar2
     TransferEngine::allocatePersistentTransferStagingSlices(
         size_t bytes_per_slice,
         size_t slice_count,
-        DeviceId device) const
+        DeviceId device,
+        HostTransferAccess host_access) const
     {
         if (bytes_per_slice == 0u || slice_count == 0u || !device.is_gpu())
         {
@@ -1393,7 +1685,7 @@ namespace llaminar2
         }
         const size_t total_bytes = bytes_per_slice * slice_count;
         const std::array devices{device};
-        auto mapped = allocateMappedHostRegion(total_bytes, devices);
+        auto mapped = allocateMappedHostRegion(total_bytes, devices, host_access);
         auto device_storage = allocateDeviceTransferBuffer(total_bytes, device);
 
         std::vector<PersistentTransferStagingSlice> slices;
@@ -1418,11 +1710,27 @@ namespace llaminar2
         return sliceMappedHostRegion(staging.mapped_, staging.offset_, staging.bytes_);
     }
 
+    PhysicalMemoryPlan TransferEngine::persistentTransferExecutionLanesBOM(
+        size_t lane_count,PhysicalMemoryResource host,PhysicalMemoryResource gpu)
+    {
+        if(!lane_count)throw std::invalid_argument("Persistent transfer stream quote requires positive lane count");
+        const auto unit=NativeAuxiliaryStreamOwnership::bom(host,gpu);
+        PhysicalMemoryPlanBuilder result;
+        for(const auto& resource:unit.resources()) {
+            const auto owner=PhysicalMemoryOwner::NativeAuxiliaryStream;
+            const auto bytes=resource.bytes(owner);
+            if(bytes && lane_count>std::numeric_limits<size_t>::max()/bytes)
+                throw std::overflow_error("Persistent transfer stream population quote overflows");
+            result.add(resource.resource(),owner,bytes*lane_count);
+        }
+        return result.build();
+    }
+
     std::vector<PersistentTransferExecutionLane>
     TransferEngine::allocatePersistentTransferExecutionLanes(
         size_t lane_count,
         DeviceId device,
-        const std::string &pool_name) const
+        const std::string &pool_name,const PreparedGPUContextUsePermit &original) const
     {
         if (isGraphCaptureActive())
             throw std::logic_error("Persistent transfer lanes must be prepared before graph capture");
@@ -1432,52 +1740,33 @@ namespace llaminar2
                 "Persistent transfer execution lanes require positive geometry, an exact GPU, and a stable pool name");
         }
 
-        auto streams = std::make_shared<std::vector<void *>>(
-            lane_count, nullptr);
-        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        if(original.device()!=device)throw std::invalid_argument("Persistent transfer lanes changed original device");
+        original.requireWorker(original.worker());
+        if(!original.memory() || original.memory()->phase()!=PhysicalMemoryAuthorityPhase::Admitted)
+            throw std::logic_error("Persistent transfer lanes require original final admission before native function preparation");
+        struct Pool final {
+            PreparedGPUContextUsePermit original;
+            std::vector<void*> streams;
+            Pool(const PreparedGPUContextUsePermit& permit,size_t count):original(permit),streams(count,nullptr){}
+        };
+        auto pool=std::make_shared<Pool>(original,lane_count);
         size_t created_count = 0u;
-        context.submitAndWait(
-            [&]
-            {
-                // Resolve native function handles while building the pool.
-                // Every lease returned below proves this setup edge completed;
-                // no first-use module load can synchronize a live inference graph.
-                if (isGraphCaptureActive())
-                    throw std::logic_error("Transfer function preparation cannot enter a captured worker");
-                auto *backend = resolveBackend(device);
-                if (!backend || !backend->prepareMappedHostCopyKernels(device.gpu_ordinal()))
-                    throw std::runtime_error(
-                        "Persistent transfer pool could not prepare mapped-copy kernels on " +
-                        device.toString());
-                for (size_t index = 0u; index < lane_count; ++index)
-                {
-                    bool created = false;
-                    (*streams)[index] = context.getOrCreateAuxiliaryStream(
-                        "persistent_transfer_execution:" + pool_name + ":" +
-                            device.toString() + ":lane:" +
-                            std::to_string(index),
-                        GPUAuxiliaryStreamSchedulingClass::
-                            BackgroundMaintenance,
-                        &created);
-                    if (!(*streams)[index])
-                    {
-                        throw std::runtime_error(
-                            "Persistent transfer execution pool could not materialize lane " +
-                            std::to_string(index) + " on " +
-                            device.toString());
-                    }
-                    created_count += created ? 1u : 0u;
-                }
-            });
+        pool->streams=preparePersistentTransferStreams(lane_count,device,
+            "persistent_transfer_execution:"+pool_name,*original.worker(),
+            [&](const std::string &name,bool *created) {
+                return original.worker()->getOrCreateAdmittedAuxiliaryStream(name,
+                    GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance,original,created);
+            },created_count);
 
         std::vector<PersistentTransferExecutionLane> lanes;
         lanes.reserve(lane_count);
-        const std::shared_ptr<void> pool_lifetime = streams;
+        const std::shared_ptr<void> pool_lifetime = pool;
         for (size_t index = 0u; index < lane_count; ++index)
         {
             lanes.push_back(PersistentTransferExecutionLane(
                 pool_lifetime,
-                (*streams)[index],
+                std::shared_ptr<const PreparedGPUContextUsePermit>(pool,&pool->original),
+                pool->streams[index],
                 device,
                 index));
         }
@@ -1490,7 +1779,73 @@ namespace llaminar2
             {{"pool", pool_name},
              {"lane_count", std::to_string(lane_count)},
              {"new_stream_count", std::to_string(created_count)},
-             {"stream_class", "background_maintenance"}});
+             {"stream_class", "background_maintenance"},
+             {"authority", "original_prepared"}});
+        return lanes;
+    }
+
+
+
+
+    std::vector<void*> TransferEngine::preparePersistentTransferStreams(
+        size_t lane_count,DeviceId device,const std::string &pool_name,IWorkerGPUContext &context,
+        const std::function<void*(const std::string&,bool*)> &creator,size_t &created_count) const
+    {
+        if(isGraphCaptureActive())
+            throw std::logic_error("Persistent transfer lanes must be prepared before graph capture");
+        if(!lane_count || !device.is_gpu() || pool_name.empty() || !creator)
+            throw std::invalid_argument("Persistent transfer execution lanes require positive geometry, an exact GPU, and a stable pool name");
+        std::vector<void*> streams(lane_count,nullptr);
+        created_count=0;
+        context.submitAndWait([&] {
+            if(isGraphCaptureActive())
+                throw std::logic_error("Transfer function preparation cannot enter a captured worker");
+            auto *backend=resolveBackend(device);
+            if(!backend || !backend->prepareMappedHostCopyKernels(device.gpu_ordinal()))
+                throw std::runtime_error("Persistent transfer pool could not prepare mapped-copy kernels on "+device.toString());
+            for(size_t index=0;index<lane_count;++index) {
+                bool created=false;
+                streams[index]=creator(pool_name+":"+device.toString()+":lane:"+std::to_string(index),&created);
+                if(reinterpret_cast<std::uintptr_t>(streams[index])<=2)
+                    throw std::runtime_error("Persistent transfer execution pool requires a non-default exact stream");
+                created_count+=created?1u:0u;
+            }
+        });
+        return streams;
+    }
+
+    std::vector<PersistentTransferExecutionLane> TransferEngine::allocateComponentTransferExecutionLanes(
+        size_t lane_count,DeviceId device,const std::string &pool_name) const
+    {
+        // This closed test boundary owns real native infrastructure only. It
+        // deliberately cannot create an original source, permit, or PMA claim.
+        if(isGraphCaptureActive())
+            throw std::logic_error("Component transfer lanes must be prepared before graph capture");
+        if(!lane_count || !device.is_gpu() || pool_name.empty())
+            throw std::invalid_argument("Component transfer lanes require positive geometry, an actual GPU, and a stable name");
+        struct Pool final {
+            std::shared_ptr<IWorkerGPUContext> worker;
+            std::vector<void*> streams;
+        };
+        auto pool=std::make_shared<Pool>();
+        pool->worker=GPUDeviceContextPool::instance().retainContext(device);
+        if(!pool->worker)throw std::logic_error("Component transfer pool lost its actual worker");
+        size_t created_count=0;
+        pool->streams=preparePersistentTransferStreams(lane_count,device,
+            "component_fixture:persistent_transfer_execution:"+pool_name,*pool->worker,
+            [&](const std::string &name,bool *created) {
+                return pool->worker->getOrCreateAuxiliaryStream(name,
+                    GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance,created);
+            },created_count);
+        std::vector<PersistentTransferExecutionLane> lanes;
+        lanes.reserve(lane_count);
+        for(size_t i=0;i<lane_count;++i)
+            lanes.push_back(PersistentTransferExecutionLane(
+                PersistentTransferExecutionLane::ComponentFixtureTag{},pool,pool->streams[i],device,i));
+        PerfStatsCollector::addCounter("transfer","persistent_execution_stream_pools_materialized",1.0,
+            "component_setup",device.toString(),{{"pool",pool_name},{"lane_count",std::to_string(lane_count)},
+            {"new_stream_count",std::to_string(created_count)},{"stream_class","background_maintenance"},
+            {"authority","component_fixture"}});
         return lanes;
     }
 
@@ -1527,13 +1882,23 @@ namespace llaminar2
         std::span<const DeviceId> devices,
         std::shared_ptr<void> lifetime) const
     {
+        return registerExternalMappedHostRegionImpl(allocation, bytes, devices,
+            std::move(lifetime), HostTransferAccess::ProcessLocal);
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    TransferEngine::registerExternalMappedHostRegionImpl(
+        void *allocation, size_t bytes, std::span<const DeviceId> devices,
+        std::shared_ptr<void> lifetime, HostTransferAccess host_access) const
+    {
         auto region = std::shared_ptr<MappedHostTransferRegion>(
             new MappedHostTransferRegion(
                 allocation,
                 bytes,
                 devices,
                 std::move(lifetime),
-                MappedHostTransferRegion::BackingKind::ExternalRegistration));
+                MappedHostTransferRegion::BackingKind::ExternalRegistration,
+                host_access));
 
         for (const DeviceId device : region->devices_)
         {
@@ -1698,7 +2063,7 @@ namespace llaminar2
                 bytes,
                 parent->devices_,
                 std::move(parent_lifetime),
-                MappedHostTransferRegion::BackingKind::ParentSlice));
+                MappedHostTransferRegion::BackingKind::ParentSlice, parent->hostAccess()));
         slice->aliases_.reserve(parent->aliases_.size());
         for (const auto &alias : parent->aliases_)
         {
@@ -1733,6 +2098,56 @@ namespace llaminar2
         return slice;
     }
 
+    CPUMappedPublicationRoot::CPUMappedPublicationRoot(
+        size_t payload_bytes, DeviceId host_allocator, DeviceId consumer)
+        : payload_bytes_(payload_bytes),
+          physical_bytes_(TransferEngine::mappedHostRegionAllocationBytes(payload_bytes)),
+          host_allocator_(host_allocator), consumer_(consumer)
+    {
+        if (!host_allocator_.is_valid() || !host_allocator_.is_cpu() ||
+            !consumer_.is_valid() || !consumer_.is_gpu())
+            throw std::invalid_argument("CPU mapped publication requires exact CPU owner and GPU consumer");
+    }
+
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::allocateMappedHostRegion(
+        const CPUMappedPublicationRoot &root,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
+        return allocateAdmittedMappedPublicationRoot(root.payloadBytes(), root.physicalBytes(),
+            root.hostAllocator(), root.consumer(), root.owner(), authority);
+    }
+
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::allocateMappedHostRegion(
+        const qwen4exp::PooledImmutableLocalHotReadyRoot &root,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
+        if (!authority || root.authority_.get() != authority.get() || root.region_ ||
+            root.consumer_.world_rank != authority->worldRank())
+            throw std::logic_error("Local ready mapping requires its unmaterialized original owner and authority");
+        return allocateAdmittedMappedPublicationRoot(sizeof(std::uint64_t),
+            mappedHostRegionAllocationBytes(sizeof(std::uint64_t)), DeviceId::cpu(),
+            root.consumer_.device, PhysicalMemoryOwner::ImmutableLookupStaging, authority);
+    }
+
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::allocateAdmittedMappedPublicationRoot(
+        size_t payload_bytes, size_t physical_bytes, DeviceId host_allocator,
+        DeviceId consumer, PhysicalMemoryOwner owner,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
+        if (!authority)
+            throw std::logic_error("CPU mapped publication requires physical-memory admission");
+        // Admission precedes backend discovery/native allocation. On failure,
+        // native cleanup completes before this exact local claim retires.
+        auto claim = std::make_shared<PhysicalMemoryAllocationLease>(
+            authority->claimNewAllocation(host_allocator, owner, physical_bytes));
+        const std::array devices{consumer};
+        auto region = allocateMappedHostRegion(payload_bytes, devices);
+        if (region->sizeBytes() != physical_bytes)
+            throw std::logic_error("CPU mapped publication allocation disagrees with its declaration");
+        region->allocation_claim_ = std::move(claim);
+        return region;
+    }
+
     size_t TransferEngine::mappedHostRegionAllocationBytes(size_t bytes)
     {
         if (!bytes) throw std::invalid_argument("Mapped host backing requires a positive payload extent");
@@ -1754,8 +2169,12 @@ namespace llaminar2
     std::shared_ptr<MappedHostTransferRegion>
     TransferEngine::allocateMappedHostRegion(
         size_t bytes,
-        std::span<const DeviceId> devices) const
+        std::span<const DeviceId> devices,
+        HostTransferAccess host_access) const
     {
+        if (host_access != HostTransferAccess::ProcessLocal &&
+            host_access != HostTransferAccess::CrossProcessReadable)
+            throw std::invalid_argument("Mapped allocation requires a known native host-access contract");
         if (devices.empty() || std::any_of(devices.begin(), devices.end(), [](DeviceId device) { return !device.is_gpu(); }))
             throw std::invalid_argument("TransferEngine::allocateMappedHostRegion requires local GPU endpoints");
         const size_t mapping_bytes = mappedHostRegionAllocationBytes(bytes);
@@ -1773,18 +2192,19 @@ namespace llaminar2
                            resolveBackend(device) == allocation_backend;
                 });
 
-        if (devices.size() > 1u && same_backend_family &&
+        if (host_access == HostTransferAccess::ProcessLocal &&
+            devices.size() > 1u && same_backend_family &&
             allocation_backend->supportsPortableMappedAllocation())
         {
             /*
              * A node-local TP/ExpertOverlay route bank is read and written by
-             * every GPU in one backend family. Anonymous mmap followed by
-             * hipHostRegisterPortable/cudaHostRegisterPortable forces the
-             * driver to retrofit every already-touched page into each GPU
-             * page table; on Vega20 that can overflow the fixed IH2 ring while
-             * the retained graph is already live. Native portable ownership
-             * establishes the aliases as one setup transaction and leaves the
-             * captured host address immutable.
+             * every GPU in one backend family. Native portable ownership binds
+             * the allocation and its complete alias set without retrofitting
+             * a separately owned anonymous range through host registration.
+             * The captured host address and native release authority remain
+             * immutable. This ownership contract does not eliminate IOMMU or
+             * device-TLB maintenance, which may reach other devices sharing
+             * the same translation domain; driver behavior needs its own proof.
              */
             void *allocation_alias = nullptr;
             void *const allocation = allocation_backend->allocatePortableMapped(
@@ -1880,7 +2300,7 @@ namespace llaminar2
             return region;
         }
 
-        if (devices.size() == 1u)
+        if (host_access == HostTransferAccess::ProcessLocal && devices.size() == 1u)
         {
             const DeviceId device = devices.front();
             IBackend *const backend = resolveBackend(device);
@@ -1892,15 +2312,13 @@ namespace llaminar2
             }
 
             /*
-             * A native mapped allocation is not merely a convenience wrapper.
-             * On Vega20, registering an already-faulted anonymous range emits
-             * an ATS invalidation interrupt for roughly every host page. Four
-             * participants materializing retained graph tickets concurrently
-             * can therefore overrun the fixed 4 KiB IH2 retry ring. KFD-owned
-             * hipHostMallocMapped pages establish the same zero-copy alias
-             * without that interrupt storm; cudaHostAllocMapped gives CUDA the
-             * symmetric ownership contract. The backend call is setup-only and
-             * serialized by its runtime-lifecycle authority.
+             * Native mapped storage keeps allocation, zero-copy alias and
+             * release under one backend authority instead of registering a
+             * separately owned anonymous range. ROCm startup selects KFD/GTT
+             * backing; CUDA supplies the symmetric native ownership contract.
+             * Native ownership does not prevent IOMMU/device-TLB invalidations
+             * or establish IH2 overflow safety. The backend call is setup-only
+             * and serialized by its runtime-lifecycle authority.
              */
             void *device_alias = nullptr;
             void *const allocation = backend->allocateMapped(
@@ -2007,17 +2425,24 @@ namespace llaminar2
                 if (address && address != MAP_FAILED)
                     (void)::munmap(address, mapping_bytes);
             });
+        // MPI/process-vm must receive ordinary host pages, not a GPU driver's
+        // VM_IO/GTT mapping. Register exactly this allocation; no extra payload
+        // buffer/copy or runtime retry exists. Exclude huge pages before first
+        // touch with the same native registration policy used by the backend.
+        if (host_access == HostTransferAccess::CrossProcessReadable)
+            HostRegistrationPageRange::prepare(mapping, mapping_bytes);
 #if defined(MADV_HUGEPAGE)
-        (void)::madvise(mapping, mapping_bytes, MADV_HUGEPAGE);
+        else (void)::madvise(mapping, mapping_bytes, MADV_HUGEPAGE);
 #endif
         /* Current-thread first touch is the only reliable placement authority
          * on the production NUMA host; callers establish setup affinity first. */
         std::memset(mapping, 0, mapping_bytes);
-        return registerExternalMappedHostRegion(
+        return registerExternalMappedHostRegionImpl(
             mapping,
             mapping_bytes,
             devices,
-            std::move(lifetime));
+            std::move(lifetime),
+            host_access);
     }
 
     std::vector<std::shared_ptr<MappedHostTransferRegion>>
@@ -2081,6 +2506,22 @@ namespace llaminar2
     {
         return std::shared_ptr<MappedHostTransferArena>(
             new MappedHostTransferArena(resolve_, devices));
+    }
+
+    std::shared_ptr<MappedHostTransferArena> TransferEngine::createMappedHostArena(
+        std::span<const DeviceId> devices, std::shared_ptr<PhysicalMemoryAuthority> authority,
+        std::span<const MappedHostTransferArena::AllocationRequest> requests) const
+    {
+        (void)MappedHostTransferArena::backingBytes(requests);
+        if (!authority) throw std::invalid_argument("Admitted mapped arena requires its original PMA");
+        if (authority->phase() != PhysicalMemoryAuthorityPhase::Admitted || !authority->contains(DeviceId::cpu()))
+            throw std::logic_error("Mapped arena requires its original admitted host allocator");
+        for (const auto device : devices) if (!authority->contains(device))
+            throw std::logic_error("Mapped arena alias is absent from its original admission");
+        auto arena = createMappedHostArena(devices);
+        arena->memory_ = std::move(authority);
+        arena->declaration_.assign(requests.begin(), requests.end());
+        return arena;
     }
 
     void *TransferEngine::resolveMappedTimelineKernelSignal64(
@@ -2417,32 +2858,37 @@ namespace llaminar2
     }
 
     DeviceTransferInputFork TransferEngine::recordDeviceInputFork(
-        ITensor *source,
-        DeviceId device,
-        void *producer_stream,
-        void *event) const
+        ITensor *source, DeviceId device, void *producer_stream, void *event) const
     {
-        if (!source || !device.is_gpu() || !producer_stream || !event)
-        {
-            throw std::invalid_argument(
-                "TransferEngine::recordDeviceInputFork requires a tensor, GPU, exact producer stream, and retained event");
-        }
+        if (!source)
+            throw std::invalid_argument("TransferEngine::recordDeviceInputFork requires a source");
+        return recordDeviceInputFork(DeviceTransferForkSources::single(*source), device, producer_stream, event);
+    }
 
+    DeviceTransferInputFork TransferEngine::recordDeviceInputFork(
+        const DeviceTransferForkSources &sources, DeviceId device, void *producer_stream, void *event) const
+    {
+        if (!device.is_gpu() || !producer_stream || !event)
+            throw std::invalid_argument("TransferEngine::recordDeviceInputFork requires GPU, exact producer stream, and retained event");
         TensorBase *const source_owner = requireTransferStorageOwner(
-            source,
-            "TransferEngine::recordDeviceInputFork");
-        /* Validate against the canonical graph stream before branching. The
-         * dependency ledger must never be asked to reinterpret an auxiliary
-         * stream as the tensor's producer. */
+            &sources.packet(), "TransferEngine::recordDeviceInputFork");
+        TensorBase *const companion_owner = sources.companion()
+            ? requireTransferStorageOwner(sources.companion(), "TransferEngine::recordDeviceInputFork companion") : nullptr;
+        TensorBase *const observation_owner = sources.observation()
+            ? requireTransferStorageOwner(sources.observation(), "TransferEngine::recordDeviceInputFork observation") : nullptr;
+        if (companion_owner == source_owner || (observation_owner &&
+                (!companion_owner || observation_owner == source_owner || observation_owner == companion_owner)))
+            throw std::invalid_argument("TransferEngine input fork operands must name distinct canonical owners");
+        // Every read (including the receipt's previous total) precedes the SAME event. Auxiliary consumers authenticate
+        // the bounded set from its acquired token instead of asking the capture
+        // ledger to reinterpret its canonical stream or importing another event.
         requireDeviceInput(source_owner, device, producer_stream);
+        if (companion_owner) requireDeviceInput(companion_owner, device, producer_stream);
+        if (observation_owner) requireDeviceInput(observation_owner, device, producer_stream);
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         if (!context.recordEventChecked(event, producer_stream))
-        {
-            throw std::runtime_error(
-                "TransferEngine::recordDeviceInputFork could not record the producer frontier");
-        }
-        return DeviceTransferInputFork(
-            source_owner, device, producer_stream, event);
+            throw std::runtime_error("TransferEngine::recordDeviceInputFork could not record the producer frontier");
+        return DeviceTransferInputFork(source_owner, companion_owner, observation_owner, device, producer_stream, event);
     }
 
     AcquiredDeviceTransferInput TransferEngine::acquireDeviceInputFork(
@@ -2463,6 +2909,8 @@ namespace llaminar2
         }
         return AcquiredDeviceTransferInput(
             publication.source_owner_,
+            publication.companion_owner_,
+            publication.observation_owner_,
             publication.device_,
             consumer_stream,
             publication.event_);
@@ -2679,12 +3127,20 @@ namespace llaminar2
         MappedTransferDirection direction, DeviceTransferBuffer &device_region, size_t device_offset,
         const MappedHostTransferRegion &mapped_region, size_t mapped_offset, size_t bytes) const
     {
-        if (!lane.valid() || !device_region.isBound() || !mapped_region.isBound() || !bytes ||
+        if (!lane.valid())throw std::invalid_argument("Mapped kernel copy requires its admitted execution lane");
+        enqueueMappedKernelCopyOnPreparedStream(lane.device(), lane.stream(), direction,
+            device_region, device_offset, mapped_region, mapped_offset, bytes);
+    }
+
+    void TransferEngine::enqueueMappedKernelCopyOnPreparedStream(DeviceId device, void *stream,
+        MappedTransferDirection direction, DeviceTransferBuffer &device_region, size_t device_offset,
+        const MappedHostTransferRegion &mapped_region, size_t mapped_offset, size_t bytes) const
+    {
+        if (!device.is_gpu() || !stream || !device_region.isBound() || !mapped_region.isBound() || !bytes ||
             (direction != MappedTransferDirection::DeviceToHost && direction != MappedTransferDirection::HostToDevice))
             throw std::invalid_argument("Mapped kernel copy requires a prepared lane, bounded owners and direction");
         if (!device_region.contains(device_offset, bytes) || !mapped_region.contains(mapped_offset, bytes))
             throw std::out_of_range("Mapped kernel copy exceeds its immutable region");
-        const DeviceId device = lane.device();
         IBackend *backend = resolveBackend(device);
         if (!backend || device_region.device_ != device || device_region.backend_ != backend ||
             mapped_region.backendFor(device) != backend)
@@ -2693,7 +3149,7 @@ namespace llaminar2
         void *mapped_bytes = mapped_region.deviceAlias(device, mapped_offset);
         const bool outbound = direction == MappedTransferDirection::DeviceToHost;
         if (!backend->copyDeviceVisibleRegionByKernelOnStream(outbound ? mapped_bytes : device_bytes,
-                outbound ? device_bytes : mapped_bytes, bytes, device.gpu_ordinal(), lane.stream()))
+                outbound ? device_bytes : mapped_bytes, bytes, device.gpu_ordinal(), stream))
             throw std::runtime_error("Mapped kernel copy launch was rejected");
     }
 
@@ -3204,6 +3660,21 @@ namespace llaminar2
     {
         static TransferEngine engine;
         return engine;
+    }
+
+    void TransferEngine::enqueueDiagnosticObservation(ITensor *source,size_t offset,
+        void *destination,size_t bytes,DeviceId device,void *stream)
+    {
+        if(!source||!device.is_gpu()||!stream||isGraphCaptureActive())
+            throw std::invalid_argument("Diagnostic observation requires an exact GPU stream outside capture");
+        if(offset>source->size_bytes()||bytes>source->size_bytes()-offset||(!destination&&bytes))
+            throw std::out_of_range("Diagnostic observation exceeds its retained source or destination");
+        if(!bytes) return;
+        requireDeviceInput(source,device,stream);
+        auto *backend=instance().resolveBackend(device);
+        if(!backend||!backend->deviceToHostOnStream(destination,
+            static_cast<const unsigned char *>(source->gpu_data_ptr())+offset,bytes,device.gpu_ordinal(),stream))
+            throw std::runtime_error("Diagnostic observation exact D2H enqueue failed");
     }
 
     void TransferEngine::prepareDeviceInput(
@@ -3981,6 +4452,99 @@ namespace llaminar2
         return result;
     }
 
+    PreparedDevicePeerCopy TransferEngine::prepareDevicePeerCopy(std::shared_ptr<TensorBase> source,
+        std::shared_ptr<TensorBase> destination,DeviceId source_device,DeviceId destination_device,
+        ExplicitGPUStream destination_stream)const
+    {
+        if(isGraphCaptureActive())throw std::logic_error("Direct peer preparation must precede capture");
+        if(!source || !destination || source==destination || source->transferStorageOwner()!=source.get() || destination->transferStorageOwner()!=destination.get() ||
+            !source_device.is_gpu() || !destination_device.is_gpu() || source_device==destination_device || source_device.type!=destination_device.type)
+            throw std::invalid_argument("Direct peer preparation requires distinct original same-backend GPU tensor owners");
+        auto& pool=GPUDeviceContextPool::instance();
+        auto source_worker=pool.retainExistingContextProvenance(source_device);
+        auto destination_worker=pool.retainExistingContextProvenance(destination_device);
+        if(!destination_worker.worker()->ownsCurrentThread() || destination_worker.worker()->defaultStream()!=destination_stream.get())
+            throw std::invalid_argument("Direct peer preparation requires the destination original worker stream");
+        const auto observed_peer=DeviceManager::instance().peerAccessAvailable(destination_device,source_device);
+        if(!observed_peer)throw std::logic_error("Direct peer preparation has no original directed peer observation");
+        if(!*observed_peer)throw std::runtime_error("Original directed peer observation reports unavailable physical P2P");
+        bool peer=false;
+#ifdef HAVE_CUDA
+        if(source_device.is_cuda())peer=detail::prepareDirectPeerAccessCUDABackend(source_device,destination_device);
+#endif
+#ifdef HAVE_ROCM
+        if(source_device.is_rocm())peer=detail::prepareDirectPeerAccessROCmBackend(source_device,destination_device);
+#endif
+        if(!peer)throw std::runtime_error("Preparation of the observed direct peer edge failed; no transfer fallback is permitted");
+        // The receiving buffer already owns initialized admitted bytes. Joining
+        // its publication and republishing unchanged bytes creates any required
+        // terminal event before capture, never inside enqueue().
+        requireDeviceInput(destination.get(),destination_device,destination_stream.get());
+        publishDeviceWrite(destination.get(),destination_device,destination_stream.get());
+        std::scoped_lock lock(source->coherence_mutex_,destination->coherence_mutex_);
+        if(!source->gpu_data_ptr_ || source->gpu_device_!=source_device || !::llaminar2::isDeviceValid(source->coherence_state_) ||
+            !destination->gpu_data_ptr_ || destination->gpu_device_!=destination_device || !source->size_bytes() || !destination->size_bytes())
+            throw std::invalid_argument("Direct peer preparation requires existing valid physical tensor allocations");
+        if(!source->device_completion_event_ || !source->completionEventProtectsDeviceValue_())
+            throw std::logic_error("Direct peer input has no published producer event; preparation cannot invent completion");
+        {
+            if(source->event_device_!=source_device)throw std::logic_error("Direct peer source producer event has a foreign physical owner");
+            auto* backend=resolveBackend(destination_device);
+            if(!backend || !backend->streamWaitEvent(destination_stream.get(),source->device_completion_event_,destination_device.ordinal))
+                throw std::runtime_error("Direct peer source event could not join exact destination stream");
+            source->last_joined_completion_event_=source->device_completion_event_;
+            source->last_joined_consumer_stream_=destination_stream.get();
+        }
+        const auto source_pointer=source->gpu_data_ptr_;const auto destination_pointer=destination->gpu_data_ptr_;
+        const auto source_capacity=source->size_bytes();const auto destination_capacity=destination->size_bytes();
+        return {std::move(source),std::move(destination),source_device,destination_device,destination_stream.get(),
+            std::move(source_worker),std::move(destination_worker),source_pointer,destination_pointer,source_capacity,destination_capacity};
+    }
+
+    void TransferEngine::enqueuePreparedDevicePeerCopy(const PreparedDevicePeerCopy& copy,std::size_t source_offset,
+        std::size_t destination_offset,std::size_t live_bytes)
+    {
+        if(!copy.source_ || !copy.destination_ || !copy.source_worker_.worker() || !copy.destination_worker_.worker() || !copy.destination_worker_.worker()->ownsCurrentThread() ||
+            copy.destination_worker_.worker()->defaultStream()!=copy.stream_)
+            throw std::logic_error("Direct peer copy lost its original destination worker/stream");
+        if(source_offset>copy.source_capacity_ || live_bytes>copy.source_capacity_-source_offset ||
+            destination_offset>copy.destination_capacity_ || live_bytes>copy.destination_capacity_-destination_offset)
+            throw std::out_of_range("Direct peer live byte range exceeds frozen storage");
+        {
+            std::scoped_lock lock(copy.source_->coherence_mutex_,copy.destination_->coherence_mutex_);
+            if(copy.source_->gpu_data_ptr_!=copy.source_pointer_ || copy.destination_->gpu_data_ptr_!=copy.destination_pointer_ ||
+                copy.source_->gpu_device_!=copy.source_device_ || copy.destination_->gpu_device_!=copy.destination_device_ ||
+                copy.source_->size_bytes()!=copy.source_capacity_ || copy.destination_->size_bytes()!=copy.destination_capacity_ ||
+                !::llaminar2::isDeviceValid(copy.source_->coherence_state_))
+                throw std::logic_error("Direct peer tensor storage was rebound or invalidated after preparation");
+            if(!copy.source_->device_completion_event_ || !copy.source_->completionEventProtectsDeviceValue_() ||
+                copy.source_->last_joined_completion_event_!=copy.source_->device_completion_event_ || copy.source_->last_joined_consumer_stream_!=copy.stream_)
+                throw std::logic_error("Direct peer source publication changed after exact-stream preparation");
+            if(!copy.destination_->device_completion_event_ || !copy.destination_->completionEventProtectsDeviceValue_() ||
+                copy.destination_->event_device_!=copy.destination_device_)
+                throw std::logic_error("Direct peer output lost its pre-created destination publication event");
+        }
+        if(!live_bytes)return;
+        // Pool lookup authenticates only existing host metadata. It never creates
+        // a worker or re-queries native properties/provider identities in capture.
+        const auto source_current=GPUDeviceContextPool::instance().retainExistingContextProvenance(copy.source_device_);
+        const auto destination_current=GPUDeviceContextPool::instance().retainExistingContextProvenance(copy.destination_device_);
+        copy.source_worker_.requireWorker(source_current.worker());copy.destination_worker_.requireWorker(destination_current.worker());
+        if(source_current.generation()!=copy.source_worker_.generation() || destination_current.generation()!=copy.destination_worker_.generation())
+            throw std::logic_error("Direct peer copy has a stale original worker generation");
+        const auto* source=static_cast<const unsigned char*>(copy.source_pointer_)+source_offset;
+        auto* destination=static_cast<unsigned char*>(copy.destination_pointer_)+destination_offset;
+        bool submitted=false;
+#ifdef HAVE_CUDA
+        if(copy.source_device_.is_cuda())submitted=detail::copyPreparedDevicePeerBytesCUDABackend(destination,copy.destination_device_.ordinal,source,copy.source_device_.ordinal,live_bytes,copy.stream_);
+#endif
+#ifdef HAVE_ROCM
+        if(copy.source_device_.is_rocm())submitted=detail::copyPreparedDevicePeerBytesROCmBackend(destination,copy.destination_device_.ordinal,source,copy.source_device_.ordinal,live_bytes,copy.stream_);
+#endif
+        if(!submitted)throw std::runtime_error("Prepared direct physical peer byte submission failed");
+        publishDeviceWrite(copy.destination_.get(),copy.destination_device_,copy.stream_);
+    }
+
     TransferResult TransferEngine::copyActivation(TensorBase *src, TensorBase *dst,
                                                   DeviceId dst_device, size_t bytes)
     {
@@ -4002,6 +4566,41 @@ namespace llaminar2
             return TransferResult::fail(TransferMethod::NOOP,
                                         "activation copy exceeds tensor storage");
 
+        const auto auth = src->getAuthoritativeDevice();
+        if (dst_device.is_cpu() && auth && auth->is_gpu() && !src->is_mapped_ && !src->hostValid())
+        {
+            // The caller owns this existing host activation bank. Download
+            // only its live prefix and keep the source GPU authoritative.
+            // A prior pipeline transfer may already have published these host
+            // bytes while retaining the producing GPU identity. Such a source
+            // uses the host-copy branch below; it must not repeat the D2H leg.
+            void *source = src->gpu_data_ptr_;
+            if (src->gpu_device_ != auth)
+            {
+                const auto secondary = src->secondary_device_buffers_.find(TensorBase::packDeviceId(*auth));
+                source = secondary == src->secondary_device_buffers_.end() ? nullptr : secondary->second;
+            }
+            if (!source || !src->deviceValid())
+                return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
+                                            "missing authoritative activation storage");
+            void *const destination = dst->mutable_data();
+            if (!destination)
+                return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
+                                            "missing original host activation storage");
+            // Import the exact source producer on the same original transfer
+            // stream used below. Its existing CPU-boundary copy event completes
+            // every read before return, so the source owner remains live for
+            // the whole DMA without publishing a partial full-host mirror.
+            requireDeviceInput(src, *auth, requireTransferStream(*auth,
+                "TransferEngine::copyActivation host destination"));
+            return executeDeviceToHost({.source = {.host_ptr = destination, .device_ptr = source,
+                .device = *auth, .size_bytes = bytes}, .target_device = dst_device,
+                .method = TransferMethod::DEVICE_TO_HOST});
+        }
+
+        // Byte counters below describe successfully submitted physical legs,
+        // not requested capacity or eventual completion. A staged two-leg copy
+        // reports each accepted leg independently, including partial failure.
         // ----------------------------------------------------------------------
         // Host or mapped destination: a plain host-side copy is correct and
         // cheapest. Mapped memory shares host/device storage, so writing the
@@ -4015,6 +4614,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
                                             "null host pointer in copyActivation host path");
             std::memcpy(host_dst, host_src, bytes);
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_host_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             if (dst_device.is_gpu())
             {
                 /*
@@ -4045,7 +4647,6 @@ namespace llaminar2
         // tensor's primary gpu_device_/gpu_data_ptr_ still point at the producing
         // GPU (e.g. CUDA), while the authoritative copy lives in a secondary buffer
         // on the consumer GPU (e.g. ROCm).
-        const auto auth = src->getAuthoritativeDevice();
         const bool src_on_gpu = auth.has_value() && auth->is_gpu();
         const DeviceId src_device = src_on_gpu ? *auth : DeviceId::cpu();
 
@@ -4086,6 +4687,9 @@ namespace llaminar2
                     destination_stream))
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "deviceToDevice failed on " + dst_device.toString());
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_d2d_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
             // Republish the unchanged source after its last read, extending
             // its storage lifetime through DMA without a host completion wait.
@@ -4117,6 +4721,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "peer copy failed " + src_device.toString() +
                                                 " -> " + dst_device.toString());
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_peer_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
             publishDeviceWrite(src, src_device, source_stream);
         }
@@ -4148,6 +4755,9 @@ namespace llaminar2
                         source_stream))
                     return TransferResult::fail(TransferMethod::HOST_STAGED,
                                                 "D2H step failed in copyActivation");
+                if (PerfStatsCollector::isDomainEnabled("transfer"))
+                    PerfStatsCollector::addCounter("transfer", "activation_copy_d2h_bytes",
+                        static_cast<double>(bytes), "activation_copy", src_device.toString());
                 host_src = src_host;
             }
             else
@@ -4171,6 +4781,9 @@ namespace llaminar2
                     destination_stream))
                 return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
                                             "H2D step failed in copyActivation");
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_h2d_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             result = TransferResult::ok(src_on_gpu ? TransferMethod::HOST_STAGED
                                                    : TransferMethod::HOST_TO_DEVICE);
         }
@@ -4233,6 +4846,9 @@ namespace llaminar2
         if (!ok)
             return TransferResult::fail(req.method, "hostToDevice failed");
 
+        // execute() bypasses uploadFull(): this accepted physical leg owns
+        // the same production transfer evidence, exactly once at submission.
+        TransferProfiler::recordH2D(req.source.size_bytes);
         return TransferResult::ok(req.method);
     }
 
@@ -4259,6 +4875,9 @@ namespace llaminar2
         if (!ok)
             return TransferResult::fail(req.method, "deviceToHost failed");
 
+        // A later consumer's host data() access must not obscure whether the
+        // canonical activation handoff already downloaded only its live rows.
+        TransferProfiler::recordD2H(req.source.size_bytes);
         return TransferResult::ok(req.method);
     }
 
@@ -4341,6 +4960,10 @@ namespace llaminar2
         if (!d2h)
             return TransferResult::fail(req.method, "D2H step of host staged failed");
 
+        // Record each physical leg before attempting the next: a rejected
+        // destination leg cannot erase bytes already downloaded into staging.
+        TransferProfiler::recordD2H(req.source.size_bytes);
+
         // Step 2: H2D to target
         IBackend *dst_backend = resolveBackend(req.target_device);
         if (!dst_backend)
@@ -4356,6 +4979,7 @@ namespace llaminar2
         if (!h2d)
             return TransferResult::fail(req.method, "H2D step of host staged failed");
 
+        TransferProfiler::recordH2D(req.source.size_bytes);
         return TransferResult::ok(req.method);
     }
 

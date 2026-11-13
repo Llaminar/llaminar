@@ -9,6 +9,9 @@
  * including CPU scratch owned by a GPU execution participant.
  * @author David Sanftenberg
  * @date March 2026
+ * A complete transient CPU grouped-MoE declaration is carried beside named
+ * slab regions. Its owned roots share this allocator lifetime and sole PMA
+ * issuer; the serial-family envelope freezes before any consumer is bound.
  */
 
 #include "WorkspaceAllocator.h"
@@ -679,6 +682,10 @@ namespace llaminar2
                     WorkspaceGraphParticipantLifetime::
                         PersistentAcrossParticipants)
                 {
+                    for(const auto &binding:bindings)
+                        if (const auto requirements = requirementsForGraphBinding(binding);
+                            requirements.cpu_grouped_moe_storage || requirements.cpu_router_q8_storage)
+                            throw std::invalid_argument("CPU typed scratch requires SerialGraphLocal lifetime, not surviving participant contents");
                     auto &persistent =
                         persistent_consumers_by_device[device];
                     persistent.insert(
@@ -747,6 +754,8 @@ namespace llaminar2
                 for (const auto &consumer_binding : consumers)
                 {
                     auto reqs = requirementsForGraphBinding(consumer_binding);
+                    existing->second->requireCPUGroupedMoEStorage(reqs.cpu_grouped_moe_storage);
+                    existing->second->requireCPURouterQ8Storage(reqs.cpu_router_q8_storage);
                     for (const auto &buf : reqs.buffers)
                     {
                         if (!existing->second->hasBuffer(buf.name) ||
@@ -1078,14 +1087,14 @@ namespace llaminar2
                 }
             }
 
-            if (combined.buffers.empty() &&
-                decode_participant.buffers.empty() &&
-                compact_participant.buffers.empty() &&
+            if (combined.empty() &&
+                decode_participant.empty() &&
+                compact_participant.empty() &&
                 std::all_of(
                     exact_participant_requirements.begin(),
                     exact_participant_requirements.end(),
                     [](const WorkspaceRequirements &requirements)
-                    { return requirements.buffers.empty(); }))
+                    { return requirements.empty(); }))
             {
                 LOG_DEBUG("[WorkspaceAllocator] No workspace requirements for device "
                           << device.toString());
@@ -1142,7 +1151,7 @@ namespace llaminar2
                               << serial_family_plan.error);
                     return false;
                 }
-                needed = serial_family_plan.total_bytes;
+                needed = serial_family_plan.totalPhysicalBytes();
 
                 /*
                  * Keep the exact interval layout behind the opt-in VRAM BOM.
@@ -1283,7 +1292,7 @@ namespace llaminar2
                            serial_family_plan))
                     : (hints.graph_family_policy ==
                                WorkspaceGraphFamilyPolicy::ExclusiveLifetime
-                           ? manager->allocate(combined, needed)
+                           ? manager->allocate(combined, combined.named_bytes_with_alignment())
                            : manager->allocateSerialFamily(
                                  serial_family_plan));
             if (!allocated)
@@ -1295,14 +1304,14 @@ namespace llaminar2
                 return false;
             }
 
-            if (!compact_participant.buffers.empty() &&
+            if (!compact_participant.empty() &&
                 !manager->bindSerialParticipant(compact_participant))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to prebind compact serial participant on "
                           << device.toString());
                 return false;
             }
-            if (!decode_participant.buffers.empty() &&
+            if (!decode_participant.empty() &&
                 !manager->bindSerialParticipant(decode_participant))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to prebind decode serial participant on "
@@ -1312,7 +1321,7 @@ namespace llaminar2
             for (const WorkspaceRequirements &participant :
                  exact_participant_requirements)
             {
-                if (!participant.buffers.empty() &&
+                if (!participant.empty() &&
                     !manager->bindSerialParticipant(participant))
                 {
                     LOG_ERROR("[WorkspaceAllocator] Failed to prebind exact serial graph participant on "
@@ -1392,7 +1401,9 @@ namespace llaminar2
                 combined.merge(consumer->getWorkspaceRequirements(/*decode_m=*/1));
             }
 
-            if (combined.buffers.empty())
+            if (combined.cpu_grouped_moe_storage || combined.cpu_router_q8_storage)
+                throw std::invalid_argument("CPU typed backing requires an explicit graph-family allocation contract");
+            if (combined.empty())
             {
                 LOG_DEBUG("[WorkspaceAllocator] No workspace requirements for device "
                           << device.toString());
@@ -1507,7 +1518,7 @@ namespace llaminar2
         size_t total = 0;
         for (const auto &[device, mgr] : device_workspaces_)
         {
-            total += mgr->used();
+            total += mgr->allocatedPhysicalBytes();
         }
         return total;
     }
@@ -1515,7 +1526,7 @@ namespace llaminar2
     size_t WorkspaceAllocator::deviceAllocated(DeviceId device) const
     {
         auto it = device_workspaces_.find(device);
-        return (it != device_workspaces_.end()) ? it->second->used() : 0;
+        return (it != device_workspaces_.end()) ? it->second->allocatedPhysicalBytes() : 0;
     }
 
     size_t WorkspaceAllocator::retainedPrimaryBytes(DeviceId device) const noexcept
@@ -1526,7 +1537,7 @@ namespace llaminar2
         if (found == device_workspaces_.end() || !found->second ||
             !found->second->hasReusablePrimaryBlock())
             return 0u;
-        return found->second->primaryBlockSize();
+        return found->second->retainedBackingBytes();
     }
 
     void WorkspaceAllocator::bumpDeviceGeneration(DeviceId device)

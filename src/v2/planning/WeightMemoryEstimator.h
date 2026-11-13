@@ -7,19 +7,35 @@
  * only; PhysicalMemoryAuthority remains the sole admission and allocation ledger.
  */
 #pragma once
+#include "memory/CPUStorageRoot.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
 {
 
     struct ModelMemoryProfile;
+    class PreparedWeightPhysicalUses;
+    enum class PreparedWeightUseIntent;
     class MoEExpertProjectionOwnership;
+    class PlanningTensorIndex;
+    /** @brief Complete source/arithmetic inputs consumed by canonical weight quoting. */
+    struct PlanningWeightSourcePolicy {
+        std::shared_ptr<const PlanningTensorIndex> source_tensor_index;
+        GDNProjectionArithmetic gdn_projection_arithmetic;
+        MoERouterArithmetic moe_router_arithmetic;
+        /** @return Current original arithmetic selectors, captured once per quote boundary. */
+        static PlanningWeightSourcePolicy current();
+        bool operator==(const PlanningWeightSourcePolicy &) const = default;
+    };
 
     /**
      * @brief Global weight uses retained beside a participant's layer interval.
@@ -39,6 +55,44 @@ namespace llaminar2
         Intermediate,
         LayersOnly,
     };
+
+    /**
+     * @brief Query the canonical global component scope shared by weight and workspace BOMs.
+     * @param scope Exact graph-owned global source uses, independent of retained verifier rows.
+     * @return Whether this component set owns an embedding lookup representation.
+     * @throws std::invalid_argument For an invalid scope.
+     */
+    [[nodiscard]] inline bool weightScopeOwnsEmbedding(WeightComponentScope scope)
+    {
+        switch (scope)
+        {
+        case WeightComponentScope::EmbeddingAndTerminal:
+        case WeightComponentScope::Embedding: return true;
+        case WeightComponentScope::Terminal:
+        case WeightComponentScope::Intermediate:
+        case WeightComponentScope::LayersOnly: return false;
+        }
+        throw std::invalid_argument("Weight component scope is invalid");
+    }
+
+    /**
+     * @brief Query whether the declared component set owns terminal model operands.
+     * @param scope Exact graph-owned global source uses, shared with weight materialization.
+     * @return Whether the terminal transformation and vocabulary projection execute locally.
+     * @throws std::invalid_argument For an invalid scope.
+     */
+    [[nodiscard]] inline bool weightScopeOwnsTerminal(WeightComponentScope scope)
+    {
+        switch (scope)
+        {
+        case WeightComponentScope::EmbeddingAndTerminal:
+        case WeightComponentScope::Terminal: return true;
+        case WeightComponentScope::Embedding:
+        case WeightComponentScope::Intermediate:
+        case WeightComponentScope::LayersOnly: return false;
+        }
+        throw std::invalid_argument("Weight component scope is invalid");
+    }
 
     /**
      * @brief Typed device-residency contract used by preflight weight sizing.
@@ -173,6 +227,7 @@ namespace llaminar2
          *        the production topology has one.
          * @param components Global lookup/projection uses actually materialized
          *        by this participant; independent of source aliases and layers.
+         * @param native_source_placement Original CPU loader/participant allocation policy; metadata-only calls explicitly default local.
          * @return Native-source and prepared-device byte inventory.
          */
         static WeightEstimate estimate(
@@ -185,8 +240,34 @@ namespace llaminar2
             const DeviceWeightResidency &residency = {},
             const std::optional<DeviceShardingAssignment>
                 &tensor_parallel_assignment = std::nullopt,
-            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal
+            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal,
+            CPUStoragePlacement native_source_placement = CPUStoragePlacement::local(),
+            PlanningWeightSourcePolicy source_policy = PlanningWeightSourcePolicy::current()
         );
+
+        /**
+         * @brief Price creators while retaining exact typed aliases in one model/device scope.
+         * @param uses Original-profile/device-bound logical-to-physical compiler.
+         * @param intent Primary creator publication or subsequent alias-or-create use.
+         * @param profile Same immutable original model inventory bound to uses.
+         * @param device Same exact participant bound to uses.
+         * @param shard_index This use's local TP coordinate.
+         * @param total_shards This use's TP degree (one for a full replica).
+         * @param first_layer First included layer.
+         * @param last_layer Last included layer, or -1 for all.
+         * @param residency Actual full/continuation/expert-only residency.
+         * @param tensor_parallel_assignment Actual local TP assignment when present.
+         * @param components Exact global component uses.
+         * @param native_source_placement Same original CPU placement used by the actual final root allocator.
+         * @param source_policy Original immutable source index and both explicit arithmetic selectors.
+         * @return Canonical byte inventory of required creators; aliases add no physical bytes.
+         */
+        static WeightEstimate estimatePhysical(PreparedWeightPhysicalUses &uses, PreparedWeightUseIntent intent,
+            const ModelMemoryProfile &profile, DeviceId device, int shard_index, int total_shards,
+            int first_layer, int last_layer, const DeviceWeightResidency &residency,
+            const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
+            WeightComponentScope components, CPUStoragePlacement native_source_placement = CPUStoragePlacement::local(),
+            PlanningWeightSourcePolicy source_policy = PlanningWeightSourcePolicy::current());
 
         /// Bytes per weight element for native (GGUF on-disk) format.
         static float getNativeBytesPerWeight(const std::string &quant_type);
@@ -199,6 +280,15 @@ namespace llaminar2
 
         /// Bytes per weight element after CPU VNNI packing.
         static float getCPUPackedBytesPerWeight(const std::string &quant_type);
+
+    private:
+        /** @brief One canonical pricing body shared by logical and physical-use entrypoints. */
+        static WeightEstimate estimateImpl(const ModelMemoryProfile &profile, DeviceId device,
+            int shard_index, int total_shards, int first_layer, int last_layer,
+            const DeviceWeightResidency &residency,
+            const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
+            WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent,
+            CPUStoragePlacement native_source_placement,const PlanningWeightSourcePolicy &source_policy);
 
     };
 

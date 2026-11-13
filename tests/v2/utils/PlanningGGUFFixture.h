@@ -92,11 +92,13 @@ namespace llaminar2::test
          *        use its actual head width, allowing valid high-degree GQA tests.
          * @param geometry Graph loading additionally needs the gated Q projection
          *        and nonzero recurrent arena metadata, even for all-FA layers.
+         * @param main_layers Positive source main-layer count; defaults preserve existing fixtures.
+         * @param expert_count Positive original MoE expert population; defaults preserve existing fixtures.
          */
         explicit PlanningGGUFFixture(bool moe = false, bool mtp = false,
             GGUFTensorType expert_type = GGUFTensorType::F32, uint32_t expert_width = 256,
             std::optional<GGUFTensorType> gdn_projection = std::nullopt, uint32_t attention_heads = 8,
-            Geometry geometry = Geometry::Directory)
+            Geometry geometry = Geometry::Directory, uint32_t main_layers = 2,uint32_t expert_count=8)
         {
             if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0)
                 throw std::invalid_argument("Planning fixture requires a supported GGUF format");
@@ -105,7 +107,7 @@ namespace llaminar2::test
             if (descriptor < 0) throw std::runtime_error("Cannot create planning GGUF fixture");
             ::close(descriptor);
             path_ = pattern;
-            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry); }
+            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,expert_count); }
             catch (...) { remove(); throw; }
         }
         /** @brief Remove only this fixture's file, including during exception unwinding. */
@@ -137,13 +139,16 @@ namespace llaminar2::test
         }
         /** @brief Publish the directory followed by sparse, unread payload extents. */
         void write(bool moe, bool mtp, GGUFTensorType expert_type, uint32_t expert_width,
-            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry)
+            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry, uint32_t main_layers,uint32_t expert_count)
         {
+            if(expert_count==0)throw std::invalid_argument("Planning fixture requires positive original expert count");
             if (attention_heads < 2 || 256 % attention_heads != 0)
                 throw std::invalid_argument("Planning fixture needs integral attention heads and two KV heads");
             const uint64_t head_columns = 256 / attention_heads;
             const std::string arch = moe ? "qwen35moe" : "qwen35";
-            const int layers = mtp ? 3 : 2;
+            if (main_layers == 0 || main_layers > 48)
+                throw std::invalid_argument("Planning fixture requires a bounded positive main-layer count");
+            const int layers = static_cast<int>(main_layers) + (mtp ? 1 : 0);
             std::vector<Tensor> tensors{
                 {"token_embd.weight", {256, 320}}, {"output.weight", {256, 320}},
                 {"output_norm.weight", {256}}};
@@ -165,9 +170,9 @@ namespace llaminar2::test
                 if (moe)
                 {
                     for (const auto name : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
-                        tensors.push_back({prefix + name, {256, expert_width, 8}, expert_type});
-                    tensors.push_back({prefix + "ffn_down_exps.weight", {expert_width, 256, 8}, expert_type});
-                    tensors.push_back({prefix + "ffn_gate_inp.weight", {256, 8}});
+                        tensors.push_back({prefix + name, {256, expert_width, expert_count}, expert_type});
+                    tensors.push_back({prefix + "ffn_down_exps.weight", {expert_width, 256, expert_count}, expert_type});
+                    tensors.push_back({prefix + "ffn_gate_inp.weight", {256, expert_count}});
                     const uint64_t shared_width = geometry == Geometry::FullAttentionGraph ? expert_width : 256;
                     for (const auto name : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
                         tensors.push_back({prefix + name, {256, shared_width}});
@@ -180,7 +185,7 @@ namespace llaminar2::test
                         tensors.push_back({prefix + name, {256, 512}, expert_type});
                     tensors.push_back({prefix + "ffn_down.weight", {512, 256}, expert_type});
                 }
-                if (mtp && layer == 2)
+                if (mtp && layer == static_cast<int>(main_layers))
                 {
                     tensors.push_back({prefix + "nextn.eh_proj.weight", {512, 256}});
                     for (const auto name : {"nextn.hnorm.weight", "nextn.enorm.weight", "nextn.shared_head_norm.weight"})
@@ -193,8 +198,8 @@ namespace llaminar2::test
                 {arch + ".feed_forward_length", moe && geometry == Geometry::FullAttentionGraph ? expert_width : 512},
                 {arch + ".attention.head_count", attention_heads}, {arch + ".attention.head_count_kv", 2},
                 {arch + ".context_length", 1024}, {"tokenizer.ggml.token_count", 320},
-                {arch + ".expert_count", moe ? 8u : 0u},
-                {arch + ".expert_used_count", moe ? 2u : 0u},
+                {arch + ".expert_count", moe ? expert_count : 0u},
+                {arch + ".expert_used_count", moe ? std::min(2u,expert_count) : 0u},
                 {arch + ".expert_feed_forward_length", moe ? expert_width : 0u},
                 {arch + ".nextn_predict_layers", mtp ? 1u : 0u}};
             if (geometry == Geometry::FullAttentionGraph)

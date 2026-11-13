@@ -149,7 +149,7 @@ namespace llaminar2
          * @param n Product/output columns, not the input reduction width.
          *
          * Call only when beta is nonzero. Backends that accumulate directly
-         * need no additional storage; CPU NativeVNNI preserves the prior output
+         * need no additional storage; CPU NativeQuantised preserves the prior output
          * while its unchanged GEMM writes a separate complete product.
          */
         virtual void appendOutputAccumulationWorkspaceRequirements(
@@ -276,13 +276,13 @@ namespace llaminar2
         constexpr const char *ROCM_FP32_MAPPED_REDIRECT = "rocm_fp32_mapped_redirect"; ///< [M × N] HBM redirect for mapped FP32 outputs
         constexpr const char *CUDA_FP32_MAPPED_REDIRECT = "cuda_fp32_mapped_redirect"; ///< [batch × M × N] HBM redirect for mapped FP32 outputs
 
-        // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
+        // GEMV kpar partials buffer for CUDA NativeQuantised two-phase reduction
         constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × bounded verifier rows × N] FP32 serial/grouped reduction arena
         constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< aligned side-stream [kpar × bounded rows × stream_N] FP32 GEMV partials
 
-        // CUDA NativeVNNI public-M1 K-partition scratch. This persistent arena
+        // CUDA NativeQuantised public-M1 K-partition scratch. This persistent arena
         // is sized before capture and shared only across non-concurrent graphs.
-        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS = "cuda_native_vnni_prefill_canonical_kpart_partials"; ///< serial [kpart × M × N], concurrent [slot × kpart × M × max_N] FP32 partials
+        constexpr const char *CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS = "cuda_native_quantised_prefill_canonical_kpart_partials"; ///< serial [kpart × M × N], concurrent [slot × kpart × M × max_N] FP32 partials
         constexpr const char *CUDA_CONCURRENT_PREFILL_ACC_INT32 = "cuda_concurrent_prefill_acc_int32";               ///< per-slot [M × max_N] INT32 accumulator
     }
 

@@ -4,7 +4,8 @@
  *
  * The fixture deliberately lets a registered payload share a huge-page-sized
  * mapping with an unrelated reclaimable tail. Production registration must
- * isolate its edges without losing bytes or disabling interior huge pages.
+ * exclude every registered page without losing bytes or disabling adjacent
+ * unregistered pages' huge-page eligibility.
  * Reading smaps checks installed policy without relying on memory fragmentation
  * or on the kernel printing its rate-limited workqueue warning.
  */

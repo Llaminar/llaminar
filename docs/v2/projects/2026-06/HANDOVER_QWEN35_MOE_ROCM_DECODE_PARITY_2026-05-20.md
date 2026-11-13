@@ -31,9 +31,9 @@ Final passing CSV snapshot was preserved here:
 
 ## Root Causes Fixed
 
-### 1. Grouped prefill mixed native-VNNI codebooks
+### 1. Grouped prefill mixed native-quantised codebooks
 
-The grouped prefill WIP must be kept, but it had a real mixed-format correctness bug. Qwen35 MoE can use different native-VNNI codebooks for gate/up and down, for example Q4_K gate/up with Q5_K down.
+The grouped prefill WIP must be kept, but it had a real mixed-format correctness bug. Qwen35 MoE can use different native-quantised codebooks for gate/up and down, for example Q4_K gate/up with Q5_K down.
 
 `ROCmMoEKernel.cpp` already declared and called `rocmMoE_grouped_prefill_pipeline()` with separate `gateup_codebook_id` and `down_codebook_id`, but the current unstaged HIP implementation in `ROCmMoEGroupedPrefillKernels.hip` had collapsed them into one `codebook_id`. That created an ABI/signature mismatch and also forced the down GEMM through the wrong codebook dispatch.
 
@@ -133,7 +133,7 @@ Test #232 ... Passed 88.69 sec
 
 ## Current Worktree State
 
-The worktree is intentionally dirty and contains large staged WIP from adjacent ROCm MoE, prefill graph-capture, native-VNNI, and loader work. Do not reset, checkout, stash, or revert unrelated changes unless the user explicitly asks.
+The worktree is intentionally dirty and contains large staged WIP from adjacent ROCm MoE, prefill graph-capture, native-quantised, and loader work. Do not reset, checkout, stash, or revert unrelated changes unless the user explicitly asks.
 
 Current `git status --short` has many staged files. Files touched in this continuation are mixed staged/unstaged (`MM`) or unstaged:
 
@@ -188,7 +188,7 @@ Existing focused mixed-codebook regression that now passes:
 
 1. Review the three continuation diffs above and decide whether to stage them with the existing WIP or split them into a focused fix commit.
 
-2. Re-run the final exact parity target if any further WIP edits touch ROCm MoE, native-VNNI packing, routing, or snapshot decode:
+2. Re-run the final exact parity target if any further WIP edits touch ROCm MoE, native-quantised packing, routing, or snapshot decode:
 
 ```bash
 ctest --test-dir build_v2_integration \
@@ -196,7 +196,7 @@ ctest --test-dir build_v2_integration \
   --output-on-failure
 ```
 
-3. Keep `V2_Integration_ROCmMoEKernel` as the fast guard for mixed native-VNNI codebook correctness:
+3. Keep `V2_Integration_ROCmMoEKernel` as the fast guard for mixed native-quantised codebook correctness:
 
 ```bash
 ctest --test-dir build_v2_integration \
@@ -211,7 +211,7 @@ ctest --test-dir build_v2_integration \
 ## Watchouts
 
 - The grouped prefill optimization is WIP and must be kept; fix correctness issues inside it rather than reverting it wholesale.
-- Never collapse grouped prefill back to one `codebook_id`. Qwen35 MoE needs mixed gate/up and down native-VNNI formats.
+- Never collapse grouped prefill back to one `codebook_id`. Qwen35 MoE needs mixed gate/up and down native-quantised formats.
 - Do not confuse intra-run `cosine_drop` with current-versus-good regression deltas when comparing CSVs.
 - The final decode parity fix depends on both parts: mixed-codebook grouped prefill dispatch and the snapshot-build device-routed decode guard.
 - The build still emits a pre-existing GCC `StageBufferContract` inlining warning through `MoEExpertComputeStage::bufferContract()`. `get_errors` reported no editor diagnostics for the touched files.

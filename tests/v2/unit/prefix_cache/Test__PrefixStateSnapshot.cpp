@@ -7,6 +7,7 @@
  */
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -100,6 +101,49 @@ TEST(PrefixTerminalLogitsSlice, InvalidVocabularyOrStorageIsRejected)
     reject({max, 1}, {max, 1}, 4);
     reject({0, 8}, {max, 2}, 32);
     reject({0, max / sizeof(float) + 1}, {0, 1}, max - max % sizeof(float));
+}
+
+/** @brief Accepted row identity and vocabulary offset jointly select the live payload. */
+TEST(PrefixTerminalLogitsSlice, AcceptedVerifierRowSelectsExactVocabularyAndExcludesCapacity)
+{
+    constexpr size_t rows = 4, stride = 16, vocabulary = 11;
+    std::vector<float> producer(rows * stride, -777.0f);
+    for (size_t row = 0; row < rows; ++row)
+        for (size_t column = 0; column < vocabulary; ++column)
+            producer[row * stride + column] = static_cast<float>(100 * row + column);
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const PrefixLogitsRowSelection selection(row, rows, 17);
+        const auto slice = PrefixTerminalLogitsSlice::resolveSelectedRow(
+            {0, vocabulary}, {3, 5}, stride * sizeof(float), selection, 17);
+        EXPECT_EQ(slice.byteOffset(), (row * stride + 3) * sizeof(float));
+        EXPECT_EQ(slice.byteCount(), 5 * sizeof(float));
+        std::vector<float> canonical(5, -999.0f);
+        std::memcpy(canonical.data(), reinterpret_cast<const uint8_t *>(producer.data()) +
+                    slice.byteOffset(), slice.byteCount());
+        for (size_t column = 0; column < canonical.size(); ++column)
+            EXPECT_EQ(canonical[column], static_cast<float>(100 * row + 3 + column));
+    }
+    const auto local = PrefixTerminalLogitsSlice::resolveSelectedRow(
+        {37, 11}, {40, 5}, stride * sizeof(float), PrefixLogitsRowSelection(2, rows, 17), 17);
+    EXPECT_EQ(local.byteOffset(), (2 * stride + 3) * sizeof(float));
+}
+
+/** @brief Request reset/restore invalidates old selected rows before any payload read. */
+TEST(PrefixTerminalLogitsSlice, AcceptedVerifierRowRejectsStaleSessionAndInvalidGeometry)
+{
+    const PrefixLogitsRowSelection old_request(1, 2, 17);
+    EXPECT_THROW(PrefixTerminalLogitsSlice::resolveSelectedRow(
+        {0, 8}, {0, 8}, 32, old_request, 18), std::invalid_argument);
+    const auto new_request = PrefixTerminalLogitsSlice::resolveSelectedRow(
+        {0, 8}, {0, 8}, 32, PrefixLogitsRowSelection(0, 1, 18), 18);
+    EXPECT_EQ(new_request.byteOffset(), 0u);
+    EXPECT_THROW(PrefixLogitsRowSelection(0, 0, 17), std::invalid_argument);
+    EXPECT_THROW(PrefixLogitsRowSelection(2, 2, 17), std::invalid_argument);
+    constexpr size_t max = std::numeric_limits<size_t>::max();
+    EXPECT_THROW(PrefixTerminalLogitsSlice::resolveSelectedRow(
+        {0, 1}, {0, 1}, max - max % sizeof(float),
+        PrefixLogitsRowSelection(1, 2, 17), 17), std::invalid_argument);
 }
 
 /** @brief One pre-tail frontier preserves cache/routing alignment without overflow. */
@@ -477,6 +521,26 @@ TEST(Test__PrefixStateSnapshot, MoveLeavesSourceEmptyForNestedPayloadHandles)
     EXPECT_TRUE(assigned.device_sequence_state_checkpoints.front().valid());
     ASSERT_EQ(assigned.blocks.size(), 2u);
     EXPECT_EQ(assigned.blocks.back().hybrid_payload, source_block_payload);
+}
+
+/** @brief Snapshot copy/move preserves physical recurrence provenance beside every payload. */
+TEST(Test__PrefixStateSnapshot, RecurrenceFormatSurvivesSnapshotCopyAndMove)
+{
+    PrefixStateSnapshot snapshot;
+    snapshot.valid = true;
+    PrefixBlockHandle block;
+    block.layout.includes_hybrid_state = true;
+    block.layout.hybrid_device_state_bytes = 64 * 65 * sizeof(float);
+    block.layout.hybrid_state_bytes = block.layout.hybrid_device_state_bytes;
+    block.layout.hybrid_device_recurrence_layout =
+        GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    snapshot.blocks.push_back(block);
+    auto copy = snapshot;
+    PrefixStateSnapshot moved = std::move(copy);
+    ASSERT_EQ(moved.blocks.size(), 1u);
+    EXPECT_EQ(moved.blocks.front().layout, snapshot.blocks.front().layout);
+    EXPECT_EQ(moved.blocks.front().layout.hybrid_device_recurrence_layout,
+              GDNRecurrenceStateLayout::ValueMajorKeyContiguous);
 }
 
 } // namespace llaminar2

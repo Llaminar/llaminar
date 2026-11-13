@@ -19,9 +19,13 @@
  *   GraphSchema schema = Qwen2Schema::create(model_config);
  *   ResolvedGraphSpec resolved = resolver.resolve(schema, runtime_config);
  *   ComputeGraph graph = builder.build(resolved);
+ *
+ * Main KV coverage is a typed schema declaration; physical source eligibility
+ * and the complete original consumer grain are authenticated before assignment.
  */
 
 #pragma once
+#include "config/KVHeadCoverage.h"
 
 #include "../../../backends/DeviceId.h"
 #include "../../StageShardingMode.h"
@@ -414,6 +418,9 @@ namespace llaminar2
      */
     struct WeightShardingConfig
     {
+        /** Main attention consumer coverage; retained full-model families resolve separately. */
+        KVHeadCoveragePolicy main_kv_head_coverage = KVHeadCoveragePolicy::Legacy;
+
         /// Patterns evaluated in order (first match wins)
         std::vector<WeightShardingPattern> patterns;
 
@@ -766,6 +773,20 @@ namespace llaminar2
          * @return Vector of weight suffixes (e.g., "attn_q.weight", "attn_q.bias")
          */
         virtual std::vector<std::string> layerWeightSuffixes() const = 0;
+
+        /**
+         * @brief Required global operands that transform the residual into the vocabulary-head input.
+         *
+         * Both eager loading and frozen weight planning consume this model-owned
+         * inventory. Ordinary architectures use a final norm; branch-residual
+         * architectures declare their mixer operands instead. The vocabulary
+         * projection and its explicit tied-weight policy are planned separately.
+         * @return Stable canonical GGUF names owned by the terminal PP participant.
+         */
+        virtual std::vector<const char *> terminalInputWeightNames() const
+        {
+            return {"output_norm.weight"};
+        }
 
         /**
          * @brief Get the stop-thinking prompt for thinking budget enforcement

@@ -126,14 +126,14 @@ namespace llaminar2
                 std::shared_ptr<DiskPrefixStorageBackend> backend,
                 PrefixBlockHandle handle,
                 std::shared_ptr<PrefixArchiveReadInode> inode,
-                std::array<SectionSnapshot, 6> sections);
+                std::array<SectionSnapshot, 7> sections);
             /** @brief Close the retained inode before releasing the backend. */
             void release() noexcept;
 
             std::shared_ptr<DiskPrefixStorageBackend> backend_;
             PrefixBlockHandle handle_;
             std::shared_ptr<PrefixArchiveReadInode> inode_;
-            std::array<SectionSnapshot, 6> sections_{};
+            std::array<SectionSnapshot, 7> sections_{};
             enum class Phase { Captured, Selected, Consumed };
             Phase phase_ = Phase::Captured;
             PrefixPayloadReadSet read_set_ = PrefixPayloadReadSet::WholeArchive;
@@ -378,7 +378,7 @@ namespace llaminar2
             std::string model_artifact_identity,
             std::shared_ptr<PhysicalMemoryAuthority> memory_authority);
 
-        static constexpr size_t kSectionCount = 6;
+        static constexpr size_t kSectionCount = 7;
 
         /** @brief Serialized section geometry in the current published inode. */
         struct SectionIndex
@@ -387,10 +387,24 @@ namespace llaminar2
             uint64_t bytes = 0;
         };
 
-        /** @brief Journal put extent, immutable payload inode identity and logical recency. */
+        /** @brief Whether an indexed record may supply current runtime state. */
+        enum class RecordLayoutSupport
+        {
+            Supported,
+            UnsupportedCPUHost
+        };
+
+        /**
+         * @brief Journal extent, immutable payload identity and logical recency.
+         *
+         * Unsupported CPU encodings retain their original bounded metadata in
+         * this same journal extent. Compaction copies it verbatim; no lookup
+         * may hydrate it. Its payload remains under ordinary capacity eviction.
+         */
         struct RecordIndex
         {
             PrefixBlockHandle handle;
+            RecordLayoutSupport layout_support = RecordLayoutSupport::Supported;
             PrefixPayloadIdentity storage_identity;
             std::weak_ptr<PrefixArchiveReadInode> lookup_inode;
             uint64_t record_offset = 0;
@@ -524,8 +538,14 @@ namespace llaminar2
         uint64_t next_sequence_ = 1;
         uint64_t active_bytes_ = 0;
         uint64_t active_record_bytes_ = 0; ///< Live journal framing/metadata only, never payload capacity.
-        uint64_t archive_device_ = 0;
-        uint64_t archive_inode_ = 0;
+        /**
+         * @brief Retain exactly the metadata inode addressed by records_/scan_offset_.
+         *
+         * A cached dev/ino pair alone permits ABA after two peer compactions.
+         * This existing descriptor lease prevents inode recycling until refresh
+         * replaces the index. It retains no payload file or additional index.
+         */
+        std::shared_ptr<PrefixArchiveReadInode> archive_index_inode_;
         std::unordered_map<PrefixCacheKey, RecordIndex, PrefixCacheKeyHasher> records_;
         std::condition_variable_any compaction_changed_;
         CompactionStatus compaction_status_;

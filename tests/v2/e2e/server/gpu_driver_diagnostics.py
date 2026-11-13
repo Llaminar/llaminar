@@ -7,11 +7,13 @@ throughout that lifetime and appends observed records to a bounded-memory
 journal. Rotation after collection is harmless; loss between observations,
 unreadable diagnostics or a retired collector cannot produce a certificate. This observer reads the serving host's shared kernel; it
 does not clear logs, change driver settings, or participate in inference.
+Actual AMD/KFD kernel wait frames also count as driver diagnostics even when
+Linux's hung-task reporter publishes every frame at informational priority.
 """
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 import json
 import math
@@ -60,6 +62,10 @@ class KernelRecord:
     pri: str
     msg: str
 
+    def to_dict(self) -> dict:
+        """Preserve the journal schema without deep-copying immutable fields."""
+        return {"time": self.time, "fac": self.fac, "pri": self.pri, "msg": self.msg}
+
     @classmethod
     def parse(cls, value: dict) -> KernelRecord:
         """Reject malformed records instead of silently dropping diagnostics."""
@@ -85,6 +91,13 @@ _DRIVER = re.compile(r"\b(?:amdgpu|amdkfd|kfd|nvrm|nvidia(?:[-_](?:uvm|modeset|d
 _PROBLEM = re.compile(
     r"\b(?:warn(?:ing)?|error|fault|fail(?:ed|ure)?|timeout|timed out|overflow|"
     r"reset(?:ting)?|fallen off|xid)\b|callbacks suppressed|hogged CPU", re.I)
+# These are actual backtrace frames from the blocked GPU clock/mapping path,
+# not driver startup prose or an unrelated task's generic dma-fence wait. Linux
+# emits them separately from the hung-task heading, often all at INFO priority.
+_GPU_KERNEL_WAIT_FRAME = re.compile(
+    r"^\s*(?:\?\s*)?(?:__pfx_)?(?:kfd_ioctl_get_clock_counters|"
+    r"amdgpu_amdkfd_gpuvm_sync_memory|kfd_ioctl_map_memory_to_gpu)"
+    r"\+0x[0-9a-f]+/0x[0-9a-f]+\s+\[amdgpu\](?:\s|$)", re.I | re.M)
 _BAD_PRIORITIES = {"emerg", "alert", "crit", "err", "warn", "warning"}
 _BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 
@@ -92,12 +105,14 @@ _BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 def driver_diagnostic(record: KernelRecord) -> bool:
     """Recognize driver severity and faults that some drivers log at INFO.
 
-    NVIDIA Xid, AMD IH overflow and SVM workqueue warnings must not depend on
-    printk priority being correct. Conversely a generic backtrace's module
+    NVIDIA Xid, AMD IH overflow, SVM workqueue warnings and actual KFD blocked
+    kernel frames must not depend on printk priority being correct. Conversely a generic backtrace's module
     inventory does not attribute an unrelated kernel warning to every driver.
     """
     if record.fac != "kern" or record.msg.startswith("Modules linked in:"):
         return False
+    if _GPU_KERNEL_WAIT_FRAME.search(record.msg):
+        return True
     attributed = _DRIVER.search(record.msg) or re.search(
         r"\b\w*ih_get_wptr:.*callbacks suppressed", record.msg, re.I)
     return bool(attributed and (record.pri in _BAD_PRIORITIES or _PROBLEM.search(record.msg)))
@@ -157,8 +172,12 @@ def new_records(checkpoint: dict, after: KernelSnapshot) -> tuple[KernelRecord, 
     cursor = tuple(KernelRecord.parse(row) for row in checkpoint.get("cursor", []))
     if not cursor:
         raise ValueError("Driver checkpoint has no retained-log cursor")
+    # Timestamp equality cheaply excludes impossible anchors. It never orders
+    # or discards records: equal stamps still require the entire exact cursor,
+    # and every candidate is checked so duplicate cursors remain fatal.
     matches = [index + len(cursor) for index in range(len(after.records) - len(cursor) + 1)
-               if after.records[index:index + len(cursor)] == cursor]
+               if after.records[index].time == cursor[0].time and
+               after.records[index:index + len(cursor)] == cursor]
     if len(matches) != 1:
         raise ValueError("Kernel log cursor lost or ambiguous: ring wrapped/cleared; cannot certify cell")
     return after.records[matches[0]:]
@@ -256,7 +275,6 @@ def collect(state: Path) -> bool:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as control:
             control.bind(address)
-            control.settimeout(_POLL_SECONDS)
             stream = journal.open('xb')
             journal_line(stream, {'kind': 'begin', 'schema': 2,
                 **{key: saved[key] for key in ('window_id', 'boot_id', 'reader', 'reader_container')},
@@ -271,12 +289,12 @@ def collect(state: Path) -> bool:
                 snapshots += 1
                 for row in rows:
                     count += 1
-                    journal_line(stream, {'kind': 'record', 'ordinal': count, **asdict(row)})
+                    journal_line(stream, {'kind': 'record', 'ordinal': count, **row.to_dict()})
                     if driver_diagnostic(row):
                         findings_count += 1
                         if len(findings) < _FINDING_PREVIEW:
-                            findings.append(asdict(row))
-                cursor = [asdict(row) for row in after.records[-8:]]
+                            findings.append(row.to_dict())
+                cursor = [row.to_dict() for row in after.records[-8:]]
                 stream.flush()
                 if closing:
                     complete = True
@@ -284,9 +302,13 @@ def collect(state: Path) -> bool:
                 if saved['state'] == 'starting':
                     saved = {**saved, 'state': 'armed'}
                     publish(state, saved)
+                # Drain busy rings immediately while still accepting an
+                # already-buffered close. Idle rings retain the bounded
+                # wait; closure always causes the fresh final read above.
+                control.settimeout(0.0 if rows else _POLL_SECONDS)
                 try:
                     raw = control.recv(4097)
-                except socket.timeout:
+                except (socket.timeout, BlockingIOError):
                     continue
                 if len(raw) > 4096 or json.loads(raw) != {
                         'action': 'close', 'window_id': saved['window_id']}:
@@ -326,7 +348,7 @@ def begin(state: Path) -> None:
     admission = {'schema': 2, 'state': 'starting', 'window_id': uuid.uuid4().hex,
         'boot_id': snapshot.boot_id, 'reader': snapshot.reader.value,
         'reader_container': snapshot.container, 'owner': owner,
-        'cursor': [asdict(row) for row in snapshot.records[-8:]]}
+        'cursor': [row.to_dict() for row in snapshot.records[-8:]]}
     state.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation claims the lifetime before any daemon is started.
     descriptor = os.open(state, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -363,9 +385,12 @@ def begin(state: Path) -> None:
 def inspect_journal(directory: Path, evidence: dict) -> None:
     """Stream and authenticate every retained record before admitting evidence.
 
-    The journal proves its exact boot/window, all record ordinals, both ends and
-    the terminal cursor. GPU findings are recomputed from the retained records;
-    neither a stale summary nor truncating a log can produce a clean receipt.
+    The journal proves its exact boot/window, all publication ordinals, both
+    ends and the terminal cursor. Kernel event timestamps are observations, not
+    publication sequence numbers: concurrent records can publish with decreasing
+    timestamps. Keep their original order and authenticate it through the cursor.
+    GPU findings are recomputed from every retained record; neither a stale
+    summary nor truncating a log can produce a clean receipt.
     """
     name = evidence.get('journal')
     if not isinstance(name, str) or Path(name).name != name or name in ('', '.', '..'):
@@ -396,19 +421,17 @@ def inspect_journal(directory: Path, evidence: dict) -> None:
                 if type(row.get('ordinal')) is not int or row['ordinal'] != count:
                     raise ValueError("Missing or reordered driver journal records")
                 record = KernelRecord.parse(row)
-                if record.time < cursor[-1].time:
-                    raise ValueError("Driver journal timestamps moved backwards")
                 cursor = (cursor + [record])[-8:]
                 if driver_diagnostic(record):
                     finding_count += 1
                     if len(findings) < _FINDING_PREVIEW:
-                        findings.append(asdict(record))
+                        findings.append(record.to_dict())
             elif row.get('kind') == 'end':
                 if (row.get('window_id') != evidence.get('window_id') or row.get('complete') is not True or
                         type(row.get('new_record_count')) is not int or row['new_record_count'] != count or
                         type(row.get('snapshot_count')) is not int or row['snapshot_count'] < 2 or
                         row['snapshot_count'] != evidence.get('snapshot_count') or
-                        row.get('cursor') != [asdict(value) for value in cursor]):
+                        row.get('cursor') != [value.to_dict() for value in cursor]):
                     raise ValueError("Incomplete or mismatched driver journal closure")
                 footer = row
             else:

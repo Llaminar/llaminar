@@ -9,17 +9,22 @@
  * that no native collective can span, uses the captured mapped sparse fabric.
  * The decision is made once before graph construction and becomes part of the
  * declarative graph contract; replay never probes topology or changes paths.
+ * An explicit startup diagnostic can select ordinary-prefill transport only;
+ * it preserves actual topology and the default decode/MTP policy.
  */
 
 #pragma once
 
 #include "backends/DeviceId.h"
 #include "backends/PeerAccessCoverage.h"
+#include "utils/DebugEnv.h"
 
 #include <cstddef>
+#include <initializer_list>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -229,6 +234,135 @@ namespace llaminar2
                 MoEOverlayNodeLocalRouteTransport::NativeCollective,
             .decode = MoEOverlayNodeLocalRouteTransport::NativeCollective,
         };
+    }
+
+    /** Startup-only diagnostic key; copied into the typed graph policy once. */
+    inline constexpr const char *kMoEOverlayDiagnosticPrefillTransportEnv =
+        "LLAMINAR_DIAGNOSTIC_MOE_PREFILL_ROUTE_TRANSPORT";
+
+    /**
+     * @brief Parse an explicit diagnostic without inferring a transport on errors.
+     * @param value Original DebugEnv lookup; nullptr means no diagnostic request.
+     * @return Owning enum value, independent of subsequent environment changes.
+     * @throws std::invalid_argument for empty, unknown, or noncanonical values.
+     */
+    [[nodiscard]] inline std::optional<MoEOverlayNodeLocalRouteTransport>
+    parseMoEOverlayDiagnosticPrefillTransport(const char *value)
+    {
+        if (!value)
+            return std::nullopt;
+        const std::string_view name(value);
+        if (name == "native_collective")
+            return MoEOverlayNodeLocalRouteTransport::NativeCollective;
+        if (name == "mapped_sparse")
+            return MoEOverlayNodeLocalRouteTransport::MappedSparse;
+        throw std::invalid_argument(
+            "LLAMINAR_DIAGNOSTIC_MOE_PREFILL_ROUTE_TRANSPORT requires "
+            "native_collective or mapped_sparse (ordinary prefill only)");
+    }
+
+    /** @brief Resolve the startup diagnostic once, shared by hardware binding and runtime validation.
+     * @return Immutable typed process-startup choice; later environment edits cannot rewrite admission.
+     */
+    [[nodiscard]] inline const std::optional<MoEOverlayNodeLocalRouteTransport>&
+    resolvedMoEOverlayDiagnosticPrefillTransport() {
+        static const auto selected = parseMoEOverlayDiagnosticPrefillTransport(
+            DebugEnv::envValue(kMoEOverlayDiagnosticPrefillTransportEnv));
+        return selected;
+    }
+
+    /**
+     * @brief Validate support independently of the conservative default policy.
+     * @param devices Actual continuation GPU endpoints; no topology is fabricated.
+     * @param coverage Original driver matrix for a homogeneous cell.
+     * @param policy Complete transport policy to embed before graph construction.
+     * @throws std::invalid_argument for unsupported or incomplete configurations.
+     *
+     * A homogeneous native communicator supports host transport even without a
+     * peer edge; P2P describes the default economy choice, not native capability.
+     * A mixed-vendor cell cannot construct one native communicator in either phase.
+     */
+    inline void validateMoEOverlayNodeLocalRouteTransportPolicy(
+        std::span<const DeviceId> devices,
+        std::optional<PeerAccessCoverage> coverage,
+        MoEOverlayNodeLocalRouteTransportPolicy policy)
+    {
+        // Reuse the source-owned endpoint/matrix validation without equating
+        // functional support with that selector's conservative default result.
+        (void)selectMoEOverlayNodeLocalRouteTransportPolicy(devices, coverage);
+        const bool homogeneous = coverage.has_value();
+        for (const auto transport : {policy.ordinary_prefill, policy.decode})
+        {
+            if (transport != MoEOverlayNodeLocalRouteTransport::MappedSparse &&
+                transport != MoEOverlayNodeLocalRouteTransport::NativeCollective)
+                throw std::invalid_argument("MoE route transport policy must be fully resolved");
+            if (!homogeneous && transport == MoEOverlayNodeLocalRouteTransport::NativeCollective)
+                throw std::invalid_argument("NativeCollective MoE route transport cannot span CUDA and ROCm");
+        }
+    }
+
+    /**
+     * @brief Authenticate the actual continuation owner without restricting auxiliary ranks.
+     * @param local_devices This Rank's actual context endpoints.
+     * @param continuation_devices Original globally declared continuation endpoints.
+     * @param rank_local_tp Whether this Rank can lower one local TP continuation.
+     * @return True only for the exact continuation cell; disjoint expert cells return false.
+     * @throws std::invalid_argument for a partial or unsupported continuation owner.
+     *
+     * CPU and separate whole-expert ranks legitimately carry the original global
+     * overlay plan. Their local layout does not decide continuation transport.
+     * A Rank that actually claims a continuation endpoint must own the complete
+     * cell and its local-TP lowering; silently ignoring that request is invalid.
+     */
+    [[nodiscard]] inline bool validateMoEOverlayDiagnosticPrefillTransportOwner(
+        std::span<const DeviceId> local_devices,
+        std::span<const DeviceId> continuation_devices,
+        bool rank_local_tp)
+    {
+        if (continuation_devices.size() < 2u)
+            throw std::invalid_argument("Diagnostic MoE transport requires at least two GPU continuation endpoints");
+        bool claims_continuation = false;
+        bool exact_cell = local_devices.size() == continuation_devices.size();
+        for (std::size_t index = 0; index < continuation_devices.size(); ++index)
+        {
+            const auto endpoint = continuation_devices[index];
+            if (!endpoint.is_gpu())
+                throw std::invalid_argument("Diagnostic MoE transport requires GPU continuation endpoints");
+            for (std::size_t prior = 0; prior < index; ++prior)
+                if (continuation_devices[prior] == endpoint)
+                    throw std::invalid_argument("Diagnostic MoE continuation endpoints must be distinct");
+            std::size_t matches = 0;
+            for (const auto local : local_devices)
+                matches += local == endpoint;
+            claims_continuation = claims_continuation || matches != 0u;
+            exact_cell = exact_cell && matches == 1u;
+        }
+        if (!claims_continuation)
+            return false;
+        if (!exact_cell || !rank_local_tp)
+            throw std::invalid_argument("Diagnostic MoE transport requires its complete rank-local TP continuation owner");
+        return true;
+    }
+
+    /**
+     * @brief Freeze a diagnostic ordinary-prefill choice while retaining decode policy.
+     * @param devices Actual continuation endpoints.
+     * @param coverage Original homogeneous driver coverage, or absent for mixed vendors.
+     * @param diagnostic Explicit parsed setting; absent preserves production defaults.
+     * @return Complete phase-aware policy; decode/MTP always keep the driver default.
+     * @throws std::invalid_argument when the requested transport is unsupported.
+     */
+    [[nodiscard]] inline MoEOverlayNodeLocalRouteTransportPolicy
+    selectMoEOverlayDiagnosticPrefillTransportPolicy(
+        std::span<const DeviceId> devices,
+        std::optional<PeerAccessCoverage> coverage,
+        std::optional<MoEOverlayNodeLocalRouteTransport> diagnostic)
+    {
+        auto policy = selectMoEOverlayNodeLocalRouteTransportPolicy(devices, coverage);
+        if (diagnostic)
+            policy.ordinary_prefill = *diagnostic;
+        validateMoEOverlayNodeLocalRouteTransportPolicy(devices, coverage, policy);
+        return policy;
     }
 
     /**

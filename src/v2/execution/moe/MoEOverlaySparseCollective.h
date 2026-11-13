@@ -29,6 +29,8 @@
 
 namespace llaminar2
 {
+    namespace cpu::moe { struct CanonicalShardRouteRecordArgs; }
+    enum class ForwardGraphSubmissionIntent : uint8_t;
     class IBackend;
     class IDeviceContext;
     class IMPIContext;
@@ -148,6 +150,36 @@ namespace llaminar2
             MoEOverlayDispatchTicketStorage &&) = delete;
 
         /**
+         * @brief Preserve the original forward construction purpose for this ticket.
+         *
+         * WorkspaceDeclaration stores immutable geometry only: no native arena
+         * slice, payload or publication word is created. Such a declaration is
+         * never an executable binding and cannot later be rebound in place.
+         * Execute and MaterializeExecutableWithoutLaunch use the original binder.
+         * @param intent Original scoped ForwardInput construction intent.
+         * @param layer_idx Exact source layer.
+         * @param bucket_rows Positive physical row capacity.
+         * @param top_k Routes per row.
+         * @param d_model FP32 hidden/return width.
+         * @param source_device Original CPU/GPU publisher.
+         * @param workspace_generation Positive captured workspace identity.
+         * @param mapped_arena Exact GPU arena; unused for declaration-only geometry.
+         * @param captured_request_epoch Original immutable epoch pointer, if present.
+         * @throws std::invalid_argument For unknown purpose or invalid geometry.
+         * @throws std::logic_error For a second declaration or binding.
+         */
+        void bindForGraphConstruction(ForwardGraphSubmissionIntent intent,
+            int layer_idx, int bucket_rows, int top_k, int d_model,
+            DeviceId source_device, uint64_t workspace_generation,
+            std::shared_ptr<MappedHostTransferArena> mapped_arena = nullptr,
+            const DeviceMoEOverlayEpochTicket *captured_request_epoch = nullptr);
+
+        /** @return A bound identity or an explicitly typed non-executable declaration. */
+        [[nodiscard]] bool hasValidConstructionIdentity() const noexcept;
+        /** @return Whether the original purpose permanently forbids execution. */
+        [[nodiscard]] bool isWorkspaceDeclaration() const noexcept;
+
+        /**
          * @brief Bind the ticket's complete fixed-capacity capture identity.
          * @param layer_idx Model layer owning this publication.
          * @param bucket_rows Captured physical row capacity.
@@ -185,8 +217,10 @@ namespace llaminar2
         bool isBound() const noexcept { return allocation_ != nullptr; }
         const DeviceId &sourceDevice() const noexcept { return source_device_; }
         size_t allocationBytes() const noexcept { return allocation_bytes_; }
-        MoEOverlayDispatchTicket &ticket() noexcept { return ticket_; }
-        const MoEOverlayDispatchTicket &ticket() const noexcept { return ticket_; }
+        /** @return The physical ticket; declaration-only access is a fatal contract error. */
+        MoEOverlayDispatchTicket &ticket();
+        /** @return The physical ticket; declaration-only access is a fatal contract error. */
+        const MoEOverlayDispatchTicket &ticket() const;
         /** @brief Validate mutable host memory against the separately retained binding identity. */
         bool hasValidBoundIdentity() const noexcept;
 
@@ -271,6 +305,8 @@ namespace llaminar2
         uint64_t workspace_generation_ = 0;
         std::vector<std::max_align_t> cpu_storage_;
         MoEOverlayDispatchTicket ticket_;
+        /** Original immutable setup purpose; absence means never declared/bound. */
+        std::optional<ForwardGraphSubmissionIntent> construction_intent_;
     };
 
     /**
@@ -286,6 +322,16 @@ namespace llaminar2
     class MoEOverlayCanonicalRouteReturnTicketStorage final
     {
     public:
+        /** @brief Exact immutable canonical ticket metadata layout. */
+        struct MetadataLayout { size_t bytes, original_route_slots_offset, compact_route_slots_offset; };
+        /**
+         * @brief Declare the same original offsets used by physical binding.
+         * @param route_capacity Positive original route capacity.
+         * @return Exact payload bytes and original/compact map offsets.
+         * @throws std::invalid_argument For zero capacity.
+         * @throws std::overflow_error For unrepresentable metadata.
+         */
+        static MetadataLayout metadataLayout(size_t route_capacity);
         /**
          * @brief Move-only CPU ownership of one unpublished ticket payload.
          *
@@ -322,6 +368,15 @@ namespace llaminar2
              * @return False for invalid ownership, capacity, or sequence state.
              */
             bool publish(size_t live_entry_count) noexcept;
+
+            /**
+             * @brief Authenticate this exact armed sequence and residency epoch before payload writes.
+             * @param storage Original bound ticket owner.
+             * @param residency_epoch Consumed sparse packet's immutable epoch.
+             * @return True only for this still-armed producer and exact nonzero epoch.
+             */
+            [[nodiscard]] bool authorizes(const MoEOverlayCanonicalRouteReturnTicketStorage& storage,
+                                          uint64_t residency_epoch) const noexcept;
 
             /** @return Whether this lease belongs to @p storage. */
             [[nodiscard]] bool belongsTo(
@@ -360,6 +415,29 @@ namespace llaminar2
             MoEOverlayCanonicalRouteReturnTicketStorage &&) = delete;
         MoEOverlayCanonicalRouteReturnTicketStorage &operator=(
             MoEOverlayCanonicalRouteReturnTicketStorage &&) = delete;
+
+        /**
+         * @brief Declare or physically bind the original canonical return ticket.
+         * @param intent Original scoped forward construction intent.
+         * @param layer_idx Exact source layer.
+         * @param route_capacity Immutable original/compact slot capacity.
+         * @param d_model FP32 row width.
+         * @param continuation_device Original local GPU consumer.
+         * @param workspace_generation Positive captured workspace identity.
+         * @param contribution_region Existing admitted serial contribution bank.
+         * @param metadata_arena Exact GPU metadata arena, unused for WorkspaceDeclaration.
+         * @throws std::invalid_argument For unknown purpose or invalid original geometry.
+         * @throws std::logic_error For a second declaration/binding.
+         */
+        void bindForGraphConstruction(ForwardGraphSubmissionIntent intent,
+            int layer_idx, size_t route_capacity, int d_model,
+            DeviceId continuation_device, uint64_t workspace_generation,
+            std::shared_ptr<MappedHostTransferRegion> contribution_region,
+            std::shared_ptr<MappedHostTransferArena> metadata_arena);
+        /** @return A bound identity or an explicitly typed non-executable declaration. */
+        [[nodiscard]] bool hasValidConstructionIdentity() const noexcept;
+        /** @return Whether this original construction purpose forbids execution. */
+        [[nodiscard]] bool isWorkspaceDeclaration() const noexcept;
 
         /**
          * @brief Bind immutable layer geometry and the serial CPU contribution arena.
@@ -501,7 +579,99 @@ namespace llaminar2
         uint64_t workspace_generation_ = 0u;
         uint64_t armed_sequence_ = 0u;
         ProducerLifecycle producer_lifecycle_ = ProducerLifecycle::Unbound;
+        /** Original immutable setup purpose; never an executable capability. */
+        std::optional<ForwardGraphSubmissionIntent> construction_intent_;
     };
+
+    struct MoEOverlaySparseRows;
+    /** @brief Which original source-owned row coordinate indexes unweighted CPU values. */
+    enum class MoEOverlayCanonicalRouteSourceIndex : uint8_t {
+        CompactRouteSlot, ///< Packet compact slots retain the original router's top-k stride.
+        OriginalRouteSlot, ///< Joint fragments combine in original router-slot order before weighting.
+    };
+    /**
+     * @brief Immutable source-coordinate mapping for one CPU route publication.
+     *
+     * Local expert execution can narrow its row width without changing packet
+     * coordinates. Carry that width explicitly; neither allocation capacity nor
+     * the packet's top-k describes the local compute layout in that case.
+     */
+    class MoEOverlayCanonicalRouteSourceLayout final {
+    public:
+        /** @return Source rows addressed by the original router's flat slots. */
+        static MoEOverlayCanonicalRouteSourceLayout originalSlots() noexcept;
+        /** @return Source rows already addressed by packet compact slots. */
+        static MoEOverlayCanonicalRouteSourceLayout compactSlots() noexcept;
+        /**
+         * @brief Describe local compute rows with a narrower live route stride.
+         * @param route_width Exact execution top-k used by the producer.
+         * @return Mapping from packet compact coordinates to those compute rows.
+         * @throws std::invalid_argument If the execution width is zero.
+         */
+        static MoEOverlayCanonicalRouteSourceLayout compactExecutionRows(size_t route_width);
+        /** @return Whether the execution width fits this original packet's top-k. */
+        bool compatibleWith(int packet_top_k) const noexcept;
+        /**
+         * @brief Resolve an authenticated packet entry's unweighted source row.
+         * @param original_slot Original router coordinate for this entry.
+         * @param compact_slot Packet compact coordinate, using packet_top_k.
+         * @param packet_top_k Original dispatch packet row stride.
+         * @return Actual source row, or absence for invalid geometry/coordinates.
+         */
+        std::optional<size_t> rowIndex(int32_t original_slot, int32_t compact_slot,
+            int packet_top_k) const noexcept;
+    private:
+        /** @brief Construct only through the named original/compact layout factories. */
+        MoEOverlayCanonicalRouteSourceLayout(MoEOverlayCanonicalRouteSourceIndex index,
+            size_t execution_width) noexcept : index_(index), execution_width_(execution_width) {}
+        MoEOverlayCanonicalRouteSourceIndex index_;
+        size_t execution_width_; ///< Zero denotes an unchanged flat packet coordinate.
+    };
+    /**
+     * @brief Apply each original router weight once into a disjoint original route matrix.
+     * @param original Complete consumed original sparse packet; no routing is reconstructed.
+     * @param unweighted_rows Actual persistent FP32 source extent.
+     * @param source_layout Exact source row coordinate and execution stride.
+     * @param weighted_rows Actual persistent FP32 destination extent.
+     * @param destination_index Existing ticket/return coordinate, never allocation capacity as traffic.
+     * @return False without publication for invalid complete prefix, overlap, extent or values.
+     */
+    bool preweightMoEOverlayCanonicalRouteRows(const MoEOverlaySparseRows& original,
+        std::span<const float> unweighted_rows,MoEOverlayCanonicalRouteSourceLayout source_layout,
+        std::span<float> weighted_rows,MoEOverlayCanonicalRouteSourceIndex destination_index) noexcept;
+
+    /**
+     * @brief Preweight original route rows once and publish through the existing mapped ticket.
+     * @param ticket Original bound canonical ticket; never rebound or replaced here.
+     * @param publication Its already-armed original producer lease.
+     * @param original Complete consumed original sparse packet.
+     * @param unweighted_rows Persistent source-owned FP32 route matrix, with a whole-row extent.
+     * @param source_layout Exact immutable coordinate and stride of those source rows.
+     * @return False before publication for invalid identity, extent, prefix or nonfinite values.
+     * @note The complete prefix is validated before writes; GPU visibility transfers only through Publication::publish.
+     */
+    bool publishMoEOverlayCanonicalRouteRows(MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& original,std::span<const float> unweighted_rows,
+        MoEOverlayCanonicalRouteSourceLayout source_layout) noexcept;
+
+    /**
+     * @brief Combine original CPU fragments and preweight the original ticket in one workshare.
+     * @param ticket Existing mapped continuation ticket, never rebound here.
+     * @param publication Its exact armed epoch/sequence producer lease.
+     * @param original Complete authenticated consumed sparse packet.
+     * @param records Original completed gather and persistent raw combined output.
+     * @return False before payload mutation for invalid lease, geometry, aliases or records.
+     * @note Ascending participant FP32 addition finishes before one separate multiplication.
+     * Both original raw output and compact weighted ticket remain populated.
+     * The existing finite-value diagnostic can reject after computation, but
+     * never releases that failed payload to a captured consumer.
+     */
+    bool combineAndPublishMoEOverlayCanonicalShardRouteRows(
+        MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& original,
+        const cpu::moe::CanonicalShardRouteRecordArgs& records) noexcept;
 
     enum class MoEOverlayCollectiveDirection : uint8_t
     {
@@ -674,6 +844,17 @@ namespace llaminar2
         int32_t *row_ids_host = nullptr;
         float *output_rows_fp32 = nullptr;
     };
+
+    /**
+     * @brief Copy only live original unweighted route rows into a CPU canonical return packet.
+     * @param input Original authenticated sparse dispatch, in increasing original-route order.
+     * @param unweighted Original-slot-indexed result of the fixed participant-order fragment combine.
+     * @param output Original admitted CPU return bank; no capacity tail is published.
+     * @return False before writes for malformed metadata, capacity, alias or nonfinite route weights.
+     * Weighting remains the continuation's one ordered-FMA fold, after its original native root return.
+     */
+    bool copyMoEOverlayCanonicalRouteRowsToHostReturn(const MoEOverlaySparseRows& input,
+        std::span<const float> unweighted,MoEOverlayReturnRows& output) noexcept;
 
     struct MoEOverlaySparseTransferCounters
     {

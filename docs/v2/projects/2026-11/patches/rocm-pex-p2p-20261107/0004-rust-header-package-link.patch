@@ -1,0 +1,11 @@
+--- a/debian/rules.d/2-binary-arch.mk
++++ b/debian/rules.d/2-binary-arch.mk
+@@ -492,7 +492,7 @@
+ 	install -d -m755 $(rustdir)
+ 	mv $(hdrdir)/rust $(rustdir)
+ 	# Generate symlink for Rust lib directory in headers
+-	$(SHELL) debian/scripts/link-lib-rust "$(hdrdir)" "$(indeppkg)" "$*"
++	$(SHELL) debian/scripts/link-lib-rust "$(hdrdir)" "$(baserustpkg)" "$*"
+ endif
+ 
+ ifneq ($(do_full_build),false)

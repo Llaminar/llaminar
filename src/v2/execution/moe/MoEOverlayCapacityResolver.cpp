@@ -4,8 +4,9 @@
  *
  * All arithmetic in this file is setup-time and fail-closed.  The implementation
  * mirrors the allocation layouts used by CpuExpertSlotPool and
- * GpuExpertSlotPool, then admits logical residents one at a time while charging
- * their actual physical copy multiplicity.  No runtime allocator or backend is
+ * GpuExpertSlotPool. Mandatory consecutive quotas use exact monotone prefix
+ * arithmetic; preferred multi-tier fill retains its one-at-a-time order. Both
+ * charge the actual physical copy multiplicity.  No runtime allocator or backend is
  * consulted, which keeps the same decision reproducible on every MPI rank.
  * Pipeline stages share the same typed physical BOM throughout admission;
  * compact stage quota/count metadata never becomes an independent byte budget.
@@ -70,6 +71,7 @@ namespace llaminar2
             const MoEOverlayTierCapacityRequest *request = nullptr;
             MoEOverlayResolvedTierCapacity output;
             std::vector<MoEOverlayPreparedExpertFootprint> movable_footprints;
+            std::vector<std::vector<MoEOverlayPreparedExpertFootprint>> fragment_footprints;
         };
 
         [[nodiscard]] std::size_t resourceUsed(
@@ -202,14 +204,20 @@ namespace llaminar2
                 throw std::logic_error(
                     "ExpertOverlay shadow geometry and footprint inventories disagree");
             }
-            std::map<ExpertPreparedTripletGeometryKey, std::vector<std::size_t>>
-                layers_by_geometry;
-            for (std::size_t layer = 0; layer < manifest.size(); ++layer)
-                layers_by_geometry[geometryKey(manifest[layer])].push_back(layer);
-
             std::map<std::string, std::size_t> charges;
-            for (const auto &participant : tier.request->participants)
+            for (std::size_t member = 0; member < tier.request->participants.size(); ++member)
             {
+                const auto &participant = tier.request->participants[member];
+                std::map<ExpertPreparedTripletGeometryKey, std::vector<std::size_t>> layers_by_geometry;
+                for (std::size_t layer = 0; layer < manifest.size(); ++layer)
+                {
+                    // A cohort's inactive root stores only this member's actual
+                    // source rectangle. Group the SAME shapes used by physical
+                    // fabric pools; full expert capacity is not a shard reserve.
+                    const auto local = tier.request->copy_policy == MoEOverlayTierCopyPolicy::TensorSharded
+                        ? tier.request->shard_cohorts.at(layer)->localManifest(member) : manifest[layer];
+                    layers_by_geometry[geometryKey(local)].push_back(layer);
+                }
                 const auto found = resource_index.find(participant.resource_id);
                 if (found == resource_index.end())
                     throw std::logic_error("Validated ExpertOverlay resource disappeared");
@@ -232,7 +240,9 @@ namespace llaminar2
                     const std::size_t bytes = checkedMultiply(
                         slots,
                         footprintFor(
-                            footprints[layers.front()],
+                            tier.request->copy_policy == MoEOverlayTierCopyPolicy::TensorSharded
+                                ? tier.fragment_footprints.at(member).at(layers.front())
+                                : footprints[layers.front()],
                             device,
                             /*shadow=*/true),
                         "tier shared-geometry shadow slots");
@@ -253,7 +263,8 @@ namespace llaminar2
             std::map<std::string, std::size_t> charges;
             const int quota =
                 tier.output.live_experts_per_layer[static_cast<std::size_t>(layer_idx)];
-            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated)
+            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated &&
+                tier.request->copy_policy != MoEOverlayTierCopyPolicy::TensorSharded)
             {
                 const std::size_t participant_index =
                     static_cast<std::size_t>(quota) %
@@ -268,11 +279,14 @@ namespace llaminar2
                 return charges;
             }
 
-            for (const auto &participant : tier.request->participants)
+            for (std::size_t p=0;p<tier.request->participants.size();++p)
             {
+                const auto& participant=tier.request->participants[p];
                 const auto resource = resource_index.at(participant.resource_id);
                 const std::size_t bytes = footprintFor(
-                    footprints[static_cast<std::size_t>(layer_idx)],
+                    tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded
+                        ? tier.fragment_footprints.at(p).at(static_cast<std::size_t>(layer_idx))
+                        : footprints[static_cast<std::size_t>(layer_idx)],
                     resources[resource].memory.build().resource().device,
                     /*shadow=*/false);
                 charges[participant.resource_id] = checkedAdd(
@@ -333,7 +347,8 @@ namespace llaminar2
             const int previous_quota = tier.output.live_experts_per_layer[layer];
             ++tier.output.live_experts_per_layer[layer];
             tier.output.has_live_residency = true;
-            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated)
+            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated &&
+                tier.request->copy_policy != MoEOverlayTierCopyPolicy::TensorSharded)
             {
                 const std::size_t participant =
                     static_cast<std::size_t>(previous_quota) %
@@ -352,6 +367,109 @@ namespace llaminar2
                 }
             }
             return true;
+        }
+
+        /**
+         * @brief Count one participant's visits in the unchanged cyclic logical-expert sequence.
+         * @param participant Original participant position, never a physical ordinal.
+         * @param participants Positive authored participant count.
+         * @param previous Existing logical quota, which fixes the next original owner.
+         * @param copies Consecutive logical additions from that exact cursor.
+         * @return Exact visits including a partial final cycle.
+         */
+        [[nodiscard]] std::size_t prefixVisits(std::size_t participant, std::size_t participants,
+            int previous, int copies)
+        {
+            const auto offset=static_cast<std::size_t>(previous)%participants;
+            const auto distance=participant>=offset?participant-offset:participants-(offset-participant);
+            return static_cast<std::size_t>(copies)/participants+
+                (distance<static_cast<std::size_t>(copies)%participants?1u:0u);
+        }
+
+        /**
+         * @brief Form exact charges for a consecutive prefix without changing any authority.
+         * @return Charges, or absence when their mathematical sum exceeds size_t and therefore cannot fit.
+         *
+         * A one-copy call is validated separately by nextLiveCharges, retaining
+         * its original overflow errors. Larger unrepresentable prefixes cannot
+         * fit any size_t physical budget; they are not committed or rounded.
+         */
+        [[nodiscard]] std::optional<std::map<std::string,std::size_t>> prefixLiveCharges(
+            const TierState &tier,int layer,int copies,
+            const std::unordered_map<std::string,std::size_t> &resource_index,
+            const std::vector<ResourceState> &resources)
+        {
+            std::map<std::string,std::size_t> charges;
+            const auto count=tier.request->participants.size();
+            const int previous=tier.output.live_experts_per_layer[static_cast<std::size_t>(layer)];
+            const bool replicated=tier.request->copy_policy==MoEOverlayTierCopyPolicy::Replicated ||
+                tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded;
+            for(std::size_t participant=0;participant<count;++participant)
+            {
+                const auto visits=replicated?static_cast<std::size_t>(copies):prefixVisits(participant,count,previous,copies);
+                if(!visits)continue;
+                const auto &endpoint=tier.request->participants[participant];
+                const auto &footprint=tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded
+                    ?tier.fragment_footprints.at(participant).at(static_cast<std::size_t>(layer))
+                    :tier.movable_footprints.at(static_cast<std::size_t>(layer));
+                const auto bytes=footprintFor(footprint,resources[resource_index.at(endpoint.resource_id)].memory.build().resource().device,false);
+                if(bytes && visits>std::numeric_limits<std::size_t>::max()/bytes)return std::nullopt;
+                const auto additional=bytes*visits;
+                auto &total=charges[endpoint.resource_id];
+                if(total>std::numeric_limits<std::size_t>::max()-additional)return std::nullopt;
+                total+=additional;
+            }
+            return charges;
+        }
+
+        /**
+         * @brief Admit the largest fitting consecutive prefix using the same canonical physical BOMs.
+         * @param requested Exact mandatory logical additions, not a capacity or whole-layer approximation.
+         * @return Number admitted before the same first failing next-copy operation as serial admission.
+         *
+         * All charges are nonnegative, so a prefix fits iff each preceding
+         * serial addition fits. Binary search changes only pure quotation work;
+         * one commit bills the exact same owners and participant counts. No
+         * certificate, free-byte balance or greedy tier order is cached.
+         */
+        [[nodiscard]] int addLiveExpertPrefix(TierState &tier,int layer,int requested,
+            const std::unordered_map<std::string,std::size_t> &resource_index,
+            std::vector<ResourceState> &resources)
+        {
+            const auto at=static_cast<std::size_t>(layer);
+            const int previous=tier.output.live_experts_per_layer[at];
+            if(requested<0 || previous<0 || requested>std::numeric_limits<int>::max()-previous)
+                throw std::overflow_error("ExpertOverlay logical quota prefix overflows");
+            int limit=requested;
+            if(!tier.request->max_live_experts_per_layer.empty())
+                limit=std::min(limit,std::max(0,tier.request->max_live_experts_per_layer[at]-previous));
+            if(!limit)return 0;
+            // Preserve source/one-copy arithmetic validation before considering
+            // larger mathematical prefixes that cannot fit a physical owner.
+            const auto first=nextLiveCharges(tier,layer,resource_index,resources);
+            if(!chargesFit(first,resource_index,resources))return 0;
+            int low=1,high=limit;
+            const auto complete=prefixLiveCharges(tier,layer,limit,resource_index,resources);
+            if(complete && chargesFit(*complete,resource_index,resources))low=limit;
+            else high=limit-1;
+            while(low<high)
+            {
+                const int middle=low+(high-low)/2+(high-low)%2;
+                const auto charges=prefixLiveCharges(tier,layer,middle,resource_index,resources);
+                if(charges && chargesFit(*charges,resource_index,resources))low=middle;
+                else high=middle-1;
+            }
+            const auto charges=prefixLiveCharges(tier,layer,low,resource_index,resources);
+            if(!charges)throw std::logic_error("Fitting expert prefix lost representable charges");
+            commitCharges(*charges,resource_index,resources,false);
+            tier.output.live_experts_per_layer[at]+=low;
+            tier.output.has_live_residency=true;
+            const bool replicated=tier.request->copy_policy==MoEOverlayTierCopyPolicy::Replicated ||
+                tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded;
+            for(std::size_t participant=0;participant<tier.request->participants.size();++participant)
+                tier.output.participant_live_copies[participant][at]+=replicated?low:
+                    static_cast<int>(prefixVisits(participant,tier.request->participants.size(),previous,low));
+            return low;
         }
 
         /**
@@ -679,6 +797,30 @@ namespace llaminar2
                 state.output.priority = request.priority;
                 state.output.fallback = request.fallback;
                 state.output.live_experts_per_layer.assign(layer_count, 0);
+                if(request.copy_policy == MoEOverlayTierCopyPolicy::TensorSharded){
+                    if(request.shard_cohorts.size()!=layer_count)
+                        throw std::invalid_argument("Tensor-sharded capacity requires every original layer cohort");
+                    state.output.shard_cohorts=request.shard_cohorts;
+                    state.fragment_footprints.resize(request.participants.size());
+                    for(std::size_t layer=0;layer<layer_count;++layer){
+                        const auto& cohort=request.shard_cohorts[layer];
+                        if(!cohort || cohort->source()!=input.layer_weight_manifest[layer] ||
+                           cohort->participants().size()!=request.participants.size() ||
+                           cohort->ownership(0).geometry().experts!=input.num_experts)
+                            throw std::invalid_argument("Tensor-sharded capacity received foreign/incomplete source geometry");
+                        for(std::size_t p=0;p<request.participants.size();++p){
+                            const auto& endpoint=request.participants[p];const auto& member=cohort->participants()[p];
+                            const auto budget=std::find_if(input.physical_budgets.begin(),input.physical_budgets.end(),
+                                [&](const auto& b){return b.resourceId()==endpoint.resource_id;});
+                            const auto resource=budget->certificate().bom().resource();
+                            if(member.participant_id!=endpoint.participant_id || !resource.device.is_cpu() ||
+                               resource.world_rank!=member.world_rank)
+                                throw std::invalid_argument("Tensor-sharded capacity requires exact original CPU resources");
+                            state.fragment_footprints[p].push_back(MoEOverlayCapacityResolver::preparedFootprints({cohort->localManifest(p)}).front());
+                        }
+                    }
+                }else if(!request.shard_cohorts.empty())
+                    throw std::invalid_argument("Whole-expert capacity cannot borrow shard cohort metadata");
                 state.output.participant_live_copies.assign(
                     request.participants.size(),
                     std::vector<int>(layer_count, 0));
@@ -813,23 +955,9 @@ namespace llaminar2
                         throw std::invalid_argument(
                             "ExpertOverlay fixed tier quotas over-assign a model layer");
                     }
-                    for (int copy = 0; copy < quota; ++copy)
-                    {
-                        if (!addOneLiveExpert(
-                                tier,
-                                static_cast<int>(layer),
-                                resource_index,
-                                resources))
-                        {
-                            throwTierCapacityFailure(
-                                tier,
-                                static_cast<int>(layer),
-                                quota,
-                                "fixed live quota",
-                                resource_index,
-                                resources);
-                        }
-                    }
+                    if (addLiveExpertPrefix(tier,static_cast<int>(layer),quota,resource_index,resources)!=quota)
+                        throwTierCapacityFailure(tier,static_cast<int>(layer),quota,
+                            "fixed live quota",resource_index,resources);
                     unassigned[layer] -= quota;
                 }
             }
@@ -852,6 +980,7 @@ namespace llaminar2
                         tier.request->participants.size();
                     if (tier.request->copy_policy !=
                             MoEOverlayTierCopyPolicy::Replicated &&
+                        tier.request->copy_policy != MoEOverlayTierCopyPolicy::TensorSharded &&
                         participant_count >
                             static_cast<std::size_t>(input.num_experts))
                     {
@@ -865,8 +994,8 @@ namespace llaminar2
                         throw std::invalid_argument(error.str());
                     }
                     const int source_quota =
-                        tier.request->copy_policy ==
-                                MoEOverlayTierCopyPolicy::Replicated
+                        (tier.request->copy_policy == MoEOverlayTierCopyPolicy::Replicated ||
+                         tier.request->copy_policy == MoEOverlayTierCopyPolicy::TensorSharded)
                             ? 1
                             : static_cast<int>(participant_count);
 
@@ -1016,23 +1145,9 @@ namespace llaminar2
                 for (std::size_t layer = 0; layer < layer_count; ++layer)
                 {
                     const int remainder = unassigned[layer];
-                    for (int copy = 0; copy < remainder; ++copy)
-                    {
-                        if (!addOneLiveExpert(
-                                *fallback,
-                                static_cast<int>(layer),
-                                resource_index,
-                                resources))
-                        {
-                            throwTierCapacityFailure(
-                                *fallback,
-                                static_cast<int>(layer),
-                                remainder,
-                                "fallback remainder",
-                                resource_index,
-                                resources);
-                        }
-                    }
+                    if (addLiveExpertPrefix(*fallback,static_cast<int>(layer),remainder,resource_index,resources)!=remainder)
+                        throwTierCapacityFailure(*fallback,static_cast<int>(layer),remainder,
+                            "fallback remainder",resource_index,resources);
                     unassigned[layer] = 0;
                 }
             }
@@ -1046,21 +1161,33 @@ namespace llaminar2
 
         }
 
+        /** @brief Exact logical publication for one resource; no physical byte arithmetic. */
+        struct ResourcePublication
+        {
+            std::string name;
+            PhysicalMemoryAllocatorIdentity identity;
+            std::vector<int> live, shadows;
+        };
+        /** @brief Owned quota and copy metadata, safe after resolver inputs retire. */
+        struct StagePublication
+        {
+            int num_experts = 0;
+            std::vector<MoEOverlayPreparedExpertFootprint> layer_footprints;
+            std::vector<MoEOverlayResolvedTierCapacity> tiers;
+            std::vector<ResourcePublication> resources;
+            std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;
+        };
         /**
-         * @brief Publish stage-local counts beside the sole aggregate byte authority.
+         * @brief Copy exact source-independent publication metadata before borrowed inputs expire.
          * @param stage Fully covered stage with exact compact participant quotas.
-         * @param authority Completed admission of all fixed and routed owners.
-         * @return Stage quota plan whose resource views retain that same certificate.
+         * @return Owned stage publication, without a final admission certificate.
          * @throws std::overflow_error if a diagnostic copy count exceeds int.
          */
-        [[nodiscard]] MoEOverlayResolvedCapacityPlan finishStage(
-            StageState &&stage,
-            const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &authority)
+        [[nodiscard]] StagePublication finishStageDraft(StageState &&stage)
         {
-            MoEOverlayResolvedCapacityPlan result;
+            StagePublication result;
             result.num_experts = stage.input->num_experts;
             result.layer_footprints = std::move(stage.footprints);
-            result.physical_memory_admission = authority;
             const auto layer_count = result.layer_footprints.size();
             for (const auto &budget : stage.input->physical_budgets)
             {
@@ -1083,9 +1210,9 @@ namespace llaminar2
                         }
                     }
                 const auto &resource = budget.certificate().bom().resource();
-                result.physical_resources.emplace_back(budget.resourceId(), authority,
+                result.resources.push_back({budget.resourceId(),
                     PhysicalMemoryAllocatorIdentity{resource.world_rank, resource.device},
-                    std::move(live), std::move(shadows));
+                    std::move(live), std::move(shadows)});
             }
             for (auto &tier : stage.tiers) result.tiers.push_back(std::move(tier.output));
             std::sort(result.tiers.begin(), result.tiers.end(),
@@ -1093,6 +1220,54 @@ namespace llaminar2
             return result;
         }
     } // namespace
+
+    struct MoEOverlayCapacityDraft::Impl
+    {
+        PhysicalMemoryPlan plan;
+        std::vector<StagePublication> stages;
+    };
+    const PhysicalMemoryPlan &MoEOverlayCapacityDraft::physicalPlan() const noexcept { return impl_->plan; }
+    std::size_t MoEOverlayCapacityDraft::stageCount() const noexcept { return impl_->stages.size(); }
+    MoEOverlayCapacityDraft MoEOverlayCapacityDraft::withReplicaGrants(
+        std::span<const std::optional<MoEOverlayReplicaCacheCapacity>> grants) const
+    {
+        if (grants.size() != stageCount())
+            throw std::invalid_argument("Replica publication differs from the frozen stage count");
+        auto next = std::make_shared<Impl>(*impl_);
+        for (std::size_t i=0; i<grants.size(); ++i) next->stages[i].replica_cache_capacity=grants[i];
+        return MoEOverlayCapacityDraft(std::move(next));
+    }
+    std::vector<MoEOverlayResolvedCapacityPlan> MoEOverlayCapacityDraft::admit(
+        std::span<const ImmutableRowTableAdmissionRequest> tables) const
+    {
+        auto complete = physicalPlan();
+        std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> placements;
+        std::set<int> ranks;
+        for (const auto &request : tables)
+        {
+            if (!ranks.insert(request.input.host().world_rank).second)
+                throw std::invalid_argument("Final ngram admission contains duplicate rank authority");
+            auto selected=ImmutableRowTablePlacementPlanner::select(request,complete);
+            placements.push_back(std::move(selected.placement));
+            complete=std::move(selected.physical_plan);
+        }
+        const auto authority=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(complete);
+        std::vector<MoEOverlayResolvedCapacityPlan> results;
+        for (const auto &stage:impl_->stages)
+        {
+            MoEOverlayResolvedCapacityPlan result;
+            result.num_experts=stage.num_experts;
+            result.layer_footprints=stage.layer_footprints;
+            result.tiers=stage.tiers;
+            result.replica_cache_capacity=stage.replica_cache_capacity;
+            result.ngram_table_placements=placements;
+            result.physical_memory_admission=authority;
+            for (const auto &resource:stage.resources)
+                result.physical_resources.emplace_back(resource.name,authority,resource.identity,resource.live,resource.shadows);
+            results.push_back(std::move(result));
+        }
+        return results;
+    }
 
     MoEOverlayResolvedCapacityPlan MoEOverlayCapacityResolver::resolve(
         const MoEOverlayCapacityResolverInput &input)
@@ -1102,6 +1277,12 @@ namespace llaminar2
     }
 
     std::vector<MoEOverlayResolvedCapacityPlan> MoEOverlayCapacityResolver::resolvePipeline(
+        std::span<const MoEOverlayCapacityResolverInput> inputs)
+    {
+        return resolvePipelineDraft(inputs).admit();
+    }
+
+    MoEOverlayCapacityDraft MoEOverlayCapacityResolver::resolvePipelineDraft(
         std::span<const MoEOverlayCapacityResolverInput> inputs)
     {
         if (inputs.empty())
@@ -1169,11 +1350,10 @@ namespace llaminar2
 
         PhysicalMemoryPlanBuilder completed;
         for (const auto &resource : resources) completed.add(resource.memory.build());
-        const auto authority = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(completed.build());
-        std::vector<MoEOverlayResolvedCapacityPlan> results;
-        results.reserve(stages.size());
-        for (auto &stage : stages) results.push_back(finishStage(std::move(stage), authority));
-        return results;
+        auto draft=std::make_shared<MoEOverlayCapacityDraft::Impl>();
+        draft->plan=completed.build();
+        for (auto &stage:stages) draft->stages.push_back(finishStageDraft(std::move(stage)));
+        return MoEOverlayCapacityDraft(std::move(draft));
     }
 
     MoERoutedExpertPlacementPlan

@@ -14,6 +14,7 @@
 
 #include "backends/IGPUGraphCapture.h"
 #include "execution/mtp/HostedDeviceGenerationLifecycle.h"
+#include "execution/mtp/DeviceGenerationContract.h"
 #include "kernels/common/SamplingMath.h"
 
 #include <algorithm>
@@ -30,6 +31,21 @@ namespace
 
     using ControlRow = std::array<int, kDeviceGenerationControlCount>;
     using MetaRow = std::array<int, kSpeculativeBatchMetaCount>;
+
+    /** @brief Author explicit publisher counts for direct controller-only observations.
+     * @param control The fixture's sole row, whose append-owned delta is supplied.
+     * @param outputs Actual authored compact output extent. @param leading Already emitted rows.
+     * @param published Actual authored state-publication extent.
+     * @return A validated transient witness; no acceptance count supplies its geometry.
+     */
+    llaminar2::MTPPublicationWitness authoredPublication(ControlRow &control,
+        int outputs, int leading, int published)
+    {
+        llaminar2::MTPPublicationWitness witness;
+        EXPECT_TRUE(llaminar2::MTPPublicationWitness::fromCounts(outputs, leading, published, false, &witness));
+        control[kDeviceGenerationControlLastTransactionEmittedTokenCount] = static_cast<int>(witness.newlyEmittedTokens());
+        return witness;
+    }
 
     /**
      * @brief Prove the controller handoff admits only the complete transaction cycle.
@@ -50,6 +66,42 @@ namespace
             EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
             EXPECT_EQ(control[kDeviceGenerationControlTransactionCommitBudget], 0);
         }
+    }
+
+    /** @test Continuation authenticates the same exact branch range used to bind its retained family. */
+    TEST(Test__DeviceGenerationController, RetainedSpeculativeContinuationDepthRangeContract)
+    {
+        using llaminar2::DeviceGenerationSpeculativeDepthRange;
+        using llaminar2::deviceGenerationSpeculativeDepthRange;
+        for (const int depth : {1, 2, 3, 15})
+        {
+            const auto fixed = DeviceGenerationPolicy::fixed(depth);
+            const auto original = fixed;
+            const auto range = deviceGenerationSpeculativeDepthRange(fixed);
+            ASSERT_TRUE(range.has_value());
+            EXPECT_EQ(*range, (DeviceGenerationSpeculativeDepthRange{depth, depth}));
+            EXPECT_EQ(fixed, original) << "Continuation must not rewrite the original request policy";
+            auto observe = fixed;
+            observe.mode = DeviceGenerationPolicyMode::Observe;
+            observe.minimum_depth = 1;
+            observe.maximum_depth = 15;
+            EXPECT_EQ(deviceGenerationSpeculativeDepthRange(observe), range);
+            auto dynamic = observe;
+            dynamic.mode = DeviceGenerationPolicyMode::Dynamic;
+            EXPECT_EQ(deviceGenerationSpeculativeDepthRange(dynamic),
+                (std::optional<DeviceGenerationSpeculativeDepthRange>{DeviceGenerationSpeculativeDepthRange{1, 15}}));
+            auto different = DeviceGenerationPolicy::fixed(depth == 15 ? 1 : depth + 1);
+            EXPECT_NE(deviceGenerationSpeculativeDepthRange(different), range)
+                << "A different fixed width cannot authenticate an already retained parent";
+        }
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(DeviceGenerationPolicy::ordinary()));
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(DeviceGenerationPolicy::forwardOnly()));
+        auto invalid = DeviceGenerationPolicy::fixed(3);
+        invalid.maximum_depth = 2;
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(invalid));
+        invalid = DeviceGenerationPolicy::fixed(3);
+        invalid.mode = static_cast<DeviceGenerationPolicyMode>(255);
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(invalid));
     }
 
     TEST(
@@ -114,6 +166,91 @@ namespace
             [](void *, void *) { return true; }));
         ASSERT_TRUE(handoff.retireAfterHostCompletion(2));
         EXPECT_TRUE(handoff.inactive());
+    }
+
+    /**
+     * @test A one-token original follower response closes its real published frontier.
+     *
+     * The source can emit the initial prefill sample with no follower forward.
+     * A later response may already own a retained forward stream, or an initial
+     * MTP verifier may have published committed state. All three frontiers must
+     * close through the original event/borrow lifecycle, without double borrowing
+     * or pretending a no-forward admission had already launched a graph.
+     */
+    TEST(Test__DeviceGenerationController, OriginalPipelineFollowerTerminalReadinessLifecycle)
+    {
+        using llaminar2::DeviceGenerationStateHandoff;
+        using llaminar2::DeviceGenerationStatePublicationKind;
+        using llaminar2::DeviceTimelineRole;
+        enum class InitialFrontier { PrefillSampleOnly, PriorForward, CommittedVerifier };
+        void *const admission = reinterpret_cast<void *>(0x11000);
+        void *const controller = reinterpret_cast<void *>(0x12000);
+        void *const verifier = reinterpret_cast<void *>(0x13000);
+        void *const bridge = reinterpret_cast<void *>(0x14000);
+        for (const auto initial : {InitialFrontier::PrefillSampleOnly, InitialFrontier::PriorForward,
+                                  InitialFrontier::CommittedVerifier})
+        {
+            DeviceGenerationStateHandoff handoff;
+            for (int request = 0; request < 3; ++request)
+            {
+                ASSERT_TRUE(handoff.inactive());
+                ASSERT_TRUE(handoff.publish(DeviceGenerationStatePublicationKind::Admission,
+                    admission, 1, [] { return true; }));
+                int terminal_acquires = 0;
+                if (initial == InitialFrontier::PriorForward)
+                {
+                    ASSERT_TRUE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                        1, [&](void *producer, void *consumer) {
+                            EXPECT_EQ(producer, admission);
+                            EXPECT_EQ(consumer, controller);
+                            return true;
+                        }));
+                }
+                else if (initial == InitialFrontier::CommittedVerifier)
+                {
+                    ASSERT_TRUE(handoff.borrow(verifier, DeviceTimelineRole::AllPositionVerifier,
+                        1, [](void *, void *) { return true; }));
+                    ASSERT_TRUE(handoff.publish(DeviceGenerationStatePublicationKind::CommittedTransaction,
+                        verifier, 1, [] { return true; }));
+                }
+                if (initial != InitialFrontier::PriorForward)
+                {
+                    // This rejected operation is the original production defect:
+                    // a published admission/commit is not a terminal writer borrow.
+                    bool unpublished_terminal_callback = false;
+                    EXPECT_FALSE(handoff.publish(DeviceGenerationStatePublicationKind::Terminal,
+                        controller, 1, [&] { unpublished_terminal_callback = true; return true; }));
+                    EXPECT_FALSE(unpublished_terminal_callback);
+                    EXPECT_TRUE(handoff.published());
+                    const auto original_producer = handoff.frontierStream();
+                    EXPECT_FALSE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                        1, [](void *, void *) { return false; }));
+                    EXPECT_EQ(handoff.frontierStream(), original_producer);
+                    ASSERT_TRUE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                        1, [&](void *producer, void *consumer) {
+                            EXPECT_EQ(producer, initial == InitialFrontier::PrefillSampleOnly ? admission : verifier);
+                            EXPECT_EQ(consumer, controller);
+                            ++terminal_acquires;
+                            return true;
+                        }));
+                }
+                EXPECT_EQ(terminal_acquires, initial == InitialFrontier::PriorForward ? 0 : 1);
+                ASSERT_TRUE(handoff.borrowed());
+                EXPECT_EQ(handoff.frontierStream(), controller);
+                EXPECT_EQ(handoff.borrowerRole(), DeviceTimelineRole::DeviceGenerationController);
+                EXPECT_FALSE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                    1, [](void *, void *) { ADD_FAILURE() << "A prior retained body must not acquire twice"; return true; }));
+                ASSERT_TRUE(handoff.publish(DeviceGenerationStatePublicationKind::Terminal,
+                    controller, 1, [] { return true; }));
+                ASSERT_TRUE(handoff.borrow(bridge, DeviceTimelineRole::HostResultBridge,
+                    1, [&](void *producer, void *consumer) {
+                        EXPECT_EQ(producer, controller);
+                        EXPECT_EQ(consumer, bridge);
+                        return true;
+                    }));
+                EXPECT_TRUE(handoff.retireAfterHostCompletion(1));
+            }
+        }
     }
 
     /**
@@ -726,7 +863,7 @@ TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEver
             /*accepted_prefix=*/depth,
             /*rollback=*/false,
             /*budget_limited=*/false,
-            control.data()));
+            control.data(), authoredPublication(control, depth + 1, 0, depth + 1)));
         EXPECT_EQ(
             control[kDeviceGenerationControlCurrentDraftDepth],
             depth + 1);
@@ -751,7 +888,7 @@ TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEver
             /*accepted_prefix=*/0,
             /*rollback=*/true,
             /*budget_limited=*/false,
-            control.data()));
+            control.data(), authoredPublication(control, 2, 0, 1)));
         EXPECT_EQ(
             control[kDeviceGenerationControlCurrentDraftDepth],
             depth - 1);
@@ -788,7 +925,7 @@ TEST(Test__DeviceGenerationController, ObservePolicyCannotMutateActiveGeometry)
         /*accepted_prefix=*/4,
         /*rollback=*/false,
         /*budget_limited=*/false,
-        control.data()));
+        control.data(), authoredPublication(control, 5, 0, 5)));
 
     EXPECT_EQ(control[kDeviceGenerationControlCurrentDraftDepth], 4);
     EXPECT_EQ(control[kDeviceGenerationControlActiveVerifierRowCount], 5);
@@ -841,7 +978,9 @@ TEST(Test__DeviceGenerationController, StreamingPublicationWindowsPreserveAdapti
                 for (auto *control : {&streamed, &uninterrupted})
                     ASSERT_TRUE(record_device_generation_depth_observation(
                         full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] : 0,
-                        !full_accept, false, control->data()));
+                        !full_accept, false, control->data(), authoredPublication(*control,
+                            full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] + 1 : 2,
+                            0, full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] + 1 : 1)));
                 EXPECT_EQ(streamed[kDeviceGenerationControlCurrentDraftDepth],
                           uninterrupted[kDeviceGenerationControlCurrentDraftDepth]);
                 for (int word = kDeviceGenerationControlDepthStepsSinceChange;
@@ -2037,4 +2176,237 @@ TEST(Test__DeviceGenerationController, InvalidAdmissionAndMaintenanceFailHard)
     EXPECT_EQ(
         control[kDeviceGenerationControlErrorCode],
         static_cast<int>(DeviceGenerationError::InvalidController));
+}
+
+namespace
+{
+/** @test Request-owned forward errors survive every response algorithm until explicit request reset. */
+TEST(Test__DeviceGenerationController, ForwardFailurePolicyPreservesPrefillErrorUntilRequestReset)
+{
+    using FailurePolicy=DeviceGenerationForwardFailurePolicy;
+    auto dynamic=DeviceGenerationPolicy::fixed(2);dynamic.mode=DeviceGenerationPolicyMode::Dynamic;
+    for(const auto policy:{DeviceGenerationPolicy::ordinary(),DeviceGenerationPolicy::forwardOnly(),
+        DeviceGenerationPolicy::fixed(1),DeviceGenerationPolicy::fixed(15),dynamic})
+    {
+        const DeviceGenerationInitialization initialization{
+            .forward_failure_policy=FailurePolicy::PreserveUntilRequestReset};
+        const int budget=policy.isForwardOnly()?0:32;
+        const auto leading=policy.isForwardOnly()?DeviceGenerationLeadingRowDisposition::AlreadyEmitted:
+            DeviceGenerationLeadingRowDisposition::PendingResponse;
+        ControlRow control{};
+        // This is the existing setup/reset state: no response is admitted, but
+        // the real prefill is allowed to publish into its native output.
+        ASSERT_EQ(control[kDeviceGenerationControlOk],0);
+        ASSERT_TRUE(initialize_device_generation_control(budget,32,policy,control.data(),leading,initialization));
+        EXPECT_EQ(control[kDeviceGenerationControlOk],1);
+        EXPECT_EQ(control[kDeviceGenerationControlErrorCode],0);
+        for(const auto error:{DeviceGenerationError::ImmutableStorageFailure,
+            DeviceGenerationError::InvalidController,DeviceGenerationError::InvalidInitialization})
+        {
+            control.fill(0);
+            ASSERT_FALSE(fail_device_generation_control(control.data(),error));
+            control[kDeviceGenerationControlTransactionCount]=71;
+            for(int admission=0;admission<3;++admission)
+            {
+                EXPECT_FALSE(initialize_device_generation_control(budget,32,policy,control.data(),leading,initialization));
+                EXPECT_EQ(control[kDeviceGenerationControlOk],0);
+                EXPECT_EQ(control[kDeviceGenerationControlRequestComplete],1);
+                EXPECT_EQ(control[kDeviceGenerationControlErrorCode],static_cast<int>(error));
+                EXPECT_EQ(control[kDeviceGenerationControlTransactionCount],71);
+            }
+            // Only the request-reset owner clears this existing allocation.
+            control.fill(0);
+            ASSERT_TRUE(initialize_device_generation_control(budget,32,policy,control.data(),leading,initialization));
+            EXPECT_EQ(control[kDeviceGenerationControlErrorCode],0);
+        }
+    }
+}
+/** @test Default response semantics remain unchanged and malformed policy is rejected. */
+TEST(Test__DeviceGenerationController, ForwardFailurePolicyKeepsLegacyAdmissionAndRejectsUnknownPolicy)
+{
+    ControlRow control{};
+    fail_device_generation_control(control.data(),DeviceGenerationError::ImmutableStorageFailure);
+    ASSERT_TRUE(initialize_device_generation_control(4,4,DeviceGenerationPolicy::ordinary(),control.data()));
+    EXPECT_EQ(control[kDeviceGenerationControlOk],1);
+    EXPECT_EQ(control[kDeviceGenerationControlErrorCode],0);
+    const DeviceGenerationInitialization unknown{
+        .forward_failure_policy=static_cast<DeviceGenerationForwardFailurePolicy>(17)};
+    EXPECT_FALSE(unknown.valid());
+    EXPECT_FALSE(initialize_device_generation_control(4,4,DeviceGenerationPolicy::ordinary(),control.data(),
+        DeviceGenerationLeadingRowDisposition::PendingResponse,unknown));
+    EXPECT_EQ(control[kDeviceGenerationControlOk],0);
+    EXPECT_EQ(control[kDeviceGenerationControlErrorCode],static_cast<int>(DeviceGenerationError::InvalidInitialization));
+}
+} // namespace
+
+namespace
+{
+    /** @brief Author the real admitted scope; no runtime/model process is initialized.
+     * @param mode Declared adaptive observation mode. @param measured Complete exact cost scope.
+     * @param depth Actual sole active selector. @return Canonical portable policy. */
+    DeviceGenerationPolicy priorWindowPolicy(DeviceGenerationPolicyMode mode,bool measured,int depth=5)
+    {
+        DeviceGenerationPolicy policy;
+        policy.mode=mode;policy.initial_depth=depth;policy.minimum_depth=1;policy.maximum_depth=15;
+        policy.window_size=16;policy.minimum_samples=4;policy.cooldown_steps=8;
+        if(measured)
+            policy.learned={.enabled=mode!=DeviceGenerationPolicyMode::Observe,
+                .backend=llaminar2::MTPDepthPolicyBackend::ROCm,
+                .model_class=llaminar2::MTPDepthPolicyModelClass::MoE,
+                .verify_mode=llaminar2::MTPVerifyMode::Greedy,
+                .scope={llaminar2::MTPVerifierPhysicalWidthPolicy::ExactLogicalRows,4,1,15,2560,48,512,10,90,6}};
+        return policy;
+    }
+
+    /** @brief Validate the fatal-only mutation boundary of the production observer.
+     * @param actual Failed control row. @param before Exact independently retained input. */
+    void expectPriorWindowFailureOnly(const ControlRow &actual,const ControlRow &before)
+    {
+        expectFatal(actual,DeviceGenerationError::InvalidDepthPolicy);
+        for(int word=0;word<kDeviceGenerationControlCount;++word)
+        {
+            if(word==kDeviceGenerationControlOk||word==kDeviceGenerationControlErrorCode||
+                word==kDeviceGenerationControlRequestComplete||word==kDeviceGenerationControlTransactionCommitBudget)continue;
+            EXPECT_EQ(actual[word],before[word])<<"word="<<word;
+        }
+    }
+}
+
+/** @test A poisoned negative A must not become a plausible unsigned V during a short window. */
+TEST(Test__DeviceGenerationController, PriorWindowNegativeAcceptedFailsBeforeMutation)
+{
+    const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);
+    ASSERT_TRUE(policy.valid());ControlRow row{};
+    ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+    const auto publication=authoredPublication(row,2,0,1);
+    row[kDeviceGenerationControlDepthWindowAcceptedTokens]=-2;
+    const auto before=row;
+    ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+    expectPriorWindowFailureOnly(row,before);
+}
+
+/** @test Safe near-maximum corruption is rejected BEFORE the full counter increment.
+ * INT32_MAX-1 reproduces the missing validation without signed-overflow UB on
+ * the defective implementation. The next full observation would otherwise
+ * produce INT32_MAX in a bank whose actual prior R is0 and return success. */
+TEST(Test__DeviceGenerationController, PriorWindowNearMaxFullCounterFailsBeforeIncrement)
+{
+    const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);
+    ASSERT_TRUE(policy.valid());ControlRow row{};
+    ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+    const auto publication=authoredPublication(row,6,0,6);
+    row[kDeviceGenerationControlDepthWindowFullAccepts]=INT32_MAX-1;
+    const auto before=row;
+    ASSERT_FALSE(record_device_generation_depth_observation(5,false,false,row.data(),publication));
+    expectPriorWindowFailureOnly(row,before);
+}
+
+/** @test Every prior count and its joint prefix geometry fails before mutation on all adaptive lanes. */
+TEST(Test__DeviceGenerationController, PriorWindowMalformedCountsAreFatalAcrossAdaptivePolicies)
+{
+    const std::array<int,8> fields{
+        kDeviceGenerationControlDepthWindowVerifierRuns,kDeviceGenerationControlDepthWindowAttemptedTokens,
+        kDeviceGenerationControlDepthWindowAcceptedTokens,kDeviceGenerationControlDepthWindowRejectedTokens,
+        kDeviceGenerationControlDepthWindowRollbacks,kDeviceGenerationControlDepthWindowFullAccepts,
+        kDeviceGenerationControlDepthWindowZeroAccepts,kDeviceGenerationControlDepthWindowAcceptedPrefixSum};
+    for(auto mode:{DeviceGenerationPolicyMode::Dynamic,DeviceGenerationPolicyMode::Observe})
+    for(bool measured:{false,true})
+    for(int field:fields)for(int poison:{-1,INT32_MAX-1})
+    {
+        SCOPED_TRACE(field);
+        SCOPED_TRACE(poison);
+        SCOPED_TRACE(static_cast<int>(mode));
+        SCOPED_TRACE(measured);
+        const auto policy=priorWindowPolicy(mode,measured);ASSERT_TRUE(policy.valid());ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        const auto publication=authoredPublication(row,2,0,1);row[field]=poison;const auto before=row;
+        ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+        expectPriorWindowFailureOnly(row,before);
+    }
+    for(int defect=0;defect<5;++defect)
+    {
+        const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        row[kDeviceGenerationControlDepthWindowVerifierRuns]=2;
+        row[kDeviceGenerationControlDepthWindowAttemptedTokens]=10;
+        row[kDeviceGenerationControlDepthWindowAcceptedTokens]=4;
+        row[kDeviceGenerationControlDepthWindowRejectedTokens]=6;
+        row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum]=4;
+        row[kDeviceGenerationControlDepthUtilityWindowEmitted]=6;
+        if(defect==0)row[kDeviceGenerationControlDepthWindowAttemptedTokens]=9;
+        if(defect==1)row[kDeviceGenerationControlDepthWindowRejectedTokens]=5;
+        if(defect==2)row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum]=3;
+        if(defect==3){row[kDeviceGenerationControlDepthWindowFullAccepts]=1;row[kDeviceGenerationControlDepthWindowZeroAccepts]=2;}
+        if(defect==4){row[kDeviceGenerationControlDepthWindowAcceptedTokens]=9;
+            row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum]=9;row[kDeviceGenerationControlDepthWindowRejectedTokens]=1;}
+        const auto publication=authoredPublication(row,2,0,1);const auto before=row;
+        ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+        expectPriorWindowFailureOnly(row,before);
+    }
+}
+
+/** @test Valid empty/partial banks retain generic/Observe/measured semantics at every supported depth. */
+TEST(Test__DeviceGenerationController, PriorWindowValidPartialCountsRemainSupported)
+{
+    for(auto mode:{DeviceGenerationPolicyMode::Dynamic,DeviceGenerationPolicyMode::Observe})
+    for(bool measured:{false,true})for(int depth=1;depth<=15;++depth)
+    {
+        const auto policy=priorWindowPolicy(mode,measured,depth);ASSERT_TRUE(policy.valid());ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        const int prefix=depth/2;
+        for(int sample=1;sample<=2;++sample)
+        {
+            ASSERT_TRUE(record_device_generation_depth_observation(prefix,true,false,row.data(),
+                authoredPublication(row,prefix+2,1,prefix+1)));
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowVerifierRuns],sample);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowAttemptedTokens],sample*depth);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowAcceptedTokens],sample*prefix);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowRejectedTokens],sample*(depth-prefix));
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum],sample*prefix);
+            EXPECT_EQ(row[kDeviceGenerationControlCurrentDraftDepth],depth);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthEvaluatedWindows],0);
+        }
+    }
+}
+
+/** @test Fixed, clipped and stopped skips do not inspect or repair an inactive adaptive bank. */
+TEST(Test__DeviceGenerationController, PriorWindowExcludedAndFixedSkipsRemainUnchanged)
+{
+    for(int kind=0;kind<3;++kind)
+    {
+        const auto policy=kind==0?DeviceGenerationPolicy::fixed(5):
+            priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);
+        ControlRow row{};ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        llaminar2::MTPPublicationWitness publication;
+        ASSERT_TRUE(llaminar2::MTPPublicationWitness::fromCounts(2,0,1,kind==2,&publication));
+        row[kDeviceGenerationControlLastTransactionEmittedTokenCount]=2;
+        row[kDeviceGenerationControlDepthWindowAcceptedTokens]=-2;
+        row[kDeviceGenerationControlDepthWindowFullAccepts]=INT32_MAX;
+        const auto before=row;
+        ASSERT_TRUE(record_device_generation_depth_observation(0,true,kind==1,row.data(),publication));
+        EXPECT_EQ(row,before);
+    }
+}
+
+/** @test A valid-bank next increment must have representable R/attempted/step capacity. */
+TEST(Test__DeviceGenerationController, PriorWindowCounterExhaustionRejectsBeforeIncrement)
+{
+    for(int kind=0;kind<3;++kind)
+    {
+        const int depth=kind==0?1:5;
+        const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,false,depth);ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        if(kind<2)
+        {
+            const int runs=kind==0?INT32_MAX:INT32_MAX/5;
+            row[kDeviceGenerationControlDepthWindowVerifierRuns]=runs;
+            row[kDeviceGenerationControlDepthWindowAttemptedTokens]=runs*depth;
+            row[kDeviceGenerationControlDepthWindowRejectedTokens]=runs*depth;
+            row[kDeviceGenerationControlDepthWindowZeroAccepts]=runs;
+        }
+        else row[kDeviceGenerationControlDepthStepsSinceChange]=INT32_MAX;
+        const auto publication=authoredPublication(row,2,0,1);const auto before=row;
+        ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+        expectPriorWindowFailureOnly(row,before);
+    }
 }

@@ -16,13 +16,15 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
-#include <thread>
+#include <pthread.h>
 
 namespace llaminar2
 {
+    namespace test { struct ImmutableLookupWorkerGateReplayAccess; }
     /**
      * @brief Runs one pre-armed CPU ticket service independently of GPU submission.
      *
@@ -51,8 +53,12 @@ namespace llaminar2
             }
         };
 
-        /** @brief Start the persistent worker in its idle state. */
-        RetainedParentTicketServiceWorker();
+        /**
+         * @brief Initialize the complete idle state before starting its persistent thread.
+         * @details Thread creation occurs in the constructor body so no member
+         * declaration order can expose uninitialized lifecycle state to run().
+         */
+        RetainedParentTicketServiceWorker()=delete;
 
         /**
          * @brief Join the persistent worker after any accepted invocation retires.
@@ -95,6 +101,41 @@ namespace llaminar2
         [[nodiscard]] bool idle() const noexcept;
 
     private:
+        friend class PreparedRetainedHostService;
+        friend struct test::ImmutableLookupWorkerGateReplayAccess;
+        /** @brief Closed fixture ownership only; never an inference/controller state. */
+        enum class BorrowedEntryOutcome : std::uint8_t
+        {
+            Uninstalled, Installed, Dispatched, Rejected, Withdrawn
+        };
+        /**
+         * @brief One fixture-owned wrapper for an exact original task/context.
+         * The fixture retains this descriptor through actual worker departure.
+         * The original dispatch still issues the sole invocation ticket.
+         */
+        struct BorrowedDispatchEntry
+        {
+            Task expected_task = nullptr;
+            void* expected_context = nullptr;
+            Task wrapper_task = nullptr;
+            void* wrapper_context = nullptr;
+            std::atomic<BorrowedEntryOutcome> outcome{BorrowedEntryOutcome::Uninstalled};
+        };
+        /**
+         * @brief Cold closed-fixture borrow, consumed once under mutex_.
+         * This pointer is part of sizeof(worker), priced/materialized by the
+         * original RetainedHostServiceProgram. Serving callers cannot install it.
+         */
+        BorrowedDispatchEntry* next_borrowed_entry_ = nullptr;
+
+        /**
+         * @brief Bind the original program declaration's ICVs before its admitted thread starts.
+         * @param original_threads Positive worker budget sealed by the original program declaration.
+         * @param original_dynamic Dynamic-team policy from that same immutable declaration.
+         */
+        explicit RetainedParentTicketServiceWorker(pthread_t,int original_threads,int original_dynamic) noexcept;
+        /** @brief Enter the original run loop, terminating on any escaping exception. */
+        static void* invoke(void*) noexcept;
         /** @brief Complete typed lifecycle of the worker's single task slot. */
         enum class State : std::uint8_t
         {
@@ -105,13 +146,16 @@ namespace llaminar2
             Stopping, ///< Destructor has prohibited future dispatch.
         };
 
-        /** @brief Persistent thread loop; all state transitions hold mutex_. */
+        /** @brief Apply original program task policy once, then run the mutex-owned ticket lifecycle. */
         void run() noexcept;
 
         mutable std::mutex mutex_;
         std::condition_variable work_ready_;
         std::condition_variable work_complete_;
-        std::thread worker_;
+        pthread_t worker_{};
+        int original_num_threads_ = 1; ///< Original program's admitted OpenMP task budget, sealed before pthread_create.
+        int original_dynamic_ = 0; ///< Original program's dynamic-team ICV; applied once on the service thread.
+        bool running_=false; ///< Published only after pthread_create succeeds.
         State state_ = State::Idle;
         Task task_ = nullptr;
         void *context_ = nullptr;

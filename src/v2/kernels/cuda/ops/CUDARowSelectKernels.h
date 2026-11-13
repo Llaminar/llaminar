@@ -10,6 +10,8 @@
  */
 
 #pragma once
+#include "../../RowSelectPolicy.h"
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,7 @@ namespace llaminar2::cuda
         int request_row_capacity,
         int bucket_seq_len,
         int32_t pad_token_id,
+        bool require_exact_rows,
         int32_t *out_token_ids,
         int32_t *out_position_ids,
         int32_t *out_real_rows,
@@ -182,7 +185,7 @@ namespace llaminar2::cuda
         int seq_len,
         int d_model,
         int selected_row_count,
-        void *stream);
+        void *stream, RowsSelectPolicy policy = {});
 
     /**
      * @brief Pack one terminal hidden row per padded request from resident lengths.
@@ -273,7 +276,7 @@ namespace llaminar2::cuda
         int seq_capacity,
         int d_model,
         int selected_row_count,
-        void *stream);
+        void *stream, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
     /**
      * @brief Prepare one request's complete shifted-MTP prefill payload.
@@ -324,7 +327,8 @@ namespace llaminar2::cuda
         int captured_row_stride,
         int seq_capacity,
         int d_model,
-        void *stream);
+        void *stream,
+        MTPShiftedCacheOrigin origin = MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
     /**
      * @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]].

@@ -8,6 +8,9 @@
  * Immutable World-model environment limits are read from MPI_COMM_WORLD, where
  * MPI publishes them; splitting a communicator does not copy those attributes.
  * Reading that local metadata never sends payloads or collectives on WORLD.
+ * Completed operation telemetry aggregates by bounded lane/topology identity;
+ * changing epoch/expert coordinates use the collector's ordered fixed-width
+ * witness instead of retaining a new string-keyed record for every transfer.
  */
 
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
@@ -28,6 +31,7 @@
 #include <climits>
 #include <cstring>
 #include <exception>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -159,7 +163,7 @@ namespace llaminar2
     MoEOverlayResidencyWaveProgress
     MoEOverlayHostRemoteProjectionSource::pollNextChunk(
         MoEOverlayRemoteProjectionChunkView *chunk,
-        std::string *error) noexcept
+        std::string *error, std::span<std::uint8_t> staging) noexcept
     {
         if (!chunk || aborted_ || outstanding_header_)
         {
@@ -172,7 +176,11 @@ namespace llaminar2
                     : "Host remote projection source requires a chunk destination");
             return MoEOverlayResidencyWaveProgress::Failed;
         }
-        const auto next = cursor_.takeNext();
+        if(cursor_.requiresCPUStaging() && staging.size()<manifest_.maximum_chunk_bytes) {
+            setError(error,"Original CPU projection requires its exclusive admitted MPI send-lane staging");
+            return MoEOverlayResidencyWaveProgress::Failed;
+        }
+        const auto next = cursor_.takeNext(staging);
         if (!next)
         {
             setError(
@@ -232,10 +240,12 @@ namespace llaminar2
             std::shared_ptr<void> lifetime,
             std::optional<MoEOverlayRemoteProjectionManifest>
                 expected_manifest,
-            MoEOverlayRemoteProjectionManifestMatchPolicy match_policy)
+            MoEOverlayRemoteProjectionManifestMatchPolicy match_policy,
+            std::shared_ptr<std::mutex> encoded_write_mutex)
         : expected_identity_(expected_identity),
           regions_(regions),
           lifetime_(std::move(lifetime)),
+          encoded_write_mutex_(std::move(encoded_write_mutex)),
           expected_manifest_(std::move(expected_manifest)),
           match_policy_(match_policy)
     {
@@ -312,24 +322,23 @@ namespace llaminar2
                 "Host remote projection physical format differs from destination contract");
             return false;
         }
-        for (std::size_t region = 0; region < regions_.size(); ++region)
-        {
-            if (regions_[region].size() != manifest.region_bytes[region])
-            {
-                setError(
-                    error,
-                    "Host remote projection final regions disagree with sender manifest");
-                return false;
+        try {
+            std::optional<ExpertTierWeightCPUStorageLayout> native;
+            if(manifest.carriesCpuBytes() && manifest.identity.destination_device.is_cpu())
+                native=remoteCpuProjectionStorageLayout(manifest,MoEOverlayRemoteCPUStorageEndpoint::Destination);
+            for(size_t region=0;region<regions_.size();++region) {
+                const ExpertWeightFormat format{.kind=manifest.format_kind};
+                const size_t expected=manifest.carriesFloatingBytes() && region==0
+                    ? size_t(manifest.destination_projection.rows)*manifest.destination_projection.columns*format.floatingElementBytes()
+                    : native && region==0?native->cpuStorageBytes():manifest.region_bytes[region];
+                if(regions_[region].size()!=expected) {
+                    setError(error,"Host remote projection original final regions disagree with sender manifest");return false;
+                }
             }
-        }
-        try
-        {
-            validator_.emplace(manifest);
-        }
-        catch (const std::exception &exception)
-        {
-            setError(error, exception.what());
-            return false;
+            validator_.emplace(manifest);cpu_layout_=native;
+            if(manifest.carriesFloatingBytes())floating_layout_=manifest;
+        } catch(const std::exception& exception) {
+            setError(error,exception.what());return false;
         }
         if (error)
             error->clear();
@@ -342,6 +351,21 @@ namespace llaminar2
         std::span<const std::uint8_t> payload,
         std::string *error) noexcept
     {
+        uint32_t first=0,units=0;
+        if(cpu_layout_) {
+            const auto total=expertTierWirePrefix(*cpu_layout_,cpu_layout_->unit_count);
+            if(header.region!=0 || header.region_offset>total || payload.size()>total-header.region_offset) {
+                setError(error,"Remote native chunk exceeds original intersection wire extent");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            first=expertTierWireUnitAt(*cpu_layout_,header.region_offset);
+            const auto end=expertTierWireUnitAt(*cpu_layout_,header.region_offset+payload.size());
+            if(end<=first || end>cpu_layout_->unit_count || end-first>cpu_layout_->maximum_units_per_chunk ||
+               expertTierWirePrefix(*cpu_layout_,first)!=header.region_offset ||
+               expertTierWirePrefix(*cpu_layout_,end)!=header.region_offset+payload.size()) {
+                setError(error,"Remote native chunk splits a live native column unit");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            units=end-first;
+        }
         if (aborted_ || !validator_ ||
             !validator_->accept(header, payload, error))
         {
@@ -352,6 +376,29 @@ namespace llaminar2
             return MoEOverlayResidencyWaveProgress::Failed;
         }
 
+        if(cpu_layout_) {
+            if(!scatterExpertTierCPUWeightChunk(*cpu_layout_,payload,first,units,regions_[0],encoded_write_mutex_.get())) {
+                validator_->abort();setError(error,"Remote native intersection scatter rejected original final storage");
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
+        }
+        if(floating_layout_) {
+            const auto& manifest=*floating_layout_;const ExpertWeightFormat format{.kind=manifest.format_kind};
+            const auto& owned=manifest.destination_projection;const auto& source=manifest.source_projection;
+            const size_t element=format.floatingElementBytes(),row_bytes=size_t(manifest.K)*element;
+            if((owned.columns!=manifest.K || source.columns!=manifest.K) && payload.size()>row_bytes-header.region_offset%row_bytes) {
+                validator_->abort();setError(error,"Floating remote chunk crosses an original local row gap");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            const size_t row=std::max(owned.first_row,source.first_row)-owned.first_row+header.region_offset/row_bytes;
+            const size_t column=std::max(owned.first_column,source.first_column)-owned.first_column;
+            const size_t offset=(row*owned.columns+column)*element+header.region_offset%row_bytes;
+            if(offset>regions_[0].size() || payload.size()>regions_[0].size()-offset) {
+                validator_->abort();setError(error,"Floating remote chunk exceeds original final root");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            std::memcpy(regions_[0].data()+offset,payload.data(),payload.size());
+            if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
+        }
         auto destination = mutableRegion(regions_, header.region);
         if (header.region_offset > destination.size() ||
             payload.size() > destination.size() -
@@ -485,24 +532,35 @@ namespace llaminar2
             std::make_shared<
                 MoEOverlayMPIRemoteProjectionTransportSharedStats>();
 
-        /** @brief Export one low-frequency proof event. */
+        /**
+         * @brief Export one transport fact under its original rank authority.
+         * @param name Existing metric family; no transport semantics are inferred.
+         * @param value Unchanged completed count, byte or timing increment.
+         * @param extra_tags Stable topology/lane dimensions for completed operations.
+         * @param words Optional fixed-width changing coordinates in completion order.
+         *
+         * Sequence observations retain exact integer extrema and ordered digests
+         * without growing the map with epoch, migration, layer or expert keys.
+         */
         void recordCounter(
             const char *name,
             double value = 1.0,
-            PerfStatsCollector::Tags extra_tags = {}) const
+            PerfStatsCollector::Tags extra_tags = {},
+            std::initializer_list<std::uint64_t> words = {}) const
         {
             auto tags = extra_tags;
             tags.emplace("world_rank", std::to_string(world_rank));
             tags.emplace("world_size", std::to_string(world_size));
             tags.emplace("background", "true");
             tags.emplace("blocking", "false");
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                name,
-                value,
-                "maintenance",
-                perf_device,
-                tags);
+            if (words.size() != 0u)
+                PerfStatsCollector::addCounterWithSequence(
+                    "moe_overlay_residency", name, value, words,
+                    "maintenance", perf_device, std::move(tags));
+            else
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency", name, value,
+                    "maintenance", perf_device, std::move(tags));
         }
 
         /** @brief Release exactly one reserved lane after MPI is quiescent. */
@@ -619,14 +677,17 @@ namespace llaminar2
             MoEOverlayResidencyWaveProgress poll(
                 std::string *error) noexcept override
             {
+                // Ready is reached only after genuine admitted transfer and
+                // final ACK. It remains a stable query after that operation
+                // releases its lane; querying it must not touch a later owner.
+                if (state_ == State::Ready)
+                    return MoEOverlayResidencyWaveProgress::Ready;
                 if (lane_released_)
                 {
                     return failProtocol(
                         "Remote projection was polled before atomic lane admission",
                         error);
                 }
-                if (state_ == State::Ready)
-                    return MoEOverlayResidencyWaveProgress::Ready;
                 if (state_ == State::Failed || state_ == State::Aborting ||
                     state_ == State::AbortReady)
                 {
@@ -818,6 +879,14 @@ namespace llaminar2
                 return state_ == State::Ready ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual source or accepted receiver manifest extent, never inferred from observation bytes. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override
+            {
+                if (source_) return source_->manifest().total_bytes;
+                return received_manifest_.total_bytes ? std::optional<std::uint64_t>(received_manifest_.total_bytes) : std::nullopt;
+            }
+
+
         private:
             /** @return Persistent lane storage reserved by this operation. */
             MoEOverlayMPIRemoteProjectionLaneStorage &lane() noexcept
@@ -891,7 +960,7 @@ namespace llaminar2
                 MoEOverlayRemoteProjectionChunkView chunk;
                 const auto endpoint_started_at =
                     std::chrono::steady_clock::now();
-                const auto progress = source_->pollNextChunk(&chunk, error);
+                const auto progress = source_->pollNextChunk(&chunk,error,lane().payload);
                 recordHostWorkSince(endpoint_started_at);
                 if (progress == MoEOverlayResidencyWaveProgress::Pending)
                 {
@@ -1236,58 +1305,61 @@ namespace llaminar2
                     {"role", role_ == Role::Source ? "source"
                                                     : "destination"},
                     {"purpose", transactionPurposeName(purpose_)},
-                    {"candidate_epoch",
-                     std::to_string(identity_.candidate_epoch)},
-                    {"migration_index",
-                     std::to_string(identity_.migration_index)},
-                    {"layer", std::to_string(identity_.layer_idx)},
-                    {"expert", std::to_string(identity_.expert_id)},
+                    {"projection", std::to_string(static_cast<unsigned>(identity_.projection))},
+                    {"source_world_rank", std::to_string(identity_.source_world_rank)},
+                    {"destination_world_rank", std::to_string(identity_.destination_world_rank)},
+                    {"source_device", identity_.source_device.to_string()},
+                    {"destination_device", identity_.destination_device.to_string()},
                     {"source_participant",
                      std::to_string(identity_.source_participant)},
                     {"destination_participant",
                      std::to_string(identity_.destination_participant)},
                 };
-                impl_->recordCounter(
+                // Completion order is lane-local observed order, not a claim
+                // that concurrently progressing peer endpoints finish together.
+                const auto record_completed = [&](const char *name, double value)
+                {
+                    impl_->recordCounter(name, value, tags,
+                        {identity_.expected_epoch, identity_.candidate_epoch,
+                         identity_.migration_index,
+                         static_cast<std::uint64_t>(identity_.layer_idx),
+                         static_cast<std::uint64_t>(identity_.expert_id),
+                         completed_payload_bytes_});
+                };
+                record_completed(
                     "remote_projection_operations_completed",
-                    1.0,
-                    tags);
+                    1.0);
                 /*
                  * Count final authenticated payload bytes, not MPI headers or
                  * manifests.  Both endpoints publish their own completion so
                  * a distributed report can prove send and receive progress;
                  * `role` keeps those quantities independently auditable.
                  */
-                impl_->recordCounter(
+                record_completed(
                     "remote_projection_payload_bytes_completed",
-                    static_cast<double>(completed_payload_bytes_),
-                    tags);
-                impl_->recordCounter(
+                    static_cast<double>(completed_payload_bytes_));
+                record_completed(
                     "remote_projection_wall_ns",
-                    static_cast<double>(wall_nanoseconds),
-                    tags);
-                impl_->recordCounter(
+                    static_cast<double>(wall_nanoseconds));
+                record_completed(
                     "remote_projection_admission_to_dispatch_ns",
                     static_cast<double>(
-                        admission_to_dispatch_nanoseconds_),
-                    tags);
-                impl_->recordCounter(
+                        admission_to_dispatch_nanoseconds_));
+                record_completed(
                     "remote_projection_host_work_ns",
-                    static_cast<double>(host_work_nanoseconds_),
-                    tags);
-                impl_->recordCounter(
+                    static_cast<double>(host_work_nanoseconds_));
+                record_completed(
                     "remote_projection_mpi_request_visible_ns",
-                    static_cast<double>(mpi_visible_nanoseconds_),
-                    tags);
+                    static_cast<double>(mpi_visible_nanoseconds_));
                 const std::uint64_t attributed_nanoseconds =
                     saturatingExpertTierMeasurementAdd(
                         host_work_nanoseconds_, mpi_visible_nanoseconds_);
-                impl_->recordCounter(
+                record_completed(
                     "remote_projection_unattributed_poll_ns",
                     static_cast<double>(
                         wall_nanoseconds > attributed_nanoseconds
                             ? wall_nanoseconds - attributed_nanoseconds
-                            : 0u),
-                    tags);
+                            : 0u));
                 if (error)
                     error->clear();
                 return MoEOverlayResidencyWaveProgress::Ready;
@@ -1537,9 +1609,9 @@ namespace llaminar2
             static_cast<double>(impl_->lanes.size()),
             {{"staging_capacity_bytes",
               std::to_string(config_.staging_capacity_bytes)},
-             {"maximum_participants_per_cycle",
+             {"maximum_pieces_per_projection_wave",
               std::to_string(
-                  config_.lane_budget.maximum_participants_per_cycle)},
+                  config_.lane_budget.maximum_pieces_per_projection_wave)},
              {"maximum_concurrent_cycles",
               std::to_string(
                   config_.lane_budget.maximum_concurrent_cycles)},

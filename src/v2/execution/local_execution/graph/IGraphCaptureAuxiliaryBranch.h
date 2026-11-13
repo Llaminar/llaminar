@@ -13,14 +13,18 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "collective/LocalTPCaptureSourceDefinition.h"
 
 #include <functional>
 #include <memory>
+#include <span>
 #include <string_view>
 
 namespace llaminar2
 {
     class IGPUGraphCapture;
+    class DeviceGraphExecutor;
+    namespace test {struct RetainedGraphParticipantsReplayAccess;}
     /**
      * @brief One cache-owned branch recorded into a complete native GPU graph.
      *
@@ -65,6 +69,30 @@ namespace llaminar2
          */
         [[nodiscard]] virtual bool attach(IGPUGraphCapture &graph) noexcept = 0;
 
+        /**
+         * @brief Attach finite body siblings under this SAME original Open/Close lifecycle.
+         * @param graph Original sealed, uninstantiated per-device parent.
+         * @param siblings Immutable graph-only bodies; none may depend on Close.
+         * @return False unless this branch explicitly supports the complete frontier.
+         * Unsupported branches reject nonempty siblings rather than silently
+         * dropping them or replacing an existing progress authority.
+         */
+        [[nodiscard]] virtual bool attachWithFiniteBody(IGPUGraphCapture& graph,
+            std::span<const IGPUGraphCapture* const> siblings) noexcept
+        {
+            return siblings.empty() && attach(graph);
+        }
+
+
+        /** @return Exact original source definition received at this cache's matched recorded boundary. */
+        const auto& originalSourceDefinition()const noexcept{return original_source_definition_;}
+    private:
+        friend class DeviceGraphExecutor;
+        friend struct test::RetainedGraphParticipantsReplayAccess;
+        /** @brief Only canonical executor may bind the existing rendezvous result before attachment. */
+        void bindOriginalSourceDefinition(std::shared_ptr<const RetainedGraphParticipantPreparationStream> definition)
+        {original_source_definition_=std::move(definition);}
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> original_source_definition_;
     protected:
         IGraphCaptureAuxiliaryBranch() = default;
     };
@@ -85,6 +113,9 @@ namespace llaminar2
         DeviceId device = DeviceId::invalid();    ///< Exact branch GPU.
         std::function<std::unique_ptr<IGraphCaptureAuxiliaryBranch>()>
             create; ///< Cold, allocation-permitted construction callback.
+
+        /** @brief Optional typed lowering of the SAME original capture-end boundary, never an additional wait. */
+        std::function<bool(const std::string&,void*,LocalTPCaptureSourceDefinition&)> source_definition_boundary;
 
         /** @return true only when all factory identity fields are complete. */
         [[nodiscard]] bool valid() const noexcept

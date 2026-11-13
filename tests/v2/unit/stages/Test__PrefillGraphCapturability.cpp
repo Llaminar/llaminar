@@ -12,6 +12,7 @@
  * - SharedExpertGateStage
  * - GDNRecurrenceStage
  * - MTP publication authority and retained capture identity
+ * - Canonical fixed-epoch storage and immutable native record geometry
  */
 
 #include <gtest/gtest.h>
@@ -24,6 +25,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "kernels/IMoEKernel.h"
@@ -38,6 +40,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using namespace llaminar2;
@@ -143,9 +146,9 @@ namespace
         bool old_device_routed_;
     };
 
-    DeviceNativeVNNIMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
+    DeviceNativeQuantisedMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x1000u);
         desc.mins = reinterpret_cast<const void *>(base + 0x2000u);
@@ -358,8 +361,8 @@ namespace
         void sharedExpertGate(const float *, const float *, float *, int, int) override {}
         void swiGLU(float *, const float *, int) override {}
         int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *,
-            const DeviceNativeVNNIMatrixDesc *,
+            const DeviceNativeQuantisedMatrixDesc *,
+            const DeviceNativeQuantisedMatrixDesc *,
             int,
             int,
             int,
@@ -369,7 +372,7 @@ namespace
             return gateup_table_uploads++;
         }
         int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *,
+            const DeviceNativeQuantisedMatrixDesc *,
             int,
             int,
             int,
@@ -534,7 +537,7 @@ namespace
         {
             return true;
         }
-        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
         {
             out = runtimeDesc(0x71000000u, desc_n_, desc_k_);
             return true;
@@ -633,9 +636,13 @@ TEST_F(MoERoutingPrefillGraphCapture, GroupedVerifierUsesCaptureOnlyLaunchPrepar
     params.force_decode_equivalent_verifier_prefill = true;
     MoERoutingStage stage(params);
 
+#if defined(HAVE_ROCM)
     EXPECT_EQ(
         stage.graphLaunchPreparationPolicy(),
         GraphLaunchPreparationPolicy::CaptureOnly);
+#else
+    EXPECT_EQ(stage.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::None);
+#endif
     EXPECT_EQ(stage.activeRowCountDeviceForTesting(), &active_rows_);
 }
 
@@ -749,7 +756,7 @@ TEST(MTPSpeculativeStatePublicationGraphCapture,
         params.outcome_token_stride = 16;
         params.outcome_meta_stride = 32;
         params.base_cached_tokens_device = storage.data();
-        params.accepted_restore_rows_device = storage.data();
+        params.accepted_restore_rows_device = storage;
         params.target_cached_tokens_device = storage.data();
         params.accepted_state_counts_device = storage.data();
         params.publication_ok_flags_device = storage.data();
@@ -1009,12 +1016,14 @@ TEST_F(MoERoutingPrefillGraphCapture,
  * @brief Lock down the heterogeneous overlay verifier publication protocol.
  *
  * The continuation GPU router must retain selected expert IDs in its own
- * per-layer ledger while routing, then expose that exact ledger to the later
- * accepted-state transaction.  The unit uses pointer sentinels only: no device
- * allocation or GPU work is permitted in this protocol-level suite.
+ * per-layer ledger while routing. A CPU-backed runtime table has no GPU
+ * publication-stream authority, so it must not authorize a later accepted-state
+ * enqueue merely because a non-null pointer is supplied. Native CUDA/ROCm
+ * publisher tests separately prove the successful table-owned stream path.
+ * This unit uses pointer sentinels only, with no GPU allocation or work.
  */
 TEST_F(MoERoutingPrefillGraphCapture,
-       OverlayTicketVerifierRetainsThenCommitsOneTypedLedger)
+       OverlayTicketVerifierRetainsLedgerButRejectsMissingPublicationAuthority)
 {
 #if defined(HAVE_ROCM)
     const DeviceId device = DeviceId::rocm(0);
@@ -1073,19 +1082,18 @@ TEST_F(MoERoutingPrefillGraphCapture,
 
     int32_t accepted_rows = SEQ_LEN - 1;
     int32_t publication_ok = 1;
-    ASSERT_TRUE(stage.enqueueCommittedGroupedVerifierHistograms(
+    EXPECT_FALSE(stage.enqueueCommittedGroupedVerifierHistograms(
         &accepted_rows,
         &publication_ok,
         /*request_count=*/1,
         /*rows_per_request=*/SEQ_LEN,
         publication_stream));
-    EXPECT_EQ(stub_kernel_.verifier_histogram_commit_calls, 1);
-    EXPECT_EQ(
-        stub_kernel_.last_committed_route_ledger,
-        runtime_table.deviceLayerState(0));
-    EXPECT_EQ(
-        stub_kernel_.last_histogram_commit_stream,
-        publication_stream);
+    EXPECT_EQ(stub_kernel_.verifier_histogram_commit_calls, 0);
+    EXPECT_EQ(stub_kernel_.last_committed_route_ledger, nullptr);
+    EXPECT_EQ(stub_kernel_.last_histogram_commit_stream, nullptr);
+    EXPECT_TRUE(stage.hasGPUStream());
+    EXPECT_EQ(stage.gpuStream(), route_stream)
+        << "Rejected publication must not replace the verifier compute stream";
 #else
     GTEST_SKIP() << "ROCm graph-capture path is not compiled in this build";
 #endif
@@ -3089,9 +3097,13 @@ TEST_F(SharedExpertGatePrefillGraphCapture, GroupedVerifierUsesCaptureOnlyLaunch
     auto params = makeValidPrefillParams();
     SharedExpertGateStage stage(params);
 
+#if defined(HAVE_ROCM)
     EXPECT_EQ(
         stage.graphLaunchPreparationPolicy(),
         GraphLaunchPreparationPolicy::CaptureOnly);
+#else
+    EXPECT_EQ(stage.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::None);
+#endif
     EXPECT_EQ(stage.activeRowCountDeviceForTesting(), &active_rows_);
 }
 
@@ -3287,6 +3299,27 @@ protected:
         return p;
     }
 };
+
+/** @brief Missing/unknown state owners cannot manufacture a retained capture orientation. */
+TEST_F(GDNPrefillGraphCapture, CaptureIdentityRejectsMissingOrUnknownRecurrenceOwner)
+{
+    GDNRecurrenceStage missing(makeValidPrefillParams(nullptr));
+    EXPECT_THROW(missing.graphCaptureVariantSignature(), std::logic_error);
+    StubGDNKernel valid(true, N_HEADS * D_K * D_V);
+    GDNRecurrenceStage admitted(makeValidPrefillParams(&valid));
+    EXPECT_EQ(admitted.graphCaptureVariantSignature(), 0x47444e4c00000000ULL);
+    /** @brief Corrupt metadata only; this unit stub never invokes a device. */
+    struct UnknownLayout final : StubGDNKernel
+    {
+        using StubGDNKernel::StubGDNKernel;
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
+        {
+            return static_cast<GDNRecurrenceStateLayout>(255);
+        }
+    } unknown(true, N_HEADS * D_K * D_V);
+    GDNRecurrenceStage malformed(makeValidPrefillParams(&unknown));
+    EXPECT_THROW(malformed.graphCaptureVariantSignature(), std::invalid_argument);
+}
 
 TEST_F(GDNPrefillGraphCapture, PrefillCapturableWhenGPUStateReady)
 {
@@ -3490,4 +3523,188 @@ TEST_F(GDNPrefillGraphCapture, LiveStateAllGatherCapturableRequiresRawAllgatherG
 #else
     GTEST_SKIP() << "GPU backend not compiled";
 #endif
+}
+
+/**
+ * @brief Retained device position rows survive request reset without host preparation.
+ *
+ * The pointers are identity-only host fixtures; this test never initializes a
+ * GPU backend or executes RoPE. Native PP lifecycle covers actual replay.
+ */
+TEST(RoPERetainedCaptureIdentity, DevicePositionBankSurvivesRequestReset)
+{
+    std::array<int32_t, 3> first{};
+    std::array<int32_t, 3> second{};
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RoPEStage::Params params;
+        params.device_id = device;
+        params.seq_len = 3;
+        params.position_ids_device = first.data();
+        RoPEStage stage(params);
+        for (int reset = 0; reset < 2; ++reset)
+        {
+            stage.resetSessionStatePreservingCapturedReplay();
+            EXPECT_EQ(stage.getParams().position_ids_device, first.data());
+            EXPECT_EQ(stage.getParams().seq_len, 3);
+            EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                      GraphLaunchPreparationPolicy::CaptureOnly);
+        }
+        stage.updateDynamicDevicePositionIds(second.data(), 2);
+        stage.resetSessionStatePreservingLazyInitialization();
+        EXPECT_EQ(stage.getParams().position_ids_device, second.data());
+        EXPECT_EQ(stage.getParams().seq_len, 2);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                  GraphLaunchPreparationPolicy::CaptureOnly);
+        stage.resetSessionState();
+        EXPECT_EQ(stage.getParams().position_ids_device, nullptr);
+        EXPECT_EQ(stage.getParams().seq_len, 0);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                  GraphLaunchPreparationPolicy::CaptureAndReplay);
+    }
+}
+
+/** @brief Host positions remain request-local and require their original preparation. */
+TEST(RoPERetainedCaptureIdentity, HostPositionStateStillClearsOnPreservingReset)
+{
+    const std::array<int, 3> positions{7, 9, 12};
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RoPEStage::Params params;
+        params.device_id = device;
+        params.seq_len = 3;
+        params.position_ids = positions.data();
+        params.pos_offset = 7;
+        RoPEStage stage(params);
+        stage.resetSessionStatePreservingCapturedReplay();
+        EXPECT_EQ(stage.getParams().position_ids, nullptr);
+        EXPECT_EQ(stage.getParams().position_ids_device, nullptr);
+        EXPECT_EQ(stage.getParams().seq_len, 0);
+        EXPECT_EQ(stage.getParams().pos_offset, 0);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                  device.is_gpu() ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                                  : GraphLaunchPreparationPolicy::None);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/** @test Real stage requirements/ownership never rebind legacy mutable kernel state for retained capture. */
+TEST(GDNRetainedStageContract, ExactWorkspaceAndColdCaptureAreOneImmutableProgram)
+{
+    class Owner final : public StubGDNKernel
+    {
+    public:
+        Owner() : StubGDNKernel(true) {}
+        int capture_binds = 0, work_binds = 0, host_restores = 0;
+        void bindVerifierStateCaptureWorkspace(float *, int, int) override { ++capture_binds; }
+        void bindSpeculativeStateWorkspace(float *, int) override { ++work_binds; }
+        bool restoreVerifierStateCaptureRow(float *, int, void *) override { ++host_restores; return true; }
+    };
+    for (auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (int requests : {1, 3})
+    for (int width : {2, 16, 31})
+    for (int dk : {64, 128})
+    for (int dv : {1, 65, 128})
+    {
+        Owner owner;
+        const std::array<std::int32_t, 3> live_lengths{width, width, width};
+        GDNRecurrenceStage::Params params;
+        params.device_id = device;
+        params.request_count = requests;
+        params.request_seq_len = width;
+        params.request_seq_lens_device = live_lengths.data();
+        params.seq_len = requests * width;
+        params.n_heads = 12;
+        params.n_k_heads = 4;
+        params.d_k = dk;
+        params.d_v = dv;
+        params.layer_idx = 0;
+        params.workspace_namespace = "grouped_mtp_verifier";
+        params.speculative_state_slot_rows = params.seq_len;
+        params.kernel = &owner;
+        params.gpu_retained_workspace = gdn_workspace::selectGPUVerifierWorkspace(
+            params.seq_len, requests, 12, dk, dv);
+        ASSERT_TRUE(params.gpu_retained_workspace);
+        GDNRecurrenceStage stage(params);
+        const auto requirements = stage.getWorkspaceRequirements(width);
+        ASSERT_EQ(requirements.buffers.size(), 1u);
+        EXPECT_TRUE(requirements.buffers[0].name.starts_with(GDNRecurrenceStage::WS_RETAINED_STATE_SLOTS));
+        EXPECT_EQ(requirements.buffers[0].size_bytes, params.gpu_retained_workspace->geometry().bankBytes());
+        EXPECT_EQ(requirements.buffers[0].content_lifetime, WorkspaceContentLifetime::SerialGraphFamily);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::CaptureOnly);
+        EXPECT_TRUE(stage.supportsGraphCaptureAfterLaunchPreparation());
+        EXPECT_FALSE(stage.isGraphCapturable());
+        EXPECT_TRUE(stage.hasVerifierStateCapture()) << "Producer discovery must not omit a selected cold stage";
+        EXPECT_TRUE(stage.requiresVerifierStateCaptureForPublication());
+        stage.bindWorkspace(nullptr);
+        stage.resetSessionState();
+        stage.resetSessionStatePreservingCapturedReplay();
+        EXPECT_THROW(stage.clearVerifierStateCaptureBindingAfterPublication(), std::logic_error);
+        // An absent preparation is fatal, never permission to borrow legacy state.
+        EXPECT_THROW((void)stage.prepareGraphLaunch(nullptr, reinterpret_cast<void *>(0x1000)), std::logic_error);
+        EXPECT_THROW((void)stage.restoreVerifierStateCaptureRow(0, reinterpret_cast<void *>(0x1000)), std::logic_error);
+        EXPECT_THROW((void)stage.restoreVerifierStateCaptureRequestTerminalRows(
+            live_lengths.data(), requests, width, reinterpret_cast<void *>(0x1000)), std::logic_error);
+        EXPECT_EQ(owner.capture_binds, 0);
+        EXPECT_EQ(owner.work_binds, 0);
+        EXPECT_EQ(owner.host_restores, 0);
+        EXPECT_THROW(stage.updateDynamicParams(0, width + 1), std::invalid_argument);
+        EXPECT_EQ(stage.getWorkspaceRequirements(width).buffers[0].size_bytes, requirements.buffers[0].size_bytes);
+        stage.unbindWorkspace();
+        EXPECT_EQ(owner.capture_binds, 0);
+        EXPECT_EQ(owner.work_binds, 0);
+        auto malformed = params;
+        malformed.request_seq_len = width + 1;
+        EXPECT_THROW((void)GDNRecurrenceStage(malformed), std::invalid_argument);
+        malformed = params;
+        malformed.device_id = DeviceId::cpu();
+        EXPECT_THROW((void)GDNRecurrenceStage(malformed), std::invalid_argument);
+
+        // The explicit required-terminal form remains a distinct complete contract.
+        params.gpu_retained_workspace.emplace(params.gpu_retained_workspace->geometry(),
+            gdn::GDNDenseCompactTerminalKind::DenseDestination);
+        GDNRecurrenceStage required_terminal(params);
+        const auto required = required_terminal.getWorkspaceRequirements(width);
+        ASSERT_EQ(required.buffers.size(), 2u);
+        EXPECT_EQ(required.buffers[1].size_bytes, params.gpu_retained_workspace->geometry().denseBankBytes());
+
+        // Original ordinary/CPU hooks retain their behavior; no retained path is selected by shape alone.
+        params.gpu_retained_workspace.reset();
+        params.speculative_state_slot_rows = 0;
+        GDNRecurrenceStage original(params);
+        EXPECT_EQ(original.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::None);
+        original.bindWorkspace(nullptr);
+        EXPECT_GT(owner.capture_binds, 0);
+        EXPECT_GT(owner.work_binds, 0);
+        EXPECT_FALSE(original.restoreVerifierStateCaptureRow(0, reinterpret_cast<void *>(0x1000)));
+        params.device_id = DeviceId::cpu();
+        GDNRecurrenceStage cpu(params);
+        EXPECT_FALSE(cpu.restoreVerifierStateCaptureRow(0));
+    }
+}
+
+/** @test Invalid geometry cannot be disguised as a cold selection of the original qualified program. */
+TEST(GDNRetainedStageContract, SharedSelectorRejectsMalformedAndNamesOriginalGeometry)
+{
+    EXPECT_FALSE(gdn_workspace::selectGPUVerifierWorkspace(48, 3, 12, 32, 128));
+    EXPECT_FALSE(gdn_workspace::selectGPUVerifierWorkspace(48, 3, 12, 128, 513));
+    for (const auto [flat, requests, heads, dk, dv] : {
+        std::array{0, 3, 12, 128, 128}, {47, 3, 12, 128, 128}, {48, 0, 12, 128, 128},
+        {48, 3, 0, 128, 128}, {48, 3, 12, 0, 128}, {48, 3, 12, 128, -1}})
+        EXPECT_THROW((void)gdn_workspace::selectGPUVerifierWorkspace(flat, requests, heads, dk, dv), std::invalid_argument);
+    EXPECT_THROW((void)gdn_workspace::selectGPUVerifierWorkspace(1, 1,
+        std::numeric_limits<int>::max(), 128, 128), std::overflow_error);
 }

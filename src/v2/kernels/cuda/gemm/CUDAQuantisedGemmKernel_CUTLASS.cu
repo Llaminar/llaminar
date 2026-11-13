@@ -2,21 +2,31 @@
  * @file CUDAQuantisedGemmKernel_CUTLASS.cu
  * @brief CUDA utility kernels and setup-time transfers for CUDAQuantisedGemmKernel
  *
- * After the NativeVNNI-only transition, this file retains:
+ * After the NativeQuantised-only transition, this file retains:
  * - Blockwise activation quantization (FP32→INT8 per-block-of-32)
  * - Setup-time packed-weight upload through the canonical CUDA backend
  * - Device copy utilities
- * - Stream/event management
+ * - Checked record/wait publication on exact context-owned stream/event handles
  *
  * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
- * blockwise dp4a GEMM kernels have been removed — NativeVNNI is now
+ * blockwise dp4a GEMM kernels have been removed — NativeQuantised is now
  * the sole CUDA GEMM execution path.
  * Activation scales remain row-major. Optional INT32 block sums are stored
  * block-major so a tensor-core consumer reads adjacent rows coalescently;
  * the producer writes that single representation directly, without a transpose.
+ * Counted producers retain immutable DeviceRowRange metadata by value. Their
+ * compile-time specialization rejects inactive rows before source/scratch access;
+ * ordinary kernels compile out every live-count read and predicate.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <cuda_runtime.h>
+#include "kernels/cuda/gemm/CUDAQuantisedActivationProducers.h"
+#include <stdexcept>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -106,17 +116,27 @@ namespace
      * @param sums_A_blockwise Optional block-major INT32 sums, K/32 by M.
      * @param M Positive physical row count, also the sum buffer's row pitch.
      * @param K Positive input width divisible by 32.
-     */
+          * @tparam Counted Read the device row authority only in the counted specialization.
+     * @param activeRows Immutable physical/live descriptor copied into this launch.
+    */
+    template<bool Counted, class Rows>
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
         int8_t *__restrict__ A_int8,            // [M × K] output
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
         int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized activation sums
-        int M, int K)
+        int M, int K, Rows activeRows)
     {
         const int row = blockIdx.y;
         if (row >= M)
             return;
+        // Whole row/quantization subgroup agrees before any load, store or barrier.
+        // Invalid interval publications trap before authored native row accesses.
+        if constexpr (Counted)
+        {
+            if (!llaminar2::projectionRowIsActive(activeRows,row))
+                return;
+        }
 
         const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
         const int lane = threadIdx.x & 31;
@@ -153,7 +173,7 @@ namespace
                 row_scales[b] = scale;
 
             // Quantize, coalesced write, and optionally record the quantized
-            // block sum. Asymmetric NativeVNNI prefill uses this sum for the
+            // block sum. Asymmetric NativeQuantised prefill uses this sum for the
             // min correction instead of recomputing it for every output tile.
             float qval = val * inv_scale;
             const int32_t q = static_cast<int32_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
@@ -175,7 +195,7 @@ namespace
     }
 
     // NOTE: blockwise_gemm_dp4a_kernel, quantize_activations_kernel, and
-    // apply_scaling_kernel have been removed — NativeVNNI-only mode.
+    // apply_scaling_kernel have been removed — NativeQuantised-only mode.
 
 } // anonymous namespace
 
@@ -183,10 +203,28 @@ namespace
 // Extern "C" API for .cpp adapter
 // =========================================================================
 
+/**
+ * @brief Reject invalid immutable producer admission before any runtime submit.
+ * @param m Positive retained physical row count.
+ * @param k Positive original input width.
+ * @param stream Exact ordinary stream; native legacy/per-thread sentinels reject.
+ * @param rows Optional immutable descriptor; its live count is never host-read.
+ */
+static void validateCUDAActivationProducer(int m,int k,void* stream,const llaminar2::DeviceRowRange* rows)
+{
+    if (m <= 0 || k <= 0)
+        throw std::invalid_argument("Activation producer requires positive M and K");
+    const auto native = static_cast<cudaStream_t>(stream);
+    if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread)
+        throw std::invalid_argument("Activation producer requires an explicit non-default stream");
+    if (rows && rows->physicalRows() != m)
+        throw std::invalid_argument("Counted quantizer row extent differs from physical matrix");
+}
+
 extern "C"
 {
 
-    // NOTE: cudaQuantGemm_uploadWeights removed — NativeVNNI-only mode,
+    // NOTE: cudaQuantGemm_uploadWeights removed — NativeQuantised-only mode,
     // no Int8Expanded weight upload needed.
 
     /**
@@ -194,27 +232,32 @@ extern "C"
      */
     // NOTE: cudaQuantGemm_execute, cudaQuantGemm_applyScaling,
     // cudaQuantGemm_quantizeActivations (row-wise), and cudaQuantGemm_blockwiseGemm
-    // have been removed — NativeVNNI is now the sole CUDA GEMM execution path.
-    // Only cudaQuantGemm_quantizeActivationsBlockwise is retained (used by NativeVNNI).
+    // have been removed — NativeQuantised is now the sole CUDA GEMM execution path.
+    // Only cudaQuantGemm_quantizeActivationsBlockwise is retained (used by NativeQuantised).
 
     /**
      * @brief Quantize FP32 activations to INT8 with per-block-of-32 scales
      */
-    bool cudaQuantGemm_quantizeActivationsBlockwise(
+    bool cudaQuantGemm_quantizeActivationsBlockwise_rows(
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_A_blockwise,
         int M, int K,
         int cuda_device_id,
-        void *stream)
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
     {
+        validateCUDAActivationProducer(M, K, stream, rowRange);
+        return llaminar2::dispatchProjectionRows(M,rowRange,[&](auto rowAuthority) {
+
+        const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
+
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm::quantizeActivationsBlockwise] Null pointer: "
-                << "d_A_fp32=" << (void *)d_A_fp32
-                << " d_A_int8=" << (void *)d_A_int8
-                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise;
+            << "d_A_fp32=" << (void *)d_A_fp32
+            << " d_A_int8=" << (void *)d_A_int8
+            << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise;
             throw std::runtime_error(oss.str());
         }
 
@@ -233,20 +276,38 @@ extern "C"
         dim3 block(BLOCK_SIZE);
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K);
+        if (countedRows) {
+            quantize_activations_blockwise_kernel<true, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K, rowAuthority);
+        } else {
+            quantize_activations_blockwise_kernel<false, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K, rowAuthority);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm] blockwise quantize kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", K=" << K << ")";
+            << cudaGetErrorString(err)
+            << " (M=" << M << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
         }
 
         return true;
+    });
+}
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
+    bool cudaQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int M, int K,
+        int cuda_device_id,
+        void *stream)
+    {
+        return cudaQuantGemm_quantizeActivationsBlockwise_rows(d_A_fp32, d_A_int8, d_scales_A_blockwise, M, K, cuda_device_id, stream, nullptr);
     }
 
     /**
@@ -261,36 +322,42 @@ extern "C"
      * @param stream Exact caller-owned execution stream.
      * @return True after successfully submitting the quantization kernel.
      */
-    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums_rows(
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_A_blockwise,
         int32_t *d_sums_A_blockwise,
         int M, int K,
         int cuda_device_id,
-        void *stream)
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
     {
+
         if (!d_sums_A_blockwise)
         {
-            return cudaQuantGemm_quantizeActivationsBlockwise(
+            return cudaQuantGemm_quantizeActivationsBlockwise_rows(
                 d_A_fp32, d_A_int8, d_scales_A_blockwise,
-                M, K, cuda_device_id, stream);
+                M, K, cuda_device_id, stream, rowRange);
         }
+        validateCUDAActivationProducer(M, K, stream, rowRange);
+        return llaminar2::dispatchProjectionRows(M,rowRange,[&](auto rowAuthority) {
+
+        const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
+
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm::quantizeActivationsBlockwiseWithSums] Null pointer: "
-                << "d_A_fp32=" << (void *)d_A_fp32
-                << " d_A_int8=" << (void *)d_A_int8
-                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
-                << " d_sums_A_blockwise=" << (void *)d_sums_A_blockwise;
+            << "d_A_fp32=" << (void *)d_A_fp32
+            << " d_A_int8=" << (void *)d_A_int8
+            << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
+            << " d_sums_A_blockwise=" << (void *)d_sums_A_blockwise;
             throw std::runtime_error(oss.str());
         }
         if ((K % BLOCKWISE_BLOCK_SIZE) != 0)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm::quantizeActivationsBlockwiseWithSums] K=" << K
-                << " is not divisible by " << BLOCKWISE_BLOCK_SIZE;
+            << " is not divisible by " << BLOCKWISE_BLOCK_SIZE;
             throw std::runtime_error(oss.str());
         }
 
@@ -306,23 +373,42 @@ extern "C"
         dim3 grid(grid_x, M);
         dim3 block(BLOCK_SIZE);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K);
+        if (countedRows) {
+            quantize_activations_blockwise_kernel<true, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, rowAuthority);
+        } else {
+            quantize_activations_blockwise_kernel<false, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, rowAuthority);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm] blockwise quantize-with-sums kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", K=" << K << ")";
+            << cudaGetErrorString(err)
+            << " (M=" << M << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
         }
 
         return true;
+    });
+}
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
+    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int32_t *d_sums_A_blockwise,
+        int M, int K,
+        int cuda_device_id,
+        void *stream)
+    {
+        return cudaQuantGemm_quantizeActivationsBlockwiseWithSums_rows(d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, cuda_device_id, stream, nullptr);
     }
 
-    // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeVNNI-only mode.
+    // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeQuantised-only mode.
 
     /**
      * @brief Release setup-owned packed-weight storage through the CUDA backend.
@@ -464,38 +550,9 @@ extern "C"
 
     // ── Concurrent prefill stream/event helpers ─────────────────────────────
 
-    bool cudaQuantGemm_createStream(void **out_stream, int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        cudaStream_t s;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-        *out_stream = static_cast<void *>(s);
-        return true;
-    }
-
-    void cudaQuantGemm_destroyStream(void *stream)
-    {
-        if (stream)
-            cudaStreamDestroy(static_cast<cudaStream_t>(stream));
-    }
-
-    bool cudaQuantGemm_createEvent(void **out_event, int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        cudaEvent_t e;
-        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-        *out_event = static_cast<void *>(e);
-        return true;
-    }
-
-    void cudaQuantGemm_destroyEvent(void *event)
-    {
-        if (event)
-            cudaEventDestroy(static_cast<cudaEvent_t>(event));
-    }
-
     bool cudaQuantGemm_recordEvent(void *event, void *stream)
     {
+        if (!event || !stream) return false;
         CUDA_CHECK(cudaEventRecord(
             static_cast<cudaEvent_t>(event),
             static_cast<cudaStream_t>(stream)));
@@ -504,6 +561,7 @@ extern "C"
 
     bool cudaQuantGemm_streamWaitEvent(void *stream, void *event)
     {
+        if (!event || !stream) return false;
         CUDA_CHECK(cudaStreamWaitEvent(
             static_cast<cudaStream_t>(stream),
             static_cast<cudaEvent_t>(event), 0));
@@ -511,6 +569,6 @@ extern "C"
     }
 
     // NOTE: repack_weights_tc_blocked_kernel and cudaQuantGemm_prepareTensorCoreBlockedWeights
-    // removed — TC-blocked weight format is no longer used (NativeVNNI-only mode).
+    // removed — TC-blocked weight format is no longer used (NativeQuantised-only mode).
 
 } // extern "C"

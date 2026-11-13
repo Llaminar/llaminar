@@ -1,26 +1,42 @@
 /**
  * @file NUMATopology.cpp
- * @brief NUMA topology detection implementation
+ * @brief NUMA topology detection with GPU identity borrowed from the physical inventory.
+ *
+ * Native GPU discovery is owned by the backend's explicit startup authority;
+ * NUMA placement resolves that admitted PCI identity through the host topology.
+ * CPU ownership belongs to the caller's complete binding, never the first
+ * textual range match or a union including unrelated runtime/helper threads.
+ * Missing or multi-node facts remain unknown for admission to reject.
  * @author David Sanftenberg
  * @date 2025-10-31
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #include "NUMATopology.h"
+#include "NodeTopology.h"
 #include "Logger.h"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
 #include <algorithm>
+#include <charconv>
+#include <limits>
+#include <string_view>
 
-// Conditional includes for optional dependencies
-#ifdef HAVE_HWLOC
+// Required only for the explicit cold MPI-placement observation below. The
+// existing optional HAVE_HWLOC ownership detector remains independently gated.
 #include <hwloc.h>
-#endif
+#include <hwloc/plugins.h>
+#include <set>
+#include <stdexcept>
 
 // GPU headers - CANNOT include both CUDA and HIP in same translation unit (type conflicts)
 // When both are enabled, use extern declarations from GPUEnumeration.h instead
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-#include <cuda_runtime.h>
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #endif
 
 #if defined(HAVE_ROCM) && !defined(HAVE_CUDA)
@@ -37,6 +53,90 @@
 
 namespace llaminar2
 {
+    std::vector<MPICorePlacement> NUMATopology::observeMPICorePlacement()
+    {
+        struct TopologyOwner
+        {
+            hwloc_topology_t value = nullptr;
+            /** @brief Retire successful or partial CPU discovery on every exit. */
+            ~TopologyOwner() { if (value) hwloc_topology_destroy(value); }
+        } topology;
+        if (hwloc_topology_init(&topology.value) != 0)
+            throw std::runtime_error("Cannot initialize canonical CPU MPI placement topology");
+        // Native GPU discovery belongs exclusively to HardwareInventory's
+        // backend branches. This CPU projection must not open any GPU runtime,
+        // including through hwloc's optional I/O/plugin discovery phases.
+        if (hwloc_topology_set_io_types_filter(topology.value, HWLOC_TYPE_FILTER_KEEP_NONE) != 0)
+            throw std::runtime_error("Cannot restrict MPI placement discovery to CPU objects");
+        // Exclude non-CPU discovery phases for all components, including
+        // optional plugins absent from a particular package. Naming a missing
+        // component is an error in hwloc, so a hardcoded plugin-name list would
+        // incorrectly reject otherwise valid CPU-only installations.
+        const unsigned excluded = HWLOC_DISC_PHASE_PCI | HWLOC_DISC_PHASE_IO |
+            HWLOC_DISC_PHASE_MISC | HWLOC_DISC_PHASE_ANNOTATE;
+        const auto phases = std::string("all:") + std::to_string(excluded);
+        if (hwloc_topology_set_components(topology.value, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, phases.c_str()) != 0)
+            throw std::runtime_error("Cannot exclude GPU/I/O phases from CPU MPI placement discovery");
+        if (hwloc_topology_load(topology.value) != 0 || !hwloc_topology_is_thissystem(topology.value))
+            throw std::runtime_error("CPU MPI placement requires actual local hwloc topology");
+        std::vector<MPICorePlacement> result;
+        for (auto *core = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_CORE, nullptr);
+             core; core = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_CORE, core))
+        {
+            if (!core->cpuset || hwloc_bitmap_iszero(core->cpuset) ||
+                core->logical_index > static_cast<unsigned>(std::numeric_limits<int>::max()))
+                throw std::runtime_error("CPU MPI placement has an invalid physical core");
+            int owner = -1;
+            for (auto *node = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_NUMANODE, nullptr);
+                 node; node = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_NUMANODE, node))
+            {
+                if (!node->cpuset || !hwloc_bitmap_intersects(core->cpuset, node->cpuset)) continue;
+                if (owner >= 0 || !hwloc_bitmap_isincluded(core->cpuset, node->cpuset) ||
+                    node->os_index > static_cast<unsigned>(std::numeric_limits<int>::max()))
+                    throw std::runtime_error("CPU MPI placement core has ambiguous observed NUMA ownership");
+                owner = static_cast<int>(node->os_index);
+            }
+            if (owner < 0)
+                throw std::runtime_error("CPU MPI placement core lacks exact observed NUMA ownership");
+            MPICorePlacement placement{owner, static_cast<int>(core->logical_index), {}};
+            for (int cpu = hwloc_bitmap_first(core->cpuset); cpu >= 0; cpu = hwloc_bitmap_next(core->cpuset, cpu))
+                placement.os_cpu_ids.push_back(cpu);
+            result.push_back(std::move(placement));
+        }
+        if (result.empty())
+            throw std::runtime_error("CPU MPI placement has no observed physical cores");
+        return result;
+    }
+
+    std::map<int,std::vector<int>> NUMATopology::logicalMPICoresForNUMANodes(
+        std::span<const MPICorePlacement> observed, std::span<const int> selected_nodes)
+    {
+        if (observed.empty() || selected_nodes.empty())
+            throw std::invalid_argument("MPI placement requires original observed cores and selected NUMA membership");
+        std::set<int> cores, cpus;
+        std::map<int,std::vector<int>> groups;
+        for (const auto &core : observed)
+        {
+            if (core.os_numa_node < 0 || core.logical_core_index < 0 || core.os_cpu_ids.empty() ||
+                !cores.insert(core.logical_core_index).second)
+                throw std::invalid_argument("MPI placement contains contradictory OS/logical core observations");
+            for (const int cpu : core.os_cpu_ids)
+                if (cpu < 0 || !cpus.insert(cpu).second)
+                    throw std::invalid_argument("MPI placement contains duplicate/unknown OS CPU membership");
+            groups[core.os_numa_node].push_back(core.logical_core_index);
+        }
+        std::map<int,std::vector<int>> selected;
+        for (const int node : selected_nodes)
+        {
+            const auto found = groups.find(node);
+            if (node < 0 || found == groups.end() || !selected.emplace(node, found->second).second)
+                throw std::invalid_argument("MPI placement cannot select an unknown/duplicate observed NUMA node");
+            auto &logical = selected.at(node);
+            std::sort(logical.begin(), logical.end());
+        }
+        return selected;
+    }
+
     // Forward declarations of private helper functions
     static int detectViaHwloc();
     static int detectViaProcfs();
@@ -72,15 +172,16 @@ namespace llaminar2
             info.local_numa_node = node;
             info.detection_succeeded = true;
             info.detection_method = "procfs";
-            LOG_DEBUG("[NUMATopology] Detected NUMA node " << node << " via /proc/self/status");
+            LOG_DEBUG("[NUMATopology] Detected NUMA node " << node << " via /proc/thread-self/status");
             return info;
         }
 
-        // Fallback to node 0 (single-socket assumption)
-        info.local_numa_node = 0;
+        // Unknown ownership must not publish a physical node. Distributed
+        // discovery and explicit CPU admission already reject this result.
+        info.local_numa_node = -1;
         info.detection_succeeded = false;
-        info.detection_method = "fallback";
-        LOG_WARN("[NUMATopology] NUMA detection failed, assuming node 0 (single socket)");
+        info.detection_method = "unknown";
+        LOG_WARN("[NUMATopology] Caller NUMA ownership could not be proven");
         return info;
     }
 
@@ -129,9 +230,10 @@ namespace llaminar2
             return -1;
         }
 
-        // Get CPU binding
+        // Caller binding excludes unrelated MPI/GPU/library helper masks.
         hwloc_cpuset_t cpuset = hwloc_bitmap_alloc();
-        if (hwloc_get_cpubind(topology, cpuset, HWLOC_CPUBIND_PROCESS) != 0)
+        if (!cpuset) { hwloc_topology_destroy(topology); return -1; }
+        if (hwloc_get_cpubind(topology, cpuset, HWLOC_CPUBIND_THREAD) != 0)
         {
             hwloc_bitmap_free(cpuset);
             hwloc_topology_destroy(topology);
@@ -153,10 +255,17 @@ namespace llaminar2
         for (int i = 0; i < num_nodes; ++i)
         {
             hwloc_obj_t obj = hwloc_get_obj_by_depth(topology, depth, i);
-            if (obj && hwloc_bitmap_intersects(cpuset, obj->cpuset))
+            if (obj && obj->cpuset && !hwloc_bitmap_iszero(cpuset) &&
+                hwloc_bitmap_isincluded(cpuset, obj->cpuset) &&
+                obj->os_index <= static_cast<unsigned>(std::numeric_limits<int>::max()))
             {
-                detected_node = i;
-                break;
+                // Return the physical OS ID; topology order is not NUMA ID.
+                if (detected_node >= 0)
+                {
+                    detected_node = -1;
+                    break;
+                }
+                detected_node = static_cast<int>(obj->os_index);
             }
         }
 
@@ -170,69 +279,61 @@ namespace llaminar2
 
     int NUMATopology::detectViaProcfs()
     {
-        // Read /proc/self/status and look for Cpus_allowed_list
-        std::ifstream status("/proc/self/status");
-        if (!status.is_open())
-        {
-            return -1;
-        }
+        return detectLocalNUMANodeFromStatus(
+            "/proc/thread-self/status", "/sys/devices/system/cpu");
+    }
 
+    int NUMATopology::detectLocalNUMANodeFromStatus(
+        const std::filesystem::path &status_path,
+        const std::filesystem::path &cpu_sysfs_root)
+    {
+        std::ifstream status(status_path);
+        if (!status.is_open()) return -1;
         std::string line;
         while (std::getline(status, line))
         {
-            if (line.find("Cpus_allowed_list:") == 0)
+            constexpr std::string_view field = "Cpus_allowed_list:";
+            if (!line.starts_with(field)) continue;
+            const auto allowed = line.substr(field.size());
+            const auto report = [&](int node) {
+                // Startup-only DEBUG evidence reuses the facts already read;
+                // it adds no affinity query, payload read or worker logging.
+                LOG_DEBUG("[NUMATopology] Caller allowed CPUs=[" << allowed
+                          << "] exact NUMA=" << node);
+                return node;
+            };
+            const auto cpus = NodeTopology::parseCPUListString(allowed);
+            if (cpus.empty()) return report(-1);
+            std::optional<int> owner;
+            for (const int cpu : cpus)
             {
-                // Parse CPU range (e.g., "0-27" or "28-55")
-                size_t colon = line.find(':');
-                if (colon == std::string::npos)
-                    continue;
-
-                std::string cpu_list = line.substr(colon + 1);
-                // Trim whitespace
-                cpu_list.erase(0, cpu_list.find_first_not_of(" \t"));
-
-                // Parse first CPU in range
-                size_t dash = cpu_list.find('-');
-                int first_cpu = -1;
-                try
+                if (cpu < 0) return report(-1);
+                std::error_code error;
+                const auto path = cpu_sysfs_root / ("cpu" + std::to_string(cpu));
+                std::filesystem::directory_iterator entry(path, error), end;
+                if (error) return report(-1);
+                std::optional<int> cpu_owner;
+                for (; entry != end; entry.increment(error))
                 {
-                    if (dash != std::string::npos)
-                    {
-                        first_cpu = std::stoi(cpu_list.substr(0, dash));
-                    }
-                    else
-                    {
-                        first_cpu = std::stoi(cpu_list);
-                    }
-                }
-                catch (...)
-                {
-                    return -1;
-                }
-
-                // Infer NUMA node from first CPU
-                // Read /sys/devices/system/cpu/cpu{N}/node{M}/cpulist
-                for (int node = 0; node < 8; ++node) // Try up to 8 NUMA nodes
-                {
-                    std::string cpulist_path = "/sys/devices/system/node/node" +
-                                               std::to_string(node) + "/cpulist";
-                    std::ifstream cpulist(cpulist_path);
-                    if (!cpulist.is_open())
+                    if (error) return report(-1);
+                    const auto name = entry->path().filename().string();
+                    if (!name.starts_with("node")) continue;
+                    int node = -1;
+                    const auto parsed = std::from_chars(name.data() + 4,
+                                                        name.data() + name.size(), node);
+                    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size() || node < 0)
                         continue;
-
-                    std::string node_cpus;
-                    std::getline(cpulist, node_cpus);
-
-                    // Check if first_cpu is in this node's CPU list
-                    // Simple check: does the string contain our CPU number?
-                    if (node_cpus.find(std::to_string(first_cpu)) != std::string::npos)
-                    {
-                        return node;
-                    }
+                    const bool directory = entry->is_directory(error);
+                    if (error) return report(-1);
+                    if (!directory) continue;
+                    if (cpu_owner) return report(-1);
+                    cpu_owner = node;
                 }
+                if (error || !cpu_owner || (owner && *owner != *cpu_owner)) return report(-1);
+                owner = cpu_owner;
             }
+            return report(owner.value_or(-1));
         }
-
         return -1;
     }
 
@@ -389,17 +490,14 @@ namespace llaminar2
     std::string NUMATopology::getCUDAPCIBusID(int cuda_device_id)
     {
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, cuda_device_id) == cudaSuccess)
-        {
-            // Format: domain:bus:device.function
-            char bus_id[32];
-            snprintf(bus_id, sizeof(bus_id), "%04x:%02x:%02x.0",
-                     prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
-            return std::string(bus_id);
-        }
-#endif
+        // NUMA discovery is an explicit startup boundary. Preserve the actual
+        // complete BDF; a PCI function must not be fabricated from an ordinal.
+        initializeCUDAHardwareMetadata();
+        return cudaHardwareMetadata().at(cuda_device_id).pci_address;
+#else
+        (void)cuda_device_id;
         return "";
+#endif
     }
 
     int NUMATopology::detectGPUViaSysfs(const std::string &pci_bus_id)

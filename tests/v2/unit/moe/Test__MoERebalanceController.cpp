@@ -7,12 +7,14 @@
  * These fixtures never allocate accelerator memory or load model weights.
  */
 
+#include "execution/moe/DeviceMoECommittedMaintenanceScope.h"
 #include <gtest/gtest.h>
 #include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoERebalanceController.h"
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <initializer_list>
 #include <iterator>
@@ -309,9 +311,9 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    // Version 16 authenticates complete-expert versus gate/up-only payloads
-    // without enlarging the generation-stamped transfer-slot records.
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 16u);
+    // Version 18 appends completed decisions to the controller; v17's exact
+    // command payload/lease fields and zero-reserved word remain unchanged.
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 18u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(
@@ -325,6 +327,7 @@ TEST(Test__MoERebalanceController,
     EXPECT_EQ(plan.destination_previous_expert, kDeviceMoEInvalidSlot);
     EXPECT_EQ(plan.destination_generation, 0u);
     EXPECT_EQ(plan.destination_overlay_participant, -1);
+    EXPECT_EQ(plan.reserved, 0u);
 }
 
 /**
@@ -2571,7 +2574,7 @@ TEST(DeviceMoETransferFormats, IQ4XSSourceTupleRetainsSecondaryCapacityAndIdenti
     std::array<uint8_t, 32> payload{}, destination_payload{};
     std::array<uint16_t, 2> primary{0x3c01u, 0x8001u}, coefficient{35u, 63u};
     std::array<uint16_t, 2> destination_primary{}, destination_coefficient{};
-    DeviceNativeVNNIMatrixDesc source{};
+    DeviceNativeQuantisedMatrixDesc source{};
     source.payload = payload.data(); source.scales = primary.data(); source.mins = coefficient.data();
     source.n = 2; source.k = 32; source.blocks_per_row = 1;
     source.codebook_id = 24; source.source_codebook_id = 4;
@@ -2583,7 +2586,7 @@ TEST(DeviceMoETransferFormats, IQ4XSSourceTupleRetainsSecondaryCapacityAndIdenti
     ASSERT_TRUE(deviceMoEProjectionAllocationCapacity(source, width, auxiliary, emins));
     EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 1); EXPECT_EQ(emins, 0);
 
-    DeviceNativeVNNIMatrixDesc destination = source;
+    DeviceNativeQuantisedMatrixDesc destination = source;
     destination.payload = destination_payload.data(); destination.scales = destination_primary.data();
     destination.mins = destination_coefficient.data(); destination.codebook_id = 4;
     destination.source_is_superblock = 0;
@@ -2621,7 +2624,7 @@ TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentit
     std::array<uint8_t, 26> payload{}, destination_payload{};
     std::array<uint16_t, 2> primary{0x3c01u, 0x8001u}, coefficient{0u, 15u};
     std::array<uint16_t, 2> destination_primary{}, destination_coefficient{};
-    DeviceNativeVNNIMatrixDesc source{};
+    DeviceNativeQuantisedMatrixDesc source{};
     source.payload = payload.data(); source.scales = primary.data(); source.mins = coefficient.data();
     source.n = 2; source.k = 32; source.blocks_per_row = 1;
     source.codebook_id = 11; source.source_codebook_id = 11;
@@ -2638,7 +2641,7 @@ TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentit
     EXPECT_EQ(deviceMoEMatrixMinsBytes(source, entry), 4u);
     EXPECT_EQ(deviceMoEMatrixEminsBytes(source, entry), 0u);
 
-    DeviceNativeVNNIMatrixDesc destination = source;
+    DeviceNativeQuantisedMatrixDesc destination = source;
     destination.payload = destination_payload.data(); destination.scales = destination_primary.data();
     destination.mins = destination_coefficient.data(); destination.codebook_id = 12;
     destination.source_codebook_id = 12;
@@ -2655,4 +2658,60 @@ TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentit
     EXPECT_EQ(destination.mins, destination_coefficient.data());
     EXPECT_EQ(destination.allocation_payload_bytes_per_block, 13);
     EXPECT_EQ(destination.allocation_has_mins, 1);
+}
+
+/** @brief All 64 wire bytes have field authority after poisoned host publication. */
+TEST(DeviceMoERebalanceCommandABI, ReservedWordAndWholeRepresentationAreDeterministic)
+{
+    using Entry = llaminar2::DeviceMoERebalancePlanEntry;
+    static_assert(sizeof(Entry) == 64);
+    static_assert(offsetof(Entry, reserved) == 52);
+    static_assert(offsetof(Entry, activation_count) == 56);
+    static_assert(std::has_unique_object_representations_v<Entry>);
+    Entry expected{};
+    expected.op = static_cast<uint32_t>(
+        llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    expected.expert = 3u;
+    expected.activation_count = 17u;
+    for (int repeat = 0; repeat < 20; ++repeat)
+    {
+        Entry source = expected;
+        source.reserved = 0xa5a5a5a5u; // Canonicalization may change no live field.
+        Entry output{};
+        std::memset(&output, repeat % 2 ? 0xa5 : 0x5a, sizeof(output));
+        uint32_t count = 0;
+        llaminar2::DeviceMoERebalanceStatus status{};
+        ASSERT_TRUE(llaminar2::deviceMoEAppendPlanEntry(
+            &output, &count, 1, source, &status));
+        ASSERT_EQ(count, 1u);
+        EXPECT_EQ(output.reserved, 0u);
+        EXPECT_EQ(std::memcmp(&output, &expected, sizeof(output)), 0);
+    }
+}
+
+/** @test Post-commit policy consumes every main layer without requiring speculative NextN evidence. */
+TEST(DeviceMoECommittedMaintenance, OriginalMainIntervalExcludesPredictorOnlyHistograms)
+{
+    for (const uint32_t main_layers : {1u, 2u, 3u, 5u, 17u})
+        for (const uint32_t predictor_layers : {0u, 1u, 3u})
+            for (const uint32_t first : {0u, 2u})
+            {
+                DeviceMoERebalanceConfig original;
+                original.num_layers = first + main_layers + predictor_layers;
+                original.layer_window_start = first + main_layers;
+                original.layer_window_count = predictor_layers;
+                original.layer_wave_count = 4;
+                const auto scoped = deviceMoECommittedMainLayerScope(original, first, main_layers);
+                EXPECT_EQ(scoped.num_layers, original.num_layers);
+                EXPECT_EQ(scoped.layer_window_start, first);
+                EXPECT_EQ(scoped.layer_window_count, main_layers);
+                EXPECT_EQ(scoped.layer_wave_count, original.layer_wave_count);
+                EXPECT_EQ(deviceMoECommittedMainLayerScope(scoped, first, main_layers).layer_window_start, first);
+            }
+    DeviceMoERebalanceConfig original;
+    original.num_layers = 3;
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, 0, 0), std::invalid_argument);
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, 3, 1), std::invalid_argument);
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, 2, 2), std::invalid_argument);
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, UINT32_MAX, 1), std::invalid_argument);
 }

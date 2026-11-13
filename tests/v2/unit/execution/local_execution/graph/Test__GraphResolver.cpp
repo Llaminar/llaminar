@@ -14,6 +14,27 @@
 
 using namespace llaminar2;
 
+/** @test The schema-to-arena boundary preserves every supported native scalar type. */
+TEST(BufferAllocatorNativeTypes, PreservesDeclaredTypesAndRejectsUnknownFormats)
+{
+    for(const auto &[name,type]:std::initializer_list<std::pair<const char *,BufferTensorType>>{
+        {"fp32",BufferTensorType::FP32},{"float32",BufferTensorType::FP32},
+        {"fp16",BufferTensorType::FP16},{"float16",BufferTensorType::FP16},
+        {"bf16",BufferTensorType::BF16},{"bfloat16",BufferTensorType::BF16},
+        {"int32",BufferTensorType::INT32},{"q8_0",BufferTensorType::Q8_0},
+        {"q8_1",BufferTensorType::Q8_1},{"q16_1",BufferTensorType::Q16_1}})
+    {
+        ResolvedBufferSpec buffer;
+        buffer.name="native_state";buffer.dtype=name;buffer.shape={1,32};
+        const auto requirements=BufferAllocator::toBufferRequirements({buffer});
+        ASSERT_EQ(requirements.buffers.size(),1u);
+        EXPECT_EQ(requirements.buffers.front().tensor_type,type)<<name;
+    }
+    ResolvedBufferSpec malformed;
+    malformed.name="misspelled_state";malformed.dtype="integer32";malformed.shape={1,4};
+    EXPECT_THROW((void)BufferAllocator::toBufferRequirements({malformed}),std::invalid_argument);
+}
+
 // ============================================================================
 // Test Fixture
 // ============================================================================

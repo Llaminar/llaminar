@@ -4,8 +4,14 @@
  *
  * Wraps GGUF model metadata and provides convenient access for pipelines.
  * Eliminates need for pipelines to hardcode architecture parameters.
+ * Immutable native tables retain one rank-owned host service or one original
+ * source-format bank per actual GPU consumer. Participant setup authenticates
+ * one source/PMA generation; graph families borrow Ready owners without reload.
  *
  * @author David Sanftenberg
+ *
+ * Original-source metadata inspection borrows the already-owned loader directory;
+ * it neither initializes weights nor changes prepared ownership or coherence.
  */
 
 #pragma once
@@ -14,15 +20,36 @@
 #include "WeightManager.h"
 #include "WeightPlacementMap.h"
 #include "ModelContextConfig.h"
+#include "ImmutableRowTable.h"
+#include "HostImmutableRowProvider.h"
+#include "ResidentImmutableRowTable.h"
+#include "ImmutableLookupNativeOwnership.h"
+#include "backends/NativeContextPreparation.h"
+#include <map>
+#include <optional>
+#include <span>
+#include <condition_variable>
+#include <exception>
+#include <thread>
 #include "../interfaces/IModelContext.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
+#include <mutex>
 #include <string>
+
+namespace llaminar2::qwen4exp { class ImmutableLookupService; }
 
 namespace llaminar2
 {
+struct GraphConfig;
+struct PreparedFollowerCaptureTerminalKey;
+class PreparedFollowerCaptureTerminalOwner;
+class PreparedFollowerCaptureTerminalPopulation;
+class MoEOverlayInferenceOriginalSlotGeometry;
+namespace qwen4exp {class PooledImmutableRetainedParticipants;}
+
 
     /**
      * @brief Model context for pipeline initialization
@@ -143,9 +170,8 @@ namespace llaminar2
         /** @brief Return the complete ordered GGUF shard set loaded by this context. */
         std::vector<std::string> artifactPaths() const override
         {
-            const auto &paths = loader_.getModel().split_paths;
-            return paths.empty() ? std::vector<std::string>{model_path_}
-                                 : paths;
+            const auto paths = loader_.artifactPaths();
+            return paths.empty() ? std::vector<std::string>{model_path_} : paths;
         }
 
         /**
@@ -162,6 +188,123 @@ namespace llaminar2
          * @brief Get ModelLoader interface for tensor loading
          */
         std::shared_ptr<IModelLoader> loader() override { return loader_interface_; }
+        /** @return Original complete loader-owned metadata; never loads or converts a tensor. */
+        const GGUFModel *ggufDirectory() const noexcept override { return loader_.ggufDirectory(); }
+
+
+        /** @brief Return the single admitted rank-owned native row service, if present. */
+        std::shared_ptr<HostImmutableRowProvider> hostImmutableRowProvider() const override;
+        /** @return Exact immutable declaration shared by preparing/Ready participants; completeness is explicit. */
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> resolvedImmutableRowTablePlacement() const override;
+
+
+        /** @return Immutable complete original lookup setup capacities, absent before validation. */
+        std::shared_ptr<const ImmutableLookupSetupObservation> immutableLookupSetupObservation()const override;
+
+        /** @brief Borrow one original-format whole/range GPU owner; every graph family shares its exact storage. */
+        std::shared_ptr<const ResidentImmutableRowTable> residentImmutableRowTable(DeviceId device) const override;
+        /** @brief Borrow the source-owned adaptive boundary; original roots and live claims survive the last graph borrow. */
+        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptiveImmutableLookupBoundary(DeviceId device) const override;
+        /**
+         * @brief Observe current model-owned adaptive native roots on one exact allocator.
+         * @param allocator Original rank/device, independent of execution-reader entries.
+         * @return Disjoint actual source/storage and local-cache observations; empty for an unrelated device.
+         * @throws std::exception For foreign rank/PMA, missing claimed roots or non-disjoint original owners.
+         * @note Historical setup rows never authorize reuse. This borrows surviving live root owners only.
+         */
+        std::vector<ImmutableLookupNativeOwnerObservation> retainedAdaptiveImmutableLookupOwners(
+            PhysicalMemoryAllocatorIdentity allocator)const;
+        /**
+         * @brief Observe disjoint model-owned CPU readiness pages, separately from shared source storage.
+         * @return One actual original PMA lease observation per local consumer, including C0 frames.
+         * @throws std::exception For missing, replaced or incomplete local roots; no hypothetical credit is returned.
+         */
+        std::vector<ImmutableLookupNativeOwnerObservation> retainedAdaptiveImmutableLookupLocalReadyOwners() const;
+        /** @brief Prepare original remote programs off all participant workers after immutable source materialization.
+         * @param graph Actual full source policy; unsupported parent/MTP shapes reject before recording. */
+        void prepareAdaptiveImmutableLookupParticipants(const GraphConfig& graph);
+        /** @return Original model-owned remote programs; storage coordinates are never compute domains. */
+        std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId device) const override;
+        /** @copydoc IModelContext::adaptiveImmutableLookupLocalHot */
+        std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> adaptiveImmutableLookupLocalHot(DeviceId device) const override;
+        /** @brief Exact live immutable-bank bytes for the existing model-retention owner row. */
+        std::size_t residentImmutableRowTableBytes(DeviceId device) const override;
+
+        /**
+         * @brief Materialize the sealed rank placement after ordinary weight-load staging drains.
+         * @param placement Concrete policy/source extent and exact admitted allocator set.
+         * @param authority Existing canonical rank PMA; replacement is forbidden.
+         * @param uploads Exact per-GPU setup streams and original released-slot receipts; empty for host storage.
+         * @param transfers Sole public allocation/copy/event authority.
+         * All upload identities validate before allocation, then this convenience
+         * entry point delegates to the same participant preparation primitive.
+         */
+        void prepareImmutableRowTable(const ResolvedImmutableRowTablePlacement &placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority,
+            std::span<const ImmutableRowTableDevicePreparation> uploads,
+            const TransferEngine &transfers);
+
+        /** @brief Retain exactly one final same-PMA CPU service binding; repeated identical publication is idempotent. */
+        void bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations>,std::shared_ptr<PhysicalMemoryAuthority>,std::span<const RetainedHostServiceInstance>)override;
+        /** @brief Exclusively lend the original retained worker; never re-claim its one-shot PMA key.
+         * @param consumer Exact original rank/device consumer selected at admission.
+         * @param role Original independently progressing CPU service role.
+         * @param memory Same admitted PMA object and shared ownership control block.
+         * @return Exclusive idle execution borrow retaining the original worker/program/PMA.
+         * @throws std::logic_error For foreign, absent, consumed, busy or concurrently borrowed instances.
+         * @throws std::exception If first native materialization fails; failure stays consumed.
+         */
+        RetainedHostServiceBorrow borrowRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,RetainedHostServiceRole role,const std::shared_ptr<PhysicalMemoryAuthority>& memory)override;
+        /** @brief Retain the original cold source-preparation authority before any table owner exists. */
+        void bindNativeContextPreparation(std::shared_ptr<NativeContextPreparation>);
+        /** @return Same original source authority for factory-to-loader typed worker handoff. */
+        std::shared_ptr<NativeContextPreparation> nativeContextPreparation() const;
+        /** @brief Exclusively borrow original follower events from this prepared model's fixed roster. */
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> borrowPreparedFollowerCaptureTerminals(
+            PreparedFollowerCaptureTerminalKey,void* exact_stream,const MoEOverlayInferenceOriginalSlotGeometry&,
+            const std::shared_ptr<PhysicalMemoryAuthority>&);
+        /** @brief Seal/verify every actual follower family after construction, without device observation. */
+        void sealPreparedFollowerCaptureTerminals();
+
+        /**
+         * @brief Materialize one actual PLE participant after its ordinary loader drains.
+         * @param placement One shared sealed rank placement/source generation.
+         * @param authority Same canonical rank PMA retained by every participant.
+         * @param consumer Exact actual PLE graph resource from placement.consumers().
+         * @param upload Required for a fresh whole/range native writer; absent for host or already-Ready owners.
+         * @param transfers Sole native allocation/copy/event authority.
+         * @param adaptive_setup Fresh adaptive metadata setup on the exact worker stream; absent for Ready reuse.
+         * Distinct GPU writes proceed outside the shared mutex. Duplicate setup
+         * callers join the original owner; recursive setup and every failure
+         * fail closed. A sibling failure prevents all late Ready publication.
+         */
+        void prepareImmutableRowTableForConsumer(const ResolvedImmutableRowTablePlacement &placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+            const std::optional<ImmutableRowTableDevicePreparation> &upload,
+            const TransferEngine &transfers,
+            const std::optional<AdaptiveImmutableLookupDevicePreparation> &adaptive_setup=std::nullopt);
+
+        /**
+         * @brief Materialize an admitted fixed PLE pipeline storage range after its original loader drains.
+         * @param placement Exact sealed rank-local pipeline placement.
+         * @param authority Original rank PMA owning the storage range.
+         * @param owner Actual fixed range storage device, independent of PLE compute membership.
+         * @param upload Original drained-loader upload lease and stream for a fresh owner.
+         * @param transfers Sole allocation and native transfer authority.
+         * @throws std::exception For a foreign owner, changed source, missing lease or failed original upload.
+         */
+        void prepareImmutableRowTableForFixedPipelineOwner(const ResolvedImmutableRowTablePlacement& placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId owner,
+            const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers);
+
+        /** @brief Require every exact planned allocator Ready before orchestration publishes inference-ready.
+         * @param placement Original sealed placement, compared by complete immutable value.
+         * @param authority Same canonical rank PMA, never a recreated certificate.
+         * No allocation, source read, synchronization or partial-owner inference occurs.
+         */
+        void requireImmutableRowTablePlacementComplete(const ResolvedImmutableRowTablePlacement &placement,
+            const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
+
 
         /**
          * @brief Get concrete ModelLoader for internal use
@@ -260,6 +403,33 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Join the one original immutable source preparation for an authenticated endpoint.
+         * @param placement Original sealed layout.
+         * @param authority Exact rank PMA.
+         * @param consumer Actual upload or execution endpoint.
+         * @param execution Checked storage mode selected by the endpoint role.
+         * @param upload Exact drained-loader authority for fresh native storage.
+         * @param transfers Sole allocation and copy authority.
+         * @param adaptive_setup Exact adaptive metadata setup, when required.
+         * @throws std::exception For invalid or failed original preparation.
+         */
+        void prepareImmutableRowTableOriginal(const ResolvedImmutableRowTablePlacement& placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+            ImmutableRowLookupExecution execution,
+            const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers,
+            const std::optional<AdaptiveImmutableLookupDevicePreparation>& adaptive_setup);
+
+        friend class RankOrchestrator;
+        friend class DeviceGraphOrchestrator;
+        /**
+         * @brief Detach one runner's exact participant authority after all native
+         * parents and graph-cache borrowers retire, while their arenas remain live.
+         * Physical table/cache/source/PMA owners are retained for model reuse.
+         * @param original Exact runtime authority retained by the retiring runner.
+         */
+        void retireAdaptiveImmutableLookupParticipants(
+            const std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants>& original);
         // Private constructor - use create() factory method
     private:
         /**
@@ -272,9 +442,68 @@ namespace llaminar2
                      WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
 
         std::string model_path_;
+        /** Original rank inventory owner retained for cold transport-policy authentication. */
+        std::shared_ptr<IMPIContext> immutable_source_mpi_;
         std::unique_ptr<TensorFactory> owned_test_factory_; // For createForTesting() only - must be declared BEFORE loader_!
         ModelLoader loader_;
         std::shared_ptr<WeightManager> weight_manager_;
+        /** @brief Extract actual immutable source coordinates from the model-owned directory. */
+        ImmutableRowTableSource immutableRowTableSource() const;
+        /**
+         * @brief Materialize one checked GPU/subordinate source through the existing setup state machine.
+         * @param placement Sole resolved layout and original request ceilings.
+         * @param authority Existing canonical PMA; duplicate authorities reject before publication.
+         * @param source Original loader-authenticated file/tensor extent.
+         * @param consumer Exact one GPU PLE endpoint.
+         * @param setup Ordinary explicit stream, required only for a fresh domain.
+         * @throws std::exception On partial preparation; no fallback or second source owner is published.
+         */
+        void prepareGPUAdaptiveImmutableLookup(const ResolvedImmutableRowTablePlacement &placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority,const ImmutableRowTableSource &source,DeviceId consumer,
+            const std::optional<AdaptiveImmutableLookupDevicePreparation> &setup);
+        /** @brief Legal setup-only owner states; no inference progress is mirrored here. */
+        enum class ImmutableRowPreparationState { Preparing, Ready, Failed };
+        /** @brief One bounded setup owner, named by the actual physical allocator. */
+        struct ImmutableRowPreparation
+        {
+            ImmutableRowPreparationState state;
+            std::thread::id preparing_thread;
+        };
+        std::mutex host_service_mutex_; ///< Cold binding publication/one-shot role transfer only.
+        std::shared_ptr<const RetainedHostServiceDeclarations> host_service_declarations_;
+        std::shared_ptr<PhysicalMemoryAuthority> host_service_memory_;
+        std::vector<RetainedHostServiceInstance> host_service_selected_;
+        std::shared_ptr<NativeContextPreparation> native_context_preparation_; ///< Original same-PMA selected worker owner, never a second resource ledger.
+        std::shared_ptr<RetainedHostServiceBinding> host_service_binding_; ///< Destroy/join retained workers before the original native source; PMA remains sole byte ledger.
+        std::shared_ptr<PreparedFollowerCaptureTerminalOwner> follower_capture_terminals_; ///< Physical events only; no runner/arena/protocol backreference.
+        mutable std::mutex immutable_row_table_mutex_;
+        std::condition_variable immutable_row_table_ready_;
+        std::map<DeviceId, ImmutableRowPreparation> immutable_row_table_preparations_;
+        std::optional<ImmutableRowTableSource> immutable_row_table_source_;
+        std::optional<ImmutableRowFileIdentity> immutable_row_table_file_identity_;
+        std::exception_ptr immutable_row_table_preparation_failure_;
+
+        std::shared_ptr<HostImmutableRowProvider> host_row_provider_;
+        /**
+         * @brief Original per-compute preparation entry, never a duplicate source authority.
+         * ConsumerLocal and the shared coordinator retain a real boundary. A shared
+         * foreign reader retains the SAME participant authority, with no CPU channel.
+         * Optional local native roots are disjoint immutable replicas and survive runner retirement.
+         */
+        struct AdaptiveLookupConsumer
+        {
+            std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
+            std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants;
+            std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local_hot;
+            std::optional<ImmutableRowPreparation> participant_preparation;
+            std::exception_ptr participant_failure;
+        };
+        std::map<DeviceId,AdaptiveLookupConsumer> adaptive_lookup_consumers_;
+        std::shared_ptr<qwen4exp::ImmutableLookupService> adaptive_lookup_service_; ///< One original shared provider/worker and closed channel population.
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> immutable_row_table_placement_;
+        mutable std::shared_ptr<const ImmutableLookupSetupObservation> immutable_lookup_setup_observation_;
+        std::map<DeviceId, std::shared_ptr<const ResidentImmutableRowTable>> resident_row_tables_;
+        std::shared_ptr<PhysicalMemoryAuthority> immutable_row_table_authority_;
 
         // Interface wrapper for loader (since loader_ is stored by value, not as shared_ptr)
         std::shared_ptr<IModelLoader> loader_interface_;

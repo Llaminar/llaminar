@@ -7,10 +7,16 @@
  * inherit the parent's model-wide runtime. This setup-only value retains those
  * owners together and authenticates their layer and participant identities.
  * It allocates no model storage and owns no physical-memory accounting.
+ * CPU root declarations remain stage-owned across child projection and reuse.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #pragma once
 
 #include "execution/factory/FactoryPPStageConfig.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "MoERoutedExpertPlacementPlanner.h"
 #include <memory>
 #include <span>
@@ -18,7 +24,10 @@
 
 namespace llaminar2
 {
+    struct CPUSerialExpertStorageAdmission;
+    struct InferenceRunnerConfig;
     class MoEOverlayResidencyAuthority;
+    class MoEOverlayCPUHostMaintenance;
     class MoEOverlayParticipantResidencyRegistry;
     class IMPIContext;
     class MoEOverlayRankBatchTransportRegistry;
@@ -44,6 +53,10 @@ namespace llaminar2
             std::shared_ptr<IMPIContext> mpi;
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry> rank_transport;
             std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> device_fabric;
+            /// Sole admitted mutable CPU-stage maintenance lifetime, absent for native GPU/no-peer stages.
+            std::shared_ptr<MoEOverlayCPUHostMaintenance> host_maintenance;
+            /// Exact stage-owned declarations retained with its admitted capacity.
+            std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         };
 
         /**
@@ -61,7 +74,7 @@ namespace llaminar2
 
         /**
          * @brief Reject installing a sealed runtime into a different PP stage.
-         * @param stage Exact destination main-layer interval and edge roles.
+         * @param stage Exact destination main-layer interval, edge roles and complete generation boundary.
          * @param participants Destination devices in canonical TP order.
          * @param weights Exact admitted tensor-parallel workshare declaration.
          * @param backend Collective implementation bound to that declaration.
@@ -73,6 +86,36 @@ namespace llaminar2
             std::span<const float> weights, CollectiveBackendType backend,
             MoERebalanceRuntimeMode mode) const;
 
+        /**
+         * @brief Seal the original CPU stage's existing rank-batch registry before graph construction.
+         * @param registry Actual source/target channels prepared in original all-rank stage order.
+         * @return New immutable binding retaining the SAME authority, residency and source interval.
+         * @throws std::invalid_argument for non-CPU ownership, a prior registry or missing original MPI owner.
+         */
+        std::shared_ptr<const MoEOverlayPipelineStageBinding> withOriginalCPURankTransport(
+            std::shared_ptr<MoEOverlayRankBatchTransportRegistry> registry) const;
+
+        /** @return Exact stage interval and generation boundary, retained from compilation. */
+        const FactoryPPStageConfig &scope() const noexcept { return stage_; }
+        /**
+         * @brief Project this one sealed stage into the original device factory configuration.
+         * @param destination Policy-only destination with its exact PP scope already installed.
+         * @param participants Original ordered local members of the destination stage.
+         * @param weights Authored local TP workshare.
+         * @param backend Original collective implementation.
+         * @throws std::invalid_argument Before mutation for a foreign scope or existing expert owner.
+         */
+        void installRuntime(InferenceRunnerConfig &destination,
+            std::span<const GlobalDeviceAddress> participants,
+            std::span<const float> weights, CollectiveBackendType backend) const;
+        /**
+         * @brief Validate the actual child against its sealed stage owner at setup.
+         * @param child Original local child, never a representative remote runner.
+         * @param frontier Owners-bound or complete-serving frontier.
+         * @throws std::logic_error For foreign participants, authority, incomplete banks or maintenance.
+         */
+        void requireRuntimeOwner(const IInferenceRunner &child,
+            IInferenceRunner::MoEPipelineOwnershipValidation frontier) const;
         /** @return The sole initial placement published by this stage's authority. */
         [[nodiscard]] const std::shared_ptr<const MoERoutedExpertPlacementPlan> &plan() const noexcept
         { return plan_; }

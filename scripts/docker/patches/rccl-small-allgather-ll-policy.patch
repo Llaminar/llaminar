@@ -1,0 +1,361 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -444,6 +444,9 @@
+   src/collectives.cc
+   src/debug.cc
+   src/enqueue.cc
++  src/SmallAllGatherPolicy.cpp
++  src/SmallAllGatherPolicy.h
++  src/include/llaminar_small_allgather_scope.h
+   src/group.cc
+   src/init.cc
+   src/init_nvtx.cc
+diff --git a/src/SmallAllGatherPolicy.cpp b/src/SmallAllGatherPolicy.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/SmallAllGatherPolicy.cpp
+@@ -0,0 +1,52 @@
++/**
++ * @file SmallAllGatherPolicy.cpp
++ * @brief Validate exact live bytes and commit one original eligible LL preference.
++ *
++ * All validation precedes the first write. No payload hashes, diagnostic cost
++ * fingerprints, strings, allocation, device API or retained state enter native
++ * planning, and the original channel output is never changed.
++ */
++#include "SmallAllGatherPolicy.h"
++#include <cmath>
++#include <limits>
++
++namespace llaminar::collective
++{
++    ncclResult_t preferSmallAllGatherLL(std::size_t ranks, std::size_t nodes,
++        ncclFunc_t collective, std::size_t bytes, float **costs,
++        int algorithms, int protocols, int *channels) noexcept
++    {
++        if (ranks < 2 || nodes != 1 || !costs || !channels ||
++            algorithms != NCCL_NUM_ALGORITHMS || protocols != NCCL_NUM_PROTOCOLS ||
++            collective < ncclFuncBroadcast || collective >= ncclNumFuncs)
++            return ncclInvalidArgument;
++        auto *table = reinterpret_cast<float *>(costs);
++        if (collective != ncclFuncAllGather) return ncclSuccess;
++        if (bytes % ranks != 0) return ncclInvalidArgument;
++        if (bytes == 0 || bytes / ranks > kSmallAllGatherMaximumPerRankBytes)
++            return ncclSuccess;
++        int selected = NCCL_ALGO_UNDEF;
++        float selected_cost = std::numeric_limits<float>::infinity();
++        for (int algorithm = 0; algorithm < algorithms; ++algorithm)
++            for (int protocol = 0; protocol < protocols; ++protocol)
++            {
++                const float value = table[algorithm * protocols + protocol];
++                if (value == NCCL_ALGO_PROTO_IGNORE) continue;
++                if (!std::isfinite(value) || value < 0.0f) return ncclInvalidArgument;
++                if (protocol == NCCL_PROTO_LL && value < selected_cost)
++                {
++                    selected = algorithm;
++                    selected_cost = value;
++                }
++            }
++        if (selected == NCCL_ALGO_UNDEF) return ncclInvalidUsage;
++        // No error can occur after this first write. Preserve every ignored
++        // entry and the original native algorithm-order tie resolution.
++        const auto selected_index = selected * protocols + NCCL_PROTO_LL;
++        for (std::size_t index = 0; index < NCCL_NUM_ALGORITHMS * NCCL_NUM_PROTOCOLS; ++index)
++            if (static_cast<int>(index) != selected_index && table[index] == 0.0f)
++                table[index] = std::numeric_limits<float>::min();
++        table[selected_index] = 0.0f;
++        return ncclSuccess;
++    }
++}
+diff --git a/src/SmallAllGatherPolicy.h b/src/SmallAllGatherPolicy.h
+new file mode 100644
+--- /dev/null
++++ b/src/SmallAllGatherPolicy.h
+@@ -0,0 +1,40 @@
++/**
++ * @file SmallAllGatherPolicy.h
++ * @brief Pure native preference for eligible small-AllGather LL costs.
++ *
++ * Native communicators own admission; the vendor owns enums, eligible masks,
++ * channel geometry, payloads and progress. This function only validates and
++ * updates the supplied cold planning table, without retaining state.
++ */
++#pragma once
++#include "nccl_tuner.h"
++#include <cstddef>
++
++namespace llaminar::collective
++{
++    inline constexpr std::size_t kSmallAllGatherMaximumPerRankBytes = 16 * 1024;
++
++    /**
++     * @brief Prefer the original minimum eligible LL pair for a small AllGather.
++     * @param ranks Original communicator rank count, at least two.
++     * @param nodes Original communicator node count, exactly one for this policy.
++     * @param collective Actual vendor collective enum.
++     * @param bytes Live vendor maximum send/receive bytes, rank-expanded for AllGather.
++     * @param costs Original flat contiguous matrix in the vendor float** ABI.
++     * @param algorithms Actual row count, equal to NCCL_NUM_ALGORITHMS.
++     * @param protocols Actual column count, equal to NCCL_NUM_PROTOCOLS.
++     * @param channels Original channel output, validated but never modified.
++     * @return Original vendor success/error; every failure precedes any write.
++     *
++     * Other collectives, zero and messages above16KiB per rank preserve all cost
++     * bits. Targeted input must normalize exactly and contain finite nonnegative
++     * eligible costs and an eligible LL pair. Ignored pairs remain ignored. The
++     * minimum original LL cost wins, retaining native algorithm-order ties.
++     * Its exact positive zero becomes unique after other eligible signed zeros
++     * become the minimum normal positive float. Original native postpasses remain
++     * the caller's authority. No diagnostic, logging or environment work occurs.
++     */
++    [[nodiscard]] ncclResult_t preferSmallAllGatherLL(std::size_t ranks, std::size_t nodes,
++        ncclFunc_t collective, std::size_t bytes, float **costs,
++        int algorithms, int protocols, int *channels) noexcept;
++}
+diff --git a/src/enqueue.cc b/src/enqueue.cc
+--- a/src/enqueue.cc
++++ b/src/enqueue.cc
+@@ -16,6 +16,8 @@
+  * for the same generated inventory that admission selects.
+  */
+ #include "enqueue.h"
++#include "SmallAllGatherPolicy.h"
++#include <limits>
+ #include "argcheck.h"
+ #include "coll_net.h"
+ #include "graph/topo.h"
+@@ -2256,6 +2258,12 @@
+     int collNetSupport, int nvlsSupport, int numPipeOps, ncclSimInfo_t* simInfo/* = NULL*/
+   ) {
+   size_t elementSize = ncclTypeSize(info->datatype);
++  // Validate this specialization's original live-count expansion before cost
++  // construction. The external-plugin and other native branches are unchanged.
++  if (comm->llaminarSmallAllGatherLL && info->func == ncclFuncAllGather &&
++      (elementSize == 0 || info->count > std::numeric_limits<size_t>::max() / elementSize ||
++       info->count * elementSize > std::numeric_limits<size_t>::max() / size_t(comm->nRanks)))
++    return ncclInvalidArgument;
+   size_t nBytes = elementSize * ncclFuncMaxSendRecvCount(info->func, comm->nRanks, info->count);
+   struct ncclReg* regSendBuf = NULL;
+   struct ncclReg* regRecvBuf = NULL;
+@@ -2281,6 +2289,14 @@
+           regBuff, &nMaxChannels));
+     NCCLCHECK(topoGetAlgoInfo(comm, info, nBytes, (float **)collCostTable, simInfo));
+   } else {
++    // The communicator owns admission; the shared native arithmetic owns the
++    // eligible cost preference. It never changes payload/count or channels.
++    if (comm->llaminarSmallAllGatherLL && info->func == ncclFuncAllGather) {
++      NCCLCHECK(llaminar::collective::preferSmallAllGatherLL(
++          comm->nRanks, comm->nNodes, info->func, nBytes, (float **)collCostTable,
++          NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS, &nMaxChannels));
++    }
++    // Keep every native protocol/pipelining/channel/thread/override postpass.
+     NCCLCHECK(topoGetAlgoInfo(comm, info, nBytes, (float **)collCostTable, simInfo));
+     //override algo, tree doesn't work with fewer than 64 bytes
+     static int userAlgoInput = -2;
+diff --git a/src/include/comm.h b/src/include/comm.h
+--- a/src/include/comm.h
++++ b/src/include/comm.h
+@@ -4,6 +4,16 @@
+  *
+  * See LICENSE.txt for license information
+  ************************************************************************/
++
++/**
++ * @file comm.h
++ * @brief Native communicator-owned topology, endpoint and planning state.
++ *
++ * The small-AllGather eligibility fact belongs to this original owner. It is
++ * zero on allocation and may be published only after completed-clique InitAll
++ * admission. Application code owns no shadow policy or transfer/count state.
++ */
++
+ 
+ #ifndef NCCL_COMM_H_
+ #define NCCL_COMM_H_
+@@ -504,6 +514,8 @@
+ 
+   int node;
+   int nNodes;
++  /** Native init-owned eligibility; immutable after successful communicator publication. */
++  bool llaminarSmallAllGatherLL;
+   int rcclUseOneSlice; // RCCL: true if this comm is using one slice per primitive
+   int gfx9CheapFenceOff; // RCCL: true if gfx9 cheap fence is disabled
+   int localRank;
+diff --git a/src/include/llaminar_small_allgather_scope.h b/src/include/llaminar_small_allgather_scope.h
+new file mode 100644
+--- /dev/null
++++ b/src/include/llaminar_small_allgather_scope.h
+@@ -0,0 +1,117 @@
++/**
++ * @file llaminar_small_allgather_scope.h
++ * @brief Native communicator facts admitting the qualified small-AllGather policy.
++ *
++ * Initialization freezes this decision in the communicator that owns its
++ * topology and configuration. No application shadow, environment read, device
++ * probe, mutable process-global cache or payload/count authority is introduced.
++ */
++#ifndef LLAMINAR_SMALL_ALLGATHER_SCOPE_H_
++#define LLAMINAR_SMALL_ALLGATHER_SCOPE_H_
++
++#include "comm.h"
++#include "graph/topo.h"
++#include "archinfo.h"
++#include "transport.h"
++
++/**
++ * @brief Admit only the homogeneous single-process gfx906 TP4/default-CTA scope.
++ * @param comm Fully initialized original communicator and final native topology.
++ * @param nativeSelectorsAbsent Existing selector presence, sampled only at init.
++ * @return Whether this communicator may apply the native small-AllGather policy.
++ *
++ * Every native rank must occur exactly once among the four local topology GPUs.
++ * Called only after the original blocking InitAll joins every initializer.
++ * External plugins retain their original branch and lifecycle. Other native
++ * configurations remain their own existing policies; they are not admitted to
++ * this specialization. Four original connected SHM/direct/direct channels are
++ * required; no claim about unobserved PCIe bandwidth/physical layout is made.
++ * No eligibility decision is inferred from device zero.
++ */
++static inline bool llaminarSmallAllGatherScope(const ncclComm* comm, bool nativeSelectorsAbsent) {
++  if (comm == nullptr || !nativeSelectorsAbsent || comm->tuner != nullptr ||
++      comm->nRanks != 4 || comm->nNodes != 1 || comm->localRanks != 4 ||
++      comm->intraRanks != 4 || comm->config.blocking != 1 || comm->initState != ncclSuccess ||
++      comm->config.CTAPolicy != NCCL_CTA_POLICY_DEFAULT ||
++      comm->topo == nullptr || comm->topo->nodes[GPU].count != 4 ||
++      (comm->topo->type & RCCL_TOPO_XGMI_ALL) != 0 || comm->runtimeConn ||
++      comm->useIntraNet || comm->nChannels != 4) return false;
++  unsigned ranks = 0;
++  for (int index = 0; index < 4; ++index) {
++    const auto& gpu = comm->topo->nodes[GPU].nodes[index].gpu;
++    if (gpu.rank < 0 || gpu.rank >= 4 || (ranks & (1u << gpu.rank)) != 0 ||
++        !IsArchMatch(gpu.gcn, "gfx906") ||
++        (gpu.gcn[6] != '\0' && gpu.gcn[6] != ':')) return false;
++    ranks |= 1u << gpu.rank;
++  }
++  if (ranks != 15u) return false;
++  // The measured native domain uses already connected SHM/direct/direct rings.
++  // Inspect original endpoint metadata only; no topology guess or device query.
++  for (int channel = 0; channel < comm->nChannels; ++channel) {
++    const auto& ring = comm->channels[channel].ring;
++    const auto* peers = comm->channels[channel].peers;
++    if (peers == nullptr || ring.prev < 0 || ring.prev >= 4 || ring.next < 0 || ring.next >= 4 ||
++        ring.prev == comm->rank || ring.next == comm->rank ||
++        peers[ring.prev] == nullptr || peers[ring.next] == nullptr) return false;
++    const auto& send = peers[ring.next]->send[0];
++    const auto& recv = peers[ring.prev]->recv[0];
++    if (!send.connected || !recv.connected || send.transportComm != &shmTransport.send ||
++        recv.transportComm != &shmTransport.recv || send.proxyConn.proxyProgress != nullptr ||
++        recv.proxyConn.proxyProgress != nullptr || send.conn.connFifo != nullptr ||
++        recv.conn.connFifo != nullptr) return false;
++  }
++  return true;
++}
++
++/**
++ * @brief Admit the complete original clique only after all initializers join.
++ * @param comms Actual original ncclCommInitAll output array, fully initialized.
++ * @param count Original initialized participant count, exactly four here.
++ * @param nativeSelectorsAbsent Existing process selector presence sampled at init.
++ * @return Unanimous native scope, validated before any owner changes policy.
++ *
++ * The outermost successful blocking GroupEnd in ncclCommInitAll joins every
++ * async initialization job. This supplies a host happens-before relationship
++ * for topology, connected endpoints and external tuner state. Nested/grouped,
++ * nonblocking and separate InitRank entrypoints do not publish this policy.
++ * Native bootstrap already authenticated the same-process peerInfo owner map;
++ * require every completed owner to name this exact same output array.
++ */
++static inline bool llaminarSmallAllGatherCliqueScope(ncclComm_t const* comms, int count, bool nativeSelectorsAbsent) {
++  if (comms == nullptr || count != 4 || !nativeSelectorsAbsent || comms[0] == nullptr ||
++      comms[0]->peerInfo == nullptr) return false;
++  const auto& first = comms[0]->peerInfo[0];
++  for (int rank = 0; rank < 4; ++rank) {
++    const ncclComm* owner = comms[rank];
++    if (!llaminarSmallAllGatherScope(owner, nativeSelectorsAbsent) || owner->rank != rank ||
++        owner->commHash != comms[0]->commHash || owner->peerInfo == nullptr) return false;
++    for (int member = 0; member < 4; ++member) {
++      const auto& peer = owner->peerInfo[member];
++      if (peer.rank != member || peer.comm != comms[member] ||
++          peer.hostHash != first.hostHash || peer.pidHash != first.pidHash) return false;
++    }
++  }
++  return true;
++}
++
++/**
++ * @brief Publish one completed-clique decision without touching partial outputs.
++ * @param comms Original InitAll output array, inspected only after owned completion.
++ * @param count Original participant count.
++ * @param ownsCompleteInit Whether the original outermost GroupEnd completed here.
++ * @param nativeSelectorsAbsent Existing selector presence, sampled only at setup.
++ * @return True only when all four owners were admitted and published together.
++ *
++ * Nonadmission preserves every flag and inspects no incomplete communicator.
++ * All checks precede the first write; publication cannot partly fail. The
++ * caller owns original initialization/joining and invokes no extra lifecycle.
++ */
++static inline bool llaminarPublishSmallAllGatherPolicy(ncclComm_t* comms, int count,
++    bool ownsCompleteInit, bool nativeSelectorsAbsent) {
++  if (!ownsCompleteInit || count != 4 || !nativeSelectorsAbsent) return false;
++  if (!llaminarSmallAllGatherCliqueScope(comms, count, nativeSelectorsAbsent)) return false;
++  for (int rank = 0; rank < count; ++rank) comms[rank]->llaminarSmallAllGatherLL = true;
++  return true;
++}
++
++#endif
+diff --git a/src/init.cc b/src/init.cc
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -5,6 +5,17 @@
+  *
+  * See LICENSE.txt for license information
+  ************************************************************************/
++
++/**
++ * @file init.cc
++ * @brief Construct and publish original native communicator ownership.
++ *
++ * Small-AllGather admission is finalized only after an outermost blocking
++ * InitAll joins every original initializer. One complete-clique predicate
++ * precedes all policy publication; nested/asynchronous/other API routes keep
++ * their original state without touching incomplete communicator outputs.
++ */
++
+ 
+ #include "nccl.h"
+ #include "alloc.h"
+@@ -25,6 +36,7 @@
+ #include "npkit/npkit.h"
+ #endif
+ #include "tuner.h"
++#include "llaminar_small_allgather_scope.h"
+ #include "ras.h"
+ #include "profiler.h"
+ #include "mnnvl.h"
+@@ -2587,6 +2599,9 @@
+ ncclResult_t ncclCommInitAll_impl(ncclComm_t* comms, int ndev, const int* devlist) {
+   Recorder::instance().record(comms, ndev, devlist);
+   ncclResult_t ret = ncclSuccess;
++  // Nested groups have not joined their initializers when this API returns.
++  // Only this original outermost blocking InitAll owns the published clique.
++  const bool ownsCompleteInit = ncclGroupDepth == 0;
+   int totalnDev;
+   int *gpuFlags = NULL;
+   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+@@ -2638,6 +2653,15 @@
+     ncclCommInitRankDev(comms+i, ndev,1, &uniqueId, i, dev, &config, __func__);
+   }
+   NCCLCHECKGOTO(ncclGroupEndInternal(), ret, fail);
++
++  // The original successful outermost blocking GroupEnd has joined every
++  // initializer. All topology, ring endpoint and tuner owners are now stable.
++  // Validate the complete clique before publishing the same immutable policy
++  // to any owner. No new connection, barrier, collective or device query runs.
++  (void)llaminarPublishSmallAllGatherPolicy(comms, ndev, ownsCompleteInit,
++      ownsCompleteInit && ndev == 4 &&
++      ncclGetEnv("NCCL_ALGO") == nullptr && ncclGetEnv("NCCL_PROTO") == nullptr &&
++      ncclGetEnv("RCCL_OVERRIDE_ALGO") == nullptr && ncclGetEnv("RCCL_OVERRIDE_PROTO") == nullptr);
+ 
+   NVTX3_RANGE_ADD_PAYLOAD(CommInitAll, NcclNvtxParamsCommInitAllSchema,
+     NVTX3_PAYLOAD(comms[0]->commHash, ndev));

@@ -10,6 +10,12 @@
  * latency, DRAM bandwidth, fused-FFN service or an assumed MTP acceptance rate.
  * A separately typed source-free FP32 probe uses that same execution lifecycle;
  * it is an arithmetic ranking proxy, never evidence for a model weight format.
+ * GPU projection preparation retains original-worker payloads across two serial row
+ * phases; independent cold preparation can overlap, measured intervals cannot.
+ * Prepared GPU phases own one original body, two unique fixed-clock markers and
+ * one ordered timing parent. One warmup and three timed body imports execute in one launch;
+ * phase families retire before the next storage allocation, so BOMs price the
+ * maximum concurrently live family rather than both serial phases together.
  */
 #pragma once
 #include "PlanningMatrixSample.h"
@@ -18,6 +24,7 @@
 #include "PhysicalMemoryAuthority.h"
 #include "backends/CPUExecutionGeometry.h"
 #include <optional>
+#include <variant>
 
 namespace llaminar2
 {
@@ -72,10 +79,43 @@ namespace llaminar2
         std::vector<PlanningProjectionPhaseObservation> phases;
     };
 
+    /** @brief Constructor-sealed source identity chooses the completed observation type. */
+    using PlanningPreparedGPUProjectionObservations=std::variant<PlanningProjectionObservations,PlanningFP32ArithmeticObservations>;
+
+    /** @brief Original-worker ordinary projection preparation owner; one phase lives at a time and observation remains isolated. */
+    class PlanningPreparedGPUProjection final
+    {
+    public:
+        /** @brief Materialize the original fixed operand/engine under its canonical PMA on the GPU worker. */
+        PlanningPreparedGPUProjection(PlanningFP32ArithmeticPlan,DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&);
+        /** @brief Share original loaded source; each GPU privately materializes its exact canonical execution representation. */
+        PlanningPreparedGPUProjection(const PlanningLoadedMatrixSample&,DeviceId,
+            const std::shared_ptr<PhysicalMemoryAuthority>&,int prefill_rows);
+        /** @brief Retire timing, graph, workspace, tensors and weights on that same original worker. */
+        ~PlanningPreparedGPUProjection();
+        PlanningPreparedGPUProjection(const PlanningPreparedGPUProjection&)=delete;
+        /** @brief Prepare the next sealed M (one then declared prefill) without executing its retained body. */
+        void prepareNextPhase();
+        /** @brief Allocate/upload the next phase without starting capture; cohort must finish all storage first. */
+        void prepareNextPhaseStorage();
+        /** @brief Record/end only the prepared graph; no allocation/instantiation/warmup retirement is interleaved. */
+        void capturePreparedPhase();
+        /** @brief After every cohort capture ends, instantiate and seal the ordered warmup/timing family. */
+        void completePreparedPhase();
+        /** @brief Observe the prepared original phase exactly once, then retire its transient owners. */
+        void observePreparedPhase();
+        /** @return Complete original observation only after both phases have retired. */
+        PlanningPreparedGPUProjectionObservations result() const;
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
     /** @brief Bounded decode/prefill sampling through the ordinary projection ABI. */
     class PlanningProjectionMeasurement final
     {
     public:
+
         /**
          * @brief Contribute source, preparation, tensors, workspace and native graphs.
          * @param plan Exact source format/geometry published before device preparation.
@@ -92,6 +132,13 @@ namespace llaminar2
         static void contributeMemory(const PlanningMatrixSamplePlan &plan, PlanningSampleOrigin origin,
             PhysicalMemoryResource host, PhysicalMemoryResource execution, PhysicalMemoryPlanBuilder &builder,
             int prefill_rows, const std::optional<PlanningProjectionCPUObservation> &cpu = {});
+
+        /** @brief Declare the single shared native source payload, independently of GPU-private preparation. */
+        static void contributeSourceMemory(const PlanningMatrixSamplePlan&,PlanningSampleOrigin,
+            PhysicalMemoryResource host,PhysicalMemoryPlanBuilder&);
+        /** @brief Declare only one GPU's private preparation; shared source is charged once by the cohort owner. */
+        static void contributeGPUParticipantMemory(const PlanningMatrixSamplePlan&,PhysicalMemoryResource host,
+            PhysicalMemoryResource execution,PhysicalMemoryPlanBuilder&,int prefill_rows);
 
         /**
          * @brief Prepare once, observe M=1 and prefill M, then retire private resources.

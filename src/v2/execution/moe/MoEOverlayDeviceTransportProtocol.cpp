@@ -438,11 +438,17 @@ namespace llaminar2
                 : demand_phase == MoEOverlayDeviceDemandPhase::Invalid;
         if (!phase_valid)
             return false;
+        const bool durable =
+            kind == MoEOverlayDeviceControllerTransactionKind::DynamicPlacement ||
+            kind == MoEOverlayDeviceControllerTransactionKind::PreparedContextRestore;
+        if (durable && header.accepted_cycles > entries.size())
+            return false;
         std::uint64_t payload_bytes = 0u;
         for (std::size_t index = 0u; index < entries.size(); ++index)
         {
             const auto &entry = entries[index];
-            if (!moeOverlayMovementCommandValid(
+            if ((durable && moeOverlayMovementCycle(entry.flags) > header.accepted_cycles) ||
+                !moeOverlayMovementCommandValid(
                     entry,
                     static_cast<std::uint32_t>(index),
                     kind,
@@ -935,6 +941,49 @@ namespace llaminar2
                    binding_,
                    ParticipantPhase::RetirementReady,
                    batch.header.base_epoch);
+    }
+
+    std::size_t MoEOverlayDeviceTransportProtocol::runtimeReaderObservationCount() const noexcept
+    {
+        if (!binding_.valid()) return 0u;
+        std::size_t count=0u;
+        for(std::uint32_t group=0u;group<binding_.group_record_count;++group)
+            count+=binding_.topology_participant_record_counts[group];
+        return count;
+    }
+
+    bool MoEOverlayDeviceTransportProtocol::observeRuntimeReaders(
+        const MoEOverlayDeviceTransportCommandBatch &batch,
+        std::span<MoEOverlayRuntimeReaderObservation> observations) const noexcept
+    {
+        using Observation=MoEOverlayRuntimeReaderObservation;
+        if(!retirementOpen(batch) || !batch.movesWeights() ||
+           batch.header.candidate_epoch<=batch.header.base_epoch ||
+           observations.empty() || observations.size()!=runtimeReaderObservationCount()) return false;
+        std::size_t index=0u;
+        for(std::uint32_t group=0u;group<binding_.group_record_count;++group) {
+            const auto *records=binding_.topology_participant_records[group];
+            const auto count=binding_.topology_participant_record_counts[group];
+            if(!records || !count)return false;
+            for(std::uint32_t member=0u;member<count;++member) {
+                const auto &record=records[member];
+                auto &out=observations[index++];out={};
+                if(record.magic!=kMoEOverlayDeviceControllerFabricMagic ||
+                   record.version!=kMoEOverlayDeviceControllerFabricVersion ||
+                   record.group_id!=group || record.topology_fingerprint!=binding_.topology_fingerprint ||
+                   loadAcquire(record.status_code)!=static_cast<std::uint32_t>(MoEOverlayDeviceControllerError::None))return false;
+                if(loadAcquire(record.retirement_ready_epoch)>=batch.header.base_epoch) {
+                    out.state=Observation::State::Ready;continue;
+                }
+                if(loadAcquire(record.finite_deferred_transaction)==batch.header.transaction_id) {
+                    out.parent_generation=loadAcquire(record.finite_parent_generation);
+                    out.parent_progress=loadAcquire(record.finite_parent_progress);
+                    if(!out.parent_generation || !out.parent_progress)return false;
+                    out.state=Observation::State::FiniteDeferred;
+                }
+            }
+        }
+        return true;
     }
 
     bool MoEOverlayDeviceTransportProtocol::publishRetired(

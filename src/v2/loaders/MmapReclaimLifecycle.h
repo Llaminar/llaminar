@@ -15,9 +15,12 @@
  * boundary.  Submission is therefore only a mutex-protected state transition
  * and notification; it performs no reclamation and creates no thread in the
  * inference path.
+ * Independent reclaim inherits the admitted OpenMP partition at construction,
+ * while the model-setup caller retains its exact original compute placement.
  */
 
 #include "../utils/Logger.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <condition_variable>
 #include <cstddef>
@@ -80,6 +83,8 @@ namespace llaminar2
          *
          * @param work Complete reclaim operation executed after schedule().
          * @throws std::invalid_argument when @p work is empty.
+         * @throws std::runtime_error for active OpenMP construction or failed affinity publication.
+         * @throws std::system_error when the native worker cannot be created.
          */
         explicit MmapReclaimLifecycle(Work work)
             : work_(std::move(work))
@@ -92,6 +97,9 @@ namespace llaminar2
 
             // Starting during model construction keeps thread creation and its
             // allocator/loader work out of the first-prefill inference boundary.
+            // Page-table reclaim is independent progress, so it must not share
+            // only the setup master's first place. Native defaults remain intact.
+            const ScopedOpenMPPartitionAffinity reclaim_affinity;
             worker_ = std::thread([this]() { workerLoop(); });
         }
 

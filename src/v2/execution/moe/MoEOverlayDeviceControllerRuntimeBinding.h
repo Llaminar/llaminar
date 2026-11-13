@@ -26,6 +26,7 @@ namespace llaminar2
     struct DeviceMoEOverlayServiceTelemetryCell;
     struct DeviceMoEOverlayServiceTelemetrySample;
     struct DeviceMoEOverlayEpochControl;
+    enum class DeviceMoEOverlayEpochParentAction : std::uint32_t;
     struct DeviceMoEOverlayEpochStatus;
     class DeviceMoERuntimeTable;
     class MappedTransferProgressEpoch;
@@ -336,6 +337,23 @@ namespace llaminar2
     {
     public:
         virtual ~IMoEOverlayDeviceInferenceBoundary() = default;
+
+        /**
+         * @brief Cold-seal finite Arm/End using this original inference owner.
+         * @return false when this owner does not implement device-owned finite placement.
+         * No generic alternate context/executor may implement the operation.
+         */
+        [[nodiscard]] virtual bool prepareMoEOverlayFinitePlacementGraphs() { return false; }
+
+        /**
+         * @brief Submit the original captured boundary and observe its exact terminal.
+         * @param action Arm before the first child, or End after every child terminal.
+         * @return false for unsupported or incomplete original owner identity.
+         * This finite ownership boundary runs off-worker, never per child and
+         * never on the maintenance worker which may await reader retirement.
+         */
+        [[nodiscard]] virtual bool runMoEOverlayFinitePlacementBoundary(
+            DeviceMoEOverlayEpochParentAction action) { (void)action; return false; }
 
         /**
          * @brief Enqueue the committed inference boundary on an exact stream.

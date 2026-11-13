@@ -3,21 +3,32 @@
  * @brief CPU-only adversarial tests for globally coordinated residency waves.
  *
  * An in-process asynchronous lane models independently progressing MPI ranks.
- * These tests prove that local backpressure, physical failure, and prepare-start
- * failure are exchanged by every participant, that no peer is stranded in a
+ * These tests prove that local backpressure and quiescent prepare-start failure
+ * are exchanged, physical-stage failure aborts before a peer-dependent vote, and no peer is stranded in a
  * different phase, that a deferred transaction can be retried unchanged, and
  * that no local old bank retires before every rank reaches its lease fence.
+ * Lifecycle summaries retain bounded keys and ordered epoch evidence, while
+ * retirement validation keeps each exact original epoch/rank proof.
+ * Recorded measurement metadata also survives wrapper drain by its original
+ * owner; this lifecycle check grants no physical measurement or source permit.
  */
 
 #include "execution/moe/MoEOverlayDistributedResidencyTransport.h"
+#include "execution/moe/MoEOverlayMigrationEvidenceContext.h"
+#include "execution/moe/ExpertTierWeightStream.h"
+
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -313,6 +324,16 @@ namespace llaminar2::test
                 return progress;
             }
 
+            /** @brief Terminate the test child only if no Staged vote was submitted. */
+            [[noreturn]] void failPhysicalStage(const std::string &diagnostic) noexcept override
+            {
+                std::fprintf(stderr, "physical-fatal rank=%d generations=%zu reason=%s\n",
+                             world_rank_, next_generation_, diagnostic.c_str());
+                std::fflush(stderr);
+                std::_Exit(!active_ && next_generation_ == 1 &&
+                    diagnostic == "injected local physical stage failure" ? 73 : 74);
+            }
+
             /** @return Whether this rank has consumed its active generation. */
             [[nodiscard]] bool idle() const noexcept override
             {
@@ -453,6 +474,7 @@ namespace llaminar2::test
                     return {
                         .status = start_status,
                         .wave = std::make_unique<Wave>(this),
+                        .measurement_context = measurement_context,
                     };
                 case MoEOverlayResidencyStageStartStatus::Deferred:
                     return {
@@ -486,6 +508,8 @@ namespace llaminar2::test
             MoEOverlayResidencyWaveProgress publication_progress =
                 MoEOverlayResidencyWaveProgress::Ready;
             bool failure_owns_cleanup = false;
+            /** Explicit passive metadata; never a scripted physical source permit. */
+            std::shared_ptr<const MoEOverlayMigrationEvidenceContext> measurement_context;
             int begin_calls = 0;
             int stage_polls = 0;
             int prepare_begins = 0;
@@ -781,6 +805,203 @@ namespace llaminar2::test
         }
     } // namespace
 
+    /** @test Repeated original transport lifecycles keep summary keys bounded and retirement epochs exact. */
+    TEST(Test__MoEOverlayDistributedResidencyTransport,
+         LifecycleSummariesRetainBoundedKeysAndExactRetirementProof)
+    {
+        /** @brief Restore both collector controls even after a fatal assertion. */
+        struct RestoreEnvironment {
+            std::optional<std::string> json, filter;
+            /** @brief Observe the inherited collection policy before the test changes it. */
+            RestoreEnvironment() {
+                if (const char *v = std::getenv("LLAMINAR_PERF_STATS_JSON")) json = v;
+                if (const char *v = std::getenv("LLAMINAR_PERF_STATS_FILTER")) filter = v;
+            }
+            /** @brief Restore exact values and reject failed environment restoration. */
+            ~RestoreEnvironment() {
+                const auto restore = [](const char *name, const std::optional<std::string> &value) {
+                    EXPECT_EQ(value ? setenv(name, value->c_str(), 1) : unsetenv(name), 0);
+                };
+                restore("LLAMINAR_PERF_STATS_JSON", json);
+                restore("LLAMINAR_PERF_STATS_FILTER", filter);
+                PerfStatsCollector::reset();
+            }
+        } restore;
+        ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_JSON", "1", 1), 0);
+        ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_FILTER", "moe_overlay_residency", 1), 0);
+        PerfStatsCollector::reset();
+        std::vector<std::uint64_t> expected_words;
+        std::set<std::pair<std::string, std::string>> expected_retirements;
+        std::vector<TransactionFixture> authorities;
+        for (int rank = 0; rank < 3; ++rank)
+            authorities.push_back(makeTransaction());
+        DistributedTransportFixture distributed;
+        for (std::uint64_t epoch = 1; epoch <= 20; ++epoch)
+        {
+            // The original root authority authors every epoch. Drive demand
+            // toward its current cold tier so each next proposal really moves
+            // experts; followers adopt its unchanged authenticated document.
+            if (epoch > 1)
+            {
+                std::vector<std::uint64_t> counts(6, 1);
+                for (const auto &owner : authorities[0].authority->snapshot()->placementOwnerMap().owners())
+                    if (owner.tier_idx == 2)
+                        counts.at(static_cast<std::size_t>(owner.expert_id)) =
+                            std::uint64_t{1} << (epoch + 10);
+                authorities[0].histogram->mergeLayerCounts(0, counts.data(), 6, false);
+                authorities[0].transaction = authorities[0].authority->proposeFromHistogram();
+            }
+            const auto &original = authorities[0].transaction;
+            ASSERT_TRUE(original.valid());
+            ASSERT_FALSE(original.empty());
+            ASSERT_EQ(original.expected_epoch, epoch);
+            const auto plan = authorities[0].authority->exportAuthoritativeResidencyPlan(original);
+            for (int rank = 1; rank < 3; ++rank)
+                authorities[rank].transaction =
+                    authorities[rank].authority->adoptAuthoritativeResidencyPlan(plan);
+            expected_words.insert(expected_words.end(), {epoch, epoch + 1});
+            for (int rank = 0; rank < 3; ++rank)
+            {
+                expected_retirements.emplace(std::to_string(epoch + 1), std::to_string(rank));
+                ASSERT_EQ(authorities[rank].authority->beginApply(
+                    authorities[rank].transaction, *distributed.transports[rank]).status,
+                    MoEOverlayResidencyApplyStatus::Started);
+            }
+            // Original authorities own publication and old-bank retirement;
+            // polling only supplies independent rank progress to real wrappers.
+            bool idle = false;
+            for (int pass = 0; pass < 128 && !idle; ++pass)
+            {
+                idle = true;
+                for (auto &fixture : authorities)
+                {
+                    const auto result = fixture.authority->advanceBackground();
+                    idle = idle && result.status == MoEOverlayResidencyApplyStatus::Idle;
+                }
+            }
+            ASSERT_TRUE(idle);
+            for (const auto &fixture : authorities)
+            {
+                EXPECT_EQ(fixture.authority->snapshot()->epoch, epoch + 1);
+                EXPECT_EQ(fixture.authority->pendingRetirementCount(), 0u);
+            }
+        }
+        const auto records = PerfStatsCollector::snapshot({"moe_overlay_residency"});
+        std::size_t summaries = 0, exact = 0;
+        std::set<std::string> summary_ranks;
+        std::set<std::pair<std::string, std::string>> actual_retirements;
+        for (const auto &record : records)
+        {
+            if (record.name == "distributed_reservation_ready")
+            {
+                ++summaries;
+                EXPECT_EQ(record.count, 20u);
+                EXPECT_DOUBLE_EQ(record.value, 20.0);
+                EXPECT_TRUE(PerfStatsCollector::matchesCounterSequence(record, expected_words, 2));
+                EXPECT_TRUE(summary_ranks.insert(record.tags.at("world_rank")).second);
+                EXPECT_FALSE(record.tags.contains("expected_epoch"));
+                EXPECT_FALSE(record.tags.contains("candidate_epoch"));
+            }
+            if (record.name == "distributed_retirement_consensus_ready")
+            {
+                ++exact;
+                EXPECT_EQ(record.count, 1u);
+                ASSERT_TRUE(record.tags.contains("expected_epoch"));
+                ASSERT_TRUE(record.tags.contains("candidate_epoch"));
+                ASSERT_TRUE(record.tags.contains("world_rank"));
+                EXPECT_EQ(std::stoull(record.tags.at("candidate_epoch")),
+                          std::stoull(record.tags.at("expected_epoch")) + 1);
+                EXPECT_TRUE(actual_retirements.emplace(record.tags.at("candidate_epoch"),
+                                                       record.tags.at("world_rank")).second);
+                EXPECT_EQ(record.tags.at("world_size"), "3");
+            }
+        }
+        EXPECT_EQ(summaries, 3u);
+        EXPECT_EQ(exact, 60u);
+        EXPECT_EQ(summary_ranks, (std::set<std::string>{"0", "1", "2"}));
+        EXPECT_EQ(actual_retirements, expected_retirements);
+    }
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyTransport,
+        OriginalMeasurementContextSurvivesWrapperDrainAndReset)
+    {
+        auto fixture = makeTransaction();
+        DistributedTransportFixture distributed;
+        const auto &transaction = fixture.transaction;
+        const auto &inventory = transaction.previous->originalOwnerMap().participants();
+        const auto metadata = modelMetadata();
+
+        // Passive coordinates come from this fixture's actual declared members
+        // and dimensions. No event, physical timing or source lease is invented.
+        const auto target = [&](int participant_id)
+        {
+            const auto &member = inventory.at(static_cast<std::size_t>(participant_id));
+            const auto whole = MoEProjectionResidence::ExpertOwner;
+            return MoEOverlayPhysicalProjectionTarget{
+                .tier_idx = member.tier_idx,
+                .members = {{
+                    .participant_id = member.participant_id,
+                    .world_rank = member.world_rank,
+                    .device = member.device,
+                    .address = member.address,
+                    .projections = {{
+                        {whole, metadata.routed_intermediate_size, metadata.d_model,
+                         0, metadata.routed_intermediate_size, 0, metadata.d_model},
+                        {whole, metadata.routed_intermediate_size, metadata.d_model,
+                         0, metadata.routed_intermediate_size, 0, metadata.d_model},
+                        {whole, metadata.d_model, metadata.routed_intermediate_size,
+                         0, metadata.d_model, 0, metadata.routed_intermediate_size}}},
+                }},
+            };
+        };
+        std::vector<MoEOverlayMigrationEvidenceIdentity> identities;
+        const auto format = ExpertWeightFormat::floating(TensorType::FP32);
+        for (const auto &migration : transaction.migrations)
+        {
+            identities.push_back({
+                transaction.expected_epoch, transaction.candidate->epoch,
+                migration.source.owner_participant, migration.destination.owner_participant,
+                migration.layer_idx, migration.expert_id,
+                MoEOverlayMigrationMeasurementGeometry::checked(
+                    {target(migration.source.owner_participant),
+                     target(migration.destination.owner_participant)},
+                    {format, format, format}),
+            });
+        }
+
+        for (const bool include_context : {true, false, true})
+        {
+            std::vector<std::weak_ptr<const MoEOverlayMigrationEvidenceContext>> owners;
+            for (auto &local : distributed.locals)
+            {
+                local->measurement_context = include_context
+                    ? MoEOverlayMigrationEvidenceContext::checked(identities, transaction.purpose)
+                    : nullptr;
+                owners.emplace_back(local->measurement_context);
+            }
+            auto starts = startEveryRank(distributed, transaction);
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                EXPECT_EQ(starts[rank].measurement_context, owners[rank].lock());
+                distributed.locals[rank]->measurement_context.reset();
+                EXPECT_EQ(owners[rank].expired(), !include_context);
+            }
+            for (const auto &result : finishStages(starts))
+                EXPECT_EQ(result.progress, MoEOverlayResidencyWaveProgress::Ready) << result.error;
+            abortEveryRank(starts);
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                starts[rank].wave.reset();
+                EXPECT_EQ(owners[rank].expired(), !include_context);
+                EXPECT_TRUE(distributed.lanes[rank]->idle());
+            }
+            starts.clear();
+            for (const auto &owner : owners)
+                EXPECT_TRUE(owner.expired());
+        }
+    }
+
     TEST(
         Test__MoEOverlayDistributedResidencyTransport,
         OneRankBackpressureDefersAllRanksAndRetriesIdenticalTransaction)
@@ -1048,46 +1269,22 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyTransport,
-        PhysicalStageFailureRetainsExactDiagnosticOnOriginatingRank)
+        PhysicalStageFailureIsFatalBeforeStagedVote)
     {
-        auto transaction = makeTransaction();
-        DistributedTransportFixture distributed;
-        distributed.locals[1]->stage_progress =
-            MoEOverlayResidencyWaveProgress::Failed;
-
-        auto starts = startEveryRank(distributed, transaction.transaction);
-        const auto failed = finishStages(starts);
-        for (std::size_t rank = 0; rank < failed.size(); ++rank)
-        {
-            EXPECT_EQ(
-                failed[rank].progress,
-                MoEOverlayResidencyWaveProgress::Failed);
-            EXPECT_NE(
-                failed[rank].error.find("world rank 1"),
-                std::string::npos)
-                << failed[rank].error;
-            EXPECT_NE(failed[rank].error.find("2102"), std::string::npos)
-                << failed[rank].error;
-            if (rank == 1u)
-            {
-                EXPECT_NE(
-                    failed[rank].error.find(
-                        "injected local physical stage failure"),
-                    std::string::npos)
-                    << failed[rank].error;
-            }
-            else
-            {
-                EXPECT_EQ(
-                    failed[rank].error.find(
-                        "injected local physical stage failure"),
-                    std::string::npos)
-                    << "Only the source rank owns the variable diagnostic";
-            }
-        }
-        abortEveryRank(starts);
-        for (const auto &lane : distributed.lanes)
-            EXPECT_TRUE(lane->idle());
+        EXPECT_EXIT({
+            auto transaction = makeTransaction();
+            DistributedTransportFixture distributed;
+            distributed.locals[0]->stage_progress = MoEOverlayResidencyWaveProgress::Pending;
+            distributed.locals[1]->stage_progress = MoEOverlayResidencyWaveProgress::Failed;
+            auto starts = startEveryRank(distributed, transaction.transaction);
+            for (int iteration = 0; iteration != 10; ++iteration)
+                for (auto &start : starts) {
+                    std::string error;
+                    (void)start.wave->pollStage(&error);
+                }
+            std::_Exit(75);
+        }, ::testing::ExitedWithCode(73),
+           "physical-fatal rank=1 generations=1 reason=injected local physical stage failure");
     }
 
     TEST(

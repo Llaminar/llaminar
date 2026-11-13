@@ -287,6 +287,7 @@ namespace llaminar2
             if (!cuda_tq_upload_codebooks(init_stream))
                 throw std::runtime_error(
                     "CUDARingKVCacheTQ: failed to enqueue constant codebook publication");
+            native_centroids_ = cuda_tq_native_centroids(mode_ == TurboQuantKVMode::AQ8_K_TQ4_V ? 4 : 8);
             rotations_ = cuda_tq_create_rotations(
                 n_layers, local_n_kv_heads_, head_dim,
                 tq_ctx->rotation().seed, device_id, init_stream, kv_head_start_);
@@ -1278,6 +1279,30 @@ namespace llaminar2
         if (out_kv_len)
             *out_kv_len = static_cast<int>(k->rows());
         return true;
+    }
+
+    qwen4exp::QwenSparseKV CUDARingKVCacheTQ::acquireSparseAttentionNativeView(
+        int layer, int sequence, const attention::AttentionDeviceParams *rows,
+        attention::AttentionKeyCachePolicy policy, void *stream)
+    {
+        requireGPUExecutionStream(stream,"CUDARingKVCacheTQ::acquireSparseAttentionNativeView");
+        if (layer < 0 || layer >= n_layers_ || sequence < 0 || sequence >= batch_size_ ||
+            head_dim_ != 256 || local_n_kv_heads_ < 1 || local_n_kv_heads_ > 2 || !rows)
+            throw std::invalid_argument("CUDA compressed selected KV view requires D256 native storage and canonical row params");
+        const auto &entry = entries_[layer][sequence];
+        const auto value_codec = turboQuantValuePrecision(mode_) == ActivationPrecision::Q8_1 ? TensorType::Q8_1 :
+            turboQuantValuePrecision(mode_) == ActivationPrecision::TQ4 ? TensorType::TQ4 : TensorType::TQ8;
+        qwen4exp::QwenSparseNativeBank key{.data=entry.d_K,
+            .token_stride_bytes=local_n_kv_heads_*k_block_size_,.head_stride_bytes=k_block_size_,
+            .codec=TensorType::AQ8,.anchor=entry.d_K_anchor};
+        qwen4exp::QwenSparseNativeBank value{.data=entry.d_V,
+            .token_stride_bytes=local_n_kv_heads_*v_block_size_,.head_stride_bytes=v_block_size_,
+            .codec=value_codec,.centroids=native_centroids_};
+        if (value_codec != TensorType::Q8_1)
+            for (int head = 0; head < local_n_kv_heads_; ++head)
+                value.rotations[head] = rotations_.rotation(layer,head);
+        return {.keys=key,.values=value,.addressing=qwen4exp::QwenSparseKVAddressing::RowParameters,
+                .row_parameters=rows,.key_policy=policy};
     }
 
     std::optional<IKVCache::DeviceReadStorage>

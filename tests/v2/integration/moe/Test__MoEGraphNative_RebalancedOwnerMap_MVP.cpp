@@ -11,6 +11,7 @@
  * No model loading, no weight I/O, single MPI rank.
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 
@@ -285,6 +286,9 @@ namespace llaminar2::test
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();

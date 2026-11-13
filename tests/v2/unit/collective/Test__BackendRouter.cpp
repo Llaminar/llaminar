@@ -15,6 +15,11 @@
 #include "v2/execution/mpi_orchestration/DeviceInventory.h"
 #include "v2/backends/DeviceId.h"
 
+#include "mocks/MockMPIContext.h"
+#include "v2/planning/ExecutionRankMembership.h"
+#include "v2/execution/local_execution/orchestrators/PipelineGraphExecutionPlan.h"
+#include "v2/collective/LocalPPTransferSelection.h"
+
 namespace llaminar2::test
 {
     /** @test Directed topology survives reordered/non-contiguous device ordinals. */
@@ -127,6 +132,183 @@ namespace llaminar2::test
             (void)buildLocalTPCollectiveInventory(
                 {GlobalDeviceAddress::cpu()}, 2, 2),
             std::invalid_argument);
+    }
+
+    /** @brief Replay only original immutable inventory ownership without an MPI runtime. */
+    class PipelineObservedContext final : public MockMPIContext
+    {
+    public:
+        /** @brief Retain one already projected execution namespace. */
+        explicit PipelineObservedContext(std::shared_ptr<const ClusterInventory> inventory)
+            :MockMPIContext(0,inventory->world_size),inventory_(std::move(inventory)) {}
+        /** @return Same original membership-projected observation, with no discovery. */
+        std::shared_ptr<const ClusterInventory> clusterInventory() const override { return inventory_; }
+        /** @brief Simulate an incompatible replacement snapshot for capture-identity rejection. */
+        void replaceObservation(std::shared_ptr<const ClusterInventory> inventory) { inventory_=std::move(inventory); }
+    private:
+        std::shared_ptr<const ClusterInventory> inventory_;
+    };
+
+    /** @brief Build real canonical membership projection over authored original hardware facts. */
+    static std::shared_ptr<PipelineObservedContext> pipelineObservedContext()
+    {
+        ClusterInventory original;original.world_size=2;original.node_count=1;
+        for(int rank=0;rank<2;++rank) {
+            RankInventory observation;observation.rank=rank;observation.node_id=0;
+            observation.local_rank=rank;observation.hostname="host";
+            observation.cpu.type=DeviceType::CPU;observation.cpu.numa_node=rank;
+            const auto add=[&](DeviceType type,int ordinal,int numa) {
+                DeviceInfo gpu;gpu.type=type;gpu.local_device_id=ordinal;gpu.numa_node=numa;
+                gpu.uuid=std::string(deviceTypeToString(type))+"-uuid-"+std::to_string(ordinal);
+                observation.gpus.push_back(gpu);
+            };
+            add(DeviceType::CUDA,0,0);add(DeviceType::CUDA,1,0); // Visible but foreign to selected rank.
+            add(DeviceType::ROCm,0,0);add(DeviceType::ROCm,5,0); // Foreign/XTX-like spare observation.
+            for(int ordinal:{7,6,8,9,1,3,4,2,12})add(DeviceType::ROCm,ordinal,1);
+            add(DeviceType::CUDA,17,1); // Authored mixed-vendor generic-boundary fixture.
+            original.ranks.push_back(std::move(observation));
+        }
+        ExecutionRankMembership selected(original,{1});
+        return std::make_shared<PipelineObservedContext>(std::make_shared<const ClusterInventory>(selected.inventory()));
+    }
+
+    /** @brief Resolve the same typed stage execution declaration consumed by production admission. */
+    static PipelineGraphExecutionPlan pipelineExecution(const std::vector<std::vector<GlobalDeviceAddress>>& stages)
+    {
+        std::vector<PipelineGraphExecutionSegment> segments;
+        for(std::size_t stage=0;stage<stages.size();++stage) {
+            PipelineGraphExecutionSegment segment;segment.stage_index=stage;
+            for(const auto& participant:stages[stage])segment.participants.push_back(participant.toLocalDeviceId());
+            segment.execution=segment.primaryDevice().is_gpu()?PipelineGraphSegmentExecution::NativeDeviceExecutable:
+                PipelineGraphSegmentExecution::HostDeclarative;
+            segments.push_back(std::move(segment));
+        }
+        return PipelineGraphExecutionPlan(std::move(segments));
+    }
+
+    TEST(PipelineRouterStartup, CapturedOriginalMembershipNeverCreatesVisibleVendorCommunicators)
+    {
+        const auto context=pipelineObservedContext();
+        const std::vector<std::vector<GlobalDeviceAddress>> stages{
+            {GlobalDeviceAddress::rocm(7,1),GlobalDeviceAddress::rocm(6,1),GlobalDeviceAddress::rocm(8,1),GlobalDeviceAddress::rocm(9,1)},
+            {GlobalDeviceAddress::rocm(1,1),GlobalDeviceAddress::rocm(3,1),GlobalDeviceAddress::rocm(4,1),GlobalDeviceAddress::rocm(2,1)}};
+        auto admission=PipelineRouterAdmission::admit(context,stages,pipelineExecution(stages));
+        EXPECT_EQ(admission.context()->rank(),0);EXPECT_EQ(admission.inventory().getRank(0).cpu.numa_node,1);
+        EXPECT_EQ(admission.participants().front().device_ordinal,7);
+        EXPECT_TRUE(admission.copyEdges().empty());
+        auto factory=std::make_unique<MockBackendFactory>();auto* observed=factory.get();
+        factory->setAvailable(CollectiveBackendType::NCCL,true);factory->setAvailable(CollectiveBackendType::RCCL,true);
+        BackendRouter router(std::move(admission),std::move(factory));
+        EXPECT_EQ(observed->createCallCount(),0);
+        EXPECT_THROW(router.getBackendForCopy(DeviceId::rocm(7),DeviceId::rocm(1)),std::logic_error);
+        EXPECT_THROW(router.getBackend(CollectiveBackendType::NCCL),std::logic_error);
+        EXPECT_EQ(observed->createCallCount(),0);
+        // Execute the actual production singleton installation and idempotent
+        // reentry too; this declaration authorizes zero native factory calls.
+        GlobalBackendRouter::shutdown();
+        GlobalBackendRouter::initForPipeline(PipelineRouterAdmission::admit(context,stages,pipelineExecution(stages)));
+        ASSERT_NE(GlobalBackendRouter::get(),nullptr);
+        EXPECT_NO_THROW(GlobalBackendRouter::initForPipeline(
+            PipelineRouterAdmission::admit(context,stages,pipelineExecution(stages))));
+        EXPECT_THROW(GlobalBackendRouter::get()->getBackendForCopy(DeviceId::rocm(7),DeviceId::rocm(1)),std::logic_error);
+        const auto original=context->clusterInventory();
+        context->replaceObservation(std::make_shared<const ClusterInventory>(*original));
+        EXPECT_THROW(GlobalBackendRouter::initForPipeline(
+            PipelineRouterAdmission::admit(context,stages,pipelineExecution(stages))),std::logic_error);
+        context->replaceObservation(original);
+        GlobalBackendRouter::shutdown();
+        auto foreign=stages;foreign[0][0]=GlobalDeviceAddress::rocm(5,0);
+        EXPECT_THROW(PipelineRouterAdmission::admit(context,foreign,pipelineExecution(foreign)),std::invalid_argument);
+        auto duplicate=stages;duplicate[1][0]=stages[0][0];
+        EXPECT_THROW(PipelineRouterAdmission::admit(context,duplicate,pipelineExecution(duplicate)),std::invalid_argument);
+        auto mismatch=stages;std::reverse(mismatch[0].begin(),mismatch[0].end());
+        EXPECT_THROW(PipelineRouterAdmission::admit(context,mismatch,pipelineExecution(stages)),std::invalid_argument);
+    }
+
+    TEST(PipelineRouterStartup, GenericUnequalDomainsAdmitOnlyActualInitialBoundaryCopies)
+    {
+        const auto context=pipelineObservedContext();
+        const std::vector<std::vector<GlobalDeviceAddress>> stages{
+            {GlobalDeviceAddress::cpu(1)},
+            {GlobalDeviceAddress::rocm(7,1),GlobalDeviceAddress::rocm(6,1),GlobalDeviceAddress::rocm(8,1)},
+            {GlobalDeviceAddress::rocm(1,1),GlobalDeviceAddress::rocm(3,1)},
+            {GlobalDeviceAddress::cuda(17,1)}};
+        auto admission=PipelineRouterAdmission::admit(context,stages,pipelineExecution(stages));
+        ASSERT_EQ(admission.copyEdges().size(),3u);
+        EXPECT_EQ(admission.copyEdges()[1].source,DeviceId::rocm(7));
+        EXPECT_EQ(admission.copyEdges()[1].target,DeviceId::rocm(1));
+        auto factory=std::make_unique<MockBackendFactory>();auto* observed=factory.get();
+        factory->setAvailable(CollectiveBackendType::NCCL,true);factory->setAvailable(CollectiveBackendType::RCCL,true);
+        auto* copy_backend=factory->addMockBackend(CollectiveBackendType::RCCL);
+        BackendRouter router(std::move(admission),std::move(factory));
+        EXPECT_EQ(observed->createCallCount(CollectiveBackendType::RCCL),1);
+        EXPECT_EQ(observed->createCallCount(CollectiveBackendType::NCCL),0);
+        EXPECT_EQ(observed->createCallCount(CollectiveBackendType::HOST),1);
+        const auto cold_creations=observed->createCallCount();
+        EXPECT_EQ(copy_backend->initGroup().devices,(std::vector{DeviceId::rocm(7),DeviceId::rocm(1)}));
+        // Endpoint capability itself belongs to the backend; the device-free
+        // mock deliberately returns unsupported without issuing native work.
+        EXPECT_NO_THROW(router.getBackendForCopy(DeviceId::rocm(7),DeviceId::rocm(1)));
+        EXPECT_NO_THROW(router.getBackendForCopy(DeviceId::rocm(1),DeviceId::cuda(17)));
+        EXPECT_THROW(router.getBackendForCopy(DeviceId::rocm(1),DeviceId::rocm(7)),std::logic_error);
+        EXPECT_THROW(router.getBackendForCopy(DeviceId::rocm(6),DeviceId::rocm(3)),std::logic_error);
+        EXPECT_EQ(observed->createCallCount(),cold_creations) << "Directed copy lookup must never construct a hot-path backend";
+        const std::array targets{DeviceId::rocm(3),DeviceId::cuda(17),DeviceId::rocm(4)};
+        EXPECT_EQ(localPPInitialDestination(DeviceId::cuda(0),targets),1);
+        EXPECT_EQ(localPPInitialDestination(DeviceId::cpu(),targets),0);
+    }
+
+    /** @test Existing generic TP dispatch chooses the source first at TP-to-TP boundaries. */
+    TEST(PipelineRouterStartup, MixedVendorSourceSelectionPreservesGenericBoundaryDispatch)
+    {
+        // These are pure indexed endpoint-policy inputs, not a claim that the
+        // homogeneous-only native graph plan admits mixed-vendor TP segments.
+        const std::vector<std::vector<DeviceId>> stages{
+            {DeviceId::cpu()},
+            {DeviceId::rocm(7),DeviceId::cuda(17)},
+            {DeviceId::cuda(19),DeviceId::rocm(1),DeviceId::rocm(3)},
+            {DeviceId::rocm(4)}};
+        const auto resolve=[&](std::size_t first,std::size_t second) {
+            const auto& sources=stages[first];const auto& targets=stages[second];
+            return localPPBoundarySelection(sources.size()>1,sources.size(),
+                [&](std::size_t index){return sources[index];},targets.size()>1,targets.size(),
+                [&](std::size_t index){return targets[index];});
+        };
+        const auto cpu_to_tp=resolve(0,1);
+        EXPECT_EQ(cpu_to_tp.source,0);EXPECT_EQ(cpu_to_tp.destination,0);
+        const auto tp_to_tp=resolve(1,2);
+        EXPECT_EQ(tp_to_tp.source,1);EXPECT_EQ(tp_to_tp.destination,0);
+        EXPECT_EQ(stages[1][tp_to_tp.source],DeviceId::cuda(17));
+        EXPECT_EQ(stages[2][tp_to_tp.destination],DeviceId::cuda(19));
+        const auto tp_to_single=resolve(2,3);
+        EXPECT_EQ(tp_to_single.source,1);EXPECT_EQ(tp_to_single.destination,0);
+        EXPECT_EQ(stages[2][tp_to_single.source],DeviceId::rocm(1));
+        // A true singleton TP source still has source-dispatch priority. Its
+        // destination leader must not be replaced by a later same-vendor peer.
+        const std::array source{DeviceId::rocm(7)};
+        const std::array targets{DeviceId::cuda(19),DeviceId::rocm(1)};
+        const auto singleton_tp=localPPBoundarySelection(true,source.size(),
+            [&](std::size_t index){return source[index];},true,targets.size(),
+            [&](std::size_t index){return targets[index];});
+        EXPECT_EQ(singleton_tp.source,0);EXPECT_EQ(singleton_tp.destination,0);
+        const auto single=localPPBoundarySelection(false,source.size(),
+            [&](std::size_t index){return source[index];},true,targets.size(),
+            [&](std::size_t index){return targets[index];});
+        EXPECT_EQ(single.source,0);EXPECT_EQ(single.destination,1);
+    }
+
+    TEST(PipelineRouterStartup, HeterogeneousCapturedDomainsKeepTheirOwnTransportAuthority)
+    {
+        const auto context=pipelineObservedContext();
+        const std::vector<std::vector<GlobalDeviceAddress>> stages{
+            {GlobalDeviceAddress::rocm(7,1),GlobalDeviceAddress::rocm(6,1)},
+            {GlobalDeviceAddress::cuda(17,1)}};
+        auto admission=PipelineRouterAdmission::admit(context,stages,pipelineExecution(stages));
+        EXPECT_TRUE(admission.copyEdges().empty());
+        auto factory=std::make_unique<MockBackendFactory>();auto* observed=factory.get();
+        BackendRouter router(std::move(admission),std::move(factory));
+        EXPECT_EQ(observed->createCallCount(),0);
+        EXPECT_THROW(router.getBackendForCopy(DeviceId::rocm(7),DeviceId::cuda(17)),std::logic_error);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

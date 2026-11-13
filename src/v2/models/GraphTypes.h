@@ -15,9 +15,16 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * A source-derived TP declaration accompanies the exact retained assignment.
+ * It names original consumer identity, never a second assignment or byte ledger.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
+#include "../execution/mtp/MTPShiftedCacheOrigin.h"
+#include "../execution/mtp/MTPSidecarCaptureLayout.h"
+#include "../execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../execution/config/ExecutionPolicy.h"
@@ -30,11 +37,13 @@
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
+#include "../config/TensorParallelAssignmentDeclaration.h"
 #include "../config/TPDomain.h"
 #include "../collective/ITPContext.h"
 #include "../loaders/WeightPlan.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/ToolCallTypes.h"
+#include "qwen4exp/Qwen4ExpWeights.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -51,11 +60,17 @@
 
 namespace llaminar2
 {
+    class RetainedHostServiceDeclarations;
+
 
     // Forward declarations
     class TensorBase;
+    class ReadAheadNativeResourceFamily;
+    class Qwen4ExpConfig;
+    class ResolvedImmutableRowTablePlacement;
     class IKVCache;
     class IMPIContext;
+    class IGlobalTPContext;
     class ITPContext;
     class ILocalTPContext;
     class ILocalPPContext;
@@ -69,6 +84,7 @@ namespace llaminar2
     class MoEExpertOverlayRuntimePlan;
     class MoEOverlayNodeLocalRouteExchange;
     class MoEOverlayRankBatchTransportRegistry;
+    class MoEOverlayActivationBatchInventory;
     class MoEOverlayNodeLocalDeviceControllerFabric;
     struct PipelineConfig;
 
@@ -99,6 +115,8 @@ namespace llaminar2
      */
     struct GraphConfig
     {
+        /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         // Model architecture
         int n_layers = 0;       ///< Number of transformer layers (local count for PP stages)
         int total_n_layers = 0; ///< Total model layers (for absolute-index validation in PP)
@@ -108,6 +126,68 @@ namespace llaminar2
         int head_dim = 0;       ///< Dimension per head
         int d_ff = 0;           ///< FFN intermediate dimension
         int vocab_size = 0;     ///< Vocabulary size
+
+        /// Exact Flash Next metadata contract. Null denotes the ordinary single residual stream.
+        std::shared_ptr<const Qwen4ExpConfig> flash_next;
+
+        /// Exact admitted attention program; graph construction must not re-read DebugEnv.
+        qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
+            qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic
+                                                                ///< consumed by execution.
+        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+        /**
+         * @brief Copy this actual device's already-admitted QSA pair, without resolving defaults.
+         * @param participants Immutable projection derived from the successful device_inputs.
+         * @throws std::invalid_argument For a foreign model, missing or conflicting participant.
+         * @details Both assignments occur only after lookup validates the complete source policy.
+         */
+        void bindAdmittedQwenSparseAttentionProgram(
+            const std::shared_ptr<
+                const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>> &participants)
+        {
+            if (!flash_next)
+                throw std::invalid_argument(
+                    "QSA admission binding requires registered Flash Next metadata");
+            if (pp_layer_offset < 0 || n_layers <= 0 ||
+                static_cast<size_t>(pp_layer_offset) > layer_types.size() ||
+                static_cast<size_t>(n_layers) >
+                    layer_types.size() - static_cast<size_t>(pp_layer_offset))
+                throw std::invalid_argument("QSA factory has an invalid declared layer interval");
+            const auto first = layer_types.begin() + pp_layer_offset;
+            if (std::none_of(first,
+                             first + n_layers,
+                             [](const auto &kind) { return kind == "full_attention"; }))
+                return; // No QSA consumer exists in this stage; no policy lookup or native work
+                        // occurs.
+            const auto program = qwen4exp::admittedQwenSparseAttentionPolicy(
+                participants, default_device, pp_layer_offset, pp_layer_offset + n_layers - 1);
+            if (program.arithmetic != qwen4exp::QwenSparseAttentionArithmetic::FixedFP32 &&
+                (resolveKVCacheStoragePrecision(kv_cache_precision, default_device.is_cpu()) !=
+                     ActivationPrecision::FP16 ||
+                 head_dim != 256 || partial_rotary_factor != 0.25f))
+                throw std::invalid_argument(
+                    "QSA graph geometry disagrees with its admitted FP16 program");
+            if (program.schedule == qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+                max_request_count != 1)
+                throw std::invalid_argument(
+                    "QSA graph requests disagree with its admitted split program");
+            attention_arithmetic = program.arithmetic;
+            attention_phase_schedule = program.schedule;
+        }
+
+        /// Frozen HC-up activation arithmetic; ordinary models never consume it.
+        QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+        /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
+        QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
+        QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
+        QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+
+        /** @return Residual/PP transport width, independently of block compute width. */
+        [[nodiscard]] int residualWidth() const;
+        /** @return Vocabulary projection input width after the terminal model mixer. */
+        [[nodiscard]] int terminalHeadWidth() const;
 
         /// Pipeline Parallelism layer offset for KV cache indexing.
         /// When building graphs for PP stage [first_layer, last_layer), this offset
@@ -195,6 +275,23 @@ namespace llaminar2
 
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
+        /** @brief Internal unpromoted graph policy; no runtime auto-selection or CLI advertisement. */
+        using NgramLookupSchedule=ImmutableLookupSchedule;
+        /** ResidentDecode is explicit phase policy: ordinary resident prefill
+         * remains consumer-scheduled; only complete ordinary decode parents use
+         * the admitted side lane. Unsupported decode roles fail before mutation.
+         */
+        NgramLookupSchedule ngram_lookup_schedule=NgramLookupSchedule::ConsumerScheduled;
+        /** Original certified exclusive lane, shared only by serialized variants on one parent stream.
+         * Candidate construction requires this source-minted owner; no automatic stream allocation occurs.
+         */
+        std::shared_ptr<ReadAheadNativeResourceFamily> ngram_read_ahead_resources;
+        ImmutableRowTablePolicy ngram_table_policy; ///< Rank-owned native PLE storage policy.
+        /** Concrete PMA-selected table placement. Owning PLE graphs reject an unresolved policy. */
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
+        std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> ngram_replicated_ple_cohort; ///< Actual Rank-owned fixed-head producer composition; no live state.
 
         /// Multi-token prediction feature gates and verification mode.
         MTPRuntimeConfig mtp;
@@ -229,15 +326,17 @@ namespace llaminar2
 
         /**
          * @brief Classify an explicit native local vocabulary publication edge.
-         * @return True for a retained MTP graph family in one native local GPU TP domain.
+         * @return True for one admitted native local GPU TP domain, independent of MTP capacity.
          *
          * Projection ownership remains sharded. This predicate describes the
          * complete graph-boundary publication after its explicit collective,
-         * allowing samplers to consume the admitted full output bank.
+         * allowing ordinary and MTP samplers to consume the admitted full output
+         * bank. A fixed ordinary row uses the same explicit publication stage
+         * without a predictor, verifier count or retained MTP workspace.
          */
         [[nodiscard]] bool hasNativeLocalVocabularyGather() const noexcept
         {
-            return retainsMTPGraphCapacity(mtp) && default_device.is_gpu() && tp_ctx && tp_ctx->isLocal() && tp_ctx->degree() > 1 &&
+            return default_device.is_gpu() && tp_ctx && tp_ctx->isLocal() && tp_ctx->degree() > 1 &&
                 (tp_ctx->backend() == CollectiveBackendType::NCCL || tp_ctx->backend() == CollectiveBackendType::RCCL);
         }
 
@@ -264,6 +363,10 @@ namespace llaminar2
             const bool mirrored = mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
             return lm_head_column_parallel && mirrored;
         }
+
+        /** @return Mandatory origin from exact model identity; callers cannot select another QFN convention. */
+        [[nodiscard]] MTPShiftedCacheOrigin mtpShiftedCacheOrigin() const noexcept
+        { return flash_next ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly; }
 
         /**
          * @brief Return whether TP participants bind a complete MTP predictor block.
@@ -330,6 +433,9 @@ namespace llaminar2
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.
         bool compute_all_position_logits = false;
+
+        /** Immutable setup demand; runtime output selection cannot enlarge this envelope. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
 
         /**
          * @brief Runtime-only grouped MTP verifier graph policy.
@@ -528,6 +634,8 @@ namespace llaminar2
         /// When set, overrides equal-split head/KV/FFN computation.
         /// Use for heterogeneous GPU setups (e.g., NVIDIA 73% + AMD 27%).
         std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
+        /** Original source/retained-family intent; QueryInterval must match the actual bound assignment. */
+        std::optional<TensorParallelAssignmentDeclaration> tp_source_declaration;
 
         /// Local rank index (used with tp_config to look up assignment)
         int local_rank = 0;
@@ -786,6 +894,11 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
                 expert_overlay_participant_residency = nullptr;
 
+            /** Original CPU expert-domain context, retained through every local
+             * fragment collective and retired explicitly after graph owners.
+             * GPU-only ranks outside that domain carry no context. */
+            std::shared_ptr<IGlobalTPContext> expert_overlay_cpu_joint_context;
+
             /// Optional MPI context dedicated to overlay domain-worker commands.
             /// It is intentionally separate from the graph-builder MPI context so
             /// continuation-root graphs can avoid unrelated world collectives.
@@ -798,6 +911,8 @@ namespace llaminar2
              */
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
                 rank_batch_transport_registry = nullptr;
+            /** Same original source/row declaration retained by the admitted channel registry. */
+            std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory;
 
             /**
              * Node-local mapped control pages for a heterogeneous or
@@ -958,6 +1073,7 @@ namespace llaminar2
      */
     struct LayerWeights
     {
+        Qwen4ExpLayerWeights<TensorBase *> flash_next; ///< Typed branch, indexer and PLE views.
         // Attention weights (Full Attention layers)
         TensorBase *wq = nullptr;        ///< Query projection
         TensorBase *wk = nullptr;        ///< Key projection
@@ -1023,6 +1139,7 @@ namespace llaminar2
      */
     struct LayerWeightBindings
     {
+        Qwen4ExpLayerWeights<const WeightBinding *> flash_next; ///< Frozen extension identities.
         // Attention weights (Full Attention layers)
         const WeightBinding *wq = nullptr;
         const WeightBinding *wk = nullptr;
@@ -1076,6 +1193,7 @@ namespace llaminar2
      */
     struct MTPDepthWeights
     {
+        HyperConnectionWeights<TensorBase *> hyper_connection_head; ///< Predictor's terminal branch mixer.
         int depth_index = 0;
         int source_layer_index = -1;
         bool nextn_block_layout = false;
@@ -1099,6 +1217,8 @@ namespace llaminar2
 
     struct MTPForwardInput
     {
+        /** Original Full/Chained cache role selected by the retained sidecar owner. */
+        MTPSidecarCaptureRole capture_role = MTPSidecarCaptureRole::Full;
         const int *draft_token_ids = nullptr;
         /**
          * @brief Optional device-resident draft token IDs.
@@ -1147,6 +1267,9 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu();
         BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         bool kv_cache_only = false;
+        /** Original construction purpose; declarations never acquire execution authority. */
+        ForwardGraphSubmissionIntent graph_submission_intent =
+            ForwardGraphSubmissionIntent::Execute;
     };
 
     struct MTPForwardOutput
@@ -1198,6 +1321,7 @@ namespace llaminar2
 
     struct MTPDepthWeightBindings
     {
+        HyperConnectionWeights<const WeightBinding *> hyper_connection_head;
         int depth_index = 0;
         int source_layer_index = -1;
         bool nextn_block_layout = false;
@@ -1226,6 +1350,7 @@ namespace llaminar2
     inline LayerWeights toLegacyLayerWeights(const LayerWeightBindings &bindings)
     {
         LayerWeights weights;
+        weights.flash_next = mapQwen4ExpLayerWeights(bindings.flash_next, legacyTensor);
         weights.wq = legacyTensor(bindings.wq);
         weights.wk = legacyTensor(bindings.wk);
         weights.wv = legacyTensor(bindings.wv);
@@ -1270,6 +1395,7 @@ namespace llaminar2
     inline MTPDepthWeights toLegacyMTPDepthWeights(const MTPDepthWeightBindings &bindings)
     {
         MTPDepthWeights weights;
+        weights.hyper_connection_head = mapHyperConnectionWeights(bindings.hyper_connection_head, legacyTensor);
         weights.depth_index = bindings.depth_index;
         weights.source_layer_index = bindings.source_layer_index;
         weights.nextn_block_layout = bindings.nextn_block_layout;
@@ -1298,12 +1424,16 @@ namespace llaminar2
      */
     struct ModelWeightBindings
     {
+        HyperConnectionWeights<const WeightBinding *> hyper_connection_head;
         const WeightBinding *embedding_table = nullptr;
         const WeightBinding *final_norm = nullptr;
         const WeightBinding *lm_head = nullptr;
         MTPWeightBindings mtp;
 
         std::function<LayerWeightBindings(int layer_idx)> get_layer_weights;
+
+        /** @brief Exact persistent allocation owner carried from the frozen source plan. */
+        PhysicalMemoryOwner physical_memory_owner = PhysicalMemoryOwner::Count;
     };
 
     /**
@@ -1313,6 +1443,7 @@ namespace llaminar2
      */
     struct ModelWeights
     {
+        HyperConnectionWeights<TensorBase *> hyper_connection_head;
         TensorBase *embedding_table = nullptr; ///< [vocab_size, d_model]
         TensorBase *final_norm = nullptr;      ///< [d_model]
         TensorBase *lm_head = nullptr;         ///< [vocab_size, d_model]
@@ -1325,6 +1456,7 @@ namespace llaminar2
     inline ModelWeights toLegacyModelWeights(const ModelWeightBindings &bindings)
     {
         ModelWeights weights;
+        weights.hyper_connection_head = mapHyperConnectionWeights(bindings.hyper_connection_head, legacyTensor);
         weights.embedding_table = legacyTensor(bindings.embedding_table);
         weights.final_norm = legacyTensor(bindings.final_norm);
         weights.lm_head = legacyTensor(bindings.lm_head);
@@ -1389,6 +1521,8 @@ namespace llaminar2
         depth.pre_fc_norm_hidden = get("nextn.hnorm.weight");
         depth.pre_fc_norm_embedding = get("nextn.enorm.weight");
         depth.final_norm = get("nextn.shared_head_norm.weight");
+        depth.hyper_connection_head = loadHyperConnectionWeights(get, "nextn.hc_head_");
+        depth.fa_block.flash_next = loadQwen4ExpLayerWeights(get);
 
         depth.fa_block.wq = get("attn_q.weight");
         depth.fa_block.wk = get("attn_k.weight");
@@ -1473,9 +1607,13 @@ namespace llaminar2
         std::optional<DeviceId> preferred_device = std::nullopt)
     {
         ModelWeightBindings bindings;
+        bindings.physical_memory_owner = weight_set.physicalMemoryOwner();
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
+        bindings.hyper_connection_head = loadHyperConnectionWeights(
+            [&weight_set](const std::string &name) { return optionalGlobalBinding(weight_set, name); },
+            "output_hc_");
         bindings.mtp = makeMTPWeightBindings(weight_set);
         bindings.get_layer_weights = [&weight_set, preferred_device](int layer_idx)
         {
@@ -1524,6 +1662,7 @@ namespace llaminar2
             layer.shared_expert_up = get("ffn_up_shexp.weight");
             layer.shared_expert_down = get("ffn_down_shexp.weight");
             layer.shared_expert_gate_inp = get("ffn_gate_inp_shexp.weight");
+            layer.flash_next = loadQwen4ExpLayerWeights(get);
             return layer;
         };
         return bindings;

@@ -10,9 +10,85 @@
  * mathematical model certification.
  */
 #include "PipelineGenerationTestSupport.h"
+#include "../../../utils/CPUOrchestratorTestAdmission.h"
+#include "kernels/HybridKVCacheConfig.h"
+#include "kernels/KernelFactory.h"
+#include "planning/PersistentStateMemoryEstimator.h"
 
 namespace llaminar2::test
 {
+/**
+ * @brief Admit this all-attention CPU fixture's actual PP cache and full graph arena.
+ * @param graph Exact graph schema constructed by the test.
+ * @param stage Head/middle/tail index, or three for the unpartitioned owner.
+ * @return Explicit dependencies without allocating weights or cache payloads.
+ *
+ * This fixture's fourth model slot is its separate predictor. Main cache
+ * ownership comes from the test's PP role; native KVCacheConfig supplies exact
+ * physical bytes, avoiding a fabricated model-weight inventory or layer profile.
+ */
+static DeviceGraphOrchestrator::Dependencies cpuPipelineStateDependencies(
+    const std::shared_ptr<Qwen35Graph> &graph, int stage)
+{
+    auto dependencies = cpuFixtureDependencies(graph, nullptr);
+    const auto &config = graph->config();
+    HybridKVCacheConfig hybrid;
+    hybrid.layer_types = config.layer_types;
+    hybrid.gdn_conv_kernel_size = config.gdn.conv_kernel_size;
+    hybrid.gdn_state_size = config.gdn.state_size;
+    hybrid.gdn_inner_size = config.gdn.inner_size;
+    hybrid.gdn_group_count = config.gdn.group_count;
+    hybrid.gdn_time_step_rank = config.gdn.time_step_rank;
+    hybrid.n_heads = config.n_heads;
+    llaminar::v2::kernels::KVCacheConfig cache;
+    cache.precision = resolveKVCacheStoragePrecision(config.kv_cache_precision, true);
+    cache.device = config.default_device;
+    cache.num_layers = stage < 3 ? 1 : config.n_layers;
+    cache.first_layer_index = stage < 3 ? stage : 0;
+    cache.batch_size = 1;
+    cache.max_seq_len = 64;
+    cache.n_kv_heads = config.n_kv_heads;
+    cache.head_dim = config.head_dim;
+    cache.hybrid_config = &hybrid;
+    size_t cache_bytes = cache.estimateBytes();
+    if (retainsMTPGraphCapacity(config.mtp) && stage >= 2)
+    {
+        cache.num_layers = 1;
+        cache.first_layer_index = 0;
+        cache.hybrid_config = nullptr;
+        cache_bytes += cache.estimateBytes();
+    }
+    const size_t arena_bytes = cpuFixtureGraphRoots(*graph, 1, 64).cpuPhysicalBytes();
+    // The all-attention rollback pool still retains terminal hidden rows.
+    // Price its owners through the same persistent-state declaration as
+    // production admission instead of treating recurrence-free as state-free.
+    const bool retained = retainsMTPGraphCapacity(config.mtp);
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_layers = config.n_layers + (retained ? 1 : 0);
+    profile.mtp_layer_count = retained ? 1 : 0;
+    profile.d_model = config.d_model;
+    profile.n_heads = config.n_heads;
+    profile.n_kv_heads = config.n_kv_heads;
+    profile.head_dim = config.head_dim;
+    const auto state = PersistentStateMemoryEstimator::estimate(profile, config.default_device,
+        1, 64, config.n_kv_heads, config.n_kv_heads, 0, config.n_heads,
+        stage < 3 ? stage : 0, stage < 3 ? stage : config.n_layers - 1,
+        activationPrecisionToString(cache.precision), resolveMTPStateRole(retained, stage >= 2));
+    const size_t capacity = arena_bytes + cache_bytes + state.stateBytes();
+    const PhysicalMemoryResource resource{.world_rank = 0, .device = config.default_device,
+        .total_bytes = capacity, .admission_available_bytes = capacity};
+    PhysicalMemoryPlanBuilder admission;
+    admission.add(resource, PhysicalMemoryOwner::ActivationArena, arena_bytes);
+    admission.add(resource, PhysicalMemoryOwner::KVCache, cache_bytes);
+    admission.add(resource, PhysicalMemoryOwner::RecurrentLiveState, state.live_recurrent_state_bytes);
+    admission.add(resource, PhysicalMemoryOwner::RecurrentCheckpointState, state.checkpoint_state_bytes);
+    admission.add(resource, PhysicalMemoryOwner::SequenceMetadata, state.sequence_metadata_bytes);
+    dependencies.physical_memory_authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(admission.build()), 0);
+    return dependencies;
+}
+
 #include "Test__PipelineMTPPublication.inc"
 #include "Test__PipelineMTPPublicationTransport.inc"
 #include "Test__PipelineVerifierEdges.inc"
@@ -44,7 +120,10 @@ TEST_P(PipelineMTPStateOwnership, ConstructionAndRollbackMatchStageOwnership)
                 // Use the production MTP-capable schema. Qwen2's ordinary
                 // schema correctly has no shifted predictor output buffers.
                 auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
-                DeviceGraphOrchestrator runner(graph, nullptr);
+                auto owner = device.is_cpu()
+                    ? DeviceGraphOrchestrator::createForTest(cpuPipelineStateDependencies(graph, stage))
+                    : std::make_unique<DeviceGraphOrchestrator>(graph, nullptr);
+                auto &runner = *owner;
                 if (stage < 3)
                     runner.setPPStageConfig({.first_layer = stage, .last_layer = stage + 1,
                         .has_embedding = stage == 0, .has_lm_head = stage == 2});

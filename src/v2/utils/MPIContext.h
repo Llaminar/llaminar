@@ -81,6 +81,13 @@ namespace llaminar2
         /** @copydoc IMPIContext::clusterInventory */
         std::shared_ptr<const ClusterInventory> clusterInventory() const override;
 
+        /**
+         * @return Borrowed parent observation retained by this selected context,
+         * or null on an original context. Its lifetime is bounded by this
+         * context. This accessor performs no MPI operation.
+         */
+        const IMPIContext *originalDiscoveryContext() const noexcept { return discovery_owner_.get(); }
+
         /** @return Selected rank mapping, or null for an original borrowed context. */
         const ExecutionRankMembership *executionMembership() const noexcept { return membership_.get(); }
 
@@ -747,6 +754,8 @@ namespace llaminar2
             std::shared_ptr<const ClusterInventory>, std::exception_ptr> inventory_publication_;
     };
 
+    class IGlobalTPContext;
+
     /**
      * @brief Factory for creating MPI contexts
      */
@@ -766,6 +775,19 @@ namespace llaminar2
          */
         static std::variant<InactiveMPIRank, std::shared_ptr<MPIContext>> selectRanks(
             const std::shared_ptr<IMPIContext> &discovery, const std::vector<int> &ranks);
+
+        /**
+         * @brief Borrow an original CPU pipeline stage's admitted dense split for graph execution.
+         * @param parent Original executing rank namespace used to admit the stage.
+         * @param stage Same admitted CPU stage context retained by the domain registry.
+         * @return A graph context with exact stage rank/size and projected parent hardware.
+         * @throws std::invalid_argument If the stage or its current rank differs from the original parent.
+         *
+         * The view retains the original split owner. It never splits or frees
+         * the communicator and never discovers devices independently.
+         */
+        static std::shared_ptr<MPIContext> borrowOriginalCPUStage(
+            const std::shared_ptr<IMPIContext>& parent, std::shared_ptr<IGlobalTPContext> stage);
 
         /**
          * @brief Get global MPI context (MPI_COMM_WORLD)

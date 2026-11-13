@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 
 namespace llaminar2
@@ -118,6 +119,10 @@ namespace llaminar2
             const NativeCollectiveRows *live_rows = nullptr) override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
+        /** @copydoc ILocalTPContext::allgatherHostIndexed */
+        bool allgatherHostIndexed(std::span<const std::byte> local_send,
+            std::span<std::byte> full_receive, int participant,
+            const std::string &stage_name) override;
         bool allgatherRawOnStream(
             const void *local_send,
             void *full_recv,
@@ -163,6 +168,10 @@ namespace llaminar2
             const std::string &boundary_name,
             int device_index,
             int timeout_ms) override;
+        /** @copydoc ILocalTPContext::graphCaptureBoundaryRendezvous */
+        bool graphCaptureBoundaryRendezvous(const std::string&,int,int,LocalTPCaptureSourceDefinition&) override;
+        /** @copydoc ILocalTPContext::graphCaptureBoundaryOnStream */
+        bool graphCaptureBoundaryOnStream(const std::string&,int,void*,int,LocalTPCaptureSourceDefinition&) override;
 
         /**
          * @brief Establish the backend-specific stream fence for a capture boundary.
@@ -237,6 +246,21 @@ namespace llaminar2
             const std::vector<const TensorBase *> &shards,
             TensorBase *output) override;
         bool reduceScatter(const TensorBase *input, TensorBase *output_shard) override;
+        /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+        bool signalNativeCompletionAbort() override;
+
+        /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+        NativeCompletionAuthority nativeCompletionAuthority(int participant) override;
+
+        /** @copydoc ILocalTPContext::nativeTransferBytesOnStream */
+        bool nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream,const std::string& stage_name) override;
+
+        /** @copydoc ILocalTPContext::nativeBroadcastBytesOnStream */
+        bool nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
+            const std::string& stage_name) override;
+
         /** @copydoc ILocalTPContext::nativeRowsOnStream */
         bool nativeRowsOnStream(
             NativeRowCollective operation, const void *send, void *receive,
@@ -324,7 +348,7 @@ namespace llaminar2
             size_t fp16_scratch_elements,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) override;
 
-        /** @brief Freeze one complete no-P2P fabric with exactly this domain's membership. */
+        /** @brief Freeze one original peer/mapped counted fabric with exactly this domain's membership. */
         void installDeviceCountedAllGather(std::shared_ptr<DeviceCountedAllGather> fabric) override;
         /** @return Setup-frozen shared transport; graph bindings retain its physical owners. */
         std::shared_ptr<DeviceCountedAllGather> deviceCountedAllGather() const override { return counted_allgather_; }
@@ -366,7 +390,8 @@ namespace llaminar2
          * @brief Publish fatal cancellation without destroying graph-owned communicators.
          *
          * The first caller closes collective admission and wakes every LocalTP
-         * rendezvous. NCCL/RCCL destruction is deliberately deferred to this
+         * rendezvous and signals fully ready original native abort words without
+         * destroying their graph borrowers. NCCL/RCCL destruction is deliberately deferred to this
          * context's destruction boundary because native graph executables may
          * retain communicator references until their owning device runners are
          * destroyed.
@@ -424,8 +449,8 @@ namespace llaminar2
         /// Device group for backend initialization
         DeviceGroup device_group_;
 
-        /// Track if backend was successfully initialized
-        bool backend_initialized_ = false;
+        /// Publishes immutable backend/communicator readiness to cancellation callers.
+        std::atomic<bool> backend_initialized_{false};
 
         // =====================================================================
         // Barrier Synchronization State
@@ -523,6 +548,38 @@ namespace llaminar2
         size_t grouped_onstream_allreduce_sideband_count_{0};
         std::vector<LocalTPCollectiveSidebandBuffer> grouped_onstream_allreduce_reference_sidebands_;
         std::vector<std::vector<LocalTPCollectiveSidebandBuffer>> grouped_onstream_allreduce_sidebands_;
+
+        /**
+         * @brief CPU-only indexed gather metadata, allocated once with the context.
+         *
+         * No payload storage or alternate ledger is owned here. Every span
+         * borrows a participant's admitted workspace until all outputs finish;
+         * departure prevents a fast next round overwriting live input storage.
+         */
+        /**
+         * @brief Publish one fatal abort while owning the gather predicate lock.
+         * @param lock Owning lock for host_allgather_mutex_; foreign/unlocked tokens fail.
+         *
+         * Public cancellation acquires this lock, while rejected arrivals pass
+         * their existing lock. The atomic predicate and notification therefore
+         * cannot race the waiter's false-predicate-to-block boundary, and a
+         * rejected generation cannot publish output before cancellation. The
+         * lock is consumed before logging, trace locks or unrelated CV wakes.
+         * @post lock no longer owns its mutex; callers must not access guarded
+         *       gather metadata after this operation.
+         */
+        void publishAbortWithHostGatherLock(std::unique_lock<std::mutex> &lock);
+        friend struct LocalTPIndexedHostKVTestPeer; ///< Device-free synchronization-boundary control only.
+        std::mutex host_allgather_mutex_;
+        std::condition_variable host_allgather_cv_;
+        std::vector<std::span<const std::byte>> host_allgather_inputs_;
+        std::vector<std::span<std::byte>> host_allgather_outputs_;
+        std::vector<bool> host_allgather_seen_;
+        size_t host_allgather_arrivals_ = 0;
+        size_t host_allgather_departures_ = 0;
+        size_t host_allgather_bytes_ = 0;
+        bool host_allgather_ready_ = false;
+        std::string_view host_allgather_stage_; ///< Borrowed retained stage name until final departure.
 
         // =====================================================================
         // GPU graph-capture lifecycle rendezvous.
@@ -729,19 +786,6 @@ namespace llaminar2
             void *producer_stream = nullptr);
 
         /**
-         * @brief Barrier-synchronized allgather for CPU-only TP
-         *
-         * For LOCAL TP where all devices are CPU, each worker thread contributes
-         * its local shard. The last-arriving thread concatenates all shards into
-         * each thread's global output tensor.
-         *
-         * @param local_shard This thread's local shard (in host memory)
-         * @param global_tensor Output tensor to receive all gathered shards
-         * @return true on success (same result for all participants)
-         */
-        bool allgatherCpuBarrier(const TensorBase *local_shard, TensorBase *global_tensor);
-
-        /**
          * @brief Validate barrier-collected tensors before multi-GPU allreduce launch.
          *
          * This method enforces correctness invariants that protect against subtle
@@ -800,6 +844,13 @@ namespace llaminar2
          * @return true when policy permits LocalTP collective execution.
          */
         bool isLocalTPGpuGraphPolicySupported(std::string *reason_out = nullptr) const;
+        /** @brief Ordinary and payload callers share the original cyclic barrier state machine. */
+        bool graphCaptureBoundaryRendezvousImpl(const std::string&,int,int,LocalTPCaptureSourceDefinition*);
+        /** @brief Preserve the original stream fence and attach payload only to its existing final rendezvous. */
+        bool graphCaptureBoundaryOnStreamImpl(const std::string&,int,void*,int,LocalTPCaptureSourceDefinition*);
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> graph_capture_source_definition_;
+        RetainedGraphParticipantDefinitionDomain graph_capture_source_domain_;
+        bool graph_capture_source_exchange_=false;
     };
 
 } // namespace llaminar2

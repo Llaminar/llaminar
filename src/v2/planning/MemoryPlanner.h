@@ -8,9 +8,13 @@
  * lifetime topology of graph-stable routed-expert buffers, allowing
  * captured serial graph families to share storage without under-admitting
  * concurrent graph families.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
+#include "planning/PlanningNativeContextEvidence.h"
+#include "loaders/NativeWeightLoadStaging.h"
+#include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
@@ -18,23 +22,41 @@
 #include "planning/PipelineTransferMemory.h"
 #include "backends/PeerAccessCoverage.h"
 #include "planning/WeightMemoryEstimator.h"
+#include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "config/CollectiveBackendType.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
+#include "execution/mtp/MTPWeightManifest.h"
 #include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "loaders/PreparedWeightAdmission.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
+#include "loaders/GPUVramPreflight.h"
 
 #include <optional>
+#include <limits>
 #include <span>
 #include <stdexcept>
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace llaminar2
 {
+class PlanningTensorIndex;
+class IMPIContext;
+struct MoERoutedExpertPlacementPlan;
+
+    class RetainedHostServiceDeclarations;
+class RetainedHostServiceBudgetProjection;
+struct ClusterInventory;
+class DeviceCountedAllGatherTopology;
+
+namespace test {struct MemoryPlannerOrderingReplayAccess;}
+
 
 /** @brief Persistent execution state owned by one planned device. */
 enum class DeviceExecutionMemoryRole
@@ -62,7 +84,7 @@ enum class AdditionalPersistentWeightSet
     MirroredDecodeEmbedding,
     /** Full-vocabulary MTP terminal head retained beside the primary TP shard. */
     MirroredMTPTerminalHead,
-    /** Complete non-routed learned MTP predictor block per TP participant. */
+    /** Learned MTP predictor replica with explicit routed-parent authority. */
     ReplicatedMTPSidecarDense,
 };
 
@@ -143,8 +165,15 @@ struct CapturedServingGraphMemoryInventory
     std::vector<int> prefill_bucket_rows;
     /** Complete forward executables retained independently of prefill rows. */
     std::size_t fixed_executable_count = 0u;
+    /** Closed main-query programs; numeric request visibility never changes this inventory. */
+    std::size_t sparse_query_program_count = 1u;
+    /** Required family provenance is checked against each GPU's declared policy. */
+    MTPVerifierGraphFamily verifier_graph_family = MTPVerifierGraphFamily::BoundedBuckets;
+    /** Frozen complete generation boundary and actual parent ownership. */
+    std::optional<DeviceGenerationExecutionDomain> generation_domain;
+    MTPGenerationParentRole generation_parent_role = MTPGenerationParentRole::Controller;
     /** Canonical MTP helper/controller cache geometry and graph owners. */
-    MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}};
+    MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller};
     /** Present only when the complete ordinary request program is retained. */
     std::optional<OrdinaryGenerationGraphPlan> ordinary_generation;
 
@@ -162,7 +191,13 @@ struct CapturedServingGraphMemoryInventory
  * @brief Resolve the exact ordinary serving-graph inventory retained at setup.
  * @param prefill_bucket_rows Configured captured-prefill bucket boundaries.
  * @param mtp Runtime execution and retained-capacity policy.
+ * @param family Required execution-owned verifier identities, shared with capture.
+ * @param parent_role Controller or pipeline follower owning the complete transactions.
+ * @param generation_domain Frozen boundary used by per-device ordinary auxiliary projection.
+ * @param query_programs Whole-main-model retained query execution programs.
  * @return Inventory consumed by @ref MemoryPlanner before graph construction.
+ * @throws std::invalid_argument For an unknown execution domain, retained family, parent role or query count.
+ * @throws std::overflow_error When retained model or auxiliary owner counts are not representable.
  *
  * The first request in a reusable model context may execute with MTP disabled
  * while reserving a wider graph family for later requests. Admission must
@@ -174,23 +209,51 @@ struct CapturedServingGraphMemoryInventory
 [[nodiscard]] inline CapturedServingGraphMemoryInventory
 resolveCapturedServingGraphMemoryInventory(
     std::vector<int> prefill_bucket_rows,
-    const MTPRuntimeConfig &mtp)
+    const MTPRuntimeConfig &mtp,
+    MTPVerifierGraphFamily family,
+    MTPGenerationParentRole parent_role,
+    DeviceGenerationExecutionDomain generation_domain,
+    std::size_t query_programs = 1u)
 {
+    if (generation_domain != DeviceGenerationExecutionDomain::NativeDomain &&
+        generation_domain != DeviceGenerationExecutionDomain::HostedBoundary)
+        throw std::invalid_argument("Serving graph inventory has an unknown generation domain");
+    if (query_programs == 0 || query_programs > kSparseQueryExecutionProgramCount)
+        throw std::invalid_argument("Serving graph inventory has an unknown query-program family");
     const bool retains_mtp = retainsMTPGraphCapacity(mtp);
+    const auto fixed = 1u + (retains_mtp ? 1u : 0u) +
+        resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, family);
+    if (fixed > std::numeric_limits<std::size_t>::max() / query_programs)
+        throw std::overflow_error("Serving sparse-query native-owner inventory overflows");
     return CapturedServingGraphMemoryInventory{
         .prefill_bucket_rows = std::move(prefill_bucket_rows),
         .fixed_executable_count =
-            1u +
-            (retains_mtp ? 1u : 0u) +
-            resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
-        .mtp_graph_owners = MTPGraphOwnerPlan(mtp),
+            query_programs * fixed,
+        .sparse_query_program_count = query_programs,
+        .verifier_graph_family = family,
+        .generation_domain = generation_domain,
+        .generation_parent_role = parent_role,
+        .mtp_graph_owners = MTPGraphOwnerPlan(mtp, family, parent_role, query_programs),
         .ordinary_generation = OrdinaryGenerationGraphPlan{},
     };
 }
 
 /// Configuration for a single device in a memory plan.
+class NativeContextPreparation;
+
 struct DevicePlanConfig
 {
+    /** Pure original source index; never a physical capacity, quota or live weight authority. */
+    std::shared_ptr<const PlanningTensorIndex> source_tensor_index;
+    /** Immutable event-program certificate source; production selects installed rows lazily.
+     * Recorded bounds can only originate from the named closed replay fixture.
+     * This is a BOM input, never a mutable catalog, allocation balance or mode flag.
+     */
+    NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+
+    /** Original source/PMA-bound immutable mandatory input; never a copied allocation balance. */
+    std::shared_ptr<NativeContextPreparation> native_context_preparation;
+
     /** MPI rank owning this allocator; -1 is valid for unbound pure estimates. */
     int world_rank = -1;
     DeviceId device;
@@ -205,12 +268,34 @@ struct DevicePlanConfig
      */
     std::optional<PhysicalMemoryResource> associated_host_memory;
 
+    /** Requested execution policy on compiled PLE consumers. Absence is valid only for
+     * lower-level incremental estimates, never a production final table request. */
+    std::optional<ImmutableRowTablePolicy> ngram_execution_policy;
+    ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled; ///< Same source-selected lookup phase policy.
+    ImmutableRowTableHostPlacement ngram_host_placement = ImmutableRowTableHostPlacement::taskPolicy(); ///< Compiled before quotas, not inferred from CPU ordinal.
+    /** Sealed final tier shared across actual PLE participants. Absent in the
+     * higher-priority base, which already includes mandatory lookup execution. */
+    std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
+    /** Existing live table lease attested by ModelContext against the same PMA.
+     * This is an admission observation, never a parallel allocation ledger. */
+    std::size_t retained_immutable_table_bytes = 0u;
+    std::size_t retained_immutable_source_table_bytes = 0u; ///< Actual mixed CPU source/cache lease; independent of GPU optional capacity.
+    std::size_t retained_immutable_source_lookup_staging_bytes = 0u; ///< Actual subordinate source/grants+mapped channel leases.
+    /** Rank-wide actual CPU LocalReady page leases, distinct from the shared source.
+     * Only the authored shared coordinator imports this sum; other configs keep zero.
+     * GPU local frame/native leases belong to retained_immutable_lookup_staging_bytes. */
+    std::size_t retained_immutable_local_ready_staging_bytes = 0u;
+    std::size_t retained_immutable_lookup_staging_bytes = 0u; ///< Actual provider request-scratch lease, excluding runner channels.
+
     /**
-     * @brief Exact transient weight-load allocations for this GPU.
+     * @brief Exact transient allocations for the original CPU source or GPU upload owner.
      *
      * The device and pinned-host rings are separate physical owners even
-     * though they share one upload geometry. CPU plans and certified retained
-     * weights leave both values at zero. A non-zero host value requires
+     * though they share one upload geometry. CPU source transactions use host bytes only and their typed
+     * native input/scratch declaration below. Certified retained preparation
+     * leaves both values at zero. A non-zero GPU host value requires
      * @ref associated_host_memory so it can be charged to the rank-local CPU
      * allocator rather than hidden in the GPU subtotal.
      */
@@ -225,6 +310,13 @@ struct DevicePlanConfig
             return device_bytes != 0u || host_bytes != 0u;
         }
     } weight_load_staging;
+    /** Fresh common CPU native-input/consumer scratch root, independent of graph workspace. */
+    std::optional<NativeWeightLoadStagingGeometry> native_weight_load_staging;
+    /** Original CPU final/source allocation policy; standalone metadata plans use explicit native heap semantics. */
+    CPUStoragePlacement native_source_placement = CPUStoragePlacement::local();
+    /** Exact original loader tuple that authored the staging bytes above.
+     * Absent for retained preparation and CPU sources; never derived from table extent. */
+    std::optional<GPUWeightLoadMemoryGeometry> ordinary_weight_load_geometry;
 
     /**
      * CUDA SMs, ROCm CUs, or configured physical-core CPU workers used by the
@@ -239,15 +331,38 @@ struct DevicePlanConfig
      */
     bool runtime_device_policy_available = false;
 
+    /// Resolved setup pair authored once by the actual attention device-input builder.
+    qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
+        qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic consumed
+                                                            ///< by execution.
+    qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+
+    /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
+    QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+    /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
+    QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
+    QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
+    QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+
     // TP configuration for this device
     int shard_index = 0;
     int total_shards = 1;
+    /** Actual rank-declared topology provenance; None cannot authorize fixed-head serving. */
+    ImmutableRowTableTPTopology ngram_tp_topology = ImmutableRowTableTPTopology::None;
+    /** Checked original pipeline fixed source, including storage-only model devices. */
+    std::shared_ptr<const ImmutableFixedHeadPipelineProjection> ngram_fixed_head_pipeline;
 
     /** Frozen physical expert layout, shared by the activation BOM and graph schema. */
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-    /// Canonical observed topology for the optional rank-local compact projection transport.
-    std::optional<PeerAccessCoverage> projection_peer_access;
+    /// Immutable original per-edge routes; their canonical quote is the only projection transport BOM.
+    std::shared_ptr<const DeviceCountedAllGatherTopology> projection_exchange_topology;
+    /** Original inventory observation for explicitly declared mapped pooled transport. */
+    std::optional<PeerAccessCoverage> ngram_gpu_peer_access;
+    /** Original coordinator-to-compute-reader observations, independent of storage edges. */
+    std::vector<ImmutableRowTableReaderPeerAccess> ngram_reader_peer_access;
 
     /**
      * Optional resolved rank-local collective backend for this participant.
@@ -259,11 +374,19 @@ struct DevicePlanConfig
      */
     std::optional<CollectiveBackendType> local_tp_backend;
 
+    /** Exact PP parent ownership, independent of transport leadership and TP sharding. */
+    PipelineForwardOnlyGraphOwner pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::None;
+
     /** Native local PP lifecycle resources, independent of TP weight sharding. */
     std::optional<CollectiveBackendType> local_pipeline_backend;
 
     /** Adjacent heterogeneous edges owned by this domain leader, never by TP nonleaders. */
     std::vector<PipelineBoundarySide> captured_pipeline_boundaries;
+    /** Actual receiving TP member's original live-prefix fanout bank, independent of channel leadership. */
+    bool pipeline_native_activation_fanout = false;
+    bool native_pipeline_maintenance_budget = false; ///< Original all-stage MTP cadence demand; separate derived scalar storage only.
+    int hosted_pipeline_activation_rows = 0; ///< Exact admitted row capacity of the sole original-rank hosted bank; zero declares no bank.
+    std::size_t native_pipeline_byte_endpoints = 0; ///< Actual incident completed-byte frames on this GPU; no payload storage.
 
     /**
      * Exact tensor-parallel slice installed by the production assignment authority.
@@ -338,8 +461,11 @@ struct DevicePlanConfig
     MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout =
         MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
 
-    /** Flattened target-verifier rows retained by the MTP graph family. */
+    /** Flattened retained target rows; ordinary arena schemas retain their positive placeholder, while workspace propagation supplies zero. */
     int mtp_target_query_rows = 2;
+
+    /** Exact ordinary diagnostic output demand within the selected activation envelope. */
+    OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
 
     /** Retained random-seed request rows, independent of current MTP enablement. */
     int generation_request_capacity = 1;
@@ -356,14 +482,17 @@ struct DevicePlanConfig
      * The physical projection layout never implies the archived output width.
      * Deriving this fact from the same immutable local transport declaration
      * avoids a second policy field that ordinary and overlay BOM builders could
-     * leave inconsistent. Retained MTP capacity is independent of enablement.
+     * leave inconsistent. Ordinary terminal projection owns this publication
+     * even when no MTP family is retained; predictor capacity is unrelated.
+     * The resolver's historical sidecar_produces_logits field also names the
+     * ordinary terminal projection here; it does not authorize a predictor.
      */
     [[nodiscard]] MTPTerminalLogitsCollective terminalLogitsCollective(
         bool owns_terminal_main_layer) const noexcept
     {
         return resolveMTPTerminalLogitsCollective({
             .layout = mtp_terminal_logits_layout,
-            .sidecar_produces_logits = mtp_enabled && owns_terminal_main_layer &&
+            .sidecar_produces_logits = owns_terminal_main_layer &&
                 execution_role == DeviceExecutionMemoryRole::ContinuationGraph,
             .spans_multiple_global_ranks = false,
             .native_local_gpu_tp = device.is_gpu() && total_shards > 1 &&
@@ -379,6 +508,8 @@ struct DevicePlanConfig
 
     /** Native graph family whose opaque driver storage must be admitted. */
     CapturedServingGraphMemoryInventory captured_serving_graphs;
+    /** Metadata-only original birth; never present alongside a live source. */
+    std::optional<PlanningNativeContextDeclaration> planning_native_context_birth;
 
     /**
      * Diagnostic checkpoint storage retained beside captured executables.
@@ -417,11 +548,15 @@ struct DevicePlanConfig
      * Zero uses @ref activation_seq_len and @ref batch_size. ExpertOverlay
      * supplies its resolved captured-segment envelope here because dense graph
      * and KV capacities may be much larger. A positive value also selects the
-     * production power-of-two route-family ladder through the resulting
-     * `rows * top_k` maximum, so admission prices every stable address later
-     * retained by the participant graph.
+     * GPU production power-of-two route-family ladder through the resulting
+     * `rows * top_k` maximum. CPU participants instead require their immutable
+     * cpu_serial_expert_storage declaration, shared with materialization.
      */
     int serial_routed_expert_compact_rows = 0;
+
+    /// Exact immutable CPU serial declaration; absent on GPU and non-serial modes.
+    std::shared_ptr<const CPUSerialExpertStorageAdmission> cpu_serial_expert_storage;
+
 
     /** Exact model-weight authority installed on this device. */
     DeviceWeightResidency weight_residency;
@@ -444,7 +579,89 @@ struct DevicePlanConfig
     DeviceExecutionMemoryRole execution_role =
         DeviceExecutionMemoryRole::ContinuationGraph;
 
+    /** Physical routed-parent owner copied from the same frozen graph authority as materialization. */
+    MTPRoutedExpertWeightAuthority mtp_routed_expert_weight_authority =
+        MTPRoutedExpertWeightAuthority::SidecarParticipant;
+
 };
+
+/**
+ * @brief Identify real sparse-attention consumers within the admitted PP layer interval.
+ * @param profile Authenticated model metadata with original global sparse-layer IDs.
+ * @param config Existing participant input, including its final layer range and role.
+ * @return False for expert-only and GDN-only continuation stages.
+ */
+inline bool ownsQwenSparseAttentionProgram(const ModelMemoryProfile &profile,
+                                           const DevicePlanConfig &config)
+{
+    if (!profile.flash_next ||
+        config.execution_role != DeviceExecutionMemoryRole::ContinuationGraph)
+        return false;
+    const int last = config.last_layer < 0 ? profile.mainLayerCount() - 1 : config.last_layer;
+    return std::any_of(profile.flash_next->sparse_decoder_layers.begin(),
+                       profile.flash_next->sparse_decoder_layers.end(),
+                       [&](auto layer) {
+                           return static_cast<int>(layer) >= config.first_layer &&
+                                  static_cast<int>(layer) <= last;
+                       });
+}
+/**
+ * @brief Resolve the program once while authoring an actual attention participant BOM.
+ * @param profile Authenticated source metadata; non-QFN and expert-only inputs do not own QSA.
+ * @param config Existing complete device input; no capacity is computed here.
+ * @param runtime Value-owned startup snapshot with absence preserved.
+ * @throws std::invalid_argument For an unsupported explicit program or malformed geometry.
+ */
+inline void resolveQwenSparseAttentionDeviceProgram(const ModelMemoryProfile &profile,
+                                                    DevicePlanConfig &config,
+                                                    const RuntimeConfig &runtime)
+{
+    if (!ownsQwenSparseAttentionProgram(profile, config))
+        return;
+    // The device input already holds canonical backend-resolved storage. Reuse
+    // its existing strict execution-format conversion; do not reinterpret AUTO.
+    const auto operands = KVCacheMemoryEstimator::attentionExecutionFormat(config.kv_precision);
+    // Qwen4ExpConfig authenticates the published64-coordinate rotary geometry.
+    // Both graph batch and retained request capacity must admit the split program.
+    const auto policy = qwen4exp::resolveQwenSparseAttentionSetup(
+        runtime.attention_setup_request,
+        {config.device.type,
+         operands,
+         operands,
+         std::max(config.batch_size, config.generation_request_capacity),
+         profile.head_dim,
+         64});
+    config.attention_arithmetic = policy.arithmetic;
+    config.attention_phase_schedule = policy.schedule;
+}
+/**
+ * @brief Copy the admitted owner's policies into factory setup, without re-resolution.
+ * @param profile Original source metadata; other model families need no QSA projection.
+ * @param inputs Exact device_inputs retained by the successful admission.
+ * @param rank Physical rank receiving the immutable factory view.
+ * @return Only existing attention participants; expert-only ranks carry an empty pointer.
+ * @throws std::invalid_argument For duplicate/conflicting devices or invalid policies.
+ */
+inline std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
+projectAdmittedQwenSparseAttentionPrograms(const ModelMemoryProfile &profile,
+                                           const std::vector<DevicePlanConfig> &inputs,
+                                           int rank)
+{
+    if (!profile.flash_next)
+        return {};
+    std::vector<qwen4exp::QwenSparseAttentionParticipantProgram> participants;
+    for (const auto &input : inputs)
+        if (input.world_rank == rank && ownsQwenSparseAttentionProgram(profile, input))
+            participants.emplace_back(
+                input.device,
+                qwen4exp::QwenSparseAttentionResolvedPolicy{input.attention_arithmetic,
+                                                            input.attention_phase_schedule},
+                input.first_layer,
+                input.last_layer < 0 ? profile.mainLayerCount() - 1 : input.last_layer);
+    if (participants.empty())
+        return {}; // This rank owns no attention graph; factories reject a foreign lookup.
+    return qwen4exp::sealQwenSparseAttentionParticipants(std::move(participants));
+}
 
 /**
  * @brief Result of selecting one common resident graph-row capacity.
@@ -467,9 +684,123 @@ struct ResidentGraphMemoryPlan
     bool fits() const { return resident_graph_rows > 0 && memory_plan.fits(); }
 };
 
+/** @brief Original canonical loader geometry for one exact PLE GPU consumer. */
+struct ImmutableRowTableUploadBinding
+{
+    PhysicalMemoryAllocatorIdentity consumer;
+    GPUWeightLoadMemoryGeometry ordinary;
+};
+
 class MemoryPlanner
 {
 public:
+    /** @brief Author immutable rank-local CPU service roles from candidate topology BEFORE any quota sizing.
+     * @param profile Original source geometry. @param configs Actual candidate continuation/expert instances.
+     * @param rank Original local physical rank. @param routed Original authored routed topology, if any.
+     * @param world Original rank namespace required by routed host-boundary classification.
+     * @return One shared immutable declaration set; no thread, mapping or PMA reservation exists yet.
+     */
+    static std::shared_ptr<const RetainedHostServiceDeclarations> declareRetainedHostServices(
+        const ModelMemoryProfile&,std::vector<DevicePlanConfig>&,int rank,
+        const MoERoutedExpertPlacementPlan* routed,const IMPIContext* world);
+
+    /** @brief Price candidate roles using original discovery-rank receipts and canonical physical inventory. */
+    static std::shared_ptr<const RetainedHostServiceDeclarations> declareRetainedHostServices(
+        const ModelMemoryProfile&,std::vector<DevicePlanConfig>&,int rank,
+        const MoERoutedExpertPlacementPlan*,const ClusterInventory&,const RetainedHostServiceBudgetProjection&);
+
+    /** @brief Retain the exact declarations from successful admitted device inputs. */
+    [[nodiscard]] static std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>>
+    cpuSerialExpertStorageAdmissions(std::span<const DevicePlanConfig> configs);
+
+    /**
+     * @brief Project original source and every actual PLE consumer after topology is fixed.
+     * @param profile Original model metadata.
+     * @param device_groups Exact retained ownership groups, possibly sharing physical consumers.
+     * @param host Canonical selected rank-local CPU allocator, independent of NUMA affinity.
+     * @param host_placement Explicit RAM locality; task-policy default makes no exact-node claim.
+     * @return Checked source/consumer input with duplicate graph-family identities coalesced.
+     * @throws std::invalid_argument For absent geometry or inconsistent physical observations.
+     */
+    static ImmutableRowTablePlacementInput immutableRowTablePlacementInput(
+        const ModelMemoryProfile &profile, std::span<const std::vector<DevicePlanConfig>> device_groups,
+        PhysicalMemoryResource host,
+        ImmutableRowTableHostPlacement host_placement = ImmutableRowTableHostPlacement::taskPolicy());
+    /**
+     * @brief Project a rank's source consumers, returning absence for unrelated PP/expert stages.
+     * @param profile Exact source metadata, including optional native table geometry.
+     * @param device_groups Actual fixed retained ownership groups.
+     * @param host Canonical rank-local CPU allocator.
+     * @param host_placement Explicit RAM locality; task-policy default makes no exact-node claim.
+     * @return Checked input only if this rank actually executes PLE.
+     * @throws std::invalid_argument For malformed source/observations on a real consumer.
+     */
+    static std::optional<ImmutableRowTablePlacementInput> immutableRowTablePlacementInputIfConsumed(
+        const ModelMemoryProfile &profile, std::span<const std::vector<DevicePlanConfig>> device_groups,
+        PhysicalMemoryResource host,
+        ImmutableRowTableHostPlacement host_placement = ImmutableRowTableHostPlacement::taskPolicy());
+
+    /**
+     * @brief Extract each actual PLE GPU's already-frozen ordinary-loader tuple.
+     * @param profile Exact source metadata identifying the PLE block.
+     * @param device_groups Selected immutable per-device ownership inputs.
+     * @return Unique source-owned bindings; missing original tuples stay absent.
+     * @throws std::invalid_argument For conflicting tuples on the same physical consumer.
+     */
+    static std::vector<ImmutableRowTableUploadBinding> immutableRowTableUploadBindings(
+        const ModelMemoryProfile &profile,std::span<const std::vector<DevicePlanConfig>> device_groups);
+    /**
+     * @brief Project exact mode costs after higher-priority row and expert decisions are frozen.
+     * @param profile Original source metadata.
+     * @param requested Original tier policy; explicit VRAM has no hosted-mode contribution.
+     * @param device_groups Exact retained continuation instances; expert-only devices own no PLE lane.
+     * @param ordinary_upload Original per-consumer canonical loader geometry; a missing GPU binding makes fresh VRAM ineligible.
+     * @return Incremental tier-dependent arena/channel/executable/upload BOMs; no table payload yet.
+     * @throws std::invalid_argument For incomplete source, host or participant geometry.
+     * @throws std::overflow_error For unrepresentable exact capacity arithmetic.
+     */
+    static ImmutableRowTableModeContributions immutableRowTableModeContributions(
+        const ModelMemoryProfile &profile,
+        const ImmutableRowTablePolicy &requested,
+        std::span<const std::vector<DevicePlanConfig>> device_groups,
+        std::span<const ImmutableRowTableUploadBinding> ordinary_upload);
+    /**
+     * @brief Bind final table admission to the actual consumers' frozen host allocator.
+     * @param profile Original model source metadata identifying the PLE block.
+     * @param requested Lossless user storage preference.
+     * @param device_groups Fixed continuation inputs with existing host resources.
+     * @param ordinary_upload Frozen original loader geometry for actual GPU consumers.
+     * @param host_placement Compiled rank RAM locality, separate from the frozen host allocator.
+     * @return Absence without a PLE consumer, otherwise its complete final request.
+     * @throws std::invalid_argument For absent, foreign or conflicting host ownership.
+     *
+     * CPU affinity is not an allocator ordinal: an unbound process may own the
+     * whole host. CPU consumers name their allocator directly; GPU consumers
+     * name the same host owner already used for their setup and prefix bytes.
+     */
+    static std::optional<ImmutableRowTableAdmissionRequest> immutableRowTableAdmissionRequest(
+        const ModelMemoryProfile &profile, const ImmutableRowTablePolicy &requested,
+        std::span<const std::vector<DevicePlanConfig>> device_groups,
+        std::span<const ImmutableRowTableUploadBinding> ordinary_upload,
+        ImmutableRowTableHostPlacement host_placement);
+    /**
+     * @brief Reauthenticate a remote setup provision using this receiver's canonical source metadata.
+     * @param profile Existing authenticated model metadata; never reconstructed from wire claims.
+     * @param requested Declared rank policy retained in the startup request.
+     * @param input Authenticated sender resource/extent/locality observations.
+     * @param consumers Exact checked temporal consumer graph geometry from that sender.
+     * @param execution Sender-authored execution envelope, independently recomputed here.
+     * @param required_base Sender's complete fixed BOM, still checked against the joint frozen base.
+     * @return Sealed source-authenticated provision or a fatal malformed-input error.
+     * @throws std::invalid_argument For foreign source, invalid geometry or changed execution BOM.
+     */
+    static std::shared_ptr<const ImmutableRowTableExecutionProvision> restoreImmutableRowTableExecutionProvision(
+        const ModelMemoryProfile &profile,const ImmutableRowTablePolicy &requested,
+        const ImmutableRowTablePlacementInput &input,std::vector<ImmutableRowTableExecutionConsumer> consumers,
+        PhysicalMemoryPlan execution,PhysicalMemoryPlan required_base);
+
+
+
     /**
      * @brief Assemble fixed allocations for one ownership group.
      * @param profile Complete model metadata without loaded tensor payloads.
@@ -517,6 +848,13 @@ public:
         const std::vector<int>& candidate_rows
     );
 private:
+    friend class ImmutableRowTableAdmissionParser;
+    friend struct test::MemoryPlannerOrderingReplayAccess;
+    /** @brief Same receiver-owned reconstruction with a sealed local source; no caps come from wire. */
+    static std::shared_ptr<const ImmutableRowTableExecutionProvision> restoreImmutableRowTableExecutionProvisionWithOrderingProjection(
+        const ModelMemoryProfile&,const ImmutableRowTablePolicy&,const ImmutableRowTablePlacementInput&,
+        std::vector<ImmutableRowTableExecutionConsumer>,PhysicalMemoryPlan,PhysicalMemoryPlan,
+        const NativeOrderingEventBudgetProjection&,const std::shared_ptr<const RetainedHostServiceDeclarations>& = {});
     struct SharedOwnerIdentities;
     /**
      * @brief Emit one group's fixed BOM using transaction-owned shared identities.

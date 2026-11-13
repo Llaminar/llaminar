@@ -13,8 +13,13 @@
  * Conversion cost: ~0.05ms for 2M elements on MI50 — negligible vs transfer.
  * Captured device-prefix conversions preserve every inactive FP32 byte. Their
  * borrowed row count is consumed on the collective stream without host readback.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
@@ -76,13 +81,14 @@ static __global__ void fp16_to_fp32_kernel(const __half* __restrict__ input,
  * @note Inactive inputs are neither read nor converted; allocation capacity is
  *       launch geometry only. The existing conversion arithmetic is unchanged.
  */
+template<class Rows>
 static __global__ void fp32_to_fp16_live_rows_kernel(
     const float *__restrict__ input, __half *__restrict__ output,
-    llaminar2::DeviceRowRange rows, size_t columns)
+    Rows rows, size_t columns)
 {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t live_elements = static_cast<size_t>(rows.activeRows()) * columns;
-    if (index < live_elements) output[index] = __float2half(input[index]);
+    const size_t physical_elements = static_cast<size_t>(rows.physicalRows()) * columns;
+    if (index < physical_elements && llaminar2::projectionRowIsActive(rows,int(index / columns))) output[index] = __float2half(input[index]);
 }
 
 /**
@@ -92,13 +98,14 @@ static __global__ void fp32_to_fp16_live_rows_kernel(
  * @param rows Same immutable borrowed prefix used by conversion and transport.
  * @param columns Exact scalar row width.
  */
+template<class Rows>
 static __global__ void fp16_to_fp32_live_rows_kernel(
     const __half *__restrict__ input, float *__restrict__ output,
-    llaminar2::DeviceRowRange rows, size_t columns)
+    Rows rows, size_t columns)
 {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t live_elements = static_cast<size_t>(rows.activeRows()) * columns;
-    if (index < live_elements) output[index] = __half2float(input[index]);
+    const size_t physical_elements = static_cast<size_t>(rows.physicalRows()) * columns;
+    if (index < physical_elements && llaminar2::projectionRowIsActive(rows,int(index / columns))) output[index] = __half2float(input[index]);
 }
 
 /**
@@ -201,8 +208,15 @@ extern "C"
         const hipError_t bound = hipSetDevice(ordinal);
         if (bound != hipSuccess) return bound;
         (void)hipGetLastError();
-        hipLaunchKernelGGL(fp32_to_fp16_live_rows_kernel, dim3(grid_size), dim3(256), 0, stream,
+        if(llaminar2::currentProjectionRowWork(rows.physicalRows())) {
+        llaminar2::dispatchProjectionRows(rows.physicalRows(),rows.countOwner()?&rows:nullptr,[&](auto authority) {
+        hipLaunchKernelGGL((fp32_to_fp16_live_rows_kernel<decltype(authority)>), dim3(grid_size), dim3(256), 0, stream,
+            fp32_input, static_cast<__half *>(fp16_output), authority, columns);
+        });
+        } else {
+        hipLaunchKernelGGL((fp32_to_fp16_live_rows_kernel<decltype(rows)>), dim3(grid_size), dim3(256), 0, stream,
             fp32_input, static_cast<__half *>(fp16_output), rows, columns);
+        }
         return hipGetLastError();
     }
 
@@ -226,8 +240,15 @@ extern "C"
         const hipError_t bound = hipSetDevice(ordinal);
         if (bound != hipSuccess) return bound;
         (void)hipGetLastError();
-        hipLaunchKernelGGL(fp16_to_fp32_live_rows_kernel, dim3(grid_size), dim3(256), 0, stream,
+        if(llaminar2::currentProjectionRowWork(rows.physicalRows())) {
+        llaminar2::dispatchProjectionRows(rows.physicalRows(),rows.countOwner()?&rows:nullptr,[&](auto authority) {
+        hipLaunchKernelGGL((fp16_to_fp32_live_rows_kernel<decltype(authority)>), dim3(grid_size), dim3(256), 0, stream,
+            static_cast<const __half *>(fp16_input), fp32_output, authority, columns);
+        });
+        } else {
+        hipLaunchKernelGGL((fp16_to_fp32_live_rows_kernel<decltype(rows)>), dim3(grid_size), dim3(256), 0, stream,
             static_cast<const __half *>(fp16_input), fp32_output, rows, columns);
+        }
         return hipGetLastError();
     }
 

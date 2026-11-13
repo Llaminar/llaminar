@@ -8,17 +8,33 @@
  * - hipBLAS handle creation and management
  * - Stream and event creation/destruction
  *
+ * Context setup retires hipBLAS's initial vendor-owned workspace before the
+ * context is published. Every arithmetic submission subsequently binds its
+ * admitted stage arena, so first-use capture never frees that initial pool.
+ *
  * @author David Sanftenberg
  * @date February 2026
+ * Hardware identity comes from the immutable process inventory, while native
+ * streams, handles and runtime generations remain context-owned resources.
+ * Concurrent projection side streams/events belong to this exact context and
+ * cannot be reset while a complete native capture submission borrows them.
  */
 
 #include "AMDDeviceContext.h"
+#include "backends/NativeContextPreparation.h"
+#include "backends/GPUCaptureDependencyRoster.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "HIPGraphCapture.h"
 #include "ROCmBackend.h"
 #include "ROCmRuntimeStartup.h"
+#include "ROCmHardwareMetadata.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "backends/GPUWorkerInitialization.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
+#include <exception>
 
 namespace llaminar2
 {
@@ -82,20 +98,18 @@ namespace llaminar2
     // ============================================================================
 
     AMDDeviceContext::AMDDeviceContext(int device_ordinal)
-        : device_ordinal_(device_ordinal)
+        : AMDDeviceContext(device_ordinal,{}) {}
+
+    AMDDeviceContext::AMDDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> prepared_stack)
+        : process_lifetime_lease_(GPUDeviceProcessLifetime::acquireNativeContext()),
+          device_ordinal_(device_ordinal)
     {
         requireROCmRuntimeStartup();
         LOG_DEBUG("[AMDDeviceContext] Creating context for ROCm device " << device_ordinal);
 
         // Validate device ordinal before starting worker
-        int device_count = 0;
-        hipError_t err = hipGetDeviceCount(&device_count);
-        if (err != hipSuccess)
-        {
-            std::ostringstream oss;
-            oss << "hipGetDeviceCount failed: " << hipGetErrorString(err);
-            throw std::runtime_error(oss.str());
-        }
+        initializeROCmHardwareMetadata();
+        const int device_count = static_cast<int>(rocmHardwareMetadata().size());
 
         if (device_ordinal < 0 || device_ordinal >= device_count)
         {
@@ -111,7 +125,16 @@ namespace llaminar2
 
         try
         {
-            worker_thread_ = std::thread(&AMDDeviceContext::workerLoop, this);
+            {
+                // The dedicated GPU-control child needs the admitted rank
+                // partition, not its creator's first OpenMP place. Restore
+                // the creator before waiting or executing any caller work.
+                const ScopedOpenMPPartitionAffinity control_affinity;
+                if(prepared_stack)
+                    worker_thread_.start(std::move(prepared_stack),[](void* self){
+                        static_cast<AMDDeviceContext*>(self)->workerLoop();},this);
+                else worker_thread_ = std::thread(&AMDDeviceContext::workerLoop, this);
+            }
 
             // Wait for worker to signal it's ready (or failed)
             std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -173,19 +196,34 @@ namespace llaminar2
         worker_thread_id_ = std::this_thread::get_id();
         LOG_TRACE("[AMDDeviceContext] Worker thread starting for device " << device_ordinal_);
 
-        // Initialize HIP context on this thread
-        if (!initializeOnWorker())
+        // One owner-thread guard covers every unpublished handle and every
+        // false/throw exit. Initialization never performs a second local cleanup.
+        bool ready = false;
+        try
+        {
+            ready = runGPUWorkerInitialization(
+                [this] { return initializeOnWorker(); },
+                [this] { cleanupOnWorker(); });
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[AMDDeviceContext] Worker initialization exception after rollback: " << error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR("[AMDDeviceContext] Unknown worker initialization exception after rollback");
+        }
+        if (!ready)
         {
             LOG_ERROR("[AMDDeviceContext] Failed to initialize HIP context on worker thread");
-            shutdown_requested_.store(true);
-            queue_cv_.notify_all();
+            publishGPUWorkerReadiness(queue_mutex_, queue_cv_, initialized_, running_,
+                shutdown_requested_, GPUWorkerReadiness::Failed);
             return;
         }
 
-        // Signal that initialization is complete
-        initialized_.store(true);
-        running_.store(true);
-        queue_cv_.notify_all();
+        // Publish every ready flag under the constructor's predicate mutex.
+        publishGPUWorkerReadiness(queue_mutex_, queue_cv_, initialized_, running_,
+            shutdown_requested_, GPUWorkerReadiness::Ready);
 
         LOG_TRACE("[AMDDeviceContext] Worker loop started for device " << device_ordinal_);
 
@@ -240,6 +278,15 @@ namespace llaminar2
         LOG_TRACE("[AMDDeviceContext] Worker loop exited for device " << device_ordinal_);
     }
 
+    /**
+     * @brief Create unpublished native resources on their owning device worker.
+     * @return True after library handles, streams and dependency events are ready.
+     *
+     * Retire the initial rocBLAS allocation here, outside graph capture. A null
+     * workspace leaves rocBLAS in its managed state with no allocation; it does
+     * not disable vendor allocation globally. HipBLASGemmKernel must bind the
+     * admitted non-null arena before every arithmetic submission.
+     */
     bool AMDDeviceContext::initializeOnWorker()
     {
         LOG_TRACE("[AMDDeviceContext] Initializing HIP on worker thread for device "
@@ -265,12 +312,23 @@ namespace llaminar2
             return false;
         }
 
+        // Replacing the initial vendor pool during first-use graph recording
+        // would call hipFree inside capture. Retire it before publication; the
+        // arithmetic adapters still require their real stage-owned workspace.
+        hipblas_status = hipblasSetWorkspace(hipblas_handle_, nullptr, 0);
+        if (hipblas_status != HIPBLAS_STATUS_SUCCESS)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipblasSetWorkspace(nullptr, 0) failed "
+                      "while retiring the initial vendor allocation: " << hipblas_status);
+            return false;
+        }
+
         // Associate hipBLAS handle with our stream
         hipblas_status = hipblasSetStream(hipblas_handle_, default_stream_);
         if (hipblas_status != HIPBLAS_STATUS_SUCCESS)
         {
-            LOG_WARN("[AMDDeviceContext] hipblasSetStream failed: " << hipblas_status);
-            // Non-fatal - continue with default stream
+            LOG_ERROR("[AMDDeviceContext] hipblasSetStream failed: " << hipblas_status);
+            return false;
         }
 
         // Disable atomic reductions inside rocBLAS/Tensile kernels.  Atomic
@@ -282,14 +340,12 @@ namespace llaminar2
         hipblas_status = hipblasSetAtomicsMode(hipblas_handle_, HIPBLAS_ATOMICS_NOT_ALLOWED);
         if (hipblas_status != HIPBLAS_STATUS_SUCCESS)
         {
-            LOG_WARN("[AMDDeviceContext] hipblasSetAtomicsMode failed: " << hipblas_status);
-            // Non-fatal - results may be nondeterministic but correct
+            LOG_ERROR("[AMDDeviceContext] hipblasSetAtomicsMode failed: " << hipblas_status);
+            return false;
         }
 
         // Step 4: Query device name
-        hipDeviceProp_t props;
-        HIP_CHECK(hipGetDeviceProperties(&props, device_ordinal_));
-        device_name_ = props.name;
+        device_name_ = rocmHardwareMetadata().at(device_ordinal_).name;
 
         LOG_DEBUG("[AMDDeviceContext] HIP context initialized for device " << device_ordinal_
                                                                            << " (" << device_name_ << ")");
@@ -319,7 +375,6 @@ namespace llaminar2
                 LOG_ERROR("[AMDDeviceContext] Failed to create persistent stream "
                           "dependency event: "
                           << hipGetErrorString(event_status));
-                cleanupOnWorker();
                 return false;
             }
         }
@@ -332,26 +387,9 @@ namespace llaminar2
     void AMDDeviceContext::cleanupOnWorker()
     {
         LOG_TRACE("[AMDDeviceContext] Cleaning up HIP resources for device " << device_ordinal_);
-
-        // Guard: Check if HIP runtime is still alive before cleanup.
-        // During static destruction (process exit), the HIP runtime's internal
-        // state may already be torn down by atexit handlers. Calling HIP APIs
-        // on dead runtime state causes SIGSEGV (use-after-free at cmpb 0xb8(%rdi)
-        // inside hipHccModuleLaunchKernel). This matches CUDA's approach of
-        // ignoring cudaErrorCudartUnloading during NvidiaDeviceContext cleanup.
-        int device_count = 0;
-        hipError_t probe = hipGetDeviceCount(&device_count);
-        if (probe != hipSuccess)
-        {
-            LOG_TRACE("[AMDDeviceContext] HIP runtime already shut down for device "
-                      << device_ordinal_ << " (hipGetDeviceCount returned "
-                      << hipGetErrorString(probe) << "), skipping cleanup");
-            hipblas_lt_handle_ = nullptr;
-            hipblas_handle_ = nullptr;
-            default_stream_ = nullptr;
-            stream_dependency_events_.fill(nullptr);
-            return;
-        }
+        // Reject live capture before destroying any context-generation resource.
+        // Exact side handles retire while the selected runtime still owns them.
+        projection_resources_.retire(*this);
 
         // Destroy hipBLASLt handle
         if (hipblas_lt_handle_ != nullptr)
@@ -359,7 +397,8 @@ namespace llaminar2
             hipblasStatus_t status = hipblasLtDestroy(hipblas_lt_handle_);
             if (status != HIPBLAS_STATUS_SUCCESS)
             {
-                LOG_WARN("[AMDDeviceContext] hipblasLtDestroy failed: " << status);
+                LOG_ERROR("[AMDDeviceContext] hipblasLtDestroy failed: " << status);
+                std::terminate();
             }
             hipblas_lt_handle_ = nullptr;
         }
@@ -370,7 +409,8 @@ namespace llaminar2
             hipblasStatus_t status = hipblasDestroy(hipblas_handle_);
             if (status != HIPBLAS_STATUS_SUCCESS)
             {
-                LOG_WARN("[AMDDeviceContext] hipblasDestroy failed: " << status);
+                LOG_ERROR("[AMDDeviceContext] hipblasDestroy failed: " << status);
+                std::terminate();
             }
             hipblas_handle_ = nullptr;
         }
@@ -393,6 +433,7 @@ namespace llaminar2
                 LOG_ERROR("[AMDDeviceContext] hipEventDestroy(stream dependency) "
                           "failed: "
                           << hipGetErrorString(err));
+                std::terminate();
             }
             event = nullptr;
         }
@@ -400,7 +441,14 @@ namespace llaminar2
         // Destroy default stream
         if (default_stream_ != nullptr)
         {
-            HIP_CHECK_VOID(hipStreamDestroy(default_stream_));
+            const auto error = hipStreamDestroy(default_stream_);
+            if (error != hipSuccess)
+            {
+                LOG_ERROR("[AMDDeviceContext] hipStreamDestroy(default_stream_) device=" << device_ordinal_
+                          << " handle=" << static_cast<void *>(default_stream_)
+                          << " status=" << static_cast<int>(error) << " error=" << hipGetErrorString(error));
+                std::terminate();
+            }
             default_stream_ = nullptr;
         }
 
@@ -523,8 +571,10 @@ namespace llaminar2
 
         std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
         auto it = auxiliary_streams_.find(name);
-        if (it != auxiliary_streams_.end() && it->second)
+        if (it != auxiliary_streams_.end() && it->second.stream)
         {
+            if(it->second.ownership)
+                throw std::logic_error("Raw auxiliary stream lookup cannot borrow an original-admitted stream without its permit");
             const auto class_it =
                 auxiliary_stream_scheduling_classes_.find(name);
             if (class_it == auxiliary_stream_scheduling_classes_.end() ||
@@ -534,7 +584,7 @@ namespace llaminar2
                           << name);
                 return nullptr;
             }
-            return static_cast<void *>(it->second);
+            return static_cast<void *>(it->second.stream);
         }
 
         hipStream_t stream = nullptr;
@@ -576,27 +626,243 @@ namespace llaminar2
         }
         if (!stream)
             return nullptr;
-        auxiliary_streams_[name] = stream;
+        auxiliary_streams_[name] = AuxiliaryStreamRecord{stream,{}};
         auxiliary_stream_scheduling_classes_[name] = scheduling_class;
         if (created)
             *created = true;
         return static_cast<void *>(stream);
     }
 
+    /** @copydoc IWorkerGPUContext::prepareProjectionResources */
+    void AMDDeviceContext::prepareProjectionResources()
+    {
+        if (!isInitialized()) throw std::logic_error("HIP projection preparation requires a live context");
+        if (isGraphCaptureActive()) throw std::logic_error("HIP projection resources must be prepared before capture");
+        if (!setAMDDeviceForResource(device_ordinal_, "prepareProjectionResources"))
+            throw std::runtime_error("Cannot select exact HIP projection resource owner");
+        // Replace the existing fixed pool at its original cold boundary. Native
+        // queues/events remain under the existing opaque PMA admission scope.
+        projection_resources_.prepare(*this);
+    }
+    /** @copydoc IWorkerGPUContext::acquireProjectionSubmission */
+    GPUProjectionSubmission AMDDeviceContext::acquireProjectionSubmission(
+        void *root, GPUProjectionSubmissionKind kind, bool native_capturing)
+    {
+        if (!isInitialized()) throw std::logic_error("HIP projection submission requires a live context");
+        const auto stream = static_cast<hipStream_t>(root);
+        hipDevice_t stream_device = -1;
+        if (!stream || stream == hipStreamLegacy || stream == hipStreamPerThread ||
+            hipSetDevice(device_ordinal_) != hipSuccess ||
+            hipStreamGetDevice(stream, &stream_device) != hipSuccess || stream_device != device_ordinal_)
+            throw std::logic_error("HIP projection requires an exact stream on its owning native device");
+        if (kind == GPUProjectionSubmissionKind::Eager && !native_capturing)
+            projection_resources_.prepare(*this); // Original eager cold boundary; never during native recording.
+        auto submission = projection_resources_.acquire(root, kind, native_capturing);
+        retainProjectionSubmission(submission);
+        return submission;
+    }
+    /** @copydoc IWorkerGPUContext::assertProjectionResourcesRetirable */
+    void AMDDeviceContext::assertProjectionResourcesRetirable()
+    { projection_resources_.assertRetirable(); }
+    /** @copydoc IWorkerGPUContext::beginProjectionResourcesRetirement */
+    void AMDDeviceContext::beginProjectionResourcesRetirement()
+    { projection_resources_.beginRetirement(); }
+    /** @copydoc GPUProjectionResourceOperations::createProjectionStream */
+    /** @copydoc GPUProjectionResourceOperations::createProjectionStream */
+    void *AMDDeviceContext::createProjectionStream()
+    {
+        hipStream_t stream = nullptr;
+        const auto status = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+        if (status != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] createProjectionStream/hipStreamCreateWithFlags"
+                      << " device=" << device_ordinal_ << " handle=" << static_cast<void *>(stream)
+                      << " status=" << static_cast<int>(status) << " error=" << hipGetErrorString(status));
+            return nullptr;
+        }
+        return static_cast<void *>(stream);
+    }
+    /** @copydoc GPUProjectionResourceOperations::createProjectionEvent */
+    void *AMDDeviceContext::createProjectionEvent()
+    {
+        hipEvent_t event = nullptr;
+        const auto status = hipEventCreateWithFlags(&event, hipEventDisableTiming);
+        if (status != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] createProjectionEvent/hipEventCreateWithFlags"
+                      << " device=" << device_ordinal_ << " handle=" << static_cast<void *>(event)
+                      << " status=" << static_cast<int>(status) << " error=" << hipGetErrorString(status));
+            return nullptr;
+        }
+        return static_cast<void *>(event);
+    }
+    /** @copydoc GPUProjectionResourceOperations::destroyProjectionStream */
+    bool AMDDeviceContext::destroyProjectionStream(void *stream) noexcept
+    {
+        const auto selected = hipSetDevice(device_ordinal_);
+        if (selected != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] destroyProjectionStream/hipSetDevice"
+                      << " device=" << device_ordinal_ << " handle=" << stream
+                      << " status=" << static_cast<int>(selected) << " error=" << hipGetErrorString(selected));
+            return false;
+        }
+        const auto destroyed = hipStreamDestroy(static_cast<hipStream_t>(stream));
+        if (destroyed != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] destroyProjectionStream/hipStreamDestroy"
+                      << " device=" << device_ordinal_ << " handle=" << stream
+                      << " status=" << static_cast<int>(destroyed) << " error=" << hipGetErrorString(destroyed));
+            return false;
+        }
+        return true;
+    }
+    /** @copydoc GPUProjectionResourceOperations::destroyProjectionEvent */
+    bool AMDDeviceContext::destroyProjectionEvent(void *event) noexcept
+    {
+        const auto selected = hipSetDevice(device_ordinal_);
+        if (selected != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] destroyProjectionEvent/hipSetDevice"
+                      << " device=" << device_ordinal_ << " handle=" << event
+                      << " status=" << static_cast<int>(selected) << " error=" << hipGetErrorString(selected));
+            return false;
+        }
+        const auto destroyed = hipEventDestroy(static_cast<hipEvent_t>(event));
+        if (destroyed != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] destroyProjectionEvent/hipEventDestroy"
+                      << " device=" << device_ordinal_ << " handle=" << event
+                      << " status=" << static_cast<int>(destroyed) << " error=" << hipGetErrorString(destroyed));
+            return false;
+        }
+        return true;
+    }
+
+    /** @copydoc IWorkerGPUContext::prepareBatchCaptureDependencies */
+    std::shared_ptr<GPUCaptureDependencyRoster> AMDDeviceContext::prepareBatchCaptureDependencies(
+        std::size_t lanes,std::size_t groups,const PreparedGPUContextUsePermit& original)
+    {
+        if(original.worker().get()!=this)throw std::logic_error("Batch dependency roster substituted original worker");
+        std::shared_ptr<GPUCaptureDependencyRoster> result;
+        projection_resources_.withIdleOperation([&]{
+            std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+            if(!batch_capture_dependencies_)batch_capture_dependencies_=GPUCaptureDependencyRoster::create(original,lanes,groups);
+            else batch_capture_dependencies_->grow(original,lanes,groups);
+            result=batch_capture_dependencies_;
+        });
+        return result;
+    }
+
+    /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+    void *AMDDeviceContext::getOrCreateAdmittedAuxiliaryStream(
+        const std::string &name,const PreparedGPUContextUsePermit &original,bool *created)
+    {
+        return getOrCreateAdmittedAuxiliaryStream(name,GPUAuxiliaryStreamSchedulingClass::Normal,original,created);
+    }
+
+    /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+    void *AMDDeviceContext::getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+        GPUAuxiliaryStreamSchedulingClass scheduling_class,const PreparedGPUContextUsePermit &original,bool *created)
+    {
+        if(created)*created=false;
+        if(name.empty() || original.worker().get()!=this || isGraphCaptureActive())
+            throw std::invalid_argument("Admitted auxiliary stream requires its exact original cold worker/name");
+        if(scheduling_class!=GPUAuxiliaryStreamSchedulingClass::Normal &&
+           scheduling_class!=GPUAuxiliaryStreamSchedulingClass::LatencyCritical &&
+           scheduling_class!=GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance)
+            throw std::invalid_argument("Admitted auxiliary stream has unknown scheduling class");
+        void* result=nullptr;
+        projection_resources_.withIdleOperation([&]{
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        if(auto it=auxiliary_streams_.find(name);it!=auxiliary_streams_.end()){
+            if(!it->second.stream || !it->second.ownership)
+                throw std::logic_error("Admitted auxiliary stream cannot adopt an unadmitted existing handle");
+            const auto priority=auxiliary_stream_scheduling_classes_.find(name);
+            if(priority==auxiliary_stream_scheduling_classes_.end() || priority->second!=scheduling_class)
+                throw std::logic_error("Admitted auxiliary stream scheduling class changed");
+            it->second.ownership->requireOriginal(original,this,name,scheduling_class);
+            result=static_cast<void*>(it->second.stream);return;
+        }
+        auto ownership=NativeAuxiliaryStreamOwnership::claim(original,name,scheduling_class);
+        auto [entry,inserted]=auxiliary_streams_.try_emplace(name);
+        if(!inserted)throw std::logic_error("Auxiliary stream owner record already exists");
+        hipStream_t stream=nullptr;
+        try{
+            auxiliary_stream_scheduling_classes_.emplace(name,scheduling_class);
+            ownership->beginNativeAttempt();
+            if(scheduling_class==GPUAuxiliaryStreamSchedulingClass::Normal)
+                stream=static_cast<hipStream_t>(createStream());
+            else {
+                auto error=hipSetDevice(device_ordinal_);int least=0,greatest=0;
+                if(error==hipSuccess)error=hipDeviceGetStreamPriorityRange(&least,&greatest);
+                if(error==hipSuccess)error=hipStreamCreateWithPriority(&stream,hipStreamNonBlocking,
+                    scheduling_class==GPUAuxiliaryStreamSchedulingClass::LatencyCritical?greatest:least);
+                if(error!=hipSuccess)throw std::runtime_error("Original prioritized auxiliary stream creation failed");
+            }
+            if(!stream)throw std::runtime_error("Original auxiliary stream creator returned null");
+            entry->second.stream=stream;
+            entry->second.ownership=std::move(ownership);
+            entry->second.ownership->delegateToContext();
+        }catch(...){
+            if(stream){
+                // Native destruction precedes commitment completion, including
+                // partial creation; never replace the creator's first failure.
+                if(!setAMDDeviceForResource(device_ordinal_,"retirePartialAdmittedAuxiliaryStream") ||
+                   hipStreamDestroy(stream)!=hipSuccess)std::terminate();
+            }
+            if(ownership)ownership->completeNativeHandles();
+            auxiliary_streams_.erase(entry);
+            auxiliary_stream_scheduling_classes_.erase(name);
+            throw;
+        }
+        if(created)*created=true;
+        result=static_cast<void*>(stream);
+        });
+        return result;
+    }
+
     void AMDDeviceContext::resetAuxiliaryStreams()
     {
-        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
-        for (auto &[name, stream] : auxiliary_streams_)
-        {
-            (void)name;
-            if (stream && stream != default_stream_)
-            {
-                if (setAMDDeviceForResource(device_ordinal_, "destroyAuxiliaryStream"))
-                    HIP_CHECK_VOID(hipStreamDestroy(stream));
+        // Completed graph objects retain fixed projection handles for replay.
+        // Only context cleanup retires them; this public reset clears named
+        // auxiliary streams under the same exclusion as native recording.
+        projection_resources_.withIdleOperation([&] {
+            std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+            for(const auto& [name,record]:auxiliary_streams_) {
+                (void)name;
+                if(record.ownership)record.ownership->requireRetirement(shutdown_requested_.load()
+                    ?NativeAuxiliaryStreamOwnership::RetirementScope::OriginalContextShutdown
+                    :NativeAuxiliaryStreamOwnership::RetirementScope::PublicReset);
             }
-        }
-        auxiliary_streams_.clear();
-        auxiliary_stream_scheduling_classes_.clear();
+            if(batch_capture_dependencies_ && batch_capture_dependencies_.use_count()!=1)
+                throw std::logic_error("Cannot destroy Batch capture events while original graph owners retain them");
+            batch_capture_dependencies_.reset();
+            for (auto &[name, record] : auxiliary_streams_)
+            {
+                const auto stream=record.stream;
+                (void)name;
+                if (stream && stream != default_stream_)
+                {
+                    if (!setAMDDeviceForResource(device_ordinal_, "destroyAuxiliaryStream"))
+                        std::terminate();
+                    const auto error = hipStreamDestroy(stream);
+                    if (error != hipSuccess)
+                    {
+                        LOG_ERROR("[AMDDeviceContext] hipStreamDestroy(auxiliary) name=" << name
+                                  << " device=" << device_ordinal_ << " handle=" << static_cast<void *>(stream)
+                                  << " status=" << static_cast<int>(error) << " error=" << hipGetErrorString(error));
+                        std::terminate();
+                    }
+                }
+                if(record.ownership) {
+                    record.ownership->completeNativeHandles();
+                    record.ownership.reset();
+                }
+            }
+            auxiliary_streams_.clear();
+            auxiliary_stream_scheduling_classes_.clear();
+        });
     }
 
     // ============================================================================
@@ -625,19 +891,25 @@ namespace llaminar2
         return static_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void AMDDeviceContext::destroyEvent(void *event)
     {
-        if (event == nullptr)
-        {
-            return;
-        }
-
-        hipEvent_t hip_event = static_cast<hipEvent_t>(event);
+        if (!event) return;
         if (!setAMDDeviceForResource(device_ordinal_, "destroyEvent"))
         {
-            return;
+            LOG_ERROR("[AMDDeviceContext::destroyEvent] Original event device selection failed");
+            std::terminate();
         }
-        HIP_CHECK_VOID(hipEventDestroy(hip_event));
+        const auto hip_event = reinterpret_cast<hipEvent_t>(event);
+        if (const auto error = hipEventDestroy(hip_event); error != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
+        }
     }
 
     void AMDDeviceContext::recordEvent(void *event, void *stream)
@@ -1031,14 +1303,14 @@ namespace llaminar2
     {
         return std::make_unique<HIPGraphCapture>(
             static_cast<hipStream_t>(defaultStream()),
-            device_ordinal_);
+            device_ordinal_, *this);
     }
 
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture(void *stream)
     {
         return std::make_unique<HIPGraphCapture>(
             static_cast<hipStream_t>(stream),
-            device_ordinal_);
+            device_ordinal_, *this);
     }
 
     PointerValidationResult AMDDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)

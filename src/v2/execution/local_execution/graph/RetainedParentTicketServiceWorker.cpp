@@ -1,20 +1,30 @@
 /**
  * @file RetainedParentTicketServiceWorker.cpp
  * @brief Lifecycle implementation for retained-parent CPU ticket service.
+ *
+ * Construction completes every lifecycle member before publishing this object
+ * to its persistent thread. Dispatch and retirement then transfer the borrowed
+ * invocation under the same mutex; teardown joins before any state is released.
  */
 
 #include "RetainedParentTicketServiceWorker.h"
 
 #include "../../../utils/Logger.h"
 
+#include <omp.h>
 #include <exception>
 #include <stdexcept>
 
 namespace llaminar2
 {
-    RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker()
-        : worker_(&RetainedParentTicketServiceWorker::run, this)
+    RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker(
+        pthread_t,int original_threads,int original_dynamic) noexcept
+        : original_num_threads_(original_threads), original_dynamic_(original_dynamic) {}
+
+    void* RetainedParentTicketServiceWorker::invoke(void* state) noexcept
     {
+        static_cast<RetainedParentTicketServiceWorker*>(state)->run();
+        return nullptr;
     }
 
     RetainedParentTicketServiceWorker::~RetainedParentTicketServiceWorker()
@@ -31,26 +41,35 @@ namespace llaminar2
             state_ = State::Stopping;
         }
         work_ready_.notify_one();
-        if (worker_.joinable())
-            worker_.join();
+        if (running_ && ::pthread_join(worker_,nullptr)!=0)
+            std::terminate();
+        running_=false;
     }
 
     RetainedParentTicketServiceWorker::Ticket
     RetainedParentTicketServiceWorker::dispatch(Task task, void *context)
     {
-        if (!task || !context)
-        {
-            throw std::invalid_argument(
-                "Retained-parent ticket service requires a complete task descriptor");
-        }
-
         Ticket ticket;
         {
             std::lock_guard lock(mutex_);
+            // Withdraw first, including every rejection. No failed dispatch
+            // leaves a fixture stack address installed in the original worker.
+            auto* borrowed = next_borrowed_entry_;
+            next_borrowed_entry_ = nullptr;
+            if (borrowed)
+                borrowed->outcome.store(BorrowedEntryOutcome::Rejected, std::memory_order_release);
+            if (!task || !context)
+                throw std::invalid_argument(
+                    "Retained-parent ticket service requires a complete task descriptor");
             if (state_ != State::Idle)
+                throw std::logic_error("Retained-parent ticket service cannot overlap invocations");
+            if (borrowed)
             {
-                throw std::logic_error(
-                    "Retained-parent ticket service cannot overlap invocations");
+                if (task != borrowed->expected_task || context != borrowed->expected_context ||
+                    !borrowed->wrapper_task || !borrowed->wrapper_context)
+                    throw std::logic_error("Closed worker wrapper changed its original dispatch task or owner");
+                task = borrowed->wrapper_task;
+                context = borrowed->wrapper_context;
             }
             ++generation_;
             if (generation_ == 0u)
@@ -60,6 +79,8 @@ namespace llaminar2
             task_result_ = false;
             state_ = State::Queued;
             ticket.generation = generation_;
+            if (borrowed)
+                borrowed->outcome.store(BorrowedEntryOutcome::Dispatched, std::memory_order_release);
         }
         work_ready_.notify_one();
         return ticket;
@@ -103,6 +124,13 @@ namespace llaminar2
 
     void RetainedParentTicketServiceWorker::run() noexcept
     {
+        // A foreign pthread starts a different initial OpenMP task. Startup's
+        // omp_set_num_threads/dynamic calls affect its caller, not this task.
+        // Borrow the original program declaration's exact budget once; incidental
+        // materializer/caller ICVs cannot replace it. Place selection was installed
+        // before exec by the existing launcher. No task/replay rebind occurs.
+        omp_set_num_threads(original_num_threads_);
+        omp_set_dynamic(original_dynamic_);
         for (;;)
         {
             Task task = nullptr;

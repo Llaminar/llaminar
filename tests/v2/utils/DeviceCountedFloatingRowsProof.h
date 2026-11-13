@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "backends/GPUDeviceContextPool.h"
 #include <gtest/gtest.h>
 #include "GpuPreparedGemmHarness.h"
 #include "ScopedGPUStream.h"
@@ -26,7 +27,7 @@ enum class FloatingVerifierOperation { Projection, SwiGLUDown };
 
 /**
  * @brief Certify one native format/operation through the real tensor interface.
- * @tparam GraphCapture Backend's retained native graph implementation.
+ * @tparam GraphCapture Backend type retained for source-compatible fixture invocation.
  * @tparam Stream Native stream handle accepted by that graph implementation.
  * @param device Explicit device owning all operands and publication state.
  * @param type Native FP32, FP16 or BF16 weight representation.
@@ -92,7 +93,7 @@ void proveDeviceCountedFloatingRows(DeviceId device, TensorType type,
             serial_output->gpu_data_ptr(), N * sizeof(float), device.ordinal, stream));
     }
     TransferEngine::requireDeviceInput(input.get(), device, stream);
-    auto graph = std::make_unique<GraphCapture>(stream, device.ordinal);
+    auto graph = GPUDeviceContextPool::instance().getContext(device).createGraphCapture(stream);
     {
         auto rows = kernel->beginVerifierDecodeEquivalentScope(
             DeviceRowRange::deviceCounted(M, static_cast<const int32_t *>(count->gpu_data_ptr())));

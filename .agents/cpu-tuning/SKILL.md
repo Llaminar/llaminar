@@ -10,6 +10,11 @@ kernel and geometry, collect counters without contaminating canonical timing,
 inspect the hot instructions, change one hypothesis, then repeat the focused
 and end-to-end correctness/economy gates.
 
+Use the shared [production kernel replay procedure](../llaminar-testing/references/kernel-replay.md)
+for fixed inputs/routes, dirty-buffer correctness and paired timing. On CPU,
+replay the production call with retained storage and explicit ISA/team/NUMA
+placement; GPU capture and native-event requirements do not apply.
+
 ## Preserve the execution contract
 
 - Keep hot-path state host-owned and persistent. Do not add allocation,
@@ -18,6 +23,14 @@ and end-to-end correctness/economy gates.
 - Preserve the production arithmetic order. Grouped verifier rows must remain
   byte-identical to serial M=1 decode for every supported format and positive
   thread count.
+- **Prefer register-resident work.** Keep reusable operands, accumulators and
+  short-lived intermediates in registers through their consumers. Choose
+  layouts, tiles, live ranges and fusion to eliminate unnecessary temporary
+  buffers, stores and reloads. Preserve independent accumulator chains and the
+  numerical contract while shortening live ranges. Apply the
+  [hot-loop spill workflow](#classify-spills-by-execution-regime) separately to
+  AVX2 and AVX-512; qualify the generated code and measured latency, including
+  shuffle and dependency costs, rather than optimizing register count alone.
 - Use physical cores as the default worker budget. Treat SMT, cross-socket
   placement, and nested BLAS/OpenMP teams as separate, explicitly measured
   modes.
@@ -27,8 +40,8 @@ and end-to-end correctness/economy gates.
 - Keep profiler collection separate from canonical latency samples. Never use
   `perf` overhead, sampling runs, or hardware-counter collection as dispatch
   labels.
-- For NativeVNNI corpus collection, policy fitting, certification, or install,
-  also read [nativevnni-gemm-tuning](../nativevnni-gemm-tuning/SKILL.md). Its
+- For NativeQuantised exact-overlay collection, selection, qualification, or install,
+  also read [nativequantised-gemm-tuning](../nativequantised-gemm-tuning/SKILL.md). Its
   trainer-owned `perf_event_open` protocol is the production evidence
   authority; use its existing collector/driver rather than inventing profiler
   environment variables. The system-wide `perf` workflow below is for
@@ -90,7 +103,7 @@ include:
 
 ```bash
 cmake --build build_v2_release --parallel --target \
-  v2_perf_cpu_native_vnni_thread_scaling
+  v2_perf_cpu_native_quantised_thread_scaling
 cmake --build build_v2_release --parallel --target \
   v2_perf_cpu_flash_attention_sweep
 cmake --build build_v2_release --parallel --target \
@@ -262,6 +275,10 @@ unreached ISA branches are not hot-loop vector spills. Build AVX2 and AVX-512
 separately because an AVX-512 build can hide pressure in code that is meant to
 represent the 16-register AVX2 regime.
 
+Inspect the production-selected entry and its arithmetic helpers after fusion,
+inlining or dispatch changes. A spill-free standalone microkernel does not
+qualify a fused caller with different live ranges and register allocation.
+
 For compute-bound GEMM and grouped-verifier candidates, a vector spill in the
 K loop disqualifies the candidate. Keep a no-spill geometry available and
 reduce the live set by narrowing the N tile, decoding/loading one subchunk at a
@@ -309,10 +326,10 @@ compute-bound candidate, and a repeated latency win over serial decode. A
 lower register count that loses cross-row reuse or changes FP accumulation is
 not an optimization.
 
-### Tune NativeVNNI cache tiles from the prepared execution layout
+### Tune NativeQuantised cache tiles from the prepared execution layout
 
 Cache policy must model the bytes consumed by the production kernel, not the
-compact source GGUF block. Use `NativeVNNIPreparedFootprint` and include all
+compact source GGUF block. Use `NativeQuantisedPreparedFootprint` and include all
 live data owned by one physical microkernel tile:
 
 - the exact interleaved weight stride, including compensation, scales, and
@@ -348,24 +365,24 @@ Treat cache residency as a tournament parameter, not as a folklore percentage:
    count. A raw timing fluctuation without a mechanism is not enough to encode
    a new generic policy.
 
-The focused NativeVNNI cache-tile tournament is
-`v2_perf_cpu_native_vnni_dispatch_sweep`, test
+The focused NativeQuantised cache-tile tournament is
+`v2_perf_cpu_native_quantised_dispatch_sweep`, test
 `CacheKTilesCoverAllPreparedFootprints`. Select geometry with
-`LLAMINAR_CPU_NVNNI_CACHE_TILE_M`, `_N`, and `_K`; select one exact profiler
+`LLAMINAR_CPU_NATIVE_QUANTISED_CACHE_TILE_M`, `_N`, and `_K`; select one exact profiler
 launch with `_FORMAT`, `_CANDIDATE`,
-`LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID`, and
-`LLAMINAR_NATIVE_VNNI_PERF_STATS_PATH`. Pin one physical socket and set
+`LLAMINAR_NATIVE_QUANTISED_PROFILE_REQUEST_ID`, and
+`LLAMINAR_NATIVE_QUANTISED_PERF_STATS_PATH`. Pin one physical socket and set
 `OMP_NUM_THREADS`, `OMP_PLACES=cores`, and `OMP_PROC_BIND=close` explicitly so
 NUMA or SMT movement cannot masquerade as a tile result.
 
-One 32-element K block is already the NativeVNNI SIMD/decode unit. Do not round
+One 32-element K block is already the NativeQuantised SIMD/decode unit. Do not round
 cache tiles to a larger block multiple unless annotated assembly and repeated
 measurements prove a real alignment requirement; odd tile lengths are valid
 and can win. Likewise, do not assume one residency regime fits every M: shallow
 grouped verification and deeper prefill may have materially different reuse.
 
 Every cache-policy change must keep the AVX-512 and forced-AVX2
-`V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_*` gates green. Those gates
+`V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_*` gates green. Those gates
 compare every K-tiled production result byte-for-byte with independent serial
 rows across all formats, odd/even M values, tail N, and tile boundaries. A
 faster tile that changes FP parenthesization is ineligible.

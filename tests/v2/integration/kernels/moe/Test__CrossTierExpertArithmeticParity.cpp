@@ -8,7 +8,7 @@
  * be iterated without rebuilding either backend's monolithic MoE test binary.
  */
 
-#include "NativeVNNIExpertTransferParityTest.h"
+#include "NativeQuantisedExpertTransferParityTest.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "../../../utils/CPUProjectionTestWorkspace.h"
@@ -122,7 +122,7 @@ namespace
     {
         using namespace llaminar2;
         using namespace llaminar2::test;
-        using namespace native_vnni_transfer_parity_detail;
+        using namespace native_quantised_transfer_parity_detail;
         using CpuKernel = gemm::FloatingPointGemmKernel;
         constexpr int d_model = 3072;
         constexpr int intermediate = 1024;

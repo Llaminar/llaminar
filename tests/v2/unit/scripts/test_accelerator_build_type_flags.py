@@ -21,6 +21,7 @@ import pathlib
 import re
 import shlex
 import sys
+import tempfile
 
 
 REQUIRED_CONFIGURATION_FLAGS = {
@@ -164,7 +165,23 @@ def device_standard(tokens: set[str]) -> int | None:
     return None
 
 
-def verify_generated_commands(compile_commands_path: pathlib.Path) -> None:
+def configured_accelerators(build_dir: pathlib.Path) -> tuple[str, ...]:
+    """Read backend admission from CMake, never infer it from missing commands."""
+    cache = (build_dir / "CMakeCache.txt").read_text(encoding="utf-8")
+    enabled = []
+    for option, language in (("HAVE_CUDA", "CUDA"), ("HAVE_ROCM", "HIP")):
+        match = re.search(rf"^{option}:BOOL=(.+)$", cache, flags=re.MULTILINE)
+        if match is None or match.group(1).upper() not in ("ON", "OFF", "TRUE", "FALSE", "1", "0"):
+            raise AssertionError(f"{option} needs an explicit CMake backend selection")
+        if match.group(1).upper() in ("ON", "TRUE", "1"):
+            enabled.append(language)
+    return tuple(enabled)
+
+
+def verify_generated_commands(
+    compile_commands_path: pathlib.Path,
+    required_backends: tuple[str, ...] = ("CUDA", "HIP"),
+) -> None:
     """Check accelerator optimization in commands emitted for this build tree."""
 
     entries = json.loads(compile_commands_path.read_text(encoding="utf-8"))
@@ -180,6 +197,10 @@ def verify_generated_commands(compile_commands_path: pathlib.Path) -> None:
             accelerator_entries["HIP"].append(entry)
 
     for backend, backend_entries in accelerator_entries.items():
+        if backend not in required_backends:
+            if backend_entries:
+                raise AssertionError(f"disabled {backend} backend has compile commands")
+            continue
         if not backend_entries:
             raise AssertionError(f"compile database contains no {backend} entries")
         for entry in backend_entries:
@@ -197,7 +218,10 @@ def verify_generated_commands(compile_commands_path: pathlib.Path) -> None:
                 )
 
 
-def verify_generated_launcher(build_dir: pathlib.Path) -> None:
+def verify_generated_launcher(
+    build_dir: pathlib.Path,
+    required_backends: tuple[str, ...] = ("CUDA", "HIP"),
+) -> None:
     """Prove Ninja's executable rules invoke ccache for host and GPU compilers."""
 
     cache_path = build_dir / "CMakeCache.txt"
@@ -218,7 +242,7 @@ def verify_generated_launcher(build_dir: pathlib.Path) -> None:
 
     rules_path = build_dir / "CMakeFiles/rules.ninja"
     rules = rules_path.read_text(encoding="utf-8")
-    for language in ("CXX", "CUDA", "HIP"):
+    for language in ("CXX", *required_backends):
         rule_pattern = re.compile(
             rf"rule {language}_COMPILER__[^\n]+\n"
             rf"(?:  [^\n]*\n)*?"
@@ -228,6 +252,33 @@ def verify_generated_launcher(build_dir: pathlib.Path) -> None:
             raise AssertionError(
                 f"{rules_path} does not launch {language} compilation through ccache"
             )
+
+
+def verify_backend_selection_controls() -> None:
+    """Prove CPU/vendor/full builds while rejecting a missing enabled compiler."""
+    with tempfile.TemporaryDirectory(prefix="accelerator-build-contract-") as directory:
+        root = pathlib.Path(directory)
+        commands = root / "compile_commands.json"
+        for cuda, rocm in ((False, False), (True, False), (False, True), (True, True)):
+            (root / "CMakeCache.txt").write_text(
+                f"HAVE_CUDA:BOOL={'ON' if cuda else 'OFF'}\n"
+                f"HAVE_ROCM:BOOL={'ON' if rocm else 'OFF'}\n", encoding="utf-8")
+            expected = tuple(language for flag, language in ((cuda, "CUDA"), (rocm, "HIP")) if flag)
+            actual = configured_accelerators(root)
+            if actual != expected:
+                raise AssertionError(f"backend selection differs: {actual} != {expected}")
+            entries = [{"file": f"kernel.{extension}", "command": "compiler -O3 -std=c++20"}
+                       for enabled, extension in ((cuda, "cu"), (rocm, "hip")) if enabled]
+            commands.write_text(json.dumps(entries), encoding="utf-8")
+            verify_generated_commands(commands, actual)
+            if actual:
+                commands.write_text("[]", encoding="utf-8")
+                try:
+                    verify_generated_commands(commands, actual)
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("missing enabled accelerator commands were accepted")
 
 
 def verify_hip_sdk_command_binding(entries: list[dict[str, object]], sdk_root: str) -> None:
@@ -282,14 +333,16 @@ def main() -> int:
         return 0
     verify_declarations(args.repo_root / "src" / "v2" / "CMakeLists.txt")
     verify_ccache_declarations(args.repo_root)
+    verify_backend_selection_controls()
+    backends = configured_accelerators(args.build_dir) if args.build_dir else ("CUDA", "HIP")
     if args.compile_commands is not None:
         if not args.compile_commands.is_file():
             raise AssertionError(
                 f"compile database does not exist: {args.compile_commands}"
             )
-        verify_generated_commands(args.compile_commands)
+        verify_generated_commands(args.compile_commands, backends)
     if args.build_dir is not None:
-        verify_generated_launcher(args.build_dir)
+        verify_generated_launcher(args.build_dir, backends)
         verify_generated_sdk_binding(args.build_dir)
     print("accelerator custom-build flags: PASS")
     return 0

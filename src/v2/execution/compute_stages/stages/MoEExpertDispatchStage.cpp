@@ -8,12 +8,14 @@
  * sparse per-tier work descriptors.  When dynamic residency is enabled, the
  * same already-host-visible route IDs are merged into the phase-specific
  * histogram; no additional D2H copy, stream wait, or hot-path allocation is
- * introduced for that evidence.
+ * introduced for that evidence. Publication-wait timing projects only the
+ * immutable routing phase; absent phase metadata is explicitly unknown.
  */
 
 #include "MoEExpertDispatchStage.h"
 
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEExpertShardCohort.h"
 #include "../../../execution/moe/MoEOverlaySparseCollective.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/DebugEnv.h"
@@ -235,6 +237,9 @@ namespace
         {
             const auto &publication =
                 *params_.routing_evidence_publication;
+            if (publication.producer_role != MoERuntimeHistogramProducerRole::ProductionDecode &&
+                publication.producer_role != MoERuntimeHistogramProducerRole::NotProducer)
+                throw std::invalid_argument("MoE routing evidence has an invalid producer role");
             if (!publication.histogram)
             {
                 throw std::invalid_argument(
@@ -288,10 +293,33 @@ namespace
         runtime_params_ = params;
     }
 
+    uint64_t MoEExpertDispatchStage::graphCaptureVariantSignature() const
+    {
+        uint64_t signature = 1469598103934665603ULL;
+        const auto mix = [&signature](uint64_t value) {
+            signature ^= value;
+            signature *= 1099511628211ULL;
+        };
+        mix(reinterpret_cast<std::uintptr_t>(params_.ticket_storage.get()));
+        mix(static_cast<uint64_t>(params_.seq_len));
+        mix(static_cast<uint64_t>(params_.top_k));
+        mix(params_.routing_evidence_publication.has_value());
+        if (params_.routing_evidence_publication)
+        {
+            const auto &publication = *params_.routing_evidence_publication;
+            mix(reinterpret_cast<std::uintptr_t>(publication.histogram));
+            mix(static_cast<uint64_t>(publication.producer_role));
+            mix(static_cast<uint64_t>(publication.source));
+        }
+        return signature;
+    }
+
     bool MoEExpertDispatchStage::publishRoutingEvidence(
         int logical_seq_len) const
     {
-        if (!params_.routing_evidence_publication)
+        if (!params_.routing_evidence_publication ||
+            params_.routing_evidence_publication->producer_role ==
+                MoERuntimeHistogramProducerRole::NotProducer)
             return true;
 
         const auto &publication = *params_.routing_evidence_publication;
@@ -343,10 +371,32 @@ namespace
 
         if (params_.ticket_storage)
         {
+            // Row capacity is not inference purpose: an M1 predictor and an
+            // M>1 verifier both retain the graph's GroupedVerifier identity.
+            // This immutable declaration requires no ticket/device probe and
+            // remains valid for peers that do not publish shared histograms.
+            const char *publication_phase = "unknown";
+            if (params_.routing_evidence_publication)
+            {
+                switch (params_.routing_evidence_publication->source)
+                {
+                case ExpertHistogramSource::DecodeToken:
+                    publication_phase = "decode";
+                    break;
+                case ExpertHistogramSource::PrefillChunk:
+                    publication_phase = "prefill";
+                    break;
+                case ExpertHistogramSource::GroupedVerifier:
+                    publication_phase = "grouped_verifier";
+                    break;
+                case ExpertHistogramSource::SyntheticTest:
+                    break; // Constructor rejects non-production declarations.
+                }
+            }
             PerfStatsCollector::ScopedTimer publication_wait(
                 "moe_overlay_endpoint",
                 "captured_ticket_publication_wait",
-                params_.seq_len == 1 ? "decode" : "prefill",
+                publication_phase,
                 params_.ticket_storage->sourceDevice().toString(),
                 {{"consumer", "expert_dispatch"},
                  {"layer",
@@ -477,7 +527,7 @@ namespace
                 return false;
             }
             effective_tiers = &snapshot.placement_plan->routed_tiers;
-            effective_owner_map = &snapshot.owner_map;
+            effective_owner_map = &snapshot.placementOwnerMap();
             residency_epoch = snapshot.epoch;
         }
         else if (params_.residency_authority)
@@ -537,7 +587,7 @@ namespace
                 return false;
             }
             effective_tiers = &snapshot.placement_plan->routed_tiers;
-            effective_owner_map = &snapshot.owner_map;
+            effective_owner_map = &snapshot.placementOwnerMap();
             residency_epoch = snapshot.epoch;
             if (requested_epoch != 0u &&
                 residency_epoch != requested_epoch)
@@ -614,6 +664,9 @@ namespace
             routed_tiers.size(),
             std::vector<unsigned char>(static_cast<size_t>(logical_seq_len), 0));
 
+        // One immutable cohort per addressed layer/tier is validated once;
+        // route entries retain their original lease rather than a scalar owner.
+        std::vector<const MoEExpertShardCohort*> validated_cohorts(routed_tiers.size(), nullptr);
         for (int token_row = 0; token_row < logical_seq_len; ++token_row)
         {
             for (int route_slot = 0; route_slot < params_.top_k; ++route_slot)
@@ -675,11 +728,11 @@ namespace
                 }
                 else if (effective_owner_map)
                 {
-                    const auto *owner = effective_owner_map->ownerFor(
+                    const auto *owner = effective_owner_map->placementFor(
                         placement.layer, expert_id);
                     if (!owner || !owner->resident ||
                         owner->tier_idx != tier_index ||
-                        owner->owner_participant < 0)
+                        (!owner->shard_cohort && owner->owner_participant < 0))
                     {
                         LOG_ERROR(
                             "[MoEExpertDispatchStage] Active residency epoch has no valid physical owner for layer="
@@ -687,8 +740,47 @@ namespace
                             << " tier=" << tier_index);
                         return false;
                     }
-                    destination_participant =
-                        owner->owner_participant;
+                    if (owner->shard_cohort)
+                    {
+                        if (!result.residency_lease ||
+                            (**result.residency_lease).ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
+                            &(**result.residency_lease).placementOwnerMap() != effective_owner_map)
+                        {
+                            LOG_ERROR("[MoEExpertDispatchStage] CPU joint dispatch lacks its original residency lease");
+                            return false;
+                        }
+                        const auto* cohort = owner->shard_cohort.get();
+                        auto*& validated = validated_cohorts[static_cast<size_t>(tier_index)];
+                        if (validated && validated != cohort)
+                        {
+                            LOG_ERROR("[MoEExpertDispatchStage] CPU joint tier changed its original source cohort");
+                            return false;
+                        }
+                        if (!validated)
+                        {
+                            const auto ids = effective_owner_map->participantIdsForTier(tier_index);
+                            const auto members = cohort->participants();
+                            bool exact = ids.size() == members.size() && cohort->source().layer_idx == placement.layer;
+                            for (size_t i = 0; exact && i < members.size(); ++i)
+                            {
+                                const auto* participant = effective_owner_map->participantForId(ids[i]);
+                                exact = participant && participant->participant_id == members[i].participant_id &&
+                                    participant->tier_idx == tier_index && participant->domain_participant_index == static_cast<int>(i) &&
+                                    participant->domain_name == routed_tiers[static_cast<size_t>(tier_index)].domain &&
+                                    participant->world_rank_known && participant->world_rank == members[i].world_rank &&
+                                    participant->address == members[i].address;
+                            }
+                            if (!exact)
+                            {
+                                LOG_ERROR("[MoEExpertDispatchStage] CPU joint dispatch changed original physical cohort membership");
+                                return false;
+                            }
+                            validated = cohort;
+                        }
+                        // No whole-owner scalar exists. The same retained typed
+                        // snapshot supplies actual consumers to sparse dispatch.
+                    }
+                    else destination_participant = owner->owner_participant;
                 }
 
                 auto &tier_dispatch = result.tiers[static_cast<size_t>(tier_index)];
@@ -794,7 +886,7 @@ namespace
             const auto current_snapshot =
                 params_.residency_authority->snapshot();
             const auto *first_owner = current_snapshot
-                                          ? current_snapshot->owner_map.ownerFor(
+                                          ? current_snapshot->placementOwnerMap().placementFor(
                                                 placement.layer,
                                                 0)
                                           : nullptr;
@@ -803,7 +895,7 @@ namespace
                 "dispatch_epoch_leases",
                 1.0,
                 logical_seq_len == 1 ? "decode" : "prefill",
-                first_owner ? first_owner->device.toString()
+                first_owner && !first_owner->shard_cohort ? first_owner->device.toString()
                             : params_.device_id.toString(),
                 {
                     {"epoch", std::to_string(result.residency_epoch)},

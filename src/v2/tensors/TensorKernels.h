@@ -6,21 +6,31 @@
  * Kernels are created by tensors via createGemm(), createRoPE(), etc.
  *
  * @author David Sanftenberg
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * Explicit CPU clone destinations carry their own admitted allocation owner;
+ * source execution storage remains immutable throughout replication and transfer.
  */
 
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
+#include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/common/OriginalOutputSlice.h"
+#include "kernels/common/GatedRMSNormProjection.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
 #include "../kernels/GDNDeviceStateBinding.h"
+#include "../kernels/gdn/GDNPreparedQK.h"
 #include "../kernels/attention/AttentionExecutionPolicy.h"
-#include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "../kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "../kernels/common/DeviceRowRange.h"
 #include "../kernels/common/DeviceRequestRowRanges.h"
-#include "NativeVnniFormatInfo.h"
+#include "../kernels/common/ProjectionRowWork.h"
+#include "NativeQuantisedFormatInfo.h"
 #include "TensorType.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
@@ -31,12 +41,20 @@
 #include <span>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
-    namespace cpu::native_vnni
+    namespace gdn
     {
-        struct CPUNativeVNNIPackedWeights;
+        struct MergedRecurrenceInput;
+        struct GDNRetainedInvocationBinding;
+        class IGDNPreparedRetainedInvocation;
+    }
+
+    namespace cpu::native_quantised
+    {
+        struct CPUNativeQuantisedPackedWeights;
     }
 
     // Forward declarations
@@ -414,6 +432,17 @@ namespace llaminar2
         }
 
         /**
+         * @brief Independent recorder-local projection work selection.
+         *
+         * This alias shares the lightweight native-wrapper registry. Entering
+         * work selection never enables decode-equivalent verifier arithmetic;
+         * the caller preserves its original ordinary/grouped arithmetic scope.
+         * Every backend must consume the same by-value descriptor before this
+         * scope may be selected by a production graph.
+         */
+        using ProjectionWorkScope = ProjectionRowWorkScope;
+
+        /**
          * @brief RAII token for verifier-only kernel dispatch modes.
          *
          * Some backends have multiple mathematically valid GEMV/GEMM dispatch
@@ -434,8 +463,10 @@ namespace llaminar2
             /** @brief Bind optional physical/live geometry for this recording scope. */
             explicit VerifierKernelModeScope(
                 std::optional<DeviceRowRange> rows = std::nullopt)
-                : previous_rows_(current_rows_), previous_active_(current_active_)
+                : previous_rows_(current_rows_), previous_requests_(current_requests_), previous_active_(current_active_)
             {
+                if(rows && current_requests_)
+                    throw std::invalid_argument("GEMM prefix/request selections cannot overlap");
                 current_active_ = true;
                 if (rows)
                     current_rows_ = rows;
@@ -445,6 +476,7 @@ namespace llaminar2
             virtual ~VerifierKernelModeScope()
             {
                 current_rows_ = previous_rows_;
+                current_requests_ = previous_requests_;
                 current_active_ = previous_active_;
             }
 
@@ -472,17 +504,74 @@ namespace llaminar2
              */
             [[nodiscard]] static const DeviceRowRange *rowsFor(int physical_rows)
             {
+                if(current_requests_)
+                    throw std::logic_error("Request-local holes cannot be consumed as DeviceRowRange");
+                return prefixForFloating(physical_rows);
+            }
+
+            /** @brief Explicit prefix alternative for updated floating request-aware launchers only. */
+            [[nodiscard]] static const DeviceRowRange *prefixForFloating(int physical_rows)
+            {
                 if (current_rows_ && current_rows_->physicalRows() != physical_rows)
                     throw std::logic_error("Verifier launch row geometry disagrees with physical matrix");
                 return current_rows_ ? &*current_rows_ : nullptr;
             }
 
+            /** @brief Borrow request geometry for an updated floating launcher; never read counts here. */
+            [[nodiscard]] static const DeviceRequestRowRanges *requestsFor(int physical_rows)
+            {
+                if(current_requests_ && current_requests_->physicalRows()!=physical_rows)
+                    throw std::logic_error("Floating request geometry disagrees with physical matrix");
+                return current_requests_ ? &*current_requests_ : nullptr;
+            }
+
+        protected:
+            /** @brief Bind only the separate floating request scope, rejecting inherited prefixes. */
+            explicit VerifierKernelModeScope(DeviceRequestRowRanges requests)
+                : VerifierKernelModeScope(std::nullopt)
+            {
+                if(current_rows_)
+                    throw std::invalid_argument("GEMM prefix/request selections cannot overlap");
+                current_requests_=requests;
+            }
+
         private:
             std::optional<DeviceRowRange> previous_rows_; ///< Enclosing recording metadata.
+            std::optional<DeviceRequestRowRanges> previous_requests_; ///< Enclosing immutable floating request geometry.
             bool previous_active_; ///< Enclosing arithmetic contract on this recorder.
             inline static thread_local std::optional<DeviceRowRange> current_rows_;
+            inline static thread_local std::optional<DeviceRequestRowRanges> current_requests_;
             inline static thread_local bool current_active_ = false;
         };
+
+    private:
+        /** @brief Sealed request token; only explicitly implementing GEMM engines can create one. */
+        struct FloatingRequestKernelModeScope final : VerifierKernelModeScope
+        {
+            friend class ITensorGemm;
+        private:
+            explicit FloatingRequestKernelModeScope(DeviceRequestRowRanges rows)
+                : VerifierKernelModeScope(rows) {}
+        };
+    protected:
+        /** @brief Create immutable thread-local metadata after a floating engine validates its policy. */
+        static std::unique_ptr<VerifierKernelModeScope> makeFloatingRequestRowsScope(DeviceRequestRowRanges rows)
+        { return std::unique_ptr<VerifierKernelModeScope>(new FloatingRequestKernelModeScope(rows)); }
+    public:
+        /**
+         * @brief Enter counted request-major floating projection arithmetic.
+         * @param rows Canonical borrowed request lengths and admitted physical stride.
+         * @return Scope inherited by nested floating adapters; destruction restores prior metadata.
+         * @throws std::logic_error For engines without this explicit implementation.
+         *
+         * This is a distinct API from DeviceRowRange. Quantized/unmodified engines
+         * cannot silently interpret request-local holes as a contiguous prefix.
+         */
+        virtual std::unique_ptr<VerifierKernelModeScope> beginFloatingRequestRowsScope(DeviceRequestRowRanges rows)
+        {
+            (void)rows;
+            throw std::logic_error("Prepared GEMM does not implement counted floating request projections");
+        }
 
         /**
          * @brief RAII token for replicated-output arithmetic equivalence.
@@ -767,17 +856,28 @@ namespace llaminar2
         virtual bool weights_converted() const { return true; }
 
         /**
-         * @brief Export a device-readable native-VNNI weight descriptor.
+         * @brief Export a device-readable native-quantised weight descriptor.
          *
-         * Backends that store weights in native-VNNI form override this for
+         * Backends that store weights in native-quantised form override this for
          * grouped MoE decode kernels. Unsupported formats return false so the
          * caller can use the existing sequential fallback.
          */
-        virtual bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
+        virtual bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out)
         {
             out = {};
             return false;
         }
+
+        /**
+         * @brief Inspect already-prepared native-quantised device metadata without materializing weights.
+         * @param out Receives the original resident descriptor, cleared on absence.
+         * @return True only when immutable native device bytes already exist.
+         * @note This const observation performs no allocation, device selection, GPU call,
+         *       transfer, synchronization, conversion, publication or mutable caching.
+         *       CPU/floating/unprepared engines return false; callers must not substitute an active export.
+         */
+        [[nodiscard]] virtual bool inspectPreparedNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) const
+        { out = {}; return false; }
 
         /**
          * @brief Export unambiguous source provenance for prepared VNNI weights.
@@ -787,42 +887,42 @@ namespace llaminar2
          * Q8_0 versus normalized Q8_1/Q8_K for cross-tier migration.
          * Unsupported or provenance-free engines return false and clear @p out.
          */
-        virtual bool exportNativeVNNISourceIdentity(
-            NativeVnniSourceIdentity &out) const
+        virtual bool exportNativeQuantisedSourceIdentity(
+            NativeQuantisedSourceIdentity &out) const
         {
             out = {};
             return false;
         }
 
         /**
-         * @brief Borrow immutable CPU NativeVNNI execution bytes for migration.
+         * @brief Borrow immutable CPU NativeQuantised execution bytes for migration.
          *
          * CPU prepared kernels override this to expose their single authoritative
          * packed representation. The returned object remains owned by the engine
          * and is valid only while the caller retains that engine's shared lifetime.
-         * GPU and non-NativeVNNI engines return null.
+         * GPU and non-NativeQuantised engines return null.
          */
-        virtual const cpu::native_vnni::CPUNativeVNNIPackedWeights *
-        exportCPUNativeVNNIPackedWeights() const
+        virtual const cpu::native_quantised::CPUNativeQuantisedPackedWeights *
+        exportCPUNativeQuantisedPackedWeights() const
         {
             return nullptr;
         }
 
         /**
-         * @brief Borrow the mutable final CPU NativeVNNI byte range for a
+         * @brief Borrow the mutable final CPU NativeQuantised byte range for a
          * retired ExpertOverlay physical slot.
          *
          * This is an infrastructure-only mutation boundary. The caller must
          * own the slot through the ExpertOverlay residency fabric and may
          * write the returned range only after the old residency epoch's ticket
          * barrier has drained. Ordinary kernels, stages, and coherence callers
-         * must use @ref exportCPUNativeVNNIPackedWeights instead.
+         * must use @ref exportCPUNativeQuantisedPackedWeights instead.
          *
          * @return Engine-owned final execution bytes, or an empty span when
          *         the prepared engine cannot participate in slot recycling.
          */
         virtual std::span<std::uint8_t>
-        exportRetiredCPUNativeVNNIStorage() noexcept
+        exportRetiredCPUNativeQuantisedStorage() noexcept
         {
             return {};
         }
@@ -848,7 +948,7 @@ namespace llaminar2
          * @brief Borrow mutable bytes from a retired CPU floating-point slot.
          *
          * This is the floating analogue of
-         * @ref exportRetiredCPUNativeVNNIStorage. Only the ExpertOverlay
+         * @ref exportRetiredCPUNativeQuantisedStorage. Only the ExpertOverlay
          * physical residency fabric may write the range, after the old epoch's
          * inference-ticket barrier has drained.
          *
@@ -865,6 +965,23 @@ namespace llaminar2
         // =====================================================================
 
         /**
+         * @brief Bind an authenticated original source interval to this leaf only.
+         * @param slice Store-minted source/engine/physical-N/K identity.
+         * @return Recording scope restored before any sibling projection.
+         * @throws std::logic_error When this backend lacks exact source-slice arithmetic.
+         *
+         * This distinct typed operation intentionally does not relax the existing
+         * two-int mirrored-output API. Floating ordinary BLAS has no authenticated
+         * original-N algorithm contract and must reject rather than switch trees.
+         */
+        virtual std::unique_ptr<OutputPartitionEquivalenceScope>
+        beginOriginalOutputSliceScope(const OriginalOutputSlice &slice)
+        {
+            slice.require(this, get_n(), get_k());
+            throw std::logic_error("Original output slice requires a supported native quantized engine");
+        }
+
+        /**
          * @brief Descriptor for tensor-aware fused multi-projection GEMM
          *
          * Unlike FusedProjectionDesc which uses raw pointers, this uses TensorBase
@@ -878,11 +995,31 @@ namespace llaminar2
             int n;                  ///< Output dimension (columns)
             const TensorBase *bias; ///< Optional bias tensor [n] (nullptr = no bias)
             const char *name;       ///< Name for debug logging
+            std::optional<OriginalOutputSlice> original_output_slice; ///< Store-authenticated source arithmetic, leaf-local.
+
+            /** @brief Authenticate every declared source fact before shared quantization/enqueue. */
+            void requireOriginalOutputSlice(int reduction) const
+            {
+                if (!original_output_slice) return;
+                if (!kernel || n != kernel->get_n() || reduction != kernel->get_k())
+                    throw std::invalid_argument("Original output slice has inconsistent projection N/K");
+                original_output_slice->require(kernel, n, reduction);
+            }
+
+            /** @return This leaf's arithmetic scope, or no scope for an unchanged sibling. */
+            std::unique_ptr<OutputPartitionEquivalenceScope> beginOriginalOutputSliceScope() const
+            {
+                if (!original_output_slice) return nullptr;
+                requireOriginalOutputSlice(kernel ? kernel->get_k() : 0);
+                return kernel->beginOriginalOutputSliceScope(*original_output_slice);
+            }
 
             TensorProjectionDesc(ITensorGemm *k, TensorBase *out, int n_dim,
                                  const TensorBase *b = nullptr,
-                                 const char *nm = nullptr)
-                : kernel(k), output(out), n(n_dim), bias(b), name(nm) {}
+                                 const char *nm = nullptr,
+                                 std::optional<OriginalOutputSlice> slice = std::nullopt)
+                : kernel(k), output(out), n(n_dim), bias(b), name(nm),
+                  original_output_slice(std::move(slice)) {}
         };
 
         /**
@@ -1606,6 +1743,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Clone weights into a caller-owned admitted CPU destination.
+         * @param destination Final allocation placement and accounting owner.
+         * @return Independent prepared storage with destination-bound leases.
+         * @throws std::logic_error If this backend lacks the CPU copy contract.
+         */
+        virtual std::unique_ptr<IPackedWeights> cloneWeightsTo(CPUWeightStoragePlacement destination) const
+        {
+            (void)destination;
+            throw std::logic_error("GEMM does not implement explicit CPU destination cloning");
+        }
+
+        /**
          * @brief Attach pre-packed weights to this kernel.
          *
          * Replaces any existing weights. The kernel takes ownership of the data.
@@ -1659,7 +1808,7 @@ namespace llaminar2
          * Graph builders and weight services use this capability before
          * retiring large raw MoE slabs. It prevents floating-point GEMM engines,
          * which intentionally retain a tensor view, from being mistaken for
-         * self-contained packed NativeVNNI engines.
+         * self-contained packed NativeQuantised engines.
          */
         virtual bool canReleaseSourceWeightTensor() const { return false; }
 
@@ -1694,6 +1843,78 @@ namespace llaminar2
          * @return Number of input features this kernel expects, or 0 if unknown
          */
         virtual int get_k() const { return 0; }
+        /**
+         * @brief Validate the exact selected composite binding without native work.
+         * @param input Original already-materialized tensors and immutable policy.
+         * @param output Original already-materialized projection destination.
+         * @param n Exact prepared local output width.
+         * @param k Exact prepared local reduction width.
+         * @param workspace Original allocated invocation workspace.
+         * @throws std::exception For unsupported or aliasing/incomplete storage.
+         * @note This cold observation never allocates, uploads, selects a device,
+         * reads a live value, initializes tables or issues a GPU operation.
+         */
+        virtual void validate_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
+            TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace) const
+        { (void)input;(void)output;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement gated-norm SingleQ8 binding"); }
+
+        /**
+         * @brief Normalize/gate the retained FP32 source and consume its SingleQ8 immediately.
+         * @param input Exact original in-place FP32 values, immutable gate/gamma and policy.
+         * @param output Distinct original FP32 projection destination.
+         * @param n Exact participant-local prepared output width.
+         * @param k Exact participant-local prepared reduction width.
+         * @param workspace Original admitted GEMM scratch; no buffer ownership is transferred.
+         * @return Native successful submission on this engine's exact bound stream.
+         * @throws std::logic_error When explicitly selected on an unsupported engine.
+         * @note Only ordinary uncounted physicalM1 is admitted. Other complete
+         * programs are selected at graph construction, never after a failure.
+         */
+        virtual bool multiply_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
+            TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace)
+        { (void)input;(void)output;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement gated-norm SingleQ8"); }
+
+        /** @brief Declare two Q8 activation banks against the actual native quantized source.
+         * @param m Physical maximum rows retained by the stage.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared reduction width.
+         * @return Named instance-owned scratch, contributed to the canonical PMA BOM.
+         * @throws std::logic_error If this selected backend/source lacks the operation.
+         */
+        virtual WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const
+        { (void)m;(void)n;(void)k;throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
+        /** @brief Evaluate independent primary/residual Q8 integer dots and add once.
+         * The original quantized weight codebook, scales, minima and IQ metadata
+         * remain authoritative for both terms. No alternate weight copy is made.
+         * @param input Prepared native FP32 source; no placement repair is permitted.
+         * @param output Prepared distinct native FP32 destination.
+         * @param rows Explicit physical/live geometry on its execution owner.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared reduction width.
+         * @param workspace Participant-owned already-admitted activation banks.
+         * @throws std::logic_error For an unavailable explicitly selected implementation.
+         */
+        virtual void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
+            DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
+        { (void)input;(void)output;(void)rows;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
+
+        /** @brief Original HC /4 SiLU, paired-Q8 publication and native projection.
+         * @param input Raw bottleneck and retained activated FP32 destination.
+         * @param output Original distinct FP32 projection output.
+         * @param rows Original complete physical/live authority.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared bottleneck width in complete32 blocks.
+         * @param workspace Existing invocation-owned activation banks.
+         * @throws std::logic_error For a source lacking this explicitly selected operation.
+         */
+        virtual void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
+            DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
+        { (void)input;(void)output;(void)rows;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement HC down two-term publication"); }
+
     };
 
     // Note: TensorBase alias already declared at top of file
@@ -3552,6 +3773,13 @@ namespace llaminar2
     {
     public:
         virtual ~ITensorShortConvolution() = default;
+        /**
+         * @brief Execute the explicitly bound scalar prepared-Q/K convolution.
+         * @param input Original raw operands and arena activation, with no state ownership.
+         * @return Enqueue success; unsupported selected implementations fail, never retry raw.
+         */
+        virtual bool forwardPreparedQK(const gdn::ScalarPreparedQKConvolution& input)
+        { (void)input; return false; }
 
         /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
         void setGPUStream(void *stream)
@@ -4024,6 +4252,48 @@ namespace llaminar2
     public:
         virtual ~ITensorGatedDeltaNet() = default;
 
+        /** @return Immutable physical orientation of every owned recurrence bank. */
+        virtual GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept
+        {
+            return GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+        }
+
+        /**
+         * @brief Bind row snapshots only in the live owner's physical orientation.
+         * @param workspace Borrowed arena storage, retained through graph retirement.
+         * @param rows Admitted snapshot row count; zero clears the binding.
+         * @param state_size FP32 elements per snapshot, not allocation capacity.
+         * @param layout Immutable format sealed by the graph's state owner.
+         * @throws std::invalid_argument Before changing a binding on a format mismatch.
+         */
+        void bindRecurrenceStateCaptureWorkspace(float *workspace,
+                                                 int rows,
+                                                 int state_size,
+                                                 GDNRecurrenceStateLayout layout)
+        {
+            if (!validGDNRecurrenceStateLayout(layout) || layout != recurrenceStateLayout())
+                throw std::invalid_argument(
+                    "GDN snapshot layout differs from its live state owner");
+            bindVerifierStateCaptureWorkspace(workspace, rows, state_size);
+        }
+
+        /**
+         * @brief Bind a borrowed speculative bank in the immutable live-bank format.
+         * @param workspace Arena-owned storage, or null to clear the binding.
+         * @param state_size Admitted FP32 element extent.
+         * @param layout Physical format authenticated by the state owner.
+         * @throws std::invalid_argument Before changing a binding on a format mismatch.
+         */
+        void bindRecurrenceSpeculativeWorkspace(float *workspace,
+                                                int state_size,
+                                                GDNRecurrenceStateLayout layout)
+        {
+            if (!validGDNRecurrenceStateLayout(layout) || layout != recurrenceStateLayout())
+                throw std::invalid_argument(
+                    "GDN speculative layout differs from its live state owner");
+            bindSpeculativeStateWorkspace(workspace, state_size);
+        }
+
         /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
         void setGPUStream(void *stream)
         {
@@ -4043,6 +4313,23 @@ namespace llaminar2
         {
             (void)binding;
             return false;
+        }
+
+        /**
+         * @brief Freeze a GPU retained transaction over caller-leased workspace and canonical state.
+         * @param sources Immutable raw merged inputs; no legacy state or snapshot bindings.
+         * @param binding Exact geometry, workspace views, stable manager identity and capture stream.
+         * @return Immutable invocation borrowing this kernel and caller-owned storage/source lifetimes.
+         * @throws std::logic_error On a backend without this explicit implementation.
+         * @details Preparation is cold; it never provisions live state or changes shared stream bindings.
+         */
+        virtual std::unique_ptr<gdn::IGDNPreparedRetainedInvocation> prepareRetainedInvocation(
+            const gdn::MergedRecurrenceInput &sources,
+            const gdn::GDNRetainedInvocationBinding &binding) const
+        {
+            (void)sources;
+            (void)binding;
+            throw std::logic_error("This backend has no prepared GPU retained GDN implementation");
         }
 
         /// Reset bound GPU state on the exact producer stream.
@@ -4113,8 +4400,35 @@ namespace llaminar2
          *
          * When enabled for an all-position MTP verifier graph, implementations may
          * write the recurrence state after each candidate verifier row into this
-         * buffer. Layout is [rows, n_heads, d_k, d_v] in FP32.
+         * buffer. Each row contains a complete backend state: CPUGDNStateLayout
+         * on CPU and [heads, native head matrix] FP32 storage on GPU. The
+         * immutable device owner names the matrix's inner axes.
          */
+        /**
+         * @brief Publish accepted request prefixes from an explicitly owned transaction.
+         * @param transaction Stage-owned immutable slots and checked logical geometry.
+         * @param destination Public canonical request-zero state.
+         * @param rows Accepted flattened row for each request, or negative for rejection.
+         * @return Whether every candidate was validated and atomically published.
+         */
+        virtual bool restoreCPUSharedStateRows(const CPUSharedGDNTransaction &transaction,
+            float *destination,const int *rows) {
+            (void)transaction; (void)destination; (void)rows;
+            throw std::invalid_argument("Backend does not implement explicit CPU shared GDN publication");
+        }
+        /**
+         * @brief Bind arena-backed CPU epoch checkpoints and raw log.
+         * @param slots Persistent immutable candidate payload, or null to retire it.
+         * @param slot_floats Admitted FP32 capacity of the candidate payload.
+         * @param rows Admitted flattened candidate-row capacity.
+         * @throws std::invalid_argument if a backend receives a nonempty binding
+         *         without implementing shared CPU epoch snapshots.
+         */
+        virtual void bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows) {
+            if (slots || slot_floats || rows)
+                throw std::invalid_argument("Backend does not implement CPU shared epoch snapshot binding");
+        }
+
         virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
         {
             (void)workspace;
@@ -4331,7 +4645,8 @@ namespace llaminar2
          * @param A_log     Learnable log-space gate [n_heads]
          * @param dt_bias   Learnable dt bias [n_heads]
          * @param output    Output context [seq_len, n_heads * d_v]
-         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param state     Backend-owned state: CPU CPUGDNStateLayout checkpoint/history;
+         *                  GPU dense [n_heads,d_k,d_v]. Updated without partial-epoch flushes.
          * @param seq_len   Sequence length
          * @param n_heads   Number of attention heads
          * @param d_k       Key head dimension
@@ -4349,6 +4664,14 @@ namespace llaminar2
             int chunk_size, bool use_qk_l2norm) = 0;
 
         /**
+         * @brief Consume a sealed scalar prepared-Q/K producer on the original state owner.
+         * @param input Original merged V/gates and explicit compact prepared activation.
+         * @return Enqueue success; failure never selects a different input program.
+         */
+        virtual bool chunkForwardPreparedQK(const gdn::ScalarPreparedQKRecurrence& input)
+        { (void)input; return false; }
+
+        /**
          * @brief Execute ordinary decode or prefill directly from merged QKV rows.
          *
          * The source layout is one row per token:
@@ -4362,6 +4685,10 @@ namespace llaminar2
          * launch their graph-captured device transform before recurrence. The
          * caller must never materialize a host-side Q/K/V copy as an alternate
          * path.
+         * Merged source and output byte ranges must be disjoint, including partial
+         * views. GPU direct-input entrypoints reject overlap before enqueue. The
+         * existing live-state owner may update its own bank in place; that state
+         * alias is independent of the source/output contract.
          *
          * This operation is mandatory for every backend. It covers ordinary
          * live-state execution; verifier snapshots, request-batched state banks,
@@ -4402,7 +4729,9 @@ namespace llaminar2
          *
          * Snapshot rows are laid out as:
          *   state_snapshots[row * snapshot_stride_floats + state_index]
-         * where state_index spans [n_heads, d_k, d_v].
+         * where state_index spans the complete backend state extent. CPU snapshots
+         * include phase and raw history from CPUGDNStateLayout; GPU snapshots
+         * contain dense [n_heads,d_k,d_v] matrices.
          * CPU implementations publish the terminal snapshot back to @p state.
          * A backend may materialize snapshots directly during recurrence, but it
          * must preserve serial-row arithmetic and may not replay rows afterward.
@@ -4712,7 +5041,8 @@ namespace llaminar2
          * @param A_log     Learnable log-space gate [n_heads]
          * @param dt_bias   Learnable dt bias [n_heads]
          * @param output    Output context [n_heads * d_v]
-         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param state     Backend-owned state: CPU CPUGDNStateLayout checkpoint/history;
+         *                  GPU dense [n_heads,d_k,d_v]. Updated without partial-epoch flushes.
          * @param n_heads   Number of attention heads
          * @param d_k       Key head dimension
          * @param d_v       Value head dimension

@@ -1,6 +1,10 @@
 /**
  * @file TensorFactory.cpp
- * @brief Factory implementation for creating tensors with NUMA-aware allocation
+ * @brief Tensor construction governed by the admitted rank CPU allocation domain.
+ *
+ * Aggregate CPU admission must remain aggregate even when this thread happens to
+ * run on one socket. Only an explicitly node-bound CPU backend permits this
+ * factory to install the existing persistent thread allocation policy.
  * @author David Sanftenberg
  */
 
@@ -8,6 +12,7 @@
 #include "BlockStructures.h"
 #include "TensorClasses.h"
 #include "../utils/Logger.h"
+#include "../backends/BackendManager.h"
 #include <cerrno>
 #include <stdexcept>
 #include <sstream>
@@ -16,7 +21,6 @@
 
 #include <numa.h>
 #include <numaif.h>
-#include <sched.h> // For sched_getcpu() in NUMA node detection
 
 #if defined(HAVE_ROCM)
 #include <hip/hip_runtime.h>
@@ -25,12 +29,11 @@
 namespace llaminar2
 {
     TensorFactory::TensorFactory(const IMPIContext &mpi_ctx)
-        : mpi_rank_(mpi_ctx.rank()), numa_node_(-1)
+        : mpi_rank_(mpi_ctx.rank()), numa_node_(cpuBackendNUMANode())
     {
-        // Determine NUMA node for this MPI rank
-        numa_node_ = getNumaNodeForRank(mpi_rank_);
-
-        // Bind current thread to NUMA node if available
+        // CPUBackend owns rank allocation locality. Aggregate (-1) intentionally
+        // leaves the caller policy untouched; execution affinity is not admission.
+        // Explicit bound-node mode retains its existing persistent policy.
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -311,58 +314,79 @@ namespace llaminar2
     std::unique_ptr<TensorBase> TensorFactory::createQuantizedOwned(
         TensorType type,
         const std::vector<size_t> &shape,
-        AlignedVector<uint8_t> raw_data)
+        AlignedVector<uint8_t> raw_data,DeviceId original_allocator)
     {
         if (numa_node_ >= 0)
             bindToNumaNode();
 
+        return adoptQuantizedFinalStorage(type,shape,std::move(raw_data),original_allocator);
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::adoptQuantizedFinalStorage(
+        TensorType type,const std::vector<size_t>& shape,AlignedVector<uint8_t> raw_data,DeviceId original_allocator)
+    {
+        if(!original_allocator.is_valid() || !original_allocator.is_cpu())
+            throw std::invalid_argument("Final native tensor requires its original valid CPU allocator");
         switch (type)
         {
         case TensorType::IQ4_NL:
-            return std::make_unique<IQ4_NLTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ4_NLTensor>(shape, std::move(raw_data),original_allocator);
+        case TensorType::Q8_1:
+            return Q8_1Tensor::adoptImmutableCPUStorage(shape,std::move(raw_data),original_allocator);
         case TensorType::Q8_0:
-            return std::make_unique<Q8_0Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q8_0Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q4_0:
-            return std::make_unique<Q4_0Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q4_0Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q4_1:
-            return std::make_unique<Q4_1Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q4_1Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q5_0:
-            return std::make_unique<Q5_0Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q5_0Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q5_1:
-            return std::make_unique<Q5_1Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q5_1Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q6_K:
-            return std::make_unique<Q6_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q6_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q2_K:
-            return std::make_unique<Q2_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q2_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q5_K:
-            return std::make_unique<Q5_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q5_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q3_K:
-            return std::make_unique<Q3_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q3_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q4_K:
-            return std::make_unique<Q4_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q4_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q8_K:
-            return std::make_unique<Q8_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q8_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ4_XS:
-            return std::make_unique<IQ4_XSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ4_XSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ2_XXS:
-            return std::make_unique<IQ2_XXSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ2_XXSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ2_XS:
-            return std::make_unique<IQ2_XSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ2_XSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ3_XXS:
-            return std::make_unique<IQ3_XXSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ3_XXSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ2_S:
-            return std::make_unique<IQ2_STensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ2_STensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ3_S:
-            return std::make_unique<IQ3_STensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ3_STensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ1_S:
-            return std::make_unique<IQ1_STensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ1_STensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ1_M:
-            return std::make_unique<IQ1_MTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ1_MTensor>(shape, std::move(raw_data),original_allocator);
         default:
             throw std::runtime_error(
                 "TensorFactory::createQuantizedOwned: unsupported type " +
                 std::to_string(static_cast<int>(type)));
         }
+    }
+
+    void TensorFactory::visitNativeWeightWindow(TensorType type,size_t rows,size_t columns,
+        std::span<const std::byte> native_bytes,
+        const std::function<void(const TensorBase&)>& consume)
+    {
+        if(!rows || !columns || native_bytes.empty() || !consume)
+            throw std::invalid_argument("Native codec window requires exact nonempty bytes and callback");
+        auto window=borrowQuantizedNativeStorage(type,{rows,columns},
+            reinterpret_cast<const uint8_t*>(native_bytes.data()),native_bytes.size(),{});
+        consume(*window);
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createQuantizedZeroCopy(
@@ -372,12 +396,21 @@ namespace llaminar2
         size_t byte_size,
         std::shared_ptr<void> mmap_lifetime_owner)
     {
+        return borrowQuantizedNativeStorage(type,shape,mmap_data,byte_size,std::move(mmap_lifetime_owner));
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::borrowQuantizedNativeStorage(
+        TensorType type,const std::vector<size_t>& shape,const uint8_t* mmap_data,
+        size_t byte_size,std::shared_ptr<void> mmap_lifetime_owner)
+    {
         // No NUMA binding needed — data lives in mmap'd memory, not heap-allocated
 
         switch (type)
         {
         case TensorType::IQ4_NL:
             return std::make_unique<IQ4_NLTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q8_1:
+            return std::make_unique<Q8_1Tensor>(shape,mmap_data,byte_size,std::move(mmap_lifetime_owner));
         case TensorType::Q8_0:
             return std::make_unique<Q8_0Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
         case TensorType::Q4_0:
@@ -442,10 +475,9 @@ namespace llaminar2
             return;
         }
 
-        // Parallel memcpy ensures destination pages are first-touched by
-        // multiple threads on the correct NUMA node (set via membind).
-        // Each thread copies a contiguous chunk, triggering page faults
-        // that place physical pages on the bound NUMA node.
+        // Each worker first-touches a contiguous range under its existing
+        // allocation policy. Copying must not introduce a node constraint into
+        // aggregate admission or overwrite a caller-established worker policy.
         auto *d = static_cast<char *>(dst);
         const auto *s = static_cast<const char *>(src);
 
@@ -512,43 +544,6 @@ namespace llaminar2
                 << "). In Docker, run with --security-opt seccomp=unconfined.";
             throw std::runtime_error(oss.str());
         }
-    }
-
-    int TensorFactory::getNumaNodeForRank(int rank)
-    {
-        if (numa_available() < 0)
-        {
-            return -1;
-        }
-
-        int max_node = numa_max_node();
-        if (max_node <= 0)
-        {
-            return -1; // Only one NUMA node
-        }
-
-        // Detect actual NUMA node from the CPU this thread is running on.
-        // This correctly handles cases where process binding doesn't follow
-        // rank order, e.g. `-d cpu:1` with a single rank bound to socket 1
-        // (rank=0 but NUMA node=1).  The old round-robin mapping
-        // (`rank % (max_node+1)`) would incorrectly return node 0.
-        int cpu = sched_getcpu();
-        if (cpu >= 0)
-        {
-            int node = numa_node_of_cpu(cpu);
-            if (node >= 0 && node <= max_node)
-            {
-                LOG_DEBUG("[TensorFactory] Detected NUMA node " << node
-                                                                << " for rank " << rank << " (cpu " << cpu << ")");
-                return node;
-            }
-        }
-
-        // Fallback: round-robin mapping (only reached if sched_getcpu fails)
-        int fallback = rank % (max_node + 1);
-        LOG_WARN("[TensorFactory] sched_getcpu() failed, using round-robin NUMA mapping: "
-                 << "rank " << rank << " -> node " << fallback);
-        return fallback;
     }
 
 } // namespace llaminar2

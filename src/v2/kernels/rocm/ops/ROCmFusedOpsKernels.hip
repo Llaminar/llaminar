@@ -6,9 +6,14 @@
  * eliminate intermediate memory round-trips:
  * 1. Fused SwiGLU + Blockwise INT8 Quantization
  * 2. Fused Residual Add + RMSNorm (FP32, BF16, FP16)
+ * Counted producers retain immutable DeviceRowRange metadata by value. Their
+ * compile-time specialization rejects inactive rows before source/scratch access;
+ * ordinary kernels compile out every live-count read and predicate.
  */
 
 #include <hip/hip_runtime.h>
+#include "kernels/rocm/gemm/ROCmQuantisedActivationProducers.h"
+#include <stdexcept>
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdio>
@@ -54,17 +59,25 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
 // 1. Fused SwiGLU + Blockwise INT8 Quantization
 // =========================================================================
 
+template<bool Counted>
 __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
     const float *__restrict__ gate,
     const float *__restrict__ up,
     int8_t *__restrict__ A_int8,
     float *__restrict__ scales_A_blockwise,
     int32_t *__restrict__ sums_A_blockwise,
-    int M, int K)
+    int M, int K, llaminar2::DeviceRowRange activeRows)
 {
     const int row = blockIdx.x;
     if (row >= M)
         return;
+    // Whole row/quantization subgroup agrees before any load, store or barrier.
+    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    if constexpr (Counted)
+    {
+        if (row >= activeRows.activeRows())
+            return;
+    }
 
     constexpr int BLOCK_SIZE = 32;
     const int num_blocks = K / BLOCK_SIZE;
@@ -319,13 +332,70 @@ __global__ void rocm_fused_residual_rmsnorm_fp16_kernel(
 // Extern "C" Wrapper Functions
 // =========================================================================
 
+/**
+ * @brief Reject invalid immutable producer admission before any runtime submit.
+ * @param m Positive retained physical row count.
+ * @param k Positive original input width.
+ * @param stream Exact ordinary stream; native legacy/per-thread sentinels reject.
+ * @param rows Optional immutable descriptor; its live count is never host-read.
+ */
+static void validateHIPActivationProducer(int m,int k,void* stream,const llaminar2::DeviceRowRange* rows)
+{
+    if (m <= 0 || k <= 0)
+        throw std::invalid_argument("Activation producer requires positive M and K");
+    const auto native = static_cast<hipStream_t>(stream);
+    if (!native || native == hipStreamLegacy || native == hipStreamPerThread)
+        throw std::invalid_argument("Activation producer requires an explicit non-default stream");
+    if (rows && rows->physicalRows() != m)
+        throw std::invalid_argument("Counted quantizer row extent differs from physical matrix");
+}
+
 extern "C"
 {
 
     // =====================================================================
     // Fused SwiGLU + Blockwise Quantization
     // =====================================================================
+    bool hipOps_fused_swiglu_quantize_blockwise_rows(
+        const float *gate,
+        const float *up,
+        int8_t *A_int8,
+        float *scales_A_blockwise,
+        int M, int K,
+        int device_idx,
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
+    {
+        validateHIPActivationProducer(M, K, stream, rowRange);
+        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
+        const bool countedRows = rowRange && rowRange->countOwner();
 
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
+        (void)hipGetLastError(); // Clear stale errors
+
+        dim3 grid(M);
+        dim3 block(256);
+
+        if (countedRows) {
+            hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel<true>,
+                grid, block, 0, static_cast<hipStream_t>(stream),
+                gate, up, A_int8, scales_A_blockwise, nullptr, M, K, rowAuthority);
+        } else {
+            hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel<false>,
+                grid, block, 0, static_cast<hipStream_t>(stream),
+                gate, up, A_int8, scales_A_blockwise, nullptr, M, K, rowAuthority);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[ROCmFusedOps] fused_swiglu_quantize_blockwise launch failed: %s\n",
+                hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool hipOps_fused_swiglu_quantize_blockwise(
         const float *gate,
         const float *up,
@@ -335,26 +405,53 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        return hipOps_fused_swiglu_quantize_blockwise_rows(gate, up, A_int8, scales_A_blockwise, M, K, device_idx, stream, nullptr);
+    }
+    bool hipOps_fused_swiglu_quantize_blockwise_with_sums_rows(
+        const float *gate,
+        const float *up,
+        int8_t *A_int8,
+        float *scales_A_blockwise,
+        int32_t *sums_A_blockwise,
+        int M, int K,
+        int device_idx,
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
+    {
+
+        if (!sums_A_blockwise)
+            return hipOps_fused_swiglu_quantize_blockwise_rows(
+                gate, up, A_int8, scales_A_blockwise, M, K, device_idx, stream, rowRange);
+        validateHIPActivationProducer(M, K, stream, rowRange);
+        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
+        const bool countedRows = rowRange && rowRange->countOwner();
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
-        (void)hipGetLastError(); // Clear stale errors
+        (void)hipGetLastError();
 
         dim3 grid(M);
         dim3 block(256);
 
-        hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel,
-                           grid, block, 0, static_cast<hipStream_t>(stream),
-                           gate, up, A_int8, scales_A_blockwise, nullptr, M, K);
+        if (countedRows) {
+            hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel<true>,
+                grid, block, 0, static_cast<hipStream_t>(stream),
+                gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K, rowAuthority);
+        } else {
+            hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel<false>,
+                grid, block, 0, static_cast<hipStream_t>(stream),
+                gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K, rowAuthority);
+        }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
-            fprintf(stderr, "[ROCmFusedOps] fused_swiglu_quantize_blockwise launch failed: %s\n",
-                    hipGetErrorString(err));
+            fprintf(stderr, "[ROCmFusedOps] fused_swiglu_quantize_blockwise_with_sums launch failed: %s\n",
+                hipGetErrorString(err));
             return false;
         }
         return true;
     }
 
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool hipOps_fused_swiglu_quantize_blockwise_with_sums(
         const float *gate,
         const float *up,
@@ -365,28 +462,7 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!sums_A_blockwise)
-            return hipOps_fused_swiglu_quantize_blockwise(
-                gate, up, A_int8, scales_A_blockwise, M, K, device_idx, stream);
-
-        llaminar2::HipDeviceGuard::setDevice(device_idx);
-        (void)hipGetLastError();
-
-        dim3 grid(M);
-        dim3 block(256);
-
-        hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel,
-                           grid, block, 0, static_cast<hipStream_t>(stream),
-                           gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K);
-
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[ROCmFusedOps] fused_swiglu_quantize_blockwise_with_sums launch failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
+        return hipOps_fused_swiglu_quantize_blockwise_with_sums_rows(gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K, device_idx, stream, nullptr);
     }
 
     // =====================================================================

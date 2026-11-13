@@ -12,7 +12,7 @@
 
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "backends/rocm/HipDeviceGuard.h"
-#include "tensors/NativeVnniIQ3SScale.h"
+#include "tensors/NativeQuantisedIQ3SScale.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -68,47 +68,50 @@ namespace llaminar2
             std::uint32_t first_unit)
         {
             const unsigned unit_index = first_unit + blockIdx.x;
+            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
+            const unsigned columns=expertTierWireColumns(layout,unit_index);
+            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
             const int column = static_cast<int>(threadIdx.x);
             const int n = static_cast<int>(unit_index / layout.blocks_per_row) * 64 + column;
             const int kb = static_cast<int>(unit_index % layout.blocks_per_row);
-            const size_t offset = static_cast<size_t>(blockIdx.x) * layout.cpu_block_stride;
+            const size_t offset = expertTierWireOffset(layout,first_unit,blockIdx.x);
             if constexpr (ToCpu)
             {
-                initializeCpuUnitROCm(cpu_destination + offset, layout.cpu_block_stride);
+                initializeCpuUnitROCm(cpu_destination + offset, cpu_stride);
                 __syncthreads();
             }
             if (n >= layout.N)
                 return;
-            const size_t linear = static_cast<size_t>(kb) * layout.N + n;
+            const size_t linear = static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             const int payload_bytes = layout.gpu_payload_bytes_per_block;
             for (int byte = 0; byte < payload_bytes; ++byte)
             {
-                const size_t cpu_offset = offset + (byte / 4) * 256 + column * 4 + byte % 4;
+                const size_t cpu_offset = offset + (byte / 4) * (4*columns) + column * 4 + byte % 4;
                 if constexpr (ToCpu)
                     cpu_destination[cpu_offset] = source.payload[linear * payload_bytes + byte];
                 else
                     destination.payload[linear * payload_bytes + byte] = cpu_source[cpu_offset];
             }
-            const size_t metadata = offset + layout.cpu_data_stride;
+            const size_t metadata = offset + (layout.cpu_data_stride/64)*columns;
             if constexpr (ToCpu)
             {
                 reinterpret_cast<uint16_t *>(cpu_destination + metadata)[column] = source.scales[linear];
-                reinterpret_cast<uint16_t *>(cpu_destination + metadata + 128)[column] = source.mins[linear];
+                reinterpret_cast<uint16_t *>(cpu_destination + metadata + 2*columns)[column] = source.mins[linear];
                 if (layout.gpu_has_emins)
-                    reinterpret_cast<uint32_t *>(cpu_destination + metadata + 256)[column] = source.emins[linear];
+                    reinterpret_cast<uint32_t *>(cpu_destination + metadata + 4*columns)[column] = source.emins[linear];
             }
             else
             {
                 destination.scales[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata)[column];
-                destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata + 128)[column];
+                destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata + 2*columns)[column];
                 if (layout.gpu_has_emins)
-                    destination.emins[linear] = reinterpret_cast<const uint32_t *>(cpu_source + metadata + 256)[column];
+                    destination.emins[linear] = reinterpret_cast<const uint32_t *>(cpu_source + metadata + 4*columns)[column];
             }
         }
 
         /**
          * @brief Compile-time properties of one accelerator source codebook.
-         * @tparam Codebook NativeVNNI codebook identifier stored in the stream
+         * @tparam Codebook NativeQuantised codebook identifier stored in the stream
          *         manifest.
          *
          * The stream kernel reads actual accelerator source blocks, not a
@@ -128,7 +131,7 @@ namespace llaminar2
             static constexpr bool is_iq1 = Codebook == 16 || Codebook == 17;
             static constexpr bool is_int8 =
                 Codebook == 19 ||
-                Codebook == kNativeVnniExpandedInt8MinCodebook;
+                Codebook == kNativeQuantisedExpandedInt8MinCodebook;
             static constexpr int payload_bytes =
                 is_int8                           ? 32
                 : is_5bit                        ? 20
@@ -154,7 +157,7 @@ namespace llaminar2
          * Multiplication scatters the four selector bits into byte-low bits.
          * Shift/subtract expands each selector to 0x00 or 0xff, after which
          * XOR-plus-carry is an independent two's-complement negate per byte.
-         * This is the same SWAR identity used by ROCm NativeVNNI inference.
+         * This is the same SWAR identity used by ROCm NativeQuantised inference.
          */
         __device__ __forceinline__ std::uint32_t applyTierIQSignsROCm(
             std::uint32_t grid4,
@@ -218,7 +221,7 @@ namespace llaminar2
          * @brief Decode one compact accelerator block into eight INT8x4 groups.
          * @tparam Codebook One of 6, 7, 9 through 17, raw-INT8 19, or
          *         normalized asymmetric INT8+minimum 23.
-         * @param payload Start of one production-packed NativeVNNI block.
+         * @param payload Start of one production-packed NativeQuantised block.
          * @param groups Receives 32 decoded integers in logical K order.
          *
          * This is the integer decode used by the production ROCm grouped MoE
@@ -432,7 +435,7 @@ namespace llaminar2
             {
                 static_assert(
                     Codebook == 19 ||
-                    Codebook == kNativeVnniExpandedInt8MinCodebook);
+                    Codebook == kNativeQuantisedExpandedInt8MinCodebook);
                 // Normalized symmetric and asymmetric INT8 share the same
                 // direct 32-byte payload.  Codebook 23's affine minimum is
                 // carried separately and is restored with metadata below.
@@ -454,13 +457,13 @@ namespace llaminar2
          */
         __device__ __forceinline__ std::size_t interleavedValueOffsetROCm(
             int local_column,
-            int value_index)
+            int value_index, unsigned columns=64)
         {
             const int group = value_index / 4;
             const int index = value_index % 4;
             const int zmm = local_column / 16;
             const int lane = local_column % 16;
-            return static_cast<std::size_t>(group) * 256u +
+            return static_cast<std::size_t>(group) * (columns*4u) +
                    static_cast<std::size_t>(zmm) * 64u +
                    static_cast<std::size_t>(lane) * 4u +
                    static_cast<std::size_t>(index);
@@ -511,19 +514,20 @@ namespace llaminar2
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
             const std::uint16_t *__restrict__ mins,
-            int N,
-            int blocks_per_row,
+            ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint32_t cpu_stride,
             std::uint8_t *__restrict__ cpu_chunk)
         {
             const std::uint32_t global_unit = first_unit + blockIdx.x;
+            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
+            const unsigned columns=expertTierWireColumns(layout,global_unit);
+            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
             const int n_chunk =
                 static_cast<int>(global_unit / blocks_per_row);
             const int kb = static_cast<int>(global_unit % blocks_per_row);
             const int local_column = static_cast<int>(threadIdx.x);
             std::uint8_t *unit =
-                cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
+                cpu_chunk + expertTierWireOffset(layout,first_unit,blockIdx.x);
 
             // Zero padding and metadata gaps before real columns publish bytes.
             initializeCpuUnitROCm(unit, cpu_stride);
@@ -533,25 +537,25 @@ namespace llaminar2
                 return;
 
             const std::size_t linear =
-                static_cast<std::size_t>(kb) * N + n;
+                static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             const std::uint8_t *source = payload + linear * 16u;
             int compensation = 0;
             for (int value = 0; value < 16; ++value)
             {
                 const std::uint8_t packed = source[value];
-                unit[interleavedValueOffsetROCm(local_column, value)] = packed;
+                unit[interleavedValueOffsetROCm(local_column, value, columns)] = packed;
                 compensation += decodeNibbleForCompensationROCm<Codebook>(
                     static_cast<std::uint8_t>(packed & 0x0fu));
                 compensation += decodeNibbleForCompensationROCm<Codebook>(
                     static_cast<std::uint8_t>(packed >> 4));
             }
-            reinterpret_cast<std::int16_t *>(unit + 1024u)[local_column] =
+            reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
                 static_cast<std::int16_t>(compensation);
-            reinterpret_cast<std::uint16_t *>(unit + 1152u)[local_column] =
+            reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
                 scales[linear];
             if constexpr (HasSecondaryMetadata)
             {
-                reinterpret_cast<std::uint16_t *>(unit + 1280u)[local_column] =
+                reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
                     mins[linear];
             }
         }
@@ -564,7 +568,7 @@ namespace llaminar2
          */
         __device__ __forceinline__ int decodedTierGroupValueROCm(
             const std::int32_t (&groups)[8],
-            int value_index)
+            int value_index, unsigned columns=64)
         {
             const std::uint32_t packed =
                 static_cast<std::uint32_t>(groups[value_index / 4]);
@@ -597,20 +601,21 @@ namespace llaminar2
             const std::uint16_t *__restrict__ scales,
             const std::uint16_t *__restrict__ mins,
             const std::uint32_t *__restrict__ emins,
-            int N,
-            int blocks_per_row,
+            ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint32_t cpu_stride,
             std::uint8_t *__restrict__ cpu_chunk)
         {
             const std::uint32_t global_unit = first_unit + blockIdx.x;
+            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
+            const unsigned columns=expertTierWireColumns(layout,global_unit);
+            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
             const int n_chunk =
                 static_cast<int>(global_unit / blocks_per_row);
             const int k_block =
                 static_cast<int>(global_unit % blocks_per_row);
             const int local_column = static_cast<int>(threadIdx.x);
             std::uint8_t *unit =
-                cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
+                cpu_chunk + expertTierWireOffset(layout,first_unit,blockIdx.x);
 
             // Whole-unit initialization makes padded N columns and metadata
             // gaps deterministic, including when a chunk starts mid-matrix.
@@ -621,7 +626,7 @@ namespace llaminar2
             if (n >= N)
                 return;
             const std::size_t linear =
-                static_cast<std::size_t>(k_block) * N + n;
+                static_cast<size_t>(k_block+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             constexpr int kPayloadBytes =
                 TierSourceTraitsROCm<Codebook>::payload_bytes;
             const std::uint8_t *source =
@@ -631,12 +636,12 @@ namespace llaminar2
 
             static_assert(Codebook == 6 || Codebook == 7 || Codebook == 11 ||
                           Codebook == 12 || Codebook == 15 || Codebook == 16 ||
-                          Codebook == 19 || Codebook == kNativeVnniExpandedInt8MinCodebook);
+                          Codebook == 19 || Codebook == kNativeQuantisedExpandedInt8MinCodebook);
             // These single-scale formats retain their exact integer domain.
             // Multi-scale sources use the native transposition kernel instead.
             for (int value = 0; value < 32; ++value)
             {
-                unit[interleavedValueOffsetROCm(local_column, value)] =
+                unit[interleavedValueOffsetROCm(local_column, value, columns)] =
                     static_cast<std::uint8_t>(static_cast<std::int8_t>(
                         decodedTierGroupValueROCm(decoded_groups, value)));
             }
@@ -647,18 +652,18 @@ namespace llaminar2
             for (int value = 0; value < 32; ++value)
             {
                 compensation += static_cast<std::int8_t>(
-                    unit[interleavedValueOffsetROCm(local_column, value)]);
+                    unit[interleavedValueOffsetROCm(local_column, value, columns)]);
             }
-            reinterpret_cast<std::int16_t *>(unit + 2048u)[local_column] =
+            reinterpret_cast<std::int16_t *>(unit + (2048u/64)*columns)[local_column] =
                 static_cast<std::int16_t>(compensation);
-            reinterpret_cast<std::uint16_t *>(unit + 2176u)[local_column] =
+            reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
                 scales[linear];
             if constexpr (
                 Codebook == 7 || Codebook == 11 || Codebook == 16 ||
-                Codebook == kNativeVnniExpandedInt8MinCodebook)
+                Codebook == kNativeQuantisedExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(
-                    unit + 2304u)[local_column] =
+                    unit + (2304u/64)*columns)[local_column] =
                     mins[linear];
             }
         }
@@ -681,72 +686,52 @@ namespace llaminar2
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
             const std::uint16_t *__restrict__ secondary_scales,
-            int N,
-            int blocks_per_row,
+            ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint32_t cpu_stride,
             std::uint8_t *__restrict__ cpu_chunk)
         {
-            const std::uint32_t global_unit = first_unit + blockIdx.x;
-            const int n_chunk =
-                static_cast<int>(global_unit / blocks_per_row);
-            const int kb = static_cast<int>(global_unit % blocks_per_row);
-            const int local_column = static_cast<int>(threadIdx.x);
-            std::uint8_t *unit =
-                cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
-
-            initializeCpuUnitROCm(unit, cpu_stride);
+            const unsigned global_unit=first_unit+blockIdx.x;
+            const unsigned columns=expertTierWireColumns(layout,global_unit);
+            const unsigned column=static_cast<unsigned>(threadIdx.x);
+            auto *unit=cpu_chunk+expertTierWireOffset(layout,first_unit,blockIdx.x);
+            if(true) initializeCpuUnitROCm(unit,(layout.cpu_block_stride/64)*columns);
             __syncthreads();
-            const int n = n_chunk * kColumnsPerUnit + local_column;
-            if (n < N)
-            {
-                const std::size_t linear =
-                    static_cast<std::size_t>(kb) * N + n;
-                const std::uint8_t *source = payload + linear * 24u;
-                for (int value = 0; value < 16; ++value)
-                {
-                    unit[interleavedValueOffsetROCm(local_column, value)] =
-                        source[value];
-                }
-                reinterpret_cast<std::uint16_t *>(unit + 1536u)[local_column] =
-                    scales[linear];
-                reinterpret_cast<std::uint16_t *>(unit + 1664u)[local_column] =
-                    secondary_scales[linear];
+            if(column>=columns)return;
+            const unsigned n=(global_unit/layout.blocks_per_row)*64+column;
+            const unsigned kb=global_unit%layout.blocks_per_row;
+            const size_t linear=size_t(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
+            for(unsigned value=0;value<16;++value) {
+                const size_t encoded=(value/4)*(columns*4)+column*4+value%4;
+                unit[encoded]=payload[linear*24+value];
             }
-
-            // Thirty-two threads each own one (group, 16-column ZMM) plane pair.
-            if (threadIdx.x < 32)
-            {
-                const int group = static_cast<int>(threadIdx.x) / 4;
-                const int zmm = static_cast<int>(threadIdx.x) % 4;
-                std::uint64_t low_plane = 0;
-                std::uint64_t high_plane = 0;
-                for (int lane = 0; lane < 16; ++lane)
-                {
-                    const int plane_n =
-                        n_chunk * kColumnsPerUnit + zmm * 16 + lane;
-                    if (plane_n >= N)
-                        continue;
-                    const std::size_t linear =
-                        static_cast<std::size_t>(kb) * N + plane_n;
-                    const std::uint8_t packed_high =
-                        payload[linear * 24u + 16u + group];
-                    for (int index = 0; index < 4; ++index)
-                    {
-                        const std::uint64_t bit =
-                            static_cast<std::uint64_t>(lane * 4 + index);
-                        const std::uint8_t high = static_cast<std::uint8_t>(
-                            (packed_high >> (index * 2)) & 0x03u);
-                        low_plane |= static_cast<std::uint64_t>(high & 1u) << bit;
-                        high_plane |= static_cast<std::uint64_t>(high >> 1u) << bit;
+            if(columns==64) {
+                // Preserve the existing complete-unit bit-plane representation.
+                // One lane owns each full plane pair; there is no shared-word RMW.
+                if(column<32) {
+                    const unsigned group=column/4,zmm=column%4;
+                    uint64_t low=0,high=0;
+                    for(unsigned lane=0;lane<16;++lane) {
+                        const unsigned source_n=(global_unit/layout.blocks_per_row)*64+zmm*16+lane+layout.gpu_first_row;
+                        const size_t source_index=size_t(kb+layout.gpu_first_column/32)*layout.gpu_N+source_n;
+                        const unsigned original=payload[source_index*24+16+group];
+                        for(unsigned index=0;index<4;++index) {
+                            low|=uint64_t((original>>(2*index))&1)<<(lane*4+index);
+                            high|=uint64_t((original>>(2*index+1))&1)<<(lane*4+index);
+                        }
                     }
+                    auto* planes=reinterpret_cast<uint64_t*>(unit+1024+group*64+zmm*16);
+                    planes[0]=low;planes[1]=high;
                 }
-                std::uint64_t *planes = reinterpret_cast<std::uint64_t *>(
-                    unit + 1024u + static_cast<std::size_t>(group) * 64u +
-                    static_cast<std::size_t>(zmm) * 16u);
-                planes[0] = low_plane;
-                planes[1] = high_plane;
+            } else for(unsigned group=0;group<8;++group) {
+                unsigned converted=0;const unsigned original=payload[linear*24+16+group];
+                for(unsigned index=0;index<4;++index) {
+                    converted|=((original>>(2*index))&1)<<index;
+                    converted|=((original>>(2*index+1))&1)<<(4+index);
+                }
+                unit[16*columns+group*columns+column]=static_cast<uint8_t>(converted);
             }
+            reinterpret_cast<uint16_t*>(unit+24*columns)[column]=scales[linear];
+            reinterpret_cast<uint16_t*>(unit+26*columns)[column]=secondary_scales[linear];
         }
 
         /**
@@ -758,15 +743,16 @@ namespace llaminar2
         template <bool HasSecondaryMetadata>
         __global__ void cpuToGpuNibbleUnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
-            int N,
-            int blocks_per_row,
+            ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint32_t cpu_stride,
             std::uint8_t *__restrict__ payload,
             std::uint16_t *__restrict__ scales,
             std::uint16_t *__restrict__ mins)
         {
             const std::uint32_t global_unit = first_unit + blockIdx.x;
+            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
+            const unsigned columns=expertTierWireColumns(layout,global_unit);
+            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
             const int n_chunk =
                 static_cast<int>(global_unit / blocks_per_row);
             const int kb = static_cast<int>(global_unit % blocks_per_row);
@@ -776,21 +762,21 @@ namespace llaminar2
                 return;
 
             const std::uint8_t *unit =
-                cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
+                cpu_chunk + expertTierWireOffset(layout,first_unit,blockIdx.x);
             const std::size_t linear =
-                static_cast<std::size_t>(kb) * N + n;
+                static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             std::uint8_t *destination = payload + linear * 16u;
             for (int value = 0; value < 16; ++value)
             {
                 destination[value] =
-                    unit[interleavedValueOffsetROCm(local_column, value)];
+                    unit[interleavedValueOffsetROCm(local_column, value, columns)];
             }
             scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + 1152u)[local_column];
+                reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column];
             if constexpr (HasSecondaryMetadata)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + 1280u)[local_column];
+                    unit + (1280u/64)*columns)[local_column];
             }
         }
 
@@ -814,15 +800,16 @@ namespace llaminar2
         template <bool Asymmetric, std::uint8_t SourceCodebook = 19>
         __global__ void cpuToGpuExpandedUnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
-            int N,
-            int blocks_per_row,
+            ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint32_t cpu_stride,
             std::uint8_t *__restrict__ payload,
             std::uint16_t *__restrict__ scales,
             std::uint16_t *__restrict__ mins)
         {
             const std::uint32_t global_unit = first_unit + blockIdx.x;
+            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
+            const unsigned columns=expertTierWireColumns(layout,global_unit);
+            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
             const int n_chunk =
                 static_cast<int>(global_unit / blocks_per_row);
             const int kb = static_cast<int>(global_unit % blocks_per_row);
@@ -832,14 +819,14 @@ namespace llaminar2
                 return;
 
             const std::uint8_t *unit =
-                cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
+                cpu_chunk + expertTierWireOffset(layout,first_unit,blockIdx.x);
             const std::size_t linear =
-                static_cast<std::size_t>(kb) * N + n;
+                static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             if constexpr (SourceCodebook == 11)
             {
                 static_assert(!Asymmetric, "IQ3_S raw source nibble is not an additive minimum");
-                const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit + 2304u)[local_column];
-                if (!native_vnni_iq3s_scale::valid(raw)) __builtin_trap();
+                const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit + (2304u/64)*columns)[local_column];
+                if (!native_quantised_iq3s_scale::valid(raw)) __builtin_trap();
                 std::uint8_t low[8]{};
                 std::uint8_t high = 0;
                 std::uint8_t signs[4]{};
@@ -850,8 +837,8 @@ namespace llaminar2
 #pragma unroll
                     for (unsigned lane = 0; lane < 4; ++lane)
                         values[lane] = static_cast<std::int8_t>(unit[
-                            interleavedValueOffsetROCm(local_column, group * 4 + lane)]);
-                    const auto encoded = native_vnni_iq3s_scale::encodeGridQuartet(values,kTierIQ3SGridROCm);
+                            interleavedValueOffsetROCm(local_column, group * 4 + lane, columns)]);
+                    const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(values,kTierIQ3SGridROCm);
                     if (!encoded.valid()) __builtin_trap();
                     low[group] = static_cast<std::uint8_t>(encoded.index);
                     high |= static_cast<std::uint8_t>((encoded.index >> 8) << group);
@@ -864,7 +851,7 @@ namespace llaminar2
                 destination[8] = high;
 #pragma unroll
                 for (unsigned byte = 0; byte < 4; ++byte) destination[9 + byte] = signs[byte];
-                scales[linear] = reinterpret_cast<const std::uint16_t *>(unit + 2176u)[local_column];
+                scales[linear] = reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
                 mins[linear] = raw;
                 return;
             }
@@ -873,14 +860,14 @@ namespace llaminar2
             for (int value = 0; value < 32; ++value)
             {
                 destination[value] =
-                    unit[interleavedValueOffsetROCm(local_column, value)];
+                    unit[interleavedValueOffsetROCm(local_column, value, columns)];
             }
             scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + 2176u)[local_column];
+                reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
             if constexpr (Asymmetric)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + 2304u)[local_column];
+                    unit + (2304u/64)*columns)[local_column];
             }
         }
 
@@ -899,58 +886,40 @@ namespace llaminar2
          */
         __global__ void cpuToGpuQ6UnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
-            int N,
-            int blocks_per_row,
+            ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint32_t cpu_stride,
             std::uint8_t *__restrict__ payload,
             std::uint16_t *__restrict__ scales,
             std::uint16_t *__restrict__ secondary_scales)
         {
-            const std::uint32_t global_unit = first_unit + blockIdx.x;
-            const int n_chunk =
-                static_cast<int>(global_unit / blocks_per_row);
-            const int kb = static_cast<int>(global_unit % blocks_per_row);
-            const int local_column = static_cast<int>(threadIdx.x);
-            const int n = n_chunk * kColumnsPerUnit + local_column;
-            if (n >= N)
-                return;
-
-            const std::uint8_t *unit =
-                cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
-            const std::size_t linear =
-                static_cast<std::size_t>(kb) * N + n;
-            std::uint8_t *destination = payload + linear * 24u;
-            for (int value = 0; value < 16; ++value)
-            {
-                destination[value] =
-                    unit[interleavedValueOffsetROCm(local_column, value)];
+            const unsigned global_unit=first_unit+blockIdx.x;
+            const unsigned columns=expertTierWireColumns(layout,global_unit);
+            const unsigned column=static_cast<unsigned>(threadIdx.x);
+            auto *unit=cpu_chunk+expertTierWireOffset(layout,first_unit,blockIdx.x);
+            if(column>=columns)return;
+            const unsigned n=(global_unit/layout.blocks_per_row)*64+column;
+            const unsigned kb=global_unit%layout.blocks_per_row;
+            const size_t linear=size_t(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
+            for(unsigned value=0;value<16;++value) {
+                const size_t encoded=(value/4)*(columns*4)+column*4+value%4;
+                payload[linear*24+value]=unit[encoded];
             }
-            const int zmm = local_column / 16;
-            const int lane = local_column % 16;
-            for (int group = 0; group < 8; ++group)
-            {
-                const std::uint64_t *planes =
-                    reinterpret_cast<const std::uint64_t *>(
-                        unit + 1024u + static_cast<std::size_t>(group) * 64u +
-                        static_cast<std::size_t>(zmm) * 16u);
-                std::uint8_t packed_high = 0;
-                for (int index = 0; index < 4; ++index)
-                {
-                    const std::uint64_t bit =
-                        static_cast<std::uint64_t>(lane * 4 + index);
-                    const std::uint8_t high = static_cast<std::uint8_t>(
-                        ((planes[0] >> bit) & 1u) |
-                        (((planes[1] >> bit) & 1u) << 1u));
-                    packed_high |= static_cast<std::uint8_t>(
-                        high << (index * 2));
+            for(unsigned group=0;group<8;++group) {
+                unsigned original;
+                if(columns==64) {
+                    const auto* planes=reinterpret_cast<const uint64_t*>(unit+1024+group*64+(column/16)*16);
+                    const auto bit=(column%16)*4;
+                    original=static_cast<unsigned>(((planes[0]>>bit)&15)|(((planes[1]>>bit)&15)<<4));
+                } else original=unit[16*columns+group*columns+column];
+                unsigned converted=0;
+                for(unsigned index=0;index<4;++index) {
+                    converted|=((original>>index)&1)<<(2*index);
+                    converted|=((original>>(4+index))&1)<<(2*index+1);
                 }
-                destination[16 + group] = packed_high;
+                payload[linear*24+16+group]=static_cast<uint8_t>(converted);
             }
-            scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + 1536u)[local_column];
-            secondary_scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + 1664u)[local_column];
+            scales[linear]=reinterpret_cast<const uint16_t*>(unit+24*columns)[column];
+            secondary_scales[linear]=reinterpret_cast<const uint16_t*>(unit+26*columns)[column];
         }
 
         /**
@@ -973,7 +942,7 @@ namespace llaminar2
                    first_unit < layout.unit_count &&
                    unit_count <= layout.unit_count - first_unit &&
                    unit_count <= layout.maximum_units_per_chunk &&
-                   cpu_chunk_capacity >= layout.chunkBytes(unit_count);
+                   cpu_chunk_capacity >= layout.chunkBytes(unit_count,first_unit);
         }
     } // namespace
 
@@ -1055,63 +1024,58 @@ namespace llaminar2
         const dim3 grid(unit_count);
         const dim3 block(kColumnsPerUnit);
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsROCm<true><<<grid, block, 0, hip_stream>>>(
                 source, {}, nullptr, device_cpu_chunk, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             hipLaunchKernelGGL((gpuToCpuDecodedUnitsROCm<11>), grid, block, 0,
                 hip_stream, source.payload, source.scales, source.mins, source.emins,
-                layout.N, layout.blocks_per_row, first_unit, layout.cpu_block_stride, device_cpu_chunk);
+                layout, first_unit, device_cpu_chunk);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
             hipLaunchKernelGGL((gpuToCpuNibbleUnitsROCm<4, true>), grid, block, 0,
-                hip_stream, source.payload, source.scales, source.mins, layout.N,
-                layout.blocks_per_row, first_unit, layout.cpu_block_stride, device_cpu_chunk);
+                hip_stream, source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk);
             return hipPeekAtLastError() == hipSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
         {
             if (layout.gpu_codebook_id == 0)
             {
                 hipLaunchKernelGGL(
                     (gpuToCpuNibbleUnitsROCm<0, false>), grid, block, 0,
                     hip_stream, source.payload, source.scales, source.mins,
-                    layout.N, layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, device_cpu_chunk);
+                    layout, first_unit, device_cpu_chunk);
             }
             else if (layout.gpu_codebook_id == 4)
             {
                 hipLaunchKernelGGL(
                     (gpuToCpuNibbleUnitsROCm<4, false>), grid, block, 0,
                     hip_stream, source.payload, source.scales, source.mins,
-                    layout.N, layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, device_cpu_chunk);
+                    layout, first_unit, device_cpu_chunk);
             }
             else
             {
                 hipLaunchKernelGGL(
                     (gpuToCpuNibbleUnitsROCm<5, true>), grid, block, 0,
                     hip_stream, source.payload, source.scales, source.mins,
-                    layout.N, layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, device_cpu_chunk);
+                    layout, first_unit, device_cpu_chunk);
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
 #define LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(CODEBOOK)                    \
     hipLaunchKernelGGL(                                               \
         (gpuToCpuDecodedUnitsROCm<CODEBOOK>), grid, block, 0,         \
         hip_stream, source.payload, source.scales, source.mins,       \
-        source.emins, layout.N, layout.blocks_per_row, first_unit,    \
-        layout.cpu_block_stride, device_cpu_chunk)
+        source.emins, layout, first_unit, device_cpu_chunk)
             switch (layout.gpu_codebook_id)
             {
             case 6:
@@ -1135,9 +1099,9 @@ namespace llaminar2
             case 19:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(19);
                 break;
-            case kNativeVnniExpandedInt8MinCodebook:
+            case kNativeQuantisedExpandedInt8MinCodebook:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(
-                    kNativeVnniExpandedInt8MinCodebook);
+                    kNativeQuantisedExpandedInt8MinCodebook);
                 break;
             default:
                 return false;
@@ -1148,8 +1112,7 @@ namespace llaminar2
         {
             hipLaunchKernelGGL(
                 gpuToCpuQ6UnitsROCm, grid, block, 0, hip_stream,
-                source.payload, source.scales, source.mins, layout.N,
-                layout.blocks_per_row, first_unit, layout.cpu_block_stride,
+                source.payload, source.scales, source.mins, layout, first_unit,
                 device_cpu_chunk);
         }
         return hipPeekAtLastError() == hipSuccess;
@@ -1183,67 +1146,57 @@ namespace llaminar2
         const dim3 block(kColumnsPerUnit);
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsROCm<false><<<grid, block, 0, hip_stream>>>(
                 {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             hipLaunchKernelGGL((cpuToGpuExpandedUnitsROCm<false,11>), grid, block, 0,
-                hip_stream, device_cpu_chunk, layout.N, layout.blocks_per_row, first_unit,
-                layout.cpu_block_stride, destination.payload, destination.scales, destination.mins);
+                hip_stream, device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
             hipLaunchKernelGGL((cpuToGpuNibbleUnitsROCm<true>), grid, block, 0,
-                hip_stream, device_cpu_chunk, layout.N, layout.blocks_per_row, first_unit,
-                layout.cpu_block_stride, destination.payload, destination.scales, destination.mins);
+                hip_stream, device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
             return hipPeekAtLastError() == hipSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
         {
             if (layout.cpu_is_asymmetric != 0)
             {
                 hipLaunchKernelGGL(
                     (cpuToGpuNibbleUnitsROCm<true>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout.N,
-                    layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, destination.payload,
+                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
                     destination.scales, destination.mins);
             }
             else
             {
                 hipLaunchKernelGGL(
                     (cpuToGpuNibbleUnitsROCm<false>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout.N,
-                    layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, destination.payload,
+                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
                     destination.scales, destination.mins);
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
             if (layout.cpu_is_asymmetric != 0)
             {
                 hipLaunchKernelGGL(
                     (cpuToGpuExpandedUnitsROCm<true>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout.N,
-                    layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, destination.payload,
+                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
                     destination.scales, destination.mins);
             }
             else
             {
                 hipLaunchKernelGGL(
                     (cpuToGpuExpandedUnitsROCm<false>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout.N,
-                    layout.blocks_per_row, first_unit,
-                    layout.cpu_block_stride, destination.payload,
+                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
                     destination.scales, destination.mins);
             }
         }
@@ -1251,8 +1204,7 @@ namespace llaminar2
         {
             hipLaunchKernelGGL(
                 cpuToGpuQ6UnitsROCm, grid, block, 0, hip_stream,
-                device_cpu_chunk, layout.N, layout.blocks_per_row, first_unit,
-                layout.cpu_block_stride, destination.payload,
+                device_cpu_chunk, layout, first_unit, destination.payload,
                 destination.scales, destination.mins);
         }
         return hipPeekAtLastError() == hipSuccess;

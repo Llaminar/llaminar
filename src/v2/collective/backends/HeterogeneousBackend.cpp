@@ -9,6 +9,8 @@
  * streams, then completes an authenticated host-observed ticket only after all
  * terminal destination events are ready. Ordinary inference threads never
  * guess a stream or treat submission as output completion.
+ * Bridge progress is independently schedulable across the caller's admitted
+ * OpenMP partition; resource preparation retains its original placement.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -22,6 +24,7 @@
 #include "../../utils/PerfStatsCollector.h"
 #include "../../backends/rocm/ROCmBackend.h" // For ROCmBackend::deviceToDevice
 #include "../../backends/BackendManager.h"   // For getBackend()
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -349,6 +352,10 @@ namespace llaminar2
         async_bridge_ready_ = true;
         try
         {
+            // Progress must not inherit an inference master's single place.
+            // Keep all prepared-resource work outside this construction scope;
+            // only the new worker inherits the existing admitted partition.
+            const ScopedOpenMPPartitionAffinity control_affinity;
             async_worker_ = std::thread(
                 &HeterogeneousBackend::asyncBridgeWorkerMain,
                 this);

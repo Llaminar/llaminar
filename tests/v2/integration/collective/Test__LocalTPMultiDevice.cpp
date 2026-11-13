@@ -17,6 +17,7 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include <memory>
 #include <vector>
@@ -982,6 +983,8 @@ TEST_F(Test__LocalTPMultiDevice, ConfigValidation_EmptyDevices)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

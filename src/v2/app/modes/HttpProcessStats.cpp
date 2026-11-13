@@ -6,8 +6,11 @@
  * of paths rather than scanning directories. CPU percentages use monotonic
  * interval deltas, with 100% meaning one occupied core. Shared-memory/file-cache
  * observations keep their kernel scopes instead of being added to process RSS.
+ * The independent collector inherits the admitted CPU partition, while its
+ * creator retains the exact OpenMP compute placement it had before startup.
  */
 #include "HttpProcessStats.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <array>
@@ -268,6 +271,9 @@ namespace llaminar2
     {
         if (interval_.count() <= 0) throw std::invalid_argument("process stats interval must be positive");
         if (!collector_) collector_ = HttpProcessStatsReader(std::move(options.filesystems));
+        // Background OS probes must not compete only on the inference master's
+        // OpenMP place. This scope changes child eligibility, not rank ownership.
+        const ScopedOpenMPPartitionAffinity collector_affinity;
         worker_ = std::jthread([this](std::stop_token stop) { collect(stop); });
     }
 

@@ -162,7 +162,7 @@ class ROCmMoEGroupedPrefillTrainerTest(unittest.TestCase):
         self.assertEqual(summary[0]["tile_m"], "16")
         self.assertEqual(summary[0]["tile_n"], "128")
         self.assertEqual(summary[0]["source_format_count"], "3")
-        self.assertIn("common NativeVNNI alias-robust exact oracle", generated)
+        self.assertIn("common NativeQuantised alias-robust exact oracle", generated)
         self.assertIn("{19, 0, -2, 32, {16, 128}}", generated)
 
     def test_opposing_aliases_choose_lowest_worst_surface_regret(self) -> None:

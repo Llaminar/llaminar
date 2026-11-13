@@ -12,6 +12,8 @@
 
 #include "MoEOverlayDistributedResidencyProtocol.h"
 #include "MoEOverlayWireIO.h"
+#include "MoEExpertShardCohort.h"
+#include <map>
 
 #include <algorithm>
 #include <limits>
@@ -170,6 +172,59 @@ namespace llaminar2
                 static_cast<std::uint64_t>(owner_map.owners().size()));
             for (const auto &owner : owner_map.owners())
                 addOwner(digest, owner);
+            // Whole-only fingerprints retain their historical recipe. Joint maps
+            // bind each fixed tier declaration once, plus every dense assignment
+            // above. Only semantic metadata enters the existing identity.
+            std::map<std::pair<int, int>, const MoEExpertShardCohort *> cohorts;
+            for (const auto &owner : owner_map.owners())
+                if (owner.shard_cohort)
+                    cohorts.emplace(std::pair{owner.layer_idx, owner.tier_idx}, owner.shard_cohort.get());
+            if (!cohorts.empty())
+            {
+                digest.addString("OriginalCPUShardCohorts/v1");
+                digest.addScalar(uint64_t(cohorts.size()));
+                for (const auto &[coordinate, cohort] : cohorts)
+                {
+                    digest.addScalar(coordinate.first);
+                    digest.addScalar(coordinate.second);
+                    const auto &source = cohort->source();
+                    digest.addScalar(source.layer_idx);
+                    digest.addScalar(uint64_t(cohort->participants().size()));
+                    const auto geometry = cohort->ownership(0).geometry();
+                    digest.addScalar(geometry.experts);
+                    digest.addScalar(geometry.model_columns);
+                    digest.addScalar(geometry.intermediate_columns);
+                    for (const auto &projection : source.projections)
+                    {
+                        digest.addScalar(projection.projection);
+                        digest.addScalar(projection.N);
+                        digest.addScalar(projection.K);
+                        digest.addScalar(projection.format.kind);
+                        digest.addScalar(projection.format.native_quantised.present);
+                        digest.addScalar(projection.format.native_quantised.codebook_id);
+                        digest.addScalar(projection.format.native_quantised.is_superblock);
+                    }
+                    for (size_t index = 0; index < cohort->participants().size(); ++index)
+                    {
+                        const auto &member = cohort->participants()[index];
+                        digest.addScalar(member.participant_id);
+                        digest.addScalar(member.world_rank);
+                        addAddress(digest, member.address);
+                        for (const auto role : {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp,
+                                                WeightRole::MoEExpertDown})
+                        {
+                            const auto rectangle = cohort->ownership(index).projection(role);
+                            digest.addScalar(rectangle.residence);
+                            digest.addScalar(rectangle.source_rows);
+                            digest.addScalar(rectangle.source_columns);
+                            digest.addScalar(rectangle.first_row);
+                            digest.addScalar(rectangle.rows);
+                            digest.addScalar(rectangle.first_column);
+                            digest.addScalar(rectangle.columns);
+                        }
+                    }
+                }
+            }
         }
 
         /** @brief Mix tier policy that affects thermal scoring and capacity. */
@@ -260,7 +315,7 @@ namespace llaminar2
         {
             digest.addScalar(snapshot.epoch);
             addPlacementPolicy(digest, *snapshot.placement_plan);
-            addOwnerMap(digest, snapshot.owner_map);
+            addOwnerMap(digest, snapshot.placementOwnerMap());
             addLayeredOwnership(digest, snapshot.layered_ownership);
         }
 
@@ -824,7 +879,7 @@ namespace llaminar2
             for (const auto &entry : plan.entries)
             {
                 digest.addScalar(entry.candidate_tier_idx);
-                digest.addScalar(entry.candidate_owner_participant);
+                digest.addScalar(entry.candidate_target.word());
                 digest.addScalar(entry.changed);
                 digest.addScalar(entry.axis);
                 digest.addScalar(entry.activation_count);
@@ -1044,7 +1099,7 @@ namespace llaminar2
             writeLittleEndian(
                 destination,
                 offset,
-                entry.candidate_owner_participant);
+                entry.candidate_target.word());
             const std::uint32_t axis_code =
                 entry.changed
                     ? static_cast<std::uint32_t>(entry.axis) + 1u
@@ -1166,8 +1221,8 @@ namespace llaminar2
         {
             entry.candidate_tier_idx =
                 readLittleEndian<std::int32_t>(packet, offset);
-            entry.candidate_owner_participant =
-                readLittleEndian<std::int32_t>(packet, offset);
+            entry.candidate_target = MoEOverlayRouteTarget::fromWord(
+                readLittleEndian<std::int32_t>(packet, offset));
             const std::uint32_t axis_code =
                 readLittleEndian<std::uint32_t>(packet, offset);
             if (axis_code > 3u)

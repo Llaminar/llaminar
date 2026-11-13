@@ -48,6 +48,13 @@ The graph is participant-local. Cross-device or cross-rank movement is an
 explicit collective or pipeline transfer. A compute stage must not conceal a
 nested multi-device graph.
 
+`DeviceGraphOrchestratorServingGraphFamily.cpp` owns the physical implementation
+of cold serving-family preparation: prefill, ordinary decode, exact MTP variants
+and the ordered reset/seal. These remain methods of the same orchestrator, with
+the same arena, workspace and captured-executable owners. The internal
+`MTPGraphPolicyScopes` implementation is shared by setup and live forwarding;
+file placement introduces no alternate policy or execution owner.
+
 ## 2. Application and configuration
 
 ### 2.1 Application lifecycle
@@ -125,8 +132,11 @@ reclassify connections from measured bandwidth.
 
 Cluster publication uses the complete driver-visible hardware observation,
 not DeviceManager's socket-local execution view. CPU affinity binds the CPU
-endpoint but never removes GPUs on another socket; the planner uses GPU NUMA
-identity to prefer an owner later. This applies equally to plan, describe and
+endpoint but never removes GPUs on another socket. Execution and native
+calibration ownership require the GPU's observed NUMA node to equal its rank's
+observed CPU NUMA node. Visibility alone grants no execution ownership; unknown
+locality cannot authorize a GPU. A one-rank launch publishes its exact observed
+node too; a genuinely unqualified whole-host CPU observation remains CPU-only. This applies equally to plan, describe and
 serve, including hostfiles with just one discovery rank on a multi-socket host.
 Projecting another view reuses that observation without driver rediscovery.
 
@@ -201,12 +211,14 @@ CPU zero or a rank-derived hostname. Domain compilation preserves endpoint,
 parent rank and proportional work as one tuple when sorting participants.
 The same tuple supplies named global-stage construction and rank-local plans.
 
-`RankHardwareOwnership` is the shared CPU ownership query used by ordinary
-placement and ExpertOverlay binding. Bound ranks own their observed NUMA
-endpoint; whole-host observations require explicit physical-node detail.
+`RankHardwareOwnership` supplies the shared CPU and GPU ownership queries used
+by ordinary placement, ExpertOverlay binding and native preparation. Bound
+ranks own their observed CPU NUMA endpoint; whole-host CPU observations require
+explicit physical-node detail. GPU execution ownership requires two known,
+equal GPU and rank CPU NUMA identities, including cache-only, coordinator and
+follower roles. Explicit remote owners are rejected rather than rebound.
 Neither MPI local-rank order nor NUMA-node count establishes a physical ID.
-GPU owner preference compares its observed locality with observed CPU affinity,
-so reordered communicators and moved cards retain the correct physical owner.
+Reordered communicators preserve the original physical owner.
 
 ### 2.2 User configuration
 
@@ -394,7 +406,9 @@ origin is explicit in its BOM: only local GGUF reading needs reader staging.
 
 `PlanningKernelServiceCatalog` collects those observations before root-only
 candidate pricing. Reporter selection uses physical node, backend and GPU UUID,
-deduplicating ordinal-remapped visibility and preferring observed NUMA affinity.
+deduplicating ordinal-remapped visibility among reporters with matching
+observed GPU and rank CPU NUMA identities. A remote observer cannot substitute
+for a missing local GPU reporter.
 CPU observations remain qualified by discovery rank, observed NUMA scope and
 the measured worker/ISA identity; a whole-host measurement is not a socket
 measurement. Neither receipt contents nor elapsed time can assign rank or
@@ -509,9 +523,10 @@ precision to match its samples.
 
 `PlanningCommunicationService` collects native collective, GPU/host and host-MPI evidence
 through the existing failure-atomic discovery publication. Its sample basis is
-physical, not per candidate: maximal homogeneous rank-visible GPU groups are
-deduplicated by node/backend/UUID set, with one common affinity-preferred rank
-observing each group. The communicator itself keeps that rank's production
+physical, not per candidate: maximal homogeneous NUMA-local executable GPU
+groups are deduplicated by node/backend/UUID set, with one eligible local rank
+observing each group. Cross-rank CPU communication keeps its actual participant
+and payload identities; GPU locality does not erase those communication edges. The communicator itself keeps that rank's production
 ordinal order; UUID sorting is only a deduplication key, never a replacement
 ring order. Receipts retain the actual ordered group, reporting rank, native
 wire precision, payload and both completed graph phases. They do not certify
@@ -530,9 +545,14 @@ capacity query or live ledger.
 
 `PlanningHostDeviceMeasurement` uses that same collection transaction for DMA
 and mapped-kernel byte copies in both directions. Each observation binds the
-physical GPU to the reporting rank's host first-touch scope; GPU affinity does
-not relabel those pages. TransferEngine supplies the prepared exact-stream lane
-and canonical mapped backing extent. Retained graph timing excludes setup,
+physical GPU's original NUMA-local executor to a distinct original same-machine
+host first-touch rank and its observed NUMA. The host role owns the PMA-backed
+shared pages and touches them before registration; only the GPU role owns native
+execution. Same-rank samples use that same protocol with one participant. Existing
+all-rank agreement retains both roles through graph and registration retirement.
+No GPU visibility or another rank's curve substitutes for either ownership role.
+TransferEngine supplies the prepared exact-stream lane and canonical mapped
+backing extent. Retained graph timing excludes setup,
 fresh host publication and exact-byte readback verification. These are byte
 primitives, not complete activation-packet/wait-kernel service; full request
 dependency/cost composition remains a separate responsibility.
@@ -908,11 +928,35 @@ same role. Disjoint PP followers retain rollback state for their own main
 layers but never allocate shifted predictor caches; the terminal vocabulary
 owner retains those caches. A same-layer TP replica is not a PP follower.
 
+The explicit single-GPU adaptive ngram policy uses separate native physical
+slot, policy/coordinator and source roots retained by the original ModelContext.
+`AdaptiveImmutableLookupGeometry` derives their exact C0 floor and selected
+slot-dependent root portions from the same native layout factories. The final
+existing PMA candidate adds those portions and optional GPU/RAM caches to the
+frozen execution plan; explicit GPU cache limits include native/source bank
+growth. Original PLE hashes remain packed INT64 values. The flat PLE builder
+expands the original device-owned token range by sixteen heads and wires the
+complete retained source/owner transaction between hashing and projections.
+Frame work is observed before grants retire, then committed to the original
+terminal controller only after every source/owner/coordinator retirement. This
+single-GPU implementation does not admit distributed owners or replace the
+separate typed transport and continuation qualification obligations.
+
 `PhysicalMemoryAuthority` owns the canonical physical admission, reservation,
 materialization, and release ledger. Planners contribute typed BOMs, not live
 capacity arithmetic. Opaque native graph pools are admitted as complete retained
 families through `GPUGraphMemoryContract`; an individual pool-growth observation
 is diagnostic evidence, not bytes owned by the graph that triggered it.
+
+Opaque context, lookup-ordering, remote-graph and retained CPU-service resources
+use conservative rounded allowances selected by supported backend and typed
+resource family. Native loader admission owns ABI compatibility. Development
+source/provider fingerprints, historical object sizes and measured population
+counts do not select these allowances. Current stack, guard, object and explicit
+buffer geometry remains exact; rank planning carries that original declaration
+through the existing pricing protocol and validates it again at local binding.
+Declared resource multiplicity contributes to the same PMA plan. Runtime samples
+are health and regression evidence, never byte-exact opaque admission ceilings.
 
 GPU planning samplers separate persistent native execution-context storage
 from executable storage before instantiation. After sealing a CUDA graph,
@@ -976,6 +1020,35 @@ memory class as captured topology. Before native instantiation, CUDA/HIP inspect
 the helper's actual node count and kinds; nested/control graphs cannot claim a
 small flat-helper reservation. Request reset preserves this class and graph
 identity. The guard adds no replay-time queries or ordering edges.
+
+`DeviceGenerationExecutionPolicy` declares the complete parent boundary before
+capture and memory admission. Hosted MTP retains every verifier width from two
+through capacity plus one, selected by the existing authenticated depth ticket.
+Native conditional parents retain their bounded family and dynamic maximum
+shape. Each exact width owns its original model-forward identity, preparation,
+publication and stochastic helper geometry; cold capture never fabricates a
+sibling signature by editing a live key. Publication and pipeline follower
+parents are counted per query program, while stochastic helper families remain
+shared. `MTPGraphOwnerPlan` owns these directory counts. Serving inventory requires
+explicit family, parent role and generation domain; each GPU validates their
+consistency. Pipeline scope authentication and retained admission identity also
+include that domain. Ordinary auxiliary owners follow the declared policy and
+sampling role, so hosted CUDA has the same required children as hosted ROCm.
+Prefill has one query program; fixed decode/condition/verifier forwards retain
+all main-model query programs independently of snapshot topology variants.
+The initial transaction executes only its selected depth. Before publishing the
+complete hosted family, setup materializes any unused chained predictor and
+draft-publication slots from authenticated persistent owners without launching
+them. A shallow first request cannot leave deeper branches uninitialized, and
+request reset cannot depend on executing drafts to recreate graph topology.
+Hosted dynamic response continuation enters this retained family through the
+native admission ticket at transaction zero, preserving the device-owned learned
+depth. Typed entry authenticates the unchanged family without materializing or
+replacing children; later tickets retain strict positive contiguous ordinals.
+Publication exports resolve their requested physical width directly, independent
+of any setup-selected child. Continuation stages its condition and terminal
+hidden state through their ordered device publications, with no host depth or
+token shadow becoming execution authority.
 
 ### 6.2 Weight lifecycle
 
@@ -1769,7 +1842,7 @@ The test hierarchy mirrors ownership:
 1. Extend the typed kernel interface only when the operation contract changes.
 2. Register backend dispatch through `KernelFactory`.
 3. Preserve exact arithmetic and backend symmetry where supported.
-4. Use the matching CPU, CUDA, ROCm, or NativeVNNI tuning skill for correctness
+4. Use the matching CPU, CUDA, ROCm, or NativeQuantised tuning skill for correctness
    and economy gates.
 
 ## 12. Source map

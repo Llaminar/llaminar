@@ -177,7 +177,7 @@ namespace llaminar2::test
                     .plan = {.expected_epoch = static_cast<std::uint64_t>(generation + 1),
                         .num_layers = layers, .num_experts = experts, .histogram_window = source,
                         .entries = std::vector<MoEOverlayAuthoritativeResidencyEntry>(layers * experts,
-                            {.candidate_tier_idx = 0, .candidate_owner_participant = 0})},
+                            {.candidate_tier_idx = 0, .candidate_target = MoEOverlayRouteTarget::whole(0)})},
                     .execution_fingerprint = {.low = 1, .high = 2},
                     .policy_fingerprint = {.low = 3, .high = 4},
                 };

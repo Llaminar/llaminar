@@ -5,6 +5,8 @@
  * These tests verify ordinary and fused-bundle workspace declarations for ROCm
  * GEMM kernels. Tests run on the CPU backend without requiring ROCm hardware;
  * kernel construction and requirement calculation are host-only operations.
+ * Native kernel declarations require a compiled ROCm backend. The generic
+ * workspace-contract tests remain available in CPU-only builds.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -400,6 +402,7 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, LMHeadRequiresLargeBudget)
     EXPECT_LT(total, 256 * 1024 * 1024); // Should fit in 256MB for decode
 }
 
+#ifdef HAVE_ROCM
 TEST_F(Test__ROCmQuantisedGemmKernel_Workspace,
        LargeSingletonDoesNotReserveFusedProjectionArena)
 {
@@ -474,3 +477,4 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace,
         batched->size_bytes,
         kGraphSafeSplitK * kSimultaneousColumns * sizeof(float));
 }
+#endif

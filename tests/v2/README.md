@@ -171,7 +171,6 @@ The V2 test infrastructure uses CMake's **FIXTURES** system to manage dependenci
 ```
 mpirun -np 2 --bind-to socket --map-by socket \
   --mca mpi_leave_pinned 1 \
-  --mca btl_vader_single_copy_mechanism none \
   v2_test_tensor_basics
 
 Environment:
@@ -185,7 +184,6 @@ Environment:
 mpirun -np 2 --bind-to socket --map-by socket \
   --oversubscribe \
   --mca mpi_leave_pinned 1 \
-  --mca btl_vader_single_copy_mechanism none \
   v2_test_tensor_basics
 
 Environment:

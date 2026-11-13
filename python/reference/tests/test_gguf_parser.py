@@ -13,6 +13,7 @@ Tests for GGUF file format parsing including:
 import unittest
 import tempfile
 import struct
+import numpy as np
 from pathlib import Path
 
 import sys
@@ -22,6 +23,7 @@ from python.reference.loaders.gguf_parser import (
     GGUFParser,
     GGUFValueType,
     GGUFTensorType,
+    GGUFTensorInfo,
 )
 
 
@@ -77,6 +79,119 @@ def _write_synthetic_split_shard(
         padding = (-handle.tell()) % GGUFParser.ALIGNMENT
         handle.write(b"\0" * padding)
         handle.write(struct.pack(f"<{len(tensor_values)}f", *tensor_values))
+
+
+def _write_iq4_nl_row_fixture(path: Path) -> bytes:
+    """Persist three exact160-element IQ4_NL rows followed by non-tensor poison."""
+    payload = b''.join(struct.pack('<e', float(row + 1)) + bytes([0x88]) * 16
+                       for row in range(3) for _ in range(5))
+    with path.open('wb') as handle:
+        handle.write(b'GGUF' + struct.pack('<IQQ', 3, 1, 0))
+        _write_gguf_string(handle, 'per_layer_token_embd.weight')
+        handle.write(struct.pack('<IQQIQ', 2, 160, 3, int(GGUFTensorType.IQ4_NL), 0))
+        handle.write(b'\0' * ((-handle.tell()) % GGUFParser.ALIGNMENT))
+        handle.write(payload)
+        handle.write(b'\xa5' * 1024)
+    return payload
+
+
+class TestGGUFNativePayloadExtent(unittest.TestCase):
+    """Native views must end at codebook payloads, including the final expert."""
+
+    def test_q5_1_expert_stride_excludes_trailing_file_bytes(self):
+        """Q5_1's24-byte blocks retain original expert511 bytes without a guessed stride."""
+        from python.reference.generate_moe_route_conditioned_reference import expert_matrix
+
+        def block(scale, minimum):
+            codes = np.arange(32, dtype=np.uint8)
+            nibbles = codes[:16] % 16 | ((codes[16:] % 16) << 4)
+            return struct.pack('<eeI', scale, minimum, 0xffff0000) + nibbles.tobytes()
+
+        first, last = block(0.25, -2.0), block(0.5, 1.0)
+        payload = first * 511 + last
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native-q5_1.gguf'
+            with path.open('wb') as handle:
+                handle.write(b'GGUF' + struct.pack('<IQQ', 3, 1, 0))
+                _write_gguf_string(handle, 'blk.0.ffn_gate_exps.weight')
+                handle.write(struct.pack('<IQQQIQ', 3, 32, 1, 512, int(GGUFTensorType.Q5_1), 0))
+                handle.write(b'\0' * ((-handle.tell()) % GGUFParser.ALIGNMENT))
+                handle.write(payload)
+                # Bytes outside the native tensor must never enlarge the expert stride.
+                handle.write(b'\xa5' * 65536)
+            with GGUFParser(path) as parser:
+                parser.parse()
+                tensor = parser.tensors[0]
+                self.assertEqual(tensor.shape, (512, 1, 32))
+                raw = parser.read_tensor_data(tensor)
+                try:
+                    self.assertEqual(len(raw), 512 * 24)
+                    self.assertEqual(bytes(raw), payload)
+                finally:
+                    raw.release()
+                np.testing.assert_array_equal(expert_matrix(parser, tensor, 0),
+                                              (np.arange(32, dtype=np.float32) * 0.25 - 2)[None, :])
+                np.testing.assert_array_equal(expert_matrix(parser, tensor, 511),
+                                              (np.arange(32, dtype=np.float32) * 0.5 + 1)[None, :])
+
+    def test_iq4_nl_160_rows_exclude_trailing_file_bytes(self):
+        """The actual parser keeps native90-byte rows, not a guessed FP16 stride."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native-iq4-nl.gguf'
+            payload = _write_iq4_nl_row_fixture(path)
+            with GGUFParser(path) as parser:
+                parser.parse()
+                tensor = parser.tensors[0]
+                self.assertEqual(tensor.shape, (3, 160))
+                self.assertEqual(parser._calculate_tensor_size(tensor) // 3, 90)
+                raw = parser.read_tensor_data(tensor)
+                try:
+                    self.assertEqual(len(raw), 270)
+                    self.assertEqual(bytes(raw), payload)
+                finally:
+                    raw.release()
+
+    def test_qwen_selected_rows_keep_original_native_bytes(self):
+        """Actual QFN selected-row loading bounds its source independently of the oversized old view."""
+        import torch
+        from python.reference.qwen4exp import NativeSliceWeights
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native-iq4-nl.gguf'
+            _write_iq4_nl_row_fixture(path)
+            weights = NativeSliceWeights(path, cache_bytes=0)
+            try:
+                result = weights.rows('per_layer_token_embd.weight', torch.tensor([[2, 0, 2]]))
+                self.assertEqual(tuple(result.shape), (1,3,160))
+                self.assertTrue(torch.equal(result[0,0], torch.full((160,),3.0)))
+                self.assertTrue(torch.equal(result[0,1], torch.ones(160)))
+                self.assertTrue(torch.equal(result[0,2], result[0,0]))
+            finally:
+                weights.close()
+
+    def test_supported_native_formats_keep_their_exact_extents(self):
+        """Existing explicit float, block32 and row-padded importance formats stay exact."""
+        cases = ((GGUFTensorType.F32,160,1920),(GGUFTensorType.F16,160,960),
+                 (GGUFTensorType.BF16,160,960),(GGUFTensorType.Q4_0,160,270),
+                 (GGUFTensorType.IQ4_NL,160,270),(GGUFTensorType.Q4_1,160,300),
+                 (GGUFTensorType.Q5_0,160,330),(GGUFTensorType.Q5_1,160,360),
+                 (GGUFTensorType.Q8_0,160,510),(GGUFTensorType.Q2_K,256,252),
+                 (GGUFTensorType.Q4_K,256,432),(GGUFTensorType.Q5_K,256,528),
+                 (GGUFTensorType.Q6_K,256,630),(GGUFTensorType.IQ2_S,160,246),
+                 (GGUFTensorType.IQ3_S,160,330),(GGUFTensorType.IQ3_XXS,160,294),
+                 (GGUFTensorType.IQ4_XS,160,408))
+        parser = GGUFParser.__new__(GGUFParser)
+        for kind,width,expected in cases:
+            with self.subTest(format=kind.name):
+                tensor = GGUFTensorInfo('native', [3,width], kind, 0)
+                self.assertEqual(parser._calculate_tensor_size(tensor), expected)
+
+    def test_unknown_native_format_cannot_borrow_fp16_bytes(self):
+        """A parsed but unsupported codebook and foreign tag fail before any physical read."""
+        parser = GGUFParser.__new__(GGUFParser)
+        for kind in (GGUFTensorType.Q8_1, GGUFTensorType.IQ1_S, GGUFTensorType.IQ1_M, 999):
+            with self.subTest(format=kind):
+                with self.assertRaisesRegex(ValueError, 'Unsupported exact GGUF tensor payload extent'):
+                    parser._calculate_tensor_size(GGUFTensorInfo('unsupported', [3,160], kind, 0))
 
 
 class TestGGUFSplitSet(unittest.TestCase):

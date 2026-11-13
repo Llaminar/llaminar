@@ -6,6 +6,13 @@
  *
  * Encapsulates runtime parameters that affect inference behavior but are not
  * part of the model architecture (which comes from GGUF metadata).
+ *
+ * Typed MoE maintenance policy is a complete value identity: defaulted equality
+ * includes every scheduling, capacity, ownership and explicit optional setting.
+ * Admission observers compare the original request with resolved configuration
+ * and execution-plan publication through that identity; normalization must not
+ * silently substitute a different maintenance mode or erase an explicit value.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
@@ -14,10 +21,15 @@
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
+#include "../../loaders/ImmutableRowTablePolicy.h"
+#include "../local_execution/graph/ReadAheadScheduling.h"
 #include "RoutedExpertPolicy.h"
+#include "OrdinaryTerminalProjectionCapacity.h"
 #include "MTPDepthDefaults.h"
 #include "MTPDepthPolicyTypes.h"
+#include "MTPDepthPolicyScope.h"
 #include "../mtp/MTPConditionForwardPurpose.h"
+#include "../mtp/MTPVerifierGraphFamily.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <bit>
@@ -27,6 +39,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +49,12 @@
 
 namespace llaminar2
 {
+    class RetainedHostServiceDeclarations;
+
+    class NativeContextPreparation;
+    struct CPUSerialExpertStorageAdmission;
+    class ResolvedImmutableRowTablePlacement;
+
 
     /**
      * @brief Fused attention execution backend
@@ -546,6 +565,7 @@ namespace llaminar2
         MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
         MTPDepthPolicyBackend backend = MTPDepthPolicyBackend::Any;
         MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
+        MTPDepthPolicyScope scope; ///< Frozen runtime projection; never request-authored.
         int min_depth = 1;
         int max_depth = 0;     ///< 0 selects the complete supported adaptive range.
         int initial_depth = 0; ///< 0 derives from a policy-specific default.
@@ -1140,13 +1160,15 @@ namespace llaminar2
     [[nodiscard]] inline MTPRequestPolicy makeMTPRequestPolicy(
         const MTPRuntimeConfig &config)
     {
+        auto depth_policy = config.depth_policy;
+        depth_policy.scope = {};
         return {
             .enabled = config.enabled,
             .draft_tokens = config.draft_tokens,
             .verify_mode = config.verify_mode,
             .require_terminal_hidden_for_full_hit =
                 config.require_terminal_hidden_for_full_hit,
-            .depth_policy = config.depth_policy,
+            .depth_policy = depth_policy,
         };
     }
 
@@ -1171,6 +1193,8 @@ namespace llaminar2
             return "MTP request verification mode is invalid";
 
         const MTPDepthPolicyConfig &depth = policy.depth_policy;
+        if (depth.scope != MTPDepthPolicyScope{})
+            return "MTP request cannot author frozen learned-policy scope";
         const bool known_depth_mode =
             depth.mode == MTPDepthPolicyMode::Fixed ||
             depth.mode == MTPDepthPolicyMode::Observe ||
@@ -1266,28 +1290,31 @@ namespace llaminar2
     }
 
     /**
-     * @brief Count the bounded scalar verifier widths in the retained family.
+     * @brief Count scalar verifier widths in the admitted immutable family.
      * @param config Immutable admitted capacity, independent of active depth.
-     * @return Power-of-two buckets plus a possibly clipped final bucket.
-     *
-     * Rows run from two through retained depth plus one. The number of those
-     * buckets is bit_width(depth); no signed depth-plus-one overflow is needed.
+     * @param family Required execution-owned family; never inferred from depth.
+     * @return Canonical grouped width count, excluding existing ordinary M1.
+     * @throws std::invalid_argument for an unknown family.
+     * @throws std::overflow_error when depth plus one is not representable.
      */
     [[nodiscard]] inline std::size_t resolveMTPRetainedVerifierWidthCount(
-        const MTPRuntimeConfig &config) noexcept
+        const MTPRuntimeConfig &config, MTPVerifierGraphFamily family)
     {
-        return retainsMTPGraphCapacity(config)
-            ? std::bit_width(static_cast<unsigned int>(resolveMTPRetainedDraftCapacity(config)))
-            : 0u;
+        const int depth = resolveMTPRetainedDraftCapacity(config);
+        if (depth == std::numeric_limits<int>::max())
+            throw std::overflow_error("MTP retained verifier row capacity overflows int");
+        const auto count = mtpVerifierGraphFamilyWidthCount(depth + 1, family);
+        return retainsMTPGraphCapacity(config) ? count : 0u;
     }
 
     /**
      * @brief Count complete model forwards retained by the MTP serving family.
      * @param config Frozen runtime and graph-capacity policy.
+     * @param family Required execution-owned family shared with materialization.
      * @return All condition purposes and both outcomes at every retained width.
      *
      * The MTP serving family owns speculative and committed condition forwards
-     * plus greedy and stochastic/disabled grouped verifiers at every bounded
+     * plus greedy and stochastic/disabled grouped verifiers at every admitted
      * width. Fixed request depth may be smaller than retained capacity without
      * discovering a new graph after admission. These are complete transformer graphs, not small
      * controller fragments, and must therefore pay the per-layer graph-memory
@@ -1297,11 +1324,11 @@ namespace llaminar2
      */
     [[nodiscard]] inline std::size_t
     resolveMTPRetainedServingForwardModelGraphIdentityCount(
-        const MTPRuntimeConfig &config) noexcept
+        const MTPRuntimeConfig &config, MTPVerifierGraphFamily family)
     {
+        const auto widths = resolveMTPRetainedVerifierWidthCount(config, family);
         return retainsMTPGraphCapacity(config)
-                   ? kMTPConditionForwardPurposes.size() +
-                         std::size_t{2} * resolveMTPRetainedVerifierWidthCount(config)
+                   ? kMTPConditionForwardPurposes.size() + std::size_t{2} * widths
                    : std::size_t{0};
     }
 
@@ -1742,14 +1769,14 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "dense=" << denseParallelPolicyToString(policy.dense)
-            << ",routed_compute="
+            << ",expert_compute="
             << routedExpertComputePolicyToString(policy.routed_compute)
-            << ",routed_phase="
+            << ",expert_phase="
             << routedExpertPhasePolicyToString(policy.routed_phase)
-            << ",routed_decode_assignment="
+            << ",expert_decode_assignment="
             << routedExpertAssignmentPolicyToString(
                    policy.routed_decode_assignment)
-            << ",routed_prefill_assignment="
+            << ",expert_prefill_assignment="
             << routedExpertAssignmentPolicyToString(
                    policy.routed_prefill_assignment);
         return out.str();
@@ -2086,6 +2113,9 @@ namespace llaminar2
          */
         int device_initial_maintenance_period_tokens = -1;
         bool release_raw_expert_weights = false;
+
+        /** @brief Exact policy identity, including explicit optional scheduling values. */
+        bool operator==(const MoERebalanceRuntimeConfig &) const = default;
     };
 
     /**
@@ -2134,6 +2164,15 @@ namespace llaminar2
      */
     struct RuntimeConfig
     {
+        /** Original selected-worker source owner; immutable mandatory BOM precedes all optional quotas. */
+        std::shared_ptr<NativeContextPreparation> native_context_preparation;
+
+        /// Optional startup intent resolved before participant BOMs; never a live DebugEnv
+        /// reference.
+        qwen4exp::QwenSparseAttentionSetupRequest attention_setup_request;
+        /// Immutable projection copied directly from admitted attention device inputs.
+        std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
+            attention_participants;
         /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 4096;
 
@@ -2147,6 +2186,9 @@ namespace llaminar2
          */
         int resident_graph_rows = 0;
 
+        /** Authored ordinary output-row demand, frozen before model admission. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
+
         /**
          * @brief ExpertOverlay prefill authority, when one is required.
          *
@@ -2156,6 +2198,8 @@ namespace llaminar2
          * distributed.
          */
         OverlayPrefillScheduleContract overlay_prefill_schedule;
+        /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
 
         /// Maximum active request batch size for runner-owned state.
         int batch_size = 1;
@@ -2195,6 +2239,17 @@ namespace llaminar2
         /// Cross-request prefix-state cache configuration.
         PrefixCacheRuntimeConfig prefix_cache;
 
+        /// Explicit native PLE table storage; file capacity is not prepared-weight memory.
+        ImmutableRowTablePolicy ngram_table_policy;
+        /** Internal explicit phase policy, projected unchanged into planning and native graph construction. */
+        ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled;
+        /** Canonical setup-selected concrete tier and exact physical consumers.
+         * Absence is permitted before final PMA selection or for models without PLE.
+         * Runtime graph/materialization must never infer concrete storage from Auto. */
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
+
         /// Multi-token prediction speculative decode configuration.
         MTPRuntimeConfig mtp;
 
@@ -2203,7 +2258,25 @@ namespace llaminar2
         explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
 
         /**
-         * @brief Create RuntimeConfig by parsing raw strings from OrchestrationConfig
+         * @brief Parse the runtime policy and freeze its setup-only attention schedule.
+         * @param max_seq_len Admitted per-request logical context capacity.
+         * @param batch_size Requested batch before the existing MTP normalization.
+         * @param activation_precision_str Authored activation precision spelling.
+         * @param kv_cache_precision_str Authored native KV precision spelling.
+         * @param fused_backend Explicit ordinary fused-attention backend.
+         * @param routed_expert_compute_policy Typed routed-expert ownership policy.
+         * @param moe_hot_expert_cache Existing hot-expert cache configuration.
+         * @param moe_routed_prefill Existing routed-prefill execution configuration.
+         * @param moe_rebalance Existing expert rebalance configuration.
+         * @param prefix_cache Existing retained-prefix policy and capacity.
+         * @param mtp Existing captured speculative-generation policy.
+         * @param tp_allreduce_precision_override Existing explicit collective precision.
+         * @param ngram_table_policy Typed immutable-table admission policy.
+         * @return Value-owned runtime policy passed unchanged to planning/graph adapters.
+         * @throws std::exception For invalid authored precision, batch or table policy.
+         * @details Setup is read here once; later reloads cannot mutate the copied
+         * intent in a retained runtime. The actual participant resolves one concrete
+         * arithmetic/schedule pair before its BOM; factories only consume that admission.
          */
         static RuntimeConfig fromOrchestrationConfig(
             int max_seq_len,
@@ -2217,9 +2290,16 @@ namespace llaminar2
             MoERebalanceRuntimeConfig moe_rebalance = {},
             PrefixCacheRuntimeConfig prefix_cache = {},
             MTPRuntimeConfig mtp = {},
-            std::string tp_allreduce_precision_override = {})
+            std::string tp_allreduce_precision_override = {},
+            ImmutableRowTablePolicy ngram_table_policy = {})
         {
             RuntimeConfig rc;
+            // Freeze once, before planning. Later DebugEnv::reload cannot change
+            // the admitted value copied through participant and graph adapters.
+            rc.attention_setup_request = {debugEnv().attention.qfn_sparse_attention,
+                                          debugEnv().attention.qfn_sparse_attention_phase_schedule};
+            rc.ngram_lookup_schedule=debugEnv().execution.qfn_ngram_lookup_schedule.value_or(
+                ImmutableLookupSchedule::ConsumerScheduled);
             rc.max_seq_len = max_seq_len;
             rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);
@@ -2231,6 +2311,8 @@ namespace llaminar2
             rc.moe_routed_prefill = moe_routed_prefill;
             rc.moe_rebalance = moe_rebalance;
             rc.prefix_cache = prefix_cache;
+            ngram_table_policy.validate();
+            rc.ngram_table_policy = ngram_table_policy;
             rc.mtp = mtp;
             return rc;
         }
@@ -2324,7 +2406,7 @@ namespace llaminar2
             {
                 LOG_INFO("AUTO activation precision: ROCm device supports FP16 → selecting FP16");
                 LOG_INFO("  Device: " << device.name);
-                LOG_INFO("  Expected: 50% memory bandwidth, matrix core acceleration");
+                LOG_INFO("  Activation storage: FP16; kernel arithmetic is selected per operation");
                 return ActivationPrecision::FP16;
             }
             else if (device.supports_bf16)

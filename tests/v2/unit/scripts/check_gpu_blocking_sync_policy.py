@@ -174,8 +174,8 @@ CATEGORY_REASONS = {
         "release boundary outside steady-state graph execution."
     ),
     "setup_certification": (
-        "One setup-only exact event makes a retained graph's immutable "
-        "terminal record observable before inference admission."
+        "One setup-only exact event completes retained immutable graph metadata "
+        "or terminal certification before inference admission."
     ),
 }
 
@@ -269,10 +269,12 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "diagnostic",
-        ("src/v2/backends/cuda/CUDATensorValidation.cu", "validate", "raw_event", 1),
+        # Physical and authored-live validation share one compact diagnostic
+        # result and its exact producer event. The wrapper adds no second wait.
+        ("src/v2/backends/cuda/CUDATensorValidation.cu", "validateObserved", "raw_event", 1),
         ("src/v2/backends/cuda/NvidiaDeviceContext.cu", "NvidiaDeviceContext::debugSynchronize", "raw_device", 1),
         ("src/v2/backends/rocm/AMDDeviceContext.cpp", "AMDDeviceContext::debugSynchronize", "raw_device", 1),
-        ("src/v2/backends/rocm/ROCmTensorValidation.cpp", "validate", "raw_event", 1),
+        ("src/v2/backends/rocm/ROCmTensorValidation.cpp", "validateObserved", "raw_event", 1),
         ("src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp", "tracePrefillAssignmentRuntime", "worker_stream", 1),
         ("src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp", "tracePrefillLLEPStatus", "worker_stream", 1),
         ("src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp", "ForwardExecutionEngine::executePrefillWithGraphCache", "worker_event", 1),
@@ -281,6 +283,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp", "DeviceGraphCaptureController::executeManualReplaySegment", "worker_stream", 3),
         ("src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp", "DeviceGraphCaptureController::executeStreamOnlyReplay", "worker_stream", 1),
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp", "DeviceGraphExecutor::runStages", "backend_device", 1),
+        # Explicit post-graph diagnostics first observe exact live extents,
+        # then acquire only selected payload bytes. No observed value feeds
+        # inference, and the one wait site belongs solely to this boundary.
+        ("src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp", "DeviceGraphExecutor::acquireGraphSnapshotArenaOnHost", "backend_event", 1),
         ("src/v2/execution/local_execution/graph/StageTimeline.h", "collect", "worker_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "completeMTPDiagnosticObservation", "backend_event", 1),
@@ -346,11 +352,28 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "host_result",
         # All participant copies/events are enqueued before this terminal-only
-        # observation of independent KV positions. No transaction or prefill
-        # dispatcher may wait on these host-result events.
-        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finish", "backend_event", 1),
+        # observation of independent KV positions. The second lexical site is
+        # the exceptional-exit RAII fence retaining accepted copy destinations;
+        # completed normal observations clear its pending flag. Exact
+        # companion body regressions reject either site escaping its terminal ownership.
+        # No transaction or prefill dispatcher may wait on these events.
+        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finish", "backend_event", 2),
+        # One lexical wait site, iterated only over submitted participants after
+        # the complete one-shot cohort has launched. Its terminal-copy RAII
+        # fence retains host result backing on every false/throw exit; failure
+        # to establish this exact event completion is fatal. This is not a
+        # model, command, activation, prefill or request-dispatch wait budget.
+        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finishForwardOnly", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGeneration", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGenerationImpl", "backend_event", 1),
+        # Rank's private final aggregation re-observes the query-only reader's
+        # exact published terminal event after ALL participant result bridges.
+        # This never authorizes ticket dispatch, transaction or PLE-stage waits.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::awaitGroupedRetainedStorageTerminal", "backend_event", 1),
+        # Explicit bounded diagnostics first authenticate the ordinary terminal
+        # controller, then copy only the populated transaction trace. This one
+        # additional terminal wait never belongs to generation or dispatch.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeMTPDepthTransactionTraceTerminal", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "sampleGreedyCandidateFromTensor", "backend_sync_compute", 2),
@@ -364,13 +387,46 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "lifecycle",
+        # One cold exact setup stream retires native frame initialization before
+        # its addresses enter captured broadcasts. Replay/reset cannot enter create.
+        ("src/v2/collective/DeviceCountedAllGather.cpp", "DeviceCountedAllGather::create", "worker_stream", 1),
+        # Sole cold metadata publication event, completed before raw sequence
+        # pointers reach independent streams; never a reset/append/capture wait.
+        ("src/v2/kernels/KVCacheMetadataInitialization.h", "completeColdKVMetadataInitialization", "backend_event", 1),
         # A graph can complete a command before its independently queued idle
         # service pass retires. Model destruction must join that exact finite
         # pass before freeing its cursor/inbox; no inference caller may join it.
         ("src/v2/transfer/MappedTransferProgressEpoch.cpp", "MappedTransferProgressEpoch::~MappedTransferProgressEpoch", "worker_event", 1),
         ("src/v2/execution/local_execution/engine/ForwardGraphTypes.h", "reset", "worker_stream", 1),
+        # The separately retained one-shot PP parents borrow original DGO and
+        # communicator resources. Last-owner teardown joins only each accepted
+        # not-yet-retired parent's exact published generation terminal event,
+        # before destroying those parents. One lexical wait site; no inference
+        # dispatcher or healthy replay gains a blocking allowance. Rank calls
+        # this private idempotent owner before stage destruction; its destructor
+        # repeats only an already-empty retirement. The transport remains alive.
+        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease", "backend_event", 2),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePendingPrefixPayloadUses", "backend_event", 1),
+        # A standalone hosted prefill has no generation parent to close its
+        # storage interval. At request reset only, join the already-owned
+        # terminal event before authenticating close and retiring the worker.
+        # Native regressions prove inactive/repeated reset adds no extra wait.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::retireRetainedStorageForRequestReset", "backend_event", 1),
+        # Rank request reset and failed-source teardown first join original
+        # native producers, then observe THIS reader's terminal frontier before
+        # shared-channel retirement/clearing. The reset wrapper delegates here;
+        # no hot replay may use this lifecycle-only original-event proof.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::prepareGroupedRetainedStorageProducerProof", "backend_event", 1),
+        # Metadata initialization/admission can enqueue before runner publication
+        # fails. Only failed submission or last setup-owner teardown waits its
+        # exact pre-created event. Successful admission/capture/terminal paths
+        # and normal setup publication remain nonblocking.
+        ("src/v2/execution/qwen4exp/ImmutableLookupExecutionBoundary.cpp", "retireImmutableLookupSubmissionOwner", "backend_event", 1),
+        # The pooled root holder similarly drains only failed/last-owner setup
+        # before allocation borrowers, tensors and original PMA claims retire.
+        # Native phase enqueue, capture preparation and healthy replay never wait.
+        ("src/v2/kernels/qwen4exp/PooledImmutableNativeStorage.cpp", "retirePooledNativeSetupOwner", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "backend_device", 2),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "rank_device", 1),
         ("src/v2/execution/moe/DeviceMoEOverlayEpochArena.cpp", "DeviceMoEOverlayEpochArena::DeviceMoEOverlayEpochArena", "worker_stream", 1),
@@ -383,11 +439,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "copyHostToMirror", "backend_sync_copy", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_uploadRawBytes", "backend_sync_copy", 1),
-        ("src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvShardImpl.cu.inc", "cudaRowMajorWeights_create", "raw_stream", 1),
+        ("src/v2/kernels/cuda/gemm/CUDANativeQuantisedGemvShardImpl.cu.inc", "cudaRowMajorWeights_create", "raw_stream", 1),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu", "CUDARingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::CUDARingKVCacheTQ", "raw_stream", 1),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 3),
-        ("src/v2/kernels/cuda/kvcache/CUDATurboQuantKernels.cu", "cuda_tq_upload_rope_freqs", "raw_stream", 1),
         ("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp", "ROCmQuantisedGemmKernel::ensureWeightsConverted", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp", "ROCmRingKVCache<Precision>::allocate_pool", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp", "ROCmRingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
@@ -398,6 +453,13 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/KernelFactory.cpp", "KernelFactory::prepareEmbeddingHandleLocal", "backend_sync_copy", 1),
         ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "workerLoop", "backend_event", 1),
         ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "DeviceLoadPipeline::processJobs", "worker_stream", 3),
+        # Failed startup may have accepted H2D/repack work before its terminal
+        # event could be recorded. The final pipeline owner joins exactly those
+        # streams before releasing their source slots, events and PMA claims.
+        # A successful processJobs already retired them; inference never enters
+        # this owner. GPUWeightSourceFailureRetirement proves the exceptional
+        # ordering and repeated release, without authorizing hot-path waits.
+        ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "DeviceLoadPipeline::release", "worker_stream", 2),
         ("src/v2/loaders/gpu_pipeline/WeightTranslator.h", "packGpuWeightsForTransfer", "backend_sync_copy", 4),
         ("src/v2/loaders/gpu_pipeline/WeightTranslator.h", "uploadGpuPackedWeights", "backend_sync_copy", 4),
         ("src/v2/loaders/gpu_pipeline/PinnedRingBuffer.cpp", "PinnedRingBuffer::release", "backend_device", 1),
@@ -409,6 +471,17 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # rejects an uncaptured setup-event dependency inside a retained graph.
         ("src/v2/transfer/MappedTransferProgressEpoch.cpp", "MappedTransferProgressEpoch::materialize", "worker_event", 1),
         ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "validateAllStaticTerminals", "worker_event", 1),
+        # A capture-rejecting exact setup copy must retire its temporary host
+        # address vector before publishing the retained immutable table owner.
+        # One site belongs to each overload: a private temporary event or the
+        # original context-owned cold event held through actual completion.
+        # The body regression proves capture exclusion/ownership for both;
+        # this is not permission for two waits in either overload.
+        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeWorkspaceMetadata", "backend_event", 2),
+        # Bounded counted-frame cold scalar publication has one accepted H2D
+        # whose temporary source cannot retire before its exact event completes.
+        # Capture rejection and source lifetime are replayed in TransferColdDeviceMetadata.
+        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeDeviceMetadata", "backend_event", 1),
     ),
 )
 

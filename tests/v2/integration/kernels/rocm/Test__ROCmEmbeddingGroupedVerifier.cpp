@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
+#include "backends/rocm/ROCmRuntimeStartup.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/KernelFactory.h"
@@ -206,7 +207,8 @@ namespace
         uint32_t seed,
         hipStream_t stream,
         SourceView source_view = SourceView::Direct,
-        int only_rows = 0)
+        int only_rows = 0,
+        int captured_replays = 1)
     {
         constexpr int vocab_size = 67;
         constexpr int d_model = 256;
@@ -328,6 +330,31 @@ namespace
                 ASSERT_EQ(hipGraphInstantiate(&captured.executable, captured.graph,
                           nullptr, nullptr, 0), hipSuccess);
                 ASSERT_EQ(hipGraphLaunch(captured.executable, stream), hipSuccess);
+                if (captured_replays > 1)
+                {
+                    std::vector<float> first(static_cast<size_t>(verifier_rows) * d_model);
+                    ASSERT_EQ(hipMemcpyAsync(first.data(), grouped_output.gpu_data_ptr(),
+                        first.size() * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+                    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                    for (int replay = 1; replay < captured_replays; ++replay)
+                    {
+                        // Reset data/bindings while retaining this exact native
+                        // executable and its persistent token/output pointers.
+                        kernel.resetDynamicState();
+                        kernel.clearGPUStreamBinding();
+                        EXPECT_THROW((void)kernel.getStream(), std::runtime_error);
+                        kernel.setGPUStream(stream);
+                        kernel.setDynamicDeviceTokenIds(device_tokens.get(), verifier_rows);
+                        ASSERT_EQ(hipMemsetAsync(grouped_output.gpu_data_ptr(), 0xa5,
+                            first.size() * sizeof(float), stream), hipSuccess);
+                        ASSERT_EQ(hipGraphLaunch(captured.executable, stream), hipSuccess);
+                        std::vector<float> next(first.size());
+                        ASSERT_EQ(hipMemcpyAsync(next.data(), grouped_output.gpu_data_ptr(),
+                            next.size() * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+                        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                        EXPECT_EQ(std::memcmp(first.data(), next.data(), first.size() * sizeof(float)), 0);
+                    }
+                }
             }
 
             std::vector<float> grouped(
@@ -391,6 +418,7 @@ class Test__ROCmEmbeddingGroupedVerifier : public ::testing::Test
 protected:
     void SetUp() override
     {
+        requireROCmRuntimeStartup();
         int count = 0;
         if (hipGetDeviceCount(&count) != hipSuccess || count <= 0)
             GTEST_SKIP() << "No ROCm device available";
@@ -427,6 +455,17 @@ TEST_F(Test__ROCmEmbeddingGroupedVerifier, NestedVocabularySlicesPreserveCapture
         SCOPED_TRACE(format.label);
         runFormat(format, seed++, stream.get(), SourceView::NestedVocabularyShard);
     }
+}
+
+/** @brief Retained native lookup replay survives explicit owner-preserving reset and rebind. */
+TEST_F(Test__ROCmEmbeddingGroupedVerifier, ImmutableOwnerResetRebindRetainsCapturedBytes)
+{
+    ScopedHipStream stream;
+    ASSERT_TRUE(stream.create());
+    ScopedPerfStats perfstats;
+    uint32_t seed = 9240;
+    for (const auto &format : embeddingVerifierFormats())
+        runFormat(format, seed++, stream.get(), SourceView::NestedVocabularyShard, 4, 3);
 }
 
 /**

@@ -4,6 +4,8 @@
  */
 
 #include "execution/moe/MoEOverlayDeviceEpochProtocol.h"
+#include "execution/moe/MoEOverlayRuntimeReaderDeadline.h"
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/MoEOverlayDeviceControllerABI.h"
 #include "execution/moe/MoEOverlayDeviceControllerRuntimeBinding.h"
@@ -86,23 +88,22 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayDeviceEpochProtocol,
          ArenaOwnsStableSlotsAndHonorsPreparedInitialBank)
     {
-        DeviceMoEOverlayEpochArena arena({
+        DeviceMoEOverlayEpochArena arena(llaminar2::test::admitEpochArenaForTest({
             .device_id = DeviceId::cpu(),
             .initial_epoch = 41u,
             .initial_bank = 1u,
             .request_slot_capacity = 3u,
-        });
+        }));
 
         ASSERT_NE(arena.control(), nullptr);
         EXPECT_EQ(arena.deviceId(), DeviceId::cpu());
         EXPECT_EQ(arena.requestSlotCapacity(), 3u);
         EXPECT_EQ(
             arena.allocationBytes(),
-            sizeof(DeviceMoEOverlayEpochControl) +
-                3u * sizeof(DeviceMoEOverlayEpochTicket) +
-                3u * sizeof(DeviceMoEOverlayEpochStatus) +
-                sizeof(std::uint64_t) +
-                sizeof(DeviceMoEOverlayEpochStatus));
+            DeviceMoEOverlayEpochArena::allocationBytesForSlots(3u));
+        EXPECT_EQ(arena.control()->finite_parent,arena.finiteParent());
+        EXPECT_EQ(arena.finiteParent()->control,arena.control());
+        EXPECT_EQ(arena.finiteParent()->state,static_cast<std::uint32_t>(DeviceMoEOverlayEpochParentState::Idle));
 
         MoEOverlayDeviceEpochProtocol protocol(*arena.control());
         EXPECT_EQ(protocol.publishedEpoch(), 41u);
@@ -673,3 +674,159 @@ namespace llaminar2::test
                   DeviceMoEOverlayEpochStatusCode::InvalidTicket);
     }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Original PMA must own the exact packed records before any actual allocation occurs. */
+TEST(Test__MoEOverlayDeviceEpochProtocol, EpochArenaRequiresExactOriginalPMAAndReleasesPackedBytes)
+{
+    const auto bytes=DeviceMoEOverlayEpochArena::allocationBytesForSlots(3u);
+    EXPECT_THROW(DeviceMoEOverlayEpochArena(DeviceMoEOverlayEpochArena::Config{.device_id=DeviceId::cpu()}),std::invalid_argument);
+    PhysicalMemoryPlanBuilder short_budget;
+    short_budget.add({0,DeviceId::cpu(),bytes,bytes},PhysicalMemoryOwner::ExecutionWorkspace,bytes-1u);
+    auto short_memory=std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(short_budget.build()),0);
+    EXPECT_THROW(DeviceMoEOverlayEpochArena((DeviceMoEOverlayEpochArena::Config{
+        .device_id=DeviceId::cpu(),.memory_authority=short_memory,.request_slot_capacity=3u})),std::logic_error);
+    EXPECT_EQ(short_memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    auto config=admitEpochArenaForTest({.device_id=DeviceId::cpu(),.request_slot_capacity=3u});
+    auto memory=config.memory_authority;
+    {
+        DeviceMoEOverlayEpochArena arena(config);
+        EXPECT_EQ(arena.allocationBytes(),bytes);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+        const auto begin=reinterpret_cast<std::uintptr_t>(arena.control());
+        const auto end=begin+bytes;
+        EXPECT_EQ(begin%alignof(DeviceMoEOverlayEpochControl),0u);
+        EXPECT_GE(reinterpret_cast<std::uintptr_t>(arena.finiteParent()),begin+sizeof(DeviceMoEOverlayEpochControl));
+        EXPECT_LE(reinterpret_cast<std::uintptr_t>(arena.finiteParentStatus())+sizeof(DeviceMoEOverlayEpochStatus),end);
+        EXPECT_EQ(arena.control()->finite_parent,arena.finiteParent());
+        EXPECT_EQ(arena.finiteParent()->control,arena.control());
+        EXPECT_THROW((void)arena.requestTicket(3u),std::out_of_range);
+    }
+    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+}
+
+/** @test Replay actual parent/child RCU operations while publication advances and an unreached owner remains protected. */
+TEST(Test__MoEOverlayDeviceEpochProtocol, FiniteParentPinsUnreachedOwnerAndResumesPublicationReplay)
+{
+    for(int replay=0;replay<20;++replay) {
+        SCOPED_TRACE(replay);
+        DeviceMoEOverlayEpochControl control{},peer{},foreign{};
+        MoEOverlayDeviceEpochProtocol::initialize(control,1u);
+        MoEOverlayDeviceEpochProtocol::initialize(peer,1u);
+        MoEOverlayDeviceEpochProtocol::initialize(foreign,1u);
+        MoEOverlayDeviceEpochProtocol protocol(control),follower(peer),other(foreign);
+        DeviceMoEOverlayEpochParent parent{.control=&control},late{.control=&peer};
+        control.finite_parent=&parent;peer.finite_parent=&late;
+        DeviceMoEOverlayEpochParent impostor{.control=&control};
+        EXPECT_FALSE(protocol.armFiniteParent(impostor));
+        EXPECT_FALSE(protocol.tryAcquireFiniteChild(impostor));
+        EXPECT_FALSE(protocol.closeFiniteParent(impostor));
+        ASSERT_TRUE(protocol.armFiniteParent(parent));ASSERT_TRUE(follower.armFiniteParent(late));
+        EXPECT_FALSE(other.armFiniteParent(parent));EXPECT_FALSE(other.tryAcquireFiniteChild(parent));
+        auto first=protocol.tryAcquireFiniteChild(parent,1u);ASSERT_TRUE(first);
+        EXPECT_EQ(first->epoch,1u);EXPECT_EQ(protocol.bankReaderCount(0u),2u);
+        EXPECT_FALSE(protocol.closeFiniteParent(parent));
+        for(auto *owner:{&protocol,&follower}) {
+            ASSERT_TRUE(owner->reserveCandidate(2u));owner->markCandidateReady(2u);
+            ASSERT_TRUE(owner->publishReadyCandidate(2u).valid());
+            EXPECT_FALSE(owner->tryRetire(1u));
+        }
+        // The peer has received NO descriptor. Its pending original acquisition
+        // guard still protects E, independent of expert routing population.
+        EXPECT_EQ(follower.acquisitionsInFlight(),1u);
+        EXPECT_EQ(follower.bankReaderCount(0u),0u);
+        const auto retired_child=*first;
+        ASSERT_TRUE(protocol.releaseFiniteChild(parent,*first));
+        auto second=protocol.tryAcquireFiniteChild(parent,1u);ASSERT_TRUE(second);
+        auto delayed_release=retired_child;
+        EXPECT_FALSE(protocol.releaseFiniteChild(parent,delayed_release));
+        EXPECT_NE(retired_child.parent_sequence,second->parent_sequence);
+        EXPECT_EQ(parent.children,1u);
+        auto peer_child=follower.tryAcquireFiniteChild(late,1u,DeviceMoEOverlayEpochChildAdmission::PreparedPeer);
+        ASSERT_TRUE(peer_child);EXPECT_EQ(peer_child->epoch,1u);
+        auto stale=*second;++stale.parent_generation;
+        EXPECT_FALSE(protocol.releaseFiniteChild(parent,stale));
+        EXPECT_FALSE(protocol.reserveCandidate(3u));EXPECT_FALSE(follower.reserveCandidate(3u));
+        ASSERT_TRUE(protocol.releaseFiniteChild(parent,*second));
+        ASSERT_TRUE(follower.releaseFiniteChild(late,*peer_child));
+        ASSERT_TRUE(protocol.closeFiniteParent(parent));ASSERT_TRUE(follower.closeFiniteParent(late));
+        EXPECT_FALSE(protocol.closeFiniteParent(parent));
+        for(auto *owner:{&protocol,&follower}) {
+            ASSERT_TRUE(owner->tryRetire(1u));ASSERT_TRUE(owner->reserveCandidate(3u));
+            owner->markCandidateReady(3u);ASSERT_TRUE(owner->publishReadyCandidate(3u).valid());
+        }
+        ASSERT_TRUE(protocol.armFiniteParent(parent));
+        EXPECT_FALSE(protocol.tryAcquireFiniteChild(parent,99u,DeviceMoEOverlayEpochChildAdmission::PreparedPeer));
+        EXPECT_EQ(protocol.acquisitionsInFlight(),1u);ASSERT_TRUE(protocol.closeFiniteParent(parent));
+    }
+}
+
+/** @test Actual CPU launch interface borrows parent E after current publication changes; request release preserves parent topology. */
+TEST(Test__MoEOverlayDeviceEpochProtocol, FiniteParentKernelAdmissionAndRequestResetReplay)
+{
+    CPUMoEKernel kernel;MoEKernelLaunchContext launch{};
+    for(int replay=0;replay<20;++replay) {
+        auto config=admitEpochArenaForTest({.device_id=DeviceId::cpu()});
+        DeviceMoEOverlayEpochArena arena(config);
+        auto *control=arena.control();auto *ticket=arena.requestTicket(0u);auto *status=arena.requestStatus(0u);
+        ASSERT_TRUE(kernel.runMoEOverlayEpochParentAction(launch,control,arena.finiteParentStatus(),DeviceMoEOverlayEpochParentAction::Arm));
+        ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(launch,control,ticket,status));ASSERT_TRUE(status->succeeded());
+        EXPECT_EQ(ticket->epoch,1u);ASSERT_NE(ticket->parent_generation,0u);
+        ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(launch,control,ticket,status));ASSERT_TRUE(status->succeeded());
+        EXPECT_FALSE(ticket->valid());EXPECT_EQ(arena.finiteParent()->ticket.epoch,1u);
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        ASSERT_TRUE(protocol.reserveCandidate(2u));protocol.markCandidateReady(2u);ASSERT_TRUE(protocol.publishReadyCandidate(2u).valid());
+        std::uint64_t current_admission=2u;
+        ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(launch,control,ticket,status,&current_admission));ASSERT_TRUE(status->succeeded());
+        EXPECT_EQ(ticket->epoch,1u); // Existing ordinary acquisition would select E+1 here.
+        ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(launch,control,ticket,status));ASSERT_TRUE(status->succeeded());
+        ASSERT_TRUE(kernel.runMoEOverlayEpochParentAction(launch,control,arena.finiteParentStatus(),DeviceMoEOverlayEpochParentAction::Close));
+        ASSERT_TRUE(protocol.tryRetire(1u));
+        ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(launch,control,ticket,status,&current_admission));ASSERT_TRUE(status->succeeded());
+        EXPECT_EQ(ticket->epoch,2u);EXPECT_EQ(ticket->parent_generation,0u);
+        ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(launch,control,ticket,status));ASSERT_TRUE(status->succeeded());
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @test Actual retirement observer never lets a busy peer refresh a stalled finite parent. */
+TEST(Test__MoEOverlayDeviceEpochProtocol, FiniteRetirementRequiresOriginalPerPeerTerminalProgressReplay)
+{
+    using Watch=MoEOverlayRuntimeReaderDeadline;
+    using Receipt=MoEOverlayRuntimeReaderObservation;
+    using State=Receipt::State;
+    using namespace std::chrono_literals;
+    const Watch::Clock::time_point start{};
+    for(int replay=0;replay<20;++replay) {
+        SCOPED_TRACE(replay);
+        Watch stalled(2u,start);
+        std::array<Receipt,2> peers{{{State::FiniteDeferred,7u,1u},
+                                   {State::FiniteDeferred,9u,1u}}};
+        EXPECT_EQ(stalled.observe(peers,start),Watch::Result::Pending);
+        for(int seconds=1;seconds<30;++seconds) {
+            ++peers[0].parent_progress;
+            EXPECT_EQ(stalled.observe(peers,start+std::chrono::seconds(seconds)),Watch::Result::Pending);
+        }
+        EXPECT_EQ(stalled.observe(peers,start+30s),Watch::Result::Expired);
+        Watch live(2u,start);
+        peers={{{State::FiniteDeferred,7u,1u},{State::FiniteDeferred,9u,1u}}};
+        ASSERT_EQ(live.observe(peers,start),Watch::Result::Pending);
+        peers[0].parent_progress=2u;peers[1].parent_progress=2u;
+        ASSERT_EQ(live.observe(peers,start+29s),Watch::Result::Pending);
+        // Real child terminal extends exactly its original owner's budget.
+        peers[0].state=State::Ready;peers[1].state=State::Ready;
+        EXPECT_EQ(live.observe(peers,start+35s),Watch::Result::Ready);
+        Watch foreign(2u,start);peers={{{State::FiniteDeferred,7u,1u},{State::FiniteDeferred,9u,1u}}};
+        ASSERT_EQ(foreign.observe(peers,start),Watch::Result::Pending);
+        ++peers[1].parent_generation;
+        EXPECT_EQ(foreign.observe(peers,start+1s),Watch::Result::Invalid);
+        Watch unchanged(2u,start);peers={{{State::FiniteDeferred,7u,1u},{State::Pending,0u,0u}}};
+        ASSERT_EQ(unchanged.observe(peers,start),Watch::Result::Pending);
+        EXPECT_EQ(unchanged.observe(peers,start+30s),Watch::Result::Expired);
+        Watch late(2u,start);peers={{{State::Ready,0u,0u},{State::Ready,0u,0u}}};
+        EXPECT_EQ(late.observe(peers,start+31s),Watch::Result::Expired);
+    }
+}
+}

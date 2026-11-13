@@ -1,10 +1,14 @@
 /**
  * @file MoEPipelinePreparedPlan.h
- * @brief Model-bound immutable expert placements for one admitted local pipeline.
+ * @brief Model-bound immutable expert placements for one admitted rank-owned pipeline stage set.
  *
  * Prepared weights retain the aggregate admission and exact initial placement
  * of every stage. Runtime histograms, registries, graphs and controllers are
  * rebuilt per runner and never enter this model-owned reuse value.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #pragma once
 #include "planning/MoEPipelineMemoryAdmission.h"
@@ -52,6 +56,21 @@ namespace llaminar2
         std::vector<std::shared_ptr<const MoEOverlayPipelineStageBinding>> createRuntimeBindings(
             const ModelLoader &loader, std::shared_ptr<PhysicalMemoryAuthority> memory,
             std::shared_ptr<IMPIContext> context, const ResolvedRankOrchestration &current) const;
+
+        /**
+         * @brief Prepare original CPU stage activation channels on every parent MPI rank.
+         * @param loader Same actual model metadata source, never reloaded or substituted.
+         * @param context Original parent MPI owner, including ranks owning different pipeline stages.
+         * @param inventory Same complete rank/NUMA publication used by admission.
+         * @param runtime Parent's admitted common prefill schedule and retained row policy.
+         * @param bindings Actual local stage owners, never representatives for remote ranks.
+         * @return Local immutable bindings with their exact original CPU rank-batch registries.
+         * @throws std::exception Collectively before a later stage if any original source/endpoint fails setup.
+         */
+        std::vector<std::shared_ptr<const MoEOverlayPipelineStageBinding>> prepareOriginalCPUStageTransports(
+            const ModelLoader& loader,std::shared_ptr<IMPIContext> context,const ClusterInventory& inventory,
+            const RuntimeConfig& runtime,
+            std::span<const std::shared_ptr<const MoEOverlayPipelineStageBinding>> bindings) const;
 
         /** @return One aggregate admission retained by every prepared stage. */
         const std::shared_ptr<const AdmittedMoEPipelineMemory> &admission() const noexcept { return admission_; }

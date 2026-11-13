@@ -22,9 +22,12 @@
 #include <cstdint>
 #include <initializer_list>
 #include <map>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
@@ -104,6 +107,16 @@ namespace llaminar2
         static bool isDomainEnabled(std::string_view domain);
 
         /**
+         * @brief Guard one optional producer before constructing its diagnostics.
+         * @param domain Existing collection domain.
+         * @param name Exact record family, including any hierarchical suffix.
+         * @return Immutable-policy domain/name-prefix selection without allocation.
+         * @details Broad domain collection is unchanged. Focused producers can
+         * avoid formatting tags for sibling families excluded by the export filter.
+         */
+        static bool isRecordFamilyEnabled(std::string_view domain, std::string_view name);
+
+        /**
          * @brief Return whether per-stage CPU wall-clock timing is requested.
          *
          * A generic PerfStats export does not enable this hot-path
@@ -148,6 +161,71 @@ namespace llaminar2
             const std::vector<std::string> &domains_to_preserve,
             const std::vector<RecordFamily> &record_families_to_preserve);
 
+        /**
+         * @brief Immutable counter dimensions bound at producer setup.
+         * @details Owns metadata only, never a record pointer or measurement epoch.
+         * Reset and filtering remain exclusively collector-owned. Copies share
+         * immutable metadata; updates reuse it without copying strings or tags.
+         */
+        class CounterIdentity
+        {
+            struct Impl;
+            std::shared_ptr<const Impl> impl_;
+            explicit CounterIdentity(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
+            friend class PerfStatsCollector;
+        };
+
+        /** @brief Bind stable counter dimensions once; does not publish a record.
+         * @param domain Existing collection domain.
+         * @param name Existing counter family.
+         * @param phase Stable execution phase.
+         * @param device Stable participant identity.
+         * @param tags Immutable bounded dimensions, never live device values.
+         * @return Metadata identity reusable across measurement resets.
+         */
+        static CounterIdentity bindCounter(std::string domain, std::string name,
+            std::string phase = {}, std::string device = {}, Tags tags = {});
+
+        /** @brief Update the current collector epoch using setup-bound metadata.
+         * @param identity Immutable dimensions; no record address is retained.
+         * @param value Counter increment following one successful host operation.
+         * @details Disabled updates return before locking. Enabled updates retain
+         * the existing map and mutex; insertion after reset may allocate a record.
+         */
+        static void addCounter(const CounterIdentity &identity, double value = 1.0);
+
+        /** @brief Sum and multiplicity of completed observations, not sampling intent. */
+        struct CounterObservationBatch
+        {
+            std::uint64_t observations;
+            double value;
+        };
+
+        /**
+         * @brief Publish completed homogeneous observations with one collector lock.
+         * @param identity Cold-bound original family dimensions.
+         * @param batch Original observation count and aggregate numeric increment.
+         * @details Positive counts retain zero-valued records. Zero observations
+         * require zero value and publish nothing. Sequence families and count
+         * overflow reject before mutation; filtering/reset keep their existing
+         * authority. No caller retains a mutable record address or measurement epoch.
+         */
+        static void addCounter(const CounterIdentity &identity, CounterObservationBatch batch);
+
+        /** @brief Publish homogeneous live observations without allocating a bound identity.
+         * @param domain Existing collection domain.
+         * @param name Existing counter family.
+         * @param batch Original observation multiplicity and summed numeric increments.
+         * @param phase Existing execution phase.
+         * @param device Existing participant identity.
+         * @param tags Complete immutable semantic dimensions for this observation group.
+         * @details Uses the same collector map, filtering, reset, sequence-schema and
+         * count-overflow authority as setup-bound counters. No mutable record is retained.
+         */
+        static void addCounter(std::string domain, std::string name,
+            CounterObservationBatch batch, std::string phase = {},
+            std::string device = {}, Tags tags = {});
+
         static void addCounter(
             std::string domain,
             std::string name,
@@ -176,6 +254,27 @@ namespace llaminar2
             std::string domain, std::string name, double value,
             std::initializer_list<uint64_t> words,
             std::string phase = {}, std::string device = {}, Tags tags = {});
+
+        /** @brief Fold lifecycle words using cold-bound dimensions, without rebuilding keys.
+         * @param identity Original setup-bound metadata, never a record pointer.
+         * @param value Completed host work increment.
+         * @param words Exact fixed-schema lifecycle coordinates; changing epochs are never keys.
+         * @throws std::invalid_argument For an empty identity or word schema.
+         * @throws std::logic_error For a counter family whose schema changed.
+         */
+        static void addCounterWithSequence(const CounterIdentity& identity,double value,
+            std::initializer_list<uint64_t> words);
+
+        /**
+         * @brief Verify a passive counter against its expected ordered fixed-width observations.
+         * @param record Original collected aggregate.
+         * @param words Concatenated expected steps in original submission order.
+         * @param words_per_step Positive word count of each expected step.
+         * @return Whether count, schema, extrema and both canonical digests agree.
+         * @note This diagnostic uses the same codec without publishing or changing collection.
+         */
+        static bool matchesCounterSequence(const PerfStatRecord &record,
+            std::span<const uint64_t> words, std::size_t words_per_step);
 
         static void recordTimingNs(
             std::string domain,

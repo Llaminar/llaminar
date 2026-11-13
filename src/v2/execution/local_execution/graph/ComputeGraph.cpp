@@ -4,10 +4,16 @@
  * @author David Sanftenberg
  * @date December 2025
  *
- * Extracted from DeviceGraphExecutor.cpp.
+ * Extracted from DeviceGraphExecutor.cpp. Geometry-only workspace topologies
+ * carry a monotone execution purpose through moves/merges, so an allocator's
+ * declaration can never become a retained executable by losing its input tag.
+ * Merging retains a source fragment's storage lifetime together with its
+ * participant metadata; query-only fragments never acquire a source lane.
  */
 
 #include "ComputeGraph.h"
+#include "../../moe/MoEExpertOverlayExecutionPlan.h"
+#include "../../../backends/ReadAheadNativeResourceFamily.h"
 #include "../../../utils/Logger.h"
 #include <queue>
 #include <algorithm>
@@ -60,6 +66,19 @@ namespace llaminar2
         order_dirty_ = true;
         execution_stages_dirty_ = true;
         fast_schedule_.clear();
+        noteTopologyMutation();
+        return *this;
+    }
+
+    ComputeGraph &ComputeGraph::setNativeTransactionCaptureContract(GraphNativeTransactionCaptureContract contract)
+    {
+        if (contract.identity.empty() || contract.terminal_node.empty() ||
+            contract.terminal_node != terminal_node_ || !getNode(contract.terminal_node) ||
+            requiresHeterogeneousTicketSegmentation(native_capture_envelope_) ||
+            (native_transaction_capture_contract_ && *native_transaction_capture_contract_ != contract))
+            throw std::invalid_argument("Native transaction capture requires its exact sealed terminal, identity and complete envelope");
+        if (native_transaction_capture_contract_) return *this;
+        native_transaction_capture_contract_ = std::move(contract);
         noteTopologyMutation();
         return *this;
     }
@@ -191,11 +210,11 @@ namespace llaminar2
                 "Replacement heterogeneous graph terminal already owns a ticket-unit contract");
         }
 
-        const std::vector<std::string> leaves = getLeafNodes();
+        const std::vector<std::string> leaves = getLeafNodes(GraphLeafScope::MainExecution);
         if (leaves.size() != 1u || leaves.front() != replacement_terminal)
         {
             throw std::logic_error(
-                "Replacement heterogeneous graph terminal is not the sole dependency leaf");
+                "Replacement heterogeneous graph terminal is not the sole main-execution dependency leaf");
         }
 
         replacement_contract = std::move(current_contract);
@@ -210,6 +229,8 @@ namespace llaminar2
     {
         if (native_capture_envelope_ == envelope)
             return *this;
+        if (native_transaction_capture_contract_ && requiresHeterogeneousTicketSegmentation(envelope))
+            throw std::invalid_argument("Whole native transaction cannot acquire a heterogeneous ticket envelope");
         if (native_capture_envelope_ != GraphNativeCaptureEnvelope::Ordinary &&
             envelope != GraphNativeCaptureEnvelope::Ordinary)
         {
@@ -248,6 +269,233 @@ namespace llaminar2
         fast_schedule_.clear();
         noteTopologyMutation();
         return *this;
+    }
+
+    bool ComputeGraph::isRetainedParticipantAuxiliaryNode(const std::string& name) const noexcept
+    {
+        return participant_auxiliary_range_ && std::find(participant_auxiliary_range_->nodes.begin(),
+            participant_auxiliary_range_->nodes.end(),name)!=participant_auxiliary_range_->nodes.end();
+    }
+
+    void ComputeGraph::requireRetainedParticipantAuxiliaryRange() const
+    {
+        if(!participant_auxiliary_range_)return;
+        const auto& range=*participant_auxiliary_range_;
+        const auto& domain=participant_definition_domain_;
+        using Lifecycle=RetainedGraphParticipantAuxiliaryLifecycle;
+        const bool current=range.lifecycle==Lifecycle::CurrentDemand;
+        const bool future=range.lifecycle==Lifecycle::FutureProducer;
+        const bool adopted=range.lifecycle==Lifecycle::AdoptedConsumer;
+        const bool discarded=range.lifecycle==Lifecycle::DiscardedConsumer;
+        const bool local=adopted || discarded;
+        const bool source=range.role==RetainedGraphParticipantAuxiliaryRole::Source;
+        if((!current && !future && !local) || (!source && range.role!=RetainedGraphParticipantAuxiliaryRole::Reader) ||
+           !domain || !range.participant.is_gpu() || !range.identity || range.nodes.empty() ||
+           range.probe_ready.empty() || range.retirement.empty() || range.nodes.back()!=range.retirement ||
+           read_ahead_branch_ || source!=(range.participant==domain->source) ||
+           (local ? bool(participant_source_plan_) || !range.local_consumption || !range.local_arena :
+                    source!=bool(participant_source_plan_) || bool(range.local_consumption) || bool(range.local_arena)))
+            throw std::invalid_argument("Participant auxiliary body has an incomplete or foreign lifecycle/source declaration");
+        const auto main_node=[&](const std::string& name) {
+            const auto* node=getNode(name);
+            return node && node->stage && node->device==range.participant && !isRetainedParticipantAuxiliaryNode(name);
+        };
+        if(!main_node(range.probe_ready) ||
+           (current && (range.main_read.empty() || range.probe_ready==range.main_read || !main_node(range.main_read))) ||
+           (adopted && (range.main_read!=range.probe_ready || !main_node(range.main_read))) ||
+           ((future || discarded) && !range.main_read.empty()) ||
+           ((current || future) ? range.ready_publication.empty() || !isRetainedParticipantAuxiliaryNode(range.ready_publication)
+                                : !range.ready_publication.empty()))
+            throw std::invalid_argument("Participant auxiliary body lost its exact lifecycle main/publication frontier");
+        if(local && (range.local_consumption->definitionDomain()!=*domain || !range.local_consumption->captureIdentity()))
+            throw std::invalid_argument("Local-only consumption changed its original prepared-source/local declaration");
+        std::unordered_set<std::string> visited;
+        bool readinessPublished=local;
+        for(const auto& name:range.nodes) {
+            const auto* node=getNode(name);
+            if(!node || !node->stage || node->device!=range.participant || !visited.insert(name).second ||
+               node->stage->isManualGraphBoundary() || node->graph_capture_wave || node->heterogeneous_ticket_unit_contract ||
+               (!node->stage->isGraphCapturable() && !node->stage->supportsGraphCaptureAfterLaunchPreparation()))
+                throw std::invalid_argument("Participant auxiliary body contains an absent, repeated or uncapturable stage: "+name);
+            for(const auto& dependency:node->dependencies) {
+                if(dependency==name || (!visited.contains(dependency) && dependency!=range.probe_ready &&
+                    (!current || dependency!=range.main_read)))
+                    throw std::invalid_argument("Participant auxiliary body has an undeclared cross-lane dependency: "+name);
+                // Only Current has a later model read. Future producer has no
+                // read dependency; a local consumer starts after its real read/discard.
+                if(current && dependency==range.main_read && !readinessPublished)
+                    throw std::invalid_argument("Participant auxiliary readiness cannot wait for the read it releases: "+name);
+            }
+            if(name==range.ready_publication)readinessPublished=true;
+        }
+    }
+
+    void requireRankLocalMixedGPUAuxiliaryExecution(const MoEExpertOverlayExecutionPlan& original)
+    {
+        const auto& rank = original.current_rank;
+        if (original.world_size != 1 || original.continuation_root_rank != 0 ||
+            rank.world_rank != 0 || original.rank_plans.size() != 1 ||
+            original.rank_plans.front() != rank || !rank.ownsContinuationGraph() ||
+            !rank.ownsTransactionAuthority() || !rank.hasRole(OverlayRankRole::ContinuationRoot) ||
+            original.continuation_domain.empty() ||
+            !rank.ownsDomain(original.continuation_domain) ||
+            !rank.cpu_fallback_expert_domains.empty() || !rank.worker_fallback_expert_domains.empty() ||
+            rank.loads_cpu_fallback_experts || rank.loads_worker_fallback_experts ||
+            original.generationExecutionDomain() != DeviceGenerationExecutionDomain::HostedBoundary)
+            throw std::invalid_argument("Native auxiliary parent requires its original world-one mixed-GPU continuation authority");
+        bool cuda = false, rocm = false, continuation = false;
+        std::unordered_set<std::string> names;
+        std::unordered_set<DeviceId> devices;
+        for (const auto& domain : original.domains)
+        {
+            if (domain.name.empty() || !names.insert(domain.name).second || !rank.ownsDomain(domain.name) ||
+                (domain.scope != ExecutionDomainScope::SINGLE && domain.scope != ExecutionDomainScope::RANK_LOCAL) ||
+                domain.participants.empty())
+                throw std::invalid_argument("Native auxiliary parent contains a foreign, distributed or empty original domain");
+            if (!domain.primary_world_rank_known || domain.primary_world_rank != 0 ||
+                !domain.primary_is_local || !domain.primary_owned_by_current_rank || domain.owner_rank != 0 ||
+                std::none_of(domain.participants.begin(), domain.participants.end(), [&](const auto& participant) {
+                    return participant.address == domain.primary_participant && participant.local_device == domain.primary_device;
+                }))
+                throw std::invalid_argument("Native auxiliary parent lost the original domain primary ownership projection");
+            continuation = continuation || domain.name == original.continuation_domain;
+            for (const auto& participant : domain.participants)
+            {
+                const auto device = participant.local_device;
+                if (!device.is_gpu() || !participant.world_rank_known || participant.world_rank != 0 ||
+                    !participant.owned_by_current_rank || !participant.locally_addressable ||
+                    participant.participant_index < 0 || !rank.hasLocalDevice(device) ||
+                    participant.address.device_type != device.type || participant.address.device_ordinal != device.ordinal)
+                    throw std::invalid_argument("Native auxiliary parent requires every original participant to be an owned addressable local GPU");
+                cuda = cuda || device.is_cuda();
+                rocm = rocm || device.is_rocm();
+                devices.insert(device);
+            }
+        }
+        if (!continuation || !cuda || !rocm || rank.local_devices.empty() ||
+            names.size() != rank.owned_domains.size() ||
+            !names.contains(original.base_model_domain) ||
+            (!original.shared_expert_domain.empty() && !names.contains(original.shared_expert_domain)) ||
+            std::any_of(rank.local_devices.begin(), rank.local_devices.end(),
+                [&](DeviceId device) { return !device.is_gpu() || !devices.contains(device); }))
+            throw std::invalid_argument("Native auxiliary parent lost its complete original mixed-GPU membership");
+    }
+
+    void ComputeGraph::requireRetainedParticipantNativeAuxiliaryParent() const
+    {
+        requireRetainedParticipantAuxiliaryRange();
+        if (nativeCaptureEnvelope() != GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction ||
+            !participant_auxiliary_range_ || !participant_auxiliary_range_->original_execution)
+            throw std::invalid_argument("Native auxiliary parent requires its actual original execution and device-owned envelope");
+        const auto& range = *participant_auxiliary_range_;
+        requireRankLocalMixedGPUAuxiliaryExecution(*range.original_execution);
+        const auto& rank = range.original_execution->current_rank;
+        if (!rank.hasLocalDevice(range.participant) || !participant_definition_domain_ ||
+            !rank.hasLocalDevice(participant_definition_domain_->source))
+            throw std::invalid_argument("Native auxiliary parent contains a participant outside its original execution");
+        // Existing packet-wave annotations remain descriptive under this
+        // envelope; Controller never lowers them into replay boundaries. Actual
+        // manual/ticket units and foreign stages remain inadmissible.
+        for (const auto& name : getExecutionOrder())
+        {
+            const auto* node = getNode(name);
+            if (!node || !node->stage || node->device != range.participant ||
+                node->stage->device() != node->device || node->stage->isManualGraphBoundary() ||
+                node->heterogeneous_ticket_unit_contract ||
+                (!node->stage->isPassiveGraphCaptureNoOp() && !node->stage->isGraphCapturable() &&
+                 !node->stage->supportsGraphCaptureAfterLaunchPreparation()))
+                throw std::invalid_argument("Native auxiliary parent cannot contain a foreign, manual or segmented stage: " + name);
+        }
+    }
+
+    void ComputeGraph::setRetainedParticipantAuxiliaryRange(RetainedGraphParticipantAuxiliaryRange range)
+    {
+        if(participant_auxiliary_range_)throw std::invalid_argument("Participant auxiliary body cannot be rebound");
+        participant_auxiliary_range_=std::move(range);
+        try { requireRetainedParticipantAuxiliaryRange(); }
+        catch(...) { participant_auxiliary_range_.reset();throw; }
+        noteTopologyMutation();
+    }
+
+    void ComputeGraph::setReadAheadBranch(GraphReadAheadBranch branch)
+    {
+        if (read_ahead_phase_identity_!=immutableLookupPhaseIdentity(ForwardExecutionPhase::Decode,ImmutableLookupInvocationSchedule::ResidentSideLane) ||
+            read_ahead_branch_ || participant_auxiliary_range_ || !branch.resources ||
+            branch.fork_node == branch.producer_node || branch.fork_node == branch.consume_node ||
+            branch.producer_node == branch.consume_node)
+            throw std::invalid_argument("Read-ahead requires one immutable admitted branch");
+        auto *fork=getNode(branch.fork_node), *producer=getNode(branch.producer_node), *consumer=getNode(branch.consume_node);
+        if (!fork || !producer || !consumer || !fork->stage || !producer->stage || !consumer->stage ||
+            producer->dependencies.size()!=1 || producer->dependencies.front()!=branch.fork_node ||
+            std::find(consumer->dependencies.begin(),consumer->dependencies.end(),branch.producer_node)==consumer->dependencies.end())
+            throw std::invalid_argument("Read-ahead requires Hash -> sole gather dependency and explicit Consume dependency");
+        for (auto* node : {fork,producer,consumer})
+            if (node->device != branch.resources->device() || node->stage->isCollectiveStage() || node->stage->isManualGraphBoundary())
+                throw std::invalid_argument("Read-ahead branch must remain on its exact native participant");
+        if (!branch.resources->stream() || !branch.resources->forkEvent() || !branch.resources->joinEvent() ||
+            !branch.resources->primaryStream() || !branch.resources->captureIdentity())
+            throw std::invalid_argument("Read-ahead native resources are incomplete");
+        read_ahead_branch_=std::move(branch);
+        noteTopologyMutation();
+    }
+
+    void ComputeGraph::resolveReadAheadJoin()
+    {
+        if(!read_ahead_branch_)return;
+        auto& branch=*read_ahead_branch_;
+        if(!branch.join_node.empty())return; // Cold plan; replay performs no descriptor allocation.
+        std::vector<ReadAheadJoinFrontier> frontiers;
+        const auto& order=getExecutionOrder();frontiers.reserve(order.size());
+        for(const auto& name:order)
+        {
+            const auto* node=getNode(name);auto kind=ReadAheadJoinFrontier::Kind::Ordinary;
+            if(node->heterogeneous_ticket_unit_contract)
+            {
+                switch(node->heterogeneous_ticket_unit_contract->disposition)
+                {
+                case GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary:kind=ReadAheadJoinFrontier::Kind::BeforeDeclaredHostBoundary;break;
+                case GraphHeterogeneousTicketUnitDisposition::TransactionTerminal:kind=ReadAheadJoinFrontier::Kind::TransactionTerminal;break;
+                default:throw std::logic_error("Unknown original native-unit frontier disposition");
+                }
+            }
+            frontiers.push_back({name,kind});
+        }
+        const auto selected=resolveReadAheadJoinAnchor(frontiers,branch.fork_node,branch.producer_node,branch.consume_node,branch.join_policy);
+        if(!branch.join_node.empty() && branch.join_node!=selected)
+            throw std::logic_error("Read-ahead native join anchor changed after planning");
+        if(branch.join_node.empty()){branch.join_node=selected;noteTopologyMutation();}
+    }
+
+    void ComputeGraph::planReadAheadRecordingStream(void* recording)
+    {
+        if(!read_ahead_branch_)return;
+        resolveReadAheadJoin();
+        const auto& resources=read_ahead_branch_->resources;
+        if(recording==resources->stream())throw std::logic_error("Read-ahead primary recording aliases its side lane");
+        if(read_ahead_recording_binding_.plan(recording,resources->primaryStream()))noteTopologyMutation();
+    }
+
+    void* ComputeGraph::executionStreamForNode(const std::string& name,void* primary) const
+    {
+        if (!primary) throw std::invalid_argument("Graph stage binding requires an exact non-null parent stream");
+        if (!read_ahead_branch_) return primary;
+        const auto& branch=*read_ahead_branch_;
+        read_ahead_recording_binding_.require(primary);
+        return name==branch.producer_node ? branch.resources->stream() : primary;
+    }
+
+    std::uint64_t ComputeGraph::readAheadCaptureIdentity() const noexcept
+    {
+        if(!read_ahead_branch_)return read_ahead_phase_identity_;
+        const auto& branch=*read_ahead_branch_;
+        auto identity=branch.resources->captureIdentity()^read_ahead_phase_identity_^read_ahead_recording_binding_.identity();
+        for(const auto* name:{&branch.fork_node,&branch.producer_node,&branch.consume_node,&branch.join_node})
+        {
+            for(unsigned char c:*name){identity^=c;identity*=1099511628211ull;}
+            identity^=0xffu;identity*=1099511628211ull;
+        }
+        identity^=static_cast<std::uint64_t>(branch.join_policy);identity*=1099511628211ull;
+        return identity;
     }
 
     const std::vector<std::string> &ComputeGraph::getExecutionOrder() const
@@ -309,6 +557,19 @@ namespace llaminar2
         if (order.size() != nodes_.size())
         {
             LOG_ERROR("[ComputeGraph] Cycle detected in graph!");
+        }
+
+        if (read_ahead_branch_)
+        {
+            // Submission priority is distinct from a dependency: gathering must
+            // enqueue early without making independent trunk kernels wait.
+            const auto &branch=*read_ahead_branch_;
+            auto producer=std::find(order.begin(),order.end(),branch.producer_node);
+            if (producer==order.end()) throw std::logic_error("Read-ahead producer is absent from executable order");
+            order.erase(producer);
+            auto fork=std::find(order.begin(),order.end(),branch.fork_node);
+            if (fork==order.end()) throw std::logic_error("Read-ahead fork is absent from executable order");
+            order.insert(fork+1,branch.producer_node);
         }
 
         cached_order_ = std::move(order);
@@ -419,6 +680,15 @@ namespace llaminar2
         return total;
     }
 
+    bool ComputeGraph::requiresCollectiveRuntimeCapture(const std::unordered_set<std::string>* named)const{
+        if(named)for(const auto& name:*named){const auto* node=getNode(name);if(!node || !node->stage)return true;}
+        for(const auto& name:getExecutionOrder()){
+            const auto* node=getNode(name);
+            if(node && node->stage && node->stage->requiresCollectiveRuntimeCapture(named && named->count(name)))return true;
+        }
+        return false;
+    }
+
     std::unordered_set<std::string> ComputeGraph::collectiveNodeNames() const
     {
         std::unordered_set<std::string> collective_nodes;
@@ -442,12 +712,22 @@ namespace llaminar2
     void ComputeGraph::clear()
     {
         nodes_.clear();
+        participant_source_plan_.reset();
+        participant_definition_domain_.reset();
+        participant_source_variants_.clear();
+        participant_auxiliary_range_.reset();
+        storage_boundary_.reset();
+        read_ahead_branch_.reset();
+        read_ahead_phase_identity_=0;
+        read_ahead_recording_binding_={};
+        purpose_=ExecutionPurpose::Executable;
         node_index_.clear();
         cached_order_.clear();
         cached_execution_stages_.clear();
         fast_schedule_.clear();
         order_dirty_ = true;
         execution_stages_dirty_ = true;
+        native_transaction_capture_contract_.reset();
         native_capture_envelope_ = GraphNativeCaptureEnvelope::Ordinary;
         executable_memory_class_ = GPUGraphExecutableClass::General;
         noteTopologyMutation();
@@ -487,6 +767,30 @@ namespace llaminar2
 
     ComputeGraph &ComputeGraph::merge(ComputeGraph &&other, const std::string &connect_from)
     {
+        if(other.read_ahead_branch_)
+            throw std::logic_error("Read-ahead graphs must be retained as complete native parents, not merged into another topology");
+        // Source fragments own an exclusive storage lane; query-only fragments
+        // intentionally do not. Transfer the original optional ownership with
+        // the topology instead of making every model builder rebind a lane.
+        // Validate all ownership conflicts first: a rejected reader/source merge
+        // must not install a lane before discovering a foreign participant domain.
+        if(participant_auxiliary_range_ && other.participant_auxiliary_range_)
+            throw std::invalid_argument("ComputeGraph merge cannot combine two independently declared auxiliary bodies");
+        if(storage_boundary_ && other.storage_boundary_ && storage_boundary_!=other.storage_boundary_)
+            throw std::invalid_argument("ComputeGraph merge changed its original immutable storage boundary");
+        if(participant_definition_domain_ && other.participant_definition_domain_ &&
+            *participant_definition_domain_!=*other.participant_definition_domain_)
+            throw std::invalid_argument("ComputeGraph merge changed its original participant definition domain");
+        if(participant_source_plan_ && other.participant_source_plan_ && participant_source_plan_!=other.participant_source_plan_)
+            throw std::logic_error("One retained source parent cannot hide multiple participant invocation plans");
+        if (!participant_source_variants_.empty() || !other.participant_source_variants_.empty())
+            throw std::logic_error("A sealed expert source-family association cannot be merged into another graph");
+        if(other.storage_boundary_)setRetainedStorageBoundary(other.storage_boundary_);
+        if(other.participant_definition_domain_)setRetainedParticipantDefinitionDomain(*other.participant_definition_domain_);
+        if(other.participant_source_plan_)
+            setRetainedParticipantSourcePlan(other.participant_source_plan_);
+
+        if(other.isWorkspaceDeclaration())markWorkspaceDeclaration();
         if (other.nodes_.empty())
         {
             return *this;
@@ -504,6 +808,11 @@ namespace llaminar2
         {
             native_capture_envelope_ = other.native_capture_envelope_;
         }
+
+        // A standalone child identity cannot name the larger enclosing graph.
+        // The outer builder may declare its own complete transaction after merge.
+        native_transaction_capture_contract_.reset();
+        other.native_transaction_capture_contract_.reset();
 
         // Find root nodes in the source graph (nodes with no dependencies)
         std::vector<std::string> source_roots;
@@ -543,6 +852,11 @@ namespace llaminar2
             }
         }
 
+        if(other.participant_auxiliary_range_) {
+            setRetainedParticipantAuxiliaryRange(std::move(*other.participant_auxiliary_range_));
+            other.participant_auxiliary_range_.reset();
+        }
+
         // Clear the source graph
         other.nodes_.clear();
         other.node_index_.clear();
@@ -575,15 +889,21 @@ namespace llaminar2
         return roots;
     }
 
-    std::vector<std::string> ComputeGraph::getLeafNodes() const
+    std::vector<std::string> ComputeGraph::getLeafNodes(GraphLeafScope scope) const
     {
-        // Build set of all nodes that are depended upon
+        if (scope != GraphLeafScope::All && scope != GraphLeafScope::MainExecution)
+            throw std::invalid_argument("Unknown graph leaf scope");
+        const auto included = [&](const std::string& name) {
+            return scope == GraphLeafScope::All || !isRetainedParticipantAuxiliaryNode(name);
+        };
+        // Only edges whose endpoints execute in this projection hide a main leaf.
         std::unordered_set<std::string> has_dependents;
         for (const auto &node : nodes_)
         {
+            if (!included(node->name)) continue;
             for (const auto &dep : node->dependencies)
             {
-                has_dependents.insert(dep);
+                if (included(dep)) has_dependents.insert(dep);
             }
         }
 
@@ -591,7 +911,7 @@ namespace llaminar2
         std::vector<std::string> leaves;
         for (const auto &node : nodes_)
         {
-            if (has_dependents.find(node->name) == has_dependents.end())
+            if (included(node->name) && has_dependents.find(node->name) == has_dependents.end())
             {
                 leaves.push_back(node->name);
             }

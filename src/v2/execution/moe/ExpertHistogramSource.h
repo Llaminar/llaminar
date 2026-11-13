@@ -9,6 +9,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -26,6 +28,34 @@ namespace llaminar2
         GroupedVerifier,
         SyntheticTest,
     };
+
+    /**
+     * @brief Typed authority decision for host runtime-histogram registration.
+     */
+    enum class MoERuntimeHistogramProducerRole : std::uint8_t
+    {
+        NotProducer,
+        ProductionDecode,
+    };
+
+    /**
+     * @brief Select one logical routing-history publisher from original continuation identities.
+     * @param graph_participant Authenticated original graph-local participant ID.
+     * @param continuation_root Authenticated original continuation-root participant ID.
+     * @return ProductionDecode only for the original root; peers retain all dispatch work.
+     * @throws std::invalid_argument If either original identity is absent.
+     * @note ProductionDecode is the existing producer role; ExpertHistogramSource
+     * independently retains PrefillChunk/DecodeToken/GroupedVerifier phase semantics.
+     */
+    [[nodiscard]] inline MoERuntimeHistogramProducerRole
+    selectMoEContinuationHistogramProducerRole(int graph_participant, int continuation_root)
+    {
+        if (graph_participant < 0 || continuation_root < 0)
+            throw std::invalid_argument("Routing history requires original continuation participant identities");
+        return graph_participant == continuation_root
+            ? MoERuntimeHistogramProducerRole::ProductionDecode
+            : MoERuntimeHistogramProducerRole::NotProducer;
+    }
 
     /** Number of independently retained production phases, preserving wire order. */
     inline constexpr std::size_t kExpertHistogramProductionSourceCount = 3;

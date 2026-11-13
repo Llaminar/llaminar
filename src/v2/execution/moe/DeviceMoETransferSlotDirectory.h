@@ -47,7 +47,7 @@ namespace llaminar2
             std::vector<ProjectionSpec> allocation_specs;
             size_t max_wire_payload_bytes = 0;
             /// Immutable raw alias capacity, independent of a slot's occupant.
-            DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeQuantised;
             /// Exact movable family, shared by sizing, materialization and device copy.
             DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
         };
@@ -89,7 +89,7 @@ namespace llaminar2
          * @brief Derive the reusable device profile from model-authenticated metadata.
          *
          * Every quantized source codebook is converted through the same
-         * NativeVNNI execution/allocation catalog used by CUDA and ROCm weight
+         * NativeQuantised execution/allocation catalog used by CUDA and ROCm weight
          * preparation. This setup-time form lets physical-memory admission run
          * before prepared engines and their device pointers exist.
          *
@@ -321,7 +321,7 @@ namespace llaminar2
          * graph-lifetime slot index.
          *
          * @return true when @p slot_index names an allocated slot with ready
-         *         gate/up/down NativeVNNI payload descriptors.
+         *         gate/up/down NativeQuantised payload descriptors.
          */
         bool descriptorForSlot(uint32_t slot_index,
                                uint32_t logical_expert,

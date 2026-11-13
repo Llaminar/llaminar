@@ -119,7 +119,7 @@ TEST_P(MaximumContextStateAllocation, Qwen27BAnd35BAllMTPPolicies) {
                      << GetParam() << " moe=" << moe << " shards=" << shards
                      << " sidecar=" << sidecar);
         const auto &envelope = sidecar ? policies.at(1) : policies.front();
-        const MTPGraphOwnerPlan envelope_owners(envelope);
+        const MTPGraphOwnerPlan envelope_owners(envelope, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
         DevicePlanConfig cfg;
         cfg.world_rank = 0;
         cfg.device = device;
@@ -205,7 +205,7 @@ TEST_P(MaximumContextStateAllocation, Qwen27BAnd35BAllMTPPolicies) {
             const auto &mtp = policies[index];
             if (mtp.enabled != sidecar)
               continue;
-            const MTPGraphOwnerPlan owners(mtp);
+            const MTPGraphOwnerPlan owners(mtp, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
             const int query_rows = sidecar ? owners.flattenedTargetRows() : 1;
             SCOPED_TRACE(::testing::Message()
                          << "depth=" << owners.draftDepth() << " policy="

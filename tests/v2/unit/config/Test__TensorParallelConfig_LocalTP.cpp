@@ -4,11 +4,13 @@
  *
  * Tests the factory method that creates TensorParallelConfig from ILocalTPContext,
  * enabling LOCAL TP weight sharding with proportional work distribution for
- * heterogeneous GPU configurations.
+ * heterogeneous GPU configurations. Opt-in query-derived coverage preserves
+ * exact LocalTP membership and defaults without any consumer/runtime wiring.
  */
 
 #include <gtest/gtest.h>
 #include "config/TensorParallelConfig.h"
+#include "kernels/attention/AttentionHeadMapping.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "tensors/ITensor.h"
@@ -341,18 +343,25 @@ namespace llaminar2
             EXPECT_EQ(config.worldSize(), 3);
             EXPECT_TRUE(config.validate()) << config.validationError();
 
-            // 14 heads / 3 with GQA alignment (n_kv_heads=2) → multiples of 2
-            // Expected: [6, 4, 4] (first device gets extra aligned chunk)
+            // Full replicated KV uses global14/2 grouping. Exact unequal
+            // local Q widths may be odd; their global intervals own the mapping.
             int total_heads = 0;
+            int odd_shards = 0;
             for (int i = 0; i < 3; ++i)
             {
                 const auto &a = config.forRank(i);
+                EXPECT_EQ(a.head_start, total_heads);
+                EXPECT_GE(a.head_count, 4);
+                EXPECT_LE(a.head_count, 5);
+                EXPECT_EQ(a.kv_head_start, 0);
+                EXPECT_EQ(a.kv_head_count, TEST_KV_HEADS);
+                EXPECT_TRUE(attention::isValidHeadMapping({a.head_count,
+                    a.kv_head_count, a.head_start, TEST_HEADS / TEST_KV_HEADS}));
                 total_heads += a.head_count;
-                EXPECT_EQ(a.head_count % TEST_KV_HEADS, 0)
-                    << "Rank " << i << " head_count=" << a.head_count
-                    << " must be divisible by n_kv_heads=" << TEST_KV_HEADS;
+                odd_shards += a.head_count % 2;
             }
             EXPECT_EQ(total_heads, TEST_HEADS);
+            EXPECT_EQ(odd_shards, 2);
         }
 
         TEST_F(Test__TensorParallelConfig_LocalTP, FromLocalTPContext_ThreeDevices_ProportionalSplit)
@@ -546,3 +555,64 @@ namespace llaminar2
 
     } // namespace test
 } // namespace llaminar2
+
+namespace llaminar2::test
+{
+/**
+ * @test Real LocalTP membership/order reaches the same opt-in source coverage factory.
+ * Empty Q owners remain rejected; no device context, allocation or transfer runs.
+ */
+TEST_F(Test__TensorParallelConfig_LocalTP, QueryCoverageRetainsExactLocalTPMembership)
+{
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        std::vector<GlobalDeviceAddress> devices;
+        for (int rank = 0; rank < degree; ++rank)
+            devices.push_back(GlobalDeviceAddress::rocm(degree - 1 - rank));
+        MockLocalTPContext context(devices);
+        const auto actual = TensorParallelConfig::fromLocalTPContext(context, 24, 2, 10240, 248320,
+            KVHeadCoveragePolicy::QueryInterval);
+        const auto legacy = TensorParallelConfig::fromLocalTPContext(context, 24, 2, 10240, 248320);
+        ASSERT_TRUE(actual.validate());
+        ASSERT_EQ(actual.totalKVHeads(), 2);
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            const auto &a = actual.forRank(rank), &b = legacy.forRank(rank);
+            EXPECT_EQ(a.device, devices[rank].toLocalDeviceId());
+            EXPECT_EQ(a.head_start, b.head_start); EXPECT_EQ(a.head_count, b.head_count);
+            EXPECT_EQ(a.kv_head_start, a.head_start / 12);
+            EXPECT_EQ(a.kvHeadEnd(), (a.headEnd() - 1) / 12 + 1);
+        }
+    }
+    MockLocalTPContext empty_owner({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}, {1.f, 0.f});
+    EXPECT_THROW(TensorParallelConfig::fromLocalTPContext(empty_owner, 24, 2, 10240, 248320,
+        KVHeadCoveragePolicy::QueryInterval), std::invalid_argument);
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/** @test Every LocalTP construction1..8 consumes the same source-derived query granularity. */
+TEST_F(Test__TensorParallelConfig_LocalTP, QueryConsumerGranularityRetainsAllDegreesAndMembership)
+{
+    const auto declaration = QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}});
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        std::vector<GlobalDeviceAddress> devices;
+        for (int rank = 0; rank < degree; ++rank) devices.push_back(GlobalDeviceAddress::rocm(degree - 1 - rank));
+        MockLocalTPContext context(devices);
+        const auto actual = TensorParallelConfig::fromLocalTPContext(context, 24, 2, 10240, 248320,
+            KVHeadCoveragePolicy::QueryInterval, declaration);
+        ASSERT_TRUE(actual.validate());
+        ASSERT_EQ(actual.queryHeadGranularity(), 3);
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            const auto &a = actual.forRank(rank);
+            EXPECT_EQ(a.device, devices[rank].toLocalDeviceId());
+            EXPECT_EQ(a.head_start % 3, 0); EXPECT_EQ(a.head_count % 3, 0);
+            EXPECT_EQ(a.kv_head_start, a.head_start / 12);
+            EXPECT_EQ(a.kvHeadEnd(), (a.headEnd() - 1) / 12 + 1);
+        }
+    }
+}
+} // namespace llaminar2::test

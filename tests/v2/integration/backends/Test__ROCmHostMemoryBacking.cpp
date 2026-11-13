@@ -10,6 +10,7 @@
  * rather than silently retaining demand-paged HMM ranges after unregistration.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
@@ -93,7 +94,7 @@ TEST(ROCmHostMemoryBacking, NativeSlabUsesDriverPagesAndTransfersExactBytes)
     const auto staging_mapping = mappingFor(staging.front().mutablePinnedData());
     ASSERT_NE(staging_mapping.find("/dev/dri/renderD"), std::string::npos) << staging_mapping;
 
-    const auto lanes = transfers.allocatePersistentTransferExecutionLanes(
+    const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
         1u, device, "native_host_backing_regression");
     auto storage = transfers.allocateDeviceTransferBuffer(bytes, device);
     auto &context = GPUDeviceContextPool::instance().getContext(device);

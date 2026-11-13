@@ -318,7 +318,7 @@ replace HF reference generation or change acceptance thresholds.
 | Residual-linked RMSNorm and absolute-position RoPE | 97 | 7.966e-8 |
 
 The local linear audit first evaluates plain FP32 operands, then independently
-encodes the transient Q8 operand used by NativeVNNI. This is internal GEMM
+encodes the transient Q8 operand used by NativeQuantised. This is internal GEMM
 scratch, **not a different configured model activation precision**. The exact
 GGUF has Q4_0 transformer matrices and a Q8_0 terminal matrix. Five fused down
 projections initially differed by up to 1.051e-4 when the diagnostic used

@@ -346,7 +346,7 @@ namespace llaminar2
                           static_cast<size_t>(params_.top_k)
                     : static_cast<size_t>(params_.bucket_rows);
             info.addOutput(
-                "output",
+                consumesCanonicalRouteTicket() ? "canonical_route_contributions" : "output",
                 params_.output,
                 rows,
                 static_cast<size_t>(params_.d_model));

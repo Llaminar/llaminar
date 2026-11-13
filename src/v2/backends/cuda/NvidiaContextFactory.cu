@@ -2,10 +2,12 @@
  * @file NvidiaContextFactory.cu
  * @brief CUDA factory registration for GPUDeviceContextPool
  *
- * This file registers the NVIDIA device context factory with the
- * GPUDeviceContextPool during static initialization. This allows
+ * This file explicitly registers the NVIDIA device context factory with the
+ * GPUDeviceContextPool after immutable physical inventory admission. This allows
  * GPUDeviceContextPool (which lives in llaminar2_core) to create
  * NvidiaDeviceContext instances without directly depending on CUDA headers.
+ * Cold discovery retains a short process-lifetime borrow before any native
+ * query, so terminal retirement cannot race factory setup before a worker exists.
  *
  * NOTE: The static initializer is intentionally a no-op to avoid ~500-800ms
  * CUDA enumeration during process startup (before main). Registration is
@@ -16,15 +18,63 @@
  * @date February 2026
  */
 
+#include "../NativeContextRuntimePolicy.h"
 #include "NvidiaDeviceContext.h"
+#include "../NativeContextPreparation.h"
+#include <mutex>
 #include "../GPUDeviceContextPool.h"
-#include "../GPUEnumeration.h"
+#include "CUDAHardwareMetadata.h"
+#include "CUDADriverApi.h"
+#include "../DeviceUUID.h"
+#include <span>
+#include "../GPUDeviceProcessLifetime.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include <memory>
 
 namespace llaminar2
 {
+    NativeContextBirthKey PreparedGPUContextFactory::cudaBirthKey(int ordinal)
+    {
+        // This is the post-inventory selected-worker population. Snapshot never
+        // initializes metadata or creates an unrelated primary context.
+        const auto& inventory=cudaHardwareMetadata();const auto& hardware=inventory.at(ordinal);
+        auto key=commonBirthKey(DeviceId::cuda(ordinal));
+        key.compute_units=hardware.sm_count;key.native_wave_width=hardware.native_warp_width;
+        key.runtime_policy_sha256=NativeContextRuntimePolicy::original(DeviceType::CUDA).identity();
+        key.physical_uuid=formatDeviceUUID(std::span<const char,16>{reinterpret_cast<const char*>(hardware.uuid.data()),16});
+        key.architecture="sm_"+std::to_string(hardware.sm_major)+std::to_string(hardware.sm_minor);
+        key.visible_device_count=inventory.size();std::string visibility;
+        for(std::size_t i=0;i<inventory.size();++i){const auto& record=inventory.at(static_cast<int>(i));
+            visibility+=formatDeviceUUID(std::span<const char,16>{reinterpret_cast<const char*>(record.uuid.data()),16})+";";}
+        key.visibility_identity=digestIdentity(visibility+":"+NativeContextRuntimePolicy::original(DeviceType::CUDA).liveIdentity());
+        int runtime=0,driver=0;
+        if(cudaRuntimeGetVersion(&runtime)!=cudaSuccess || cudaDriverGetVersion(&driver)!=cudaSuccess || runtime<=0 || driver<=0)
+            throw std::runtime_error("Selected CUDA worker lacks its actual runtime/driver version identity");
+        key.runtime_version=std::to_string(runtime);key.driver_version=std::to_string(driver);
+        key.runtime_sha256=libraryIdentity(reinterpret_cast<const void*>(&cudaRuntimeGetVersion));
+        key.driver_sha256=libraryIdentity(reinterpret_cast<const void*>(CUDADriverApi::instance().init));
+        key.backend_sha256=digestIdentity(libraryIdentity(reinterpret_cast<const void*>(&cublasCreate_v2))+":"+
+            libraryIdentity(reinterpret_cast<const void*>(&cublasLtCreate)));
+        key.requireComplete();return key;
+    }
+    PreparedGPUContextObjectGeometry PreparedGPUContextFactory::cudaObjectGeometry()
+    {return {sizeof(NvidiaDeviceContext),alignof(NvidiaDeviceContext)};}
+    std::shared_ptr<IWorkerGPUContext> PreparedGPUContextFactory::cuda(int ordinal,std::shared_ptr<PreparedGPUWorkerStack> stack)
+    {
+        if(!stack)throw std::invalid_argument("Prepared original worker needs its source-owned stack");
+        auto* storage=stack->contextObjectStorage(sizeof(NvidiaDeviceContext),alignof(NvidiaDeviceContext));
+        auto* worker=new(storage) NvidiaDeviceContext(ordinal,stack);
+        return std::shared_ptr<IWorkerGPUContext>(worker,[stack=std::move(stack)](IWorkerGPUContext* base){
+            std::destroy_at(static_cast<NvidiaDeviceContext*>(base));
+        });
+    }
+    /** @brief Pure creator registration; original constructor owns native initialization after source claims. */
+    void ensureNvidiaPreparedFactoryRegistered()
+    {
+        static std::once_flag registered;
+        std::call_once(registered,[]{GPUDeviceContextPool::instance().registerPreparedFactory(DeviceType::CUDA,PreparedGPUContextFactory::cuda);});
+    }
     namespace
     {
 
@@ -67,8 +117,9 @@ namespace llaminar2
             if (pool.hasNvidiaSupport())
                 return; // Already registered
 
-            auto devices = cuda_enumeration::enumerate_cuda_devices();
-            int device_count = static_cast<int>(devices.size());
+            const auto discovery_lifetime = GPUDeviceProcessLifetime::acquireNativeContext();
+            initializeCUDAHardwareMetadata();
+            const int device_count = static_cast<int>(cudaHardwareMetadata().size());
 
             if (device_count > 0)
             {
@@ -113,16 +164,13 @@ namespace llaminar2
     // Explicit registration (called when static init is unreliable)
     // =========================================================================
 
+    /**
+     * @brief Register the exact admitted CUDA visibility after explicit startup.
+     * @throws Discovery or inventory validation errors without hiding failed admission.
+     */
     void ensureNvidiaFactoryRegistered()
     {
-        try
-        {
-            doRegisterNvidiaFactory();
-        }
-        catch (const std::exception &e)
-        {
-            LOG_WARN("[NvidiaContextFactory] Explicit registration failed: " << e.what());
-        }
+        doRegisterNvidiaFactory();
     }
 
 } // namespace llaminar2

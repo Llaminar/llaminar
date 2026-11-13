@@ -10,6 +10,10 @@
  * - Multi-machine support via hostfile
  *
  * @author David Sanftenberg
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #pragma once
@@ -17,6 +21,8 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <span>
+#include "NUMATopology.h"
 
 namespace llaminar2
 {
@@ -37,6 +43,39 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable cold mapping of one real rank per observed NUMA partition.
+     *
+     * Node labels are physical observations, never MPI rank IDs. The original
+     * launcher writes native rankfile entries from their exact logical core
+     * sets. Rank indices enumerate observed partitions; they are never NUMA IDs.
+     */
+    class MPINUMAMapping final
+    {
+    public:
+        /**
+         * @brief Seal distinct observed nodes and their original logical core sets.
+         * @param placement Original cached OS NUMA/PU and logical-core observations.
+         * @param selected_nodes Exact participating OS NUMA labels, never rank IDs.
+         * @return Checked placement containing no worker/thread execution state.
+         * @throws std::invalid_argument For unknown nodes, empty lists or overlapping/invalid CPUs.
+         */
+        static MPINUMAMapping fromObservedPlacement(std::span<const MPICorePlacement> placement,
+            std::span<const int> selected_nodes);
+        /** @return Original node roster, unrelated to eventual MPI rank numbers. */
+        const std::vector<int> &nodes() const noexcept { return nodes_; }
+        /** @return Exact CPU union in the original launcher CPU-set grammar. */
+        const std::string &cpuSet() const noexcept { return cpu_set_; }
+        /** @return Native local OpenMPI rankfile, one complete logical-core set per observed node. */
+        const std::string &rankFileContents() const noexcept { return rank_file_contents_; }
+    private:
+        /** @brief Only the checked observation factory may publish a placement. */
+        MPINUMAMapping() = default;
+        std::vector<int> nodes_;
+        std::string cpu_set_;
+        std::string rank_file_contents_;
+    };
+
+    /**
      * @brief MPI launch configuration
      */
     struct MPILaunchConfig
@@ -52,9 +91,10 @@ namespace llaminar2
         // Per-rank OpenMP configuration
         int omp_threads_per_rank = 0;   ///< OMP_NUM_THREADS (0 = auto)
         bool use_physical_cores = true; ///< Restrict to physical cores only
-        std::string omp_places = "sockets";
+        std::string omp_places = "cores"; ///< One place per physical core, including its allowed SMT siblings.
         std::string omp_proc_bind = "close";
         std::string cpu_set; ///< Optional OpenMPI --cpu-set for explicit CPU NUMA targeting
+        std::optional<MPINUMAMapping> numa_mapping; ///< Exact local one-rank-per-observed-NUMA declaration.
     };
 
     /**
@@ -67,6 +107,13 @@ namespace llaminar2
         int detected_world_size = -1;   ///< World size if detected (-1 if not)
         std::string mpi_implementation; ///< "openmpi", "mpich", "unknown"
         std::string detection_method;   ///< How MPI was detected
+    };
+
+    /** @brief Original application argv ownership during an MPI self-launch. */
+    enum class MPIBootstrapArgumentPolicy
+    {
+        FilterLaunchArguments, ///< Existing frontends consume launcher-only flags.
+        PreserveOriginalArguments, ///< Opaque wrappers retain their exact parser/config contract.
     };
 
     /**
@@ -108,11 +155,19 @@ namespace llaminar2
         static CPUTopology detectCPUTopology();
 
         /**
+         * @brief Publish only portable placement before any child loads libgomp.
+         * @param config Existing explicit launch policy; no host-local CPU count is exported.
+         * @throws std::runtime_error If the exact selected environment cannot be published.
+         * @throws std::invalid_argument For empty placement or binding policy.
+         */
+        static void configureOpenMPPlacement(const MPILaunchConfig &config);
+
+        /**
          * @brief Configure OpenMP environment for optimal performance
          *
          * Sets environment variables:
          * - OMP_NUM_THREADS: Based on cores per socket (or forced value)
-         * - OMP_PLACES: sockets
+         * - OMP_PLACES: selected placement (physical core places by default)
          * - OMP_PROC_BIND: close
          * - MKL_NUM_THREADS: Match OMP
          *
@@ -136,28 +191,34 @@ namespace llaminar2
          * @param argv Original argv
          * @param config Launch configuration
          * @param topology CPU topology (for auto-detecting num_procs)
+         * @param arguments Whether original application flags remain exact after re-exec.
+         * @param observed_numa_rankfile Original guardian-owned rankfile pathname, required only for a typed NUMA mapping.
          * @return Vector of command-line arguments for execvp
          */
         static std::vector<std::string> buildMPIRunCommand(
             int argc, char *argv[],
             const MPILaunchConfig &config,
-            const CPUTopology &topology);
+            const CPUTopology &topology,
+            MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments,
+            const std::string &observed_numa_rankfile = {});
 
         /**
          * @brief Self-launch via mpirun
          *
-         * Replaces current process with mpirun invocation.
+         * Replaces this managed child with exact mpirun argv beneath its original ancestor owner.
          * This function does not return on success.
          *
          * @param argc Original argc
          * @param argv Original argv
          * @param config Launch configuration
          * @param topology CPU topology
-         * @return -1 on failure (exec failed)
+         * @param arguments Existing frontends filter launch flags; typed wrappers may retain them.
+         * @return -1 on failure (owned mpirun exec failed)
          */
         static int selfLaunchMPI(int argc, char *argv[],
                                  const MPILaunchConfig &config,
-                                 const CPUTopology &topology);
+                                 const CPUTopology &topology,
+                                 MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments);
 
         /**
          * @brief Get default launch configuration based on topology
@@ -184,15 +245,16 @@ namespace llaminar2
                                               const MPIEnvironmentInfo &env);
 
         /**
-         * @brief Read OpenMPI cpu-set mask string for a NUMA node (e.g., "28-55,84-111")
+         * @brief Read OS CPU-list string for a NUMA node (e.g., "28-55,84-111")
          */
         static std::string getCpuSetForNumaNode(int numa_node);
 
         /**
-         * @brief Read physical-core-only OpenMPI cpu-set for a NUMA node.
+         * @brief Read physical-core representatives as OS CPU IDs for a NUMA node.
          *
          * Uses thread_siblings topology to keep one logical CPU per physical core
-         * and returns a compact range list (e.g., "28-55").
+         * and returns a compact OS range list (e.g., "28-55"). These IDs are
+         * diagnostics/affinity inputs, never OpenMPI logical cpu-set indices.
          */
         static std::string getPhysicalCpuSetForNumaNode(int numa_node);
 

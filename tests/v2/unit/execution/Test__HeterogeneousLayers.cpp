@@ -461,7 +461,7 @@ TEST(Test__HeterogeneousLayers, HybridCacheManager_GDNStateInit)
     ASSERT_NE(state, nullptr);
 
     // Recurrence state: [n_heads, head_dim, head_dim] = 2 * 4 * 4 = 32 floats
-    EXPECT_EQ(state->recurrence_state.size(), 32u);
+    EXPECT_EQ(state->recurrence_state.size(), 194u);
     // All zeros
     for (float v : state->recurrence_state)
         EXPECT_FLOAT_EQ(v, 0.0f);
@@ -506,8 +506,9 @@ TEST(Test__HeterogeneousLayers, HybridCacheManager_MemoryBytes)
     config.conv_kernel_size = 4;
 
     HybridCacheManager manager(config, nullptr);
-    // Each GDN layer: (2*4*4 + 2*3*4) * 4 bytes = (32 + 24) * 4 = 224 bytes
-    EXPECT_EQ(manager.gdnMemoryBytes(), 2 * 224u);
+    // Each layer owns two checkpoint/history heads plus convolution history.
+    // 2 * (1 phase + 16 checkpoint + 8 * 10 raw) = 194 recurrence floats.
+    EXPECT_EQ(manager.gdnMemoryBytes(), 2 * (194u + 24u) * sizeof(float));
 }
 
 TEST(Test__HeterogeneousLayers, HybridCacheManager_OutOfBounds)

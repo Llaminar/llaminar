@@ -3,9 +3,11 @@
  * @brief AVX2 GEMV/GEMM kernels using saturation-safe emulated VNNI.
  *
  * These kernels read the SAME packed weight format as the AVX512 VNNI kernels
- * (CPUNativeVNNIGemv.h). Each 64-byte ZMM slot is processed as two 32-byte
+ * (CPUNativeQuantisedGemv.h). Each 64-byte ZMM slot is processed as two 32-byte
  * YMM halves, and 8 YMM accumulators cover the same 64 columns that 4 ZMM
  * accumulators cover in AVX512.
+ * GPU-aligned K folds retain the original serial NaN operand precedence as
+ * well as the fixed finite arithmetic tree; native FMA paths remain unchanged.
  *
  * Both AVX512 and AVX2 paths are always compiled (no #ifdef gates) so they
  * can be tested against each other on AVX512 hardware via runtime dispatch.
@@ -22,22 +24,22 @@
 #include <cstring>
 #include <algorithm>
 
-#include "CPUNativeVNNIWeightPacker.h"
-#include "CPUNativeVNNIContributionContract.h"
-#include "CPUNativeVNNIFP16.h"
-#include "CPUNativeVNNIQ6Kernels.h"
-#include "CPUNativeVNNIMultiScaleKernels.h"
+#include "CPUNativeQuantisedWeightPacker.h"
+#include "CPUNativeQuantisedContributionContract.h"
+#include "CPUNativeQuantisedFP16.h"
+#include "CPUNativeQuantisedQ6Kernels.h"
+#include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "VNNIEmulation.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
 
-namespace llaminar2::cpu::native_vnni
+namespace llaminar2::cpu::native_quantised
 {
 
     // =========================================================================
     // Decode LUT tables for nibble → signed int8 mapping
     // =========================================================================
-    // These are duplicated from CPUNativeVNNIGemv.h so this header is
+    // These are duplicated from CPUNativeQuantisedGemv.h so this header is
     // self-contained. The values are identical to the AVX512 versions.
     // =========================================================================
 
@@ -120,7 +122,7 @@ namespace llaminar2::cpu::native_vnni
      * @return Updated FP32 segment.
      */
     inline __m256 accumulateNibbleSegmentAVX2(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
         int chunk,
         int kb_start,
@@ -176,7 +178,7 @@ namespace llaminar2::cpu::native_vnni
                 _mm256_mullo_epi32(bias_128_i32, compensation));
             const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
             const float activation_scale =
-                nativeVNNIFP16ScaleToFP32(activation.d);
+                nativeQuantisedFP16ScaleToFP32(activation.d);
             if (packed.is_asymmetric)
             {
                 const __m256 weight_min = _mm256_cvtph_ps(
@@ -212,7 +214,7 @@ namespace llaminar2::cpu::native_vnni
      *        the serial per-K-block reduction tree.
      */
     inline void gemv_avx2_chunk_native(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
         float *C,
         int chunk,
@@ -256,7 +258,7 @@ namespace llaminar2::cpu::native_vnni
      *        prepared encoding has identical tile-boundary semantics.
      */
     inline void gemv_avx2_chunk_non_nibble(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
         float *C,
         int chunk,
@@ -328,7 +330,7 @@ namespace llaminar2::cpu::native_vnni
                     _mm256_mullo_epi32(bias_128_i32, compensation));
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float activation_scale =
-                    nativeVNNIFP16ScaleToFP32(activation.d);
+                    nativeQuantisedFP16ScaleToFP32(activation.d);
                 if (packed.is_asymmetric)
                 {
                     const __m256 weight_min = _mm256_cvtph_ps(
@@ -363,7 +365,7 @@ namespace llaminar2::cpu::native_vnni
     // =========================================================================
 
     inline void gemv_avx2_block(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
         float *C,
         int chunk_start,
@@ -423,7 +425,7 @@ namespace llaminar2::cpu::native_vnni
      * @param fp1 Running second-row FP32 value, updated in place.
      */
     inline void accumulateTwoRowsNibbleSegmentAVX2(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
         const Q8_1Block *A_q8_row1,
         int chunk,
@@ -497,8 +499,8 @@ namespace llaminar2::cpu::native_vnni
                 const __m256i corrected1 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot1_low, dot1_high), bias);
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
-                const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
-                const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
+                const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
+                const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)
                 {
                     const __m256 weight_min = _mm256_cvtph_ps(
@@ -533,7 +535,7 @@ namespace llaminar2::cpu::native_vnni
      * register AVX2 ABI without hot-loop spills.
      */
     inline void gemm_2row_native_chunk_avx2(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
         const Q8_1Block *A_q8_row1,
         float *C_row0,
@@ -572,8 +574,9 @@ namespace llaminar2::cpu::native_vnni
      * @brief AVX2 2-row INT8 pre-decoded GEMM microkernel for one 64-col chunk.
      */
     /** @brief Dispatch a two-row non-nibble AVX2 verifier chunk. */
+    template<bool SumPairs=false>
     inline void gemm_2row_non_nibble_chunk_avx2(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
         const Q8_1Block *A_q8_row1,
         float *C_row0,
@@ -673,8 +676,8 @@ namespace llaminar2::cpu::native_vnni
                 const __m256i corrected1 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot1_even, dot1_odd), bias);
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
-                const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
-                const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
+                const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
+                const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)
                 {
                     const __m256 weight_min = _mm256_cvtph_ps(
@@ -697,8 +700,9 @@ namespace llaminar2::cpu::native_vnni
                         packed.numerical_policy);
                 }
             }
-            _mm256_storeu_ps(C_row0 + segment * 8, fp0);
-            _mm256_storeu_ps(C_row1 + segment * 8, fp1);
+            if constexpr(SumPairs) _mm256_storeu_ps(C_row0 + segment * 8,_mm256_add_ps(fp0,fp1));
+            else { _mm256_storeu_ps(C_row0 + segment * 8, fp0);
+            _mm256_storeu_ps(C_row1 + segment * 8, fp1); }
         }
     }
 
@@ -726,7 +730,7 @@ namespace llaminar2::cpu::native_vnni
                 destination + segment * 8,
                 first_partition
                     ? value
-                    : _mm256_add_ps(
+                    : addOrderedAVX2(
                           _mm256_loadu_ps(destination + segment * 8),
                           value));
         }
@@ -749,7 +753,7 @@ namespace llaminar2::cpu::native_vnni
      * @param decode_lut Broadcast decoder for nibble formats.
      */
     inline void gemvAVX2OrderedPartitions(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row,
         float *output,
         int chunk,
@@ -759,10 +763,10 @@ namespace llaminar2::cpu::native_vnni
         const __m256i decode_lut)
     {
         if (MoEProjectionNumericalContract::
-                oneNativeVNNIBlockPerOrderedPartition(
+                oneNativeQuantisedBlockPerOrderedPartition(
                     K_blocks *
                     MoEProjectionNumericalContract::
-                        native_vnni_values_per_block))
+                        native_quantised_values_per_block))
         {
             if (packed.usesNibbleLUT())
             {
@@ -811,7 +815,7 @@ namespace llaminar2::cpu::native_vnni
                         _mm256_setzero_ps());
                     reduced = k_tile == 0
                         ? partial
-                        : _mm256_add_ps(reduced, partial);
+                        : addOrderedAVX2(reduced, partial);
                 }
                 _mm256_storeu_ps(output + segment * 8, reduced);
             }
@@ -856,7 +860,7 @@ namespace llaminar2::cpu::native_vnni
      * @param decode_lut Broadcast decoder for nibble formats.
      */
     inline void gemmTwoRowsAVX2OrderedPartitions(
-        const CPUNativeVNNIPackedWeights &packed,
+        const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row0,
         const Q8_1Block *row1,
         float *output0,
@@ -868,10 +872,10 @@ namespace llaminar2::cpu::native_vnni
         const __m256i decode_lut)
     {
         if (MoEProjectionNumericalContract::
-                oneNativeVNNIBlockPerOrderedPartition(
+                oneNativeQuantisedBlockPerOrderedPartition(
                     K_blocks *
                     MoEProjectionNumericalContract::
-                        native_vnni_values_per_block))
+                        native_quantised_values_per_block))
         {
             if (packed.usesNibbleLUT())
             {
@@ -934,8 +938,8 @@ namespace llaminar2::cpu::native_vnni
                     }
                     else
                     {
-                        reduced0 = _mm256_add_ps(reduced0, partial0);
-                        reduced1 = _mm256_add_ps(reduced1, partial1);
+                        reduced0 = addOrderedAVX2(reduced0, partial0);
+                        reduced1 = addOrderedAVX2(reduced1, partial1);
                     }
                 }
                 _mm256_storeu_ps(output0 + segment * 8, reduced0);
@@ -968,4 +972,4 @@ namespace llaminar2::cpu::native_vnni
         }
     }
 
-} // namespace llaminar2::cpu::native_vnni
+} // namespace llaminar2::cpu::native_quantised

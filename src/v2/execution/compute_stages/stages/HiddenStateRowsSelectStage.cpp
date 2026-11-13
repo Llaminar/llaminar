@@ -71,9 +71,8 @@ namespace llaminar2
     {
         if (params_.seq_len <= 0)
             return 0;
-        if (requested_row < 0)
-            return 0;
-        return std::clamp(requested_row, 0, params_.seq_len - 1);
+        return selectedRowForCopy(requested_row, params_.seq_len,
+            params_.row_copy_policy.negative_rows);
     }
 
     std::vector<int> HiddenStateRowsSelectStage::defaultSelectedRows() const
@@ -293,6 +292,7 @@ namespace llaminar2
             DeviceRowIndexSource::ShiftedPrefillTransaction)
         {
             const bool valid_transaction =
+                validMTPShiftedCacheOrigin(params_.shifted_cache_origin) &&
                 params_.device_id.is_gpu() && params_.request_count > 0 &&
                 params_.seq_len % params_.request_count == 0 &&
                 selected_row_count_ == params_.seq_len &&
@@ -401,6 +401,16 @@ namespace llaminar2
             return false;
         }
 
+        const auto &copy = params_.row_copy_policy;
+        if ((copy.negative_rows != NegativeRowSelectionPolicy::ClampToFirst &&
+             copy.negative_rows != NegativeRowSelectionPolicy::PreserveDestination) ||
+            (copy.source_stride && copy.source_stride != resolved_input->cols()) ||
+            (copy.destination_stride && copy.destination_stride != resolved_output->cols()))
+        {
+            LOG_ERROR("[HiddenStateRowsSelectStage] Row-copy policy disagrees with physical tensor strides");
+            return false;
+        }
+
         *input_base = resolved_input;
         *output_base = resolved_output;
         return true;
@@ -433,11 +443,14 @@ namespace llaminar2
         const size_t row_bytes = static_cast<size_t>(params_.d_model) * sizeof(float);
         for (int output_row = 0; output_row < selected_row_count_; ++output_row)
         {
+            const int source_row = selected_rows_[static_cast<size_t>(output_row)];
+            if (source_row < 0)
+                continue;
             const size_t source_offset =
-                static_cast<size_t>(selected_rows_[static_cast<size_t>(output_row)]) *
-                static_cast<size_t>(params_.d_model);
+                static_cast<size_t>(source_row) *
+                static_cast<size_t>(params_.row_copy_policy.source_stride ? params_.row_copy_policy.source_stride : params_.d_model);
             const size_t output_offset =
-                static_cast<size_t>(output_row) * static_cast<size_t>(params_.d_model);
+                static_cast<size_t>(output_row) * static_cast<size_t>(params_.row_copy_policy.destination_stride ? params_.row_copy_policy.destination_stride : params_.d_model);
             std::memcpy(output_data + output_offset, input_data + source_offset, row_bytes);
         }
         return true;
@@ -740,7 +753,7 @@ namespace llaminar2
                         row_stride,
                         params_.seq_len,
                         params_.d_model,
-                        gpuStream());
+                        gpuStream(),params_.shifted_cache_origin);
                 }
             }
             else if (shifted_prefill_progress)
@@ -756,7 +769,7 @@ namespace llaminar2
                     params_.seq_len,
                     params_.d_model,
                     selected_row_count_,
-                    gpuStream());
+                    gpuStream(),params_.shifted_cache_origin);
             }
             else if (request_terminal_rows)
             {
@@ -782,14 +795,27 @@ namespace llaminar2
             }
             else if (fixed_contiguous_rows)
             {
-                launched = cuda::launchFixedRowsSelectFP32(
-                    input_device,
-                    output_device,
-                    params_.fixed_contiguous_row_start,
-                    selected_row_count_,
-                    params_.seq_len,
-                    params_.d_model,
-                    gpuStream());
+                // Tight legacy rows retain their contiguous-copy specialization.
+                // Explicit strides copy only live columns, never shard padding.
+                if (params_.row_copy_policy.source_stride || params_.row_copy_policy.destination_stride)
+                {
+                    auto policy = params_.row_copy_policy;
+                    policy.fixed_first_row = params_.fixed_contiguous_row_start;
+                    launched = cuda::launchRowsSelectFP32(input_device, output_device,
+                        nullptr, params_.seq_len, params_.d_model, selected_row_count_,
+                        gpuStream(), policy);
+                }
+                else
+                {
+                    launched = cuda::launchFixedRowsSelectFP32(
+                        input_device,
+                        output_device,
+                        params_.fixed_contiguous_row_start,
+                        selected_row_count_,
+                        params_.seq_len,
+                        params_.d_model,
+                        gpuStream());
+                }
             }
             else
             {
@@ -800,7 +826,7 @@ namespace llaminar2
                     params_.seq_len,
                     params_.d_model,
                     selected_row_count_,
-                    gpuStream());
+                    gpuStream(), params_.row_copy_policy);
             }
 #endif
         }
@@ -854,7 +880,7 @@ namespace llaminar2
                         row_stride,
                         params_.seq_len,
                         params_.d_model,
-                        gpuStream());
+                        gpuStream(),params_.shifted_cache_origin);
                 }
             }
             else if (shifted_prefill_progress)
@@ -870,7 +896,7 @@ namespace llaminar2
                     params_.seq_len,
                     params_.d_model,
                     selected_row_count_,
-                    gpuStream());
+                    gpuStream(),params_.shifted_cache_origin);
             }
             else if (request_terminal_rows)
             {
@@ -896,14 +922,27 @@ namespace llaminar2
             }
             else if (fixed_contiguous_rows)
             {
-                launched = rocm::launchFixedRowsSelectFP32(
-                    input_device,
-                    output_device,
-                    params_.fixed_contiguous_row_start,
-                    selected_row_count_,
-                    params_.seq_len,
-                    params_.d_model,
-                    gpuStream());
+                // Tight legacy rows retain their contiguous-copy specialization.
+                // Explicit strides copy only live columns, never shard padding.
+                if (params_.row_copy_policy.source_stride || params_.row_copy_policy.destination_stride)
+                {
+                    auto policy = params_.row_copy_policy;
+                    policy.fixed_first_row = params_.fixed_contiguous_row_start;
+                    launched = rocm::launchRowsSelectFP32(input_device, output_device,
+                        nullptr, params_.seq_len, params_.d_model, selected_row_count_,
+                        gpuStream(), policy);
+                }
+                else
+                {
+                    launched = rocm::launchFixedRowsSelectFP32(
+                        input_device,
+                        output_device,
+                        params_.fixed_contiguous_row_start,
+                        selected_row_count_,
+                        params_.seq_len,
+                        params_.d_model,
+                        gpuStream());
+                }
             }
             else
             {
@@ -914,7 +953,7 @@ namespace llaminar2
                     params_.seq_len,
                     params_.d_model,
                     selected_row_count_,
-                    gpuStream());
+                    gpuStream(), params_.row_copy_policy);
             }
 #endif
         }
@@ -1031,6 +1070,14 @@ namespace llaminar2
                 .addOutput(BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS, "INT32")
                 .addOutput(BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS, "INT32")
                 .addOutput(BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS, "INT32");
+        }
+        if (params_.row_copy_policy.negative_rows == NegativeRowSelectionPolicy::PreserveDestination)
+        {
+            // An absent accepted row keeps the prior committed value and its
+            // original producer edge. This is an in/out, never an uninitialized output.
+            return StageBufferContract::build()
+                .addInput(*params_.input_buffer_id, "FP32")
+                .addPreallocatedInOut(*params_.output_buffer_id, "FP32");
         }
         return StageBufferContract::build()
             .addInput(*params_.input_buffer_id, "FP32")

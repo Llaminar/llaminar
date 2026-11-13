@@ -26,7 +26,9 @@
 
 #ifdef HAVE_CUDA
 
+#include "backends/detail/GPUFlatGraphInspection.h"
 #include "CUDAGraphCapture.h"
+#include "NvidiaDeviceContext.h"
 #include "CUDADriverApi.h"
 #include "CUDABackend.h"
 #include "../BackendManager.h"
@@ -1112,6 +1114,15 @@ namespace llaminar2
                         return false;
                     }
 
+                    // Zero is a genuine compiler result for an empty kernel.
+                    // A negative result is malformed, not an unknown value to
+                    // turn into a valid zero-register observation.
+                    if (registers_per_thread < 0)
+                    {
+                        error = "CUDA kernel node has a negative register count at " + node_path;
+                        return false;
+                    }
+
                     const uint64_t captured_block_threads =
                         static_cast<uint64_t>(params.blockDimX) *
                         static_cast<uint64_t>(params.blockDimY) *
@@ -1157,7 +1168,7 @@ namespace llaminar2
                         .local_memory_bytes_per_thread = static_cast<size_t>(
                             std::max(0, local_memory_bytes_per_thread)),
                         .registers_per_thread = static_cast<uint32_t>(
-                            std::max(0, registers_per_thread)),
+                            registers_per_thread),
                         .max_threads_per_block = static_cast<uint32_t>(
                             std::max(0, max_threads_per_block)),
                         .max_active_blocks_per_sm = static_cast<uint32_t>(
@@ -1840,6 +1851,29 @@ namespace llaminar2
         (void)CUDADriverApi::instance();
     }
 
+    CUDAGraphCapture::CUDAGraphCapture(
+        cudaStream_t stream, int device_ordinal, NvidiaDeviceContext &owner)
+        : CUDAGraphCapture(stream, device_ordinal)
+    {
+        if (owner.deviceOrdinal() != device_ordinal)
+            throw std::invalid_argument("CUDA capture requires its exact worker device owner");
+        projection_context_lifetime_ = owner.retainProjectionContextOwner();
+        projection_owner_ = &owner;
+    }
+
+    void CUDAGraphCapture::releaseNativeCaptureSubmission()
+    {
+        cudaStreamCaptureStatus status{};
+        if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess ||
+            status != cudaStreamCaptureStatusNone)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Cannot prove native capture retired before projection resource release");
+            std::terminate();
+        }
+        native_capture_active_ = false;
+        projection_submission_.reset();
+    }
+
     CUDAGraphCapture::~CUDAGraphCapture() { reset(); }
 
     CUDAGraphCapture::CUDAGraphCapture(CUDAGraphCapture &&other) noexcept
@@ -1851,6 +1885,15 @@ namespace llaminar2
           ordered_timeline_timing_pending_(
               other.ordered_timeline_timing_pending_)
     {
+        projection_owner_ = other.projection_owner_;
+        projection_context_lifetime_ = std::move(other.projection_context_lifetime_);
+        native_capture_active_ = std::exchange(other.native_capture_active_, false);
+        if (other.projection_submission_)
+        {
+            projection_submission_.emplace(std::move(*other.projection_submission_));
+            other.projection_submission_.reset();
+        }
+        other.projection_owner_ = nullptr;
         timeline_recording_ = std::move(other.timeline_recording_);
         recording_role_ = other.recording_role_;
         fragment_state_ = other.fragment_state_;
@@ -1859,6 +1902,8 @@ namespace llaminar2
         fragment_nodes_ = std::move(other.fragment_nodes_);
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
+        definition_scope_=std::move(other.definition_scope_);
+        fragment_frontiers_=std::move(other.fragment_frontiers_);
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
@@ -1881,6 +1926,15 @@ namespace llaminar2
                 std::move(other.ordered_timeline_timing_events_);
             ordered_timeline_timing_pending_ =
                 other.ordered_timeline_timing_pending_;
+            projection_owner_ = other.projection_owner_;
+            projection_context_lifetime_ = std::move(other.projection_context_lifetime_);
+            native_capture_active_ = std::exchange(other.native_capture_active_, false);
+            if (other.projection_submission_)
+            {
+                projection_submission_.emplace(std::move(*other.projection_submission_));
+                other.projection_submission_.reset();
+            }
+            other.projection_owner_ = nullptr;
             timeline_recording_ = std::move(other.timeline_recording_);
             recording_role_ = other.recording_role_;
             fragment_state_ = other.fragment_state_;
@@ -1889,6 +1943,8 @@ namespace llaminar2
             fragment_nodes_ = std::move(other.fragment_nodes_);
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
+            definition_scope_=std::move(other.definition_scope_);
+            fragment_frontiers_=std::move(other.fragment_frontiers_);
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
@@ -1924,10 +1980,19 @@ namespace llaminar2
 
     bool CUDAGraphCapture::beginCapture()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (!activateOwner("beginCapture"))
             return false;
         if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
             return false;
+
+        if (native_capture_active_)
+            throw std::logic_error("CUDA native capture cannot begin twice");
+        std::optional<GPUProjectionSubmission> submission;
+        if (projection_owner_)
+            submission.emplace(projection_owner_->acquireProjectionSubmission(
+                stream_, GPUProjectionSubmissionKind::Capture));
 
         if (timeline_recording_)
         {
@@ -1950,6 +2015,8 @@ namespace llaminar2
                           << cudaGetErrorString(error));
                 return false;
             }
+            native_capture_active_ = true;
+            if (submission) projection_submission_.emplace(std::move(*submission));
             fragment_state_ = FragmentState::Recording;
             timeline_recording_->state = OrderedTimelineRecording::State::Recording;
             return true;
@@ -1977,11 +2044,64 @@ namespace llaminar2
             LOG_ERROR("[CUDAGraphCapture] cudaStreamBeginCapture failed: " << cudaGetErrorString(err));
             return false;
         }
+        native_capture_active_ = true;
+        if (submission) projection_submission_.emplace(std::move(*submission));
+        return true;
+    }
+
+    bool CUDAGraphCapture::appendActiveCaptureChild(const IGPUGraphCapture &child)
+    {
+        const auto *recorded = dynamic_cast<const CUDAGraphCapture *>(&child);
+        if (!native_capture_active_ || !recorded || recorded == this ||
+            recorded->device_ordinal_ != device_ordinal_ || recorded->projection_owner_ != projection_owner_ ||
+            recorded->recording_role_ != RecordingRole::Owner || recorded->native_capture_active_ ||
+            !recorded->graph_ || !recorded->node_count_ || recorded->exec_ ||
+            !activateOwner("appendActiveCaptureChild"))
+            return false;
+
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        unsigned long long capture_id = 0;
+        cudaGraph_t destination = nullptr;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t count = 0;
+        const auto query = cudaStreamGetCaptureInfo(stream_, &status, &capture_id,
+            &destination, &dependencies, &edge_data, &count);
+        if (query != cudaSuccess || status != cudaStreamCaptureStatusActive || !capture_id ||
+            !destination || destination == recorded->graph_ || (graph_ && destination != graph_) ||
+            (count && !dependencies))
+        {
+            LOG_ERROR("[CUDAGraphCapture] Shared child could not resolve its active stream frontier: "
+                      << cudaGetErrorString(query));
+            return false;
+        }
+        // A child has one ordinary entry. Do not reinterpret programmatic
+        // launch/partial completion edges as full-memory dependencies.
+        for (std::size_t i = 0; edge_data && i < count; ++i)
+        {
+            const auto &edge = edge_data[i];
+            if (edge.from_port || edge.to_port || edge.type ||
+                std::any_of(edge.reserved, edge.reserved + sizeof(edge.reserved), [](auto byte) { return byte != 0; }))
+            {
+                LOG_ERROR("[CUDAGraphCapture] Shared child requires full-completion frontier edges");
+                return false;
+            }
+        }
+        cudaGraphNode_t node = nullptr;
+        auto result = cudaGraphAddChildGraphNode(&node, destination, dependencies, count, recorded->graph_);
+        if (result == cudaSuccess && node)
+            result = cudaStreamUpdateCaptureDependencies(stream_, &node, nullptr, 1u, cudaStreamSetCaptureDependencies);
+        if (result != cudaSuccess || !node)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Shared child frontier import failed: " << cudaGetErrorString(result));
+            return false;
+        }
         return true;
     }
 
     bool CUDAGraphCapture::endCapture()
     {
+        if (!native_capture_active_) return false;
         if (!activateOwner("endCapture"))
             return false;
         if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
@@ -2005,6 +2125,7 @@ namespace llaminar2
             else if (error == cudaSuccess)
                 error = cudaErrorInvalidValue;
             const auto end_error = cudaStreamEndCapture(stream_, &captured);
+            releaseNativeCaptureSubmission();
             if (error == cudaSuccess)
                 error = end_error;
             if (error != cudaSuccess || captured != graph_)
@@ -2043,6 +2164,7 @@ namespace llaminar2
         }
 
         cudaError_t err = cudaStreamEndCapture(stream_, &graph_);
+        releaseNativeCaptureSubmission();
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDAGraphCapture] cudaStreamEndCapture failed: " << cudaGetErrorString(err));
@@ -2404,7 +2526,9 @@ namespace llaminar2
             timeline_recording_ = std::move(recording);
             graph_ = timeline_recording_->graph;
         }
-        auto fragment = std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_);
+        auto fragment = projection_owner_
+            ? std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_, *projection_owner_)
+            : std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_);
         fragment->timeline_recording_ = timeline_recording_;
         fragment->recording_role_ = RecordingRole::Fragment;
         fragment->graph_ = graph_;
@@ -2478,6 +2602,8 @@ namespace llaminar2
         if (timeline_recording_ &&
             recorded_fragments.size() != timeline_recording_->fragment_count)
             return false;
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (!timeline_recording_)
             reset();
         cudaError_t runtime_error = timeline_recording_ ? cudaSuccess :
@@ -2599,6 +2725,8 @@ namespace llaminar2
                 }
                 tail = node;
                 }
+                fragment_frontiers_.remember(fragments[index],fragments[index]->definitionScope(),
+                    fragments[index]->graph(),fragments[index]->nodeCount(),std::span<const cudaGraphNode_t>(&tail,1));
             }
             else
             {
@@ -2689,6 +2817,80 @@ namespace llaminar2
         };
     }
 
+    bool CUDAGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        const IGPUGraphCapture& producer, const IGPUGraphCapture& body)
+    {
+        const std::array<const IGPUGraphCapture*, 1> producers{&producer};
+        return appendFiniteBodyAfterCapturedFragment(producers, body);
+    }
+
+    bool CUDAGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body)
+    {
+        if (!activateOwner("appendFiniteBodyAfterCapturedFragment") || !graph_ || exec_ ||
+            !node_count_ || native_capture_active_ || recording_role_ != RecordingRole::Owner || producers.empty()) return false;
+        const auto* auxiliary = dynamic_cast<const CUDAGraphCapture*>(&body);
+        if (!auxiliary || auxiliary == this || auxiliary->deviceOrdinal() != device_ordinal_ ||
+            auxiliary->projection_owner_ != projection_owner_ || !auxiliary->graph() ||
+            auxiliary->graph() == graph_ || !auxiliary->nodeCount() || auxiliary->hasExecutable() ||
+            auxiliary->native_capture_active_ || auxiliary->recording_role_ != RecordingRole::Owner ||
+            fragment_frontiers_.alreadyAttached(auxiliary, auxiliary->definitionScope(), auxiliary->graph())) return false;
+
+        using Definition = typename decltype(fragment_frontiers_)::Definition;
+        std::vector<Definition> original_definitions;
+        for (const auto* producer : producers)
+        {
+            const auto* original = dynamic_cast<const CUDAGraphCapture*>(producer);
+            if (!original || original == this || original == auxiliary ||
+                original->deviceOrdinal() != device_ordinal_ || original->projection_owner_ != projection_owner_ ||
+                !original->graph() || !original->nodeCount() || original->hasExecutable() ||
+                original->native_capture_active_) return false;
+            original_definitions.push_back({original, original->definition_scope_, original->graph(), original->nodeCount()});
+        }
+        const auto frontier = fragment_frontiers_.requireJoined(original_definitions);
+        if (frontier.empty()) return false;
+        // Only these exact original exits gate the new body. Existing later
+        // main units remain independent; normal parent completion joins every
+        // finite child. Retaining the actual child exit permits the next body
+        // to join prior local Retire with genuine accepted-history publication.
+        const auto result = detail::appendNativeFiniteBodyAfterFrontier<CUDAParallelGraphAPI>(graph_, auxiliary->graph(), frontier);
+        if (result.error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Finite producer attachment failed operation=" << result.operation
+                      << " error=" << cudaGetErrorString(result.error));
+            return false;
+        }
+        definition_scope_.reset();
+        fragment_frontiers_.attached(auxiliary, auxiliary->definitionScope(), auxiliary->graph(),
+            auxiliary->nodeCount(), result.appended_exit);
+        std::size_t count = 0;
+        if (cudaGraphGetNodes(graph_, nullptr, &count) != cudaSuccess) return false;
+        node_count_ = count;
+        return true;
+    }
+
+    bool CUDAGraphCapture::appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> originals)
+    {
+        if(!activateOwner("appendFiniteBodySiblings") || !graph_ || exec_ || !node_count_ || native_capture_active_ || recording_role_ != RecordingRole::Owner || originals.empty())return false;
+        cudaStreamCaptureStatus status{};
+        if(cudaStreamIsCapturing(stream_,&status)!=cudaSuccess || status!=cudaStreamCaptureStatusNone)return false;
+        std::vector<cudaGraph_t> siblings;siblings.reserve(originals.size());
+        for(const auto* original:originals){
+            const auto* sibling=dynamic_cast<const CUDAGraphCapture*>(original);
+            if(!sibling || sibling==this || sibling->deviceOrdinal()!=device_ordinal_ ||
+               sibling->recording_role_!=RecordingRole::Owner || !sibling->graph() || sibling->graph()==graph_ || !sibling->nodeCount() || sibling->hasExecutable() || sibling->native_capture_active_ ||
+               std::find(siblings.begin(),siblings.end(),sibling->graph())!=siblings.end())return false;
+            siblings.push_back(sibling->graph());
+        }
+        const auto result=detail::appendNativeFiniteBodySiblings<CUDAParallelGraphAPI>(graph_,siblings);
+        if(result.error!=cudaSuccess){
+            LOG_ERROR("[CUDAGraphCapture] Finite sibling assembly failed operation="<<result.operation<<" error="<<cudaGetErrorString(result.error));
+            return false;
+        }
+        std::size_t count=0;if(cudaGraphGetNodes(graph_,nullptr,&count)!=cudaSuccess)return false;
+        node_count_=count;return true;
+    }
+
     bool CUDAGraphCapture::appendParallelBranch(
         const GPUCapturedParallelBranch &branch)
     {
@@ -2719,7 +2921,25 @@ namespace llaminar2
             }
             fragments[i] = source->graph();
         }
-        const auto result = detail::appendNativeParallelBranch<CUDAParallelGraphAPI>(graph_, fragments);
+        // Every finite sibling is a cold original definition. Reject aliases
+        // of Open/progress/Close: a progress-as-body alias would make Close
+        // wait for the very worker whose device loop waits for Close.
+        std::vector<cudaGraph_t> siblings;
+        siblings.reserve(branch.body_siblings.size());
+        for (const auto* original : branch.body_siblings)
+        {
+            const auto* sibling = dynamic_cast<const CUDAGraphCapture*>(original);
+            if (!sibling || sibling == this || sibling->deviceOrdinal() != device_ordinal_ ||
+                !sibling->graph() || sibling->graph() == graph_ || !sibling->nodeCount() || sibling->hasExecutable() ||
+                std::find(fragments.begin(), fragments.end(), sibling->graph()) != fragments.end() ||
+                std::find(siblings.begin(), siblings.end(), sibling->graph()) != siblings.end())
+            {
+                LOG_ERROR("[CUDAGraphCapture] Finite body sibling has incompatible original graph ownership");
+                return false;
+            }
+            siblings.push_back(sibling->graph());
+        }
+        const auto result = detail::appendNativeParallelBranch<CUDAParallelGraphAPI>(graph_, fragments, siblings);
         if (result.error != cudaSuccess)
         {
             LOG_ERROR("[CUDAGraphCapture] Parallel graph assembly failed operation=" <<
@@ -2816,7 +3036,7 @@ namespace llaminar2
                       << " predicate_valid=" << predicate.valid());
             return false;
         }
-        if (!validateLoopEntry(*this, program.entry) ||
+        if (!validateLoopEntry(*this, program.entry) || !validateLoopEntry(*this, program.terminal) ||
             !validateLoopInitialization(*this, program.initialization))
             return false;
 
@@ -2989,6 +3209,9 @@ namespace llaminar2
         if (error != cudaSuccess)
             return fail("cudaGraphAddKernelNode(loop predicate)", error);
 
+        const auto terminal=appendLoopEntry(graph_,conditional_node,program.terminal);
+        if(!terminal.succeeded())return fail(terminal.operation,terminal.error);
+
         size_t count = 0;
         error = cudaGraphGetNodes(graph_, nullptr, &count);
         if (error != cudaSuccess)
@@ -3148,7 +3371,7 @@ namespace llaminar2
             LOG_ERROR("[CUDAGraphCapture] Selector/WHILE transaction has no selector-gated prefix groups");
             return false;
         }
-        if (!validateLoopEntry(*this, program.entry) ||
+        if (!validateLoopEntry(*this, program.entry) || !validateLoopEntry(*this, program.terminal) ||
             !validateLoopInitialization(*this, program.initialization))
             return false;
 
@@ -3469,6 +3692,9 @@ namespace llaminar2
         if (error != cudaSuccess)
             return fail("cudaGraphAddKernelNode(loop predicate)", error);
 
+        const auto terminal=appendLoopEntry(graph_,while_node,program.terminal);
+        if(!terminal.succeeded())return fail(terminal.operation,terminal.error);
+
         size_t count = 0;
         error = cudaGraphGetNodes(graph_, nullptr, &count);
         if (error != cudaSuccess)
@@ -3534,6 +3760,36 @@ namespace llaminar2
     size_t CUDAGraphCapture::nodeCount() const
     {
         return node_count_;
+    }
+
+    bool CUDAGraphCapture::inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,
+        std::span<std::byte> scratch,GPUFlatGraphStructure& observed,std::string* error)const
+    {
+        observed={};if(error)error->clear();
+        if(!activateOwner("inspectFlatGraphStructure") || !graph_){
+            if(error)*error="Flat graph inspection lost its original backend owner/definition";
+            return false;
+        }
+        struct API {
+            using Node=cudaGraphNode_t;
+            cudaGraph_t graph;
+            bool nodes(Node* values,std::size_t* count){return cudaGraphGetNodes(graph,values,count)==cudaSuccess;}
+            bool edges(Node* from,Node* to,std::size_t* count){return cudaGraphGetEdges(graph,from,to,nullptr,count)==cudaSuccess;}
+            bool kind(Node node,GPUFlatGraphNodeKind& value){
+                cudaGraphNodeType native;
+                if(cudaGraphNodeGetType(node,&native)!=cudaSuccess)return false;
+                switch(native){
+                case cudaGraphNodeTypeKernel:value=GPUFlatGraphNodeKind::Kernel;return true;
+                case cudaGraphNodeTypeMemcpy:value=GPUFlatGraphNodeKind::Copy;return true;
+                case cudaGraphNodeTypeMemset:value=GPUFlatGraphNodeKind::Set;return true;
+                case cudaGraphNodeTypeEmpty:value=GPUFlatGraphNodeKind::Empty;return true;
+                case cudaGraphNodeTypeWaitEvent:value=GPUFlatGraphNodeKind::EventWait;return true;
+                case cudaGraphNodeTypeEventRecord:value=GPUFlatGraphNodeKind::EventRecord;return true;
+                default:return false;
+                }
+            }
+        } api{graph_};
+        return detail::inspectFlatGraph(api,limits,scratch,observed,error);
     }
 
     bool CUDAGraphCapture::validateFlatHelperNodeKinds(std::string *error) const
@@ -3625,22 +3881,44 @@ namespace llaminar2
         ordered_timeline_timing_pending_ = false;
     }
 
+    /**
+     * @brief Destroy original native handles before clearing ownership/accounting state.
+     * @note Failed activation or native teardown is fatal: returning would let an
+     * enclosing PMA retirement owner falsely publish successful handle destruction.
+     */
     void CUDAGraphCapture::reset()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
+        if (native_capture_active_)
+        {
+            // Invalidated capture still must leave native capture before its
+            // side streams may be used by a different submission owner.
+            (void)endCapture();
+            if (native_capture_active_) std::terminate();
+        }
         if ((exec_ || graph_) && device_ordinal_ >= 0)
         {
-            CUDA_WARN_IF_FAIL(cudaSetDevice(device_ordinal_));
+            if(cudaSetDevice(device_ordinal_)!=cudaSuccess) {
+                LOG_ERROR("[CUDAGraphCapture] Cannot activate original graph owner before teardown");
+                std::terminate();
+            }
         }
         if (exec_)
         {
-            CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));
+            if(cudaGraphExecDestroy(exec_)!=cudaSuccess) {
+                LOG_ERROR("[CUDAGraphCapture] Native executable teardown failed before handle/accounting release");
+                std::terminate();
+            }
             exec_ = nullptr;
         }
         resident_memory_bytes_ = 0u;
         if (graph_)
         {
-            if (!timeline_recording_)
-                CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
+            if (!timeline_recording_ && cudaGraphDestroy(graph_)!=cudaSuccess) {
+                LOG_ERROR("[CUDAGraphCapture] Native graph teardown failed before handle/accounting release");
+                std::terminate();
+            }
             graph_ = nullptr;
         }
         // Invalidating the owner revokes any surviving fragment views. Their

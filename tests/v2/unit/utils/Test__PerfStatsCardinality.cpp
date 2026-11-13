@@ -160,8 +160,8 @@ TEST_F(PerfStatsCardinality, ControllerMovementRejectsInvalidWaveBeforeCounterMu
         case 2: ++receipt.edges_checked; break;
         case 3: --receipt.cross_backend_moves; break;
         case 4: bad.edges.front().direction = MoEOptimizationMovementDirection::SamePriority; break;
-        case 5: bad.edges.back().destination_participant = 17; break;
-        case 6: bad.edges.back().source_world_rank_known = false; break;
+        case 5: bad.edges.back().destination = MoEOptimizationMovementEndpoint::whole(17,bad.edges.back().destination.whole().device,bad.edges.back().destination.whole().world_rank); break;
+        case 6: bad.edges.back().source = MoEOptimizationMovementEndpoint::whole(bad.edges.back().source.whole().participant,bad.edges.back().source.whole().device); break;
         case 7: bad.edges.back().cycle_size = 4; break;
         case 8: publication.controller.reset(); break;
         }
@@ -179,12 +179,8 @@ TEST_F(PerfStatsCardinality, NativeMovementWavesRetainConstantRowsAndExactTransp
             .transaction = first, .candidate_epoch = first, .layer = 1, .expert = static_cast<int>(i),
             .cycle_index = 0, .cycle_size = 2, .direction = MoEOptimizationMovementDirection::SamePriority,
             .axis = MoEOptimizationMovementAxis::ParticipantPlacement,
-            .source_participant = static_cast<int>(i), .destination_participant = static_cast<int>(1 - i),
+            .source = MoEOptimizationMovementEndpoint::whole(static_cast<int>(i), DeviceId::rocm(static_cast<int>(i)), (true) ? std::optional<int>{3} : std::nullopt), .destination = MoEOptimizationMovementEndpoint::whole(static_cast<int>(1 - i), DeviceId::rocm(static_cast<int>(1 - i)), (true) ? std::optional<int>{3} : std::nullopt),
             .source_priority = -7, .destination_priority = -7,
-            .source_device = DeviceId::rocm(static_cast<int>(i)),
-            .destination_device = DeviceId::rocm(static_cast<int>(1 - i)),
-            .source_world_rank = 3, .destination_world_rank = 3,
-            .source_world_rank_known = true, .destination_world_rank_known = true,
             .estimated_weight_bytes = 8192, .activation_count = 17};
     std::uint64_t bytes = 0;
     for (std::uint64_t wave = 0; wave < waves; ++wave)
@@ -226,8 +222,8 @@ TEST_F(PerfStatsCardinality, NativeMovementRejectsMismatchedEvidenceBeforeAnyPub
         .transaction = 9, .candidate_epoch = 10, .layer = 0, .expert = 3,
         .cycle_index = 0, .cycle_size = 2, .direction = MoEOptimizationMovementDirection::SamePriority,
         .axis = MoEOptimizationMovementAxis::ParticipantPlacement,
-        .source_participant = 0, .destination_participant = 1,
-        .source_device = DeviceId::cuda(0), .destination_device = DeviceId::cuda(1),
+        .source = MoEOptimizationMovementEndpoint::whole(0, DeviceId::cuda(0), (false) ? std::optional<int>{-1} : std::nullopt), .destination = MoEOptimizationMovementEndpoint::whole(1, DeviceId::cuda(1), (false) ? std::optional<int>{-1} : std::nullopt),
+
         .estimated_weight_bytes = 8192};
     for (int mutation = 0; mutation < 8; ++mutation)
     {
@@ -239,8 +235,8 @@ TEST_F(PerfStatsCardinality, NativeMovementRejectsMismatchedEvidenceBeforeAnyPub
         case 0: changed.physical_payload_bytes = 0; break;
         case 1: changed.command_count = 1; break;
         case 2: ++edges[1].transaction; break;
-        case 3: edges[1].source_device = DeviceId::invalid(); break;
-        case 4: edges[1].destination_device = DeviceId::rocm(1); break;
+        case 3: edges[1].source = {}; break;
+        case 4: edges[1].destination = MoEOptimizationMovementEndpoint::whole(edges[1].destination.whole().participant,DeviceId::rocm(1),edges[1].destination.whole().world_rank); break;
         case 5: edges[1].estimated_weight_bytes = 0; break;
         case 6: edges[1].blocking_inference = true; break;
         case 7: edges[1].destination_priority = 1; break;
@@ -262,8 +258,8 @@ TEST_F(PerfStatsCardinality, NativeMovementPipelineStagesOnOneDeviceKeepSeparate
                     .transaction = wave, .candidate_epoch = wave, .layer = first_layer + 1, .expert = i,
                     .cycle_index = 0, .cycle_size = 2, .direction = MoEOptimizationMovementDirection::SamePriority,
                     .axis = MoEOptimizationMovementAxis::ParticipantPlacement,
-                    .source_participant = i, .destination_participant = 1 - i,
-                    .source_device = DeviceId::cuda(i), .destination_device = DeviceId::cuda(1 - i),
+                    .source = MoEOptimizationMovementEndpoint::whole(i, DeviceId::cuda(i), (false) ? std::optional<int>{-1} : std::nullopt), .destination = MoEOptimizationMovementEndpoint::whole(1 - i, DeviceId::cuda(1 - i), (false) ? std::optional<int>{-1} : std::nullopt),
+
                     .estimated_weight_bytes = 8192};
             const MoEOptimizationDeviceMovementPublication publication{wave, wave, 2, static_cast<std::uint64_t>(6000 + first_layer)};
             recordNativeMoECompletedMovement(publication, edges, "CUDA:0", first_layer, 8);
@@ -673,4 +669,23 @@ TEST_F(PerfStatsCardinality, IncompleteMovementObservationsCannotCombineIntoComp
     EXPECT_EQ(PerfStatsCollector::snapshot()[0].count, 10000u);
 }
 
+}
+
+namespace llaminar2 {
+/** @test Cold-bound changing lifecycle words keep one resettable topology row without hot key construction. */
+TEST_F(PerfStatsCardinality, ColdBoundFragmentExecutionSequenceRetainsOriginalArrivalAcrossReset)
+{
+    const auto identity=PerfStatsCollector::bindCounter("moe_overlay_residency","completed_cpu_fragment_execution",
+        "inference","CPU:0",{{"layer","7"},{"expert","1"},{"participant","2"}});
+    for(std::uint64_t lifetime=0;lifetime<20;++lifetime){
+        PerfStatsCollector::reset();
+        for(std::uint64_t epoch=2;epoch<102;++epoch)PerfStatsCollector::addCounterWithSequence(identity,3,{2,epoch});
+        auto rows=PerfStatsCollector::snapshot({"moe_overlay_residency"});ASSERT_EQ(rows.size(),1u);
+        EXPECT_EQ(rows.front().count,100u);EXPECT_EQ(rows.front().value,300.0);
+        EXPECT_EQ(rows.front().sequence_minimum_words,(std::vector<std::uint64_t>{2,2}));
+        EXPECT_EQ(rows.front().sequence_maximum_words,(std::vector<std::uint64_t>{2,101}));
+        EXPECT_THROW(PerfStatsCollector::addCounterWithSequence(identity,1,{2}),std::logic_error);
+        EXPECT_EQ(PerfStatsCollector::snapshot({"moe_overlay_residency"}).front().count,100u);
+    }
+}
 }

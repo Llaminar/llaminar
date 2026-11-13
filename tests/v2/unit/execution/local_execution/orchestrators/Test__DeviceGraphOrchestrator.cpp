@@ -9,9 +9,19 @@
  * Long-prefix fixtures exercise real archive admission and participant lookup
  * with small host-owned payloads so historical checkpoint retention is tested
  * independently of model weights, accelerator availability, and generation.
+ * Auxiliary terminal fixtures exercise registered model-owned requirements at
+ * the actual installer, without model payloads, native graphs or GPU contexts.
+ * CPU state-only fixtures admit their schema and cache geometry before
+ * initialization without manufacturing model weights or prepared payloads.
+ * Host-RCU fixtures seal the same topology-derived execution authority required
+ * by production; unresolved or foreign authority cannot mint a no-peer proof.
  */
 
+#include "PrefixArchiveSourceContract.h"
+#include "../../../../utils/CPUOrchestratorTestAdmission.h"
+#include "../../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
+#include <type_traits>
 #include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
@@ -23,6 +33,9 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/ShortConv1dStage.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoERebalanceController.h"
@@ -32,6 +45,9 @@
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "models/qwen4exp/Qwen4ExpGraph.h"
+#include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
+#include "../../../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
@@ -45,10 +61,12 @@
 #include "utils/Sha256.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
+#include "transfer/TransferEngine.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -59,6 +77,125 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace llaminar2
+{
+    /** @brief Model-free access to the actual accepted CPU logits publication boundary. */
+    struct DeviceGraphOrchestratorLiveStateTestAccess
+    {
+        /**
+         * @brief Seed the actual production context cache with a hardware-free test owner.
+         * @param owner Actual orchestrator whose getDeviceContext cache is exercised.
+         * @param device Exact backend/ordinal key, not a native device admission.
+         * @param context Borrowed-behavior mock transferred into the production unique owner.
+         * @return Stable pointer owned by that actual cache.
+         * @throws std::invalid_argument On missing/mismatched identity or duplicate injection.
+         */
+        static IDeviceContext *injectDeviceContext(
+            DeviceGraphOrchestrator &owner, DeviceId device, std::unique_ptr<IDeviceContext> context)
+        {
+            if (!context || context->deviceId() != device || owner.device_contexts_.contains(device))
+                throw std::invalid_argument("Unit context injection requires one exact unique device identity");
+            auto *result = context.get();
+            owner.device_contexts_.emplace(device, std::move(context));
+            return result;
+        }
+        /**
+         * @brief Invoke the actual production grouped workspace input constructor.
+         * @param ordinary Existing ordinary/prefill metadata declaration.
+         * @param owner Existing immutable generation request/row authority.
+         * @return The same grouped input metadata submitted by the family manifest.
+         */
+        static ForwardInput groupedWorkspaceInput(
+            const ForwardInput &ordinary, const MTPGraphOwnerPlan &owner)
+        {
+            return DeviceGraphOrchestrator::groupedVerifierWorkspaceInput(ordinary, owner);
+        }
+        /** @brief Existing graph owners that close model-weight publication without device work. */
+        enum class WeightGraphOwner { FullHost, FullDevice, ChainedHost, ChainedDevice, KVHost, KVDevice,
+                                      KVBatch, Attention, FFN, ServingPlan, ServingSealed };
+
+        /** @brief Select an actual owned graph slot; never fabricate capture/executable support. */
+        static std::unique_ptr<ComputeGraph> *weightGraphSlot(DeviceGraphOrchestrator &owner, WeightGraphOwner kind)
+        {
+            switch (kind)
+            {
+            case WeightGraphOwner::FullHost: return &owner.mtp_sidecar_depth0_cache_.graph;
+            case WeightGraphOwner::FullDevice: return &owner.mtp_sidecar_depth0_device_token_cache_.graph;
+            case WeightGraphOwner::ChainedHost: return &owner.mtp_sidecar_depth0_chained_cache_.graph;
+            case WeightGraphOwner::ChainedDevice: return &owner.mtp_sidecar_depth0_chained_device_token_cache_.graph;
+            case WeightGraphOwner::KVHost: return &owner.mtp_sidecar_depth0_kv_only_cache_.graph;
+            case WeightGraphOwner::KVDevice: return &owner.mtp_sidecar_depth0_kv_only_device_token_cache_.graph;
+            case WeightGraphOwner::KVBatch:
+                if (owner.mtp_sidecar_depth0_kv_only_batch_caches_.empty())
+                    owner.mtp_sidecar_depth0_kv_only_batch_caches_.push_back(
+                        std::make_unique<DeviceGraphOrchestrator::MTPSidecarGraphCache>());
+                return &owner.mtp_sidecar_depth0_kv_only_batch_caches_.front()->graph;
+            case WeightGraphOwner::Attention:
+            case WeightGraphOwner::FFN:
+                if (owner.layer_graph_cache_.empty()) owner.layer_graph_cache_.resize(1);
+                return kind == WeightGraphOwner::Attention ? &owner.layer_graph_cache_.front().attention_decode
+                                                          : &owner.layer_graph_cache_.front().ffn_decode;
+            case WeightGraphOwner::ServingPlan:
+            case WeightGraphOwner::ServingSealed: return nullptr;
+            }
+            throw std::invalid_argument("Unknown test weight graph owner");
+        }
+
+        /** @brief Cross the real ownership boundary with tiny graph metadata only. */
+        static void closeWeightPublication(DeviceGraphOrchestrator &owner, WeightGraphOwner kind, DeviceId device)
+        {
+            if (kind == WeightGraphOwner::ServingPlan) owner.serving_graph_family_plan_.emplace();
+            else if (kind == WeightGraphOwner::ServingSealed)
+                owner.serving_graph_family_lifecycle_ = DeviceGraphOrchestrator::ServingGraphFamilyLifecycle::Sealed;
+            else
+            {
+                auto graph = std::make_unique<ComputeGraph>();
+                graph->addNode("weight_binding_owner", std::make_unique<testing::MockComputeStage>(
+                    ComputeStageType::GEMM, "weight_binding_owner", device), device);
+                *weightGraphSlot(owner, kind) = std::move(graph);
+            }
+        }
+
+        /** @return Original alternate source, without lending mutation authority. */
+        static const FrozenModelWeightSet *decodeWeightSource(const DeviceGraphOrchestrator &owner)
+        { return owner.decode_replicated_dense_weight_set_.get(); }
+
+        /** @brief Exercise the private legacy materializer's defensive boundary directly. */
+        static void rebuildFrozenWeights(DeviceGraphOrchestrator &owner, const ModelWeights &weights)
+        { owner.buildFrozenWeightSet(weights, {}, 0, 0); }
+
+        /** @brief Bind small CPU-owned producer/destination tensors and request identity. */
+        static void seed(DeviceGraphOrchestrator &runner,
+                         std::shared_ptr<TensorBase> producer,
+                         std::shared_ptr<TensorBase> canonical, uint64_t epoch)
+        {
+            runner.state_.device_id = DeviceId::cpu();
+            runner.state_.all_position_logits = std::move(producer);
+            runner.state_.logits = std::move(canonical);
+            runner.session_epoch_ = epoch;
+            runner.prefix_layout_.terminal_logits_bytes = 8 * sizeof(float);
+        }
+        /** @brief Invoke the production copy, coherence and scalar-publication operation. */
+        static bool publish(DeviceGraphOrchestrator &runner,
+                            const PrefixLogitsRowSelection &selection)
+        {
+            return runner.publishCPUAcceptedVerifierLogits(selection);
+        }
+        /** @brief Observe the real prefix/archive authority, not just canonical tensor bytes. */
+        static const TensorBase *current(DeviceGraphOrchestrator &runner)
+        {
+            const auto view = runner.currentPrefixArchiveLogits();
+            return view ? view->tensor : nullptr;
+        }
+        /** @brief Cross the production publication's request-epoch invalidation boundary. */
+        static void resetPublication(DeviceGraphOrchestrator &runner)
+        {
+            ++runner.session_epoch_;
+            runner.clearCurrentMainLogitsPublication("accepted_logits_unit_request_reset");
+        }
+    };
+}
 
 using namespace llaminar2;
 
@@ -130,10 +267,298 @@ public:
         return preparedRefForGraphWeight(binding, device);
     }
 
+    /** @brief Observe the actual graph-builder owner selection without device work. */
+    void setBuffers(const ModelBuffers &buffers) override
+    {
+        captured_buffers = buffers;
+        QwenStandardGraph::setBuffers(buffers);
+    }
+
+    ModelBuffers captured_buffers;
     int binding_set_count = 0;
     ModelWeights captured_weights;
     ModelWeightBindings captured_bindings;
 };
+
+namespace llaminar2
+{
+/** @brief Exercise the actual private setup scope; no model capability is fabricated. */
+struct DeviceGraphOrchestratorServingBuffersTestAccess
+{
+    /** @brief Run one role sequence inside the production cold buffer binding. */
+    template <typename Action>
+    static void inProgram(DeviceGraphOrchestrator &owner, const ModelBuffers &ordinary,
+                          Action &&action)
+    {
+        DeviceGraphOrchestrator::ServingProgramBufferScope scope(owner, ordinary);
+        std::forward<Action>(action)();
+    }
+
+    /** @brief Read the same participant-owned selection updated by setBuffers(). */
+    static const ModelBuffers &selected(const DeviceGraphOrchestrator &owner)
+    {
+        return owner.managed_buffers_;
+    }
+};
+
+/**
+ * @brief Exercise real metadata cache owners without pretending to capture a GPU graph.
+ *
+ * Stages below are constructed but never validated/enqueued. Native output and
+ * capture proofs remain the explicit CUDA/ROCm integration fixtures.
+ */
+struct DeviceGraphOrchestratorPublicationProgramsTestAccess
+{
+    /** @brief Call the actual cold checkpoint authority with an intentionally absent original KV owner. */
+    static bool initializeCheckpointPoolWithoutKV(DeviceGraphOrchestrator &owner)
+    {
+        if (owner.state_.kv_cache)
+            throw std::logic_error("Checkpoint rejection fixture must not carry a substituted KV owner");
+        return owner.initializeLiveCheckpointStoragePool();
+    }
+
+    /** @brief Actual no-launch rejection preserves the original mailbox; pending writes still block readers. */
+    static void provePrelaunchFailure(DeviceGraphOrchestrator &owner, DeviceId device)
+    {
+        const auto old_device = owner.state_.device_id;
+        owner.state_.device_id = device;
+        std::array<int32_t,7> rows{};
+        auto &mailbox = owner.device_resident_logical_sequence_state_mailbox_;
+        mailbox.request_count=1;
+        mailbox.target_positions_device=&rows[0];
+        mailbox.target_sequence_lengths_device=&rows[1];
+        mailbox.accepted_state_counts_device=&rows[2];
+        mailbox.next_condition_tokens_device=&rows[3];
+        mailbox.all_drafts_accepted_flags_device=&rows[4];
+        mailbox.stopped_flags_device=&rows[5];
+        mailbox.publication_ok_flags_device=&rows[6];
+        mailbox.producer_stream=rows.data();
+        mailbox.ready_event=std::make_shared<int>(1);
+        mailbox.publication_generation=7;
+        ASSERT_TRUE(mailbox.valid());
+        const auto original_event=mailbox.ready_event;
+        // These are metadata-only borrows: the invalid cache must reject before
+        // any context lookup, tensor dereference, native capture or enqueue.
+        std::string error;
+        EXPECT_FALSE(owner.executeMTPStatePublicationGraph(rows.data(),&error,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch));
+        EXPECT_FALSE(error.empty());
+        EXPECT_FALSE(owner.pending_device_resident_logical_state_writer_.valid());
+        EXPECT_TRUE(mailbox.valid());
+        EXPECT_EQ(mailbox.ready_event,original_event);
+        EXPECT_EQ(mailbox.publication_generation,7u);
+        EXPECT_EQ(mailbox.target_positions_device,&rows[0]);
+        // Unknown/possibly-enqueued writers remain fail closed. This fixture
+        // creates no writes and only exercises the existing admission guard.
+        owner.pending_device_resident_logical_state_writer_.begin(rows.data(),7,"test_pending_writer");
+        bool pending=false;
+        EXPECT_FALSE(owner.waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
+            rows.data(),"test_prelaunch_observer",&pending));
+        EXPECT_TRUE(pending);
+        EXPECT_TRUE(owner.pending_device_resident_logical_state_writer_.valid());
+        EXPECT_EQ(mailbox.publication_generation,7u);
+        owner.pending_device_resident_logical_state_writer_.clear();
+        mailbox.clear();
+        owner.state_.device_id=old_device;
+    }
+
+    /** @brief Prove exact-width metadata owners survive arbitrary selection and retire before hooks. */
+    static void proveExactWidths(DeviceGraphOrchestrator &owner)
+    {
+        using Program = SparseQueryExecutionProgram;
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        config.draft_tokens = 15;
+        config.graph_capacity_draft_tokens = 15;
+        owner.mtp_verifier_graph_family_ = MTPVerifierGraphFamily::ExactRows;
+        owner.mtp_graph_owner_plan_ = MTPGraphOwnerPlan(config, MTPVerifierGraphFamily::ExactRows,
+            MTPGenerationParentRole::Controller, 2u);
+        owner.mtp_max_verifier_rows_ = 16;
+        owner.mtp_speculative_state_publication_graphs_.clear();
+        owner.mtp_speculative_state_publication_graphs_.resize(owner.mtp_graph_owner_plan_.speculativePublicationGraphSlots());
+        std::array<std::array<const ComputeGraph *, 17>, 2> original{};
+        const auto key = [&](Program program, int rows) {
+            ForwardGraphSignature signature;
+            signature.device = owner.state_.device_id;
+            signature.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+            signature.seq_len = signature.all_position_logit_rows = rows;
+            signature.batch_size = 1;
+            signature.decode = signature.all_position_logits = true;
+            signature.sparse_query_execution_program = program;
+            return signature;
+        };
+        for (const auto program : {Program::RankingPossible, Program::ProvenNoRanking})
+        {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope scope(owner, program);
+            for (int rows = 16; rows >= 2; --rows)
+            {
+                auto &cache = owner.mtpStatePublicationCache(key(program, rows));
+                EXPECT_FALSE(cache.graph);
+                cache.graph = std::make_unique<ComputeGraph>();
+                cache.verifier_signature = key(program, rows);
+                cache.valid = true;
+                original[sparseQueryExecutionProgramIndex(program)][rows] = cache.graph.get();
+            }
+        }
+        // Physical16 storage remains admitted while each exact native owner is
+        // selected independently. No width may replace an earlier sibling.
+        for (const auto program : {Program::ProvenNoRanking, Program::RankingPossible})
+        {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope scope(owner, program);
+            for (const int rows : {16, 4, 8, 3, 15, 2, 16})
+            {
+                auto &cache = owner.mtpStatePublicationCache(key(program, rows));
+                EXPECT_EQ(cache.graph.get(), original[sparseQueryExecutionProgramIndex(program)][rows]);
+                cache.resetSessionState();
+                EXPECT_EQ(cache.verifier_signature, key(program, rows));
+                auto malformed = key(program, rows);
+                malformed.device = DeviceId::rocm(0);
+                EXPECT_THROW((void)owner.mtpStatePublicationCache(malformed), std::invalid_argument);
+                EXPECT_THROW((void)owner.mtpStatePublicationCache(key(program, 1)), std::invalid_argument);
+                EXPECT_THROW((void)owner.mtpStatePublicationCache(key(program, 17)), std::invalid_argument);
+                EXPECT_EQ(owner.mtpStatePublicationCache().graph.get(), original[sparseQueryExecutionProgramIndex(program)][rows]);
+            }
+        }
+        owner.retireMTPPublicationVerifierBorrows();
+        for (const auto &cache : owner.mtp_speculative_state_publication_graphs_)
+        {
+            EXPECT_FALSE(cache.graph);
+            EXPECT_FALSE(cache.verifier_signature);
+            EXPECT_FALSE(cache.valid);
+        }
+    }
+
+    /** @brief Retain sibling hook identities and exercise exact selection/reset/retirement. */
+    static void prove(DeviceGraphOrchestrator &owner, IComputeStage *short_hook, IComputeStage *full_hook)
+    {
+        using Program = SparseQueryExecutionProgram;
+        const auto key = [&](Program program) {
+            ForwardGraphSignature signature;
+            signature.device = owner.state_.device_id;
+            signature.seq_len = signature.all_position_logit_rows = 3;
+            signature.batch_size = 1;
+            signature.decode = signature.all_position_logits = true;
+            signature.sparse_query_execution_program = program;
+            return signature;
+        };
+        const auto bind = [&](Program program, IComputeStage *hook) {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope selected(owner, program);
+            const auto signature = key(program);
+            auto &cache = owner.mtpStatePublicationCache(signature);
+            MTPSpeculativeStatePublicationStage::Params params;
+            params.device_id = owner.state_.device_id;
+            params.request_count = 1;
+            params.verifier_rows_per_request = 3;
+            params.verifier_state_stages = {hook};
+            auto stage = std::make_unique<MTPSpeculativeStatePublicationStage>(params);
+            cache.stage = stage.get();
+            cache.graph = std::make_unique<ComputeGraph>();
+            cache.graph->addNode("metadata_publication", std::move(stage), owner.state_.device_id);
+            cache.verifier_signature = signature;
+            cache.workspace_generation = 7;
+            cache.valid = true;
+            return cache.graph.get();
+        };
+        // The first actual request may be short; owner zero must not be a
+        // prerequisite for retaining the short child's exact stage pointers.
+        auto *short_graph = bind(Program::ProvenNoRanking, short_hook);
+        auto *full_graph = bind(Program::RankingPossible, full_hook);
+        ASSERT_NE(short_graph, full_graph);
+        for (const auto program : {Program::ProvenNoRanking, Program::RankingPossible, Program::ProvenNoRanking})
+        {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope selected(owner, program);
+            const auto signature = key(program);
+            auto &cache = owner.mtpStatePublicationCache(signature);
+            auto expected = cache.stage->getParams();
+            ASSERT_EQ(cache.graph.get(), program == Program::ProvenNoRanking ? short_graph : full_graph);
+            EXPECT_EQ(expected.verifier_state_stages,
+                std::vector<IComputeStage *>{program == Program::ProvenNoRanking ? short_hook : full_hook});
+            EXPECT_TRUE(cache.matches(signature, 7, nullptr, expected));
+            auto foreign = signature;
+            foreign.sparse_query_execution_program = program == Program::RankingPossible ?
+                Program::ProvenNoRanking : Program::RankingPossible;
+            EXPECT_THROW((void)owner.mtpStatePublicationCache(foreign), std::invalid_argument);
+            EXPECT_EQ(cache.graph.get(), program == Program::ProvenNoRanking ? short_graph : full_graph);
+            EXPECT_FALSE(cache.matches(foreign, 7, nullptr, expected));
+            EXPECT_FALSE(cache.matches(signature, 8, nullptr, expected));
+            foreign = signature;
+            ++foreign.seq_len;
+            EXPECT_FALSE(cache.matches(foreign, 7, nullptr, expected));
+            expected.verifier_state_stages = {program == Program::ProvenNoRanking ? full_hook : short_hook};
+            EXPECT_FALSE(cache.matches(signature, 7, nullptr, expected));
+            cache.resetSessionState();
+            EXPECT_EQ(cache.graph.get(), program == Program::ProvenNoRanking ? short_graph : full_graph);
+        }
+        // A new actual sampling/publication admission can change policy and
+        // outcome pointers without changing any verifier key or arena address.
+        // Rebuild metadata stages only: no GPU support or capture is fabricated.
+        const auto replaceStage = [](auto &cache, auto params) {
+            auto stage = std::make_unique<MTPSpeculativeStatePublicationStage>(std::move(params));
+            cache.stage = stage.get();
+            cache.graph->getNode("metadata_publication")->stage = std::move(stage);
+        };
+        int32_t outcomes[2] = {1, 2};
+        uint32_t boundary[4] = {};
+        int iteration = 0;
+        for (const auto original : {Program::ProvenNoRanking, Program::RankingPossible})
+        {
+            const auto original_key = key(original);
+            auto &source = owner.mtp_speculative_state_publication_graphs_.at(sparseQueryExecutionProgramIndex(original));
+            auto admitted = source.stage->getParams();
+            admitted.outcome_tokens_device = &outcomes[iteration];
+            if (iteration == 0)
+                admitted.dynamic_moe_commit_boundary = MTPSpeculativeStatePublicationStage::DynamicMoECommitBoundaryBinding{
+                    &boundary[0], &boundary[1], &boundary[2], &boundary[3]};
+            else
+                admitted.dynamic_moe_commit_boundary.reset();
+            replaceStage(source, admitted);
+            owner.mtp_publication_admission_authority_ = original_key;
+            for (const auto program : {Program::ProvenNoRanking, Program::RankingPossible})
+            {
+                DeviceGraphOrchestrator::SparseQueryProgramCompilationScope selected(owner, program);
+                const auto signature = key(program);
+                auto &target = owner.mtpStatePublicationCache(signature);
+                auto expected = owner.mtpStatePublicationAuthority(signature, 7);
+                EXPECT_EQ(expected.outcome_tokens_device, &outcomes[iteration]);
+                EXPECT_EQ(expected.dynamic_moe_commit_boundary.has_value(), iteration == 0);
+                expected.verifier_state_stages = {program == Program::ProvenNoRanking ? short_hook : full_hook};
+                if (program != original)
+                {
+                    EXPECT_FALSE(target.matches(signature, 7, nullptr, expected))
+                        << "A same-key sibling must reject old outcome/policy Params";
+                    for (auto &parent : owner.sparse_query_generation_parents_) parent.valid = true;
+                    const auto index = sparseQueryExecutionProgramIndex(program);
+                    const auto sibling = 1u - index;
+                    owner.sparse_query_generation_parents_[sibling].launched = true;
+                    EXPECT_THROW(owner.retireMTPPublicationParent(signature), std::logic_error);
+                    EXPECT_TRUE(owner.sparse_query_generation_parents_[index].valid);
+                    EXPECT_TRUE(owner.sparse_query_generation_parents_[sibling].valid);
+                    EXPECT_FALSE(target.matches(signature, 7, nullptr, expected));
+                    owner.sparse_query_generation_parents_[sibling].launched = false;
+                    owner.retireMTPPublicationParent(signature);
+                    EXPECT_FALSE(owner.sparse_query_generation_parents_[index].valid);
+                    EXPECT_TRUE(owner.sparse_query_generation_parents_[sibling].valid);
+                    replaceStage(target, expected);
+                }
+                EXPECT_TRUE(target.matches(signature, 7, nullptr, expected));
+                EXPECT_THROW((void)owner.mtpStatePublicationAuthority(signature, 8), std::logic_error);
+            }
+            ++iteration;
+        }
+        for (auto &parent : owner.sparse_query_generation_parents_) parent.valid = true;
+        owner.retireMTPPublicationVerifierBorrows();
+        for (const auto &parent : owner.sparse_query_generation_parents_) EXPECT_FALSE(parent.valid);
+        for (const auto &cache : owner.mtp_speculative_state_publication_graphs_)
+        {
+            EXPECT_FALSE(cache.valid);
+            EXPECT_FALSE(cache.graph);
+            EXPECT_EQ(cache.stage, nullptr);
+            EXPECT_FALSE(cache.verifier_signature);
+        }
+        EXPECT_FALSE(owner.mtp_publication_admission_authority_);
+    }
+};
+} // namespace llaminar2
 
 namespace
 {
@@ -150,6 +575,31 @@ namespace
         std::ostringstream buffer;
         buffer << input.rdbuf();
         return buffer.str();
+    }
+
+    /**
+     * @brief Read the serving-family implementation registered in the core target.
+     * @return The actual compiled family source; absent registration fails closed.
+     *
+     * Source-policy checks follow the physical implementation rather than an
+     * assumed location in the main orchestrator translation unit. The CMake
+     * source inventory must name this file before any policy can be certified.
+     */
+    std::string readServingGraphFamilySourceForTest()
+    {
+        const std::string relative =
+            "execution/local_execution/orchestrators/"
+            "DeviceGraphOrchestratorServingGraphFamily.cpp";
+        const auto inventory = readSourceFileForDeviceGraphOrchestratorTest(
+            "src/v2/CMakeLists.txt");
+        const auto registration = "    " + relative + "\n";
+        const auto found = inventory.find(registration);
+        EXPECT_NE(found, std::string::npos);
+        if (found == std::string::npos)
+            return {};
+        EXPECT_EQ(inventory.find(registration, found + registration.size()),
+                  std::string::npos);
+        return readSourceFileForDeviceGraphOrchestratorTest("src/v2/" + relative);
     }
 
     bool canReuseCachedFFNGraphForTest(
@@ -212,15 +662,13 @@ namespace
         ServingFamilySealsHistoryBearingDecodeBeforeFollowerAdmission)
     {
         const std::string source =
-            readSourceFileForDeviceGraphOrchestratorTest(
-                "src/v2/execution/local_execution/orchestrators/"
-                "DeviceGraphOrchestrator.cpp");
+            readServingGraphFamilySourceForTest();
         ASSERT_FALSE(source.empty());
 
         const size_t begin = source.find(
             "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
         const size_t end = source.find(
-            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            "} // namespace llaminar2",
             begin);
         ASSERT_NE(begin, std::string::npos);
         ASSERT_NE(end, std::string::npos);
@@ -266,9 +714,7 @@ namespace
         ServingFamilyMaterializesCompleteMTPForwardInventoryBeforeSeal)
     {
         const std::string source =
-            readSourceFileForDeviceGraphOrchestratorTest(
-                "src/v2/execution/local_execution/orchestrators/"
-                "DeviceGraphOrchestrator.cpp");
+            readServingGraphFamilySourceForTest();
         ASSERT_FALSE(source.empty());
 
         const size_t helper_begin = source.find(
@@ -298,11 +744,19 @@ namespace
             std::string::npos);
 
         const size_t serving_end = source.find(
-            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            "} // namespace llaminar2",
             serving_begin);
         ASSERT_NE(serving_end, std::string::npos);
         const std::string serving = source.substr(
             serving_begin, serving_end - serving_begin);
+        const size_t template_preparation = serving.find(
+            "graph_builder_->prepareForwardGraphTemplate(state_.device_id)");
+        const size_t workspace_declaration = serving.find(
+            "materializeForwardGraphForShape(");
+        ASSERT_NE(template_preparation, std::string::npos);
+        ASSERT_NE(workspace_declaration, std::string::npos);
+        EXPECT_LT(template_preparation, workspace_declaration)
+            << "Workspace and executable specializations must share one cold recipe.";
         const size_t mtp_family = serving.find(
             "materializeMTPServingForwardExecutablesWithoutLaunch(");
         const size_t sealed = serving.rfind(
@@ -325,15 +779,13 @@ namespace
         EagerHostServingFamilyMaterializesAndSealsWithoutInference)
     {
         const std::string source =
-            readSourceFileForDeviceGraphOrchestratorTest(
-                "src/v2/execution/local_execution/orchestrators/"
-                "DeviceGraphOrchestrator.cpp");
+            readServingGraphFamilySourceForTest();
         ASSERT_FALSE(source.empty());
 
         const size_t begin = source.find(
             "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
         const size_t end = source.find(
-            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            "} // namespace llaminar2",
             begin);
         ASSERT_NE(begin, std::string::npos);
         ASSERT_NE(end, std::string::npos);
@@ -948,9 +1400,10 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
     moe_config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     moe_config.moe.local_expert_start = 0;
     moe_config.moe.local_expert_count = -1;
-    DeviceGraphOrchestrator moe_orchestrator(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto moe_graph = std::make_shared<Qwen35MoEGraph>(moe_config, nullptr);
+    auto moe_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(moe_graph, nullptr, 1, 16, 16));
+    auto &moe_orchestrator = *moe_owner;
     ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     EXPECT_TRUE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
@@ -974,9 +1427,10 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
 
     auto dense_config = moe_config;
     dense_config.moe = {};
-    DeviceGraphOrchestrator dense_orchestrator(
-        std::make_shared<Qwen35Graph>(dense_config, nullptr),
-        nullptr);
+    auto dense_graph = std::make_shared<Qwen35Graph>(dense_config, nullptr);
+    auto dense_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(dense_graph, nullptr, 1, 16, 16));
+    auto &dense_orchestrator = *dense_owner;
     EXPECT_FALSE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "The capability requires initialized KV/MTP cache state, not just config.";
     ASSERT_TRUE(dense_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
@@ -1009,9 +1463,10 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
 
     auto undeclared_config = config_;
     undeclared_config.mtp.enabled = true;
-    DeviceGraphOrchestrator undeclared_orchestrator(
-        std::make_shared<QwenStandardGraph>(undeclared_config, nullptr),
-        nullptr);
+    auto undeclared_orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(undeclared_config, nullptr),
+            nullptr, 1, 16, 16));
+    auto &undeclared_orchestrator = *undeclared_orchestrator_owner;
     ASSERT_TRUE(undeclared_orchestrator.initializeInferenceStateFromArena(
         1, 16, DeviceId::cpu()));
     EXPECT_FALSE(
@@ -1039,6 +1494,7 @@ TEST_F(
 {
     GraphConfig replicated = makeMaintenanceMoEGraphConfig();
     replicated.layer_types = {"gdn", "full_attention"};
+    replicated.gdn.full_attention_interval = 2; // Same authored two-layer map for state admission.
     replicated.head_start = 0;
     replicated.local_n_heads = replicated.n_heads;
     replicated.local_n_kv_heads = replicated.n_kv_heads;
@@ -1048,9 +1504,10 @@ TEST_F(
     replicated.local_rank = 1;
     replicated.tp_config.reset();
 
-    DeviceGraphOrchestrator participant_one(
-        std::make_shared<Qwen35MoEGraph>(replicated, nullptr),
-        nullptr);
+    auto participant_one_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(replicated, nullptr),
+            nullptr, 1, 16, 16));
+    auto &participant_one = *participant_one_owner;
 
     ASSERT_TRUE(participant_one.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -1145,6 +1602,84 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
     ASSERT_TRUE(graph_ref.has_value());
     EXPECT_EQ(graph_ref->binding_id, registered_ref.binding_id);
     EXPECT_EQ(graph_ref->binding_id, gdn_binding->binding_id);
+}
+
+/** @brief Build a tiny immutable CPU source; no model, prepared payload or device is loaded. */
+static std::unique_ptr<FrozenModelWeightSet> lifecycleWeightSource(TensorBase *embedding)
+{
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{42};
+    strategy.devices = {DeviceId::cpu()};
+    ModelWeightSetBuilder builder(strategy);
+    WeightBinding binding;
+    binding.identity = makeSourceWeightIdentity("token_embd.weight", strategy.model_id);
+    binding.identity.role = WeightRole::Embedding;
+    binding.tensor = embedding;
+    binding.residency.home_device = DeviceId::cpu();
+    binding.residency.resident_device = DeviceId::cpu();
+    builder.addBinding(std::move(binding));
+    return std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
+}
+
+/** @test Real startup publication order stays open until graph binding begins. */
+TEST_F(Test__DeviceGraphOrchestrator, WeightPublicationAllowsStartupBeforeGraphBinding)
+{
+    config_.n_layers = 1;
+    FP32Tensor first(std::vector<size_t>{16, 8}), second(std::vector<size_t>{16, 8});
+    auto builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    EXPECT_NO_THROW(owner.setWeights(ModelWeights{}));
+    EXPECT_NO_THROW(owner.setFrozenWeightSet(lifecycleWeightSource(&first)));
+    EXPECT_NO_THROW(owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&first)));
+    EXPECT_NO_THROW(owner.setFrozenWeightSet(lifecycleWeightSource(&second)));
+    EXPECT_NO_THROW(owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&second)));
+    EXPECT_NO_THROW(owner.setDecodeReplicatedDenseWeightSet(nullptr));
+    EXPECT_EQ(builder->captured_weights.embedding_table, &second);
+    EXPECT_EQ(owner.frozenWeightSet()->global("token_embd.weight").tensor, &second);
+}
+
+/** @test Full(A) and every other weight-bound graph prevent source B publication before any mutation. */
+TEST_F(Test__DeviceGraphOrchestrator, WeightPublicationRejectsEveryBoundGraphOwnerBeforeMutation)
+{
+    using Access = DeviceGraphOrchestratorLiveStateTestAccess;
+    using Kind = Access::WeightGraphOwner;
+    for (auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (auto kind : {Kind::FullHost, Kind::FullDevice, Kind::ChainedHost, Kind::ChainedDevice,
+                     Kind::KVHost, Kind::KVDevice, Kind::KVBatch, Kind::Attention, Kind::FFN,
+                     Kind::ServingPlan, Kind::ServingSealed})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << '/' << static_cast<int>(kind));
+        config_.n_layers = 1;
+        FP32Tensor first(std::vector<size_t>{16, 8}), second(std::vector<size_t>{16, 8});
+        auto builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+        DeviceGraphOrchestrator owner(builder, nullptr);
+        owner.setFrozenWeightSet(lifecycleWeightSource(&first));
+        owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&first));
+        const auto *primary = owner.frozenWeightSet();
+        const auto *alternate = Access::decodeWeightSource(owner);
+        const auto binding_publications = builder->binding_set_count;
+        Access::closeWeightPublication(owner, kind, device);
+        auto *slot = Access::weightGraphSlot(owner, kind);
+        const auto *original_graph = slot ? slot->get() : nullptr;
+        int callbacks = 0;
+        ModelWeights replacement;
+        replacement.embedding_table = &second;
+        replacement.get_layer_weights = [&](int) { ++callbacks; return LayerWeights{}; };
+        EXPECT_THROW(owner.setWeights(replacement), std::logic_error);
+        EXPECT_THROW(owner.setFrozenWeightSet(lifecycleWeightSource(&second)), std::logic_error);
+        EXPECT_THROW(owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&second)), std::logic_error);
+        EXPECT_THROW(owner.setDecodeReplicatedDenseWeightSet(nullptr), std::logic_error);
+        EXPECT_THROW(Access::rebuildFrozenWeights(owner, replacement), std::logic_error);
+        EXPECT_EQ(callbacks, 0);
+        ASSERT_EQ(owner.frozenWeightSet(), primary);
+        ASSERT_EQ(Access::decodeWeightSource(owner), alternate);
+        EXPECT_EQ(primary->global("token_embd.weight").tensor, &first);
+        EXPECT_EQ(alternate->global("token_embd.weight").tensor, &first);
+        EXPECT_EQ(builder->binding_set_count, binding_publications);
+        EXPECT_EQ(builder->captured_weights.embedding_table, &first);
+        EXPECT_EQ(slot ? slot->get() : nullptr, original_graph);
+    }
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirectly)
@@ -1272,6 +1807,8 @@ TEST_F(Test__DeviceGraphOrchestrator, PreparedStoreIncludesDecodeReplicatedDense
     orchestrator.setDecodeReplicatedDenseWeightSet(
         std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings()));
 
+    test::admitCPUPreparedStoreForTest(*shared_store,
+        {lm_head.get(), primary_attn_q.get(), decode_down.get()});
     ASSERT_NO_THROW(orchestrator.initializePreparedWeightStore(DeviceId::cpu()));
 
     auto decode_ref = shared_store->preparedRefForBinding(decode_binding_id, DeviceId::cpu());
@@ -1392,6 +1929,145 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseDecodeAllowsPPTerminalWitho
     EXPECT_NO_THROW(
         orchestrator.setDecodeReplicatedDenseWeightSet(
             std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings())));
+}
+
+namespace
+{
+/**
+ * @brief Tiny host operands for the real auxiliary-set installer presence contract.
+ *
+ * These are not numerical model weights or full model geometry. Original typed
+ * QFN metadata still selects the actual registered graph/schema; no arena,
+ * source model or backend executable is materialized by these interface checks.
+ * Declare this owner before the orchestrator so all borrowed tensors outlive it.
+ */
+struct AuxiliaryTerminalWeights
+{
+    std::vector<std::unique_ptr<FP32Tensor>> operands;
+
+    /** @brief Freeze named original identities over tiny CPU-owned test tensors. */
+    std::unique_ptr<FrozenModelWeightSet> freeze(const std::vector<std::string> &names)
+    {
+        InferenceStrategy strategy;
+        strategy.model_id = ModelContextId{6169};
+        strategy.devices = {DeviceId::cpu()};
+        ModelWeightSetBuilder builder(strategy);
+        for (const auto &name : names)
+        {
+            operands.push_back(std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}));
+            auto *tensor = operands.back().get();
+            WeightBinding binding;
+            binding.identity = makeSourceWeightIdentity(name, strategy.model_id, operands.size());
+            binding.tensor = tensor;
+            binding.slice.source_rows = tensor->rows();
+            binding.slice.source_cols = tensor->cols();
+            binding.slice.row_count = tensor->rows();
+            binding.slice.col_count = tensor->cols();
+            binding.residency.home_device = DeviceId::cpu();
+            binding.residency.resident_device = DeviceId::cpu();
+            builder.addBinding(std::move(binding));
+        }
+        return std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
+    }
+};
+
+/** @brief Select the real registered QFN metadata contract without loading any model. */
+GraphConfig auxiliaryQFNConfig(bool full_dense)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device = DeviceId::cpu();
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = full_dense;
+    config.lm_head_column_parallel = !full_dense;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    return config;
+}
+} // namespace
+
+/** @brief Both actual head-only and full-dense auxiliary lanes accept QFN's HC terminal instead of output_norm. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractUsesDeclaredQFNInputs)
+{
+    for (const bool full_dense : {false, true})
+    {
+        AuxiliaryTerminalWeights source;
+        auto graph = std::make_shared<Qwen4ExpGraph>(auxiliaryQFNConfig(full_dense), nullptr);
+        DeviceGraphOrchestrator orchestrator(graph, nullptr);
+        std::vector<std::string> names{
+            "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"};
+        if (full_dense)
+        {
+            names.push_back("token_embd.weight");
+        }
+        EXPECT_NO_THROW(orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names)));
+    }
+}
+
+/** @brief Every declared QFN HC operand and the independent vocabulary head remain mandatory. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractRejectsEachMissingQFNInput)
+{
+    for (const std::string missing : {"output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"})
+    {
+        SCOPED_TRACE(missing);
+        AuxiliaryTerminalWeights source;
+        auto graph = std::make_shared<Qwen4ExpGraph>(auxiliaryQFNConfig(true), nullptr);
+        DeviceGraphOrchestrator orchestrator(graph, nullptr);
+        std::vector<std::string> names{"token_embd.weight", "output_norm.weight"};
+        for (const std::string name : {"output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"})
+        {
+            if (name != missing)
+            {
+                names.push_back(name);
+            }
+        }
+        try
+        {
+            orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names));
+            FAIL() << "Missing model-owned terminal operand was accepted";
+        }
+        catch (const std::runtime_error &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("missing " + missing), std::string::npos);
+        }
+    }
+}
+
+/** @brief Foreign HC globals never waive a non-QFN model's ordinary final norm. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractOrdinaryNormRemainsRequired)
+{
+    AuxiliaryTerminalWeights source;
+    auto config = config_;
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    auto graph = std::make_shared<CapturingQwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph, nullptr);
+    std::vector<std::string> names{"token_embd.weight", "output.weight",
+        "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight"};
+    try
+    {
+        orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names));
+        FAIL() << "Ordinary final norm was waived by foreign HC weights";
+    }
+    catch (const std::runtime_error &error)
+    {
+        EXPECT_NE(std::string(error.what()).find("missing output_norm.weight"), std::string::npos);
+    }
+    names.push_back("output_norm.weight");
+    EXPECT_NO_THROW(orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names)));
+}
+
+/** @brief A PP participant without the terminal stage still owns no terminal requirement. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractSkipsUnownedPPHead)
+{
+    AuxiliaryTerminalWeights source;
+    auto config = auxiliaryQFNConfig(true);
+    config.n_layers = 1;
+    config.pp_layer_offset = 1;
+    auto graph = std::make_shared<Qwen4ExpGraph>(config, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph, nullptr);
+    orchestrator.setPPStageConfig(FactoryPPStageConfig{.first_layer = 1, .last_layer = 2,
+        .has_embedding = false, .has_lm_head = false});
+    EXPECT_NO_THROW(orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze({"blk.1.attn_q.weight"})));
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAttentionStateUsesDecodeDenseGdnBindingsForGroupedDecode)
@@ -1555,23 +2231,51 @@ TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextLazyCreation)
     EXPECT_EQ(ctx1, ctx2);
 }
 
+/** @test Actual cached contexts retain distinct backend/ordinal identity without GPU startup. */
 TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextMultipleDevices)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-
-    // Get context for device 0 (may fail without DeviceManager init)
-    IDeviceContext *ctx0 = orchestrator->getDeviceContext(DeviceId::cpu());
-    if (ctx0 == nullptr)
+    /** @brief Observe actual unique-cache destruction, never a native context factory. */
+    class CountedContext final : public llaminar2::testing::MockDeviceContext
     {
-        GTEST_SKIP() << "DeviceContext creation not available in this environment";
-    }
-
-    // Device 1 might not exist, which is fine
-    IDeviceContext *ctx1 = orchestrator->getDeviceContext(DeviceId::cuda(0));
-    if (ctx1 != nullptr)
+    public:
+        /** @brief Retain the exact authored identity and caller-owned destruction counter. */
+        CountedContext(DeviceId device, ComputeBackendType backend, int &destroyed)
+            : MockDeviceContext(device, backend), destroyed_(destroyed) {}
+        /** @brief Record exactly one release by the actual orchestrator cache owner. */
+        ~CountedContext() override { ++destroyed_; }
+    private:
+        int &destroyed_;
+    };
+    const std::vector<std::pair<DeviceId, ComputeBackendType>> identities{
+        {DeviceId::cpu(), ComputeBackendType::CPU},
+        {DeviceId::cuda(0), ComputeBackendType::GPU_CUDA},
+        {DeviceId::rocm(0), ComputeBackendType::GPU_ROCM},
+        {DeviceId::cuda(7), ComputeBackendType::GPU_CUDA},
+        {DeviceId::cuda(8), ComputeBackendType::GPU_CUDA},
+        {DeviceId::rocm(127), ComputeBackendType::GPU_ROCM}};
+    std::vector<int> destroyed(identities.size(), 0);
     {
-        EXPECT_NE(ctx0, ctx1);
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+        std::vector<IDeviceContext *> injected;
+        for (size_t index = 0; index < identities.size(); ++index)
+        {
+            const auto &[device, backend] = identities[index];
+            injected.push_back(DeviceGraphOrchestratorLiveStateTestAccess::injectDeviceContext(
+                *orchestrator, device, std::make_unique<CountedContext>(device, backend, destroyed[index])));
+        }
+        for (int replay = 0; replay < 20; ++replay)
+            for (size_t index = 0; index < identities.size(); ++index)
+            {
+                const auto &[device, backend] = identities[index];
+                auto *actual = orchestrator->getDeviceContext(device);
+                ASSERT_EQ(actual, injected[index]);
+                EXPECT_EQ(actual->deviceId(), device);
+                EXPECT_EQ(actual->backendType(), backend);
+                EXPECT_EQ(destroyed[index], 0);
+                for (size_t other = 0; other < index; ++other) EXPECT_NE(actual, injected[other]);
+            }
     }
+    for (int count : destroyed) EXPECT_EQ(count, 1);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, InvalidateExecutionCachesClearsDeviceContexts)
@@ -1696,29 +2400,31 @@ TEST_F(Test__DeviceGraphOrchestrator, InvalidateGraphCacheOutOfBounds)
     EXPECT_NO_THROW(orchestrator->invalidateGraphCache(-2));
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, MoveConstruction)
+TEST_F(Test__DeviceGraphOrchestrator, UniqueOwnerRelocationKeepsObjectAddress)
 {
-    auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-    orchestrator1->initializeGraphCache(24);
-
-    // Move construct
-    auto orchestrator2 = std::move(orchestrator1);
-
-    EXPECT_NE(orchestrator2, nullptr);
-    EXPECT_EQ(std::as_const(*orchestrator2).graphBuilder(), graph_builder_.get());
+    auto original_owner = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    original_owner->initializeGraphCache(24);
+    const auto *const original_address = original_owner.get();
+    auto constructed_owner = std::move(original_owner);
+    EXPECT_EQ(original_owner, nullptr);
+    EXPECT_EQ(constructed_owner.get(), original_address);
+    EXPECT_EQ(std::as_const(*constructed_owner).graphBuilder(), graph_builder_.get());
+    std::unique_ptr<DeviceGraphOrchestrator> assigned_owner;
+    assigned_owner = std::move(constructed_owner);
+    EXPECT_EQ(constructed_owner, nullptr);
+    EXPECT_EQ(assigned_owner.get(), original_address);
+    EXPECT_EQ(std::as_const(*assigned_owner).graphBuilder(), graph_builder_.get());
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
+TEST_F(Test__DeviceGraphOrchestrator, FixedAddressOwnerCannotMoveObjects)
 {
-    auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-    orchestrator1->initializeGraphCache(24);
-
-    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
-
-    // Move assign
-    *orchestrator2 = std::move(*orchestrator1);
-
-    EXPECT_EQ(std::as_const(*orchestrator2).graphBuilder(), graph_builder_.get());
+    static_assert(!std::is_copy_constructible_v<DeviceGraphOrchestrator>);
+    static_assert(!std::is_copy_assignable_v<DeviceGraphOrchestrator>);
+    static_assert(!std::is_move_constructible_v<DeviceGraphOrchestrator>);
+    static_assert(!std::is_move_assignable_v<DeviceGraphOrchestrator>);
+    static_assert(std::is_nothrow_move_constructible_v<std::unique_ptr<DeviceGraphOrchestrator>>);
+    static_assert(std::is_nothrow_move_assignable_v<std::unique_ptr<DeviceGraphOrchestrator>>);
+    SUCCEED();
 }
 
 // =============================================================================
@@ -1813,6 +2519,107 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     EXPECT_TRUE(std::as_const(*orchestrator).graphBuilder()->isInitialized());
 }
 
+/**
+ * @brief Role-specific logits cannot leak between retained serving siblings.
+ *
+ * The actual DGO scope and actual CPU graph builder are exercised with small
+ * distinct tensor owners. This proves cold binding/reset ownership only; it
+ * does not advertise sparse GPU support or certify native model arithmetic.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, ServingProgramRestoresOrdinaryOwnersAcrossRolesAndFailures)
+{
+    FP32Tensor ordinary_full({1, 16}, DeviceId::cpu());
+    FP32Tensor ordinary_local({1, 8}, DeviceId::cpu());
+    FP32Tensor condition_full({1, 16}, DeviceId::cpu());
+    FP32Tensor condition_local({1, 8}, DeviceId::cpu());
+    FP32Tensor verifier_full({3, 16}, DeviceId::cpu());
+    FP32Tensor verifier_local({3, 8}, DeviceId::cpu());
+    auto builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    for (const bool sharded : {false, true})
+    {
+        SCOPED_TRACE(sharded);
+        ModelBuffers ordinary;
+        ordinary.logits = &ordinary_full;
+        ordinary.logits_local = sharded ? &ordinary_local : nullptr;
+        ModelBuffers condition = ordinary;
+        condition.logits = &condition_full;
+        condition.logits_local = sharded ? &condition_local : nullptr;
+        ModelBuffers verifier = ordinary;
+        verifier.logits = &verifier_full;
+        verifier.logits_local = sharded ? &verifier_local : nullptr;
+
+        const auto check = [&](const ModelBuffers &expected)
+        {
+            const auto &selected = DeviceGraphOrchestratorServingBuffersTestAccess::selected(owner);
+            EXPECT_EQ(selected.logits, expected.logits);
+            EXPECT_EQ(selected.logits_local, expected.logits_local);
+            EXPECT_EQ(builder->captured_buffers.logits, expected.logits);
+            EXPECT_EQ(builder->captured_buffers.logits_local, expected.logits_local);
+        };
+        owner.setBuffers(verifier); // Reproduce a preceding role's output binding.
+        for (int sibling = 0; sibling < 2; ++sibling)
+        {
+            SCOPED_TRACE(sibling);
+            DeviceGraphOrchestratorServingBuffersTestAccess::inProgram(owner, ordinary, [&]
+            {
+                check(ordinary);
+                owner.setBuffers(condition);
+                check(condition);
+                owner.setBuffers(verifier);
+                check(verifier);
+            });
+            check(ordinary);
+        }
+        EXPECT_THROW(
+            DeviceGraphOrchestratorServingBuffersTestAccess::inProgram(owner, ordinary, [&]
+            {
+                check(ordinary);
+                owner.setBuffers(condition);
+                throw std::runtime_error("stop cold materialization");
+            }),
+            std::runtime_error);
+        check(ordinary);
+    }
+}
+
+/** @test Query programs keep independent exact accepted-state children through reset and failed selection. */
+TEST_F(Test__DeviceGraphOrchestrator, SparseQueryPublicationChildrenRetainExactVerifierOwners)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device = DeviceId::cpu();
+    // Hook owners outlive the DGO metadata borrows, including exceptional cleanup.
+    llaminar2::testing::MockComputeStage short_hook;
+    llaminar2::testing::MockComputeStage full_hook;
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    DeviceGraphOrchestratorPublicationProgramsTestAccess::prove(owner, &short_hook, &full_hook);
+}
+
+/** @test Every admitted hosted row/program has an independent metadata owner through dirty selection and reset. */
+TEST_F(Test__DeviceGraphOrchestrator, HostedExactVerifierPublicationOwnersRetainEveryWidth)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device = DeviceId::cpu();
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    DeviceGraphOrchestratorPublicationProgramsTestAccess::proveExactWidths(owner);
+}
+
+/** @test No-launch rejection preserves original publication authority and unknown writes still block readers. */
+TEST_F(Test__DeviceGraphOrchestrator, PublicationPrelaunchFailureKeepsOriginalMailbox)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device=DeviceId::cpu();
+    auto builder=std::make_shared<QwenStandardGraph>(config,nullptr);
+    DeviceGraphOrchestrator owner(builder,nullptr);
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        DeviceGraphOrchestratorPublicationProgramsTestAccess::provePrelaunchFailure(owner,device);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -1878,7 +2685,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InferenceStateNotInitializedByDefault)
 
 TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateSuccess)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 2, 64, 64));
 
     // Initialize state
     int batch_size = 2;
@@ -1892,7 +2700,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateSuccess)
 
 TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 2, 64, 64));
 
     int batch_size = 2;
     int max_seq_len = 64;
@@ -1907,7 +2716,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
 
 TEST_F(Test__DeviceGraphOrchestrator, RequestBoundaryResetResetsPositions)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 2, 64, 64));
 
     int batch_size = 2;
     int max_seq_len = 64;
@@ -1954,7 +2764,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutState)
 
 TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutWeights)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 1, 64, 64));
 
     // Initialize state but not weights
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
@@ -1968,7 +2779,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutWeights)
 
 TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 4, 128, 128));
 
     int batch_size = 4;
     int max_seq_len = 128;
@@ -1986,9 +2798,8 @@ TEST_F(Test__DeviceGraphOrchestrator, DisabledPrefixCacheDoesNotRecordBypassStat
 {
     auto custom_config = config_;
     custom_config.prefix_cache.enabled = false;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr, 1, 16, 16));
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
@@ -2015,9 +2826,8 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
     custom_config.prefix_cache.block_size = 2;
     custom_config.prefix_cache.ram_budget_bytes = 1;
     custom_config.mtp.enabled = false;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr, 1, 16, 16));
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
@@ -2863,11 +3673,13 @@ TEST_F(Test__DeviceGraphOrchestrator, DeviceHotPrefixTierHasNoRamReplayPath)
             "prefix_backend->deviceCopyAsync("),
         std::string::npos);
 
-    const auto materialize_pos = orchestrator_source.find(
+    const auto serving_source = readServingGraphFamilySourceForTest();
+    ASSERT_FALSE(serving_source.empty());
+    const auto materialize_pos = serving_source.find(
         "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(");
-    const auto prefix_ready_pos = orchestrator_source.find(
+    const auto prefix_ready_pos = serving_source.find(
         "prefix_cache_ready = ensurePrefixCacheReady()", materialize_pos);
-    const auto graph_materialization_pos = orchestrator_source.find(
+    const auto graph_materialization_pos = serving_source.find(
         "materializeForwardGraphForShape(", materialize_pos);
     ASSERT_NE(materialize_pos, std::string::npos);
     ASSERT_NE(prefix_ready_pos, std::string::npos);
@@ -2912,8 +3724,10 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
         populate_body.find("state_.positions[seq_idx] = hit.cached_tokens");
     const auto mutation_boundary_pos =
         populate_body.find("handleLivePrefixReplayStateAfterMutation");
+    // The typed scope publishes on both success and unwind. Its callback is
+    // defined before imports; the normal commit must remain after mutation.
     const auto mutation_ready_pos =
-        populate_body.find("recordLivePrefixMutationReady", mutation_boundary_pos);
+        populate_body.find("restore_completion.commit();", mutation_boundary_pos);
 
     ASSERT_NE(wait_mutation_pos, std::string::npos);
     ASSERT_NE(wait_graph_pos, std::string::npos);
@@ -2939,6 +3753,9 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
     EXPECT_LT(import_hybrid_pos, update_position_pos);
     EXPECT_LT(update_position_pos, mutation_boundary_pos);
     EXPECT_LT(mutation_boundary_pos, mutation_ready_pos);
+    EXPECT_TRUE(test::hasOrderedPrefixArchivePublication(populate_body))
+        << "The typed callback must record readiness before it can be committed "
+           "after imports and the live-state mutation boundary.";
 }
 
 /**
@@ -3193,12 +4010,11 @@ TEST_F(
     EXPECT_EQ(destructor_body.find("synchronize("), std::string::npos);
     EXPECT_EQ(destructor_body.find("synchronizeStream("), std::string::npos);
 
-    const auto move_constructor_pos =
+    const auto next_method_pos =
         source.find(
-            "DeviceGraphOrchestrator::DeviceGraphOrchestrator("
-            "DeviceGraphOrchestrator &&)",
+            "void DeviceGraphOrchestrator::setForwardGraphExecutionRendezvous(",
             topology_destruction_pos);
-    ASSERT_NE(move_constructor_pos, std::string::npos);
+    ASSERT_NE(next_method_pos, std::string::npos);
     const std::string retirement_body =
         source.substr(
             retirement_pos,
@@ -3215,9 +4031,9 @@ TEST_F(
     const std::string topology_destruction_body =
         source.substr(
             topology_destruction_pos,
-            move_constructor_pos - topology_destruction_pos);
+            next_method_pos - topology_destruction_pos);
     const auto parent_release = topology_destruction_body.find(
-        "mtp_device_generation_loop_graph_.release();");
+        "releaseRetainedStorageGenerationTopology();");
     const auto forward_release = topology_destruction_body.find(
         "forward_engine_->discardAllCachedGraphs();");
     const auto context_release = topology_destruction_body.find(
@@ -3227,15 +4043,49 @@ TEST_F(
     ASSERT_NE(context_release, std::string::npos);
     EXPECT_LT(parent_release, forward_release)
         << "The complete generation parent must die before its borrowed child captures";
+    const auto publication_release = topology_destruction_body.find(
+        "mtp_speculative_state_publication_graphs_.rbegin()");
+    ASSERT_NE(publication_release, std::string::npos);
+    EXPECT_LT(parent_release, publication_release);
+    EXPECT_LT(publication_release, forward_release)
+        << "Publication hooks must retire before their exact verifier stage owners";
     EXPECT_LT(forward_release, context_release)
         << "Captured forward graphs must die before graph-creation contexts";
 
+    // The generation owner now also retains the immutable-storage terminal
+    // graph. Prove its helper still releases the complete parent before that
+    // borrowed terminal fragment and the terminal capture's final stream lease.
+    const auto generation_source = readSourceFileForDeviceGraphOrchestratorTest(
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp");
+    const auto retained_release_begin = generation_source.find(
+        "void DeviceGraphOrchestrator::releaseRetainedStorageGenerationTopology()");
+    const auto retained_release_end = generation_source.find(
+        "void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()", retained_release_begin);
+    ASSERT_NE(retained_release_begin, std::string::npos);
+    ASSERT_NE(retained_release_end, std::string::npos);
+    auto retained_release_body = generation_source.substr(
+        retained_release_begin, retained_release_end - retained_release_begin);
+    std::erase_if(retained_release_body, [](unsigned char value) {
+        return std::isspace(value);
+    });
+    const auto native_parent_release = retained_release_body.find(
+        "for(auto&parent:sparse_query_generation_parents_)parent.release();");
+    const auto terminal_fragment_release = retained_release_body.find(
+        "retained_storage_terminal_fragment_={};");
+    const auto terminal_capture_release = retained_release_body.find(
+        "retained_storage_terminal_capture_.reset();");
+    ASSERT_NE(native_parent_release, std::string::npos);
+    ASSERT_NE(terminal_fragment_release, std::string::npos);
+    ASSERT_NE(terminal_capture_release, std::string::npos);
+    EXPECT_LT(native_parent_release, terminal_fragment_release);
+    EXPECT_LT(terminal_fragment_release, terminal_capture_release);
+
     for (const char *required_release : {
-             "mtp_speculative_state_publication_graph_.invalidate();",
+             "mtp_speculative_state_publication_graphs_.rbegin()",
              "mtp_draft_token_publication_graphs_",
              "mtp_verifier_preparation_graphs_",
-             "mtp_stochastic_outcome_graph_.invalidate();",
-             "mtp_stochastic_target_distribution_graph_.invalidate();",
+             "for (auto &cache : mtp_stochastic_outcome_graphs_) cache.invalidate();",
+             "for (auto &cache : mtp_stochastic_target_distribution_graphs_) cache.invalidate();",
              "moe_overlay_epoch_acquire_graph_.invalidate();",
              "moe_overlay_epoch_release_graph_.invalidate();",
              "device_moe_rebalance_maintenance_graph_.invalidate();"})
@@ -3458,12 +4308,10 @@ TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintNamesEachLogicalPayload
     auto rank0_config = make_participant_config(0);
     auto rank1_config = make_participant_config(1);
 
-    auto rank0 = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(rank0_config, nullptr),
-        nullptr);
-    auto rank1 = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(rank1_config, nullptr),
-        nullptr);
+    auto rank0 = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(rank0_config, nullptr), nullptr, 1, 16, 16));
+    auto rank1 = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(rank1_config, nullptr), nullptr, 1, 16, 16));
 
     ASSERT_TRUE(rank0->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
     ASSERT_TRUE(rank1->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
@@ -3510,6 +4358,7 @@ TEST_F(Test__DeviceGraphOrchestrator,
 
     auto cfg = makeMaintenanceMoEGraphConfig();
     cfg.layer_types = {"gdn", "full_attention"};
+    cfg.gdn.full_attention_interval = 2; // Same authored two-layer map for state admission.
     cfg.moe = {};
     constexpr int blocks = 24;
     std::vector<int32_t> tokens(blocks * cfg.prefix_cache.block_size);
@@ -3519,7 +4368,10 @@ TEST_F(Test__DeviceGraphOrchestrator,
     PrefixPayloadLayout layout;
     uint64_t fingerprint = 0;
     {
-        DeviceGraphOrchestrator probe(std::make_shared<Qwen35Graph>(cfg, nullptr), nullptr);
+        auto probe_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35Graph>(cfg, nullptr),
+            nullptr, 1, static_cast<int>(tokens.size()), static_cast<int>(tokens.size())));
+        auto &probe = *probe_owner;
         probe.retainModelContext(context);
         ASSERT_TRUE(probe.initializeInferenceStateFromArena(1, tokens.size(), DeviceId::cpu()));
         const auto admission = probe.lookupPrefix(tokens);
@@ -3579,10 +4431,15 @@ TEST_F(Test__DeviceGraphOrchestrator,
     kv.hybrid_config = &hybrid;
     const size_t recurrent_bytes = hybrid.gdnStateGeometry().localPayloadBytes(hybrid.countGDNLayers());
     const size_t archive_scratch = PrefixArchiveIOGeometry::scratchBytes();
-    const size_t capacity = kv.estimateBytes() + recurrent_bytes + archive_scratch + cfg.prefix_cache.ram_budget_bytes;
+    auto restore_graph = std::make_shared<Qwen35Graph>(cfg, nullptr);
+    const size_t arena_bytes = test::cpuFixtureGraphRoots(*restore_graph, 1,
+        static_cast<int>(tokens.size())).cpuPhysicalBytes();
+    const size_t capacity = kv.estimateBytes() + recurrent_bytes + archive_scratch +
+        cfg.prefix_cache.ram_budget_bytes + arena_bytes;
     const PhysicalMemoryResource resource{.world_rank = 0, .device = DeviceId::cpu(),
         .total_bytes = capacity, .admission_available_bytes = capacity};
     PhysicalMemoryPlanBuilder plan;
+    plan.add(resource, PhysicalMemoryOwner::ActivationArena, arena_bytes);
     plan.add(resource, PhysicalMemoryOwner::KVCache, kv.estimateBytes());
     plan.add(resource, PhysicalMemoryOwner::RecurrentLiveState, recurrent_bytes);
     plan.add(resource, PhysicalMemoryOwner::PrefixArchiveStaging, archive_scratch);
@@ -3590,7 +4447,7 @@ TEST_F(Test__DeviceGraphOrchestrator,
     auto authority = std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
     auto runner = DeviceGraphOrchestrator::createForTest({
-        .model_ctx = context, .graph_builder = std::make_shared<Qwen35Graph>(cfg, nullptr),
+        .model_ctx = context, .graph_builder = restore_graph,
         .physical_memory_authority = authority});
     ASSERT_TRUE(runner->initializeInferenceStateFromArena(1, tokens.size(), DeviceId::cpu()));
     const auto hit = runner->lookupPrefix(tokens);
@@ -3655,9 +4512,8 @@ TEST(InferenceStateResetRequest, ServingGraphSetupScrubsAllOwnersAndPreservesExe
 TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingPrefix)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
@@ -3709,9 +4565,8 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingP
 TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWithoutRekeyingPrefix)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
@@ -3734,6 +4589,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWith
            "model-runtime prefix payload, not encoded into the cache key.";
 }
 
+/** @test A resolved singleton CPU authority owns runtime epochs; unresolved/foreign setup is rejected. */
 TEST_F(Test__DeviceGraphOrchestrator, HostExpertOverlayRuntimeEpochComesFromSoleRCUAuthority)
 {
     MoERoutedExpertPlacementPlan plan;
@@ -3762,25 +4618,63 @@ TEST_F(Test__DeviceGraphOrchestrator, HostExpertOverlayRuntimeEpochComesFromSole
     tier.fallback = true;
     plan.routed_tiers = {std::move(tier)};
 
-    auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
-        MoEOverlayResidencyAuthority::Config{
-            .initial_plan = plan,
-            .model_metadata =
-                MoERoutedExpertModelMetadata{
-                    .num_layers = 2,
-                    .num_experts = 8,
-                    .d_model = 8,
-                    .routed_intermediate_size = 8,
-                    .shared_intermediate_size = 0,
-                    .has_shared_expert = false,
-                    .routed_quant_type = "F32",
-                    .shared_quant_type = "F32",
-                },
-            .maintenance_mode = MoERebalanceRuntimeMode::Off,
-            .perf_device = "CPU",
-        });
+    const MoERoutedExpertModelMetadata metadata{
+        .num_layers = 2,
+        .num_experts = 8,
+        .d_model = 8,
+        .routed_intermediate_size = 8,
+        .shared_intermediate_size = 0,
+        .has_shared_expert = false,
+        .routed_quant_type = "F32",
+        .shared_quant_type = "F32",
+        .main_inference_layer_count = 2,
+    };
+    // User input may be unresolved, but a constructed residency authority is a
+    // frozen setup object. Use the same canonical topology resolver as the
+    // production factory rather than installing a second hard-coded authority.
+    ASSERT_EQ(plan.authority_execution, MoEOverlayAuthorityExecutionKind::Unresolved);
+    plan.authority_execution = resolveMoEOverlayAuthorityExecutionKind(plan);
+    ASSERT_EQ(plan.authority_execution, MoEOverlayAuthorityExecutionKind::HostResident);
+    const auto make_authority = [&](const MoERoutedExpertPlacementPlan &candidate)
+    {
+        return std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = candidate,
+                .model_metadata = metadata,
+                .maintenance_mode = MoERebalanceRuntimeMode::Off,
+                .perf_device = "CPU",
+            });
+    };
+    // These controls alter only the declared execution authority. Geometry,
+    // world-rank membership and every resident expert remain the same, so a
+    // failure cannot be attributed to an unrelated incomplete fixture field.
+    for (const auto &[execution, diagnostic] : {
+        std::pair{MoEOverlayAuthorityExecutionKind::Unresolved,
+            "No-peer residency requires the exact complete stage geometry"},
+        std::pair{MoEOverlayAuthorityExecutionKind::DeviceResident,
+            "does not match topology-required"}})
+    {
+        auto foreign = plan;
+        foreign.authority_execution = execution;
+        try
+        {
+            (void)make_authority(foreign);
+            FAIL() << "A CPU-only frozen plan must reject " << toString(execution);
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find(diagnostic), std::string::npos) << error.what();
+        }
+    }
+    auto authority = make_authority(plan);
     ASSERT_TRUE(authority->snapshot());
     ASSERT_EQ(authority->snapshot()->epoch, 1u);
+    ASSERT_EQ(authority->snapshot()->placement_plan->authority_execution, plan.authority_execution);
+    ASSERT_TRUE(authority->noPeerResidency());
+    EXPECT_EQ(authority->noPeerResidency()->authorityExecution(), plan.authority_execution);
+    EXPECT_NO_THROW(authority->noPeerResidency()->requireDestination(DeviceId::cpu(), 0, 2, 8));
+    EXPECT_THROW(authority->noPeerResidency()->requireDestination(DeviceId::cpu(), 1, 2, 8), std::invalid_argument);
+    EXPECT_THROW(authority->noPeerResidency()->requireDestination(DeviceId::cpu(), 0, 2, 7), std::invalid_argument);
 
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.moe.routed_expert_plan =
@@ -3806,9 +4700,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InvalidateOnRebalanceRekeysGraphStableRunt
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.prefix_cache.moe_policy =
         PrefixCacheMoEPolicy::InvalidateOnRebalance;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(
         1, 16, DeviceId::cpu()));
 
@@ -3832,7 +4725,9 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixLookupRetainsEpochUsedToBuildFingerp
     auto config = makeMaintenanceMoEGraphConfig();
     config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     auto graph = std::make_shared<PublishingPrefixMoEGraph>(config);
-    DeviceGraphOrchestrator runner(graph, nullptr);
+    auto runner_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph, nullptr, 1, 16, 16));
+    auto &runner = *runner_owner;
     ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     const std::vector<int32_t> prompt = {1, 2};
@@ -3875,9 +4770,8 @@ TEST_F(
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.prefix_cache.moe_policy =
         PrefixCacheMoEPolicy::InvalidateOnRebalance;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(
         1, 16, DeviceId::cpu()));
 
@@ -4336,7 +5230,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_AutoDefaultsToQ16He
     // Create config with FP32 precision, AUTO KV cache (default)
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr, 1, 64, 64));
 
     // Initialize state
     int batch_size = 1;
@@ -4357,7 +5252,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_Defau
 {
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr, 1, 64, 64));
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
@@ -4375,7 +5271,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_AutoDefaultsToQ16He
     // Create config with BF16 precision, AUTO KV cache (default)
     auto bf16_config = config_;
     bf16_config.activation_precision = ActivationPrecision::BF16;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(bf16_config, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(bf16_config, nullptr), nullptr, 1, 64, 64));
 
     // Initialize state
     int batch_size = 1;
@@ -5386,7 +6283,8 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_AllConsumersG
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInferenceState)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr, 8, 64, 64));
 
     // Initialize inference state with specific batch size
     const int batch_size = 8;
@@ -5706,3 +6604,180 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPCallbackRejectingOut
     EXPECT_EQ(lw0.wq, nullptr);
 }
 // - DeviceWorkspaceManager allocation verification
+
+/** @brief Accepted row bytes, coherence and current scalar owner advance together. */
+TEST_F(Test__DeviceGraphOrchestrator, AcceptedVerifierTerminalLogitsPublishSelectedRowAndReset)
+{
+    auto config = config_;
+    config.vocab_size = 8;
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator runner(builder);
+    auto producer = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 8});
+    auto canonical = std::make_shared<FP32Tensor>(std::vector<size_t>{1, 8});
+    auto *values = static_cast<float *>(producer->raw_mutable_data());
+    ASSERT_NE(values, nullptr);
+    for (size_t row = 0; row < 3; ++row)
+        for (size_t column = 0; column < 8; ++column)
+            values[row * 8 + column] = static_cast<float>(100 * row + column);
+    TransferEngine::publishHostWrite(producer.get());
+    DeviceGraphOrchestratorLiveStateTestAccess::seed(runner, producer, canonical, 17);
+    const PrefixLogitsRowSelection accepted(1, 3, 17);
+    ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publish(runner, accepted));
+    EXPECT_EQ(DeviceGraphOrchestratorLiveStateTestAccess::current(runner), canonical.get());
+    ASSERT_TRUE(canonical->hostValid());
+    const auto *published = canonical->fp32_data();
+    ASSERT_NE(published, nullptr);
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    // Producer reuse cannot alter the accepted scalar authority.
+    std::fill_n(values, 24, -777.0f);
+    TransferEngine::publishHostWrite(producer.get());
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    DeviceGraphOrchestratorLiveStateTestAccess::resetPublication(runner);
+    EXPECT_EQ(DeviceGraphOrchestratorLiveStateTestAccess::current(runner), nullptr);
+    EXPECT_THROW(DeviceGraphOrchestratorLiveStateTestAccess::publish(runner, accepted),
+                 std::invalid_argument);
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    // A capacity-shaped tensor cannot certify a narrower live producer view.
+    EXPECT_FALSE(DeviceGraphOrchestratorLiveStateTestAccess::publish(
+        runner, PrefixLogitsRowSelection(0, 2, 18)));
+    ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publish(
+        runner, PrefixLogitsRowSelection(2, 3, 18)));
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], -777.0f);
+}
+
+
+/**
+ * @test The actual grouped manifest input uses generation R rather than generic batch.
+ * @details Calls the production cold input constructor through its existing test
+ * peer, then constructs actual GPU stage requirement owners from that input.
+ * No GPU context, native memory, model, graph launch or source scan is involved.
+ */
+TEST(DeviceGraphOrchestratorWorkspaceInput, GroupedVerifierUsesGenerationRequestOwner)
+{
+    MTPRuntimeConfig config;
+    config.enabled = true;
+    config.draft_tokens = 15;
+    config.max_request_batch = 3;
+    const MTPGraphOwnerPlan owner(config, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
+    int token = 4, position = 0;
+    std::vector<int> ordinary_lengths(7, 9);
+    ForwardInput ordinary;
+    ordinary.graph_submission_intent = ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+    ordinary.execution_role = ForwardExecutionRole::MainInference;
+    ordinary.execution_phase = ForwardExecutionPhase::Prefill;
+    ordinary.batch_size = 7;
+    ordinary.seq_len = 9;
+    ordinary.real_seq_len = 9;
+    ordinary.bucket_seq_len = 16;
+    // Borrowed sentinels prove the constructor clears prefill authorities;
+    // neither it nor this test dereferences an alleged native device address.
+    ordinary.token_ids = &token;
+    ordinary.token_ids_device = &token;
+    ordinary.position_ids = &position;
+    ordinary.position_ids_device = &position;
+    ordinary.sequence_lengths = &ordinary_lengths;
+    ordinary.sequence_lengths_device = ordinary_lengths.data();
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ordinary.device = device;
+        const auto grouped = DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(ordinary, owner);
+        EXPECT_EQ(grouped.batch_size, 3);
+        EXPECT_EQ(grouped.seq_len, 16);
+        EXPECT_EQ(grouped.batch_size * grouped.seq_len, owner.flattenedTargetRows());
+        EXPECT_EQ(grouped.execution_role, ForwardExecutionRole::GroupedMTPVerifier);
+        EXPECT_EQ(grouped.execution_phase, ForwardExecutionPhase::Decode);
+        EXPECT_EQ(grouped.graph_submission_intent, ForwardGraphSubmissionIntent::WorkspaceDeclaration);
+        EXPECT_EQ(grouped.position_offset, 1);
+        EXPECT_EQ(grouped.real_seq_len, 0);
+        EXPECT_EQ(grouped.bucket_seq_len, 0);
+        EXPECT_EQ(grouped.token_ids, nullptr);
+        EXPECT_EQ(grouped.token_ids_device, nullptr);
+        EXPECT_EQ(grouped.position_ids, nullptr);
+        EXPECT_EQ(grouped.position_ids_device, nullptr);
+        EXPECT_EQ(grouped.sequence_lengths, nullptr);
+        EXPECT_EQ(grouped.sequence_lengths_device, nullptr);
+        EXPECT_EQ(ordinary.batch_size, 7);
+        EXPECT_EQ(ordinary.seq_len, 9);
+        EXPECT_EQ(ordinary.execution_phase, ForwardExecutionPhase::Prefill);
+        EXPECT_EQ(ordinary.sequence_lengths, &ordinary_lengths);
+        EXPECT_EQ(ordinary.token_ids, &token);
+
+        GDNRecurrenceStage::Params rec;
+        rec.device_id = device;
+        rec.seq_len = grouped.batch_size * grouped.seq_len;
+        rec.request_count = grouped.batch_size;
+        rec.request_seq_len = grouped.seq_len;
+        rec.n_heads = 32;
+        rec.n_k_heads = 16;
+        rec.d_k = rec.d_v = 128;
+        rec.speculative_state_slot_rows = owner.flattenedTargetRows();
+        GDNRecurrenceStage recurrence(rec);
+        const auto recurrence_requirements = recurrence.getWorkspaceRequirements(grouped.seq_len);
+        const auto expected_rec = gdn_workspace::recurrenceStateFootprint(owner.flattenedTargetRows(),
+            owner.requestCapacity(), 32, 128, 128, GDNStateStorage::DeviceDense);
+        const auto actual_rec_work = std::find_if(recurrence_requirements.buffers.begin(),
+            recurrence_requirements.buffers.end(), [](const auto &buffer) {
+                return buffer.name.starts_with(GDNRecurrenceStage::WS_SPECULATIVE_STATE_WORK);
+            });
+        ASSERT_NE(actual_rec_work, recurrence_requirements.buffers.end());
+        EXPECT_EQ(actual_rec_work->size_bytes, expected_rec.work_bytes);
+
+        ShortConv1dStage::Params conv;
+        conv.device_id = device;
+        conv.seq_len = grouped.batch_size * grouped.seq_len;
+        conv.request_count = grouped.batch_size;
+        conv.request_seq_len = grouped.seq_len;
+        conv.channels = 8192;
+        conv.kernel_size = 4;
+        conv.speculative_state_slot_rows = owner.flattenedTargetRows();
+        ShortConv1dStage convolution(conv);
+        const auto conv_requirements = convolution.getWorkspaceRequirements(grouped.seq_len);
+        const auto expected_conv = gdn_workspace::shortConvStateFootprint(owner.flattenedTargetRows(),
+            owner.requestCapacity(), 8192, 4);
+        const auto actual_conv_work = std::find_if(conv_requirements.buffers.begin(),
+            conv_requirements.buffers.end(), [](const auto &buffer) {
+                return buffer.name.starts_with(ShortConv1dStage::WS_SPECULATIVE_STATE_WORK);
+            });
+        ASSERT_NE(actual_conv_work, conv_requirements.buffers.end());
+        EXPECT_EQ(actual_conv_work->size_bytes, expected_conv.work_bytes);
+    }
+    // CPU workspace discovery preserves its existing host batch semantics.
+    ordinary.device = DeviceId::cpu();
+    const auto cpu = DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(ordinary, owner);
+    EXPECT_EQ(cpu.batch_size, ordinary.batch_size);
+    EXPECT_EQ(cpu.seq_len, owner.verifierRowsPerRequest());
+    EXPECT_EQ(ordinary.batch_size, 7);
+    auto malformed = ordinary;
+    malformed.batch_size = 0;
+    EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(malformed, owner),
+        std::invalid_argument);
+    malformed = ordinary;
+    malformed.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+    EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(malformed, owner),
+        std::invalid_argument);
+    EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(
+        ordinary, MTPGraphOwnerPlan(MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller)), std::logic_error);
+}
+
+/** @test Retained-Off setup cannot silently skip the real checkpoint owner's preconditions. */
+TEST(Test__DeviceGraphOrchestratorRetainedMTP, CheckpointSetupRequiresOriginalKVForOffAndEnabledCapacity)
+{
+    for (const bool enabled : {false, true})
+        for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+            for (const int capacity : {0, 15})
+            {
+                GraphConfig config;
+                config.default_device = DeviceId::cpu();
+                config.mtp.enabled = enabled;
+                config.mtp.depth_policy.mode = mode;
+                config.mtp.graph_capacity_draft_tokens = capacity;
+                auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+                DeviceGraphOrchestrator owner(builder, nullptr);
+                EXPECT_EQ(DeviceGraphOrchestratorPublicationProgramsTestAccess::initializeCheckpointPoolWithoutKV(owner),
+                    !retainsMTPGraphCapacity(config.mtp));
+            }
+}

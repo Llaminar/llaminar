@@ -2,10 +2,10 @@
  * @file MoEOverlayMigrationMeasurementLedger.h
  * @brief Bounded robust evidence ledger for ExpertOverlay migration economy.
  *
- * Physical migration lanes publish one pointer-free observation per completed
- * gate/up/down operation.  This setup-owned ledger stores a fixed number of
- * warmup and measured samples for every explicitly declared directed
-     * participant/layer coordinate.  Recording performs no allocation, waiting,
+ * Physical migration lanes publish scalar observations and shared immutable
+ * original geometry for completed projection pieces. This setup-owned ledger
+ * stores a fixed number of warmup and measured samples for every explicitly
+ * declared directed complete-target/layer coordinate.  Recording performs no allocation, waiting,
  * device work, or topology inference.  Once its single maintenance producer
  * is quiescent, sealing computes deterministic medians suitable for
  * `MoEOverlayEconomyProfileComposer`.
@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <compare>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,22 @@ namespace llaminar2
 
         /** @return Whether this names a non-self directed layer edge. */
         [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /** @brief Setup-declared original target geometry; a coordinate alone cannot size a cohort. */
+    struct MoEOverlayRequiredTargetMigrationMeasurement
+    {
+        MoEOverlayMigrationTargetCoordinate coordinate;
+        std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> geometry;
+        /** Optional original operation/layout quotes; exact piece order, never inferred from incoming evidence. */
+        std::vector<std::uint64_t> quoted_payload_bytes;
+    };
+
+    /** @brief Borrowed completed observation; metadata grants no source or readiness authority. */
+    struct MoEOverlayBorrowedTargetMigrationObservation
+    {
+        MoEOverlayMigrationTargetCoordinate coordinate;
+        const MoEOverlayCompletedMigrationMeasurement &measurement;
     };
 
     /** @brief Race-safe proof counters for one calibration ledger. */
@@ -66,7 +83,11 @@ namespace llaminar2
     struct MoEOverlaySealedMigrationMeasurements
     {
         std::string identity;
-        std::vector<MoEOverlayParticipantLayerMigrationMeasurement> rows;
+        std::vector<MoEOverlayTargetLayerMigrationMeasurement> rows;
+
+        /** @return Checked whole-only projection, never a retained duplicate corpus.
+         * @throws std::invalid_argument For any cohort or incomplete row. */
+        [[nodiscard]] std::vector<MoEOverlayParticipantLayerMigrationMeasurement> wholeRows() const;
 
         /** @return Whether identity and every required row are present. */
         [[nodiscard]] bool valid() const noexcept;
@@ -88,6 +109,9 @@ namespace llaminar2
         /** @brief Immutable bounded corpus geometry and robust-sampling policy. */
         struct Config
         {
+            /** Canonical typed declarations; mutually exclusive with the scalar input adapter. */
+            std::vector<MoEOverlayRequiredTargetMigrationMeasurement> required_target_measurements;
+            /** Explicit legacy whole-only input adapter; no geometry/cut claim is invented. */
             std::vector<MoEOverlayMigrationMeasurementCoordinate>
                 required_coordinates;
             std::uint64_t warmup_samples_per_coordinate = 1;
@@ -120,7 +144,19 @@ namespace llaminar2
         bool recordCompletedWave(
             const std::vector<MoEOverlayCompletedMigrationMeasurement> &
                 measurements,
+            std::string *error) noexcept;
+
+        /** @brief Take an already-owned completed wave without copying nested metadata.
+         * @param measurements Exact wave-owned observations. @param error Optional rejection reason.
+         * @return Whether the complete observation was accepted atomically. */
+        bool recordCompletedWave(std::vector<MoEOverlayCompletedMigrationMeasurement> &&measurements,
             std::string *error) noexcept override;
+
+        /** @brief Record one borrowed original-target wave without allocation or geometry inference.
+         * @param observations Exact typed coordinates and complete original observations.
+         * @param error Optional rejection diagnostic. @return Whether the entire wave was accepted atomically. */
+        bool recordCompletedTargetWave(std::span<const MoEOverlayBorrowedTargetMigrationObservation> observations,
+            std::string *error = nullptr) noexcept;
 
         /**
          * @brief Retain one paired inference-only/with-movement latency sample.
@@ -160,6 +196,24 @@ namespace llaminar2
             return coordinates_.size();
         }
 
+        /**
+         * @return Immutable canonical coordinate identities admitted at setup.
+         * @note A matching count alone cannot bind a planner to this corpus.
+         */
+        [[nodiscard]] std::vector<MoEOverlayMigrationMeasurementCoordinate>
+        requiredCoordinates() const;
+
+        /** @return The one canonical typed coordinate list admitted at setup. */
+        [[nodiscard]] const std::vector<MoEOverlayMigrationTargetCoordinate> &
+        requiredTargetCoordinates() const noexcept { return coordinates_; }
+
+        /** @brief Authenticate presealed evidence against original setup declarations without mutation.
+         * @param measurements Imported corpus at the setup/quiescent boundary.
+         * @param error Optional exact incompatibility diagnostic.
+         * @return Exact coordinate/geometry/quote compatibility; cohort reuse requires setup-bound quotes. */
+        [[nodiscard]] bool matchesDeclarations(const MoEOverlaySealedMigrationMeasurements &measurements,
+            std::string *error = nullptr) const noexcept;
+
         /** @return Warmup plus retained observations required per coordinate/phase. */
         [[nodiscard]] std::uint64_t requiredObservationsPerCoordinate()
             const noexcept
@@ -184,12 +238,15 @@ namespace llaminar2
                 std::atomic<std::uint64_t>,
                 kExpertHistogramProductionSourceCount>
                 interference_observations{};
-            std::array<std::uint64_t, 3> projection_bytes{};
+            std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> geometry;
+            std::size_t first_piece = 0;
+            std::size_t piece_count = 0;
+            bool setup_quotes_bound = false;
         };
 
         /** @brief Find one canonical coordinate without allocation. */
         [[nodiscard]] std::size_t coordinateIndex(
-            const MoEOverlayMigrationMeasurementCoordinate &coordinate)
+            const MoEOverlayMigrationTargetCoordinate &coordinate)
             const noexcept;
 
         /** @brief Flatten a coordinate and retained sample into fixed storage. */
@@ -203,14 +260,24 @@ namespace llaminar2
             std::size_t phase_index,
             std::uint64_t measured_sample_index) const noexcept;
 
+        /** @brief Shared adapter implementation; exactly one borrowed input arm is nonempty.
+         * @param whole Existing whole-only input adapter. @param targets Explicit borrowed typed inputs.
+         * @param error Optional diagnostic. @return Atomic whole-wave acceptance. */
+        bool recordWave(std::span<const MoEOverlayCompletedMigrationMeasurement> whole,
+            std::span<const MoEOverlayBorrowedTargetMigrationObservation> targets,std::string *error) noexcept;
+
+        /** @brief Flatten one canonical piece and measured sample into setup-owned storage.
+         * @param coordinate_index Canonical coordinate. @param piece Canonical piece ordinal.
+         * @param measured_index Post-warmup sample ordinal. @return Checked setup-established offset. */
+        [[nodiscard]] std::size_t pieceSampleOffset(std::size_t coordinate_index,std::size_t piece,
+            std::uint64_t measured_index) const noexcept;
+
         Config config_;
-        std::vector<MoEOverlayMigrationMeasurementCoordinate> coordinates_;
+        std::vector<MoEOverlayMigrationTargetCoordinate> coordinates_;
         std::unique_ptr<CoordinateState[]> coordinate_state_;
         std::vector<std::uint64_t> wave_samples_;
-        std::array<
-            std::vector<ExpertTierProjectionTransferMeasurement>,
-            3>
-            projection_samples_;
+        std::vector<ExpertTierProjectionTransferMeasurement> piece_samples_;
+        std::vector<std::uint64_t> piece_bytes_;
         std::vector<std::uint64_t> interference_samples_;
         std::atomic<bool> sealed_{false};
 

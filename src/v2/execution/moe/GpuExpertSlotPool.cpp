@@ -157,7 +157,7 @@ namespace llaminar2
                             spec.payload_bytes_per_block <= 0)
                         {
                             throw std::invalid_argument(
-                                "GpuExpertSlotPool NativeVNNI projection spec has invalid block geometry");
+                                "GpuExpertSlotPool NativeQuantised projection spec has invalid block geometry");
                         }
                         orchestrator->planWeightForOwner(
                             device_ordinal,
@@ -355,7 +355,7 @@ namespace llaminar2
             ProjectionSlot projection;
             projection.spec = spec;
             projection.slot = *slot;
-            projection.blocks_per_row = spec.format.isNativeVnni()
+            projection.blocks_per_row = spec.format.isNativeQuantised()
                                             ? static_cast<uint32_t>(spec.K / 32)
                                             : 0;
             acquired.projections.push_back(std::move(projection));
@@ -475,7 +475,7 @@ namespace llaminar2
             ProjectionSlot projection;
             projection.spec = spec;
             projection.slot = *slot;
-            projection.blocks_per_row = spec.format.isNativeVnni()
+            projection.blocks_per_row = spec.format.isNativeQuantised()
                                             ? static_cast<uint32_t>(spec.K / 32)
                                             : 0;
             acquired.projections.push_back(std::move(projection));

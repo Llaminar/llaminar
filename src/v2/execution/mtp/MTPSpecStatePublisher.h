@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include <span>
 
 #include "MTPSpecStateContract.h"
 #include "../../backends/DeviceId.h"
@@ -110,7 +111,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
         const MTPSpecStepPlan &plan,
-        const int *device_verifier_restore_row,
+        std::span<const int> device_verifier_restore_row,
         const std::vector<IComputeStage *> &state_stages,
         DeviceId device,
         void *stream,
@@ -125,7 +126,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
         const MTPDeviceVerifierStatePublicationShape &shape,
-        const int *device_verifier_restore_row,
+        std::span<const int> device_verifier_restore_row,
         const std::vector<IComputeStage *> &state_stages,
         DeviceId device,
         void *stream,
@@ -142,7 +143,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
         const MTPSpecStepPlanBatch &plans,
-        const int *device_verifier_restore_rows,
+        std::span<const int> device_verifier_restore_rows,
         int row_index_stride,
         const std::vector<IComputeStage *> &state_stages,
         DeviceId device,
@@ -159,7 +160,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
         const MTPDeviceVerifierStatePublicationShape &shape,
-        const int *device_verifier_restore_rows,
+        std::span<const int> device_verifier_restore_rows,
         int row_index_stride,
         const std::vector<IComputeStage *> &state_stages,
         DeviceId device,
@@ -200,7 +201,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
         const MTPSpecStepPlan &plan,
-        const int *device_verifier_restore_row,
+        std::span<const int> device_verifier_restore_row,
         ComputeGraph &graph,
         DeviceId device,
         void *stream,
@@ -211,7 +212,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
         const MTPDeviceVerifierStatePublicationShape &shape,
-        const int *device_verifier_restore_row,
+        std::span<const int> device_verifier_restore_row,
         ComputeGraph &graph,
         DeviceId device,
         void *stream,
@@ -222,7 +223,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
         const MTPSpecStepPlanBatch &plans,
-        const int *device_verifier_restore_rows,
+        std::span<const int> device_verifier_restore_rows,
         int row_index_stride,
         ComputeGraph &graph,
         DeviceId device,
@@ -234,7 +235,7 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
         const MTPDeviceVerifierStatePublicationShape &shape,
-        const int *device_verifier_restore_rows,
+        std::span<const int> device_verifier_restore_rows,
         int row_index_stride,
         ComputeGraph &graph,
         DeviceId device,

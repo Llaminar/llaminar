@@ -23,6 +23,8 @@
 
 namespace llaminar2
 {
+    class CPUExpertShardRouteCompletion;
+    class MoECPUExpertShardRouteStage;
     /**
      * @brief Backend-agnostic endpoint selected by the topology planner.
      *
@@ -62,6 +64,10 @@ namespace llaminar2
         std::uint32_t graph_role_mask = 0u;
         /** Strictly increasing model-layer indices embedded in the transaction. */
         std::vector<std::int32_t> model_layer_indices;
+        MoEOverlayActivationReturnRole return_role =
+            MoEOverlayActivationReturnRole::Ordinary; ///< Immutable logical return policy.
+        std::int32_t cohort_target =
+            -1; ///< Fixed original CPU cohort tag, never expert membership.
 
         /** @return Whether the rank pair, topology, and stage manifest are usable. */
         [[nodiscard]] bool valid() const noexcept;
@@ -83,6 +89,8 @@ namespace llaminar2
     {
         std::uint64_t dispatch_payload_bytes = 0u;
         std::uint64_t return_payload_bytes = 0u;
+        /** Unique useful shared hidden bytes; only the group publisher counts them. */
+        std::uint64_t dispatch_shared_hidden_bytes = 0u;
         std::uint64_t dispatch_live_rows = 0u;
         std::uint64_t return_live_rows = 0u;
         std::uint64_t dispatch_live_entries = 0u;
@@ -148,6 +156,18 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Describe a checked original submission without touching live device controls.
+         * @param original Exact already-Submitted token from the original active protocol.
+         * @param epoch_generation Original immutable per-lane publication generation.
+         * @return Same identity construction used by arm; native handoff owns live mutation.
+         * @throws std::logic_error For absent/stale/aborted/foreign channel or invalid generation.
+         * This method reads only the frozen channel header. It neither infers
+         * completion nor resets/arms a GPU-owned control block from the host.
+         */
+        [[nodiscard]] MoEOverlayActivationEpochIdentity describeOriginalNativeSubmission(
+            const MoEOverlayInferenceOriginalSlot &original,std::uint64_t epoch_generation) const;
+
+        /**
          * @brief Validate the armed identity and make one endpoint device-active.
          * @return False and terminally aborts that endpoint on any mismatch.
          */
@@ -197,6 +217,19 @@ namespace llaminar2
             std::uint32_t stage_ordinal,
             std::uint64_t payload_bytes,
             std::string *error = nullptr);
+        /**
+         * @brief Publish a joint return only after its real original CPU cohort completed.
+         * @param identity Exact active original invocation.
+         * @param stage_ordinal Original layer operation.
+         * @param payload_bytes Actual root payload bytes; exactly zero for contributors.
+         * @param completed Closed witness minted by the real source-bound collective.
+         * @param error Fatal contract diagnostic on rejection.
+         * @return True only after the existing release publication succeeds.
+         */
+        bool publishJointReturn(const MoEOverlayActivationEpochIdentity &identity,
+            std::uint32_t stage_ordinal,std::uint64_t payload_bytes,
+            const CPUExpertShardRouteCompletion &completed,std::string *error=nullptr);
+
 
         /**
          * @brief Continuation validation and consumption of one return descriptor.
@@ -229,6 +262,18 @@ namespace llaminar2
             const MoEOverlayActivationEpochIdentity &identity,
             MoEOverlayActivationStatusCode code,
             std::string *error = nullptr);
+
+        /**
+         * @brief Cancel the original scheduler invocation without writing device-owned endpoint status.
+         * @param identity Complete original published generation/ticket identity.
+         * @param code Terminal scheduler reason; an earlier scheduler failure is preserved.
+         * @param error Exact missing/foreign/stale identity diagnostic.
+         * @return True for the same absorbing cancelled invocation, false without mutation for a foreign one.
+         * Concurrent original workers may request cancellation; all existing
+         * admission and timeline fields remain the sole progress authority.
+         */
+        bool cancelOriginalInvocation(const MoEOverlayActivationEpochIdentity &identity,
+            MoEOverlayActivationStatusCode code, std::string *error = nullptr);
 
         /**
          * @brief Record that one endpoint observed its peer's terminal abort.
@@ -310,6 +355,25 @@ namespace llaminar2
         }
 
     private:
+        friend class MoECPUExpertShardRouteStage;
+        friend class MoEOverlayNodeLocalRankBatchTransport;
+        /** @brief Canonical terminal traffic validation; no live-control mirror or retirement permission. */
+        static std::optional<MoEOverlayActivationEpochTraffic> completedSnapshotTraffic(
+            const MoEOverlayActivationEpochIdentity& identity,std::uint32_t return_role,
+            const MoEOverlayActivationEndpointStatus& continuation,
+            const MoEOverlayActivationEndpointStatus& follower,std::string* error);
+
+        /** @return Whether the immutable ticket authenticates this exact frozen channel. */
+        [[nodiscard]] bool ticketAuthenticatesChannel(const MoEOverlayInferenceTransactionTicket &ticket) const noexcept;
+        /** @return Original identity construction, shared by host arm and native immutable admission. */
+        [[nodiscard]] MoEOverlayActivationEpochIdentity immutableTicketIdentity(
+            const MoEOverlayInferenceTransactionTicket &ticket,std::uint64_t epoch_generation) const noexcept;
+        /** @brief One original publication body; joint scope requires its actual completed witness. */
+        bool publishReturnImpl(const MoEOverlayActivationEpochIdentity &identity,
+            std::uint32_t stage,std::uint64_t bytes,const CPUExpertShardRouteCompletion *completed,std::string *error);
+
+        /** @brief Authenticate every immutable published field independently of active/failed scheduler state. */
+        bool matchesPublishedIdentity(const MoEOverlayActivationEpochIdentity &identity) const noexcept;
         /** @return Whether identity exactly matches the active authenticated value. */
         [[nodiscard]] bool matchesActiveIdentity(
             const MoEOverlayActivationEpochIdentity &identity) const noexcept;

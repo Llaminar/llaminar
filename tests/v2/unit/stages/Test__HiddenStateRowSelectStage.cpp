@@ -18,8 +18,10 @@
 #include "utils/PreparedWeightTestHarness.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -761,4 +763,113 @@ TEST(Test__HiddenStateRowSelectStage, FixedContiguousGpuRowsHaveNoHostMetadataLi
         /*ctx=*/nullptr,
         reinterpret_cast<void *>(static_cast<uintptr_t>(1))))
         << "Launch preparation must accept an explicit stream without allocating or uploading metadata.";
+}
+
+/** @test Original CPU stage preserves absent rows and copies only live columns under explicit strides. */
+TEST(Test__HiddenStateRowSelectStage, PublicationSentinelStridesAndLegacyClampAreExact)
+{
+    for (int width : {11, 6, 5})
+    {
+        const int source_stride = width + 4;
+        const int destination_stride = width + 7;
+        auto input = makeHiddenStates(4, source_stride);
+        FP32Tensor output({3, static_cast<size_t>(destination_stride)}, DeviceId::cpu());
+        std::fill_n(output.mutable_data(), output.numel(), -777.0f);
+        HiddenStateRowsSelectStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = input.get();
+        params.output = &output;
+        params.seq_len = 4;
+        params.d_model = width;
+        params.selected_row_count = 3;
+        params.selected_row_indices = {-1, 0, 3};
+        params.row_copy_policy = {
+            NegativeRowSelectionPolicy::PreserveDestination, source_stride, destination_stride};
+        HiddenStateRowsSelectStage stage(params);
+        ASSERT_TRUE(stage.execute(nullptr));
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < destination_stride; ++column)
+            {
+                const float expected = row == 0 || column >= width
+                    ? -777.0f : input->data()[(row == 1 ? 0 : 3) * source_stride + column];
+                EXPECT_EQ(std::memcmp(output.data() + row * destination_stride + column, &expected, 4), 0);
+            }
+        }
+        const std::vector<float> preserved(output.data(), output.data() + output.numel());
+        ASSERT_TRUE(stage.setSelectedRowsForReplay({-1, -1, -1}));
+        ASSERT_TRUE(stage.execute(nullptr));
+        EXPECT_EQ(std::memcmp(output.data(), preserved.data(), output.numel() * 4), 0);
+        params.row_copy_policy.negative_rows = NegativeRowSelectionPolicy::ClampToFirst;
+        params.selected_row_indices = {-1, 2, 99};
+        HiddenStateRowsSelectStage legacy(params);
+        ASSERT_TRUE(legacy.execute(nullptr));
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < width; ++column)
+                EXPECT_EQ(output.data()[row * destination_stride + column],
+                    input->data()[(row == 0 ? 0 : row == 1 ? 2 : 3) * source_stride + column]);
+    }
+}
+
+/** @test PreserveDestination retains the exact original producer as an external capture input. */
+TEST(Test__HiddenStateRowSelectStage, PreservedDestinationRetainsOriginalProducerFrontier)
+{
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 4;
+    params.d_model = 11;
+    params.selected_row_count = 1;
+    params.selected_row_indices = {-1};
+    params.input_buffer_id = BufferId::ALL_POSITION_LOGITS;
+    params.output_buffer_id = BufferId::PREFIX_TERMINAL_LOGITS;
+    params.row_copy_policy.negative_rows = NegativeRowSelectionPolicy::PreserveDestination;
+    HiddenStateRowsSelectStage preserve(params);
+    const auto contract = preserve.bufferContract();
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts.front().id, BufferId::PREFIX_TERMINAL_LOGITS);
+    EXPECT_FALSE(contract.inouts.front().prepare_write_storage);
+    EXPECT_TRUE(contract.outputs.empty());
+    GraphArenaDependencyTracker frontier;
+    const auto reads = frontier.observeStage(contract);
+    ASSERT_EQ(reads.size(), 2u);
+    EXPECT_TRUE(std::any_of(reads.begin(), reads.end(), [](const auto &binding) {
+        return binding.id == BufferId::PREFIX_TERMINAL_LOGITS;
+    }));
+    params.row_copy_policy.negative_rows = NegativeRowSelectionPolicy::ClampToFirst;
+    HiddenStateRowsSelectStage legacy(params);
+    EXPECT_TRUE(legacy.bufferContract().inouts.empty());
+    EXPECT_EQ(legacy.bufferContract().outputs.size(), 1u);
+    EXPECT_NE(preserve.graphCaptureVariantSignature(), legacy.graphCaptureVariantSignature());
+}
+
+/** @test One canonical destination owns request zero, independently of later request rows. */
+TEST(Test__HiddenStateRowSelectStage, CanonicalSingleRowPublishesOnlyRequestZero)
+{
+    constexpr int width = 11;
+    constexpr int source_stride = 15;
+    constexpr int destination_stride = 18;
+    auto input = makeHiddenStates(8, source_stride);
+    FP32Tensor output({1, destination_stride}, DeviceId::cpu());
+    std::fill_n(output.mutable_data(), output.numel(), -811.0f);
+    const std::array<int, 3> request_rows{2, 3, 1};
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.output = &output;
+    params.seq_len = 8;
+    params.d_model = width;
+    params.selected_row_count = 1;
+    // CPU owns its row list; only request zero belongs to this scalar output.
+    params.selected_row_indices = {request_rows.front()};
+    params.row_copy_policy = {
+        NegativeRowSelectionPolicy::PreserveDestination, source_stride, destination_stride};
+    HiddenStateRowsSelectStage stage(params);
+    ASSERT_TRUE(stage.execute(nullptr));
+    EXPECT_EQ(std::memcmp(output.data(), input->data() + 2 * source_stride, width * 4), 0);
+    for (int column = width; column < destination_stride; ++column)
+        EXPECT_EQ(output.data()[column], -811.0f);
+    const std::vector<float> prior(output.data(), output.data() + output.numel());
+    ASSERT_TRUE(stage.setSelectedRowsForReplay({-1}));
+    ASSERT_TRUE(stage.execute(nullptr));
+    EXPECT_EQ(std::memcmp(output.data(), prior.data(), output.numel() * 4), 0);
 }

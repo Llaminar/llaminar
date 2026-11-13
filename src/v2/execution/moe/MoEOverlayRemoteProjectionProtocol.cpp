@@ -100,7 +100,7 @@ namespace llaminar2
         /** @brief Validate current GPU execution format against provenance. */
         bool validGpuExecutionFormat(
             const MoEOverlayRemoteProjectionManifest &manifest,
-            const NativeVnniFormatInfo &source) noexcept
+            const NativeQuantisedFormatInfo &source) noexcept
         {
             const std::uint8_t canonical =
                 canonicalDeviceVnniCodebookId(source);
@@ -119,14 +119,14 @@ namespace llaminar2
              * destination GPU then executes normalized signed bytes while the
              * source identity remains the mathematical GGUF provenance.
              */
-            if (cpu::native_vnni::preparedEncodingForSource(source) !=
-                cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+            if (cpu::native_quantised::preparedEncodingForSource(source) !=
+                cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
             {
                 return false;
             }
             const std::uint8_t normalized =
                 source.is_asymmetric
-                    ? kNativeVnniExpandedInt8MinCodebook
+                    ? kNativeQuantisedExpandedInt8MinCodebook
                     : static_cast<std::uint8_t>(19);
             return manifest.gpu_codebook_id == normalized &&
                    manifest.gpu_payload_bytes_per_block == 32u &&
@@ -150,6 +150,10 @@ namespace llaminar2
                 throw std::overflow_error(
                     "Remote ExpertOverlay projection byte total is invalid");
             }
+            if(manifest.source_projection.source_rows==0) {
+                manifest.source_projection={MoEProjectionResidence::ExpertOwner,manifest.N,manifest.K,0,manifest.N,0,manifest.K};
+                manifest.destination_projection=manifest.source_projection;
+            }
             manifest.manifest_hash = manifest.computedHash();
             std::string error;
             if (!manifest.valid(&error))
@@ -160,7 +164,7 @@ namespace llaminar2
         /** @brief Populate fields shared by every physical packing. */
         MoEOverlayRemoteProjectionManifest baseManifest(
             const MoEOverlayRemoteProjectionIdentity &identity,
-            NativeVnniSourceIdentity source_identity,
+            NativeQuantisedSourceIdentity source_identity,
             int N,
             int K,
             std::uint32_t maximum_chunk_bytes)
@@ -171,7 +175,7 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "Remote ExpertOverlay projection has invalid identity, provenance, geometry, or capacity");
             }
-            const auto *source = native_vnni_formats::forSourceIdentity(
+            const auto *source = native_quantised_formats::forSourceIdentity(
                 source_identity.codebook_id,
                 source_identity.is_superblock);
             if (!source)
@@ -181,7 +185,7 @@ namespace llaminar2
             }
 
             MoEOverlayRemoteProjectionManifest manifest;
-            manifest.format_kind = ExpertWeightFormatKind::NativeVnni;
+            manifest.format_kind = ExpertWeightFormatKind::NativeQuantised;
             manifest.identity = identity;
             manifest.N = N;
             manifest.K = K;
@@ -195,11 +199,11 @@ namespace llaminar2
             manifest.cpu_is_superblock =
                 source_identity.is_superblock ? 1u : 0u;
             manifest.cpu_encoding =
-                cpu::native_vnni::preparedEncodingForSource(*source);
+                cpu::native_quantised::preparedEncodingForSource(*source);
             manifest.cpu_data_stride =
-                cpu::native_vnni::preparedDataStride(manifest.cpu_encoding);
+                cpu::native_quantised::preparedDataStride(manifest.cpu_encoding);
             manifest.cpu_block_stride = static_cast<std::uint32_t>(
-                cpu::native_vnni::preparedInterleavedBlockStride(
+                cpu::native_quantised::preparedInterleavedBlockStride(
                     manifest.cpu_encoding,
                     manifest.cpu_is_asymmetric != 0));
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
@@ -323,11 +327,65 @@ namespace llaminar2
         hashScalar(hash, cpu_encoding);
         hashScalar(hash, cpu_data_stride);
         hashScalar(hash, cpu_block_stride);
+        hashScalar(hash, cpu_wire_columns_per_unit);
         for (const auto bytes : region_bytes)
             hashScalar(hash, bytes);
         hashScalar(hash, total_bytes);
         hashScalar(hash, maximum_chunk_bytes);
+        for(const auto& owned:{source_projection,destination_projection}) {
+            hashScalar(hash,static_cast<int32_t>(owned.residence));
+            for(const auto field:{owned.source_rows,owned.source_columns,owned.first_row,owned.rows,owned.first_column,owned.columns})
+                hashScalar(hash,field);
+        }
         return hash == 0 ? 0x9e3779b97f4a7c15ull : hash;
+    }
+
+    MoEOverlayRemoteProjectionManifest MoEOverlayRemoteProjectionManifest::forFloatingIntersection(
+        const ExpertTierWeightProjectionIntersection& intersection) const
+    {
+        if(!valid() || !carriesFloatingBytes() || intersection.empty() ||
+           intersection.source().rows!=source_projection.rows || intersection.source().columns!=source_projection.columns)
+            throw std::invalid_argument("Floating remote intersection differs from its original source allocation");
+        auto result=*this;result.source_projection=intersection.source();result.destination_projection=intersection.destination();
+        result.N=intersection.rows();result.K=intersection.columns();
+        // Floating wire geometry is compact. The original endpoint projections
+        // retain their independent allocation strides; no padded rows travel.
+        result.N_padded=result.N;
+        const ExpertWeightFormat format{.kind=format_kind};
+        result.region_bytes[0]=uint64_t(result.N)*result.K*format.floatingElementBytes();
+        return seal(result);
+    }
+
+    MoEOverlayRemoteProjectionManifest MoEOverlayRemoteProjectionManifest::forCPUIntersection(
+        const ExpertTierWeightProjectionIntersection& intersection) const
+    {
+        if(!valid() || !carriesCpuBytes() || !identity.source_device.is_cpu() || !identity.destination_device.is_cpu() ||
+           intersection.empty() || intersection.source().rows!=source_projection.rows ||
+           intersection.source().columns!=source_projection.columns || intersection.firstColumn()%32 || intersection.columns()%32 ||
+           intersection.sourceColumnOrigin()%32 || intersection.destinationColumnOrigin()%32)
+            throw std::invalid_argument("Native CPU remote intersection differs from its original source or native K groups");
+        auto result=*this; result.source_projection=intersection.source();result.destination_projection=intersection.destination();
+        result.N=intersection.rows();result.K=intersection.columns();result.N_padded=(result.N+63)/64*64;
+        result.blocks_per_row=result.K/32;
+        result.region_bytes[0]=uint64_t(result.N)*result.blocks_per_row*(result.cpu_block_stride/64);
+        return seal(result);
+    }
+
+    bool MoEOverlayRemoteProjectionManifest::matchesGpuDestinationProjection(
+        const ExpertTierWeightProjectionIntersection &original,
+        ExpertWeightFormat destination_format,
+        int destination_rows, int destination_columns) const noexcept
+    {
+        if (!valid() || !identity.destination_device.is_gpu() || !destination_format.valid() ||
+            source_projection != original.source() || destination_projection != original.destination() ||
+            destination_projection.rows != destination_rows ||
+            destination_projection.columns != destination_columns)
+            return false;
+        if (destination_format.isFloating())
+            return carriesFloatingBytes() && format_kind == destination_format.kind;
+        return (carriesGpuBytes() || carriesCpuBytes()) &&
+            source_codebook_id == destination_format.native_quantised.codebook_id &&
+            (source_is_superblock != 0) == destination_format.native_quantised.is_superblock;
     }
 
     bool MoEOverlayRemoteProjectionManifest::valid(
@@ -346,6 +404,13 @@ namespace llaminar2
             return reject(
                 error,
                 "Remote ExpertOverlay projection geometry or chunk capacity is invalid");
+        }
+        try {
+            const auto overlap=ExpertTierWeightProjectionIntersection::between(source_projection,destination_projection);
+            if(overlap.empty() || overlap.rows()!=N || overlap.columns()!=K)
+                return reject(error,"Remote projection original ownership intersection disagrees with payload geometry");
+        } catch(const std::invalid_argument&) {
+            return reject(error,"Remote projection original ownership rectangles are invalid");
         }
         std::uint64_t summed = 0;
         if (!sumRegions(region_bytes, summed) || summed == 0 ||
@@ -373,7 +438,7 @@ namespace llaminar2
                 gpu_payload_bytes_per_block != 0 ||
                 cpu_is_asymmetric != 0 || cpu_is_superblock != 0 ||
                 gpu_is_asymmetric != 0 || gpu_has_emins != 0 ||
-                cpu_data_stride != 0 || cpu_block_stride != 0 ||
+                cpu_data_stride != 0 || cpu_block_stride != 0 || cpu_wire_columns_per_unit != 0 ||
                 !byte_count_valid ||
                 region_bytes != std::array<std::uint64_t, 4>{
                     n * k * element_bytes, 0u, 0u, 0u})
@@ -385,27 +450,27 @@ namespace llaminar2
         }
         else
         {
-            if (format_kind != ExpertWeightFormatKind::NativeVnni ||
+            if (format_kind != ExpertWeightFormatKind::NativeQuantised ||
                 (K % 32) != 0 ||
                 N_padded != ((N + 63) / 64) * 64 ||
                 blocks_per_row != K / 32)
             {
                 return reject(
                     error,
-                    "Remote ExpertOverlay NativeVNNI projection geometry or format kind is invalid");
+                    "Remote ExpertOverlay NativeQuantised projection geometry or format kind is invalid");
             }
-            const auto *source = native_vnni_formats::forSourceIdentity(
+            const auto *source = native_quantised_formats::forSourceIdentity(
                 source_codebook_id, source_is_superblock != 0);
             if (!source || cpu_codebook_id != source_codebook_id ||
                 cpu_is_asymmetric !=
                     static_cast<std::uint8_t>(source->is_asymmetric) ||
                 cpu_is_superblock != source_is_superblock ||
                 cpu_encoding !=
-                    cpu::native_vnni::preparedEncodingForSource(*source) ||
+                    cpu::native_quantised::preparedEncodingForSource(*source) ||
                 cpu_data_stride !=
-                    cpu::native_vnni::preparedDataStride(cpu_encoding) ||
+                    cpu::native_quantised::preparedDataStride(cpu_encoding) ||
                 cpu_block_stride !=
-                    cpu::native_vnni::preparedInterleavedBlockStride(
+                    cpu::native_quantised::preparedInterleavedBlockStride(
                         cpu_encoding, cpu_is_asymmetric != 0))
             {
                 return reject(
@@ -422,19 +487,21 @@ namespace llaminar2
                     error,
                     "CPU-format remote projection does not cross a CPU endpoint");
             }
-            const std::uint64_t expected_units =
-                static_cast<std::uint64_t>(N_padded / 64) *
-                static_cast<std::uint64_t>(blocks_per_row);
-            const std::uint64_t expected_bytes =
-                expected_units * cpu_block_stride;
-            if (region_bytes[0] != expected_bytes ||
-                region_bytes[1] != 0 || region_bytes[2] != 0 ||
-                region_bytes[3] != 0)
-            {
-                return reject(
-                    error,
-                    "CPU-format remote projection does not contain exact final units");
-            }
+            const auto overlap=ExpertTierWeightProjectionIntersection::between(source_projection,destination_projection);
+            if(source_projection.rows>std::numeric_limits<int32_t>::max()-63 ||
+               destination_projection.rows>std::numeric_limits<int32_t>::max()-63 ||
+               source_projection.columns%32 || destination_projection.columns%32 ||
+               overlap.sourceColumnOrigin()%32 || overlap.destinationColumnOrigin()%32)
+                return reject(error,"Native CPU root projections must retain original32-element K groups");
+            if(cpu_wire_columns_per_unit==0 || cpu_wire_columns_per_unit>64 ||
+               ((uint64_t(N)+cpu_wire_columns_per_unit-1)/cpu_wire_columns_per_unit)*blocks_per_row>UINT32_MAX)
+                return reject(error,"Native CPU compact wire unit population exceeds its bounded ABI");
+            // The checked32-bit unit population and canonical per-column stride
+            // make this product representable before any endpoint is admitted.
+            const std::uint64_t expected_bytes = static_cast<uint64_t>(N)*blocks_per_row*(cpu_block_stride/64);
+            if (region_bytes[0] != expected_bytes || region_bytes[1] || region_bytes[2] || region_bytes[3] ||
+                maximum_chunk_bytes < (cpu_block_stride/64)*std::min<uint32_t>(cpu_wire_columns_per_unit,N))
+                return reject(error,"CPU-format remote projection requires exact live native planes and bounded column groups");
             if (identity.source_device.is_gpu() ||
                 identity.destination_device.is_gpu())
             {
@@ -446,18 +513,18 @@ namespace llaminar2
                 }
                 /*
                  * Device repack kernels consume indivisible 64-column by
-                 * 32-K NativeVNNI units.  Reject a malformed wire capacity at
+                 * 32-K NativeQuantised units.  Reject a malformed wire capacity at
                  * manifest authentication rather than accepting it and
                  * discovering the partial-unit boundary after MPI has begun
                  * mutating destination state.
                  */
-                if (cpu_block_stride == 0 ||
+                if (cpu_wire_columns_per_unit != 64 || cpu_block_stride == 0 ||
                     maximum_chunk_bytes < cpu_block_stride ||
                     (maximum_chunk_bytes % cpu_block_stride) != 0)
                 {
                     return reject(
                         error,
-                        "CPU/GPU remote projection chunks must contain complete NativeVNNI units");
+                        "CPU/GPU remote projection chunks must contain complete NativeQuantised units");
                 }
             }
             else if (gpu_codebook_id != 0 ||
@@ -471,7 +538,7 @@ namespace llaminar2
             }
             else if (carriesGpuBytes())
             {
-            if (!identity.source_device.is_gpu() ||
+            if (cpu_wire_columns_per_unit != 0 || !identity.source_device.is_gpu() ||
                 !identity.destination_device.is_gpu() ||
                 !validGpuExecutionFormat(*this, *source))
             {
@@ -514,13 +581,37 @@ namespace llaminar2
         return true;
     }
 
+    namespace {
+        /** @brief Validate actual final CPU root metadata against its own canonical physical geometry. */
+        void requireCanonicalCpuRoot(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &root,
+            const MoEOverlayRemoteProjectionManifest &format)
+        {
+            if (root.N_padded != format.N_padded || root.blocks_per_row != format.blocks_per_row ||
+                root.encoding != format.cpu_encoding || root.data_stride != static_cast<int>(format.cpu_data_stride) ||
+                root.interleaved_block_stride != format.cpu_block_stride || root.native_interleaved.size() !=
+                    uint64_t(format.N_padded / 64) * format.blocks_per_row * format.cpu_block_stride)
+                throw std::invalid_argument("Remote CPU root does not match its genuine canonical final storage");
+        }
+        /** @brief Seal CPU-only wire geometry without claiming any source payload owner. */
+        MoEOverlayRemoteProjectionManifest sealCpuWire(MoEOverlayRemoteProjectionManifest manifest,
+            uint32_t maximum_chunk_bytes)
+        {
+            manifest.packing = MoEOverlayRemoteProjectionPacking::CpuNativeQuantisedInterleaved;
+            if (maximum_chunk_bytes < manifest.cpu_block_stride / 64)
+                throw std::invalid_argument("Native CPU capacity cannot contain one exact encoded column");
+            manifest.cpu_wire_columns_per_unit = std::min<uint32_t>(64, maximum_chunk_bytes / (manifest.cpu_block_stride / 64));
+            manifest.region_bytes[0] = uint64_t(manifest.N) * manifest.blocks_per_row * (manifest.cpu_block_stride / 64);
+            return seal(std::move(manifest));
+        }
+    }
+
     MoEOverlayRemoteProjectionManifest
     makeMoEOverlayRemoteCpuProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
         std::uint32_t maximum_chunk_bytes)
     {
-        const NativeVnniSourceIdentity source_identity{
+        const NativeQuantisedSourceIdentity source_identity{
             .codebook_id = source.codebook_id,
             .is_superblock = source.is_superblock,
             .present = true,
@@ -531,22 +622,27 @@ namespace llaminar2
             source.N,
             source.K,
             maximum_chunk_bytes);
-        if (!identity.source_device.is_cpu() ||
-            !identity.destination_device.is_cpu() || source.N_padded !=
-                manifest.N_padded || source.blocks_per_row !=
-                manifest.blocks_per_row || source.encoding !=
-                manifest.cpu_encoding || source.data_stride !=
-                static_cast<int>(manifest.cpu_data_stride) ||
-            source.interleaved_block_stride !=
-                manifest.cpu_block_stride || source.native_interleaved.empty())
-        {
-            throw std::invalid_argument(
-                "Remote CPU-to-CPU projection source does not match canonical final storage");
-        }
-        manifest.packing = MoEOverlayRemoteProjectionPacking::
-            CpuNativeVnniInterleaved;
-        manifest.region_bytes[0] = source.native_interleaved.size();
-        return seal(std::move(manifest));
+        if (!identity.source_device.is_cpu() || !identity.destination_device.is_cpu())
+            throw std::invalid_argument("Native CPU wire requires its actual original CPU endpoints");
+        requireCanonicalCpuRoot(source, manifest);
+        return sealCpuWire(std::move(manifest), maximum_chunk_bytes);
+    }
+
+    MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteCpuDestinationProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, uint32_t capacity)
+    {
+        if (!identity.source_device.is_cpu() || !identity.destination_device.is_cpu() || intersection.empty() ||
+            destination.N != intersection.destination().rows || destination.K != intersection.destination().columns)
+            throw std::invalid_argument("Native receiver expectation changed its genuine original destination");
+        const NativeQuantisedSourceIdentity provenance{.codebook_id = destination.codebook_id,
+            .is_superblock = destination.is_superblock, .present = true};
+        const auto actual = baseManifest(identity, provenance, destination.N, destination.K, capacity);
+        requireCanonicalCpuRoot(destination, actual);
+        auto expected = baseManifest(identity, provenance, intersection.source().rows,
+            intersection.source().columns, capacity);
+        return sealCpuWire(std::move(expected), capacity).forCPUIntersection(intersection);
     }
 
     MoEOverlayRemoteProjectionManifest
@@ -558,7 +654,7 @@ namespace llaminar2
         std::string stream_error;
         if (!stream.valid(&stream_error))
             throw std::invalid_argument(stream_error);
-        const NativeVnniSourceIdentity source_identity{
+        const NativeQuantisedSourceIdentity source_identity{
             .codebook_id = stream.gpu_source_codebook_id,
             .is_superblock = stream.gpu_source_is_superblock != 0,
             .present = true,
@@ -588,7 +684,7 @@ namespace llaminar2
             identity.destination_device.is_gpu();
         const bool stream_is_gpu_to_cpu =
             stream.source_packing ==
-            ExpertTierWeightPacking::GpuSeparatedNativeVnni;
+            ExpertTierWeightPacking::GpuSeparatedNativeQuantised;
         if ((!identity_is_gpu_to_cpu && !identity_is_cpu_to_gpu) ||
             identity_is_gpu_to_cpu != stream_is_gpu_to_cpu ||
             stream.residency_epoch !=
@@ -603,7 +699,7 @@ namespace llaminar2
         }
 
         manifest.packing = MoEOverlayRemoteProjectionPacking::
-            CpuNativeVnniInterleaved;
+            CpuNativeQuantisedInterleaved;
         manifest.N_padded = stream.N_padded;
         manifest.blocks_per_row = stream.blocks_per_row;
         manifest.cpu_codebook_id = stream.cpu_codebook_id;
@@ -617,6 +713,9 @@ namespace llaminar2
         manifest.cpu_encoding = stream.cpu_encoding;
         manifest.cpu_data_stride = stream.cpu_data_stride;
         manifest.cpu_block_stride = stream.cpu_block_stride;
+        manifest.cpu_wire_columns_per_unit = 64;
+        manifest.source_projection=stream.source_projection;
+        manifest.destination_projection=stream.destination_projection;
         manifest.region_bytes[0] = stream.total_stream_bytes;
         return seal(std::move(manifest));
     }
@@ -625,7 +724,7 @@ namespace llaminar2
     makeMoEOverlayRemoteGpuProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
         const GpuExpertPackedDescriptor &source,
-        NativeVnniSourceIdentity source_identity,
+        NativeQuantisedSourceIdentity source_identity,
         std::uint32_t maximum_chunk_bytes)
     {
         if (!source.valid() || !identity.source_device.is_gpu() ||
@@ -641,7 +740,7 @@ namespace llaminar2
             source.k,
             maximum_chunk_bytes);
         manifest.packing = MoEOverlayRemoteProjectionPacking::
-            GpuSeparatedNativeVnni;
+            GpuSeparatedNativeQuantised;
         manifest.gpu_codebook_id = source.codebook_id;
         manifest.gpu_payload_bytes_per_block =
             source.payload_bytes_per_block;
@@ -656,35 +755,61 @@ namespace llaminar2
         return seal(std::move(manifest));
     }
 
-    MoEOverlayRemoteProjectionManifest
-    makeMoEOverlayRemoteFloatingProjectionManifest(
-        const MoEOverlayRemoteProjectionIdentity &identity,
-        const ContiguousFloatingPointWeightDescriptor &source,
-        std::uint32_t maximum_chunk_bytes)
-    {
-        const auto format = ExpertWeightFormat::floating(source.type);
-        if (!source.valid() || !format.valid() ||
-            !identity.valid() ||
-            maximum_chunk_bytes == 0u)
+    namespace {
+        /** @brief Shared floating metadata builder; only the caller can authenticate actual storage. */
+        MoEOverlayRemoteProjectionManifest floatingProjectionGeometry(
+            const MoEOverlayRemoteProjectionIdentity &identity, TensorType type,
+            int rows, int columns, uint32_t capacity)
         {
-            throw std::invalid_argument(
-                "Remote floating projection requires valid endpoints, storage, precision, and capacity");
+            const auto format = ExpertWeightFormat::floating(type);
+            if (!identity.valid() || !format.valid() || rows <= 0 || columns <= 0 || capacity == 0)
+                throw std::invalid_argument("Floating wire geometry requires original endpoints, precision and bounds");
+            MoEOverlayRemoteProjectionManifest manifest;
+            manifest.packing = MoEOverlayRemoteProjectionPacking::ContiguousFloating;
+            manifest.format_kind = format.kind;
+            manifest.identity = identity;
+            manifest.N = rows; manifest.K = columns; manifest.N_padded = rows;
+            manifest.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT;
+            manifest.region_bytes[0] = uint64_t(rows) * columns * format.floatingElementBytes();
+            manifest.maximum_chunk_bytes = capacity;
+            return seal(std::move(manifest));
         }
+    }
+    MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteFloatingProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &source, uint32_t capacity)
+    {
+        if (!source.valid()) throw std::invalid_argument("Floating remote source requires its genuine retained storage");
+        return floatingProjectionGeometry(identity, source.type, source.n, source.k, capacity);
+    }
+    MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteFloatingDestinationProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, uint32_t capacity)
+    {
+        if (!destination.valid() || intersection.empty() || destination.n != intersection.destination().rows ||
+            destination.k != intersection.destination().columns)
+            throw std::invalid_argument("Floating receiver expectation changed its actual original destination");
+        return floatingProjectionGeometry(identity, destination.type, intersection.source().rows,
+            intersection.source().columns, capacity).forFloatingIntersection(intersection);
+    }
 
-        MoEOverlayRemoteProjectionManifest manifest;
-        manifest.packing = MoEOverlayRemoteProjectionPacking::
-            ContiguousFloating;
-        manifest.format_kind = format.kind;
-        manifest.identity = identity;
-        manifest.N = source.n;
-        manifest.K = source.k;
-        manifest.N_padded = source.n;
-        manifest.blocks_per_row = 0;
-        manifest.cpu_encoding =
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT;
-        manifest.region_bytes[0] = source.bytes;
-        manifest.maximum_chunk_bytes = maximum_chunk_bytes;
-        return seal(std::move(manifest));
+    ExpertTierWeightCPUStorageLayout remoteCpuProjectionStorageLayout(
+        const MoEOverlayRemoteProjectionManifest& manifest,MoEOverlayRemoteCPUStorageEndpoint endpoint)
+    {
+        const bool source=endpoint==MoEOverlayRemoteCPUStorageEndpoint::Source;
+        if((!source && endpoint!=MoEOverlayRemoteCPUStorageEndpoint::Destination) || !manifest.valid() || !manifest.carriesCpuBytes() ||
+           !(source?manifest.identity.source_device:manifest.identity.destination_device).is_cpu())
+            throw std::invalid_argument("Native CPU storage layout requires an authenticated actual CPU endpoint");
+        const auto& owned=source?manifest.source_projection:manifest.destination_projection;
+        ExpertTierWeightCPUStorageLayout format{
+            .cpu_codebook_id = manifest.cpu_codebook_id, .cpu_is_asymmetric = manifest.cpu_is_asymmetric,
+            .cpu_is_superblock = manifest.cpu_is_superblock, .cpu_encoding = manifest.cpu_encoding,
+            .cpu_data_stride = manifest.cpu_data_stride, .cpu_block_stride = manifest.cpu_block_stride,
+            .wire_columns_per_unit = manifest.cpu_wire_columns_per_unit};
+        return cpuExpertTierStorageLayoutForIntersection(format, owned,
+            ExpertTierWeightProjectionIntersection::between(manifest.source_projection, manifest.destination_projection),
+            manifest.maximum_chunk_bytes);
     }
 
     ExpertTierWeightDeviceLayout remoteCpuProjectionDeviceLayout(
@@ -711,7 +836,7 @@ namespace llaminar2
             (manifest.maximum_chunk_bytes % manifest.cpu_block_stride) != 0)
         {
             throw std::invalid_argument(
-                "Remote CPU/GPU projection chunks must contain complete NativeVNNI units");
+                "Remote CPU/GPU projection chunks must contain complete NativeQuantised units");
         }
 
         const std::uint64_t units =
@@ -735,6 +860,14 @@ namespace llaminar2
             .K = manifest.K,
             .N_padded = manifest.N_padded,
             .blocks_per_row = manifest.blocks_per_row,
+            .cpu_N = (gpu_to_cpu?manifest.destination_projection:manifest.source_projection).rows,
+            .cpu_K = (gpu_to_cpu?manifest.destination_projection:manifest.source_projection).columns,
+            .cpu_first_row = std::max(manifest.source_projection.first_row,manifest.destination_projection.first_row)-(gpu_to_cpu?manifest.destination_projection:manifest.source_projection).first_row,
+            .cpu_first_column = std::max(manifest.source_projection.first_column,manifest.destination_projection.first_column)-(gpu_to_cpu?manifest.destination_projection:manifest.source_projection).first_column,
+            .gpu_N = (gpu_to_cpu?manifest.source_projection:manifest.destination_projection).rows,
+            .gpu_K = (gpu_to_cpu?manifest.source_projection:manifest.destination_projection).columns,
+            .gpu_first_row = std::max(manifest.source_projection.first_row,manifest.destination_projection.first_row)-(gpu_to_cpu?manifest.source_projection:manifest.destination_projection).first_row,
+            .gpu_first_column = std::max(manifest.source_projection.first_column,manifest.destination_projection.first_column)-(gpu_to_cpu?manifest.source_projection:manifest.destination_projection).first_column,
             .cpu_codebook_id = manifest.cpu_codebook_id,
             .gpu_source_codebook_id = manifest.source_codebook_id,
             .gpu_source_is_superblock = manifest.source_is_superblock,
@@ -822,12 +955,18 @@ namespace llaminar2
             writeLittleEndian(destination, offset, byte);
         writeLittleEndian(destination, offset, manifest.cpu_data_stride);
         writeLittleEndian(destination, offset, manifest.cpu_block_stride);
+        writeLittleEndian(destination, offset, manifest.cpu_wire_columns_per_unit);
         for (const auto bytes : manifest.region_bytes)
             writeLittleEndian(destination, offset, bytes);
         writeLittleEndian(destination, offset, manifest.total_bytes);
         writeLittleEndian(destination, offset, manifest.maximum_chunk_bytes);
         writeLittleEndian(destination, offset, manifest.reserved_size);
         writeLittleEndian(destination, offset, manifest.manifest_hash);
+        for(const auto& owned:{manifest.source_projection,manifest.destination_projection}) {
+            writeLittleEndian<int32_t>(destination,offset,static_cast<int32_t>(owned.residence));
+            for(const auto field:{owned.source_rows,owned.source_columns,owned.first_row,owned.rows,owned.first_column,owned.columns})
+                writeLittleEndian<int32_t>(destination,offset,field);
+        }
         if (offset != destination.size())
             return reject(error, "Remote ExpertOverlay manifest encoder size drift");
         if (error)
@@ -910,13 +1049,14 @@ namespace llaminar2
             readLittleEndian<std::uint8_t>(packet, offset);
         manifest->cpu_encoding =
             readLittleEndian<
-                cpu::native_vnni::CPUNativeVNNIEncoding>(packet, offset);
+                cpu::native_quantised::CPUNativeQuantisedEncoding>(packet, offset);
         for (auto &byte : manifest->reserved_format)
             byte = readLittleEndian<std::uint8_t>(packet, offset);
         manifest->cpu_data_stride =
             readLittleEndian<std::uint32_t>(packet, offset);
         manifest->cpu_block_stride =
             readLittleEndian<std::uint32_t>(packet, offset);
+        manifest->cpu_wire_columns_per_unit = readLittleEndian<std::uint32_t>(packet,offset);
         for (auto &bytes : manifest->region_bytes)
             bytes = readLittleEndian<std::uint64_t>(packet, offset);
         manifest->total_bytes =
@@ -927,6 +1067,11 @@ namespace llaminar2
             readLittleEndian<std::uint32_t>(packet, offset);
         manifest->manifest_hash =
             readLittleEndian<std::uint64_t>(packet, offset);
+        for(auto* owned:{&manifest->source_projection,&manifest->destination_projection}) {
+            owned->residence=static_cast<MoEProjectionResidence>(readLittleEndian<int32_t>(packet,offset));
+            for(auto* field:{&owned->source_rows,&owned->source_columns,&owned->first_row,&owned->rows,&owned->first_column,&owned->columns})
+                *field=readLittleEndian<int32_t>(packet,offset);
+        }
         if (offset != packet.size() || !manifest->valid(error))
         {
             if (offset != packet.size())
@@ -1040,7 +1185,11 @@ namespace llaminar2
             throw std::invalid_argument(error);
         for (std::size_t region = 0; region < regions_.size(); ++region)
         {
-            if (regions_[region].size() != manifest_.region_bytes[region])
+            const ExpertWeightFormat format{.kind=manifest_.format_kind};
+            const size_t expected=region==0 && manifest_.carriesFloatingBytes()
+                ? size_t(manifest_.source_projection.rows)*manifest_.source_projection.columns*format.floatingElementBytes()
+                : requiresCPUStaging() && region==0 ? remoteCpuProjectionStorageLayout(manifest_,MoEOverlayRemoteCPUStorageEndpoint::Source).cpuStorageBytes():manifest_.region_bytes[region];
+            if (regions_[region].size() != expected)
             {
                 throw std::invalid_argument(
                     "Remote ExpertOverlay chunk cursor regions disagree with manifest");
@@ -1060,18 +1209,36 @@ namespace llaminar2
     }
 
     std::optional<MoEOverlayRemoteProjectionChunkView>
-    MoEOverlayRemoteProjectionChunkCursor::takeNext() noexcept
+    MoEOverlayRemoteProjectionChunkCursor::takeNext(std::span<uint8_t> staging) noexcept
     {
         seekNextRegion();
         if (region_ == regions_.size())
             return std::nullopt;
         const std::uint64_t remaining =
             manifest_.region_bytes[region_] - region_offset_;
-        const std::uint64_t bytes = std::min<std::uint64_t>(
-            remaining, manifest_.maximum_chunk_bytes);
-        const auto payload = regions_[region_].subspan(
-            static_cast<std::size_t>(region_offset_),
-            static_cast<std::size_t>(bytes));
+        std::uint64_t bytes=std::min<std::uint64_t>(remaining,manifest_.maximum_chunk_bytes);
+        std::span<const uint8_t> payload;
+        if(requiresCPUStaging()) {
+            // The native root remains immutable. Reuse exactly the transport's
+            // already-admitted send lane until its original MPI ACK retires it.
+            const auto layout=remoteCpuProjectionStorageLayout(manifest_,MoEOverlayRemoteCPUStorageEndpoint::Source);
+            const auto first=expertTierWireUnitAt(layout,region_offset_);
+            const auto count=std::min(layout.maximum_units_per_chunk,layout.unit_count-first);
+            bytes=layout.chunkBytes(count,first);
+            if(staging.size()<bytes || !gatherExpertTierCPUWeightChunk(layout,regions_[0],first,count,staging.first(bytes)))
+                return std::nullopt;
+            payload=staging.first(bytes);
+        } else if(manifest_.carriesFloatingBytes()) {
+            const ExpertWeightFormat format{.kind=manifest_.format_kind};
+            const size_t element=format.floatingElementBytes(),row_bytes=size_t(manifest_.K)*element;
+            const auto& owned=manifest_.source_projection;
+            if(owned.columns!=manifest_.K || manifest_.destination_projection.columns!=manifest_.K)
+                bytes=std::min(bytes,row_bytes-region_offset_%row_bytes);
+            const auto first_row=std::max(owned.first_row,manifest_.destination_projection.first_row)-owned.first_row;
+            const auto first_col=std::max(owned.first_column,manifest_.destination_projection.first_column)-owned.first_column;
+            const size_t offset=(size_t(first_row)+region_offset_/row_bytes)*owned.columns*element+size_t(first_col)*element+region_offset_%row_bytes;
+            payload=regions_[0].subspan(offset,bytes);
+        } else payload=regions_[region_].subspan(static_cast<size_t>(region_offset_),static_cast<size_t>(bytes));
         const bool final = emitted_bytes_ + bytes == manifest_.total_bytes;
         MoEOverlayRemoteProjectionChunkView result{
             .header = {

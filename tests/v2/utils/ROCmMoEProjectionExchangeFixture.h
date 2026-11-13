@@ -16,9 +16,14 @@
 #include "backends/IWorkerGPUContext.h"
 #include "collective/LocalTPContext.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
+#include "../fixtures/moe/NodeLocalRouteExchangeReplayAccess.h"
 #include "kernels/common/MoEGroupedIntermediateExchangeKernels.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "ROCmMoEProjectionBoundaryFixture.h"
+#include "ObservedNativeReplayOwner.h"
+#include "../fixtures/backends/OriginalRankLocalNativeCohort.h"
+#include "utils/MPIContext.h"
+#include "utils/NUMATopology.h"
 
 #include <array>
 #include <barrier>
@@ -104,12 +109,30 @@ namespace llaminar2::test::projection_exchange
             down_publication, gate_up_format, down_format] = shape;
         require(rows > 0 && width > 0 && width % 64 == 0 && intermediate > 0 && intermediate % 256 == 0 &&
             top_k > 0 && experts >= top_k && warmups >= 0 && samples > 0, "invalid projection exchange geometry");
-        auto tp = createLocalTPContext({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}, {},
+        const auto mpi = MPIContextFactory::global();
+        require(mpi && mpi->clusterInventory(), "projection exchange requires original MPI inventory");
+        const std::array families{NativeReplayFamily{DeviceType::ROCm, 2}};
+        const auto owner = selectObservedNativeReplayOwner(*mpi->clusterInventory(), families);
+        require(owner && owner->discovery_owner == mpi->rank(),
+            "projection exchange must run on its original complete NUMA-local owner");
+        const auto &devices = owner->devices;
+        const auto binding = NUMATopology::detectLocalNUMANode();
+        require(binding.detection_succeeded, "projection exchange requires original CPU binding");
+        (void)requireOriginalRankLocalNativeCohort(*mpi->clusterInventory(), mpi->rank(),
+            mpi->world_size(), binding.local_numa_node, devices);
+        // Logical shard indices remain 0/1; only original physical coordinates
+        // select native workers, kernels, route storage and communicator members.
+        auto tp = createLocalTPContext({GlobalDeviceAddress::rocm(devices[0].ordinal),
+            GlobalDeviceAddress::rocm(devices[1].ordinal)}, {},
             CollectiveBackendType::RCCL);
         require(tp != nullptr, "projection exchange RCCL setup failed");
-        MoEOverlayNodeLocalRouteExchange exchange({.devices = {DeviceId::rocm(0), DeviceId::rocm(1)},
-            .root_device = DeviceId::rocm(0), .identity = "projection_exchange_economy_control"});
-        exchange.materialize({{0, DeviceId::rocm(0)}, {1, DeviceId::rocm(1)}}, 0, rows, top_k, width);
+        // This isolated kernel control owns raw route storage, not an admitted
+        // model source. Keep that test-only boundary explicit and lifetime scoped.
+        auto exchange_owner = NodeLocalRouteExchangeReplayAccess::createUnique(
+            MoEOverlayNodeLocalRouteExchange::Config{.devices = devices,
+                .root_device = devices[0], .identity = "projection_exchange_economy_control"});
+        auto &exchange = *exchange_owner;
+        exchange.materialize({{0, devices[0]}, {1, devices[1]}}, 0, rows, top_k, width);
         std::barrier rendezvous(2);
         std::array<std::exception_ptr, 2> failures{};
         std::array<std::vector<double>, 2> times{std::vector<double>(samples), std::vector<double>(samples)};
@@ -120,13 +143,13 @@ namespace llaminar2::test::projection_exchange
             {
                 try
                 {
-                    auto &worker = GPUDeviceContextPool::instance().getContext(DeviceId::rocm(participant));
+                    auto &worker = GPUDeviceContextPool::instance().getContext(devices[participant]);
                     worker.submitAndWait([&]
                     {
                         const ProjectionFixtureFormats formats{
                             quantizedMoEVerifierFormat(gate_up_format),
                             quantizedMoEVerifierFormat(down_format)};
-                        const ProjectionFixturePlacement placement{DeviceId::rocm(participant), experts, top_k};
+                        const ProjectionFixturePlacement placement{devices[participant], experts, top_k};
                         const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
                             {experts, width, intermediate}, participant, 2);
                         const auto down_projection = ownership.projection(WeightRole::MoEExpertDown);
@@ -151,7 +174,7 @@ namespace llaminar2::test::projection_exchange
                             MoENodeLocalRoutePublishLaunch control_publish;
                             if (participant == 0)
                             {
-                                auto *peers = producer.upload(exchange.rootPeerBindings(DeviceId::rocm(0)));
+                                auto *peers = producer.upload(exchange.rootPeerBindings(devices[0]));
                                 control_consume = {.peers = peers, .peer_count = 1,
                                     .root_canonical_route_contributions = routes,
                                     .domain_assignment = {.participant_ids = producer.routeOwners(), .capacity = static_cast<std::uint32_t>(rows * top_k)},
@@ -160,7 +183,7 @@ namespace llaminar2::test::projection_exchange
                                     .physical_rows = static_cast<std::uint32_t>(rows), .top_k = static_cast<std::uint32_t>(top_k), .d_model = static_cast<std::uint32_t>(width)};
                             }
                             else
-                                control_publish = {.lane = exchange.producerBinding(DeviceId::rocm(1)),
+                                control_publish = {.lane = exchange.producerBinding(devices[1]),
                                     .canonical_route_contributions = routes,
                                     .domain_assignment = {.participant_ids = producer.routeOwners(), .capacity = static_cast<std::uint32_t>(rows * top_k)},
                                     .live_route_slots = static_cast<std::uint32_t>(rows * top_k)};
@@ -217,7 +240,7 @@ namespace llaminar2::test::projection_exchange
                             require(transaction->endCapture() && transaction->instantiate(), "projection exchange instantiate");
                             // The control uses the existing production route fabric
                             // and the identical weights/inputs, not summed estimates.
-                            ROCmMoEKernel kernel(participant);
+                            ROCmMoEKernel kernel(devices[participant].ordinal);
                             control = worker.createGraphCapture(producer.stream);
                             rendezvous.arrive_and_wait();
                             require(control && control->beginCapture(), "projection control begin capture");

@@ -149,7 +149,7 @@ namespace llaminar2
             // Walk the sysfs topology upstream from the GPU endpoint,
             // collecting link speed/width at each bridge hop.
             // Returns the segments ordered from endpoint to root.
-            std::vector<LinkSegment> walk_upstream_links(const std::string &device_sysfs_path)
+            std::vector<LinkSegment> walk_upstream_links(const std::string &device_sysfs_path, std::vector<std::string> &upstream_bdfs)
             {
                 std::vector<LinkSegment> segments;
                 std::string current = device_sysfs_path;
@@ -173,6 +173,10 @@ namespace llaminar2
                         current = parent;
                         continue;
                     }
+
+                    // Preserve physical ancestry from this same discovery walk,
+                    // even when a bridge does not publish usable link speeds.
+                    upstream_bdfs.push_back(extract_bdf_from_path(parent));
 
                     // Read link info for this bridge
                     std::string speed_path = parent + "/current_link_speed";
@@ -230,7 +234,7 @@ namespace llaminar2
             std::string sysfs_path = resolve_sysfs_path(bdf);
             if (!sysfs_path.empty())
             {
-                auto segments = walk_upstream_links(sysfs_path);
+                auto segments = walk_upstream_links(sysfs_path, info.upstream_bdfs);
                 double endpoint_bw = effective_bandwidth(info.link_speed_gts, info.link_width);
 
                 for (const auto &seg : segments)

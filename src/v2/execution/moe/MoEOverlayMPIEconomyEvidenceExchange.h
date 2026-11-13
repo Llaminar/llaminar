@@ -41,6 +41,11 @@ namespace llaminar2
         std::uint64_t rejected_packets = 0;
         std::uint64_t concurrent_start_rejections = 0;
         std::uint64_t mpi_failures = 0;
+        /** Actual live protocol traffic; capacities never contribute. */
+        std::uint64_t evidence_count_bytes_sent = 0;
+        std::uint64_t evidence_payload_bytes_sent = 0;
+        std::uint64_t evidence_payload_bytes_received = 0;
+        std::uint64_t evidence_payload_collectives_started = 0;
     };
 
     /** @brief MPI_THREAD_MULTIPLE implementation of the economy evidence ABI. */
@@ -118,6 +123,13 @@ namespace llaminar2
         MoEOverlayResidencyWaveProgress pollService(
             std::vector<MoEOverlayParticipantLayerServiceTotals> *result,
             std::string *error = nullptr) override;
+
+        /** @brief Same lane/deadline, count then exact-live original root metadata. */
+        bool beginPreparedService(std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+            const std::vector<MoEOverlayPreparedTargetServiceTotals>& local,std::string* error=nullptr) override;
+        /** @brief Decode against retained original declarations without accepting sender geometry. */
+        MoEOverlayResidencyWaveProgress pollPreparedService(
+            std::vector<MoEOverlayPreparedTargetServiceTotals>* result,std::string* error=nullptr) override;
 
         [[nodiscard]] bool idle() const noexcept override;
         [[nodiscard]] int worldRank() const noexcept override;

@@ -1,6 +1,11 @@
 /**
  * @file GPUExpertTransferCUDA.cpp
- * @brief CUDA backend for same-backend GPU expert packed transfer.
+ * @brief CUDA expert migration and prepared capture-safe physical byte transport.
+ *
+ * Migration retains its original explicit peer API and ambient-device lifecycle.
+ * Prepared copies use UVA asynchronous D2D on the authenticated destination
+ * worker: the operation must become a native graph node, never eager setup work.
+ * Neither path retries or selects an alternate transport after a native failure.
  */
 
 #include "GPUExpertTransferBackend.h"
@@ -53,6 +58,27 @@ namespace llaminar2::detail
         }
     }
 
+    /** @brief Prepared UVA device copy records a native memcpy node during capture.
+     * The explicit PeerAsync API is deliberately retained only by legacy
+     * migration below: CUDA rejects it in capture, while HIP may enqueue it
+     * eagerly without a graph node. This is a distinct prepared path, never a
+     * capture-state retry or an eager substitute.
+     */
+    bool copyPreparedDevicePeerBytesCUDABackend(void* destination,int destination_ordinal,const void* source,int source_ordinal,std::size_t bytes,void* destination_stream)
+    {
+        if(!destination || !source || !destination_stream)return false;
+        if(!bytes)return true;
+        // TransferEngine has authenticated the exact original destination
+        // worker/stream; capture must not mutate that native context binding.
+        auto status=cudaMemcpyAsync(destination,source,bytes,cudaMemcpyDeviceToDevice,static_cast<cudaStream_t>(destination_stream));
+        if(status!=cudaSuccess){
+            LOG_ERROR("[PreparedDevicePeerCopy] cudaMemcpyAsync(D2D) failed: " << cudaGetErrorString(status)
+                << " src=" << source_ordinal << " dst=" << destination_ordinal << " bytes=" << bytes);
+            return false;
+        }
+        return true;
+    }
+
     int currentCUDADeviceOrdinal() noexcept
     {
         int ordinal = -1;
@@ -74,6 +100,17 @@ namespace llaminar2::detail
             return source == destination && source.is_cuda();
         }
 
+        // Setup owns only its own AlreadyEnabled status. Never overwrite or
+        // consume an unrelated error left by an earlier owner on this thread.
+        const cudaError_t previous_error = cudaPeekAtLastError();
+        if (previous_error != cudaSuccess)
+        {
+            LOG_ERROR("[GPUExpertTransfer] Direct-peer setup found an unconsumed CUDA error: "
+                      << cudaGetErrorString(previous_error)
+                      << " status=" << static_cast<int>(previous_error));
+            return false;
+        }
+
         int original_device = -1;
         if (cudaGetDevice(&original_device) != cudaSuccess)
             return false;
@@ -92,8 +129,27 @@ namespace llaminar2::detail
             {
                 const cudaError_t enable =
                     cudaDeviceEnablePeerAccess(source_ordinal, 0);
-                prepared = enable == cudaSuccess ||
-                           enable == cudaErrorPeerAccessAlreadyEnabled;
+                prepared = enable == cudaSuccess;
+                if (enable == cudaErrorPeerAccessAlreadyEnabled)
+                {
+                    // Successful native APIs do not retire this expected
+                    // status. Prove it is precisely ours before consuming it;
+                    // a different error remains visible and rejects setup.
+                    const auto owned_error = cudaPeekAtLastError();
+                    if (owned_error == cudaErrorPeerAccessAlreadyEnabled)
+                    {
+                        const auto retired = cudaGetLastError();
+                        prepared = retired == cudaErrorPeerAccessAlreadyEnabled;
+                        if (!prepared)
+                            LOG_ERROR("[GPUExpertTransfer] Expected peer-access status changed during retirement: "
+                                      << cudaGetErrorString(retired));
+                    }
+                    else
+                    {
+                        LOG_ERROR("[GPUExpertTransfer] Peer-access setup cannot consume unrelated CUDA error: "
+                                  << cudaGetErrorString(owned_error));
+                    }
+                }
             }
         }
 

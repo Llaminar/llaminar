@@ -34,6 +34,7 @@
 
 #include "ICollectiveBackend.h"
 #include "DeviceGroup.h"
+#include "backends/GlobalDeviceAddress.h"
 #include "CollectiveRuntimeLifecycle.h"
 #include "../execution/mpi_orchestration/DeviceInventory.h"
 #include "../utils/MPIContext.h"
@@ -41,9 +42,56 @@
 #include <memory>
 #include <unordered_map>
 #include <functional>
+#include <optional>
 
 namespace llaminar2
 {
+
+    class PipelineGraphExecutionPlan;
+
+    /**
+     * @brief Authenticated PP participants and exact transfer ownership.
+     *
+     * Retains the original communicator's immutable membership projection.
+     * Actual native executable plans own their captured transport edges; generic
+     * plans declare only initial boundary copies, before their own TP broadcasts.
+     * Device visibility never authorizes an additional copy communicator.
+     */
+    class PipelineRouterAdmission final
+    {
+    public:
+        /**
+         * @brief Authenticate the actual ordered stage participants without discovery.
+         * @param context Original active communicator, including its selected membership.
+         * @param stages Authored ordered PP domains with their original physical addresses.
+         * @param execution Existing actual runner-resolved graph/capture ownership plan.
+         * @return Complete source-owned admission; no native state is created.
+         * @throws std::invalid_argument For missing, foreign, duplicate or unowned endpoints.
+         */
+        static PipelineRouterAdmission admit(std::shared_ptr<IMPIContext> context,
+            const std::vector<std::vector<GlobalDeviceAddress>>& stages,
+            const PipelineGraphExecutionPlan& execution);
+        /** @brief Exact directed initial transfer boundary; TP broadcasts are separate owners. */
+        struct CopyEdge { DeviceId source,target; };
+        /** @return Actual generic PP copy edges; graph-native GPU pipelines own none here. */
+        const std::vector<CopyEdge>& copyEdges() const noexcept { return copy_edges_; }
+        /** @return Same active communicator that owns the immutable observation. */
+        const std::shared_ptr<IMPIContext>& context() const noexcept { return context_; }
+        /** @return Its exact canonical membership-projected hardware observation. */
+        const ClusterInventory& inventory() const noexcept { return *inventory_; }
+        /** @return Authenticated original stage order, without ordinal renumbering. */
+        const std::vector<GlobalDeviceAddress>& participants() const noexcept { return participants_; }
+    private:
+        /** @brief Preserve only a fully authenticated participant topology. */
+        PipelineRouterAdmission(std::shared_ptr<IMPIContext> context,
+            std::shared_ptr<const ClusterInventory> inventory,std::vector<GlobalDeviceAddress> participants,
+            std::vector<CopyEdge> edges)
+            :context_(std::move(context)),inventory_(std::move(inventory)),participants_(std::move(participants)),copy_edges_(std::move(edges)) {}
+        std::shared_ptr<IMPIContext> context_;
+        std::shared_ptr<const ClusterInventory> inventory_;
+        std::vector<GlobalDeviceAddress> participants_;
+        std::vector<CopyEdge> copy_edges_;
+    };
 
     // Forward declarations for domain-aware routing
     struct TPDomain;
@@ -166,6 +214,17 @@ namespace llaminar2
         BackendRouter(
             std::shared_ptr<IMPIContext> mpi_ctx,
             const ClusterInventory &cluster_inventory,
+            std::unique_ptr<IBackendFactory> factory = nullptr);
+
+        /**
+         * @brief Install exact PP routing, constructing only declared generic copy groups.
+         * @param admission Actual source-owned captured pipeline participant contract.
+         * @param factory Optional device-free backend factory for replay tests.
+         * @details Captured edges need no router communicator. Generic edges
+         * initialize their exact endpoint groups before forwards; undeclared
+         * copies/groups reject before factory/native work.
+         */
+        explicit BackendRouter(PipelineRouterAdmission admission,
             std::unique_ptr<IBackendFactory> factory = nullptr);
 
         ~BackendRouter();
@@ -332,9 +391,13 @@ namespace llaminar2
         bool hasDomainSupport() const;
 
     private:
+        friend class GlobalBackendRouter; ///< Validates exact idempotent source-owned reentry.
         std::shared_ptr<IMPIContext> mpi_ctx_;
         ClusterInventory cluster_inventory_;
         std::unique_ptr<IBackendFactory> factory_;
+
+        /// Original actual PP transfer authority; absent for ordinary collective contexts.
+        std::optional<PipelineRouterAdmission> pipeline_admission_;
 
         // Backend instances (lazily created via factory)
         std::unique_ptr<ICollectiveBackend> mpi_backend_;
@@ -348,6 +411,11 @@ namespace llaminar2
 
         // UPI backend for CPU cross-rank domains (optional)
         std::unique_ptr<UPICollectiveBackend> upi_backend_;
+
+        /** @brief Reject backend creation outside the explicit pipeline copy contract.
+         * @param type Native/host backend requested by the original copy path.
+         * @return Whether at least one admitted edge requires this backend. */
+        bool pipelineCopyBackendRequired(CollectiveBackendType type) const noexcept;
 
         // Internal helpers
         ICollectiveBackend *getOrCreateBackend(CollectiveBackendType type);
@@ -418,6 +486,13 @@ namespace llaminar2
         static void init(
             std::shared_ptr<IMPIContext> mpi_ctx,
             const ClusterInventory &cluster_inventory);
+
+        /**
+         * @brief Bind original PP transport authority with only its declared copy groups.
+         * @param admission Authenticated actual MPI/inventory/participant ownership.
+         * @throws std::logic_error When another global router is already installed.
+         */
+        static void initForPipeline(PipelineRouterAdmission admission);
 
         /**
          * @brief Initialize global router for tests (no MPI required)

@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace llaminar2
@@ -179,6 +181,38 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
+         * @brief Move a floating original-coordinate rectangle through this same event-polled lane.
+         * @param source Genuine source GPU allocation, retaining its complete local stride.
+         * @param final_cpu_bytes Complete inactive CPU allocation, retaining its own local stride.
+         * @param source_readiness Original producer event or installed-bank authority.
+         * @param intersection Checked original source/destination overlap; arbitrary floating K cuts are legal.
+         * @param error Exact cold validation or submission diagnostic.
+         * @return Whether the first live row segment was submitted without conversion.
+         */
+        bool startGpuToCpuContiguous(const ContiguousFloatingPointWeightDescriptor& source,
+            std::span<std::uint8_t> final_cpu_bytes,const ExpertTierSourceReadiness& source_readiness,
+            const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr) noexcept;
+        /**
+         * @brief Promote the exact floating rectangle without CPU assembly or a precision change.
+         * @param cpu_bytes Complete immutable original CPU local allocation.
+         * @param destination Actual inactive GPU local allocation.
+         * @param intersection Checked original source/destination overlap.
+         * @param error Exact cold validation or submission diagnostic.
+         * @return Whether the first live row segment was submitted.
+         */
+        bool startCpuToGpuContiguous(std::span<const std::uint8_t> cpu_bytes,
+            const ContiguousFloatingPointWeightDescriptor& destination,
+            const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr) noexcept;
+
+        /**
+         * @brief Bind the actual final-role encoded-word writer before starting a reserved lane.
+         * @param owner SAME destination-role authority shared with other local/remote pieces; null denotes an exclusive writer.
+         * @throws std::logic_error If a prior transfer can still touch final storage.
+         * @note This controls host encoded-bit writes only, never execution readiness or source authority.
+         */
+        void bindCPUEncodedWriteOwnership(std::shared_ptr<std::mutex> owner);
+
+        /**
          * @brief Advance the state machine using a non-blocking event query.
          * @param error Optional exact query or enqueue failure.
          * @return Current transfer progress after at most one completed chunk.
@@ -212,6 +246,10 @@ namespace llaminar2
         {
             return !work_may_be_in_flight_;
         }
+
+        /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
+        [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
+        { return isContiguousDirection() ? contiguous_total_bytes_ : layout_.chunkBytes(layout_.unit_count); }
 
         /** @brief Return cumulative proof counters for integration assertions. */
         [[nodiscard]] ExpertTierWeightTransferLaneStats stats() const noexcept
@@ -309,9 +347,22 @@ namespace llaminar2
         ExpertTierGpuConstProjectionView gpu_source_;
         ExpertTierGpuMutableProjectionView gpu_destination_;
         std::span<std::uint8_t> cpu_destination_;
+        std::shared_ptr<std::mutex> cpu_encoded_write_mutex_;
         std::span<const std::uint8_t> cpu_source_;
         const std::uint8_t *gpu_contiguous_source_ = nullptr;
         std::uint8_t *gpu_contiguous_destination_ = nullptr;
+        /**
+         * @brief Map the current wire prefix to one actual endpoint allocation.
+         * @param gpu Select the original GPU local allocation rather than CPU local storage.
+         * @return Exact byte offset for the next contiguous live row segment.
+         */
+        std::size_t floatingOffset(bool gpu) const noexcept {
+            const auto row=contiguous_completed_bytes_/contiguous_wire_row_bytes_;
+            const auto column=contiguous_completed_bytes_%contiguous_wire_row_bytes_;
+            return (gpu?contiguous_gpu_origin_:contiguous_cpu_origin_)+row*(gpu?contiguous_gpu_row_bytes_:contiguous_cpu_row_bytes_)+column;
+        }
+        std::size_t contiguous_wire_row_bytes_=0,contiguous_cpu_row_bytes_=0,contiguous_gpu_row_bytes_=0;
+        std::size_t contiguous_cpu_origin_=0,contiguous_gpu_origin_=0,contiguous_gpu_storage_bytes_=0;
         std::size_t contiguous_total_bytes_ = 0;
         std::size_t contiguous_completed_bytes_ = 0;
         std::uint32_t completed_units_ = 0;

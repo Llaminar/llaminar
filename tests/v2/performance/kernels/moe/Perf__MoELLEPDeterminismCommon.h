@@ -226,7 +226,7 @@ namespace llaminar2::test::moe_llep_perf
 
     inline uint64_t syntheticMatrixDataBytes(const SyntheticPayloadSpec &spec)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.n = spec.n;
         desc.k = spec.k;
         desc.blocks_per_row = syntheticBlocksPerRow(spec.k);
@@ -250,11 +250,11 @@ namespace llaminar2::test::moe_llep_perf
                        256u);
     }
 
-    inline DeviceNativeVNNIMatrixDesc makeSyntheticMatrixDesc(uint8_t *base,
+    inline DeviceNativeQuantisedMatrixDesc makeSyntheticMatrixDesc(uint8_t *base,
                                                              uint64_t &offset,
                                                              const SyntheticPayloadSpec &spec)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.n = spec.n;
         desc.k = spec.k;
         desc.blocks_per_row = syntheticBlocksPerRow(spec.k);
@@ -314,7 +314,7 @@ namespace llaminar2::test::moe_llep_perf
         entry.slot_index = slot;
         entry.flags = static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
                       static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
-        auto mark_transfer_capacity = [](DeviceNativeVNNIMatrixDesc &matrix)
+        auto mark_transfer_capacity = [](DeviceNativeQuantisedMatrixDesc &matrix)
         {
             uint8_t payload_bytes_per_block = 0;
             uint8_t is_asymmetric = 0;

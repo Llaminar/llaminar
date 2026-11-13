@@ -66,7 +66,7 @@ namespace
                 if (!owner) throw std::logic_error("Owned routing requires canonical retained packet owners");
                 return owner;
             };
-            const auto identity = node + "/owned/" + std::to_string(layout.capacity) + "/" +
+            const auto identity = node + "/owned/phase/prefill/" + std::to_string(layout.capacity) + "/" +
                 std::to_string(layout.top_k) + "/" + std::to_string(layout.partition.participants());
             exchange = distribution.fabric->bind(layout.partition.participant(),
                 {fnv1a64(identity.data(), identity.size()), layout.packetBytes()},

@@ -9,9 +9,12 @@
  */
 
 #include "PhysicalMemoryAuthority.h"
+#include "backends/NativeContextOpaqueContract.h"
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -42,6 +45,25 @@ namespace llaminar2
                     " overflows size_t");
             }
             return left + right;
+        }
+
+        /**
+         * @brief Mint only lifecycle identity, never an allocation or pointer ledger.
+         * Unique identities prevent a prior source's request from matching a new
+         * source epoch even when its native owner address is later reused.
+         */
+        [[nodiscard]] std::uint64_t nextNativeSetupIdentity()
+        {
+            static std::atomic<std::uint64_t> next{1};
+            auto value = next.load(std::memory_order_relaxed);
+            for (;;)
+            {
+                if (value == std::numeric_limits<std::uint64_t>::max())
+                    throw std::overflow_error("Native setup epoch identity exhausted");
+                if (next.compare_exchange_weak(value, value + 1, std::memory_order_relaxed,
+                                               std::memory_order_relaxed))
+                    return value;
+            }
         }
 
         /** @brief Test only the typed identity, never volatile capacity fields. */
@@ -81,11 +103,23 @@ namespace llaminar2
 
     namespace detail
     {
+        struct PhysicalMemoryOpaqueContextRootState;
+        struct PhysicalMemoryReservationState;
+        /** @brief One typed instance use record, never another byte/allocation ledger. */
+        struct PhysicalMemoryHostServiceInstanceRecord {
+            RetainedHostServiceInstance instance;
+            std::string original_program;
+            PhysicalMemoryHostServiceInstancePolicy policy;
+            bool active=false,published=false;
+        };
         /** @brief Mutable live counters protected by one setup-time mutex. */
         struct PhysicalMemoryMaterializationState
         {
+            PhysicalMemoryOpaqueContextRootState* opaque_contexts=nullptr;
+            std::vector<std::shared_ptr<PhysicalMemoryHostServiceInstanceRecord>> host_service_instances; ///< Original instance lifecycle only; all byte claims remain above.
             struct ResourceClaims
             {
+                std::weak_ptr<PhysicalMemoryReservationState> cpu_collective_pool_borrow; ///< Readonly borrow of the sole original MPI session reservation, never resident bytes.
                 // Direct leases describe fixed backing allocations.
                 std::array<std::size_t, PhysicalMemoryBOM::ownerCount()>
                     new_allocations{};
@@ -99,20 +133,117 @@ namespace llaminar2
                     new_reservation_capacity{};
                 std::array<std::size_t, PhysicalMemoryBOM::ownerCount()>
                     new_reservation_materialized{};
+                // Preparing and exact SDK root preclaims are typed columns of
+                // this same authority. They never create another capacity balance.
+                std::array<std::size_t, PhysicalMemoryBOM::ownerCount()>
+                    native_declared_preclaimed{};
+                std::array<std::size_t, PhysicalMemoryBOM::ownerCount()> preparation_committed{},
+                    preparation_materialized{};
             };
 
             explicit PhysicalMemoryMaterializationState(
-                std::shared_ptr<
-                    const PhysicalMemoryPlanAdmissionCertificate> admitted)
+                std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> admitted)
                 : certificate(std::move(admitted)),
-                  claims(certificate->plan().resources().size())
+                  observations(
+                      [&]
+                      {
+                          std::vector<PhysicalMemoryResource> result;
+                          for (const auto &bom : certificate->plan().resources())
+                              result.push_back(bom.resource());
+                          return result;
+                      }()),
+                  claims(observations.size())
             {
+            }
+
+            /** @brief Preparing owns only immutable observations and the existing canonical
+             * counters. */
+            explicit PhysicalMemoryMaterializationState(
+                std::span<const PhysicalMemoryResource> initial)
+                : observations(
+                      [&]
+                      {
+                          std::vector<PhysicalMemoryResource> result(initial.begin(),
+                                                                     initial.end());
+                          std::sort(result.begin(), result.end(),
+                                    [](const auto &a, const auto &b)
+                                    {
+                                        return a.world_rank == b.world_rank
+                                                   ? a.device < b.device
+                                                   : a.world_rank < b.world_rank;
+                                    });
+                          return result;
+                      }()),
+                  phase(PhysicalMemoryAuthorityPhase::Preparing)
+            {
+                if (observations.empty())
+                    throw std::invalid_argument(
+                        "Native preparation needs original physical observations");
+
+                for (std::size_t i = 0; i < observations.size(); ++i)
+                    if (!observations[i].valid() ||
+                        (observations[i].device.is_cpu() &&
+                         observations[i].device != DeviceId::cpu()) ||
+                        (i && observations[i].world_rank == observations[i - 1].world_rank &&
+                         observations[i].device == observations[i - 1].device))
+                        throw std::invalid_argument(
+                            "Native preparation physical observation is invalid/duplicated");
+                claims.resize(observations.size());
             }
 
             std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
                 certificate;
+            const std::vector<PhysicalMemoryResource> observations;
             std::vector<ResourceClaims> claims;
+            PhysicalMemoryAuthorityPhase phase = PhysicalMemoryAuthorityPhase::Admitted;
+            bool preparation_frozen = false;
             mutable std::mutex mutex;
+            // One common CPU load arena across all model managers sharing this
+            // rank ledger. No accounting operation waits while holding mutex.
+            std::mutex cpu_weight_source_mutex;
+        };
+
+        /** @brief Epoch lifecycle facts; all mutation holds authority->mutex. */
+        struct PhysicalMemoryNativeSetupEpochState
+        {
+            std::shared_ptr<PhysicalMemoryMaterializationState> authority;
+            int world_rank = -1;
+            std::uint64_t identity = 0;
+            enum class Phase
+            {
+                Preparation,
+                HostRecording,
+                Sealed,
+                Abandoned
+            };
+            Phase phase = Phase::Preparation;
+            // Counts authenticate setup/publication lifetime, not physical bytes.
+            std::size_t unpublished_roots = 0;
+            std::size_t live_roots = 0;
+            PhysicalMemoryPreparationRootState *preparation_roots = nullptr;
+            std::vector<std::shared_ptr<PhysicalMemoryNativeRootPermitState>> native_permits;
+            std::vector<PhysicalMemoryNativeRootDeclaration> admitted_preparation;
+        };
+
+        /** @brief Intrusive immutable declaration attached to its actual unique root lease. */
+        struct PhysicalMemoryPreparationRootState
+        {
+            explicit PhysicalMemoryPreparationRootState(PhysicalMemoryNativeRootDeclaration value)
+                : declaration(std::move(value))
+            {
+            }
+            const PhysicalMemoryNativeRootDeclaration declaration;
+            PhysicalMemoryPreparationRootState *previous = nullptr;
+            PhysicalMemoryPreparationRootState *next = nullptr;
+        };
+
+        /** @brief Closed immutable planning value, never another authority or live counter ledger.
+         */
+        struct PhysicalMemoryPreparationSnapshotState
+        {
+            std::shared_ptr<PhysicalMemoryNativeSetupEpochState> epoch;
+            PhysicalMemoryPlan retained;
+            std::vector<PhysicalMemoryNativeRootDeclaration> declarations;
         };
 
         /**
@@ -144,7 +275,49 @@ namespace llaminar2
             PhysicalMemoryOwner owner = PhysicalMemoryOwner::Count;
             std::size_t capacity_bytes = 0u;
             std::size_t materialized_bytes = 0u;
+            std::size_t native_preclaimed_bytes = 0u;
             bool registered = false;
+        };
+
+        /** @brief Observe the original pool commitment without issuing another reservation.
+         * The original session keeps the strong root until successful MPI_Finalize.
+         * A borrower cannot materialize this capacity or extend its physical lifetime. */
+        std::size_t borrowedCPUCollectivePoolBytes(
+            const PhysicalMemoryMaterializationState::ResourceClaims& claims,
+            std::size_t owner)
+        {
+            if (owner != static_cast<std::size_t>(PhysicalMemoryOwner::NativeCPUCollectiveProcessPool)) return 0;
+            const auto original = claims.cpu_collective_pool_borrow.lock();
+            return original ? original->capacity_bytes : 0;
+        }
+
+        /** @brief One actual source-owned reservation family in the canonical authority. */
+        struct PhysicalMemoryOpaqueContextRootState {
+            enum class Phase { Preclaimed,NativeStarted,Created,Retired };
+            const NativeContextBirthKey key;
+            const NativePhysicalLifetime lifetime;
+            const std::string evidence;
+            const std::uint64_t epoch_identity;
+            std::array<std::shared_ptr<PhysicalMemoryReservationState>,2> reservations;
+            Phase phase=Phase::Preclaimed;
+            PhysicalMemoryOpaqueContextRootState* previous=nullptr;
+            PhysicalMemoryOpaqueContextRootState* next=nullptr;
+            PhysicalMemoryOpaqueContextRootState(const NativeContextOpaqueContract& contract,std::uint64_t epoch)
+                :key(contract.key()),lifetime(contract.lifetime()),evidence(contract.evidenceSha256()),epoch_identity(epoch){}
+        };
+        /** @brief One immutable SDK source declaration and its canonical one-shot lifecycle. */
+        struct PhysicalMemoryNativeRootPermitState
+        {
+            PhysicalMemoryNativeRootPermitState(
+                PhysicalMemoryNativeRootDeclaration value,
+                std::shared_ptr<PhysicalMemoryReservationState> owner)
+                : declaration(std::move(value)), reservation(std::move(owner))
+            {
+            }
+            const PhysicalMemoryNativeRootDeclaration declaration;
+            const std::shared_ptr<PhysicalMemoryReservationState> reservation;
+            bool consumed = false,
+                 retired = false; ///< Existing authority mutex protects both lifecycle facts.
         };
 
         PhysicalMemoryReservationState::~PhysicalMemoryReservationState()
@@ -160,7 +333,7 @@ namespace llaminar2
             // Last-reference destruction with a live child is impossible under
             // the RAII graph. Treat counter corruption as fatal instead of
             // silently publishing false capacity during teardown.
-            if (materialized_bytes != 0u ||
+            if (materialized_bytes != 0u || native_preclaimed_bytes != 0u ||
                 claims.new_reservation_capacity[index] < capacity_bytes)
             {
                 std::terminate();
@@ -169,6 +342,21 @@ namespace llaminar2
             registered = false;
         }
     } // namespace detail
+
+    namespace
+    {
+        /** @brief Authenticate phase before optional certificate access; publication is immutable
+         * afterward. */
+        const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &requireAdmitted(
+            const detail::PhysicalMemoryMaterializationState &state)
+        {
+            std::lock_guard lock(state.mutex);
+            if (state.phase != PhysicalMemoryAuthorityPhase::Admitted || !state.certificate)
+                throw std::logic_error(
+                    "Ordinary physical storage requires the final Admitted authority phase");
+            return state.certificate;
+        }
+    } // namespace
 
     std::string PhysicalMemoryAllocatorIdentity::toString() const
     {
@@ -433,6 +621,887 @@ namespace llaminar2
         return PhysicalMemoryAdmissionCertificate(*bom);
     }
 
+    PhysicalMemoryNativeSetupEpoch PhysicalMemoryMaterializationLedger::beginPreparationEpoch(
+        int rank)
+    {
+        if (rank < 0 || std::none_of(
+                            state_->observations.begin(), state_->observations.end(),
+                            [&](const auto &r) { return r.world_rank == rank; }))
+            throw std::invalid_argument("Preparation epoch requires its original physical rank");
+        auto epoch = std::make_shared<detail::PhysicalMemoryNativeSetupEpochState>();
+        epoch->authority = state_;
+        epoch->world_rank = rank;
+        std::lock_guard lock(state_->mutex);
+        if (state_->phase != PhysicalMemoryAuthorityPhase::Preparing || state_->preparation_frozen)
+            throw std::logic_error("Native preparation epoch requires open Preparing authority");
+        epoch->identity = nextNativeSetupIdentity();
+        return PhysicalMemoryNativeSetupEpoch(std::move(epoch));
+    }
+
+    /** @brief Unique source family owner; all capacity remains in original PMA reservation states. */
+    struct PhysicalMemoryOpaqueRuntimeCommitment::State {
+        std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch;
+        std::unique_ptr<detail::PhysicalMemoryOpaqueContextRootState> root;
+        std::weak_ptr<PhysicalMemoryAuthority> original_memory;
+    };
+    PhysicalMemoryOpaqueRuntimeCommitment::PhysicalMemoryOpaqueRuntimeCommitment(std::unique_ptr<State> state)
+        :state_(std::move(state)){}
+    PhysicalMemoryOpaqueRuntimeCommitment::~PhysicalMemoryOpaqueRuntimeCommitment() noexcept {
+        if(!state_ || !state_->root)return;
+        {
+            std::lock_guard lock(state_->epoch->authority->mutex);
+            if(state_->root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted ||
+               state_->root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Created)std::terminate();
+        }
+        try{retirePhysically();}catch(...){std::terminate();}
+    }
+    std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment> PhysicalMemoryNativeSetupEpoch::reserveOpaqueContext(
+        const NativeContextOpaqueContract& contract,const std::shared_ptr<PhysicalMemoryAuthority>& memory) const {
+        if(!epoch_ || !memory || memory->ledger_.state_!=epoch_->authority)throw std::logic_error("Opaque context has no original source epoch");
+        contract.key().requireComplete();
+        if(contract.evidenceSha256().size()!=64 || (!contract.hostUpperBytes() && !contract.deviceUpperBytes()))
+            throw std::invalid_argument("Opaque context has no qualified positive family commitment/evidence");
+        auto holder=std::make_unique<PhysicalMemoryOpaqueRuntimeCommitment::State>();holder->epoch=epoch_;holder->original_memory=memory;
+        holder->root=std::make_unique<detail::PhysicalMemoryOpaqueContextRootState>(contract,epoch_->identity);
+        auto& state=*epoch_->authority;
+        const std::array devices{DeviceId::cpu(),contract.key().device};
+        const std::array bytes{contract.hostUpperBytes(),contract.deviceUpperBytes()};
+        const auto owner=ownerIndex(PhysicalMemoryOwner::NativeExecutionContext);
+        for(std::size_t part=0;part<devices.size();++part){
+            const auto found=std::find_if(state.observations.begin(),state.observations.end(),[&](const auto& observed){
+                return observed.world_rank==epoch_->world_rank && observed.device==devices[part];});
+            if(found==state.observations.end())throw std::invalid_argument("Opaque context changed its original physical allocator set");
+            holder->root->reservations[part]=std::make_shared<detail::PhysicalMemoryReservationState>(
+                epoch_->authority,static_cast<std::size_t>(found-state.observations.begin()),PhysicalMemoryOwner::NativeExecutionContext,bytes[part]);
+        }
+        auto result=std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment>(new PhysicalMemoryOpaqueRuntimeCommitment(std::move(holder)));
+        std::lock_guard lock(state.mutex);
+        if(state.phase!=PhysicalMemoryAuthorityPhase::Preparing || state.preparation_frozen ||
+           epoch_->phase!=detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation)
+            throw std::logic_error("Opaque context commitment must precede original native birth and optional admission");
+        for(auto* existing=state.opaque_contexts;existing;existing=existing->next)
+            if(existing->key.device==contract.key().device)
+                throw std::logic_error("Original opaque context family is already committed; borrow its original owner instead");
+        for(const auto& reservation:result->state_->root->reservations){
+            const auto& claims=state.claims[reservation->resource_index];std::size_t committed=0;
+            for(std::size_t at=0;at<PhysicalMemoryBOM::ownerCount();++at){
+                committed=checkedAdd(committed,claims.new_allocations[at],"opaque original allocations");
+                committed=checkedAdd(committed,claims.new_reservation_capacity[at],"opaque original reservations");
+                committed=checkedAdd(committed,claims.preparation_committed[at],"opaque original preparation");
+            }
+            const auto available=state.observations[reservation->resource_index].admission_available_bytes;
+            if(committed>available || reservation->capacity_bytes>available-committed)
+                throw PhysicalMemoryCapacityExhausted("Qualified context commitment displaces original pending owners");
+        }
+        if(epoch_->live_roots==std::numeric_limits<std::size_t>::max() || epoch_->unpublished_roots==std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("Opaque source lifetime exhausted");
+        auto* root=result->state_->root.get();root->next=state.opaque_contexts;
+        if(root->next)root->next->previous=root;state.opaque_contexts=root;
+        for(const auto& reservation:root->reservations){
+            state.claims[reservation->resource_index].new_reservation_capacity[owner]+=reservation->capacity_bytes;
+            reservation->registered=true;
+        }
+        ++epoch_->live_roots;++epoch_->unpublished_roots;
+        return result;
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::requireOriginalProcessRetention(
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,const NativeContextOpaqueContract& contract) const {
+        if(!memory || !state_ || !state_->epoch || !state_->root)
+            throw std::logic_error("Process opaque retention lost its original source token");
+        const auto originalMemory=state_->original_memory.lock();
+        if(!originalMemory || originalMemory.get()!=memory.get() || originalMemory.owner_before(memory) || memory.owner_before(originalMemory))
+            throw std::logic_error("Process opaque retention substituted its original source authority owner");
+        const auto& original=state_->epoch->authority;const auto& candidate=memory->ledger_.state_;
+        if(!candidate || original.get()!=candidate.get() || original.owner_before(candidate) || candidate.owner_before(original))
+            throw std::logic_error("Process opaque retention crossed the original physical authority");
+        std::lock_guard lock(original->mutex);const auto& root=*state_->root;
+        if(contract.lifetime()!=NativePhysicalLifetime::ProcessRuntime || root.lifetime!=contract.lifetime() ||
+           root.key!=contract.key() || root.evidence!=contract.evidenceSha256() ||
+           root.epoch_identity!=state_->epoch->identity || root.phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Preclaimed ||
+           original->phase!=PhysicalMemoryAuthorityPhase::Preparing || original->preparation_frozen ||
+           state_->epoch->phase!=detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation)
+            throw std::logic_error("Process opaque retention requires its exact original unpublished source certificate");
+        const std::array bounds{contract.hostUpperBytes(),contract.deviceUpperBytes()};
+        for(std::size_t part=0;part<bounds.size();++part){const auto& reservation=root.reservations[part];
+            if(!reservation || !reservation->registered || reservation->capacity_bytes!=bounds[part] ||
+               reservation->authority!=original || reservation->owner!=PhysicalMemoryOwner::NativeExecutionContext ||
+               reservation->materialized_bytes || reservation->native_preclaimed_bytes)
+                throw std::logic_error("Process opaque retention changed its original reservation obligation");}
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::beginNative(){
+        auto& original=*state_->epoch->authority;std::lock_guard lock(original.mutex);
+        if(original.phase!=PhysicalMemoryAuthorityPhase::Preparing || original.preparation_frozen ||
+           state_->root->phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Preclaimed)
+            throw std::logic_error("Original opaque context birth permit is stale or already used");
+        state_->root->phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted;
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::publishCreated(){
+        auto& epoch=*state_->epoch;std::lock_guard lock(epoch.authority->mutex);
+        if(epoch.authority->phase!=PhysicalMemoryAuthorityPhase::Preparing || epoch.authority->preparation_frozen ||
+           state_->root->phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted || !epoch.unpublished_roots)
+            throw std::logic_error("Original opaque context cannot publish a missing/duplicate creator");
+        state_->root->phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created;--epoch.unpublished_roots;
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::retirePhysically(){
+        if(!state_ || !state_->root)return;
+        auto& epoch=*state_->epoch;auto& authority=*epoch.authority;std::lock_guard lock(authority.mutex);
+        auto& root=*state_->root;
+        if(root.phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Retired)return;
+        if(root.lifetime==NativePhysicalLifetime::ProcessRuntime &&
+           (root.phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted || root.phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Created))
+            throw std::logic_error("Process-runtime opaque backing survives context reset; original tokens cannot retire here");
+        // Unregistered pending construction never acquired capacity or a source lifetime.
+        if(!root.reservations[0]->registered && !root.reservations[1]->registered){root.phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::Retired;return;}
+        if(!epoch.live_roots || (root.phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created && !epoch.unpublished_roots))
+            throw std::logic_error("Opaque runtime retirement lost its original source obligation");
+        for(const auto& reservation:root.reservations){
+            auto& capacity=authority.claims[reservation->resource_index].new_reservation_capacity[ownerIndex(reservation->owner)];
+            if(!reservation->registered || reservation->materialized_bytes || reservation->native_preclaimed_bytes || capacity<reservation->capacity_bytes)
+                throw std::logic_error("Opaque runtime reservation acquired an unrelated child or changed authority");
+        }
+        for(const auto& reservation:root.reservations){
+            authority.claims[reservation->resource_index].new_reservation_capacity[ownerIndex(reservation->owner)]-=reservation->capacity_bytes;
+            reservation->registered=false;
+        }
+        if(root.previous)root.previous->next=root.next;else authority.opaque_contexts=root.next;
+        if(root.next)root.next->previous=root.previous;
+        if(root.phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created)--epoch.unpublished_roots;
+        --epoch.live_roots;root.phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::Retired;
+    }
+
+    PhysicalMemoryNativeSetupLease PhysicalMemoryNativeSetupEpoch::claimPreparation(
+        const PhysicalMemoryNativeRootDeclaration &declaration) const
+    {
+        if (!epoch_ || declaration.device != DeviceId::cpu() || !declaration.owner_identity ||
+            !declaration.shared_anchor_identity || !declaration.requested_bytes ||
+            !declaration.physical_bytes || !declaration.allocation_granularity ||
+            declaration.host_numa < -1 ||
+            declaration.requested_bytes > std::numeric_limits<std::size_t>::max() -
+                                              (declaration.allocation_granularity - 1) ||
+            declaration.physical_bytes !=
+                ((declaration.requested_bytes + declaration.allocation_granularity - 1) /
+                 declaration.allocation_granularity) *
+                    declaration.allocation_granularity)
+            throw std::invalid_argument(
+                "Preparing root requires exact source-issued CPU0 physical geometry");
+        auto root = std::make_unique<detail::PhysicalMemoryPreparationRootState>(declaration);
+        auto &state = *epoch_->authority;
+        const auto found = std::find_if(
+            state.observations.begin(), state.observations.end(), [&](const auto &r)
+            { return r.world_rank == epoch_->world_rank && r.device == DeviceId::cpu(); });
+        if (found == state.observations.end())
+            throw std::out_of_range("Preparing source has no original CPU0 observation");
+        const auto resource = std::size_t(found - state.observations.begin());
+        std::lock_guard lock(state.mutex);
+        if (state.phase != PhysicalMemoryAuthorityPhase::Preparing || state.preparation_frozen ||
+            epoch_->phase != detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation)
+            throw std::logic_error(
+                "Preparation CPU0 growth is closed and cannot revive after source admission");
+        for (auto *live = epoch_->preparation_roots; live; live = live->next)
+            if (live->declaration.shared_anchor_identity == declaration.shared_anchor_identity)
+                throw std::invalid_argument(
+                    "Preparing creator root anchor is already owned by its actual source lease");
+        auto &claims = state.claims[resource];
+        std::size_t committed = 0;
+        for (auto bytes : claims.preparation_committed)
+            committed = checkedAdd(committed, bytes, "preparation commitments");
+        if (committed > found->admission_available_bytes ||
+            declaration.physical_bytes > found->admission_available_bytes - committed)
+            throw PhysicalMemoryCapacityExhausted(
+                "Native source preparation exceeds original CPU0 physical observation");
+        if (epoch_->live_roots == std::numeric_limits<std::size_t>::max() ||
+            epoch_->unpublished_roots == std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("Preparing physical owner lifecycle exhausted");
+        PhysicalMemoryNativeSetupLease lease(epoch_, resource, PhysicalMemoryOwner::LocalCollective,
+                                             declaration.physical_bytes);
+        lease.preparation_root_ = std::move(root);
+        auto *node = lease.preparation_root_.get();
+        node->next = epoch_->preparation_roots;
+        if (node->next)
+            node->next->previous = node;
+        epoch_->preparation_roots = node;
+        claims.preparation_committed[ownerIndex(PhysicalMemoryOwner::LocalCollective)] +=
+            declaration.physical_bytes;
+        ++epoch_->live_roots;
+        ++epoch_->unpublished_roots;
+        return lease;
+    }
+
+    std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState>
+    PhysicalMemoryNativeSetupEpoch::closePreparationForPlanning() const
+    {
+        if (!epoch_)
+            throw std::logic_error("Cannot close inactive source preparation");
+        auto &state = *epoch_->authority;
+        std::lock_guard lock(state.mutex);
+        if (state.phase != PhysicalMemoryAuthorityPhase::Preparing || state.preparation_frozen ||
+            epoch_->unpublished_roots)
+            throw std::logic_error(
+                "Preparing snapshot requires open, fully published physical roots");
+        auto snapshot = std::make_shared<detail::PhysicalMemoryPreparationSnapshotState>();
+        snapshot->epoch = epoch_;
+        PhysicalMemoryPlanBuilder builder;
+        for (std::size_t i = 0; i < state.observations.size(); ++i)
+        {
+            const auto &resource = state.observations[i];
+            builder.add(resource, PhysicalMemoryOwner::LocalCollective, 0);
+            for (std::size_t owner = 0; owner < PhysicalMemoryBOM::ownerCount(); ++owner)
+                if (const auto bytes = state.claims[i].preparation_committed[owner])
+                {
+                    if (bytes != state.claims[i].preparation_materialized[owner])
+                        throw std::logic_error("Preparing source root is unpublished");
+                    builder.add(resource, PhysicalMemoryBOM::ownerAt(owner), bytes);
+                }
+            for(std::size_t owner=0;owner<PhysicalMemoryBOM::ownerCount();++owner)
+                if(const auto opaque=state.claims[i].new_reservation_capacity[owner])
+                    builder.add(resource,PhysicalMemoryBOM::ownerAt(owner),opaque);
+        }
+        for(auto* root=state.opaque_contexts;root;root=root->next)
+            if(root->epoch_identity!=epoch_->identity || root->phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created)
+                throw std::logic_error("Opaque birth family was not completely created in its original source epoch");
+        for (auto *root = epoch_->preparation_roots; root; root = root->next)
+            snapshot->declarations.push_back(root->declaration);
+        std::sort(snapshot->declarations.begin(), snapshot->declarations.end(),
+                  [](const auto &a, const auto &b)
+                  { return a.shared_anchor_identity < b.shared_anchor_identity; });
+        snapshot->retained = builder.build();
+        // All possible allocation/validation failures above leave the original
+        // source phase and every actual lease/token unchanged.
+        state.preparation_frozen = true;
+        return snapshot;
+    }
+
+    void PhysicalMemoryNativeSetupEpoch::cancelPreparation() const
+    {
+        if (!epoch_)
+            return;
+        auto &state = *epoch_->authority;
+        std::lock_guard lock(state.mutex);
+        if (state.phase == PhysicalMemoryAuthorityPhase::Admitted)
+            throw std::logic_error("Admitted source cannot cancel/reopen its Preparing authority");
+        for(auto* root=state.opaque_contexts;root;root=root->next)
+            if(root->lifetime==NativePhysicalLifetime::ProcessRuntime &&
+               (root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted || root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Created))
+                throw std::logic_error("Original Preparing source retains attempted process-runtime backing and cannot be cancelled");
+        state.phase = PhysicalMemoryAuthorityPhase::Cancelled;
+        state.preparation_frozen = true;
+        epoch_->phase = detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned;
+    }
+
+    std::uint64_t NativePreparationPlanningSnapshot::epochIdentity() const
+    {
+        if (!snapshot_)
+            throw std::logic_error("Native preparation snapshot already consumed");
+        return snapshot_->epoch->identity;
+    }
+    int NativePreparationPlanningSnapshot::worldRank() const
+    {
+        if (!snapshot_)
+            throw std::logic_error("Native preparation snapshot already consumed");
+        return snapshot_->epoch->world_rank;
+    }
+
+    std::span<const PhysicalMemoryResource> NativePreparationPlanningSnapshot::initialObservations()
+        const
+    {
+        if (!snapshot_)
+            throw std::logic_error("Native preparation snapshot already consumed");
+        return snapshot_->epoch->authority->observations;
+    }
+
+    const PhysicalMemoryPlan &NativePreparationPlanningSnapshot::retainedPreparationBOM() const
+    {
+        if (!snapshot_)
+            throw std::logic_error("Native preparation snapshot already consumed");
+        return snapshot_->retained;
+    }
+
+    std::span<const PhysicalMemoryNativeRootDeclaration> NativePreparationPlanningSnapshot::
+        declarations() const
+    {
+        if (!snapshot_)
+            throw std::logic_error("Native preparation snapshot already consumed");
+        return snapshot_->declarations;
+    }
+
+    namespace
+    {
+        /**
+         * @brief Revalidate every original observation, root anchor and mandatory source floor.
+         * @param epoch Original source session retaining actual root leases.
+         * @param snapshot Closed immutable planning value captured from that same epoch.
+         * @param mandatory Exact SDK creator BOM priced before optional placement.
+         * @param final Complete final source certificate with unchanged physical observations.
+         * @pre The caller holds epoch->authority->mutex.
+         * @throws Before mutation for stale roots, changed observations or incomplete source
+         * charges.
+         */
+        void validateNativeAdmissionLocked(
+            const std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> &epoch,
+            const std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> &snapshot,
+            const PhysicalMemoryPlan &mandatory,
+            const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &final)
+        {
+            if (!epoch || !snapshot || snapshot->epoch != epoch || !final)
+                throw std::invalid_argument("Native admission requires its exact original "
+                                            "epoch/snapshot and final certificate");
+            const auto &state = *epoch->authority;
+            if (state.phase != PhysicalMemoryAuthorityPhase::Preparing ||
+                !state.preparation_frozen || state.certificate || epoch->unpublished_roots ||
+                epoch->phase != detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation)
+                throw std::logic_error(
+                    "Native admission is not a fully published frozen Preparing source");
+            const auto &resources = final->plan().resources();
+            if (resources.size() != state.observations.size())
+            {
+                // Report the two cold declarations directly. A rank-local source
+                // presented with a topology-wide certificate must be diagnosable
+                // without another model launch or live device probe.
+                std::ostringstream diagnostic;
+                diagnostic << "Final native admission changes/drops the original physical resource registry"
+                           << "; source_rank=" << epoch->world_rank << " original=[";
+                for (const auto &resource : state.observations)
+                    diagnostic << PhysicalMemoryAllocatorIdentity{
+                        resource.world_rank, resource.device}.toString() << ' ';
+                diagnostic << "] final=[";
+                for (const auto &bom : resources)
+                    diagnostic << PhysicalMemoryAllocatorIdentity{
+                        bom.resource().world_rank, bom.resource().device}.toString() << ' ';
+                diagnostic << ']';
+                throw std::invalid_argument(diagnostic.str());
+            }
+            for (std::size_t i = 0; i < resources.size(); ++i)
+            {
+                const auto &original = state.observations[i];
+                const auto &candidate = resources[i].resource();
+                if (candidate.world_rank != original.world_rank ||
+                    candidate.device != original.device ||
+                    candidate.total_bytes != original.total_bytes ||
+                    candidate.admission_available_bytes != original.admission_available_bytes)
+                    throw std::invalid_argument("Final native admission changed original "
+                                                "observation or stable resource index");
+                const auto *retained =
+                    snapshot->retained.find({original.world_rank, original.device});
+                if (!retained)
+                    throw std::logic_error(
+                        "Preparation snapshot lacks an original physical resource");
+                for (std::size_t owner = 0; owner < PhysicalMemoryBOM::ownerCount(); ++owner)
+                {
+                    const auto kind = PhysicalMemoryBOM::ownerAt(owner);
+                    const auto bytes = retained->charge(kind).incrementalBytes();
+                    if (checkedAdd(state.claims[i].preparation_committed[owner],state.claims[i].new_reservation_capacity[owner],"original opaque preparation") != bytes ||
+                        state.claims[i].preparation_materialized[owner] != state.claims[i].preparation_committed[owner])
+                        throw std::logic_error("A retained preparation root retired/changed after "
+                                               "optional planning snapshot");
+                    if (resources[i].charge(kind).incrementalBytes() < bytes)
+                        throw std::logic_error("Final source plan omitted/relabelled preparation "
+                                               "backing as residency");
+                }
+            }
+            std::size_t roots = 0;
+            for (auto *root = epoch->preparation_roots; root; root = root->next)
+            {
+                const auto &declaration = root->declaration;
+                const auto found = std::lower_bound(
+                    snapshot->declarations.begin(), snapshot->declarations.end(),
+                    declaration.shared_anchor_identity, [](const auto &d, std::uint64_t anchor)
+                    { return d.shared_anchor_identity < anchor; });
+                if (found == snapshot->declarations.end() || *found != declaration)
+                    throw std::logic_error(
+                        "Native preparation root declaration/anchor changed after snapshot");
+                ++roots;
+            }
+            if (roots != snapshot->declarations.size())
+                throw std::logic_error("Native preparation lost an actual retained root owner");
+            for (const auto &requirement : mandatory.resources())
+            {
+                const auto identity = PhysicalMemoryAllocatorIdentity{
+                    requirement.resource().world_rank, requirement.resource().device};
+                const auto *candidate = final->plan().find(identity);
+                const auto *retained = snapshot->retained.find(identity);
+                if (!candidate || !retained ||
+                    requirement.resource().total_bytes != candidate->resource().total_bytes ||
+                    requirement.resource().admission_available_bytes !=
+                        candidate->resource().admission_available_bytes)
+                    throw std::invalid_argument(
+                        "Mandatory SDK descriptor names another original observation");
+                for (std::size_t i = 0; i < PhysicalMemoryBOM::ownerCount(); ++i)
+                {
+                    const auto owner = PhysicalMemoryBOM::ownerAt(i);
+                    const auto bytes = requirement.charge(owner).incrementalBytes();
+                    if (requirement.charge(owner).already_resident_bytes ||
+                        bytes < retained->charge(owner).incrementalBytes() ||
+                        bytes > candidate->charge(owner).incrementalBytes())
+                        throw std::logic_error("Final source plan omitted/duplicated/relabelled "
+                                               "exact mandatory native storage");
+                    if (bytes && owner != PhysicalMemoryOwner::NativeExecutionContext &&
+                        (identity.device.is_gpu() || owner!=PhysicalMemoryOwner::LocalCollective))
+                        throw std::invalid_argument(
+                            "Mandatory native descriptor charged an ordinary model owner");
+                }
+            }
+        }
+    } // namespace
+
+    std::vector<PhysicalMemoryOwnerReservation> PhysicalMemoryNativeSetupEpoch::
+        prepareNativeAdmission(
+            const std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> &snapshot,
+            const PhysicalMemoryPlan &mandatory,
+            const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &final) const
+    {
+        if (!epoch_)
+            throw std::logic_error("Inactive preparation cannot build admitted native owners");
+        {
+            std::lock_guard lock(epoch_->authority->mutex);
+            validateNativeAdmissionLocked(epoch_, snapshot, mandatory, final);
+        }
+        std::vector<PhysicalMemoryOwnerReservation> reservations;
+        const auto &observations = epoch_->authority->observations;
+        for (std::size_t resource = 0; resource < observations.size(); ++resource)
+        {
+            const auto &observed = observations[resource];
+            const PhysicalMemoryAllocatorIdentity identity{observed.world_rank, observed.device};
+            const auto *required = mandatory.find(identity);
+            const auto *retained = snapshot->retained.find(identity);
+            if (!required)
+                continue;
+            for (std::size_t index = 0; index < PhysicalMemoryBOM::ownerCount(); ++index)
+            {
+                const auto owner = PhysicalMemoryBOM::ownerAt(index);
+                const auto bytes = required->charge(owner).incrementalBytes() -
+                                   retained->charge(owner).incrementalBytes();
+                if (!bytes)
+                    continue;
+                auto state = std::make_shared<detail::PhysicalMemoryReservationState>(
+                    epoch_->authority, resource, owner, bytes);
+                // Pending reservation states own no committed capacity. They
+                // are unobservable until final publication's noexcept section.
+                reservations.push_back(PhysicalMemoryOwnerReservation(std::move(state)));
+            }
+        }
+        return reservations;
+    }
+
+    void PhysicalMemoryNativeSetupEpoch::publishNativeAdmission(
+        const std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> &snapshot,
+        const PhysicalMemoryPlan &mandatory,
+        std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> final,
+        const std::vector<PhysicalMemoryOwnerReservation> &reservations,
+        std::vector<std::shared_ptr<detail::PhysicalMemoryNativeRootPermitState>> permits,
+        std::vector<PhysicalMemoryNativeRootDeclaration> retainedPreparations, void *context,
+        void (*arm)(void *) noexcept) const
+    {
+        if (!epoch_ || !snapshot || !context || !arm)
+            throw std::invalid_argument(
+                "Native admission requires its prebuilt disarmed callback binding");
+        auto &state = *epoch_->authority;
+        std::lock_guard lock(state.mutex);
+        validateNativeAdmissionLocked(epoch_, snapshot, mandatory, final);
+        if (!epoch_->native_permits.empty())
+            throw std::logic_error("Native descriptor program already published");
+        if (retainedPreparations != snapshot->declarations)
+            throw std::logic_error(
+                "Prebuilt native commit bundle changed retained preparation declarations");
+        for (const auto &permit : permits)
+            if (!permit || permit->consumed || permit->retired || !permit->reservation ||
+                permit->reservation->registered)
+                throw std::logic_error(
+                    "Final native descriptor permit is partial/already consumed");
+        for (const auto &handle : reservations)
+        {
+            if (!handle.state_ || handle.state_->authority != epoch_->authority ||
+                handle.state_->registered)
+                throw std::logic_error("Native final reservation is foreign/already published");
+            const auto &pending = *handle.state_;
+            const auto index = ownerIndex(pending.owner);
+            const auto &claims = state.claims[pending.resource_index];
+            const auto limit = final->plan()
+                                   .resources()[pending.resource_index]
+                                   .charge(pending.owner)
+                                   .incrementalBytes();
+            const auto committed = checkedAdd(
+                checkedAdd(claims.new_allocations[index], claims.new_reservation_capacity[index],
+                           "native final commitments"),
+                claims.preparation_committed[index], "native preparation commitments");
+            if (committed > limit || pending.capacity_bytes > limit - committed)
+                throw std::logic_error(
+                    "Native mandatory reservation would double-spend original preparation backing");
+        }
+        // No allocation, callback into SDK, validation or throwing operation
+        // follows this point. Same state, indices, epoch and actual tokens survive.
+        static_assert(noexcept(state.certificate = std::move(final)));
+        static_assert(noexcept(epoch_->native_permits = std::move(permits)));
+        static_assert(noexcept(epoch_->admitted_preparation = std::move(retainedPreparations)));
+        state.certificate = std::move(final);
+        for (const auto &handle : reservations)
+        {
+            auto &pending = *handle.state_;
+            state.claims[pending.resource_index]
+                .new_reservation_capacity[std::size_t(pending.owner)] += pending.capacity_bytes;
+            pending.registered = true;
+        }
+        epoch_->native_permits = std::move(permits);
+        epoch_->admitted_preparation = std::move(retainedPreparations);
+        state.phase = PhysicalMemoryAuthorityPhase::Admitted;
+        arm(context);
+    }
+
+    std::vector<std::shared_ptr<detail::PhysicalMemoryNativeRootPermitState>>
+    PhysicalMemoryNativeSetupEpoch::prepareNativePermits(
+        std::span<const PhysicalMemoryNativeRootDeclaration> declarations,
+        const std::vector<PhysicalMemoryOwnerReservation> &reservations) const
+    {
+        if (!epoch_)
+            throw std::logic_error("Inactive source epoch cannot prepare native descriptors");
+        std::vector<std::shared_ptr<detail::PhysicalMemoryNativeRootPermitState>> permits;
+        permits.reserve(declarations.size());
+        for (const auto &declaration : declarations)
+        {
+            if (declaration.owner_identity || !declaration.shared_anchor_identity ||
+                !declaration.physical_bytes)
+                throw std::invalid_argument(
+                    "Prepared native root must retain immutable unbound source geometry");
+            if (std::any_of(permits.begin(), permits.end(),
+                            [&](const auto &p)
+                            {
+                                return p->declaration.shared_anchor_identity ==
+                                       declaration.shared_anchor_identity;
+                            }))
+                throw std::invalid_argument("SDK source program duplicates a creator root anchor");
+            const auto owner = declaration.device.is_gpu()
+                                   ? PhysicalMemoryOwner::NativeExecutionContext
+                                   : PhysicalMemoryOwner::LocalCollective;
+            const auto found =
+                std::find_if(reservations.begin(), reservations.end(),
+                             [&](const auto &r)
+                             {
+                                 return r.allocatorIdentity() ==
+                                            PhysicalMemoryAllocatorIdentity{epoch_->world_rank,
+                                                                            declaration.device} &&
+                                        r.owner() == owner;
+                             });
+            if (found == reservations.end() || !found->state_ || found->state_->registered)
+                throw std::logic_error(
+                    "SDK source descriptor lacks its exact unpublished original owner reserve");
+            permits.push_back(std::make_shared<detail::PhysicalMemoryNativeRootPermitState>(
+                declaration, found->state_));
+        }
+        for (const auto &reservation : reservations)
+        {
+            std::size_t extent = 0;
+            for (const auto &permit : permits)
+                if (permit->reservation == reservation.state_)
+                    extent = checkedAdd(extent, permit->declaration.physical_bytes,
+                                        "native descriptor creation extents");
+            if (extent != reservation.capacityBytes())
+                throw std::logic_error(
+                    "Native source permit extents do not cover their exact owner reserve");
+        }
+        return permits;
+    }
+
+    PhysicalMemoryNativeSetupLease PhysicalMemoryNativeSetupEpoch::claimPreparedNative(
+        const PhysicalMemoryNativeRootDeclaration &declaration) const
+    {
+        if (!epoch_ || !declaration.owner_identity || !declaration.shared_anchor_identity)
+            throw std::invalid_argument(
+                "Native Create requires its actual owner and prepared source anchor");
+        auto &state = *epoch_->authority;
+        std::lock_guard lock(state.mutex);
+        if (state.phase != PhysicalMemoryAuthorityPhase::Admitted)
+            throw std::logic_error(
+                "Native source descriptor cannot materialize before final admission");
+        const auto expected =
+            declaration.source_phase == PhysicalMemoryNativeRootPhase::GraphRecordingHostMetadata
+                ? detail::PhysicalMemoryNativeSetupEpochState::Phase::HostRecording
+                : detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation;
+        if (epoch_->phase != expected)
+            throw std::logic_error(
+                "Native descriptor growth is outside its exact setup/recording phase");
+        const auto found = std::find_if(
+            epoch_->native_permits.begin(), epoch_->native_permits.end(),
+            [&](const auto &p)
+            {
+                return p->declaration.shared_anchor_identity == declaration.shared_anchor_identity;
+            });
+        if (found == epoch_->native_permits.end() ||
+            !(*found)->declaration.samePreparedGeometry(declaration))
+            throw std::logic_error("Native Create changed its frozen source descriptor/anchor");
+        auto permit = *found;
+        if (permit->consumed || permit->retired)
+            throw std::logic_error(
+                "Native source descriptor already consumed; cancelled Create cannot recycle it");
+        auto reservation = permit->reservation;
+        if (!reservation || !reservation->registered || reservation->authority != epoch_->authority)
+            throw std::logic_error("Native source descriptor lost its canonical owner reserve");
+        const auto bytes = declaration.physical_bytes;
+        const auto owner = ownerIndex(reservation->owner);
+        if (reservation->materialized_bytes > reservation->capacity_bytes ||
+            reservation->native_preclaimed_bytes >
+                reservation->capacity_bytes - reservation->materialized_bytes ||
+            bytes > reservation->capacity_bytes - reservation->materialized_bytes -
+                        reservation->native_preclaimed_bytes)
+            throw std::logic_error(
+                "Native source descriptor exceeds its exact original reservation");
+        if (epoch_->live_roots == std::numeric_limits<std::size_t>::max() ||
+            epoch_->unpublished_roots == std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("Native source root lifetime exhausted");
+        PhysicalMemoryNativeSetupLease lease(epoch_, reservation->resource_index,
+                                             reservation->owner, bytes);
+        lease.declared_reservation_ = reservation;
+        lease.permit_ = permit;
+        permit->consumed = true;
+        reservation->native_preclaimed_bytes += bytes;
+        state.claims[reservation->resource_index].native_declared_preclaimed[owner] += bytes;
+        ++epoch_->live_roots;
+        ++epoch_->unpublished_roots;
+        return lease;
+    }
+
+    std::uint64_t PhysicalMemoryNativeSetupEpoch::identity() const noexcept
+    {
+        return epoch_ ? epoch_->identity : 0;
+    }
+
+    void PhysicalMemoryNativeSetupEpoch::beginHostRecording() const
+    {
+        if (!epoch_)
+            throw std::logic_error("Cannot record an inactive native setup epoch");
+        std::lock_guard lock(epoch_->authority->mutex);
+        if (epoch_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted)
+            throw std::logic_error("Host graph recording requires final source admission");
+        if (epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::HostRecording)
+            return;
+        if (epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Sealed ||
+            epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned ||
+            epoch_->unpublished_roots)
+            throw std::logic_error(
+                "Native host recording requires complete physical setup and an unsealed epoch");
+        epoch_->phase = detail::PhysicalMemoryNativeSetupEpochState::Phase::HostRecording;
+    }
+
+    void PhysicalMemoryNativeSetupEpoch::sealForExecution() const
+    {
+        if (!epoch_)
+            throw std::logic_error("Cannot close an inactive native setup epoch");
+        std::lock_guard lock(epoch_->authority->mutex);
+        if (epoch_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted)
+            throw std::logic_error("Executable publication requires final source admission");
+        if (epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned)
+            throw std::logic_error("Abandoned native setup cannot publish an executable");
+        if (epoch_->unpublished_roots)
+            throw std::logic_error(
+                "Native capture cannot close setup with unpublished physical roots");
+        std::size_t preparationRoots = 0;
+        for (auto *root = epoch_->preparation_roots; root; root = root->next)
+        {
+            if (std::find(epoch_->admitted_preparation.begin(), epoch_->admitted_preparation.end(),
+                          root->declaration) == epoch_->admitted_preparation.end())
+                throw std::logic_error("Executable seal changed a retained preparation root");
+            ++preparationRoots;
+        }
+        if (preparationRoots != epoch_->admitted_preparation.size())
+            throw std::logic_error("Executable seal lost a mandatory retained preparation owner");
+        for (const auto &permit : epoch_->native_permits)
+            if (!permit->consumed || permit->retired)
+                throw std::logic_error(
+                    "Executable seal omitted/retired mandatory retained native root anchor=" +
+                    std::to_string(permit->declaration.shared_anchor_identity));
+        epoch_->phase = detail::PhysicalMemoryNativeSetupEpochState::Phase::Sealed;
+    }
+
+    void PhysicalMemoryNativeSetupEpoch::abandonSetup() const
+    {
+        if (!epoch_)
+            return;
+        std::lock_guard lock(epoch_->authority->mutex);
+        if (epoch_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted)
+            throw std::logic_error("Only admitted native setup may close as abandoned");
+        // Failure closure cannot publish an executable, release physical bytes,
+        // or recycle a descriptor. Actual root leases still own retirement.
+        // Destruction after a successful seal preserves its distinct terminal state.
+        if (epoch_->phase != detail::PhysicalMemoryNativeSetupEpochState::Phase::Sealed)
+            epoch_->phase = detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned;
+    }
+
+    bool PhysicalMemoryNativeSetupEpoch::sealed() const
+    {
+        if (!epoch_)
+            return false;
+        std::lock_guard lock(epoch_->authority->mutex);
+        return epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Sealed ||
+               epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned;
+    }
+
+    bool PhysicalMemoryNativeSetupEpoch::retired() const
+    {
+        if (!epoch_)
+            return false;
+        std::lock_guard lock(epoch_->authority->mutex);
+        return (epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Sealed ||
+                epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned) &&
+               !epoch_->live_roots && !epoch_->unpublished_roots;
+    }
+
+    void PhysicalMemoryNativeSetupEpoch::requireRetired() const
+    {
+        if (!retired())
+            throw std::logic_error(
+                "Native source re-admission requires final SDK physical-root/alias retirement");
+    }
+
+    PhysicalMemoryNativeSetupLease::PhysicalMemoryNativeSetupLease() = default;
+
+    PhysicalMemoryNativeSetupLease::PhysicalMemoryNativeSetupLease(
+        std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch,
+        std::size_t resource_index, PhysicalMemoryOwner owner, std::size_t bytes)
+        : epoch_(std::move(epoch)), resource_index_(resource_index), owner_(owner), bytes_(bytes)
+    {
+    }
+
+    PhysicalMemoryNativeSetupLease::~PhysicalMemoryNativeSetupLease()
+    {
+        release();
+    }
+
+    PhysicalMemoryNativeSetupLease::PhysicalMemoryNativeSetupLease(
+        PhysicalMemoryNativeSetupLease &&other) noexcept
+        : epoch_(std::move(other.epoch_)),
+          declared_reservation_(std::move(other.declared_reservation_)),
+          preparation_root_(std::move(other.preparation_root_)), permit_(std::move(other.permit_)),
+          resource_index_(other.resource_index_), owner_(other.owner_), bytes_(other.bytes_),
+          materialized_(other.materialized_)
+    {
+        other.bytes_ = 0;
+        other.owner_ = PhysicalMemoryOwner::Count;
+        other.materialized_ = false;
+    }
+
+    PhysicalMemoryNativeSetupLease &PhysicalMemoryNativeSetupLease::operator=(
+        PhysicalMemoryNativeSetupLease &&other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            epoch_ = std::move(other.epoch_);
+            declared_reservation_ = std::move(other.declared_reservation_);
+            preparation_root_ = std::move(other.preparation_root_);
+            permit_ = std::move(other.permit_);
+            resource_index_ = other.resource_index_;
+            owner_ = other.owner_;
+            bytes_ = other.bytes_;
+            materialized_ = other.materialized_;
+            other.bytes_ = 0;
+            other.owner_ = PhysicalMemoryOwner::Count;
+            other.materialized_ = false;
+        }
+        return *this;
+    }
+
+    void PhysicalMemoryNativeSetupLease::materialize()
+    {
+        if (!valid())
+            throw std::logic_error("Cannot materialize an inactive native root claim");
+        auto &state = *epoch_->authority;
+        std::lock_guard lock(state.mutex);
+        if (materialized_ ||
+            epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Sealed ||
+            epoch_->phase == detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned ||
+            !epoch_->unpublished_roots)
+            throw std::logic_error(
+                "Native root physical publication is duplicate or its setup epoch closed");
+        const auto owner = ownerIndex(owner_);
+        auto &claims = state.claims[resource_index_];
+        if (preparation_root_)
+        {
+            if (state.phase != PhysicalMemoryAuthorityPhase::Preparing ||
+                state.preparation_frozen || claims.preparation_committed[owner] < bytes_ ||
+                claims.preparation_materialized[owner] >
+                    claims.preparation_committed[owner] - bytes_)
+                throw std::logic_error(
+                    "Preparation physical publication requires its live pending source claim");
+            claims.preparation_materialized[owner] += bytes_;
+        }
+        else if (declared_reservation_)
+        {
+            auto &reserved = *declared_reservation_;
+            if (reserved.native_preclaimed_bytes < bytes_ ||
+                claims.native_declared_preclaimed[owner] < bytes_)
+                throw std::logic_error(
+                    "Declared native publication exceeds its pending reservation child");
+            reserved.native_preclaimed_bytes -= bytes_;
+            claims.native_declared_preclaimed[owner] -= bytes_;
+            reserved.materialized_bytes += bytes_;
+            claims.new_reservation_materialized[owner] += bytes_;
+        }
+        else
+            throw std::logic_error(
+                "Native root has no exact preparation/program reservation authority");
+        --epoch_->unpublished_roots;
+        materialized_ = true;
+    }
+
+    void PhysicalMemoryNativeSetupLease::release() noexcept
+    {
+        if (!valid())
+            return;
+        auto retained = epoch_;
+        {
+            auto &state = *retained->authority;
+            std::lock_guard lock(state.mutex);
+            const auto owner = std::size_t(owner_);
+            auto &claims = state.claims[resource_index_];
+            if (!retained->live_roots || (!materialized_ && !retained->unpublished_roots))
+                std::terminate();
+            if (preparation_root_)
+            {
+                if (claims.preparation_committed[owner] < bytes_ ||
+                    (materialized_ && claims.preparation_materialized[owner] < bytes_))
+                    std::terminate();
+                claims.preparation_committed[owner] -= bytes_;
+                if (materialized_)
+                    claims.preparation_materialized[owner] -= bytes_;
+                auto *node = preparation_root_.get();
+                if (node->previous)
+                    node->previous->next = node->next;
+                else
+                    retained->preparation_roots = node->next;
+                if (node->next)
+                    node->next->previous = node->previous;
+            }
+            else if (declared_reservation_)
+            {
+                auto &reserved = *declared_reservation_;
+                auto &local =
+                    materialized_ ? reserved.materialized_bytes : reserved.native_preclaimed_bytes;
+                auto &aggregate = materialized_ ? claims.new_reservation_materialized[owner]
+                                                : claims.native_declared_preclaimed[owner];
+                if (local < bytes_ || aggregate < bytes_)
+                    std::terminate();
+                local -= bytes_;
+                aggregate -= bytes_;
+            }
+            else
+                std::terminate();
+            if (!materialized_)
+                --retained->unpublished_roots;
+            --retained->live_roots;
+            if (permit_)
+            {
+                if (!permit_->consumed || permit_->retired)
+                    std::terminate();
+                permit_->retired = true;
+            }
+        }
+        permit_.reset();
+        preparation_root_.reset();
+        declared_reservation_.reset();
+        epoch_.reset();
+        bytes_ = 0;
+        owner_ = PhysicalMemoryOwner::Count;
+        materialized_ = false;
+    }
+
     PhysicalMemoryAllocationLease::PhysicalMemoryAllocationLease(
         std::shared_ptr<detail::PhysicalMemoryMaterializationState> state,
         std::size_t resource_index,
@@ -593,6 +1662,9 @@ namespace llaminar2
         if (!state_)
             return 0u;
         std::lock_guard lock(state_->authority->mutex);
+        if (state_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted ||
+            !state_->registered)
+            throw std::logic_error("Native pending reservation is not an admitted physical owner");
         return state_->materialized_bytes;
     }
 
@@ -601,7 +1673,21 @@ namespace llaminar2
         if (!state_)
             return 0u;
         std::lock_guard lock(state_->authority->mutex);
-        return state_->capacity_bytes - state_->materialized_bytes;
+        if (state_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted ||
+            !state_->registered)
+            throw std::logic_error(
+                "Native pending reservation has no ordinary allocation capacity");
+        return state_->capacity_bytes - state_->materialized_bytes -
+               state_->native_preclaimed_bytes;
+    }
+
+    PhysicalMemoryAllocatorIdentity PhysicalMemoryOwnerReservation::allocatorIdentity()
+        const noexcept
+    {
+        if (!state_)
+            return {};
+        const auto &resource = state_->authority->observations[state_->resource_index];
+        return {resource.world_rank, resource.device};
     }
 
     PhysicalMemoryOwner PhysicalMemoryOwnerReservation::owner() const noexcept
@@ -619,8 +1705,14 @@ namespace llaminar2
         }
 
         std::lock_guard lock(state_->authority->mutex);
+        if (state_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted ||
+            !state_->registered)
+            throw std::logic_error(
+                "Ordinary child allocation requires published Admitted owner capacity");
         if (state_->materialized_bytes > state_->capacity_bytes ||
-            bytes > state_->capacity_bytes - state_->materialized_bytes)
+            state_->native_preclaimed_bytes > state_->capacity_bytes - state_->materialized_bytes ||
+            bytes > state_->capacity_bytes - state_->materialized_bytes -
+                        state_->native_preclaimed_bytes)
         {
             throw std::logic_error(
                 "Physical memory pool allocation exceeds reserved " +
@@ -649,9 +1741,9 @@ namespace llaminar2
     }
 
     const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &
-    PhysicalMemoryMaterializationLedger::admission() const noexcept
+    PhysicalMemoryMaterializationLedger::admission() const
     {
-        return state_->certificate;
+        return requireAdmitted(*state_);
     }
 
     PhysicalMemoryAllocationLease
@@ -692,7 +1784,7 @@ namespace llaminar2
                 "Physical memory reservation requires a valid resource and positive bytes");
         }
         const std::size_t owner_index = ownerIndex(owner);
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(
             resources.begin(),
             resources.end(),
@@ -716,9 +1808,9 @@ namespace llaminar2
             std::lock_guard lock(state_->mutex);
             auto &claims = state_->claims[resource_index];
             const std::size_t direct =
-                claims.new_allocations[owner_index];
+                claims.new_allocations[owner_index] + claims.preparation_committed[owner_index];
             const std::size_t reserved =
-                claims.new_reservation_capacity[owner_index];
+                claims.new_reservation_capacity[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
             if (direct > limit || reserved > limit - direct ||
                 bytes > limit - direct - reserved)
             {
@@ -749,7 +1841,7 @@ namespace llaminar2
                 "Physical memory live claim requires a valid resource and positive bytes");
         }
         const std::size_t owner_index = ownerIndex(owner);
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(
             resources.begin(),
             resources.end(),
@@ -774,10 +1866,10 @@ namespace llaminar2
             kind == PhysicalMemoryMaterializationKind::NewAllocation
                 ? claims.new_allocations[owner_index]
                 : claims.adopted_residency[owner_index];
-        const std::size_t reserved =
-            kind == PhysicalMemoryMaterializationKind::NewAllocation
-                ? claims.new_reservation_capacity[owner_index]
-                : 0u;
+        const std::size_t reserved = kind == PhysicalMemoryMaterializationKind::NewAllocation
+                                         ? claims.new_reservation_capacity[owner_index] +
+                                               claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index)
+                                         : 0u;
         if (counter > limit || reserved > limit - counter ||
             bytes > limit - counter - reserved)
         {
@@ -806,7 +1898,7 @@ namespace llaminar2
         PhysicalMemoryMaterializationKind kind) const
     {
         const std::size_t owner_index = ownerIndex(owner);
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(
             resources.begin(),
             resources.end(),
@@ -824,7 +1916,8 @@ namespace llaminar2
         if (kind == PhysicalMemoryMaterializationKind::NewAllocation)
         {
             return claims.new_allocations[owner_index] +
-                   claims.new_reservation_materialized[owner_index];
+                   claims.new_reservation_materialized[owner_index] +
+                   claims.preparation_materialized[owner_index];
         }
         return claims.adopted_residency[owner_index];
     }
@@ -834,7 +1927,7 @@ namespace llaminar2
         PhysicalMemoryOwner owner) const
     {
         const std::size_t owner_index = ownerIndex(owner);
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(
             resources.begin(),
             resources.end(),
@@ -858,7 +1951,7 @@ namespace llaminar2
         PhysicalMemoryMaterializationKind kind) const
     {
         const std::size_t owner_index = ownerIndex(owner);
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(
             resources.begin(),
             resources.end(),
@@ -876,7 +1969,8 @@ namespace llaminar2
         if (kind == PhysicalMemoryMaterializationKind::NewAllocation)
         {
             return claims.new_allocations[owner_index] +
-                   claims.new_reservation_capacity[owner_index];
+                   claims.new_reservation_capacity[owner_index] +
+                   claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
         }
         return claims.adopted_residency[owner_index];
     }
@@ -887,7 +1981,7 @@ namespace llaminar2
             PhysicalMemoryOwner owner) const
     {
         const std::size_t owner_index = ownerIndex(owner);
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(
             resources.begin(),
             resources.end(),
@@ -904,9 +1998,9 @@ namespace llaminar2
         std::lock_guard lock(state_->mutex);
         const auto &claims = state_->claims[resource_index];
         const std::size_t direct =
-            claims.new_allocations[owner_index];
+            claims.new_allocations[owner_index] + claims.preparation_committed[owner_index];
         const std::size_t reserved =
-            claims.new_reservation_capacity[owner_index];
+            claims.new_reservation_capacity[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
         if (direct > limit || reserved > limit - direct)
             std::terminate();
         return limit - direct - reserved;
@@ -915,7 +2009,7 @@ namespace llaminar2
     std::size_t PhysicalMemoryMaterializationLedger::unmaterializedNewBytes(
         PhysicalMemoryAllocatorIdentity identity) const
     {
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         const auto found = std::find_if(resources.begin(), resources.end(),
             [&](const auto &bom) { return matches(bom.resource(), identity); });
         if (found == resources.end())
@@ -928,8 +2022,10 @@ namespace llaminar2
         for (std::size_t index = 0; index < PhysicalMemoryBOM::ownerCount(); ++index)
         {
             const auto planned = found->charge(PhysicalMemoryBOM::ownerAt(index)).incrementalBytes();
-            const auto live = checkedAdd(claims.new_allocations[index],
-                claims.new_reservation_materialized[index], "materialized owner bytes");
+            const auto live = checkedAdd(
+                checkedAdd(claims.new_allocations[index],
+                           claims.new_reservation_materialized[index], "materialized owner bytes"),
+                claims.preparation_materialized[index], "source preparation materialization");
             if (live > planned)
                 throw std::logic_error("Physical memory materialization exceeds its admitted owner line");
             pending = checkedAdd(pending, planned - live, "pending allocator demand");
@@ -939,7 +2035,7 @@ namespace llaminar2
 
     bool PhysicalMemoryMaterializationLedger::complete() const
     {
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         std::lock_guard lock(state_->mutex);
         for (std::size_t resource = 0; resource < resources.size(); ++resource)
         {
@@ -951,10 +2047,10 @@ namespace llaminar2
                 const auto &charge = resources[resource].charge(owner);
                 const auto &claims = state_->claims[resource];
                 if (claims.new_allocations[owner_index] +
-                            claims.new_reservation_materialized[owner_index] !=
+                            claims.new_reservation_materialized[owner_index] +
+                            claims.preparation_materialized[owner_index] !=
                         charge.incrementalBytes() ||
-                    claims.adopted_residency[owner_index] !=
-                        charge.already_resident_bytes)
+                    claims.adopted_residency[owner_index] != charge.already_resident_bytes)
                 {
                     return false;
                 }
@@ -965,7 +2061,7 @@ namespace llaminar2
 
     void PhysicalMemoryMaterializationLedger::requireComplete() const
     {
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         std::lock_guard lock(state_->mutex);
         for (std::size_t resource = 0; resource < resources.size(); ++resource)
         {
@@ -978,7 +2074,8 @@ namespace llaminar2
                 const auto &claims = state_->claims[resource];
                 const std::size_t materialized_new =
                     claims.new_allocations[owner_index] +
-                    claims.new_reservation_materialized[owner_index];
+                    claims.new_reservation_materialized[owner_index] +
+                    claims.preparation_materialized[owner_index];
                 if (materialized_new ==
                         charge.incrementalBytes() &&
                     claims.adopted_residency[owner_index] ==
@@ -988,24 +2085,19 @@ namespace llaminar2
                 }
                 throw std::logic_error(
                     "Physical memory materialization is incomplete for " +
-                    resources[resource].resource().id() + " owner=" +
-                    std::string(toString(owner)) + " new=" +
-                    std::to_string(materialized_new) +
-                    "/" + std::to_string(charge.incrementalBytes()) +
-                    " reserved=" +
-                    std::to_string(
-                        claims.new_reservation_capacity[owner_index]) +
-                    " retained=" +
-                    std::to_string(claims.adopted_residency[owner_index]) +
-                    "/" +
-                    std::to_string(charge.already_resident_bytes));
+                    resources[resource].resource().id() + " owner=" + std::string(toString(owner)) +
+                    " new=" + std::to_string(materialized_new) + "/" +
+                    std::to_string(charge.incrementalBytes()) +
+                    " reserved=" + std::to_string(claims.new_reservation_capacity[owner_index]) +
+                    " retained=" + std::to_string(claims.adopted_residency[owner_index]) + "/" +
+                    std::to_string(charge.already_resident_bytes) + "");
             }
         }
     }
 
     bool PhysicalMemoryMaterializationLedger::committed() const
     {
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         std::lock_guard lock(state_->mutex);
         for (std::size_t resource = 0; resource < resources.size(); ++resource)
         {
@@ -1017,10 +2109,10 @@ namespace llaminar2
                 const auto &charge = resources[resource].charge(owner);
                 const auto &claims = state_->claims[resource];
                 if (claims.new_allocations[owner_index] +
-                            claims.new_reservation_capacity[owner_index] !=
+                            claims.new_reservation_capacity[owner_index] +
+                            claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index) !=
                         charge.incrementalBytes() ||
-                    claims.adopted_residency[owner_index] !=
-                        charge.already_resident_bytes)
+                    claims.adopted_residency[owner_index] != charge.already_resident_bytes)
                 {
                     return false;
                 }
@@ -1031,7 +2123,7 @@ namespace llaminar2
 
     void PhysicalMemoryMaterializationLedger::requireCommitted() const
     {
-        const auto &resources = state_->certificate->plan().resources();
+        const auto &resources = requireAdmitted(*state_)->plan().resources();
         std::lock_guard lock(state_->mutex);
         for (std::size_t resource = 0; resource < resources.size(); ++resource)
         {
@@ -1042,9 +2134,9 @@ namespace llaminar2
                 const auto owner = PhysicalMemoryBOM::ownerAt(owner_index);
                 const auto &charge = resources[resource].charge(owner);
                 const auto &claims = state_->claims[resource];
-                const std::size_t committed_new =
-                    claims.new_allocations[owner_index] +
-                    claims.new_reservation_capacity[owner_index];
+                const std::size_t committed_new = claims.new_allocations[owner_index] +
+                                                  claims.new_reservation_capacity[owner_index] +
+                                                  claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
                 if (committed_new == charge.incrementalBytes() &&
                     claims.adopted_residency[owner_index] ==
                         charge.already_resident_bytes)
@@ -1053,17 +2145,13 @@ namespace llaminar2
                 }
                 throw std::logic_error(
                     "Physical memory capacity commitment is incomplete for " +
-                    resources[resource].resource().id() + " owner=" +
-                    std::string(toString(owner)) + " new=" +
-                    std::to_string(committed_new) + "/" +
-                    std::to_string(charge.incrementalBytes()) +
-                    " materialized=" +
-                    std::to_string(
-                        claims.new_allocations[owner_index] +
-                        claims.new_reservation_materialized[owner_index]) +
-                    " retained=" +
-                    std::to_string(claims.adopted_residency[owner_index]) +
-                    "/" +
+                    resources[resource].resource().id() + " owner=" + std::string(toString(owner)) +
+                    " new=" + std::to_string(committed_new) + "/" +
+                    std::to_string(charge.incrementalBytes()) + " materialized=" +
+                    std::to_string(claims.new_allocations[owner_index] +
+                                   claims.new_reservation_materialized[owner_index] +
+                                   claims.preparation_materialized[owner_index]) +
+                    " retained=" + std::to_string(claims.adopted_residency[owner_index]) + "/" +
                     std::to_string(charge.already_resident_bytes));
             }
         }
@@ -1072,60 +2160,186 @@ namespace llaminar2
     std::vector<PhysicalMemoryOwnerAttestation>
     PhysicalMemoryMaterializationLedger::attestation() const
     {
-        const auto &resources = state_->certificate->plan().resources();
         std::vector<PhysicalMemoryOwnerAttestation> result;
-        result.reserve(
-            resources.size() * PhysicalMemoryBOM::ownerCount());
-
-        /*
-         * Copy every related counter while holding the one ledger mutex. This
-         * is the only way a diagnostic can distinguish a lazy capacity
-         * commitment from its currently materialized children without racing
-         * a concurrent setup allocation or teardown.
-         */
+        result.reserve(state_->observations.size() * PhysicalMemoryBOM::ownerCount());
         std::lock_guard lock(state_->mutex);
-        for (std::size_t resource_index = 0u;
-             resource_index < resources.size();
-             ++resource_index)
+        const bool admitted = state_->phase == PhysicalMemoryAuthorityPhase::Admitted;
+        if (admitted && !state_->certificate)
+            throw std::logic_error("Admitted source has no immutable certificate");
+        for (std::size_t resource = 0; resource < state_->observations.size(); ++resource)
         {
-            const auto &bom = resources[resource_index];
-            const auto &claims = state_->claims[resource_index];
-            const PhysicalMemoryAllocatorIdentity identity{
-                .world_rank = bom.resource().world_rank,
-                .device = bom.resource().device,
-            };
-            for (std::size_t owner_index = 0u;
-                 owner_index < PhysicalMemoryBOM::ownerCount();
-                 ++owner_index)
+            const auto &observed = state_->observations[resource];
+            const auto &claims = state_->claims[resource];
+            for (std::size_t owner = 0; owner < PhysicalMemoryBOM::ownerCount(); ++owner)
             {
-                const auto owner = PhysicalMemoryBOM::ownerAt(owner_index);
-                const auto &charge = bom.charge(owner);
-                const std::size_t direct_new =
-                    claims.new_allocations[owner_index];
-                const std::size_t reserved_capacity =
-                    claims.new_reservation_capacity[owner_index];
-                const std::size_t reserved_materialized =
-                    claims.new_reservation_materialized[owner_index];
+                const auto kind = PhysicalMemoryBOM::ownerAt(owner);
+                const auto *charge =
+                    admitted ? &state_->certificate->plan().resources()[resource].charge(kind)
+                             : nullptr;
+                std::size_t opaque=0;
+                const auto borrowed = detail::borrowedCPUCollectivePoolBytes(claims, owner);
+                if (kind == PhysicalMemoryOwner::NativeCPUCollectiveDomain || kind == PhysicalMemoryOwner::NativeCPUCollectiveProcessPool) opaque = claims.new_reservation_capacity[owner];
+                for(auto* root=state_->opaque_contexts;root;root=root->next)
+                    for(const auto& reservation:root->reservations)
+                        if(reservation->registered && reservation->resource_index==resource && ownerIndex(reservation->owner)==owner)
+                            opaque=checkedAdd(opaque,reservation->capacity_bytes,"named opaque source commitments");
                 result.push_back({
-                    .identity = identity,
-                    .owner = owner,
-                    .planned_new_bytes = charge.incrementalBytes(),
-                    .planned_resident_bytes =
-                        charge.already_resident_bytes,
+                    .identity = {observed.world_rank, observed.device},
+                    .phase = state_->phase,
+                    .owner = kind,
+                    .planned_new_bytes = charge ? charge->incrementalBytes() : 0u,
+                    .planned_resident_bytes = charge ? charge->already_resident_bytes : 0u,
                     .materialized_new_bytes = checkedAdd(
-                        direct_new,
-                        reserved_materialized,
-                        "attested materialization"),
+                        checkedAdd(claims.new_allocations[owner],
+                                   claims.new_reservation_materialized[owner],
+                                   "source materialization"),
+                        claims.preparation_materialized[owner], "preparation materialization"),
                     .committed_new_bytes = checkedAdd(
-                        direct_new,
-                        reserved_capacity,
-                        "attested commitment"),
-                    .adopted_resident_bytes =
-                        claims.adopted_residency[owner_index],
+                        checkedAdd(claims.new_allocations[owner],
+                                   claims.new_reservation_capacity[owner], "source commitments"),
+                        checkedAdd(claims.preparation_committed[owner], borrowed, "borrowed MPI pool obligation"), "preparation commitments"),
+                    .adopted_resident_bytes = claims.adopted_residency[owner],
+                    .preparation_committed_bytes = claims.preparation_committed[owner],
+                    .preparation_materialized_bytes = claims.preparation_materialized[owner],
+                    .native_declared_preclaimed_bytes = claims.native_declared_preclaimed[owner],
+                    .borrowed_opaque_runtime_committed_bytes = borrowed,
+                    .opaque_runtime_committed_bytes = opaque,
                 });
             }
         }
         return result;
+    }
+
+    /** @brief Retain the sole original owner until the source lock has retired. */
+    struct PhysicalMemoryCPUWeightSourceLease::State
+    {
+        std::shared_ptr<PhysicalMemoryAuthority> original;
+        std::shared_ptr<detail::PhysicalMemoryMaterializationState> materialization;
+        std::unique_lock<std::mutex> lock;
+        /** @brief Wait only on the CPU source mutex, never the accounting mutex. */
+        State(std::shared_ptr<PhysicalMemoryAuthority> owner,
+              std::shared_ptr<detail::PhysicalMemoryMaterializationState> state)
+            : original(std::move(owner)), materialization(std::move(state)),
+              lock(materialization->cpu_weight_source_mutex) {}
+    };
+    PhysicalMemoryCPUWeightSourceLease::PhysicalMemoryCPUWeightSourceLease(std::unique_ptr<State> state)
+        : state_(std::move(state)) {}
+    PhysicalMemoryCPUWeightSourceLease::PhysicalMemoryCPUWeightSourceLease(PhysicalMemoryCPUWeightSourceLease &&) noexcept = default;
+    PhysicalMemoryCPUWeightSourceLease &PhysicalMemoryCPUWeightSourceLease::operator=(PhysicalMemoryCPUWeightSourceLease &&) noexcept = default;
+    PhysicalMemoryCPUWeightSourceLease::~PhysicalMemoryCPUWeightSourceLease() noexcept = default;
+
+    PhysicalMemoryCPUWeightSourceLease PhysicalMemoryAuthority::acquireCPUWeightSourceTransaction(DeviceId original_allocator)
+    {
+        auto original = weak_from_this().lock();
+        if (!original || original.get() != this || !original_allocator.is_valid() || !original_allocator.is_cpu())
+            throw std::logic_error("CPU weight source transaction requires its original shared physical authority and CPU allocator");
+        // No accounting mutex is held during source-lock acquisition. A waiting
+        // manager cannot prevent the previous arena's actual lease from retiring.
+        auto scope = std::make_unique<PhysicalMemoryCPUWeightSourceLease::State>(
+            std::move(original), ledger_.state_);
+        {
+            std::lock_guard lock(ledger_.state_->mutex);
+            const PhysicalMemoryAllocatorIdentity cpu{.world_rank = world_rank_, .device = original_allocator};
+            if (ledger_.state_->phase != PhysicalMemoryAuthorityPhase::Admitted ||
+                !ledger_.state_->certificate || !ledger_.state_->certificate->plan().find(cpu))
+                throw std::logic_error("CPU weight source transaction requires final original rank CPU admission");
+        }
+        return PhysicalMemoryCPUWeightSourceLease(std::move(scope));
+    }
+
+    /** @brief Lease teardown runs after the actual worker and existing byte claims have retired. */
+    struct PhysicalMemoryHostServiceInstanceLease::State {
+        std::shared_ptr<detail::PhysicalMemoryMaterializationState> authority;
+        std::shared_ptr<detail::PhysicalMemoryHostServiceInstanceRecord> record;
+        ~State()noexcept{
+            if(!record)return; // An exception before arming owns no instance.
+            if(!authority)std::terminate();
+            std::lock_guard lock(authority->mutex);
+            if(!record->active)std::terminate();
+            record->active=false;
+            // Failed claims never published an instance. Remove only their own
+            // stable record, allowing explicit retry without poisoning a role.
+            if(!record->published){
+                auto& records=authority->host_service_instances;
+                const auto found=std::find(records.begin(),records.end(),record);
+                if(found==records.end())std::terminate();records.erase(found);
+            }
+        }
+    };
+    PhysicalMemoryHostServiceInstanceLease::PhysicalMemoryHostServiceInstanceLease(std::unique_ptr<State> state):state_(std::move(state)){}
+    PhysicalMemoryHostServiceInstanceLease::PhysicalMemoryHostServiceInstanceLease(PhysicalMemoryHostServiceInstanceLease&&)noexcept=default;
+    PhysicalMemoryHostServiceInstanceLease& PhysicalMemoryHostServiceInstanceLease::operator=(PhysicalMemoryHostServiceInstanceLease&&)noexcept=default;
+    PhysicalMemoryHostServiceInstanceLease::~PhysicalMemoryHostServiceInstanceLease()noexcept=default;
+    void PhysicalMemoryHostServiceInstanceLease::publish()noexcept{
+        if(!state_)std::terminate();std::lock_guard lock(state_->authority->mutex);
+        if(!state_->record->active)std::terminate();state_->record->published=true;
+    }
+    void PhysicalMemoryAuthority::borrowCPUCollectiveProcessPool(const PhysicalMemoryOwnerReservation& original)
+    {
+        const auto root = original.state_;
+        if (!root || root->owner != PhysicalMemoryOwner::NativeCPUCollectiveProcessPool || !root->capacity_bytes)
+            throw std::logic_error("MPI process pool borrow requires its original named reservation");
+        const auto source = original.allocatorIdentity();
+        if (source.world_rank != world_rank_ || source.device != DeviceId::cpu())
+            throw std::logic_error("MPI process pool borrow names a foreign CPU allocator");
+        const auto target = ledger_.state_;
+        if (target == root->authority) {
+            std::lock_guard lock(target->mutex);
+            if (target->phase != PhysicalMemoryAuthorityPhase::Admitted || !target->certificate || !root->registered || root->materialized_bytes)
+                throw std::logic_error("MPI process pool original commitment is not live/admitted");
+            return; // Already committed by this very ledger, never another reservation.
+        }
+        const auto certificate = requireAdmitted(*target);
+        const auto& resources = certificate->plan().resources();
+        std::scoped_lock lock(target->mutex, root->authority->mutex);
+        if (target->phase != PhysicalMemoryAuthorityPhase::Admitted || target->certificate != certificate ||
+            root->authority->phase != PhysicalMemoryAuthorityPhase::Admitted || !root->authority->certificate)
+            throw std::logic_error("MPI process pool admission identity changed before locked publication");
+        const auto found = std::find_if(resources.begin(), resources.end(), [&](const auto& bom){ return matches(bom.resource(), source); });
+        const auto owner = ownerIndex(root->owner);
+        if (found == resources.end() || found->charge(root->owner).incrementalBytes() != root->capacity_bytes ||
+            found->charge(root->owner).already_resident_bytes != 0 ||
+            found->resource().total_bytes != root->authority->certificate->plan().resources()[root->resource_index].resource().total_bytes || !root->registered || root->materialized_bytes != 0)
+            throw std::logic_error("MPI process pool borrow requires matching admitted potential growth, never resident credit");
+        auto& claims = target->claims[static_cast<std::size_t>(found-resources.begin())];
+        if (const auto previous = claims.cpu_collective_pool_borrow.lock()) {
+            if (previous != root) throw std::logic_error("MPI process pool borrow already belongs to another original session");
+            return;
+        }
+        if (claims.new_allocations[owner] || claims.new_reservation_capacity[owner] || claims.preparation_committed[owner])
+            throw std::logic_error("MPI process pool borrow cannot duplicate a local commitment");
+        claims.cpu_collective_pool_borrow = root;
+    }
+
+    void PhysicalMemoryAuthority::requireOriginalHostServiceOwner(const std::shared_ptr<PhysicalMemoryAuthority>& memory)const{
+        const auto original=weak_from_this().lock();
+        if(!memory||memory.get()!=this||!original||original.get()!=this||original.owner_before(memory)||memory.owner_before(original))
+            throw std::logic_error("CPU service requires its original canonical PMA shared owner/controlblock");
+    }
+    PhysicalMemoryHostServiceInstanceLease PhysicalMemoryAuthority::claimHostServiceInstance(
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,const RetainedHostServiceInstance& instance,
+        const std::string& program,PhysicalMemoryHostServiceInstancePolicy policy){
+        requireOriginalHostServiceOwner(memory);
+        if(instance.worldRank!=world_rank_||!instance.consumer.is_valid()||program.empty())throw std::logic_error("CPU service original instance identity is incomplete/foreign");
+        auto lease=std::make_unique<PhysicalMemoryHostServiceInstanceLease::State>();
+        lease->authority=ledger_.state_;
+        // No PMA lock spans source checks, native creators or existing byte claims.
+        std::lock_guard lock(ledger_.state_->mutex);
+        if(ledger_.state_->phase!=PhysicalMemoryAuthorityPhase::Admitted)throw std::logic_error("CPU service original instance requires final admission");
+        auto& records=ledger_.state_->host_service_instances;
+        auto found=std::find_if(records.begin(),records.end(),[&](const auto& record){return record->instance==instance;});
+        if(found!=records.end()){
+            const auto& record=*found;
+            if(record->active||record->policy!=policy||record->original_program!=program||
+               (record->published&&policy==PhysicalMemoryHostServiceInstancePolicy::OneShot))
+                throw std::logic_error("CPU service original instance already active/consumed or changed policy");
+            lease->record=record;
+        }else{
+            auto record=std::make_shared<detail::PhysicalMemoryHostServiceInstanceRecord>(detail::PhysicalMemoryHostServiceInstanceRecord{instance,program,policy});
+            records.push_back(record);lease->record=std::move(record);
+        }
+        lease->record->active=true;
+        return PhysicalMemoryHostServiceInstanceLease(std::move(lease));
     }
 
     PhysicalMemoryAuthority::PhysicalMemoryAuthority(
@@ -1154,13 +2368,13 @@ namespace llaminar2
         }
     }
 
-    const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &
-    PhysicalMemoryAuthority::admission() const noexcept
+    const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &PhysicalMemoryAuthority::
+        admission() const
     {
         return ledger_.admission();
     }
 
-    bool PhysicalMemoryAuthority::contains(DeviceId device) const noexcept
+    bool PhysicalMemoryAuthority::contains(DeviceId device) const
     {
         if (!device.is_valid())
             return false;
@@ -1202,6 +2416,30 @@ namespace llaminar2
         std::size_t bytes)
     {
         return ledger_.claimNewAllocation(identity(device), owner, bytes);
+    }
+
+    PhysicalMemoryMaterializationLedger::PhysicalMemoryMaterializationLedger(
+        std::span<const PhysicalMemoryResource> observations)
+        : state_(std::make_shared<detail::PhysicalMemoryMaterializationState>(observations))
+    {
+    }
+
+    PhysicalMemoryAuthority::PhysicalMemoryAuthority(
+        std::span<const PhysicalMemoryResource> observations, int rank, PreparingNativeStorageTag)
+        : world_rank_(rank), ledger_(observations)
+    {
+        if (rank < 0 ||
+            std::none_of(
+                ledger_.state_->observations.begin(), ledger_.state_->observations.end(),
+                [&](const auto &r) { return r.world_rank == rank && r.device == DeviceId::cpu(); }))
+            throw std::invalid_argument(
+                "Native Preparing requires its original local CPU0 physical allocator");
+    }
+
+    PhysicalMemoryAuthorityPhase PhysicalMemoryAuthority::phase() const
+    {
+        std::lock_guard lock(ledger_.state_->mutex);
+        return ledger_.state_->phase;
     }
 
     PhysicalMemoryAllocationLease
@@ -1285,73 +2523,23 @@ namespace llaminar2
 
     bool PhysicalMemoryAuthority::rankComplete() const
     {
-        const auto &resources = admission()->plan().resources();
-        for (const auto &bom : resources)
-        {
-            if (bom.resource().world_rank != world_rank_)
-                continue;
-            for (std::size_t owner_index = 0;
-                 owner_index < PhysicalMemoryBOM::ownerCount();
-                 ++owner_index)
-            {
-                const auto owner = PhysicalMemoryBOM::ownerAt(owner_index);
-                const auto &charge = bom.charge(owner);
-                const DeviceId device = bom.resource().device;
-                if (claimedBytes(
-                        device,
-                        owner,
-                        PhysicalMemoryMaterializationKind::NewAllocation) !=
-                        charge.incrementalBytes() ||
-                    claimedBytes(
-                        device,
-                        owner,
-                        PhysicalMemoryMaterializationKind::AdoptedResident) !=
-                        charge.already_resident_bytes)
-                {
-                    return false;
-                }
-            }
-        }
-        return true;
+        const auto rows = rankAttestation();
+        return std::all_of(rows.begin(), rows.end(),
+                           [](const auto &row) { return row.complete(); });
     }
 
     void PhysicalMemoryAuthority::requireRankComplete() const
     {
-        const auto &resources = admission()->plan().resources();
-        for (const auto &bom : resources)
-        {
-            if (bom.resource().world_rank != world_rank_)
-                continue;
-            for (std::size_t owner_index = 0;
-                 owner_index < PhysicalMemoryBOM::ownerCount();
-                 ++owner_index)
-            {
-                const auto owner = PhysicalMemoryBOM::ownerAt(owner_index);
-                const auto &charge = bom.charge(owner);
-                const DeviceId device = bom.resource().device;
-                const auto newly_claimed = claimedBytes(
-                    device,
-                    owner,
-                    PhysicalMemoryMaterializationKind::NewAllocation);
-                const auto resident_claimed = claimedBytes(
-                    device,
-                    owner,
-                    PhysicalMemoryMaterializationKind::AdoptedResident);
-                if (newly_claimed == charge.incrementalBytes() &&
-                    resident_claimed == charge.already_resident_bytes)
-                {
-                    continue;
-                }
-                throw std::logic_error(
-                    "Rank-local physical memory materialization is incomplete for " +
-                    bom.resource().id() + " owner=" +
-                    std::string(toString(owner)) + " new=" +
-                    std::to_string(newly_claimed) + "/" +
-                    std::to_string(charge.incrementalBytes()) +
-                    " retained=" + std::to_string(resident_claimed) + "/" +
-                    std::to_string(charge.already_resident_bytes));
-            }
-        }
+        const auto rows = rankAttestation();
+        for (const auto &row : rows)
+            if (!row.complete())
+                throw std::logic_error("Physical rank materialization incomplete for " +
+                                       row.identity.toString() +
+                                       " owner=" + std::string(toString(row.owner)) +
+                                       " new=" + std::to_string(row.materialized_new_bytes) + "/" +
+                                       std::to_string(row.planned_new_bytes) +
+                                       " retained=" + std::to_string(row.adopted_resident_bytes) +
+                                       "/" + std::to_string(row.planned_resident_bytes));
     }
 
     bool PhysicalMemoryAuthority::rankCommitted() const
@@ -1450,31 +2638,32 @@ namespace llaminar2
         bool first = true;
         for (const auto &row : rows)
         {
-            const bool zero = row.planned_new_bytes == 0u &&
-                              row.planned_resident_bytes == 0u &&
-                              row.materialized_new_bytes == 0u &&
-                              row.committed_new_bytes == 0u &&
-                              row.adopted_resident_bytes == 0u;
+            const bool zero = row.planned_new_bytes == 0u && row.planned_resident_bytes == 0u &&
+                              row.materialized_new_bytes == 0u && row.committed_new_bytes == 0u &&
+                              row.adopted_resident_bytes == 0u &&
+                              row.native_declared_preclaimed_bytes == 0u;
             if (zero && !include_zero_lines)
                 continue;
             if (!first)
                 output << '\n';
             first = false;
-            output << row.identity.toString()
-                   << " owner=" << toString(row.owner)
-                   << " planned_new=" << row.planned_new_bytes
+            output << row.identity.toString() << " phase=" << toString(row.phase)
+                   << " owner=" << toString(row.owner) << " planned_new=" << row.planned_new_bytes
                    << " committed_new=" << row.committed_new_bytes
-                   << " materialized_new="
-                   << row.materialized_new_bytes
-                   << " planned_resident="
-                   << row.planned_resident_bytes
-                   << " adopted_resident="
-                   << row.adopted_resident_bytes
-                   << " committed="
-                   << (row.committed() ? "true" : "false")
-                   << " complete="
-                   << (row.complete() ? "true" : "false");
+                   << " materialized_new=" << row.materialized_new_bytes
+                   << " planned_resident=" << row.planned_resident_bytes
+                   << " adopted_resident=" << row.adopted_resident_bytes
+                   << " preparation_committed=" << row.preparation_committed_bytes
+                   << " preparation_materialized=" << row.preparation_materialized_bytes
+                   << " borrowed_opaque_runtime_committed=" << row.borrowed_opaque_runtime_committed_bytes
+                   << " opaque_runtime_committed=" << row.opaque_runtime_committed_bytes
+                   << " native_declared_preclaimed=" << row.native_declared_preclaimed_bytes
+                   << " committed=" << (row.committed() ? "true" : "false")
+                   << " complete=" << (row.complete() ? "true" : "false");
         }
+        if (first && !rows.empty() && rows.front().phase != PhysicalMemoryAuthorityPhase::Admitted)
+            output << "rank=" << world_rank_ << " phase=" << toString(rows.front().phase)
+                   << " source_plan_admitted=false";
         return output.str();
     }
 } // namespace llaminar2

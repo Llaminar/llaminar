@@ -5,11 +5,15 @@
  * These kernels preserve FP32 bit patterns and borrow preallocated disjoint
  * banks. Swapping the transpose's outer dimensions packs model rows for native
  * reduce-scatter; one outer element is a valid copy, not a reason to skip it.
+ * Resident launch geometry combines admitted physical limits with the exact
+ * loaded function's occupancy; runtime resource observations are not cached.
  */
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <algorithm>
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/ColumnShardAssemblyKernels.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
 
 namespace
 {
@@ -176,16 +180,15 @@ extern "C" bool cudaTPKV_deinterleave_live_rank_major_fp32(
     if (cudaSetDevice(device_ordinal) != cudaSuccess) return false;
     constexpr int threads = 256;
     const long long total = static_cast<long long>(rows.capacity()) * degree * local_dim;
-    int processors = 0, active_blocks = 0;
-    if (cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device_ordinal) != cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,
+    const int processors = llaminar2::cudaHardwareMetadata().at(device_ordinal).sm_count;
+    int active_blocks = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,
             tpkv_deinterleave_live_rank_major_fp32_kernel, threads, 0) != cudaSuccess ||
         processors <= 0 || active_blocks <= 0) return false;
     // Recording freezes one fully occupied wave of CTAs. Each CTA strides
     // over the live prefix; large-to-small and empty replays avoid launching
     // thousands of capacity-only CTAs without reading the live count on host.
-    const int blocks = static_cast<int>(std::min(static_cast<long long>(processors) * active_blocks,
-        (total + threads - 1) / threads));
+    const int blocks = llaminar2::residentColumnAssemblyBlockCount(processors, active_blocks, total, threads);
     tpkv_deinterleave_live_rank_major_fp32_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         rank_major, row_major, rows, degree, local_dim);
     return cudaGetLastError() == cudaSuccess;

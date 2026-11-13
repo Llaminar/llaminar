@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -967,5 +968,143 @@ namespace llaminar2::test::parity
         std::string_view key) noexcept
     {
         return mtpParityModelCheckpointContextPrefix(key).has_value();
+    }
+    /**
+     * @brief Ordered native-prefix witness selection inside one declared history window.
+     * This is diagnostic test state, not a controller or allocation authority.
+     * Only actual transaction outcomes can nominate an accepting checkpoint;
+     * rejected observations remain visible and cannot be skipped or reordered.
+     */
+    class MTPParityNativeCheckpointWitness final
+    {
+    public:
+        /** @param maximum_prefix_rows Existing fixture decode window, without extension. */
+        explicit MTPParityNativeCheckpointWitness(int maximum_prefix_rows)
+            : maximum_prefix_rows_(maximum_prefix_rows)
+        {
+            if (maximum_prefix_rows < 0)
+                throw std::invalid_argument("Native MTP checkpoint window cannot be negative");
+        }
+
+        /** @brief Consume one original native transaction outcome in prefix order.
+         * @param prefix_rows Native continuation rows appended to the original prompt.
+         * @param accepted Actual accepted-token counter delta, never a prediction.
+         * @param rejected Actual rejected-token delta, independent from budget clipping.
+         * @param verifier_runs Actual verifier transaction delta.
+         * @throws std::invalid_argument For missing, reordered, duplicate or out-of-window observations. */
+        void observe(int prefix_rows, std::uint64_t accepted, std::uint64_t rejected,
+                     std::uint64_t verifier_runs)
+        {
+            if (accepted_prefix_rows_ || prefix_rows != next_prefix_rows_ ||
+                prefix_rows > maximum_prefix_rows_ || verifier_runs == 0)
+                throw std::invalid_argument("Native MTP checkpoint observation is incomplete or outside its declared order/window");
+            saw_rejection_ = saw_rejection_ || rejected > 0;
+            if (accepted > 0)
+                accepted_prefix_rows_ = prefix_rows;
+            ++next_prefix_rows_;
+        }
+
+        /** @return The first actually accepting native checkpoint, if observed. */
+        std::optional<int> acceptedPrefixRows() const noexcept
+        {
+            return accepted_prefix_rows_;
+        }
+        /** @return Whether an actual rejection was retained, not inferred from unused capacity. */
+        bool sawRejection() const noexcept
+        {
+            return saw_rejection_;
+        }
+        /** @return Whether the original window has no unobserved checkpoint remaining. */
+        bool exhausted() const noexcept
+        {
+            return next_prefix_rows_ > maximum_prefix_rows_;
+        }
+
+    private:
+        int maximum_prefix_rows_;
+        std::int64_t next_prefix_rows_ = 0;
+        std::optional<int> accepted_prefix_rows_;
+        bool saw_rejection_ = false;
+    };
+
+    /** @brief Observed verifier identity and actual work from one existing observation interval. */
+    struct MTPParityVerifierDepthObservation
+    {
+        int draft_depth = 0; ///< Last original committed verifier identity.
+        std::size_t proposal_count = 0; ///< Live extent of that identity's original proposal vector.
+        std::uint64_t verifier_runs = 0; ///< Actual completed verifier counter delta.
+        std::uint64_t attempted_drafts = 0; ///< Actual attempted draft counter delta.
+    };
+
+    /**
+     * @brief Distinguish an isolated full-depth checkpoint from a later response's terminal identity.
+     * @param required_depth Exact selected depth proven by the isolated original checkpoint.
+     * @param retained_capacity Actual original admitted maximum graph depth.
+     * @param isolated Original single-transaction checkpoint, already checked against its native input rows.
+     * @param terminal Last identity of the later, possibly multi-transaction acceptance response.
+     * @return True only for complete, capacity-valid original evidence in both intervals.
+     * A Dynamic controller may shrink OR grow after the initial checkpoint. Its
+     * terminal identity must match its own live proposal extent, not initial depth.
+     */
+    [[nodiscard]] constexpr bool validMTPParityAcceptanceDepthAttribution(
+        int required_depth, int retained_capacity,
+        MTPParityVerifierDepthObservation isolated,
+        MTPParityVerifierDepthObservation terminal) noexcept
+    {
+        const auto valid = [retained_capacity](MTPParityVerifierDepthObservation observed) {
+            return observed.draft_depth > 0 && observed.draft_depth <= retained_capacity &&
+                observed.proposal_count == static_cast<std::size_t>(observed.draft_depth) &&
+                observed.verifier_runs > 0 &&
+                observed.attempted_drafts >= static_cast<std::uint64_t>(observed.draft_depth);
+        };
+        return required_depth > 0 && required_depth <= retained_capacity &&
+            isolated.draft_depth == required_depth && isolated.verifier_runs == 1 &&
+            valid(isolated) && valid(terminal);
+    }
+    /**
+     * @brief Select the exact committed serial boundary using original continuation evidence.
+     * @param positions Original serial snapshot positions, in the byte-checked output order.
+     * @param tokens Original byte-checked serial output trajectory.
+     * @param candidate_position Position from the original candidate device publication.
+     * @param continuation Original packed publication plus authenticated ready disposition.
+     * @return Unique final frontier, or the preceding frontier only with an exact already-emitted token proof.
+     * Missing evidence never authorizes comparison to an earlier state. A same
+     * final-position comparison retains the original full-state contract unchanged.
+     */
+    [[nodiscard]] inline std::optional<std::size_t> selectMTPParityCommittedFrontier(
+        std::span<const int> positions, std::span<const int32_t> tokens,
+        int candidate_position, const std::optional<PrefixResidentConditionProbe> &continuation)
+    {
+        if (positions.empty() || positions.size() != tokens.size() || candidate_position < 0)
+            return std::nullopt;
+        // This oracle owns consecutive committed rows, not arbitrary matching
+        // coordinates borrowed from another response or a gapped history.
+        for (std::size_t row = 0; row < positions.size(); ++row)
+            if (positions[row] < 0 || (row > 0 &&
+                static_cast<std::int64_t>(positions[row-1])+1 != positions[row]))
+                return std::nullopt;
+        std::optional<std::size_t> selected;
+        for (std::size_t row = 0; row < positions.size(); ++row)
+            if (positions[row] == candidate_position)
+            {
+                if (selected) return std::nullopt;
+                selected = row;
+            }
+        if (!selected) return std::nullopt;
+        if (*selected == positions.size()-1)
+        {
+            // An authenticated already-emitted condition is still owed to the
+            // model. It cannot simultaneously name this fully committed end.
+            if (continuation && continuation->response_disposition ==
+                sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted)
+                return std::nullopt;
+            return selected;
+        }
+        if (*selected+2 != positions.size() || !continuation ||
+            !continuation->isAlreadyEmitted() ||
+            continuation->target_position != candidate_position ||
+            continuation->next_condition_token != tokens.back())
+            return std::nullopt;
+        return selected;
     }
 } // namespace llaminar2::test::parity

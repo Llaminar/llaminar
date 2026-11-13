@@ -69,7 +69,7 @@ inline std::size_t checkedProduct(
 /**
  * @brief Declare the stable buffers used by one quantized projection.
  *
- * All GGUF quantization codebooks are repacked to the same NativeVNNI runtime
+ * All GGUF quantization codebooks are repacked to the same NativeQuantised runtime
  * representation, so this contract is intentionally codebook-independent.
  * Buffer names, reduction capacity, verifier-row tiling, and alignment are the
  * ABI consumed by captured graphs; changing any of them changes memory
@@ -129,7 +129,7 @@ inline WorkspaceRequirements projectionRequirements(
      * larger grouped calls execute several tiles against this same address.
      */
     const std::size_t scatter_rows = static_cast<std::size_t>(
-        std::clamp(rows, 1, kDefaultNativeVNNIVerifierRowCapacity));
+        std::clamp(rows, 1, kDefaultNativeQuantisedVerifierRowCapacity));
     std::size_t scatter_elements = checkedProduct(
         static_cast<std::size_t>(kScatterKBlockCapacity),
         scatter_rows,
@@ -204,7 +204,7 @@ inline void appendFusedProjectionRequirements(
     }
 
     const std::size_t verifier_rows = static_cast<std::size_t>(
-        std::clamp(rows, 1, kDefaultNativeVNNIVerifierRowCapacity));
+        std::clamp(rows, 1, kDefaultNativeQuantisedVerifierRowCapacity));
     std::size_t elements = checkedProduct(
         static_cast<std::size_t>(kScatterKBlockCapacity),
         verifier_rows,

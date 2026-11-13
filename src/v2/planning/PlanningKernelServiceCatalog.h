@@ -129,8 +129,9 @@ namespace llaminar2
          *
          * Call on all ranks before root-only candidate selection. Allocation
          * admission, payload publication and completed observations have separate
-         * collective failure boundaries. Samplers run serially within a rank to
-         * avoid measuring self-contention and share the PMA's per-owner envelope;
+         * collective failure boundaries. Timed samplers run serially within a rank.
+         * Ordinary projection GPU cold preparation overlaps under a summed concurrent host BOM;
+         * all warmups retire before timing, while CPU observation is exclusive.
          * GPU work runs on its normal owning worker, never in a native MPI progress callback.
          */
         static std::optional<PlanningKernelServiceCatalog> collect(

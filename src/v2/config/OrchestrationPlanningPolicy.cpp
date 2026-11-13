@@ -147,7 +147,7 @@ namespace llaminar2
 
     bool AutomaticOrchestrationOptions::specified() const noexcept
     {
-        return only_backends || only_strategies || prefer_backend || prefer_strategy || host_participation || workload || device_counts;
+        return only_backends || only_strategies || prefer_backend || prefer_strategy || host_participation || workload || device_counts || pipeline_stage_widths;
     }
 
     AutomaticOrchestrationRequest::AutomaticOrchestrationRequest(AutomaticOrchestrationOptions options)
@@ -163,6 +163,38 @@ namespace llaminar2
             for (const auto &entry : *options_.device_counts)
                 if (entry.count <= 0 || !allows(entry.backend) || !seen.insert(entry.backend).second)
                     throw std::invalid_argument("Automatic device counts require positive counts, distinct permitted backends");
+        }
+        if (options_.pipeline_stage_widths)
+        {
+            const auto &widths = *options_.pipeline_stage_widths;
+            if (widths.empty() || !permitted(options_.only_strategies, OrchestrationStrategy::PipelineParallel))
+                throw std::invalid_argument("Automatic pipeline stage widths require nonempty PP-compatible intent");
+            int total = 0;
+            for (const int width : widths)
+            {
+                if (width <= 0 || width > std::numeric_limits<int>::max() - total)
+                    throw std::invalid_argument("Automatic pipeline stage widths require positive integers with a representable total");
+                total += width;
+            }
+            if (options_.device_counts)
+            {
+                int counted = 0;
+                for (const auto &entry : *options_.device_counts)
+                {
+                    if (entry.count > total - counted)
+                        throw std::invalid_argument("Automatic device counts exceed the requested pipeline widths");
+                    counted += entry.count;
+                }
+                // Only a closed backend inventory fixes the total. An omitted
+                // backend count leaves legal endpoints of that backend available.
+                const bool complete = options_.only_backends && std::all_of(
+                    options_.only_backends->begin(), options_.only_backends->end(), [&](DeviceType backend) {
+                        return std::any_of(options_.device_counts->begin(), options_.device_counts->end(),
+                            [&](const auto &entry) { return entry.backend == backend; });
+                    });
+                if (complete && counted != total)
+                    throw std::invalid_argument("Automatic pipeline widths differ from the complete exact device counts");
+            }
         }
         if (options_.host_participation &&
             *options_.host_participation != AutomaticHostParticipation::BestSubset &&
@@ -181,7 +213,8 @@ namespace llaminar2
 
     bool AutomaticOrchestrationRequest::allows(OrchestrationStrategy strategy) const noexcept
     {
-        return permitted(options_.only_strategies, strategy);
+        return permitted(options_.only_strategies, strategy) &&
+            (!options_.pipeline_stage_widths || strategy == OrchestrationStrategy::PipelineParallel);
     }
 
     bool AutomaticOrchestrationRequest::allows(
@@ -190,11 +223,37 @@ namespace llaminar2
         if (!allows(strategy) || participants.empty() ||
             !std::all_of(participants.begin(), participants.end(), [this](DeviceType backend) { return allows(backend); }))
             return false;
+        if (options_.pipeline_stage_widths && participants.size() != static_cast<std::size_t>(
+                std::accumulate(options_.pipeline_stage_widths->begin(), options_.pipeline_stage_widths->end(), 0)))
+            return false;
         if (options_.device_counts)
             for (const auto &entry : *options_.device_counts)
                 if (std::count(participants.begin(), participants.end(), entry.backend) != entry.count)
                     return false;
         return true;
+    }
+
+    std::vector<int> parseAutomaticPipelineStageWidths(std::string_view value)
+    {
+        std::vector<int> widths;
+        for (;;)
+        {
+            const auto comma = value.find(',');
+            const auto token = trimToken(value.substr(0, comma));
+            if (token.empty())
+                throw std::invalid_argument("Automatic pipeline stage widths cannot contain an empty item");
+            int width = 0;
+            const auto parsed = std::from_chars(token.data(), token.data() + token.size(), width);
+            if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || width <= 0)
+                throw std::invalid_argument("Automatic pipeline stage widths require comma-separated positive integers");
+            widths.push_back(width);
+            if (comma == std::string_view::npos) break;
+            value.remove_prefix(comma + 1);
+        }
+        AutomaticOrchestrationOptions options;
+        options.pipeline_stage_widths = widths;
+        (void)AutomaticOrchestrationRequest(std::move(options));
+        return widths;
     }
 
     std::vector<AutomaticBackendDeviceCount> parseAutomaticDeviceCounts(std::string_view value)

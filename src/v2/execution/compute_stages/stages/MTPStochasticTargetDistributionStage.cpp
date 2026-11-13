@@ -1,6 +1,10 @@
 /**
  * @file MTPStochasticTargetDistributionStage.cpp
  * @brief Device-only implementation of captured stochastic target preparation.
+ *
+ * Canonical all-position logits remain raw for terminal accepted-row publication.
+ * The selector consumes request history on candidate reads; only compact tables
+ * and their already-admitted reduction scratch are outputs of this stage.
  */
 
 #include "MTPStochasticTargetDistributionStage.h"
@@ -75,31 +79,36 @@ namespace llaminar2
         if (!stream)
             return false;
 
-        if (params_.apply_penalties)
+        const auto build = [&]()
         {
-            /*
-             * The graph consumes request-admitted policy and the history bit
-             * published by the previous accepted-state transaction. Mutation is
-             * forbidden here: this stage owns logits/distribution bytes only.
-             */
-            if (!params_.backend->enqueueApplyMTPPenaltiesToF32RowsDevice(
+            if (params_.apply_penalties)
+            {
+                const auto history = params_.active_rows_device
+                    ? GenerationPenaltyHistory::speculative(
+                          params_.generated_token_counts_device, params_.penalty_policy_device,
+                          params_.verifier_input_tokens_device, params_.active_rows_device)
+                    : GenerationPenaltyHistory::speculativeFixedRows(
+                          params_.generated_token_counts_device, params_.penalty_policy_device,
+                          params_.verifier_input_tokens_device, params_.row_count);
+                return params_.backend->enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
                     params_.logits_device,
                     params_.row_count,
                     params_.vocab_size,
                     params_.logits_row_stride,
-                    params_.verifier_input_tokens_device,
-                    params_.generated_token_counts_device,
-                    params_.penalty_policy_device,
+                    params_.top_k,
+                    params_.top_p,
+                    params_.temperature,
                     params_.device_id.gpu_ordinal(),
                     stream,
-                    params_.active_rows_device))
-            {
-                LOG_ERROR("[MTPStochasticTargetDistributionStage] Device-history penalty transform failed");
-                return false;
+                    params_.target_token_ids_device,
+                    params_.target_row_stride,
+                    params_.target_probs_device,
+                    params_.topk_partial_values_device,
+                    params_.topk_partial_indices_device,
+                    params_.topk_partial_capacity,
+                    history);
             }
-        }
-
-        if (!params_.backend->enqueueBuildTopKTopPDistributionsF32Device(
+            return params_.backend->enqueueBuildTopKTopPDistributionsF32Device(
                 params_.logits_device,
                 params_.row_count,
                 params_.vocab_size,
@@ -115,7 +124,9 @@ namespace llaminar2
                 params_.topk_partial_values_device,
                 params_.topk_partial_indices_device,
                 params_.topk_partial_capacity,
-                params_.active_rows_device))
+                params_.active_rows_device);
+        };
+        if (!build())
         {
             LOG_ERROR("[MTPStochasticTargetDistributionStage] Compact target-row construction failed");
             return false;
@@ -172,7 +183,7 @@ namespace llaminar2
         contract.inputs.reserve(
             (params_.apply_penalties ? 4U : 1U) +
             (params_.active_rows_device ? 1U : 0U));
-        contract.outputs.reserve(params_.apply_penalties ? 5U : 4U);
+        contract.outputs.reserve(4U);
         contract.addInput(BufferId::ALL_POSITION_LOGITS);
         if (params_.active_rows_device)
             contract.addInput(BufferId::MTP_VERIFIER_REQUEST_LENGTHS);
@@ -182,7 +193,6 @@ namespace llaminar2
             contract.addInput(BufferId::MTP_GENERATED_TOKEN_COUNTS);
             contract.addInput(BufferId::MTP_GREEDY_PENALTY_POLICY);
         }
-        contract.addOutput(BufferId::ALL_POSITION_LOGITS);
         contract.addOutput(BufferId::STOCHASTIC_TARGET_TOKEN_IDS);
         contract.addOutput(BufferId::STOCHASTIC_TARGET_PROBS);
         contract.addOutput(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS);

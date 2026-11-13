@@ -13,6 +13,7 @@
 #include <gmock/gmock.h>
 
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/factory/ImmutableRowTableParticipantRole.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
@@ -145,6 +146,51 @@ namespace
                 compact.push_back(ch);
         }
         return compact;
+    }
+
+    /**
+     * @test CPU factory construction cannot bypass original-plan admission with eager payload getters.
+     *
+     * The common-loader lifecycle suite executes the admitted writer. This
+     * architecture check additionally protects the concrete GGUF factory, whose
+     * real model/device graph setup belongs to source-admission integration.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract, CPUWeightsStartAtAdmittedPlan)
+    {
+        const auto source = readFactorySourceFile("src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        const std::string signature = "static bool configureOrchestratorWeightsImpl(";
+        const auto declaration = source.find(signature);
+        ASSERT_NE(declaration, std::string::npos);
+        const auto definition = source.find(signature, declaration + signature.size());
+        ASSERT_NE(definition, std::string::npos);
+        const auto plan = source.find("auto weight_plan = buildSingleDeviceWeightPlan(", definition);
+        ASSERT_NE(plan, std::string::npos);
+        auto prelude = source.substr(definition, plan - definition);
+        const auto gpu_guard = prelude.find("if (device.is_gpu())");
+        ASSERT_NE(gpu_guard, std::string::npos);
+        const auto open = prelude.find('{', gpu_guard);
+        ASSERT_NE(open, std::string::npos);
+        size_t depth = 1;
+        size_t end = open + 1;
+        for (; end < prelude.size() && depth; ++end)
+        {
+            if (prelude[end] == '{') ++depth;
+            else if (prelude[end] == '}') --depth;
+        }
+        ASSERT_EQ(depth, 0u);
+        const auto gpu_body = withoutFactorySourceWhitespace(prelude.substr(open, end - open));
+        EXPECT_NE(gpu_body.find("getWeightForDevice(name,device,"), std::string::npos);
+        EXPECT_NE(gpu_body.find("getShardedWeightForAssignment(name,device,"), std::string::npos);
+        EXPECT_NE(gpu_body.find("forRank(graph_config.local_rank)"), std::string::npos);
+        EXPECT_EQ(gpu_body.find("DeviceId::cpu("), std::string::npos);
+        prelude.erase(gpu_guard, end - gpu_guard);
+        for (const char *bypass : {"getWeightForDevice(", "getShardedWeightForAssignment(", "hostRamPreflight("})
+            EXPECT_EQ(prelude.find(bypass), std::string::npos) << bypass;
+        const auto admission = source.find("installPreparedWeightStoreForPlan(", plan);
+        const auto materialization = source.find("weight_mgr->materialize(weight_plan)", plan);
+        ASSERT_NE(admission, std::string::npos);
+        ASSERT_NE(materialization, std::string::npos);
+        EXPECT_LT(admission, materialization);
     }
 
     // =============================================================================
@@ -810,38 +856,6 @@ namespace
     }
 
     /**
-     * @brief Replicated dense decode plans must keep MTP verifier sidecar weights.
-     *
-     * Base-layer routed experts are excluded from the dense decode subset because
-     * ExpertOverlay owns their residency separately. Qwen3.6 MTP is different:
-     * its trailing nextn block is the verifier path itself, so even nextn tensors
-     * with ffn_*_exps names must remain in the replicated decode weight plan.
-     */
-    TEST(Test__InferenceRunnerFactory_SourceContract,
-         DecodeReplicatedDensePlansRetainNextNMTPSidecarWeights)
-    {
-        const std::string source =
-            readFactorySourceFile("src/v2/execution/factory/InferenceRunnerFactory.cpp");
-        ASSERT_FALSE(source.empty());
-
-        EXPECT_NE(source.find("weight_name.find(\".nextn.\")"),
-                  std::string::npos)
-            << "phase-split dense decode must keep Qwen3.6 nextn verifier weights";
-        EXPECT_NE(source.find("weight_name.rfind(\"mtp.\", 0)"),
-                  std::string::npos)
-            << "generic mtp.layers verifier weights must also remain in the dense decode plan";
-        EXPECT_NE(source.find("discoverDenseDecodeMTPSourceLayers"),
-                  std::string::npos)
-            << "Qwen3.6 nextn source-layer discovery must keep normal-named sidecar attention/expert weights";
-        EXPECT_NE(source.find("inferWeightLayer(weight_name)"),
-                  std::string::npos)
-            << "dense decode filtering must recognize the full trailing nextn layer, not only names containing nextn";
-        EXPECT_NE(source.find("grouped MTP rows remain mathematically identical to serial decode"),
-                  std::string::npos)
-            << "the source contract should document the parity reason for keeping MTP sidecar weights";
-    }
-
-    /**
      * @brief The MTP replica plan consumes typed manifest ownership directly.
      *
      * Source-layer substring filters cannot distinguish a locally replicated
@@ -935,15 +949,19 @@ namespace
                 "src/v2/execution/factory/InferenceRunnerFactory.cpp");
         ASSERT_FALSE(source.empty());
 
-        EXPECT_NE(source.find("participant.world_rank == rank &&"),
+        EXPECT_NE(source.find("MoEExpertOverlayGraphScope::resolveForTPParticipant("),
                   std::string::npos)
-            << "overlay slice selection must authenticate the exact MPI rank";
-        EXPECT_NE(source.find("participant.device == graph_device ||"),
+            << "logical rank/device/index ownership must use the source-bound scope";
+        EXPECT_NE(source.find("filteredForGraphScope(*runtime, scope)"),
                   std::string::npos)
-            << "ordinary LocalTP slices must authenticate the exact graph device";
-        EXPECT_NE(source.find("graph_owns_colocated_cpu_endpoints &&"),
+            << "source loading must consume the same exact scope as preparation";
+        EXPECT_NE(source.find("hasRole(OverlayRankRole::ContinuationRoot)"),
+                  std::string::npos);
+        EXPECT_NE(source.find("device == runtime.continuationDevice()"),
                   std::string::npos)
-            << "only the continuation-root graph may add colocated CPU sparse endpoints";
+            << "only the exact continuation graph can own colocated endpoints";
+        EXPECT_NE(source.find("MoEOverlayColocatedCPUOwnership::CurrentRank"),
+                  std::string::npos);
         EXPECT_GE(
             countFactorySourceOccurrences(
                 source,
@@ -1031,11 +1049,11 @@ namespace
             << "current-batch LLEP must validate its declared graph policy before lowering";
         EXPECT_NE(
             source.find(
-                "routed_prefill_assignment=least-loaded-resident"),
+                "expert_prefill_assignment=least-loaded-resident"),
             std::string::npos)
             << "a missing explicit LLEP prefill assignment must fail with actionable diagnostics";
         EXPECT_NE(
-            source.find("routed_decode_assignment=static-owner"),
+            source.find("expert_decode_assignment=static-owner"),
             std::string::npos)
             << "the economical grouped-verifier assignment must be validated independently";
     }
@@ -1724,3 +1742,32 @@ namespace
     }
 
 } // namespace
+
+/** @test Preserve fixed-head preparation roles across PP ownership and repeated setup decisions. */
+TEST(ImmutableRowTableParticipantPreparation, FixedPipelineStorageSurvivesPLELayerFiltering)
+{
+    const std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> stages{
+        {{0, DeviceId::rocm(7)}, {0, DeviceId::rocm(6)}, {0, DeviceId::rocm(8)}, {0, DeviceId::rocm(9)}},
+        {{0, DeviceId::rocm(1)}, {0, DeviceId::rocm(3)}, {0, DeviceId::rocm(4)}, {0, DeviceId::rocm(2)}}};
+    using Role = ImmutableRowTableParticipantRole;
+    // A second source policy places PLE in the later stage. Physical source
+    // ownership must survive either direction and repeated cold-family setup.
+    for (const int ple_stage : {0, 1, 0}) {
+        const auto pipeline = ImmutableFixedHeadPipelineProjection::checked(0, ple_stage, 32, 64, stages);
+        const int ple = ple_stage * 24;
+        for (int replay = 0; replay < 3; ++replay) {
+            for (int stage = 0; stage < 2; ++stage) {
+                for (const auto &owner : stages[stage]) {
+                    EXPECT_EQ(immutableRowTableParticipantRole(ple, stage * 24, 24, owner.device, &pipeline),
+                        Role::FixedPipelineStorage);
+                    EXPECT_EQ(immutableRowTableParticipantRole(ple, stage * 24, 24, owner.device, nullptr),
+                        stage == ple_stage ? Role::Consumer : Role::None);
+                    EXPECT_EQ(immutableRowTableParticipantRole(std::nullopt, stage * 24, 24, owner.device, &pipeline),
+                        Role::None);
+                }
+            }
+            EXPECT_EQ(immutableRowTableParticipantRole(ple, (1 - ple_stage) * 24, 24,
+                DeviceId::rocm(0), &pipeline), Role::None);
+        }
+    }
+}

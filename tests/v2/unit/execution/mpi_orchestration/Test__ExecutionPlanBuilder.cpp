@@ -20,6 +20,7 @@
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "execution/global_pp/GlobalPPTopology.h"
+#include "planning/RankHardwareOwnership.h"
 
 using namespace llaminar2;
 
@@ -1229,8 +1230,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
 TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainSingleRankCpuLocalTPResolvesLocalNuma)
 {
     auto cluster = ClusterInventoryBuilder()
-                       .addRank(0, "localhost", 0,
-                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .addRank(0, "localhost", 0)
                        .build();
 
     // Only an unbound whole-host observation owns both physical endpoints.
@@ -1242,8 +1242,6 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainSingleRankCpuLocalTPReso
         cluster.ranks[0].cpu_socket_info.push_back(socket);
     }
 
-    config.domain_definitions.push_back(DomainDefinition::parse(
-        "rocm_hot=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"));
     config.domain_definitions.push_back(DomainDefinition::parse(
         "cpu_cold=0:cpu:0,1:cpu:0;scope=rank_local;backend=upi;owner=0"));
 
@@ -1558,4 +1556,137 @@ TEST(Test__RenderTopologyInfo, ContainsDomainNamesAndRankCounts)
     // Must mention per-rank counts
     EXPECT_NE(info.find("rank 0"), std::string::npos);
     EXPECT_NE(info.find("rank 1"), std::string::npos);
+}
+
+/** @test Physical sparse NUMA identities, never rank arithmetic, admit both GPU vendors. */
+TEST(RankLocalGPUOwnership, RequiresKnownExactNUMAForEveryVendor)
+{
+    RankInventory rank;
+    rank.rank = 5;
+    rank.cpu.numa_node = 13;
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        DeviceInfo gpu;
+        gpu.type = backend;
+        gpu.local_device_id = 9;
+        for (const int node : {-1, 0, 13, 19})
+        {
+            gpu.numa_node = node;
+            EXPECT_EQ(rankOwnsGPUDevice(rank, gpu), node == 13);
+            if (node != 13)
+                EXPECT_THROW(requireRankLocalGPUOwnership(rank, gpu, "authored domain"), std::invalid_argument);
+        }
+        gpu.numa_node = 13;
+        rank.cpu.numa_node = -1;
+        EXPECT_FALSE(rankOwnsGPUDevice(rank, gpu));
+        rank.cpu.numa_node = 13;
+    }
+}
+
+/** @test A GPU-visible remote CPU rank stays CPU-only under implicit selection. */
+TEST_F(Test__ExecutionPlanBuilder, RankLocalGPUOwnershipImplicitLeavesRemoteRankCPUOnly)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = ClusterInventoryBuilder()
+            .addRank(0, "host", 11).addRank(1, "host", 27, {{backend, 3}}).build();
+        inventory.ranks[0].node_id = inventory.ranks[1].node_id = 0;
+        inventory.ranks[0].gpus = inventory.ranks[1].gpus;
+        inventory.buildNodeAggregations();
+        const auto plans = builder->buildAllPlans(config, model, inventory);
+        ASSERT_EQ(plans.size(), 2u);
+        EXPECT_TRUE(plans[0].primary_device.isCPU());
+        EXPECT_TRUE(plans[0].local_tp_devices.empty());
+        EXPECT_EQ(plans[1].primary_device.device_type, backend);
+        EXPECT_EQ(plans[1].primary_device.numa_node, 27);
+        EXPECT_EQ(inventory.ranks[0].gpus.size(), 1u);
+    }
+}
+
+/** @test Explicit domain and simple device-map owners cannot bypass locality admission. */
+TEST_F(Test__ExecutionPlanBuilder, RankLocalGPUOwnershipRejectsPinnedRemoteDomainsAndMaps)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = ClusterInventoryBuilder()
+            .addRank(0, "localhost", 11, {{backend, 3}}).build();
+        inventory.ranks[0].gpus[0].numa_node = 27;
+        const auto token = backend == DeviceType::CUDA ? "cuda" : "rocm";
+        auto authored = config;
+        authored.domain_definitions = {DomainDefinition::parse(std::string("gpu=") + token + ":3")};
+        EXPECT_THROW(builder->buildAllPlans(authored, model, inventory), std::invalid_argument);
+        authored = config;
+        authored.device_mode = DeviceAssignmentMode::EXPLICIT;
+        authored.device_map = {{0, GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, 3))}};
+        try
+        {
+            (void)builder->buildAllPlans(authored, model, inventory);
+            FAIL() << "Remote explicit GPU owner was admitted";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("CPU NUMA=11"), std::string::npos);
+            EXPECT_NE(std::string(error.what()).find("GPU NUMA=27"), std::string::npos);
+        }
+        inventory.ranks[0].cpu.numa_node = 27;
+        EXPECT_NO_THROW(builder->buildAllPlans(authored, model, inventory));
+    }
+}
+
+/** @test Direct legacy/production topology emission cannot reassign a remote local-stage GPU. */
+TEST_F(Test__ExecutionPlanBuilder, RankLocalGPUOwnershipDirectPPTopologyRejectsRemoteOwner)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto cluster = ClusterInventoryBuilder()
+            .addRank(0, "host", 11, {{backend, 0}})
+            .addRank(1, "host", 27, {{backend, 1}}).build();
+        // Full-host discovery: both ranks see both physical endpoints.
+        cluster.ranks[0].gpus.push_back(cluster.ranks[1].gpus.front());
+        cluster.ranks[1].gpus.push_back(cluster.ranks[0].gpus.front());
+        DomainDefinition domain;
+        domain.name = "local_stage";
+        domain.scope = TPScope::RANK_LOCAL;
+        domain.devices = {
+            GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, 0), "host", 11),
+            GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, 1), "host", 27)};
+        domain.explicit_ranks = {0, 1};
+        auto authored = config;
+        authored.domain_definitions = {domain};
+        authored.pp_stage_definitions = {PPStageDefinition::parse("0=local_stage:0-" + std::to_string(model.n_layers - 1))};
+        ExecutionPlanBuilder direct;
+        EXPECT_THROW(direct.buildGlobalPPTopology(authored, model, cluster), std::invalid_argument);
+        // The exact same owner is legal when every member is really local.
+        cluster.ranks[0].gpus[1].numa_node = 11;
+        cluster.ranks[1].gpus[0].numa_node = 11;
+        authored.domain_definitions[0].devices[1].numa_node = 11;
+        authored.domain_definitions[0].explicit_ranks.clear();
+        authored.domain_definitions[0].owner_rank = 0;
+        EXPECT_NO_THROW(direct.buildGlobalPPTopology(authored, model, cluster));
+    }
+}
+
+/** @test Source/cache-only GPU roles require their own original NUMA-local rank. */
+TEST_F(Test__ExecutionPlanBuilder, RankLocalGPUOwnershipRejectsNgramOnlyRemoteGPU)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto other = backend == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA;
+        auto cluster = ClusterInventoryBuilder()
+            .addRank(0, "localhost", 11, {{backend, 3}, {other, 4}}).build();
+        cluster.ranks[0].gpus[0].numa_node = 27;
+        auto authored = config;
+        authored.ngram_table_policy.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+        const auto token = backend == DeviceType::CUDA ? "cuda" : "rocm";
+        const auto coordinator = backend == DeviceType::CUDA ? "rocm" : "cuda";
+        authored.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(
+            std::string("0:") + token + ":3/0/0@0:" + coordinator + ":4");
+        // Compute remains on the local opposite-vendor card; the remote card is storage-only.
+        EXPECT_THROW(builder->buildAllPlans(authored, model, cluster), std::invalid_argument);
+        cluster.ranks[0].gpus[0].numa_node = 11;
+        EXPECT_NO_THROW(builder->buildAllPlans(authored, model, cluster));
+        EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks[0], DeviceId(backend, 3), "cached source role"));
+        cluster.ranks[0].gpus[0].numa_node = 27;
+        EXPECT_THROW(requireRankLocalGPUOwnership(cluster.ranks[0], DeviceId(backend, 3), "cached source role"), std::invalid_argument);
+    }
 }

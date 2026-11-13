@@ -2,7 +2,10 @@
  * @file ROCmGatedDeltaNet.h
  * @brief ROCm/HIP implementation of ITensorGatedDeltaNet
  *
- * Consumes cache-owned, persistently bound GPU recurrence state.
+ * Consumes cache-owned, persistently bound GPU recurrence state. The sole
+ * successful device-state binding freezes its canonical physical layout;
+ * planar/merged launchers carry that same value through decode, grouped rows,
+ * long prefill and snapshots without conversion or a second state bank.
  *
  * Device-pointer design: All input/output pointers passed to chunk_forward()
  * and recurrent_step() are expected to be DEVICE pointers (already on GPU).
@@ -16,8 +19,13 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPlanarRecurrence.h"
+#include "kernels/gdn/GDNPreparedRetainedInvocation.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 extern "C"
 {
@@ -132,6 +140,7 @@ namespace llaminar2
             if (device_state_bound_ || !binding.valid())
                 return false;
 
+            recurrence_layout_ = binding.recurrence_layout;
             gpu_state_ = binding.primary_state;
             state_size_ = binding.primary_state_floats;
             secondary_gpu_state_ = binding.secondary_state;
@@ -142,6 +151,9 @@ namespace llaminar2
             device_state_bound_ = true;
             return true;
         }
+
+        /** @brief Return the layout frozen by the sole successful device-state binding. */
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override { return recurrence_layout_; }
 
         bool resetGPUState(void *stream) override { return resetState(stream); }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
@@ -309,6 +321,14 @@ namespace llaminar2
         {
             return hasState(required_state_size);
         }
+        /** @brief Prepare an immutable retained invocation without allocating or rebinding live state.
+         * @param sources Frozen raw merged operands and device live-count owner.
+         * @param binding Actual leased views, physical geometry, owner identity and exact capture stream.
+         * @return Prepared backend program; all borrowed owners must outlive its graphs.
+         * @throws std::invalid_argument For unsupported or incomplete immutable bindings. */
+        std::unique_ptr<gdn::IGDNPreparedRetainedInvocation>
+        prepareRetainedInvocation(const gdn::MergedRecurrenceInput &sources,
+                                  const gdn::GDNRetainedInvocationBinding &binding) const override;
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {
             return device_state_bound_ &&
@@ -377,7 +397,7 @@ namespace llaminar2
                 return false;
 
             // All pointers are device pointers — pass directly to HIP kernel.
-            const bool ok = rocmGDN_chunk_forward(
+            const bool ok = launchBoundPlanar(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
@@ -389,10 +409,38 @@ namespace llaminar2
         }
 
         /**
-         * @brief Execute merged-QKV recurrence through the bound HIP workspace.
+         * @brief Consume the explicitly paired scalar convolution's compact Q/K activation.
+         * @param input Original raw merged V/gates and exact immutable head mapping.
+         * @return Native enqueue success; no alternate raw-input program is retried.
+         * @throws std::invalid_argument For invalid original scalar head geometry.
+         * @details The original cache binding remains the sole live, speculative
+         * and snapshot state authority. Its physical layout must be ValueMajor.
+         */
+        bool chunkForwardPreparedQK(const gdn::ScalarPreparedQKRecurrence& input) override
+        {
+            if(recurrence_layout_!=GDNRecurrenceStateLayout::ValueMajorKeyContiguous)return false;
+            (void)gdn::ScalarPreparedQKLayout::fromHeads(
+                input.key_heads,input.value_heads,input.key_width,input.value_width);
+            const auto state=std::int64_t(input.value_heads)*input.key_width*input.value_width;
+            if(state<=0||state>std::numeric_limits<int>::max())return false;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int size=static_cast<int>(state);
+            const float* initial=requireState(size,"ROCmGatedDeltaNet::chunkForwardPreparedQK");
+            float* destination=resolveVerifierStateDestination(size,stream_);
+            if(!initial||!destination)return false;
+            return gdn::launchROCmScalarPreparedQKRecurrence({{
+                DeviceRequestRowRanges::fullyActive(1),input.key_heads,input.value_heads,
+                input.key_width,input.value_width,input.global_value_offset,input.normalize_qk,
+                input.merged,input.alpha,input.beta_raw,input.A_log,input.dt_bias,input.output,
+                initial,destination,verifier_state_capture_,verifier_state_capture_size_,
+                verifier_state_capture_rows_,recurrence_layout_},input.prepared},stream_);
+        }
+
+        /**
+         * @brief Execute explicit merged M1 directly; retain optimized prefill layout preparation.
          *
-         * Device deinterleave and recurrence are enqueued on the exact stage
-         * stream and remain one graph-captured producer/consumer sequence. The
+         * Nonidentity M1 has one captured raw recurrence; ordinary prefill retains
+         * its original transform and optimized recurrence on the exact stream. The
          * implementation performs no host materialization or synchronization.
          */
         bool chunkForwardMergedQKV(
@@ -404,13 +452,30 @@ namespace llaminar2
             int global_v_head_offset, int chunk_size,
             bool use_qk_l2norm) override
         {
-            const int compact_stride =
-                2 * n_k_heads * d_k + n_heads * d_v;
-            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
-                n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-                qkv_stride != compact_stride)
-            {
+            if (!merged_qkv || seq_len<=0 || n_k_heads<=0 || n_heads<=0 || d_k<=0 || d_v<=0)
                 return false;
+            const auto rows=DeviceRequestRowRanges::fullyActive(seq_len);
+            if(gdnDeinterleaveElementsPerRequest(rows,n_k_heads,n_heads,d_k,d_v)<=0)
+                return false;
+            const auto compact_stride=2*std::int64_t(n_k_heads)*d_k+std::int64_t(n_heads)*d_v;
+            if(qkv_stride!=compact_stride)return false;
+
+            if (seq_len == 1 && (n_k_heads != n_heads || global_v_head_offset != 0))
+            {
+                // Resolve exactly the live/speculative banks used by recurrent_step.
+                // The merged address specialization introduces no state authority.
+                rocmGDN_gpu_set_device(device_ordinal_);
+                const auto state_floats=std::int64_t(n_heads)*d_k*d_v;
+                if(state_floats<=0 || state_floats>std::numeric_limits<int>::max()) return false;
+                const int required_state_size=static_cast<int>(state_floats);
+                float* live_state=requireState(required_state_size,"ROCmGatedDeltaNet::chunkForwardMergedQKV");
+                if(!live_state)return false;
+                float* destination=resolveVerifierStateDestination(required_state_size,stream_);
+                if(!destination)return false;
+                return gdn::launchROCmMergedRecurrence({
+                    DeviceRequestRowRanges::fullyActive(1),n_k_heads,n_heads,d_k,d_v,global_v_head_offset,
+                    use_qk_l2norm,merged_qkv,alpha,beta_raw,A_log,dt_bias,output,live_state,destination,
+                    verifier_state_capture_,verifier_state_capture_size_,verifier_state_capture_rows_,recurrence_layout_},stream_);
             }
 
             float *q = nullptr;
@@ -465,7 +530,7 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            const bool ok = rocmGDN_chunk_forward_effective(
+            const bool ok = launchBoundPlanarEffective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
@@ -552,7 +617,7 @@ namespace llaminar2
                         std::min(request_seq_len, verifier_state_capture_rows_ - snapshot_base);
                 }
 
-                if (!rocmGDN_chunk_forward(
+                if (!launchBoundPlanar(
                         Q + qk_offset,
                         K + qk_offset,
                         V + v_offset,
@@ -631,7 +696,7 @@ namespace llaminar2
                 effective_states = speculative_state_work_;
             }
 
-            return rocmGDN_chunk_forward_batched_effective(
+            return launchBoundPlanarRequests(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, request_state_bank_, effective_states,
                 seq_len, request_count, request_seq_len,
@@ -677,7 +742,7 @@ namespace llaminar2
              * true replay-equivalent handoff rather than a backend-specific
              * approximation.
              */
-            const bool ok = rocmGDN_chunk_forward(
+            const bool ok = launchBoundPlanar(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
                 /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
@@ -932,7 +997,90 @@ namespace llaminar2
         }
 
     private:
+        // Written once by bindDeviceState before any snapshot binding/capture.
+        GDNRecurrenceStateLayout recurrence_layout_=GDNRecurrenceStateLayout::KeyMajorValueContiguous;
         int device_ordinal_;
+
+        /**
+         * @brief Bind the immutable admitted state layout to a fully-active planar launch.
+         * @param Q,K,V Original expanded planar inputs.
+         * @param alpha,beta_raw Original projected gates.
+         * @param A_log,dt_bias Original learned head gates.
+         * @param output Exclusive activation destination.
+         * @param initial_state,updated_state Same-layout state owners; exact alias is legal.
+         * @param seq_len Physical rows in this request.
+         * @param heads,dk,dv Original recurrence geometry.
+         * @param normalize Original raw-input normalization policy.
+         * @param snapshots Optional same-layout snapshot owner.
+         * @param stride,maximum Full admitted snapshot envelope.
+         * @param device Exact owner ordinal retained by this backend.
+         * @param stream Exact caller-owned non-default stream.
+         * @return Typed native admission/enqueue status.
+         */
+        bool launchBoundPlanar(const float* Q,const float* K,const float* V,
+            const float* alpha,const float* beta_raw,const float* A_log,const float* dt_bias,
+            float* output,const float* initial_state,float* updated_state,int seq_len,int heads,int dk,int dv,
+            bool normalize,float* snapshots,int stride,int maximum,int device,void* stream)
+        {
+            if(seq_len<=0||device!=device_ordinal_||reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+            return gdn::launchROCmPlanarRecurrence({DeviceRequestRowRanges::fullyActive(seq_len),heads,dk,dv,normalize,
+                Q,K,V,alpha,beta_raw,A_log,dt_bias,output,initial_state,updated_state,snapshots,stride,maximum,recurrence_layout_},stream);
+        }
+        /**
+         * @brief Bind one device-owned live prefix without reading it on the host.
+         * @param Q,K,V Original expanded planar input planes.
+         * @param alpha,beta_raw Original projected gates.
+         * @param A_log,dt_bias Original learned gates.
+         * @param output Original activation destination.
+         * @param initial_state,updated_state Original same-layout state owners.
+         * @param seq_len Physical request capacity.
+         * @param heads,dk,dv Original head/key/value geometry.
+         * @param normalize Original raw normalization flag.
+         * @param count Original replay-owned live-prefix pointer.
+         * @param snapshots Optional same-layout snapshots.
+         * @param stride,maximum Full snapshot envelope.
+         * @param device Exact owner ordinal.
+         * @param stream Exact caller-owned stream.
+         * @return Typed native admission/enqueue status.
+         */
+        bool launchBoundPlanarEffective(const float* Q,const float* K,const float* V,
+            const float* alpha,const float* beta_raw,const float* A_log,const float* dt_bias,
+            float* output,const float* initial_state,float* updated_state,int seq_len,int heads,int dk,int dv,
+            bool normalize,const int* count,float* snapshots,int stride,int maximum,int device,void* stream)
+        {
+            if(seq_len<=0||!count||device!=device_ordinal_||reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+            return gdn::launchROCmPlanarRecurrence({DeviceRequestRowRanges::deviceCounted(1,seq_len,count),heads,dk,dv,normalize,
+                Q,K,V,alpha,beta_raw,A_log,dt_bias,output,initial_state,updated_state,snapshots,stride,maximum,recurrence_layout_},stream);
+        }
+        /**
+         * @brief Bind independent original request counts to one native grid.
+         * @param Q,K,V Original request-major expanded planes.
+         * @param alpha,beta_raw Original projected gates.
+         * @param A_log,dt_bias Original learned gates.
+         * @param output Original activation destination.
+         * @param initial_state,updated_state Original per-request same-layout state banks.
+         * @param seq_len,requests,per_request Exact original physical row topology.
+         * @param heads,dk,dv Original recurrence dimensions.
+         * @param normalize Original raw normalization policy.
+         * @param counts Original independent device prefix array.
+         * @param snapshots Optional same-layout snapshots in flattened original row order.
+         * @param stride,maximum Original snapshot envelope.
+         * @param device Exact owner ordinal.
+         * @param stream Exact non-default caller stream.
+         * @return Typed native admission/enqueue status.
+         */
+        bool launchBoundPlanarRequests(const float* Q,const float* K,const float* V,
+            const float* alpha,const float* beta_raw,const float* A_log,const float* dt_bias,
+            float* output,const float* initial_state,float* updated_state,int seq_len,int requests,int per_request,
+            int heads,int dk,int dv,bool normalize,const int* counts,float* snapshots,int stride,int maximum,int device,void* stream)
+        {
+            if(seq_len<=0||requests<=0||per_request<=0||std::int64_t(requests)*per_request!=seq_len||!counts||
+                device!=device_ordinal_||reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+            return gdn::launchROCmPlanarRecurrence({DeviceRequestRowRanges::deviceCounted(requests,per_request,counts),heads,dk,dv,
+                normalize,Q,K,V,alpha,beta_raw,A_log,dt_bias,output,initial_state,updated_state,snapshots,stride,maximum,recurrence_layout_},stream);
+        }
+
+
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
         int state_size_ = 0;
@@ -1091,6 +1239,144 @@ namespace llaminar2
             }
             return true;
         }
+
+        /** @brief Immutable backend program; leases and source/kernel lifetimes remain with the stage. */
+        class PreparedRetainedInvocation final : public gdn::IGDNPreparedRetainedInvocation
+        {
+          public:
+            /** @brief Freeze validated canonical banks and native capture identity cold.
+             * @param owner Existing immutable device-state owner.
+             * @param sources Raw source tuple without legacy state/snapshot bindings.
+             * @param binding Caller-leased exact workspace and capture stream.
+             * @param state_size Exact per-request live image size from native geometry. */
+            PreparedRetainedInvocation(const ROCmGatedDeltaNet &owner,
+                                       const gdn::MergedRecurrenceInput &sources,
+                                       const gdn::GDNRetainedInvocationBinding &binding, int state_size)
+                : owner_(owner), binding_(binding), state_size_(state_size),
+                  scalar_(owner.stateForSize(state_size)), packed_(owner.request_state_bank_),
+                  input_(gdn::makeGDNRetainedCaptureInput(
+                      sources, binding, binding.geometry.requests() == 1 ? scalar_ : packed_,
+                      owner.recurrence_layout_, gdn::GDNDenseCompactArithmetic::ROCmFourPartFusedUpdateV1))
+            {
+                if (!gdn::prepareROCmGDNRetainedCaptureStream(owner.device_ordinal_,
+                                                              binding.capture_stream))
+                    throw std::invalid_argument(
+                        "ROCm retained capture requires its exact idle device stream");
+                if (!gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {owner.gpu_state_, static_cast<std::size_t>(owner.state_size_)}) ||
+                    !gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {owner.secondary_gpu_state_,
+                                 static_cast<std::size_t>(owner.secondary_state_size_)}) ||
+                    !gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {packed_, owner.request_state_bank_floats_}))
+                    throw std::invalid_argument(
+                        "Retained GDN speculative writes overlap canonical live state");
+            }
+            /** @return Frozen complete native input. */
+            const gdn::GDNDenseCompactCaptureInput &captureInput() const noexcept override
+            {
+                return input_;
+            }
+            /** @return Frozen actual leased views and stable manager identity. */
+            const gdn::GDNRetainedInvocationBinding &binding() const noexcept override { return binding_; }
+            /** @return Exact canonical scalar or packed publication destination. */
+            float *publicationDestination() const noexcept override
+            {
+                return binding_.geometry.requests() == 1 ? scalar_ : packed_;
+            }
+            /** @return Backend, terminal and compiled scheduling identity. */
+            std::uint64_t captureProgramIdentity() const noexcept override
+            {
+                return 512ULL + (static_cast<std::uint64_t>(binding_.terminal_kind) << 4);
+            }
+            /** @brief Authenticate complete immutable backend/source/workspace identity.
+             * @param candidate Proposed reused invocation.
+             * @return Exact identity match, without inspecting device payload. */
+            bool sameCaptureIdentity(
+                const gdn::IGDNPreparedRetainedInvocation &candidate) const noexcept override
+            {
+                const auto *other = dynamic_cast<const PreparedRetainedInvocation *>(&candidate);
+                return other && &owner_ == &other->owner_ && state_size_ == other->state_size_ &&
+                       scalar_ == other->scalar_ && packed_ == other->packed_ &&
+                       gdn::sameGDNRetainedBindingViews(binding_, other->binding_) &&
+                       gdn::sameGDNRetainedCaptureInput(input_, other->input_);
+            }
+            /** @brief Record the frozen recurrence on its authenticated capture stream.
+             * @return Native submission succeeded; no shared kernel binding is modified. */
+            bool capture() const override
+            {
+                if (!stateBindingCurrent())
+                    return false;
+                rocmGDN_gpu_set_device(owner_.device_ordinal_);
+                return gdn::launchROCmDenseCompactRecurrence(input_, binding_.capture_stream);
+            }
+            /** @brief Publish under the existing exact device/event authority, possibly on another stream.
+             * @param selection Immutable typed metadata view authenticated by the native whole-plan guard.
+             * @param stream Explicit same-device publication stream with producer-event ordering
+             * established.
+             * @return Publication and the one necessary scalar/request-zero visibility edge succeeded. */
+            bool publish(const gdn::GDNDenseAcceptedSelection &selection, void *stream) const override
+            {
+                if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !stateBindingCurrent() ||
+                    !selection.matchesGeometry(binding_.geometry) ||
+                    !gdn::retainedSelectionDisjointFromState(
+                        selection, {owner_.gpu_state_, static_cast<std::size_t>(owner_.state_size_)}) ||
+                    !gdn::retainedSelectionDisjointFromState(
+                        selection, {owner_.secondary_gpu_state_,
+                                    static_cast<std::size_t>(owner_.secondary_state_size_)}) ||
+                    !gdn::retainedSelectionDisjointFromState(selection,
+                                                             {packed_, owner_.request_state_bank_floats_}))
+                    return false;
+                const auto mirror = scalar_ == packed_ ? gdn::GDNDenseCompactRequestZeroMirror::none() :
+                    gdn::GDNDenseCompactRequestZeroMirror::borrow(binding_.geometry,
+                        binding_.geometry.requests() == 1 ? packed_ : scalar_,
+                        static_cast<std::size_t>(state_size_));
+                const gdn::GDNDenseCompactAcceptedPrefixInput publication{input_.transaction, selection,
+                    publicationDestination(), mirror};
+                rocmGDN_gpu_set_device(owner_.device_ordinal_);
+                if (!gdn::launchROCmDenseCompactAcceptedPrefix(publication, stream))
+                    return false;
+                return true;
+            }
+
+          private:
+            /** @brief Reject any changed canonical state topology before enqueue.
+             * @return Original immutable bound state owners and request capacity remain valid. */
+            bool stateBindingCurrent() const noexcept
+            {
+                return owner_.device_state_bound_ && owner_.stateForSize(state_size_) == scalar_ &&
+                       owner_.request_state_bank_ == packed_ &&
+                       owner_.supportsRequestLiveStateBank(binding_.geometry.requests(), state_size_);
+            }
+            const ROCmGatedDeltaNet &owner_;
+            const gdn::GDNRetainedInvocationBinding binding_;
+            const int state_size_;
+            float *const scalar_;
+            float *const packed_;
+            const gdn::GDNDenseCompactCaptureInput input_;
+        };
     };
+
+
+    /** @brief Freeze native geometry over already-bound canonical GPU state.
+     * @param sources Frozen raw inputs; no legacy speculative state bindings.
+     * @param binding Actual workspace views, terminal requirement and exact cold stream.
+     * @return Immutable borrowing invocation; unsupported state/geometry fails before recording.
+     * @throws std::invalid_argument For absent device state or unsupported native dimensions. */
+    inline std::unique_ptr<gdn::IGDNPreparedRetainedInvocation>
+    ROCmGatedDeltaNet::prepareRetainedInvocation(const gdn::MergedRecurrenceInput &sources,
+                                                 const gdn::GDNRetainedInvocationBinding &binding) const
+    {
+        const auto &g = binding.geometry;
+        const auto state_size = g.denseBankFloats() / static_cast<std::size_t>(g.requests());
+        if ((g.keyWidth() != 64 && g.keyWidth() != 128) ||
+            state_size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            !device_state_bound_ ||
+            !supportsRequestLiveStateBank(g.requests(), static_cast<int>(state_size)))
+            throw std::invalid_argument("Prepared retained GDN requires supported geometry and "
+                                        "existing canonical device state");
+        return std::make_unique<PreparedRetainedInvocation>(*this, sources, binding,
+                                                            static_cast<int>(state_size));
+    }
 
 } // namespace llaminar2

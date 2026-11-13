@@ -1630,7 +1630,7 @@ TEST(Test__ActivationRotation, RotationChangesVector)
 //   X @ W^T == (X@R) @ Pack(R^T @ dequant(W))
 // ============================================================================
 
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 
 TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
 {
@@ -1669,7 +1669,7 @@ TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
     weight->setActivationRotation(&rot);
 
     // Create GEMM kernel (will pack with rotation fused in)
-    auto kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+    auto kernel = std::make_unique<llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
         weight.get());
     ASSERT_TRUE(kernel->isValid()) << "GEMM kernel should be valid after packing";
 
@@ -1724,7 +1724,7 @@ TEST(Test__ActivationRotation, FusedPacking_PreservesFormatForNonRotated)
     // No rotation set — should use the nibble-LUT path as usual
     EXPECT_EQ(weight->activationRotation(), nullptr);
 
-    auto kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+    auto kernel = std::make_unique<llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
         weight.get());
     ASSERT_TRUE(kernel->isValid());
 

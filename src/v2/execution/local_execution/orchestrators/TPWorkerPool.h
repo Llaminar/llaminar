@@ -16,6 +16,11 @@
  * Generation-qualified state prevents that completion from being reset or
  * mistaken for a neighboring operation.
  *
+ * An explicit independent-GPU-control intent constructs children on the actual
+ * admitted OpenMP partition, then restores the caller's exact place. CPU/mixed/
+ * composed compute workers retain inherited placement. No replay-time affinity
+ * call, CPU-team change or new worker budget is introduced.
+ *
  * Workers intentionally do not select a CUDA or HIP device themselves. Device
  * graph runners submit work through streams that already belong to the correct
  * device context; the rank's dispatched callable also installs the profiler
@@ -30,6 +35,10 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <span>
+#include "backends/DeviceId.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -38,6 +47,42 @@
 
 namespace llaminar2
 {
+    namespace test { struct TPWorkerPoolCallbackLifecycleAccess; }
+
+    /** @brief Separate independent GPU control from inherited CPU/composed compute placement. */
+    enum class TPWorkerHostPlacement
+    {
+        InheritedCompute,
+        IndependentGPUControl,
+    };
+
+    /** @brief Only a flat rank is eligible for independent homogeneous-GPU control. */
+    enum class TPWorkerHostScope { FlatRank, PipelineOrComposed };
+
+    /**
+     * @brief Resolve worker intent from original actual members, not row counts or GPU quantity.
+     * @param members Exact child-runner device identities in their original order.
+     * @param scope Original flat versus composed rank ownership.
+     * @return IndependentGPUControl only for a nonempty homogeneous GPU flat rank.
+     * @throws std::invalid_argument For an invalid endpoint or unknown scope.
+     * CPU, mixed and pipeline compute owners retain their established placement.
+     */
+    [[nodiscard]] inline TPWorkerHostPlacement tpWorkerHostPlacement(
+        std::span<const DeviceId> members, TPWorkerHostScope scope)
+    {
+        if (members.empty()) throw std::invalid_argument("Worker placement requires actual participants");
+        for (const auto device : members)
+            if (!device.is_gpu() && !device.is_cpu())
+                throw std::invalid_argument("Worker placement received an invalid participant");
+        if (scope == TPWorkerHostScope::PipelineOrComposed)
+            return TPWorkerHostPlacement::InheritedCompute;
+        if (scope != TPWorkerHostScope::FlatRank)
+            throw std::invalid_argument("Worker placement requires explicit original rank scope");
+        for (const auto device : members)
+            if (!device.is_gpu() || device.type != members.front().type)
+                return TPWorkerHostPlacement::InheritedCompute;
+        return TPWorkerHostPlacement::IndependentGPUControl;
+    }
 
     /**
      * @brief Fan one rank-local operation out to persistent participant workers.
@@ -66,7 +111,15 @@ namespace llaminar2
             size_t worker_index = 0;
         };
 
-        explicit TPWorkerPool(size_t num_workers)
+        /**
+         * @brief Construct persistent participant workers with an explicit immutable host role.
+         * @param num_workers Original participant count, not the CPU/OpenMP team budget.
+         * @param placement GPU-control role widens only child eligibility to the actual
+         *        OpenMP partition; inherited compute preserves the original caller placement.
+         * @throws std::exception Before dispatch for invalid geometry/role or unavailable placement.
+         */
+        explicit TPWorkerPool(size_t num_workers,
+            TPWorkerHostPlacement placement = TPWorkerHostPlacement::InheritedCompute)
             : num_workers_(num_workers),
               results_(num_workers)
         {
@@ -75,6 +128,14 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "TPWorkerPool requires at least one participant worker");
             }
+            std::optional<ScopedOpenMPPartitionAffinity> control_affinity;
+            if (placement == TPWorkerHostPlacement::IndependentGPUControl)
+                control_affinity.emplace();
+            else if (placement != TPWorkerHostPlacement::InheritedCompute)
+                throw std::invalid_argument("TP workers require an explicit host placement intent");
+            // Only construction occurs in this scope. Every participant and
+            // failure-callback child inherits the same admitted partition;
+            // the caller's exact OpenMP place is restored before dispatch.
             workers_.reserve(num_workers);
             for (size_t i = 0; i < num_workers; ++i)
             {
@@ -167,6 +228,12 @@ namespace llaminar2
             if (target_generation == 0)
                 return results_;
             ++active_collectors_;
+            struct CollectorAdmission
+            {
+                size_t &count;
+                /** @brief Release admission even when copying the result snapshot throws. */
+                ~CollectorAdmission() noexcept { --count; }
+            } admission{active_collectors_};
 
             auto pred = [this, target_generation]()
             {
@@ -189,7 +256,6 @@ namespace llaminar2
                 collected_generation_ =
                     std::max(collected_generation_, target_generation);
             }
-            --active_collectors_;
             return snapshot;
         }
 
@@ -232,7 +298,32 @@ namespace llaminar2
             failure_callback_ = std::move(cb);
         }
 
+        /**
+         * @brief Retire the collected generation's failure callable before replacing its original request authority.
+         * @param replacement Ordinary TP abort behavior retained after source-specific ownership is withdrawn.
+         * @throws std::logic_error If participant work remains uncollected or the failure worker would wait on itself.
+         * Only the existing failure-control thread is awaited. No GPU event,
+         * stream, participant job or new worker is created here. Its captured
+         * callable is destroyed before the completion generation is published.
+         */
+        void retireFailureCallback(std::function<void()> replacement)
+        {
+            if (std::this_thread::get_id()==failure_callback_worker_.get_id())
+                throw std::logic_error("Failure callback cannot retire its own original worker");
+            std::unique_lock lock(mutex_);
+            if (generation_ != collected_generation_ || active_collectors_ != 0)
+                throw std::logic_error("Failure callback retirement requires its collected original generation");
+            const auto target=failure_callback_generation_;
+            ++active_collectors_; // Existing dispatch exclusion also owns this terminal replacement.
+            failure_callback_cv_.wait(lock,[&]{return shutdown_ || completed_failure_callback_generation_>=target;});
+            --active_collectors_;
+            if (shutdown_)
+                throw std::logic_error("Failure callback retirement encountered an original pool shutdown");
+            failure_callback_=std::move(replacement);
+        }
+
     private:
+        friend struct test::TPWorkerPoolCallbackLifecycleAccess;
         void workerLoop(size_t index)
         {
             uint64_t last_gen = 0;
@@ -316,6 +407,8 @@ namespace llaminar2
                         result.success = false;
                     }
 
+                    if (schedule_failure_callback)
+                        failure_callback_generation_=std::max(failure_callback_generation_,work_generation);
                     results_[index] = std::move(result);
                     const size_t completed =
                         completed_count_.fetch_add(
@@ -346,13 +439,7 @@ namespace llaminar2
                      * coordinator. A collective abort is allowed to block, but a
                      * participant completion can never again be held behind it.
                      */
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        failure_callback_generation_ = std::max(
-                            failure_callback_generation_,
-                            work_generation);
-                    }
-                    failure_callback_cv_.notify_one();
+                    failure_callback_cv_.notify_all();
                 }
             }
         }
@@ -368,31 +455,29 @@ namespace llaminar2
          */
         void failureCallbackLoop()
         {
-            uint64_t handled_generation = 0;
             while (true)
             {
                 std::function<void()> callback;
+                uint64_t callback_generation=0;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
                     failure_callback_cv_.wait(
                         lock,
-                        [this, handled_generation]()
+                        [this]()
                         {
                             return shutdown_ ||
                                    failure_callback_generation_ >
-                                       handled_generation;
+                                       completed_failure_callback_generation_;
                         });
                     if (shutdown_)
                         return;
-                    handled_generation = failure_callback_generation_;
+                    callback_generation = failure_callback_generation_;
                     callback = failure_callback_;
                 }
 
-                if (!callback)
-                    continue;
                 try
                 {
-                    callback();
+                    if (callback) callback();
                 }
                 catch (const std::exception &error)
                 {
@@ -405,6 +490,12 @@ namespace llaminar2
                     LOG_ERROR("[TPWorkerPool] Fatal non-standard collective-abort callback exception");
                     std::terminate();
                 }
+                callback={}; // Drop original source/channel captures BEFORE publishing retirement.
+                {
+                    std::lock_guard lock(mutex_);
+                    completed_failure_callback_generation_=std::max(completed_failure_callback_generation_,callback_generation);
+                }
+                failure_callback_cv_.notify_all();
             }
         }
 
@@ -420,6 +511,7 @@ namespace llaminar2
         std::function<bool(size_t)> work_fn_;
         std::function<void()> failure_callback_;
         uint64_t failure_callback_generation_ = 0;
+        uint64_t completed_failure_callback_generation_ = 0; ///< Same existing failure-worker generation, published only after its callable releases.
         uint64_t generation_ = 0;
         uint64_t completed_generation_ = 0;
         uint64_t collected_generation_ = 0;

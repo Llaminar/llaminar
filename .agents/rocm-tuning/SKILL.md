@@ -1,15 +1,17 @@
 ---
 name: rocm-tuning
-description: Profile and tune Llaminar V2 ROCm/HIP kernels on AMD Instinct GPUs (gfx906 MI50/MI60), including INT8 VNNI GEMM/GEMV, sampling, grouped verification, and graph-captured inference. Use rocprof per-dispatch timing/counters plus LLVM ISA analysis to diagnose occupancy, vectorization, VGPR pressure, spills, divergence, LDS conflicts, and throughput while retaining byte-exact production behavior.
+description: Profile and tune Llaminar V2 ROCm/HIP kernels across native AMD GPU targets, including INT8 VNNI GEMM/GEMV, sampling, grouped verification, and graph-captured inference. Use rocprof per-dispatch timing/counters plus LLVM ISA analysis to diagnose occupancy, vectorization, VGPR pressure, spills, divergence, LDS conflicts, and throughput while retaining byte-exact production behavior.
 ---
 
-# ROCm / HIP Kernel Profiling & Tuning (Llaminar V2, gfx906)
+# ROCm / HIP Kernel Profiling & Tuning (Llaminar V2)
 
 ## Purpose
 
-A repeatable, evidence-driven workflow for tuning Llaminar V2 HIP INT8 GEMM/GEMV kernels
-on AMD Instinct MI50/MI60 (gfx906), distilled from the multi-session effort that produced
-the V7 native kernel matching/beating AMD's Composable Kernel (CK) on N-heavy LLM shapes.
+A repeatable workflow for tuning Llaminar V2 HIP kernels across native AMD GPU
+targets. The labeled gfx906 sections retain measured MI50/MI60 NativeQuantised/CK
+reference evidence; their occupancy limits and winning launch geometry do not
+qualify another architecture. Use the actual device and loaded code object for
+each candidate.
 
 It combines four evidence sources:
 
@@ -26,11 +28,56 @@ cannot isolate an asynchronous kernel, while profiler overhead and overlapping
 kernel intervals cannot be substituted for end-to-end throughput. Measure
 communication and overlap instead of assuming a fixed fraction of either.
 
+For isolated kernel work, follow the shared
+[production kernel replay procedure](../llaminar-testing/references/kernel-replay.md).
+It is the canonical correctness/timing method: retain the production graph and
+inputs, prove dirty reuse, then collect events and separate profiler evidence.
+Use the ROCm procedures below for exact-dispatch counters and ISA inspection.
+
+## Native target and program admission
+
+Use the SDK selected by `ROCM_PATH` and the complete architecture set owned by
+`cmake/ROCmArchitectures.cmake` and `scripts/docker/rocm-release.env`. Do not
+infer shipping targets from the locally visible card. Remove
+`HSA_OVERRIDE_GFX_VERSION` from the environment before discovery, profiling or
+qualification; ISA spoofing cannot qualify another card's implementation.
+Authenticate device UUID/PCI, exact native ISA, selected SDK and loaded code
+object with each record. Select profiler tools and metrics for that actual
+architecture instead of applying gfx906 counter groups or occupancy formulas.
+
+`ROCmHardwareMetadata` owns immutable visible-device facts admitted once at
+explicit ROCm startup. Physical native-wave preference is distinct from the
+compiled kernel wave contract. Existing ordered kernels require actual wave64
+compilation; compiler feature predicates choose exact native instructions.
+Bind launch variants from cached CU/LDS/thread limits during preparation, with
+no property queries or host variant decisions during captured replay. Keep
+loaded function resources keyed by program/runtime generation rather than
+refreshing physical metadata on reset. Legacy precision booleans do not qualify
+an MMA implementation. See
+[targets and dispatch](../../docs/v2/projects/2026-10/ROCM_KERNEL_TARGETS_AND_DISPATCH.md)
+for the installed ownership and future prefill variant contracts.
+
+Compile the full declared target set with the mandatory spill guard, then run
+native retained replay and the applicable all-format/parity gates on each
+available architecture. Hardware that is absent stays explicitly unqualified.
+New wave policies or MMA prefill require their own implemented precision,
+layout, shape, resource, capture and numerical contracts before installation.
+
 ## Production hot-path invariants
 
 ROCm kernel tuning must preserve the production execution architecture, not
 trade architecture for an isolated microbenchmark win:
 
+- **Prefer register-resident work.** Keep per-thread reusable operands,
+  accumulators and intermediate results in registers through their consumers.
+  Evaluate layouts, tiling and producer/consumer fusion that remove unnecessary
+  LDS/global-memory staging, reloads and barriers. LDS remains appropriate for
+  measured cooperative reuse and required synchronization. Shorten live ranges
+  and recycle dead registers while preserving independent arithmetic chains
+  and the numerical contract. Inspect final ISA for the actual fused entry and
+  its helpers; qualify VGPR/SGPR pressure, spills, shuffle traffic and wave
+  occupancy on each target. Promote measured production wins under the existing
+  zero-spill policy; increased register residency alone is not a performance result.
 - **No dynamic allocation or deallocation.** Hot-path kernels and launch
   bridges consume persistent workspace bindings. `hipMalloc`,
   `hipMallocAsync`, `hipFree`, container growth, or hidden scratch allocation
@@ -72,7 +119,7 @@ trade architecture for an isolated microbenchmark win:
 
 The full reference write-up lives at
 `src/v2/kernels/rocm/gemm/README.vnni-gemm-tuning.md` (and the companion
-`README.native-vnni-isa-analysis.md` for GEMV). Read those for the V1-V7 history and the
+`README.native-quantised-isa-analysis.md` for GEMV). Read those for the V1-V7 history and the
 CK ISA census; this skill is the operational checklist.
 
 For whole-model diagnosis, first measure the production captured graph:
@@ -160,6 +207,17 @@ actual output/schema. Database/report generation after device shutdown is
 profiler overhead, not model loading or inference. Persistent waits and summed
 parallel-agent durations are not a critical-path measurement.
 
+For launch-under-profiler diagnostics, set
+`HSA_TOOLS_ROCPROFILER_V1_TOOLS=0` before the profiled application starts. The
+selected rocprofiler SDK installs this same legacy-tool exclusion lazily when
+HSA registers its API table. Preconfiguring it keeps the original runtime
+environment immutable across metadata discovery; modern rocprofv3 tracing
+remains enabled. Do not weaken the runtime environment guard or refresh its
+original identity to accommodate a late profiler mutation. An existing
+`v2_perf_native_context_source_probe --device rocm:N --key-only` invocation
+under the same profiler checks this boundary without creating a context worker
+or loading model weights.
+
 Captured auxiliary-stream kernels can be attributed to the parent replay's
 stream ID in the dispatch trace. A shared `stream_id` therefore does not prove
 serialization. Establish overlap from same-agent start/end intervals and the
@@ -170,7 +228,11 @@ comparisons.
 
 ---
 
-## Step 0: Architecture facts you must keep in mind (gfx906)
+## Step 0: Measured gfx906 MI50 reference
+
+This reference describes the measured MI50 configuration. Read actual CU/LDS
+limits from the immutable hardware inventory and compiler resource metadata;
+do not transplant these counts or occupancy thresholds to RDNA or other cards.
 
 | Parameter | Value | Why it matters |
 |-----------|-------|----------------|
@@ -183,7 +245,7 @@ comparisons.
 | Wavefront | 64 threads | One instruction = 64 lanes |
 | `v_dot4_i32_i8` | 1/cycle/lane | gfx906's VNNI (`vpdpbusd` equivalent) |
 
-**Occupancy ladder:** 1-64 VGPRs → 4 waves; 65-84 → 3; 85-128 → **2 (the sweet spot for
+**Measured gfx906 occupancy ladder:** 1-64 VGPRs → 4 waves; 65-84 → 3; 85-128 → **2 (the sweet spot for
 M128×N128 INT8 GEMM, matches CK)**; 129-256 → 1 (catastrophic — no latency hiding).
 Below 2 waves nothing else matters; going from 2 waves to "perfect scheduling" gave
 **zero** measurable gain on this workload.
@@ -193,11 +255,15 @@ Below 2 waves nothing else matters; going from 2 waves to "perfect scheduling" g
 ## Step 1: Build the dispatch-comparison benchmark
 
 ```bash
-cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_ROCM=ON
+unset HSA_OVERRIDE_GFX_VERSION
+cmake -B build_v2_release -S src/v2 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DHAVE_ROCM=ON -DROCM_PATH=/opt/rocm-sdk \
+  -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
 cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel
 ```
 
-This binary instantiates **all native variants (V1-V7) and CK in one executable**, which
+The gfx906 reference benchmark instantiates **native variants (V1-V7) and CK in one executable**, which
 is exactly what makes comparative disassembly and A/B benchmarking fast.
 
 ---
@@ -215,7 +281,7 @@ cat results.stats.csv | column -t -s,
 ```
 
 `results.stats.csv` gives the real GPU kernel time, excluding host overhead and PCIe.
-This is the metric that exposed the "19% wallclock gap" as a mere **6.6% real kernel gap**
+In the gfx906 reference, this exposed the "19% wallclock gap" as a **6.6% real kernel gap**
 vs CK. Rank kernels by per-dispatch GPU time; that is your optimization target list.
 
 > ⚠️ If two variants have nearly identical wallclock but you suspect a kernel difference,
@@ -277,7 +343,9 @@ candidate. Leave them unset to profile the installed capture-time policy.
 ## Step 3: ISA deep-dive (occupancy + scheduling)
 
 `rocprof` tells you *which* kernel is slow; the LLVM toolchain tells you *why*. HIP
-executables embed gfx906 code objects as ELF bundle sections.
+executables can contain several target code objects. Extract the actual native
+agent's loaded object and verify its target, wave width and resource metadata.
+The following extraction and resource examples are specifically gfx906.
 
 ```bash
 BINARY=build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison
@@ -306,7 +374,9 @@ and static ISA must always describe the same compiled candidate.
 
 ### Read the metadata FIRST
 
-The VGPR/SGPR/LDS line decides occupancy before you read a single instruction:
+For the gfx906 reference, inspect VGPR/SGPR/LDS before reading instructions.
+These thresholds are target-specific; use the other target's actual allocation
+and occupancy evidence rather than this table:
 
 | Symptom in metadata | Diagnosis | Fix |
 |---------------------|-----------|-----|
@@ -346,13 +416,15 @@ What to read for:
 
 ---
 
-## Step 4: The seven latency-hiding levers (in priority order)
+## Step 4: gfx906 reference tuning sequence
 
-Apply these to the targeted kernel; the first two are mandatory, the rest are refinements.
+Use these measured gfx906 techniques as candidate hypotheses. Qualify launch
+bounds, buffering and occupancy independently on each new target.
 
-1. **`__launch_bounds__(threads, min_waves)` — non-negotiable.** The 2nd arg caps VGPRs
-   (256/min_waves). Omitting it let V4 use 256 VGPRs + spills → 1 wave → slower than V1.
-   1→2 waves is often a 3-5× swing, not 2×.
+1. **Target-appropriate launch bounds.** Inspect the selected compiler's final
+   allocation and actual occupancy. In the gfx906 reference, unbounded V4 used
+   256 VGPRs plus spills, leaving one wave and losing to V1. Do not assume that
+   the same bound or register threshold is economical on another architecture.
 2. **LDS double-buffering.** Ping-pong even/odd buffers: compute buf[cur] while loading
    buf[nxt], one `__syncthreads()` between. Kills the serial load→barrier→compute cycle.
 3. **Inner-loop unroll control.** `#pragma unroll` → VGPR explosion (V4). Prefer
@@ -395,110 +467,35 @@ select per shape; don't assume one kernel wins everywhere.
 
 ---
 
-## Step 6: Train generated NativeVNNI dispatch tables
+## Step 6: Refresh NativeQuantised exact overlays
 
-Read `.agents/nativevnni-gemm-tuning/SKILL.md` for the shared corpus, learner,
-certification, Git LFS, and installation workflow. This section owns only
-ROCm-specific kernel/profiler constraints.
+Use [NativeQuantised exact-overlay tuning](../nativequantised-gemm-tuning/SKILL.md).
+Generic fitting is retired. The shared inventory owns every model, physical
+TP-shard and applicable source-format obligation. Preserve the installed
+runtime generic program and unrelated exact rows when adding measured winners.
+Do not let an emitter append unmeasured generic codebook supplements.
 
-ROCm NativeVNNI dispatch should follow the same automatic sweep/generate/validate
-pipeline as CUDA. Avoid hand-coded per-shape overrides except as throwaway
-experiments.
+Keep all runtime discriminators, observed producer families and source aliases
+in evidence. ROCm Q8 blockwise INT8 and low-bit NativeQuantised launches have different
+candidate controls. An Auto streaming family is not automatically a forceable
+cooperative candidate. MTP grouped rows inherit the staged M1 arithmetic and
+must match serial output bytes at every required M.
 
-1. Keep the shape inventory in the perf harness aligned with real model routes:
-   `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp` for prefill
-   and `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp` for
-   decode/GEMV.
-2. For decode/GEMV dispatch tables, use the Git-LFS-aware turnkey transaction:
-   `scripts/train_native_vnni_dispatch.sh --backend rocm --install`.
-   The lower-level `refresh_native_vnni_dispatch_tables.sh` remains the phase
-   executor used by the driver and for focused diagnostic collection.
-   It runs with `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`, sweeps canonical
-   serial `M=1` first and grouped verifier `M=2..16,31` against that exact frozen
-   dependency, generates the include, validates it, and can install it with
-   `--install`. M31 is a deeper sentinel rather than a production maximum.
-   Keep public M1 decisions keyed by every runtime-visible discriminator.
-   Grouped verifier buckets must inherit the frozen M1 K partition and ordered
-   reduction tree; selecting a different M2+ family is incompatible with the
-   byte-exact serial-row contract.
-   The durable decode selector must generalize by aspect ratio plus work-size
-   segments. Exact `(M,N,K)` winners are allowed only as overlays above that
-   broad fallback; do not land an exact-shape-only table that would require
-   retraining for every nearby model dimension.
-   Score generated tables on the runtime dispatch surface, not raw
-   source-format rows. If several GGUF formats share a NativeVNNI codebook, the
-   runtime can only choose one `(codebook,M,N,K)` tuning; analyzers should
-   collapse aliases before enforcing exact-hit thresholds.
-   Use staged strict profiles when the full shape inventory is too expensive in
-   one pass: `--profile qwen36-core` covers FFN/GDN projections and
-   `--profile qwen36-lm-head` covers the giant LM-head shape. The LM-head
-   profile defaults to `LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE=native-auto`, which
-   compares candidates with a reset-AUTO native output instead of building a
-   multi-GB FP32 hipBLAS mirror. Treat that as a dispatch-equivalence trainer
-   proxy; model parity and benchmarks still gate any `--install`.
-   Production collection derives immutable profiler requests only after the
-   canonical timing CSV and raw timing sidecar are sealed. Each request starts
-   a fresh process. `roctxProfilerResume(0)`/`roctxProfilerPause(0)` bracket one
-   extra production launch, while a request-specific ROCTx range identifies the
-   exact pipeline in PMC passes. The trace pass keeps physical kernel names;
-   renamed PMC rows join back by contiguous dispatch order. On gfx906, collect
-   `FetchSize`, `WriteSize`, `Wavefronts`, `VALUUtilization`, and
-   `LDSBankConflict` as reviewed singleton passes. Combining the TCC traffic
-   metrics exceeds hardware profile capabilities and can hang rocprofiler's
-   abort path. Never let profiler replay or overhead enter canonical timing.
-   The final `rocm_profiler_features.csv` must be the authenticated export of
-   the canonical observation, request, and evidence manifests, with one row per
-   physical dispatch rather than an ad hoc join of rocprof CSVs.
-   The common policy fit may separately use every ROCm and CUDA device through
-   exact leaf-primary scorer DSOs. The refresh wrapper auto-discovers devices;
-   `--policy-accelerators` fixes the inventory and `--policy-lanes` controls
-   independent CPU orchestration lanes per device. Those scorer launches do not
-   time candidate kernels and never enter rocprof evidence. Keep CUDA and HIP
-   in separate worker processes and hard-fail any requested accelerator error.
-3. Use `--profile family-smoke` for a bounded representative training pass before
-   a full acceptance refresh. This profile is stratified by format: it runs one
-   small sweep per codebook/family, writes per-format partial CSVs, combines them,
-   then runs the normal train/generate/validate flow. This avoids a capped sweep
-   accidentally covering only the first format in the list.
+The canonical transaction records whether Auto uses a frozen installed base or
+explicitly excludes generated lookup; do not mix those timing meanings. Native
+FP32 cosine is only a health diagnostic for packed low-bit sources. Source byte
+contracts, model parity and matched Release throughput gate promotion.
 
-   ```bash
-   scripts/refresh_native_vnni_dispatch_tables.sh --backend rocm \
-     --profile family-smoke \
-     --rocm-formats Q4_0,IQ4_XS \
-     --m-values 1,2
-   ```
+Collect profiler evidence outside canonical timing. Bracket one selected launch
+with request-local ROCTx identity and retain ordered pipeline dispatches. On
+gfx906 use compatible counter passes; do not combine TCC traffic metrics into
+an unsupported PMC set. Authenticate raw reports and exact resource identity,
+including VGPR/SGPR, LDS and private memory, before accepting a candidate.
 
-   `family-smoke` is a workflow/proxy gate, not production acceptance. Do not
-   replace broad checked-in tables from this profile alone; run `qwen36` or
-   `all`, then model-level parity and benchmark gates, before `--install`.
-   Treat the trainer's FP32 cosine as a health filter, not the exact dispatch
-   oracle: packed K-quant formats such as Q4_K/Q2_K can sit just below the
-   generic FP32 gate while still matching the native packed contract. Keep
-   `V2_Integration_ROCm_NativeVNNI_GEMV`,
-   `V2_Integration_ROCmQuantisedGemmSmallM`, and model parity as the promotion
-   gates.
-4. If you are debugging the ROCm trainer directly, run sweeps with
-   `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`. This is important:
-   AUTO normally consumes the checked-in generated tables, so training without
-   this guard can benchmark the previous table and emit no explicit winner.
-5. Validate CSVs with
-   `tests/v2/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py`.
-   It checks decode/prefill schema, shared codebook ids, and canonical prefill
-   bucket policy from `src/v2/utils/PrefillGraphBucketDefaults.h`.
-6. Generate prefill tables with
-   `tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py` and
-   decode tables with
-   `tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py`.
-   The checked-in outputs are
-   `src/v2/kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc` and
-   `src/v2/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc`.
-7. Validate generated codebook references with
-   `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
-   and run the focused units:
-   `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,
-   `V2_Unit_ROCmNativeVNNITrainerGenerator`,
-   `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`, and
-   `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+Use the existing dense/MoE resumable prefill transactions and common exact
+emitters. Run their validators, generated-codebook regressions, captured/eager
+all-format kernels and grouped byte-equivalence tests. A partial or filtered
+refresh remains explicitly partial until every declared cell is qualified.
 
 ### MTP verifier dispatch mode
 
@@ -507,49 +504,20 @@ also matches rowwise serial decode. The shared convention is
 `ITensorGemm::beginVerifierDecodeEquivalentScope()`: stages keep the returned
 RAII scope alive while running serial verifier replay or grouped verifier
 publication. ROCm implements the scope by selecting the M=1 decode-equivalent
-NativeVNNI policy. Do not call ROCm mode toggles directly from stage code, and
+NativeQuantised policy. Do not call ROCm mode toggles directly from stage code, and
 do not hide unsupported verifier modes behind quiet rowwise fallbacks.
 For shared-expert MoE verifier rows, compare grouped publication against the
 canonical M=1 GEMM/SwiGLU/down replay oracle unless a grouped decode shortcut
 has already passed the same strict all-codebook gates.
 
-Compact refresh example:
-
-```bash
-LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 \
-LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_K \
-LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_GDN_TimeProjection \
-LLAMINAR_ROCM_NVNNI_DECODE_CSV=/tmp/decode.csv \
-HSA_OVERRIDE_GFX_VERSION=9.0.6 \
-./build_v2_release/tests/v2/v2_perf_native_vnni_throughput \
-  --gtest_filter='NativeVNNIPerfTest.TrainerCsv_CodebookTagged'
-
-LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 \
-LLAMINAR_ROCM_NVNNI_SWEEP_FORMATS=Q4_K \
-LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES=Qwen36_GDN_TimeProjection \
-LLAMINAR_ROCM_NVNNI_SWEEP_M=600 \
-LLAMINAR_ROCM_NVNNI_SWEEP_CSV=/tmp/prefill.csv \
-HSA_OVERRIDE_GFX_VERSION=9.0.6 \
-./build_v2_release/tests/v2/v2_perf_native_vnni_sweep \
-  --gtest_filter='NativeVNNISweepTest.TrainerCsv_CodebookTagged'
-
-python3 tests/v2/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py \
-  --require-policy-prefill-m --require-prefill-m 600 /tmp/prefill.csv /tmp/decode.csv
-python3 tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py \
-  --input /tmp/prefill.csv --output /tmp/prefill.inc --summary /tmp/prefill.summary
-python3 tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py \
-  --input /tmp/decode.csv --output /tmp/decode.inc --summary /tmp/decode.summary
-python3 tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py \
-  /tmp/prefill.inc /tmp/decode.inc
-```
-
-After updating checked-in tables, rerun focused ROCm coverage:
-`V2_Integration_ROCm_NativeVNNI_GEMM` and
-`V2_Integration_ROCm_NativeVNNI_GEMV`.
+After updating checked-in tables, run the affected ROCm GEMM/GEMV and
+all-format verifier regressions, then the matched real-model performance and
+numerical gates. Use the canonical exact transaction help for current CLI
+arguments rather than the retired generic-training examples.
 
 ---
 
-## Key lessons (hard-won)
+## gfx906 reference findings
 
 1. **Profile before optimizing.** `rocprof` revealed the real 6.6% gap hidden under a
    misleading 19% wallclock gap — without it you optimize the wrong thing for days.
@@ -575,7 +543,7 @@ rocprof --stats --timestamp on \
   ./build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison \
   --gtest_filter="*WideTileVariantComparison*" && cat results.stats.csv | column -t -s,
 
-# ISA: extract → metadata (occupancy) → disassemble → find kernels
+# gfx906-only ISA example; extract the actual loaded target for other cards
 BINARY=build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison
 llvm-objcopy --dump-section='__CLANG_OFFLOAD_BUNDLE__hipv4-amdgcn-amd-amdhsa--gfx906=/tmp/co.elf' "$BINARY" /dev/null
 llvm-readelf --notes /tmp/co.elf 2>/dev/null | awk '/\.name:/{n=$2}/\.vgpr_count:/{v=$2}/\.sgpr_count:/{s=$2}/\.group_segment_fixed_size:/{l=$2}/\.wavefront_size:/{printf "%-60s VGPR=%-4s SGPR=%-4s LDS=%s\n",substr(n,1,60),v,s,l}'

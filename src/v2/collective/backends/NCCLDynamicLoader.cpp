@@ -2,8 +2,9 @@
  * @file NCCLDynamicLoader.cpp
  * @brief Implementation of dynamic NCCL loader using dlopen/dlsym
  *
- * Uses dlopen with RTLD_LOCAL to load NCCL into an isolated symbol namespace,
- * preventing conflicts with RCCL which exports identical symbol names.
+ * Loads exactly CMake's selected NCCL dependency, or an explicit diagnostic
+ * path, with RTLD_LOCAL so RCCL's identically named symbols remain isolated.
+ * An absent/empty selection or failed load never triggers runtime rediscovery.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -16,6 +17,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -60,6 +62,9 @@ namespace llaminar2
 
             std::mutex g_mutex;
             void *g_library_handle = nullptr;
+            // The exact admitted selection belongs to the same lifetime as its
+            // resolved callbacks. A handle cannot certify another path.
+            std::string g_library_path;
             std::string g_last_error;
 
             // Function pointer types
@@ -98,6 +103,26 @@ namespace llaminar2
 
             // The extension retains the native schedule/transport while clipping
             // only useful payload bytes. Resolve it once, never during capture.
+            // Additional counted-byte symbols are resolved once under the
+            // original library lifetime. The completed family is mandatory at load;
+            // fixed operations remain the existing ordinary native API.
+            using deviceBytesBroadcast_t = ncclResult_t (*)(const void*, void*,
+                std::uint64_t*, size_t, int, const ncclLlaminarCompletionOperand*, ncclComm_t, void*);
+            using deviceSliceBroadcast_t = ncclResult_t (*)(const void*, void*,
+                const NativeByteSourceSlice*, std::uint64_t*, size_t, size_t, int, std::uint64_t,
+                const ncclLlaminarCompletionOperand*, ncclComm_t, void*);
+            using deviceBytesSend_t = ncclResult_t (*)(const void*,std::uint64_t*,size_t,int,const ncclLlaminarCompletionOperand*,ncclComm_t,void*);
+            using deviceBytesRecv_t = ncclResult_t (*)(void*,std::uint64_t*,size_t,int,const ncclLlaminarCompletionOperand*,ncclComm_t,void*);
+            using deviceSliceSend_t = ncclResult_t (*)(const void*,const NativeByteSourceSlice*,size_t,size_t,int,std::uint64_t,const ncclLlaminarCompletionOperand*,ncclComm_t,void*);
+            deviceBytesSend_t fp_device_bytes_send = nullptr;
+            deviceBytesRecv_t fp_device_bytes_recv = nullptr;
+            deviceSliceSend_t fp_device_slice_send = nullptr;
+            using completionAuthority_t = ncclResult_t (*)(ncclComm_t, ncclLlaminarCompletionAuthority*);
+            completionAuthority_t fp_completion_authority = nullptr;
+            using completionSignal_t = ncclResult_t (*)(ncclComm_t);
+            completionSignal_t fp_completion_signal = nullptr;
+            deviceBytesBroadcast_t fp_device_bytes_broadcast = nullptr;
+            deviceSliceBroadcast_t fp_device_slice_broadcast = nullptr;
             using deviceRowsGather_t = ncclResult_t (*)(const void *, void *,
                 const std::int32_t *, size_t, size_t, unsigned long long *, ncclComm_t, void *);
             using deviceRowsReduction_t = ncclResult_t (*)(const void *, void *,
@@ -128,6 +153,42 @@ namespace llaminar2
             ncclGroupStart_t fp_ncclGroupStart = nullptr;
             ncclGroupEnd_t fp_ncclGroupEnd = nullptr;
 
+            /**
+             * @brief Withdraw every borrowed callback before its DSO can retire.
+             * The caller holds g_mutex. Failed partial resolution must leave the
+             * same unavailable state as unload, including the live-row extensions.
+             */
+            void clearResolvedSymbols() noexcept
+            {
+                fp_ncclGetVersion = nullptr;
+                fp_ncclGetUniqueId = nullptr;
+                fp_ncclCommInitRank = nullptr;
+                fp_ncclCommInitRankConfig = nullptr;
+                fp_ncclCommDestroy = nullptr;
+                fp_ncclCommAbort = nullptr;
+                fp_ncclCommCount = nullptr;
+                fp_ncclCommCuDevice = nullptr;
+                fp_ncclCommUserRank = nullptr;
+                fp_ncclGetErrorString = nullptr;
+                fp_ncclAllReduce = nullptr;
+                fp_ncclBroadcast = nullptr;
+                fp_ncclReduce = nullptr;
+                fp_ncclAllGather = nullptr;
+                fp_ncclReduceScatter = nullptr;
+                fp_completion_signal = nullptr;
+                fp_completion_authority = nullptr;
+                fp_device_bytes_broadcast = nullptr;
+                fp_device_bytes_send = nullptr;fp_device_bytes_recv = nullptr;fp_device_slice_send = nullptr;
+                fp_device_slice_broadcast = nullptr;
+                fp_device_rows_gather = nullptr;
+                fp_device_rows_reduce = nullptr;
+                fp_device_rows_scatter = nullptr;
+                fp_ncclSend = nullptr;
+                fp_ncclRecv = nullptr;
+                fp_ncclGroupStart = nullptr;
+                fp_ncclGroupEnd = nullptr;
+            }
+
             // Helper to load a symbol
             template <typename T>
             bool loadSymbol(T &func_ptr, const char *name)
@@ -148,26 +209,48 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Load the canonical capture-reentry NCCL once with local symbols.
-         * @param library_path Explicit test/deployment library, or null for the
-         *        installed canonical SONAME. Failure never selects another DSO.
-         * @return Whether all required NCCL entrypoints were resolved.
+         * @brief Resolve the exact selected NCCL dependency without substitution.
+         * @param library_path Explicit nonempty diagnostic/deployment path, or null
+         *        for CMake's selected LLAMINAR_NCCL_LIBRARY/NCCL_LIBRARY path.
+         * @return True when the same selection is already loaded or every required
+         *         symbol resolves; false for an invalid/different selection or failure.
+         * Empty explicit input is invalid even if an earlier load succeeded. A
+         * failed load never searches another directory or bare SONAME. The mutex
+         * protects the existing single dependency and its resolved entrypoints.
          */
         bool load(const char *library_path)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
 
+            const char *path = library_path;
+#ifdef LLAMINAR_NCCL_LIBRARY_PATH
+            if (!path)
+                path = LLAMINAR_NCCL_LIBRARY_PATH;
+#endif
+            if (!path || !*path)
+            {
+                g_last_error = library_path ? "Explicit NCCL library path is empty" :
+                    "No NCCL library configured; set LLAMINAR_NCCL_LIBRARY when configuring the build";
+                LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                return false;
+            }
+
             if (g_library_handle)
             {
-                // Already loaded
+                if (g_library_path != path)
+                {
+                    g_last_error = "NCCL is already loaded from '" + g_library_path +
+                        "'; requested different library '" + path + "'";
+                    LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                    return false;
+                }
                 return true;
             }
 
-            // The distinct SONAME is deliberate: an unpatched system library
-            // fails when a retained parent resumes capture with the same ID.
-            // Resolve exactly one dependency; never hide a missing installation
-            // by loading the incompatible distribution package instead.
-            const char *path = library_path ? library_path : "libllaminar_nccl.so.2";
+            // Allocate the owned identity before opening the DSO; publication
+            // after symbol resolution is a nonthrowing string move.
+            std::string admitted_path(path);
+            path = admitted_path.c_str();
 
             // Clear any previous dlerror
             dlerror();
@@ -184,7 +267,7 @@ namespace llaminar2
 
             if (!g_library_handle)
             {
-                g_last_error = std::string("Failed to load canonical NCCL library: ") + path;
+                g_last_error = std::string("Failed to load configured NCCL library: ") + path;
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
                 return false;
             }
@@ -206,6 +289,43 @@ namespace llaminar2
             success = success && loadSymbol(fp_ncclReduce, "ncclReduce");
             success = success && loadSymbol(fp_ncclAllGather, "ncclAllGather");
             success = success && loadSymbol(fp_ncclReduceScatter, "ncclReduceScatter");
+            // Preserve an earlier required-symbol error without invoking any
+            // callback from a library that has not passed that original boundary.
+            if (success)
+            {
+                // Vendor release and symbol presence cannot attest GROUP abort semantics.
+                // Reject the selected DSO before admitting any completed-family callback.
+                using completedProtocolVersion_t = std::uint32_t (*)();
+                const auto completedProtocolVersion = reinterpret_cast<completedProtocolVersion_t>(
+                    dlsym(g_library_handle, "llaminarNcclCompletedProtocolVersion"));
+                const bool completedProtocolAccepted = completedProtocolVersion &&
+                    completedProtocolVersion() == kNativeCompletedProtocolVersion;
+                if (!completedProtocolAccepted)
+                {
+                    g_last_error = "NCCL completed-byte protocol requires version 3 (addressed completion, origin bounds and abortable GROUP barriers)";
+                    success = false;
+                }
+                else
+                {
+                    fp_completion_signal = reinterpret_cast<completionSignal_t>(
+                        dlsym(g_library_handle, "llaminarNcclSignalCompletionAbort"));
+                    fp_completion_authority = reinterpret_cast<completionAuthority_t>(
+                        dlsym(g_library_handle, "llaminarNcclCompletionAuthority"));
+                    fp_device_bytes_broadcast = reinterpret_cast<deviceBytesBroadcast_t>(
+                        dlsym(g_library_handle, "llaminarNcclBroadcastCompletedBytes"));
+                    fp_device_slice_broadcast = reinterpret_cast<deviceSliceBroadcast_t>(
+                        dlsym(g_library_handle, "llaminarNcclBroadcastCompletedSliceOrigin"));
+                    fp_device_bytes_send = reinterpret_cast<deviceBytesSend_t>(dlsym(g_library_handle,"llaminarNcclSendCompletedBytes"));
+                    fp_device_bytes_recv = reinterpret_cast<deviceBytesRecv_t>(dlsym(g_library_handle,"llaminarNcclRecvCompletedBytes"));
+                    fp_device_slice_send = reinterpret_cast<deviceSliceSend_t>(dlsym(g_library_handle,"llaminarNcclSendCompletedSliceOrigin"));
+                    if (!fp_completion_signal || !fp_completion_authority ||
+                        !fp_device_bytes_broadcast || !fp_device_slice_broadcast || !fp_device_bytes_send || !fp_device_bytes_recv || !fp_device_slice_send)
+                    {
+                        g_last_error = "NCCL completed protocol3 ABI is incomplete";
+                        success = false;
+                    }
+                }
+            }
             success = success && loadSymbol(fp_device_rows_gather, "llaminarNcclAllGatherDeviceRows");
             success = success && loadSymbol(fp_device_rows_reduce, "llaminarNcclAllReduceDeviceRows");
             success = success && loadSymbol(fp_device_rows_scatter, "llaminarNcclReduceScatterDeviceRows");
@@ -217,12 +337,14 @@ namespace llaminar2
             if (!success)
             {
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                clearResolvedSymbols();
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
                 return false;
             }
 
-            LOG_INFO("NCCL Dynamic Loader: All " << 19 << " symbols loaded successfully");
+            g_library_path = std::move(admitted_path);
+            LOG_INFO("NCCL Dynamic Loader: All required symbols loaded successfully");
             return true;
         }
 
@@ -230,35 +352,12 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lock(g_mutex);
 
+            clearResolvedSymbols();
+            g_library_path.clear();
             if (g_library_handle)
             {
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
-
-                // Clear function pointers
-                fp_ncclGetVersion = nullptr;
-                fp_ncclGetUniqueId = nullptr;
-                fp_ncclCommInitRank = nullptr;
-                fp_ncclCommInitRankConfig = nullptr;
-                fp_ncclCommDestroy = nullptr;
-                fp_ncclCommAbort = nullptr;
-                fp_ncclCommCount = nullptr;
-                fp_ncclCommCuDevice = nullptr;
-                fp_ncclCommUserRank = nullptr;
-                fp_ncclGetErrorString = nullptr;
-                fp_ncclAllReduce = nullptr;
-                fp_ncclBroadcast = nullptr;
-                fp_ncclReduce = nullptr;
-                fp_ncclAllGather = nullptr;
-                fp_ncclReduceScatter = nullptr;
-                fp_device_rows_gather = nullptr;
-                fp_device_rows_reduce = nullptr;
-                fp_device_rows_scatter = nullptr;
-                fp_ncclSend = nullptr;
-                fp_ncclRecv = nullptr;
-                fp_ncclGroupStart = nullptr;
-                fp_ncclGroupEnd = nullptr;
-
                 LOG_DEBUG("NCCL Dynamic Loader: Library unloaded");
             }
         }
@@ -469,6 +568,105 @@ namespace llaminar2
                 return ncclInternalError;
             }
             return fp_ncclAllGather(sendbuff, recvbuff, sendcount, datatype, comm, stream);
+        }
+
+        /** @copydoc signalNativeCompletionAbort(ncclComm_t) */
+        ncclResult_t signalNativeCompletionAbort(ncclComm_t comm)
+        {
+            if (!comm) return ncclInvalidArgument;
+            if (!fp_completion_signal) {
+                LOG_ERROR("NCCL loaded library lacks original signal-only completed-byte abort ABI");
+                return ncclInvalidUsage;
+            }
+            return fp_completion_signal(comm);
+        }
+
+        /** @copydoc nativeCompletionAuthority(ncclComm_t,ncclLlaminarCompletionAuthority*) */
+        ncclResult_t nativeCompletionAuthority(ncclComm_t comm, ncclLlaminarCompletionAuthority* original)
+        {
+            if (!comm || !original) return ncclInvalidArgument;
+            if (!fp_completion_authority || !fp_completion_signal || !fp_device_bytes_broadcast || !fp_device_slice_broadcast || !fp_device_bytes_send || !fp_device_bytes_recv || !fp_device_slice_send) {
+                LOG_ERROR("NCCL loaded library lacks original completed-byte authority ABI");
+                return ncclInvalidUsage;
+            }
+            return fp_completion_authority(comm, original);
+        }
+
+        /** @copydoc nativeBroadcastBytes(const void*,void*,const NativeCollectiveBytes&,int,ncclComm_t,void*) */
+        ncclResult_t nativeBroadcastBytes(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, ncclComm_t comm, void* stream)
+        {
+            if (!send || !receive || !comm || reinterpret_cast<std::uintptr_t>(stream) <= 2)
+                return ncclInvalidArgument;
+            switch (bytes.kind())
+            {
+            case NativeByteExtent::Fixed:
+                return ncclBroadcast(send, receive, bytes.capacityBytes(), ncclInt8, root, comm, stream);
+            case NativeByteExtent::DevicePrefix:
+                if (!fp_device_bytes_broadcast || !fp_completion_authority || !fp_completion_signal)
+                {
+                    LOG_ERROR("NCCL loaded library lacks the selected UINT64 byte-prefix Broadcast ABI");
+                    return ncclInvalidUsage;
+                }
+                return fp_device_bytes_broadcast(send, receive, bytes.extent(), bytes.capacityBytes(),
+                    root, bytes.completion(), comm, stream);
+            case NativeByteExtent::DeviceSourceSlice:
+                if (!fp_device_slice_broadcast || !fp_completion_authority || !fp_completion_signal)
+                {
+                    LOG_ERROR("NCCL loaded library lacks the selected UINT64 source-slice Broadcast ABI");
+                    return ncclInvalidUsage;
+                }
+                return fp_device_slice_broadcast(send, receive, bytes.sourceSlice(), bytes.extent(),
+                    bytes.sourceCapacityBytes(), bytes.capacityBytes(), root, bytes.sourceOffsetOrigin(), bytes.completion(), comm, stream);
+            }
+            return ncclInvalidArgument;
+        }
+
+        /** @copydoc nativeP2pProgressGeometry(ncclLlaminarP2pProgressShape*) */
+        ncclResult_t nativeP2pProgressGeometry(ncclLlaminarP2pProgressShape* shape)
+        {
+            if(!shape)return ncclInvalidArgument;
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if(!g_library_handle)return ncclInvalidUsage;
+            using Geometry=ncclResult_t (*)(ncclLlaminarP2pProgressShape*);
+            const auto geometry=reinterpret_cast<Geometry>(dlsym(g_library_handle,"llaminarNcclP2pProgressGeometry"));
+            return geometry ? geometry(shape) : ncclInvalidUsage;
+        }
+
+        /** @copydoc nativeP2pProgressSnapshot(ncclLlaminarCompletionAuthority,int,ncclLlaminarP2pProgress*,std::size_t,void*) */
+        ncclResult_t nativeP2pProgressSnapshot(ncclLlaminarCompletionAuthority original,
+            int peer,ncclLlaminarP2pProgress* snapshot,std::size_t bytes,void* stream)
+        {
+            if(!original.deviceCommunicator || !original.abortFlag || !snapshot || peer<0 ||
+                reinterpret_cast<std::uintptr_t>(stream)<=2 || !bytes)
+                return ncclInvalidArgument;
+            // Resolve only from the exact admitted handle; no callback survives unload.
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if(!g_library_handle)return ncclInvalidUsage;
+            using Observe=ncclResult_t (*)(const ncclLlaminarCompletionAuthority*,int,ncclLlaminarP2pProgress*,std::size_t,void*);
+            const auto observe=reinterpret_cast<Observe>(dlsym(g_library_handle,"llaminarNcclObserveP2pProgress"));
+            return observe ? observe(&original,peer,snapshot,bytes,stream) : ncclInvalidUsage;
+        }
+
+        /** @copydoc nativeTransferBytes(void*,const NativeCollectiveBytes&,NativeByteEdge,int,ncclComm_t,void*) */
+        ncclResult_t nativeTransferBytes(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,ncclComm_t comm,void* stream) {
+            if(!payload || !comm || reinterpret_cast<std::uintptr_t>(stream)<=2 ||
+                (participant!=edge.producer() && participant!=edge.consumer()))return ncclInvalidArgument;
+            const bool sending=participant==edge.producer();const int peer=edge.peer(participant);
+            if(bytes.kind()==NativeByteExtent::DeviceSourceSlice && bool(bytes.sourceSlice())!=sending)return ncclInvalidArgument;
+            if(bytes.kind()==NativeByteExtent::Fixed)
+                return sending?ncclSend(payload,bytes.capacityBytes(),ncclInt8,peer,comm,stream):
+                    ncclRecv(payload,bytes.capacityBytes(),ncclInt8,peer,comm,stream);
+            if(!fp_device_bytes_send || !fp_device_bytes_recv || !fp_device_slice_send ||
+                !fp_completion_authority || !fp_completion_signal)return ncclInvalidUsage;
+            if(bytes.sourceSlice()) {
+                if(!sending)return ncclInvalidArgument;
+                return fp_device_slice_send(payload,bytes.sourceSlice(),bytes.sourceCapacityBytes(),bytes.capacityBytes(),
+                    peer,bytes.sourceOffsetOrigin(),bytes.completion(),comm,stream);
+            }
+            return sending?fp_device_bytes_send(payload,bytes.extent(),bytes.capacityBytes(),peer,bytes.completion(),comm,stream):
+                fp_device_bytes_recv(payload,bytes.extent(),bytes.capacityBytes(),peer,bytes.completion(),comm,stream);
         }
 
         /** @copydoc nativeRows(NativeRowCollective,const void*,void*,const NativeCollectiveRows&,ncclDataType_t,ncclRedOp_t,unsigned long long*,ncclComm_t,void*) */

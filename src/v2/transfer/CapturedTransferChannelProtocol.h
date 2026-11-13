@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <type_traits>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -62,8 +63,23 @@ namespace llaminar2
         return false;
     }
 
+    /**
+     * @brief One producer-owned live slice within an immutable retained source region.
+     *
+     * Offsets use the binding's immutable coordinate origin, independent of
+     * the mapped slot. The graph orders this whole descriptor before acquisition;
+     * acquire snapshots both fields before waiting and retains them through
+     * payload publication. Empty slices may name the source region's end.
+     */
+    struct CapturedTransferSourceSlice
+    {
+        std::uint64_t byte_offset = 0;
+        std::uint64_t live_bytes = 0;
+    };
+    static_assert(sizeof(CapturedTransferSourceSlice) == 16);
+
     /** @brief Local lease state; a failed endpoint is never reusable. */
-    enum class CapturedTransferPhase : std::uint32_t { Idle, Acquired, Publishing, Failed };
+    enum class CapturedTransferPhase : std::uint32_t { Idle, Acquired, Publishing, Failed, Cancelled };
 
     /** @brief Semantic decision, independent of a backend enqueue result. */
     enum class CapturedTransferStatus : std::uint32_t
@@ -77,6 +93,7 @@ namespace llaminar2
         MessageMismatch,
         EpochExhausted,
         TimedOut,
+        Cancelled, ///< Original parent cancelled the bound invocation; channel is terminal.
     };
 
     /** Reserved terminal value releases a peer into failure, never into payload work. */
@@ -101,6 +118,8 @@ namespace llaminar2
             std::uint64_t capacity) const noexcept
         { return key != 0 && bytes != 0 && bytes <= capacity; }
     };
+
+    /** @brief Explicit physical payload route; a peer request never selects mapped-host payload. */
 
     /** @brief Immutable mapped-lane identity; new storage receives a new identity. */
     struct CapturedTransferChannelIdentity
@@ -133,15 +152,59 @@ namespace llaminar2
         CapturedTransferPhase phase = CapturedTransferPhase::Idle;
         std::uint32_t completed_payload_blocks = 0; ///< GPU-only completion cohort; occupies former alignment padding.
         CapturedTransferMessage acquired_message;
+        std::uint64_t acquired_source_offset = 0; ///< Producer-private snapshot; never a wire extent or host observation.
     };
 
-    /** @brief Setup-owned mapped header and independent release words. */
+    /** @brief Original admission outcome after the enclosing owner has proved native endpoint retirement. */
+    enum class CapturedTransferInvocationRetirement { Completed, Cancelled };
+
+    /** @brief Original immutable request identity borrowed from its existing parent admission. */
+    struct CapturedTransferInvocation
+    {
+        std::uint64_t generation = 0;
+        std::uint64_t invocation = 0;
+        /** @return Whether this names a real original admission, never an unticketed observation. */
+        [[nodiscard]] constexpr bool valid() const noexcept { return generation && invocation; }
+        /** @return Exact original request equality, including its generation. */
+        [[nodiscard]] constexpr bool operator==(const CapturedTransferInvocation &other) const noexcept
+        { return generation == other.generation && invocation == other.invocation; }
+        /** @return Whether either original request coordinate differs. */
+        [[nodiscard]] constexpr bool operator!=(const CapturedTransferInvocation &other) const noexcept
+        { return !(*this == other); }
+    };
+
+    /** @brief Setup identity, CPU-owned terminal cancellation and independent GPU release words. */
     struct alignas(64) CapturedTransferChannelControl
     {
         CapturedTransferChannelIdentity identity;
+        std::uint64_t cancelled_nonce = 0; ///< Sole CPU parent publication; endpoints never clear or write it.
         CapturedTransferPublication producer;
         CapturedTransferPublication consumer;
     };
+
+    // Cancellation occupies the identity cache line's existing alignment padding.
+    // The shared memoryFor() BOM and physical producer/consumer offsets stay exact.
+    static_assert(sizeof(CapturedTransferChannelControl) == 192);
+    static_assert(offsetof(CapturedTransferChannelControl, producer) == 64);
+
+    /** @brief Checked lowering of a device-owned logical row count; no second scalar or wire authority. */
+    struct CapturedTransferRowBytes
+    {
+        bool valid;
+        std::uint64_t bytes;
+    };
+    /** @brief Convert exactly the original live rows, rejecting negative, overflow and capacity excess.
+     * @param rows Original signed INT32 device row count, including legitimate zero.
+     * @param row_bytes Positive immutable physical row stride in bytes.
+     * @param capacity Maximum captured message bytes, never the current live count.
+     * @return Checked uint64 byte extent for the existing producer publication. */
+    [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr CapturedTransferRowBytes capturedTransferRowBytes(
+        std::int32_t rows, std::uint64_t row_bytes, std::uint64_t capacity) noexcept
+    {
+        if (rows < 0 || !row_bytes || !capacity || std::uint64_t(rows) > capacity / row_bytes)
+            return {false, 0};
+        return {true, std::uint64_t(rows) * row_bytes};
+    }
 
     /**
      * @brief Exact aliases and immutable geometry passed to one CUDA/HIP boundary.
@@ -159,16 +222,107 @@ namespace llaminar2
         CapturedTransferEndpoint role = CapturedTransferEndpoint::Producer;
         std::uint64_t timeout_ticks = 0;
         CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage;
-        std::uint64_t *device_extent = nullptr; ///< Producer input or consumer output; retained device storage.
+        std::uint64_t *device_extent = nullptr; ///< Existing byte-count input/output, absent for typed row counts.
+        const std::int32_t *device_rows = nullptr; ///< Retained local live-row input; never reinterpreted as uint64.
+        std::uint64_t row_bytes = 0; ///< Immutable checked bytes per row; zero on existing byte-count paths.
+        const CapturedTransferSourceSlice *source_slice = nullptr; ///< Optional producer descriptor in its original retained Tensor.
+        std::uint64_t source_span_bytes = 0; ///< Immutable local source region, independent of maximum/live wire bytes.
+        std::uint64_t source_offset_origin = 0; ///< Coordinate origin of that source region in the original descriptor.
 
         /** @return Whether immutable fields can name a bounded native operation. */
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool valid() const noexcept
         {
             return control && cursor && expected.valid() && message.fits(expected.capacity) && timeout_ticks != 0 &&
                 capturedTransferExtentMatchesRole(extent_source, role) &&
-                ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr));
+                (device_rows ? !device_extent && row_bytes != 0 && message.bytes % row_bytes == 0 &&
+                    extent_source != CapturedTransferExtentSource::FixedMessage && !source_slice
+                    : row_bytes == 0 && ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr))) &&
+                (source_slice ? role == CapturedTransferEndpoint::Producer &&
+                    extent_source == CapturedTransferExtentSource::ProducerDevice &&
+                    device_extent == &source_slice->live_bytes && source_span_bytes != 0 && source_span_bytes >= message.bytes &&
+                    source_offset_origin <= ~std::uint64_t{0} - source_span_bytes
+                    : source_span_bytes == 0 && source_offset_origin == 0);
         }
     };
+
+    /**
+     * @brief Read-only device receipt borrowed from an actual retained consumer binding.
+     *
+     * This view adds no progress word and never reads GPU state on the host.
+     * The original binding/channel owner must outlive every captured reader.
+     * Native callers acquire the original mapped publication/cancellation words
+     * before evaluating the same pure receipt law used by CPU replay.
+     */
+    class CapturedTransferReceiveCompletion final
+    {
+    public:
+        /** @return Explicit absence for native phases that do not consume a payload receipt. */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD static constexpr CapturedTransferReceiveCompletion notRequired() noexcept
+        { return CapturedTransferReceiveCompletion{}; }
+        /** @return Whether this names original positive-capacity consumer metadata. */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool valid() const noexcept
+        { return control_ && cursor_ && expected_.valid() && message_.fits(expected_.capacity); }
+        /** @return Original mapped cancellation address; native system-acquire only. */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr const std::uint64_t* cancellationAddress() const noexcept
+        { return control_ ? &control_->cancelled_nonce : nullptr; }
+        /** @return Original consumer publication, acquired on device after that endpoint completes. */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr const CapturedTransferPublication* publication() const noexcept
+        { return control_ ? &control_->consumer : nullptr; }
+        /** @return Original endpoint-local cancellation disposition; native callers inspect this before a rare system acquire. */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool hasCancelledCursor() const noexcept
+        { return valid() && cursor_->phase == CapturedTransferPhase::Cancelled; }
+        /**
+         * @brief Recognize absorbing cancellation on this exact original receive endpoint.
+         * @param cancellation System-acquired publication from this original physical channel.
+         * @return True only for its absorbing Cancelled cursor and exact original nonce.
+         * @note This claims neither that no payload was copied nor that model/owner retirement is proven.
+         */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool cancelledReceive(
+            std::uint64_t cancellation) const noexcept
+        {
+            return valid() && control_->identity.nonce == expected_.nonce &&
+                control_->identity.capacity == expected_.capacity && cancellation == expected_.nonce &&
+                cursor_->phase == CapturedTransferPhase::Cancelled;
+        }
+        /**
+         * @brief Validate actual completed payload identity rather than inferring success from byte count.
+         * @param bytes Actual received bytes, including a legitimate zero.
+         * @param cancellation System-acquired original channel cancellation publication.
+         * @param observed_epoch Original publication epoch acquired on device, or recorded CPU input.
+         * @param observed_message Descriptor read after that acquire, never a host GPU observation.
+         * @return Ready only for the exact successful message/epoch; real prior faults outrank cancellation.
+         */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr CapturedTransferStatus status(
+            std::uint64_t bytes, std::uint64_t cancellation, std::uint64_t observed_epoch,
+            CapturedTransferMessage observed_message) const noexcept
+        {
+            if (!valid() || control_->identity.nonce != expected_.nonce || control_->identity.capacity != expected_.capacity)
+                return CapturedTransferStatus::InvalidBinding;
+            if (cursor_->phase == CapturedTransferPhase::Failed) return CapturedTransferStatus::InvalidPhase;
+            if (cursor_->phase == CapturedTransferPhase::Cancelled)
+                return cancellation == expected_.nonce ? CapturedTransferStatus::Cancelled : CapturedTransferStatus::InvalidBinding;
+            if (cursor_->phase != CapturedTransferPhase::Idle) return CapturedTransferStatus::InvalidPhase;
+            if (!cursor_->completed_epoch || cursor_->completed_epoch == kCapturedTransferAbortEpoch ||
+                observed_epoch != cursor_->completed_epoch) return CapturedTransferStatus::EpochMismatch;
+            if (observed_message.key != message_.key || observed_message.bytes != bytes || bytes > message_.bytes)
+                return CapturedTransferStatus::MessageMismatch;
+            if (cancellation)
+                return cancellation == expected_.nonce ? CapturedTransferStatus::Cancelled : CapturedTransferStatus::InvalidBinding;
+            return CapturedTransferStatus::Ready;
+        }
+    private:
+        friend class TransferEngine;
+        /** @brief Explicit unbound source-only argument; never accepted by an ACK launch. */
+        LLAMINAR_TRANSFER_CHANNEL_HD constexpr CapturedTransferReceiveCompletion() noexcept = default;
+        /** @brief Only TransferEngine projects an already authenticated original consumer binding. */
+        explicit constexpr CapturedTransferReceiveCompletion(const CapturedTransferChannelDeviceBinding& original) noexcept
+            : control_(original.control), cursor_(original.cursor), expected_(original.expected), message_(original.message) {}
+        const CapturedTransferChannelControl* control_ = nullptr;
+        const CapturedTransferCursor* cursor_ = nullptr;
+        CapturedTransferChannelIdentity expected_;
+        CapturedTransferMessage message_;
+    };
+    static_assert(std::is_trivially_copyable_v<CapturedTransferReceiveCompletion>);
 
     /** @brief Result of one pure transition; only Ready grants payload access. */
     struct CapturedTransferDecision
@@ -202,7 +356,11 @@ namespace llaminar2
          * @param message Semantic role and exact size or positive maximum extent.
          * @param extent_source Immutable authority for this invocation's live size.
          * @param producer_bytes Producer device scalar sampled once, ignored by other sources.
-         * @return Ready with one lease, WaitForPeer without mutation, or failure.
+         * @param producer_source_offset Optional offset sampled with that scalar from its original slice.
+         * @param producer_source_span Positive immutable source region for a sliced producer; zero for ordinary bindings.
+         * @param producer_source_origin Immutable coordinate origin; subtraction never widens the admitted region.
+         * @param cancelled_nonce Original CPU parent's terminal publication, acquired with system scope.
+         * @return Ready with one lease, WaitForPeer without mutation, or absorbing failure/cancellation.
          *
          * The producer waits for acknowledgement of its previous epoch. The
          * consumer waits for precisely one new producer epoch, then validates
@@ -214,15 +372,34 @@ namespace llaminar2
             CapturedTransferChannelIdentity actual, CapturedTransferCursor &cursor,
             CapturedTransferPublication peer, CapturedTransferMessage message,
             CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage,
-            std::uint64_t producer_bytes = 0) noexcept
+            std::uint64_t producer_bytes = 0,
+            std::uint64_t producer_source_offset = 0,
+            std::uint64_t producer_source_span = 0,
+            std::uint64_t producer_source_origin = 0,
+            std::uint64_t cancelled_nonce = 0) noexcept
         {
             if (!identity.valid() || identity.nonce != actual.nonce || identity.capacity != actual.capacity ||
                 !message.fits(identity.capacity) ||
                 !capturedTransferExtentMatchesRole(extent_source, role) ||
-                (extent_source == CapturedTransferExtentSource::ProducerDevice && producer_bytes > message.bytes))
+                (extent_source == CapturedTransferExtentSource::ProducerDevice && producer_bytes > message.bytes) ||
+                (producer_source_span ? role != CapturedTransferEndpoint::Producer ||
+                    extent_source != CapturedTransferExtentSource::ProducerDevice || producer_source_span < message.bytes ||
+                    producer_source_origin > ~std::uint64_t{0} - producer_source_span ||
+                    producer_source_offset < producer_source_origin ||
+                    producer_source_offset - producer_source_origin > producer_source_span ||
+                    producer_bytes > producer_source_span - (producer_source_offset - producer_source_origin)
+                    : producer_source_offset != 0 || producer_source_origin != 0))
                 return fail(cursor, CapturedTransferStatus::InvalidBinding);
+            if (cursor.phase == CapturedTransferPhase::Failed)
+                return fail(cursor, CapturedTransferStatus::InvalidPhase);
+            if (cursor.phase == CapturedTransferPhase::Cancelled)
+                return cancelled_nonce == identity.nonce ? fail(cursor, CapturedTransferStatus::Cancelled)
+                    : fail(cursor, CapturedTransferStatus::InvalidPhase);
             if (cursor.phase != CapturedTransferPhase::Idle)
                 return fail(cursor, CapturedTransferStatus::InvalidPhase);
+            if (cancelled_nonce)
+                return fail(cursor, cancelled_nonce == identity.nonce
+                    ? CapturedTransferStatus::Cancelled : CapturedTransferStatus::InvalidBinding);
             if (peer.epoch == kCapturedTransferAbortEpoch)
                 return fail(cursor, CapturedTransferStatus::PeerAborted);
             if (cursor.completed_epoch >= kCapturedTransferAbortEpoch - 1)
@@ -254,6 +431,7 @@ namespace llaminar2
             }
             cursor.phase = CapturedTransferPhase::Acquired;
             cursor.acquired_message = message;
+            cursor.acquired_source_offset = producer_source_offset - producer_source_origin;
             return {CapturedTransferStatus::Ready, completed + 1};
         }
 
@@ -262,7 +440,10 @@ namespace llaminar2
          * @param cursor Endpoint-private owner that acquired the slot.
          * @param lease Epoch returned by the successful acquire, never a host clock.
          * @param publication Descriptor to release-publish after this transition.
-         * @return Ready with the completed epoch, or absorbing failure.
+         * @param cancelled_nonce Optional system-acquired original parent cancellation.
+         * @param original_nonce Original physical identity for that cancellation.
+         * @return Ready with the completed epoch, or absorbing failure/cancellation.
+         * Original phase/epoch errors are validated before cancellation.
          *
          * The lowering writes descriptor fields before the system-release epoch
          * store. A consumer acknowledgement follows the copy into its own bank,
@@ -270,19 +451,60 @@ namespace llaminar2
          * bank. Capture contains the entire acquire/copy/publication order.
          */
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD static constexpr CapturedTransferDecision publish(
-            CapturedTransferCursor &cursor, std::uint64_t lease, CapturedTransferPublication &publication) noexcept
+            CapturedTransferCursor &cursor, std::uint64_t lease, CapturedTransferPublication &publication,
+            std::uint64_t cancelled_nonce = 0,std::uint64_t original_nonce = 0) noexcept
         {
             if (cursor.phase != CapturedTransferPhase::Acquired)
                 return fail(cursor, CapturedTransferStatus::InvalidPhase);
             if (lease == 0 || lease == kCapturedTransferAbortEpoch || lease != cursor.completed_epoch + 1 ||
                 publication.epoch != cursor.completed_epoch)
                 return fail(cursor, CapturedTransferStatus::EpochMismatch);
+            if(cancelled_nonce)return fail(cursor,cancelled_nonce==original_nonce && original_nonce
+                ?CapturedTransferStatus::Cancelled:CapturedTransferStatus::InvalidBinding);
             publication.message = cursor.acquired_message;
             publication.epoch = lease;
             cursor.completed_epoch = lease;
             cursor.phase = CapturedTransferPhase::Idle;
             cursor.acquired_message = {};
+            cursor.acquired_source_offset = 0;
             return {CapturedTransferStatus::Ready, lease};
+        }
+
+        /** @brief Prepare a release locally, validating original faults before cancellation.
+         * @param cursor Private snapshot of the original acquired endpoint, committed only on Ready.
+         * @param publication Private snapshot of its own publication, committed only on Ready.
+         * @param expected Frozen semantic message geometry from the original capture binding.
+         * @param extent_source Original fixed/count authority, never a replacement live count.
+         * @param cancelled_nonce System-acquired original parent terminal publication.
+         * @param original_nonce This channel's frozen physical identity.
+         * @return Original phase/message/epoch failure, explicit cancellation, or complete Ready proposal.
+         * @note No positive publication or epoch advance escapes a rejected proposal.
+         */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD static constexpr CapturedTransferDecision preparePublication(
+            CapturedTransferCursor& cursor,CapturedTransferPublication& publication,CapturedTransferMessage expected,
+            CapturedTransferExtentSource extent_source,std::uint64_t cancelled_nonce,std::uint64_t original_nonce) noexcept
+        {
+            if(cursor.phase!=CapturedTransferPhase::Acquired)
+                return fail(cursor,CapturedTransferStatus::InvalidPhase);
+            if(cursor.acquired_message.key!=expected.key ||
+               (extent_source==CapturedTransferExtentSource::FixedMessage
+                   ?cursor.acquired_message.bytes!=expected.bytes:cursor.acquired_message.bytes>expected.bytes))
+                return fail(cursor,CapturedTransferStatus::MessageMismatch);
+            return publish(cursor,cursor.completed_epoch+1,publication,cancelled_nonce,original_nonce);
+        }
+
+        /** @brief Decide only an explicit cancellation; prior or concurrent real faults remain fatal.
+         * @param phase Actual original endpoint phase, acquired atomically by native lowering.
+         * @param status Actual operation outcome, never inferred from a cancellation flag.
+         * @param matches_original Whether the original parent's terminal publication matches this channel.
+         * @return True only for explicit cancellation with no earlier endpoint fault.
+         */
+        [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD static constexpr bool drainsCancellation(
+            CapturedTransferPhase phase, CapturedTransferStatus status, bool matches_original) noexcept
+        {
+            return status == CapturedTransferStatus::Cancelled && matches_original &&
+                (phase == CapturedTransferPhase::Idle || phase == CapturedTransferPhase::Acquired ||
+                    phase == CapturedTransferPhase::Publishing || phase == CapturedTransferPhase::Cancelled);
         }
 
         /**
@@ -304,7 +526,8 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD static constexpr CapturedTransferDecision fail(
             CapturedTransferCursor &cursor, CapturedTransferStatus status) noexcept
         {
-            cursor.phase = CapturedTransferPhase::Failed;
+            cursor.phase = status == CapturedTransferStatus::Cancelled && cursor.phase != CapturedTransferPhase::Failed
+                ? CapturedTransferPhase::Cancelled : CapturedTransferPhase::Failed;
             return {status, 0};
         }
     };
@@ -312,7 +535,7 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<CapturedTransferPublication>);
     static_assert(std::is_trivially_copyable_v<CapturedTransferCursor>);
     static_assert(sizeof(CapturedTransferPublication) == 64);
-    static_assert(sizeof(CapturedTransferCursor) == 32);
+    static_assert(sizeof(CapturedTransferCursor) == 40);
     static_assert(sizeof(CapturedTransferChannelControl) == 192);
 }
 

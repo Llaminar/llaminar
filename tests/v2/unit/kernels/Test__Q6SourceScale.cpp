@@ -17,16 +17,16 @@
 #include "tensors/TensorClasses.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/VnniPackContext.h"
-#include "tensors/NativeVnniQ6Scale.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIQ6Kernels.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "tensors/NativeQuantisedQ6Scale.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedQ6Kernels.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 
 namespace llaminar2::test
 {
 namespace
 {
-using namespace cpu::native_vnni;
+using namespace cpu::native_quantised;
 constexpr int kFullN = 73;
 constexpr int kStart = 3;
 constexpr int kN = 67;
@@ -122,9 +122,9 @@ TEST_F(Q6SourceScale, EverySignedCoefficientPairRoundTrips)
     for (int low = -128; low <= 127; ++low)
     for (int high = -128; high <= 127; ++high)
     {
-        const uint16_t word = native_vnni_q6_scale::pack(int8_t(low), int8_t(high));
-        ASSERT_EQ(native_vnni_q6_scale::low(word), low);
-        ASSERT_EQ(native_vnni_q6_scale::high(word), high);
+        const uint16_t word = native_quantised_q6_scale::pack(int8_t(low), int8_t(high));
+        ASSERT_EQ(native_quantised_q6_scale::low(word), low);
+        ASSERT_EQ(native_quantised_q6_scale::high(word), high);
     }
 }
 
@@ -166,8 +166,8 @@ TEST_F(Q6SourceScale, ScalarAndSIMDUseOriginalFactorsWithQ8Activations)
 {
     const auto blocks = sourceBlocks();
     auto tensor = sourceTensor(blocks);
-    CPUNativeVNNIPackedWeights packed;
-    ASSERT_TRUE(packWeightsCPUNativeVNNI(&tensor, packed, kStart, kStart + kN));
+    CPUNativeQuantisedPackedWeights packed;
+    ASSERT_TRUE(packWeightsCPUNativeQuantised(&tensor, packed, kStart, kStart + kN));
     ASSERT_TRUE(packed.usesQ6KNativeDualScale());
     EXPECT_EQ(packed.interleaved_block_stride, 1792);
     EXPECT_EQ(packed.native_interleaved.size(), size_t(2 * kBlocks * 1792));
@@ -186,7 +186,7 @@ TEST_F(Q6SourceScale, ScalarAndSIMDUseOriginalFactorsWithQ8Activations)
     // Execute the actual scalar consumer, not only its metadata accessors.
     std::array<std::array<float, kN>, 4> scalar_actual{};
     for (int row = 0; row < 4; ++row)
-        gemv_native_vnni_scalar(packed, activations[row].data(),
+        gemv_native_quantised_scalar(packed, activations[row].data(),
             scalar_actual[row].data(), kN, kBlocks);
     for (int chunk = 0; chunk < 2; ++chunk)
     {

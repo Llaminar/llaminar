@@ -4,7 +4,11 @@
  *
  * Separate translation units reuse these declarations without recompiling every
  * state, ordinary-generation and speculative-generation test together. All
- * cache and GPU operations remain production implementations.
+ * cache and GPU operations remain production implementations. The numerical
+ * probe owns its immutable table recipe; it does not borrow a transformer
+ * layer-weight source for the graph methods it replaces.
+ * Sidecar workspace declarations retain their original typed construction
+ * purpose and can never become executable/capturable numerical graphs.
  */
 #pragma once
 #include <gtest/gtest.h>
@@ -12,6 +16,8 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
@@ -20,7 +26,9 @@
 #include "execution/local_execution/orchestrators/TPWorkerPool.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/mtp/MTPCheckpointPolicy.h"
+#include "execution/mtp/MTPForwardConstruction.h"
 #include "loaders/WeightPlan.h"
+#include "memory/CPUStorageRoot.h"
 #include "models/qwen35/Qwen35Graph.h"
 #include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
@@ -29,10 +37,14 @@
 #include "execution/compute_stages/stages/MTPVerifierPreparationStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/PlanningGGUFFixture.h"
+#include "../../../utils/ServingGGUFFixturePayload.h"
+#include "utils/MPIContext.h"
 #include "transfer/TransferEngine.h"
 #include "collective/BackendRouter.h"
 #include "collective/LocalTPContext.h"
 #include "planning/MemoryPlanner.h"
+#include "planning/RankHardwareOwnership.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/FP16Utils.h"
 #include "../../../mocks/MockModelContext.h"
@@ -40,6 +52,94 @@
 
 namespace llaminar2::test
 {
+/** @brief Physical CLI placement and local GPU identity from one original rank. */
+struct ObservedSingletonPipelinePlacement
+{
+    DeviceId gpu; ///< Local GPU ordinal in the original runtime.
+    int cpu_numa_node; ///< Physical CPU NUMA address used by public CLI placement.
+};
+
+/**
+ * @brief Select one actual GPU on the singleton bootstrap's original NUMA rank.
+ * @param family Native family already named in the original bootstrap intent.
+ * @return The first UUID-authenticated GPU in inventory order and its owning rank CPU NUMA.
+ * @throws std::runtime_error If the original bound rank or local device is absent.
+ */
+inline ObservedSingletonPipelinePlacement observedSingletonPipelinePlacement(DeviceType family)
+{
+    const auto mpi = MPIContextFactory::global();
+    if (!mpi || mpi->world_size() != 1 || !mpi->clusterInventory())
+        throw std::runtime_error("Singleton pipeline replay requires its original MPI rank");
+    const auto &rank = mpi->clusterInventory()->getRank(mpi->rank());
+    if (rank.cpu.numa_node < 0)
+        throw std::runtime_error("Singleton pipeline replay has no observed original NUMA binding");
+    for (const auto &gpu : rank.gpus)
+        if (gpu.type == family && !gpu.uuid.empty() && rankOwnsGPUDevice(rank, gpu))
+            return {{family, gpu.local_device_id}, rank.cpu.numa_node};
+    throw std::runtime_error("Singleton pipeline replay has no original NUMA-owned GPU for its native family");
+}
+
+/**
+ * @brief One original-rank-owned GGUF shared by every stage's real loader.
+ *
+ * The local multi-NUMA fixture uses the same filesystem path and immutable
+ * source on every rank. The root retains the file until all original ranks
+ * have retired their runners; followers never manufacture independent models.
+ */
+class SharedPipelinePlanningGGUFFixture final
+{
+public:
+    /**
+     * @brief Publish one actual generated source before collective model admission.
+     * @param distributed Retain original two-rank source and terminal ownership.
+     * @param main_layers Authored positive stage/layer count, independent of device counts.
+     * @param serving_payload Populate the existing nondegenerate native serving recipe.
+     */
+    explicit SharedPipelinePlanningGGUFFixture(bool distributed = true, uint32_t main_layers = 2,
+        bool serving_payload = false)
+        : mpi_(distributed ? MPIContextFactory::global() : nullptr)
+    {
+        if (!distributed)
+        {
+            fixture_ = std::make_unique<PlanningGGUFFixture>(true, true, GGUFTensorType::Q4_0,
+                256, std::nullopt, 8, PlanningGGUFFixture::Geometry::FullAttentionGraph, main_layers);
+            if (serving_payload) populateServingGGUFFixture(*fixture_);
+            path_ = fixture_->path();
+            return;
+        }
+        if (!mpi_ || mpi_->world_size() != 2)
+            throw std::runtime_error("Shared pipeline GGUF requires its original two-rank context");
+        if (mpi_->rank() == 0)
+            fixture_ = std::make_unique<PlanningGGUFFixture>(true, true, GGUFTensorType::Q4_0,
+                256, std::nullopt, 8, PlanningGGUFFixture::Geometry::FullAttentionGraph, main_layers);
+        if (fixture_ && serving_payload) populateServingGGUFFixture(*fixture_);
+        int32_t length = fixture_ ? static_cast<int32_t>(fixture_->path().size()) : 0;
+        mpi_->broadcast_int32(&length, 1, 0);
+        if (length <= 0 || length > 4096)
+            throw std::runtime_error("Shared pipeline GGUF path publication is malformed");
+        std::vector<int32_t> bytes(length);
+        if (fixture_)
+            std::copy(fixture_->path().begin(), fixture_->path().end(), bytes.begin());
+        mpi_->broadcast_int32(bytes.data(), bytes.size(), 0);
+        path_.assign(bytes.begin(), bytes.end());
+    }
+    /** @brief Preserve the real file until every original loader and prepared owner retires. */
+    ~SharedPipelinePlanningGGUFFixture()
+    {
+        if (!mpi_) return;
+        const int32_t retired = 1;
+        std::array<int32_t, 2> receipts{};
+        mpi_->allgather_bytes(&retired, receipts.data(), sizeof(retired));
+        if (receipts != std::array<int32_t, 2>{1, 1}) std::terminate();
+    }
+    /** @return The identical actual source path admitted by every original rank. */
+    const std::string &path() const noexcept { return path_; }
+private:
+    std::shared_ptr<IMPIContext> mpi_; ///< Original owner for initial/final fixture metadata only.
+    std::unique_ptr<PlanningGGUFFixture> fixture_; ///< Rank zero alone owns source-file removal.
+    std::string path_; ///< Immutable shared source identity, never inference state.
+};
+
 /** @brief Explicit backend selection keeps CPU-only preflight device-free. */
 class PipelineMTPStateOwnership : public ::testing::TestWithParam<std::string>
 {
@@ -133,10 +233,36 @@ private:
 /** @brief A token-dependent numerical graph with actual canonical KV advancement. */
 class OrdinaryDGOGraph final : public Qwen35Graph
 {
+private:
+    static constexpr size_t kTableWidth = 32;
+    static constexpr size_t kTableElements = kTableWidth * kTableWidth;
+    // The actual FP32 tensor releases its native allocation before this claim.
+    std::optional<PhysicalMemoryAllocationLease> table_device_lease_;
+
 public:
-    /** @brief Own immutable weight bytes before any graph borrows their address. */
-    explicit OrdinaryDGOGraph(const GraphConfig &config, bool embedding = true, bool head = true)
-        : Qwen35Graph(config, nullptr), table({32, 32}), owns_embedding(embedding), owns_head(head)
+    /** @return Exact device allocation of the immutable numerical recipe. */
+    static constexpr size_t tableDeviceBytes() noexcept { return kTableElements * sizeof(float); }
+
+    /** @return The same typed source storage used for planning and construction. */
+    static CPUStorageRoot<float> tableSourceStorage()
+    {
+        return {kTableElements, PhysicalMemoryOwner::ModelSourcePayload, DeviceId::cpu()};
+    }
+
+    /**
+     * @brief Own immutable weight bytes before any graph borrows their address.
+     * @param config Original participant and numerical graph geometry.
+     * @param embedding Whether this stage owns input embedding.
+     * @param head Whether this stage owns terminal logits.
+     * @param memory Original admitted PMA for source-prepared pipeline replays.
+     */
+    explicit OrdinaryDGOGraph(const GraphConfig &config, bool embedding = true, bool head = true,
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory = {})
+        : Qwen35Graph(config, nullptr),
+          table_device_lease_(memory ? std::optional{memory->claimNewAllocation(config.default_device,
+              PhysicalMemoryOwner::PrimaryModelWeights, tableDeviceBytes())} : std::nullopt),
+          table({kTableWidth, kTableWidth}, memory ? tableSourceStorage().allocate(memory)
+              : AlignedVector<float>(kTableElements)), owns_embedding(embedding), owns_head(head)
     {
         auto *data = table.mutable_data();
         for (int input = 0; input < 32; ++input)
@@ -145,6 +271,27 @@ public:
     }
     /** @return This model-free graph owns its only immutable weight. */
     bool isInitialized() const override { return true; }
+    /**
+     * @brief Prepare the actual table source used by this numerical probe.
+     * @param device Original participant retained by every graph specialization.
+     * @throws std::invalid_argument for a foreign participant or malformed table.
+     * @details Qwen supplies the arena schema, but this builder replaces all
+     * transformer arithmetic with its own table. It therefore prepares that
+     * original source, without inventing layer-weight bindings for Qwen's recipe.
+     */
+    void prepareForwardGraphTemplate(DeviceId device) override
+    {
+        if (device == DeviceId::invalid() || device != config().default_device ||
+            table.rows() != 32 || table.cols() != 32)
+            throw std::invalid_argument("Ordinary graph template requires its original participant and table");
+        (void)table_template_.prepare([this] { return &table; });
+    }
+    /** @return Actual immutable preparation and main-forward construction counts. */
+    PreparedGraphTemplateStats forwardGraphTemplateStats() const override
+    {
+        return {.preparations = table_template_.preparations(),
+            .specialization_attempts = table_template_.specializationAttempts()};
+    }
     /** @brief Bind actual resident token input, logits and KV append in one DAG.
      * @param input Exact production invocation, never a host token shadow.
      * @param output Receives the arena-owned terminal logits.
@@ -153,10 +300,12 @@ public:
     {
         if (input.seq_len <= 0 || input.batch_size != 1 || !input.kv_cache)
             throw std::invalid_argument("Ordinary DGO probe requires one canonical KV row");
+        prepareForwardGraphTemplate(input.device);
+        auto *const original_table = table_template_.beginSpecialization();
         ++builds;
         EmbeddingStage::Params embedding;
         embedding.device_id = input.device;
-        embedding.embed_table = &table;
+        embedding.embed_table = original_table;
         embedding.token_ids = input.token_ids;
         embedding.token_ids_device = input.token_ids_device;
         embedding.output = buffers_.current_hidden;
@@ -256,10 +405,16 @@ public:
     {
         (void)depth_idx;
         (void)bindings;
+        // This numerical override owns its recipe, but the manifest still
+        // requires the same declaration/execution boundary as Qwen35Graph.
+        const auto construction_input = mtpForwardConstructionInput(input);
+        ForwardInputConstructionScope construction_scope(*this, construction_input);
         ComputeGraph graph;
+        applyForwardGraphConstructionIntent(graph, construction_input);
         if (!input.kv_cache || !input.terminal_hidden ||
             input.batch_size <= 0 || input.seq_len <= 0)
             return graph;
+        prepareForwardGraphTemplate(input.device);
 
         KVCacheAppendStage::Params append;
         append.device_id = input.device;
@@ -277,7 +432,7 @@ public:
         {
             EmbeddingStage::Params prediction;
             prediction.device_id = input.device;
-            prediction.embed_table = &table;
+            prediction.embed_table = table_template_.recipe();
             prediction.token_ids = input.draft_token_ids;
             prediction.token_ids_device = input.draft_token_ids_device;
             prediction.output = output.logits;
@@ -314,8 +469,10 @@ public:
     }
     FP32Tensor table; ///< Outlives the runner's retained embedding graph.
     int builds = 0; ///< Setup-only evidence of cache reuse, not inference authority.
-    bool owns_embedding; ///< Only the pipeline entry embeds the tail's token.
-    bool owns_head; ///< Only the tail produces vocabulary logits for sampling.
+    const bool owns_embedding; ///< Only the pipeline entry embeds the tail's token.
+    const bool owns_head; ///< Only the tail produces vocabulary logits for sampling.
+private:
+    PreparedGraphTemplate<FP32Tensor *> table_template_; ///< Borrows this builder's original table.
 };
 
 /**

@@ -19,6 +19,7 @@
 
 // Include the kernels
 #include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
+#include "backends/rocm/ROCmRuntimeStartup.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/BlockStructures.h"
@@ -36,6 +37,7 @@ using namespace llaminar2;
 bool hasROCm()
 {
 #ifdef HAVE_ROCM
+    requireROCmRuntimeStartup();
     int count = 0;
     hipError_t err = hipGetDeviceCount(&count);
     return (err == hipSuccess && count > 0);
@@ -112,6 +114,23 @@ bool hasNaNOrInf(const float *data, size_t count)
 class Test__ROCmEmbeddingParity : public ::testing::Test
 {
 protected:
+    /** @brief Own one exact nonblocking stream for all raw native lookup fixtures. */
+    void SetUp() override
+    {
+        if (!hasROCm()) GTEST_SKIP() << "No ROCm GPU available";
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), hipSuccess);
+    }
+    /** @brief Finish fixture work before destroying its borrowed producer stream. */
+    void TearDown() override
+    {
+        if (stream_)
+        {
+            EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+            EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+        }
+    }
+    hipStream_t stream_ = nullptr; ///< Exact fixture-owned producer, never the legacy stream.
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
 
@@ -174,11 +193,13 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP32_Small)
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
     // Execute ROCm kernel
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply(d_embed, d_token_ids, num_tokens, d_model,
                                    d_output, nullptr, 0));
 
     // Copy result back
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output,
                         num_tokens * d_model * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -233,10 +254,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP32_Large)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply(d_embed, d_token_ids, num_tokens, d_model,
                                    d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output,
                         num_tokens * d_model * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -293,10 +316,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_BF16_Small)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply_bf16(d_embed, d_token_ids, num_tokens, d_model,
                                         d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_bf16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -354,10 +379,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_BF16_Large)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply_bf16(d_embed, d_token_ids, num_tokens, d_model,
                                         d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_bf16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -417,10 +444,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP16_Small)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply_fp16(d_embed, d_token_ids, num_tokens, d_model,
                                         d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_fp16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -476,10 +505,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP16_Large)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply_fp16(d_embed, d_token_ids, num_tokens, d_model,
                                         d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_fp16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -563,10 +594,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_Q8_1_Small)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply_q8_1(d_embed, d_token_ids, num_tokens, d_model,
                                         d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_q8_1_output.data(), d_output,
                         num_tokens * blocks_per_row * sizeof(Q8_1Block), hipMemcpyDeviceToHost), hipSuccess);
 
@@ -622,10 +655,12 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_Q8_1_Large)
     ASSERT_EQ(hipMemcpy(d_token_ids, token_ids.data(),
                         num_tokens * sizeof(int), hipMemcpyHostToDevice), hipSuccess);
 
-    ROCmEmbeddingKernelT rocm_kernel;
+    ROCmEmbeddingKernelT rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream_);
     ASSERT_TRUE(rocm_kernel.apply_q8_1(d_embed, d_token_ids, num_tokens, d_model,
                                         d_output, nullptr, 0));
 
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_q8_1_output.data(), d_output,
                         num_tokens * blocks_per_row * sizeof(Q8_1Block), hipMemcpyDeviceToHost), hipSuccess);
 

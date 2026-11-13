@@ -154,7 +154,7 @@ installation should remain the only certification lifecycle.
 `KernelFactory::createExpertServiceExecutionView()` now gives GPU probes private
 stream/workspace/library bindings over the source engine's exact prepared
 allocations. It preserves physical decoder format and original arithmetic
-provenance independently. CPU NativeVNNI engines are immutable and may be
+provenance independently. CPU NativeQuantised engines are immutable and may be
 shared; CPU floating engines now have an aliasing-source constructor that
 retains the same tensor and numerical policy but a private workspace binding.
 The original prepared engine remains retained. No expert weights are copied or

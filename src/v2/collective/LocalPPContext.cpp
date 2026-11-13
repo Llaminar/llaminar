@@ -17,6 +17,7 @@
  */
 
 #include "ILocalPPContext.h"
+#include "LocalPPTransferSelection.h"
 #include "ILocalTPContext.h"
 #include "PPStage.h"
 #include "DeviceGroup.h"
@@ -717,45 +718,11 @@ namespace llaminar2
         // can serve as the source. Choosing a same-vendor device enables fast D2D transfer
         // via NCCL/RCCL/NVLink instead of the slower 2-hop host-staged path.
 
-        const int degree = tp_ctx->degree();
-
-        // Single device TP domain - no choice
-        if (degree == 1)
-        {
-            return tp_ctx->deviceAt(0).toLocalDeviceId();
-        }
-
-        // Check destination type
-        const bool dst_is_cuda = dst_device.is_cuda();
-        const bool dst_is_rocm = dst_device.is_rocm();
-        const bool dst_is_gpu = dst_is_cuda || dst_is_rocm;
-
-        // For CPU destination, any source works equally well (all paths go through host)
-        if (!dst_is_gpu)
-        {
-            return tp_ctx->deviceAt(0).toLocalDeviceId();
-        }
-
-        // Search for a same-vendor device in the TP domain
-        for (int i = 0; i < degree; ++i)
-        {
-            DeviceId candidate = tp_ctx->deviceAt(i).toLocalDeviceId();
-
-            if ((dst_is_cuda && candidate.is_cuda()) ||
-                (dst_is_rocm && candidate.is_rocm()))
-            {
-                LOG_DEBUG("HierarchicalPPContext::findBestSourceDevice: "
-                          << "selected same-vendor device " << candidate.toString()
-                          << " (index " << i << ") for destination " << dst_device.toString());
-                return candidate;
-            }
-        }
-
-        // No same-vendor device found - fall back to representative (index 0)
-        LOG_DEBUG("HierarchicalPPContext::findBestSourceDevice: "
-                  << "no same-vendor device found in TP domain, using representative "
-                  << tp_ctx->deviceAt(0).toString() << " for destination " << dst_device.toString());
-        return tp_ctx->deviceAt(0).toLocalDeviceId();
+        const int degree=tp_ctx->degree();
+        const auto selection=localPPBoundarySelection(true,static_cast<std::size_t>(degree),
+            [&](std::size_t index){return tp_ctx->deviceAt(static_cast<int>(index)).toLocalDeviceId();},
+            false,1,[&](std::size_t){return dst_device;});
+        return tp_ctx->deviceAt(selection.source).toLocalDeviceId();
     }
 
     bool HierarchicalPPContext::transferFromTPDomain(TensorBase *activations,
@@ -964,29 +931,10 @@ namespace llaminar2
         // then broadcast to all other devices.
 
         // Find same-vendor device in TP domain if possible
-        const bool src_is_cuda = src_device.is_cuda();
-        const bool src_is_rocm = src_device.is_rocm();
-        const bool src_is_gpu = src_is_cuda || src_is_rocm;
-
-        int initial_dst_index = 0; // Default to representative
-
-        if (src_is_gpu)
-        {
-            // Search for a same-vendor device in the TP domain
-            for (int i = 0; i < tp_degree; ++i)
-            {
-                DeviceId candidate = tp_ctx->deviceAt(i).toLocalDeviceId();
-                if ((src_is_cuda && candidate.is_cuda()) ||
-                    (src_is_rocm && candidate.is_rocm()))
-                {
-                    initial_dst_index = i;
-                    LOG_DEBUG("HierarchicalPPContext::transferToTPDomain: "
-                              << "selected same-vendor device " << candidate.toString()
-                              << " (index " << i << ") as initial destination");
-                    break;
-                }
-            }
-        }
+        const auto selection=localPPBoundarySelection(false,1,[&](std::size_t){return src_device;},
+            true,static_cast<std::size_t>(tp_degree),
+            [&](std::size_t index){return tp_ctx->deviceAt(static_cast<int>(index)).toLocalDeviceId();});
+        const int initial_dst_index=selection.destination;
 
         DeviceId initial_dst_device = tp_ctx->deviceAt(initial_dst_index).toLocalDeviceId();
 

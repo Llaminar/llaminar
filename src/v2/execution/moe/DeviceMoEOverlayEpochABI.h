@@ -19,6 +19,7 @@
 namespace llaminar2
 {
     struct MoEOverlayDeviceControllerInferenceEpochRecord;
+    struct DeviceMoEOverlayEpochParent;
 
     /** Number of simultaneously retained ExpertOverlay execution banks. */
     inline constexpr std::uint32_t kDeviceMoEOverlayEpochBankCount = 2u;
@@ -47,6 +48,8 @@ namespace llaminar2
         PublishCandidate = 5u,
         AbortCandidate = 6u,
         Retire = 7u,
+        ArmFiniteParent = 8u,
+        CloseFiniteParent = 9u,
     };
 
     /** Device-visible result of one epoch operation. */
@@ -112,7 +115,8 @@ namespace llaminar2
         std::uint64_t acquisitions_in_flight = 0u;
         std::uint32_t bank_states[kDeviceMoEOverlayEpochBankCount] = {};
         std::uint64_t published_selector = 0u;
-        std::uint64_t reserved = 0u;
+        /// Immutable original arena parent address; null for legacy unscoped component controls.
+        DeviceMoEOverlayEpochParent *finite_parent = nullptr;
     };
 
     /**
@@ -126,11 +130,16 @@ namespace llaminar2
     {
         std::uint64_t epoch = 0u;
         std::uint64_t selector = 0u;
+        /// Zero for ordinary admission; exact device parent generation for a descendant.
+        std::uint64_t parent_generation = 0u;
+        /// Unique original serial-child stamp; zero outside finite admission.
+        std::uint64_t parent_sequence = 0u;
 
         /** @return Whether epoch, generation, and bank encoding are usable. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
             return epoch != 0u &&
+                   ((parent_generation == 0u) == (parent_sequence == 0u)) &&
                    deviceMoEOverlayEpochSelectorGeneration(selector) != 0u &&
                    deviceMoEOverlayEpochSelectorBank(selector) <
                        kDeviceMoEOverlayEpochBankCount;
@@ -147,6 +156,59 @@ namespace llaminar2
         {
             return deviceMoEOverlayEpochSelectorGeneration(selector);
         }
+    };
+
+    /** ABI of the closed finite-parent lifecycle, checked before any mutation. */
+    inline constexpr std::uint32_t kDeviceMoEOverlayEpochParentVersion = 1u;
+
+    /** @brief Captured lifecycle operation on the original arena parent. */
+    enum class DeviceMoEOverlayEpochParentAction : std::uint32_t
+    {
+        Arm = 0u, ///< Guard every possible original bank until first actual admission.
+        Close = 1u, ///< Release only after every original descendant is terminal.
+    };
+
+    /** @brief Existing admission authority supplied to a finite descendant. */
+    enum class DeviceMoEOverlayEpochChildAdmission : std::uint32_t
+    {
+        Published = 0u, ///< Ordinary/local or topology-wide published admission.
+        PreparedPeer = 1u, ///< Existing authenticated activation descriptor may name Ready state.
+    };
+
+    /** @brief Device-owned lifecycle of one finite serial comparison parent. */
+    enum class DeviceMoEOverlayEpochParentState : std::uint32_t
+    {
+        Idle = 0u, ///< No scope owns an acquisition guard or reader.
+        Arming = 1u, ///< Original captured Arm is installing its acquisition guard.
+        Armed = 2u, ///< Guard protects all possible banks until the first real admission.
+        Activating = 3u, ///< First authenticated child is installing the parent reader.
+        Active = 4u, ///< Parent retains one exact original bank independently of children.
+        Closing = 5u, ///< No new child may enter while original End checks terminal children.
+    };
+
+    /**
+     * @brief Persistent finite parent in the original participant epoch arena.
+     *
+     * Armed owns one original acquisitions_in_flight guard. This includes a
+     * zero-work mapped owner which has not received its first descriptor yet.
+     * Activation installs a real bank reader BEFORE releasing that guard.
+     * Active descendants own separate existing bank readers and an exact parent
+     * generation; End may release the parent only after all children terminate.
+     * These fields are device-owned, never a host selector or policy ledger.
+     */
+    struct alignas(64) DeviceMoEOverlayEpochParent
+    {
+        /// Exact immutable original arena control address, installed only during cold setup.
+        DeviceMoEOverlayEpochControl *control = nullptr;
+        DeviceMoEOverlayEpochTicket ticket{};
+        std::uint64_t generation = 0u;
+        std::uint64_t children = 0u;
+        /// Monotonic actual Arm/child-terminal/End progress; never inferred by the host.
+        std::uint64_t progress = 0u;
+        /// Serial request-lease stamp distinguishes a released child from its successor.
+        std::uint64_t child_sequence = 0u;
+        std::uint32_t state = static_cast<std::uint32_t>(DeviceMoEOverlayEpochParentState::Idle);
+        std::uint32_t version = kDeviceMoEOverlayEpochParentVersion;
     };
 
     /**
@@ -221,7 +283,9 @@ namespace llaminar2
                   DeviceMoEOverlayEpochAdmissionBarrierBinding>);
     static_assert(sizeof(DeviceMoEOverlayEpochControl) == 64u);
     static_assert(alignof(DeviceMoEOverlayEpochControl) == 64u);
-    static_assert(sizeof(DeviceMoEOverlayEpochTicket) == 16u);
+    static_assert(sizeof(DeviceMoEOverlayEpochTicket) == 32u);
+    static_assert(sizeof(DeviceMoEOverlayEpochParent) == 128u);
+    static_assert(std::is_trivially_copyable_v<DeviceMoEOverlayEpochParent>);
     static_assert(sizeof(DeviceMoEOverlayEpochStatus) == 32u);
     static_assert(alignof(DeviceMoEOverlayEpochStatus) == 16u);
 } // namespace llaminar2

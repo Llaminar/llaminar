@@ -15,7 +15,7 @@
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayCycleSearch.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
-#include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -139,9 +139,9 @@ namespace llaminar2::moe_overlay_controller_device
     /** Device-safe view of the host runtime's fixed expert descriptor ABI. */
     struct RuntimeExpertDescriptorView
     {
-        DeviceNativeVNNIMatrixDesc gate;
-        DeviceNativeVNNIMatrixDesc up;
-        DeviceNativeVNNIMatrixDesc down;
+        DeviceNativeQuantisedMatrixDesc gate;
+        DeviceNativeQuantisedMatrixDesc up;
+        DeviceNativeQuantisedMatrixDesc down;
         DeviceMoEFloatingMatrixDesc floating_gate;
         DeviceMoEFloatingMatrixDesc floating_up;
         DeviceMoEFloatingMatrixDesc floating_down;
@@ -376,9 +376,9 @@ namespace llaminar2::moe_overlay_controller_device
                nullptr;
     }
 
-    /** @return Device-safe completeness check for one NativeVNNI matrix. */
+    /** @return Device-safe completeness check for one NativeQuantised matrix. */
     __device__ __forceinline__ bool nativeMatrixReady(
-        const DeviceNativeVNNIMatrixDesc &matrix) noexcept
+        const DeviceNativeQuantisedMatrixDesc &matrix) noexcept
     {
         return matrix.payload != nullptr && matrix.scales != nullptr &&
                matrix.n > 0 && matrix.k > 0 && matrix.blocks_per_row > 0u;
@@ -402,7 +402,7 @@ namespace llaminar2::moe_overlay_controller_device
         {
             return false;
         }
-        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised)
         {
             return nativeMatrixReady(descriptor.gate) &&
                    nativeMatrixReady(descriptor.up) &&
@@ -2876,7 +2876,8 @@ namespace llaminar2::moe_overlay_controller_device
                     command.expert = expert;
                     command.source_participant = source;
                     command.destination_participant = destination;
-                    command.flags = raw(movement_axis);
+                    command.flags = moeOverlayMovementFlags(
+                        movement_axis, result.accepted_cycles + 1u);
                     command.payload_bytes = payload_bytes;
                     command.source_epoch = base_epoch;
                     command.candidate_epoch = candidate_epoch;
@@ -3241,7 +3242,8 @@ namespace llaminar2::moe_overlay_controller_device
                     command.expert = expert;
                     command.source_participant = source;
                     command.destination_participant = destination;
-                    command.flags = raw(movement_axis);
+                    command.flags = moeOverlayMovementFlags(
+                        movement_axis, result.accepted_cycles + 1u);
                     command.payload_bytes = payload_bytes;
                     command.source_epoch = base_epoch;
                     command.candidate_epoch = candidate_epoch;
@@ -4819,6 +4821,43 @@ namespace llaminar2::moe_overlay_controller_device
                 command.base_epoch,
                 &retiring_bank))
         {
+            // Finite ownership may defer this exact reclamation, but only
+            // actual captured child terminals may extend its no-progress
+            // deadline. The host never reads a selector or edits this receipt.
+            const auto *control = readiness.epoch_control;
+            const auto *parent = control ? control->finite_parent : nullptr;
+            if (parent && parent->control == control &&
+                parent->version == kDeviceMoEOverlayEpochParentVersion)
+            {
+                const auto state = loadLocalEpochWord(&parent->state);
+                const bool armed = state == static_cast<std::uint32_t>(
+                    DeviceMoEOverlayEpochParentState::Armed);
+                const bool active = state == static_cast<std::uint32_t>(
+                    DeviceMoEOverlayEpochParentState::Active);
+                bool retains_base = active &&
+                    loadLocalEpochWord(&parent->ticket.epoch) == command.base_epoch;
+                // An unreached zero-work peer still owns its original Arm
+                // guard. Authenticate the actual Retiring bank, not a guessed
+                // selected epoch or a host copy of the admission selector.
+                if (armed)
+                    for (std::uint32_t bank = 0u;
+                         bank < kDeviceMoEOverlayEpochBankCount; ++bank)
+                        retains_base = retains_base ||
+                            (loadLocalEpochWord(&control->bank_epochs[bank]) == command.base_epoch &&
+                             loadLocalEpochWord(&control->bank_states[bank]) ==
+                                 static_cast<std::uint32_t>(DeviceMoEOverlayEpochBankState::Retiring));
+                const auto generation = loadLocalEpochWord(&parent->generation);
+                const auto progress = loadLocalEpochWord(&parent->progress);
+                if (retains_base && generation != 0u && progress != 0u)
+                {
+                    auto *record = binding.local_participant_record;
+                    storeSystemRelease(&record->finite_parent_generation, generation);
+                    storeSystemRelease(&record->finite_parent_progress, progress);
+                    __threadfence_system();
+                    storeSystemRelease(&record->finite_deferred_transaction,
+                                       command.transaction_id);
+                }
+            }
             return;
         }
         __threadfence_system();

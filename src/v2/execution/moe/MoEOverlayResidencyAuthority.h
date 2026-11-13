@@ -9,7 +9,9 @@
  * This file defines the single publication authority and its transactional
  * transport boundary.  It is deliberately device-free so the lifecycle can be
  * proved exhaustively in unit tests; production transports bind the protocol to
- * prepared-weight services and exact backend transfer streams.
+ * prepared-weight services and exact backend transfer streams. Committed
+ * observations retain immutable demand and weak epoch identity, never old
+ * reader/bank ownership, for current-epoch economy re-evaluation.
  */
 
 #pragma once
@@ -17,8 +19,11 @@
 #include "DecodeExpertHistogram.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "MoEExpertOwnerMap.h"
+#include "MoEOverlayRouteTarget.h"
+#include "MoEOverlayMigrationTargetCoordinate.h"
 #include "MoELayeredExpertOwnership.h"
 #include "MoEOptimizationStatus.h"
+#include "MoEOverlayNoPeerResidency.h"
 #include "MoERoutedExpertPlacementPlanner.h"
 
 #include <atomic>
@@ -30,14 +35,18 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
 {
     class MoEOverlayEconomyCalibrationLayerCatalog;
+    class MoEOverlayEconomyCalibrationPlanner;
+    class MoEExpertOverlayPreparationPlan;
     namespace test
     {
         struct MoEOverlayResidencyAuthorityConcurrencyPeer;
+        struct MoEOverlayJointPlacementCandidateTestAccess;
     }
 
     /** @brief Thermal direction of one complete expert residency move. */
@@ -49,7 +58,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Exact source and destination for one layer/expert weight triplet.
+     * @brief Exact source/destination for one expert's original movable projection family.
      *
      * Tier priority is a compute-capacity ordering: a smaller numeric priority
      * is hotter.  Keeping both resolved owners in the record lets transports
@@ -61,6 +70,7 @@ namespace llaminar2
         int layer_idx = -1;
         int expert_id = -1;
         uint64_t activation_count = 0;
+        /** Source-format planning estimate; actual transfers use original physical-piece operation quotes. */
         size_t estimated_weight_bytes = 0;
         MoEOverlayTierMigrationDirection direction =
             MoEOverlayTierMigrationDirection::SamePriority;
@@ -80,16 +90,15 @@ namespace llaminar2
             return source.domain_name != destination.domain_name;
         }
 
-        bool crossesWorldRank() const noexcept
-        {
-            return source.owner_world_rank_known &&
-                   destination.owner_world_rank_known &&
-                   source.owner_world_rank != destination.owner_world_rank;
-        }
+        /** @return Whether a required original member intersection crosses a known MPI rank. */
+        bool crossesWorldRank() const noexcept;
 
+        /** @return Whether actual whole/cohort compute backends differ, without a representative member. */
         bool crossesBackend() const noexcept
         {
-            return source.device.type != destination.device.type;
+            const auto from = source.shard_cohort ? DeviceType::CPU : source.device.type;
+            const auto to = destination.shard_cohort ? DeviceType::CPU : destination.device.type;
+            return from != to;
         }
     };
 
@@ -99,7 +108,9 @@ namespace llaminar2
      * Thermal direction counts are diagnostic only: a closed three-tier cycle
      * may contain one direct promotion and two stepwise demotions. Capacity is
      * preserved when every `(layer, participant)` and `(layer, tier)` vertex
-     * has equal incoming and outgoing expert slots. This typed summary keeps
+     * has equal incoming and outgoing expert slots. A cohort contributes one
+     * fragment slot at each physical member, but one expert slot at its tier.
+     * This typed summary keeps
      * that graph invariant distinct from priority-direction accounting.
      */
     struct MoEOverlayMigrationCapacityEvidence
@@ -133,8 +144,8 @@ namespace llaminar2
      * @brief One closed, capacity-preserving migration cycle within a layer.
      *
      * Indices refer to the enclosing transaction's immutable migration vector.
-     * The destination participant of each indexed edge equals the source
-     * participant of the next edge, including the last-to-first wrap. A
+     * The complete destination placement target of each indexed edge equals
+     * the source target of the next edge, including the last-to-first wrap. A
      * one-edge cycle represents a logical relocation whose physical endpoint
      * is unchanged. Cycles are the smallest units that may be selected for a
      * bounded-shadow publication wave without changing any physical
@@ -148,7 +159,7 @@ namespace llaminar2
         /**
          * @brief Validate closure, layer identity, bounds, and unique edges.
          * @param migrations Enclosing transaction's complete movement vector.
-         * @return Whether this is one well-formed directed participant cycle.
+         * @return Whether this is one well-formed directed placement cycle.
          */
         [[nodiscard]] bool valid(
             const std::vector<MoEOverlayTierMigration> &migrations) const noexcept;
@@ -173,6 +184,38 @@ namespace llaminar2
     };
 
     /**
+     * @brief Cover immutable whole/cohort edges with simple placement-target cycles.
+     * @param migrations Complete capacity-preserving edges in their original order.
+     * @return Deterministic cycles covering each edge once and visiting each target
+     *         once per cycle; neither command order nor movement axes are changed.
+     * @throws std::logic_error For malformed targets or an open capacity flow.
+     * @note Device-authored commands and host residency planning share this
+     *       geometry so both obey the same physical lane-demand bound.
+     */
+    [[nodiscard]] std::vector<MoEOverlayTierMigrationCycle> decomposeMoEOverlayMigrationCycles(
+        const std::vector<MoEOverlayTierMigration> &migrations);
+
+    /**
+     * @brief Decompose the canonical whole/cohort edges into closed placement cycles.
+     * @param migrations Complete capacity-preserving edges whose original command
+     * axes remain unchanged. Cohort members are never separate movements.
+     * @return Deterministic cycle cover with every edge represented exactly once;
+     * consumers derive an aggregate cycle axis without rewriting the commands.
+     * @throws std::logic_error For malformed targets or an open capacity flow.
+     */
+    [[nodiscard]] std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
+        std::vector<MoEOverlayTierMigration> &migrations);
+
+    /**
+     * @brief Derive inactive physical fragment slots from the original destinations.
+     * @param migrations Complete canonical movement wave.
+     * @return Exact per-layer/tier/member shadow obligations, including every cohort member.
+     * @throws std::logic_error For malformed physical placement targets.
+     */
+    [[nodiscard]] std::vector<MoEOverlayTierShadowRequirement> buildMoEOverlayShadowRequirements(
+        const std::vector<MoEOverlayTierMigration> &migrations);
+
+    /**
      * @brief Measured cost of moving one complete expert between endpoints.
      *
      * One row covers gate, up, and down projections for the exact model layer,
@@ -195,6 +238,14 @@ namespace llaminar2
         uint64_t inference_interference_ns = 0;
     };
 
+    /** @brief Complete-target movement price; source/cuts remain in original measurement context. */
+    struct MoEOverlayTargetLayerMigrationCost
+    {
+        MoEOverlayMigrationTargetCoordinate coordinate;
+        std::uint64_t transfer_and_repack_ns=0;
+        std::uint64_t inference_interference_ns=0;
+    };
+
     /**
      * @brief Complete setup-certified directed endpoint migration profile.
      *
@@ -205,7 +256,27 @@ namespace llaminar2
     struct MoEOverlayMigrationCostProfile
     {
         std::string identity;
-        std::vector<MoEOverlayParticipantLayerMigrationCost> costs;
+        std::vector<MoEOverlayTargetLayerMigrationCost> costs;
+        /** @brief Checked cold adapter for existing whole-only device consumers.
+         * @return Whole movement rows. @throws std::invalid_argument For any cohort. */
+        std::vector<MoEOverlayParticipantLayerMigrationCost> wholeCosts() const {
+            std::vector<MoEOverlayParticipantLayerMigrationCost> result;result.reserve(costs.size());
+            for(const auto& row:costs) {
+                if(!row.coordinate.source_target.isWhole() || !row.coordinate.destination_target.isWhole())
+                    throw std::invalid_argument("Whole movement projection rejects complete cohort prices");
+                result.push_back({row.coordinate.source_target.word(),row.coordinate.destination_target.word(),
+                    row.coordinate.layer,row.transfer_and_repack_ns,row.inference_interference_ns});
+            }
+            return result;
+        }
+        /** @brief Explicit legacy import into the same canonical cost vector.
+         * @param rows Original whole movement rows. */
+        void setWholeCosts(std::span<const MoEOverlayParticipantLayerMigrationCost> rows) {
+            std::vector<MoEOverlayTargetLayerMigrationCost> canonical;canonical.reserve(rows.size());
+            for(const auto& row:rows)canonical.push_back({{MoEOverlayRouteTarget::whole(row.source_participant),
+                MoEOverlayRouteTarget::whole(row.destination_participant),row.layer},row.transfer_and_repack_ns,row.inference_interference_ns});
+            costs=std::move(canonical);
+        }
     };
 
     /**
@@ -311,6 +382,9 @@ namespace llaminar2
         [[nodiscard]] bool valid(bool has_migrations) const noexcept;
     };
 
+    /** @brief Physical ownership representation; joint fragments never have a scalar whole owner. */
+    enum class MoEOverlayResidencyOwnershipKind { WholeExperts, CPUJointFragments };
+
     /** @brief Immutable placement state consumed by one or more dispatch tickets. */
     struct MoEOverlayResidencySnapshot
     {
@@ -319,14 +393,41 @@ namespace llaminar2
         MoEExpertOwnerMap owner_map;
         MoELayeredExpertOwnership layered_ownership;
 
-        /** @return Whether the published plan and compact owners name one stage. */
-        bool valid() const noexcept
-        {
-            return epoch > 0 && placement_plan != nullptr &&
-                   !layered_ownership.empty() &&
-                   placement_plan->first_model_layer ==
-                       layered_ownership.firstModelLayer();
-        }
+        /** @return Constant-time validity of the constructor-validated immutable ownership arm. */
+        bool valid() const noexcept;
+        /** @return Explicit physical representation; never infer joint ownership from a scalar sentinel. */
+        MoEOverlayResidencyOwnershipKind ownershipKind() const noexcept;
+        /** @return Same original source map for joint fragments; ordinary owner map otherwise. */
+        const MoEExpertOwnerMap& originalOwnerMap() const;
+        /** @return Current canonical live joint map, or null for ordinary whole experts. */
+        std::shared_ptr<const MoEExpertOwnerMap> jointOwnerMap() const noexcept;
+        /** @return Actual live placement for this epoch, distinct from original source selection.
+         */
+        const MoEExpertOwnerMap &placementOwnerMap() const;
+        /** @return Original model-global first layer; zero for an empty snapshot. */
+        int firstModelLayer() const noexcept;
+        /** @return Original layer count, without constructing scalar ownership for cohorts. */
+        int layerCount() const noexcept;
+        /** @return Original logical experts per layer, independent of fragment count. */
+        int expertCount() const noexcept;
+        /** @return SAME original joint source/preparation control block, or null for ordinary
+         * ownership. */
+        std::shared_ptr<const MoEExpertOverlayPreparationPlan>
+        originalProjectionPreparation() const noexcept;
+
+    private:
+        friend class MoEOverlayResidencyAuthority;
+        friend struct MoEOverlayResidencyTransaction;
+        /** @brief Sealed source and current placement; only the authority can construct this arm.
+         */
+        struct CPUJointDefinition {
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan;
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
+            uint64_t epoch;
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> live_plan;
+            std::shared_ptr<const MoEExpertOwnerMap> live_owners;
+        };
+        std::optional<CPUJointDefinition> joint_; ///< No public scalar field can manufacture fragment ownership.
     };
 
     /** @brief Typed intent separating publishable placement from calibration. */
@@ -393,7 +494,9 @@ namespace llaminar2
      * @brief One dense root-authored candidate coordinate for distributed use.
      *
      * Every model `(layer, expert)` coordinate names its candidate tier and
-     * physical participant.  Changed coordinates additionally retain the
+     * typed whole participant or complete original fixed CPU cohort. The target
+     * word grants no membership/readiness authority; reconstruction resolves it
+     * against the retained original source on every coordinate. Changed entries retain the
      * exact execution metadata used by migration staging.  Unchanged entries
      * keep that metadata zero so the wire representation has one canonical
      * form and cannot hide a second sparse change set.
@@ -401,7 +504,7 @@ namespace llaminar2
     struct MoEOverlayAuthoritativeResidencyEntry
     {
         int candidate_tier_idx = -1;
-        int candidate_owner_participant = -1;
+        MoEOverlayRouteTarget candidate_target;
         bool changed = false;
         MoEOptimizationMovementAxis axis =
             MoEOptimizationMovementAxis::TierResidency;
@@ -411,8 +514,16 @@ namespace llaminar2
         /** @return Whether this is one canonical dense proposal entry. */
         [[nodiscard]] bool valid() const noexcept;
 
-        bool operator==(
-            const MoEOverlayAuthoritativeResidencyEntry &) const = default;
+        /** @param other Dense original proposal coordinate.
+         * @return Exact target word and movement evidence equality. */
+        bool operator==(const MoEOverlayAuthoritativeResidencyEntry &other) const
+        {
+            return candidate_tier_idx == other.candidate_tier_idx &&
+                   candidate_target.word() == other.candidate_target.word() &&
+                   changed == other.changed && axis == other.axis &&
+                   activation_count == other.activation_count &&
+                   estimated_weight_bytes == other.estimated_weight_bytes;
+        }
     };
 
     /**
@@ -677,6 +788,8 @@ namespace llaminar2
         Failed,   ///< Validation or enqueue failed; the wave is not retryable.
     };
 
+    class MoEOverlayMigrationEvidenceContext;
+
     /** @brief Typed ownership returned by a transport's non-blocking start. */
     struct MoEOverlayResidencyStageStart
     {
@@ -686,6 +799,9 @@ namespace llaminar2
         /** Partially enqueued unpublished work retained only for async cleanup. */
         std::unique_ptr<IMoEOverlayResidencyWave> cleanup_wave;
         std::string error;
+
+        /** Passive original prepared-wave geometry, retained independently of cleanup. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> measurement_context;
 
         /** @return Whether status and wave ownership form a valid start result. */
         [[nodiscard]] bool valid() const noexcept
@@ -901,6 +1017,39 @@ namespace llaminar2
         struct EconomyState;
 
     public:
+        /**
+         * @brief One certified committed observation, without a bank or reader lease.
+         *
+         * Only the original authority can issue this witness after publication.
+         * The window shares its existing PMA-owned immutable demand; the weak
+         * identity cannot retain the old/current expert bank or placement state.
+         */
+        class CommittedObservation final
+        {
+        public:
+            /** @return Whether a later wave belongs to this exact original observation. */
+            [[nodiscard]] bool observes(const std::shared_ptr<const DecodeExpertHistogramWindow> &window) const noexcept
+            {
+                return window_.get() == window.get() &&
+                    !window_.owner_before(window) && !window.owner_before(window_);
+            }
+        private:
+            friend class MoEOverlayResidencyAuthority;
+            /** @brief Bind already-authenticated immutable source and committed identity. */
+            CommittedObservation(std::shared_ptr<const DecodeExpertHistogramWindow> window,
+                                 const std::shared_ptr<const MoEOverlayResidencySnapshot> &committed)
+                : window_(std::move(window)), committed_(committed) {}
+            /** @return Exact current snapshot/control-block equality, without retaining it. */
+            [[nodiscard]] bool matches(const std::shared_ptr<const MoEOverlayResidencySnapshot> &current) const noexcept
+            {
+                const auto committed = committed_.lock();
+                return committed && committed.get() == current.get() &&
+                    !committed.owner_before(current) && !current.owner_before(committed);
+            }
+            std::shared_ptr<const DecodeExpertHistogramWindow> window_;
+            std::weak_ptr<const MoEOverlayResidencySnapshot> committed_;
+        };
+
         /** @brief Semantic reader class retained by one epoch lease. */
         enum class TicketLeasePurpose : std::uint8_t
         {
@@ -919,6 +1068,8 @@ namespace llaminar2
              */
             MoERoutedExpertPlacementPlan initial_plan;
             MoERoutedExpertModelMetadata model_metadata;
+            /** Original closed source preparation; required for static CPU joint fragments only. */
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
             /**
              * Durable maintenance intent, independent of epoch-one placement.
              * `Observe` records routing evidence without permitting movement;
@@ -1108,6 +1259,22 @@ namespace llaminar2
             int domain_participant_count,
             std::span<uint32_t> owner_participants_out,
             std::string *error = nullptr);
+
+        /**
+         * @brief Authenticate the immutable no-peer identity against its original epoch.
+         * @return Setup proof, with no host copy of GPU route state.
+         * @throws std::logic_error if a replacement owner-map generation invalidated the proof.
+         *
+         * Only the canonical host authority's publication identity is read. A
+         * no-peer GPU graph has no movement writer; native table pointers and
+         * workspace generations remain authenticated by ordinary graph seals.
+         */
+        [[nodiscard]] const std::optional<MoEOverlayNoPeerResidency> &noPeerResidency() const
+        {
+            if (no_peer_residency_ && snapshot().get() != initial_snapshot_.get())
+                throw std::logic_error("No-peer ownership proof cannot survive a replacement residency generation");
+            return no_peer_residency_;
+        }
 
         /** @brief Read the current immutable snapshot outside ticket execution. */
         std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot() const;
@@ -1323,6 +1490,31 @@ namespace llaminar2
             std::shared_ptr<const DecodeExpertHistogramWindow> window);
 
         /**
+         * @brief Issue a source-only witness for a just-published certified move.
+         * @param committed Original nonempty live transaction now exactly current.
+         * @return Immutable observation and weak current identity, never a lease.
+         * @throws std::logic_error For foreign/stale/unpriced/restoration input.
+         */
+        [[nodiscard]] CommittedObservation retainCommittedObservation(
+            const MoEOverlayResidencyTransaction &committed) const;
+
+        /** @brief Check the weak epoch witness before a progress-funded attempt.
+         * @param observation Original authority-issued committed witness.
+         * @return Whether its weak exact identity is still this authority's current epoch. */
+        [[nodiscard]] bool isCurrentCommittedObservation(const CommittedObservation &observation) const;
+
+        /**
+         * @brief Reprice one committed observation on current ownership, without ingestion.
+         * @param observation Original certified current witness, after physical retirement.
+         * @return Fresh strictly improving transaction, or no further eligible movement.
+         * @throws std::logic_error For stale/foreign source or unsupported lifecycle.
+         * @note Reuses the original solver/objective, but never advances histogram
+         *       cadence, re-smooths a generation, or reuses old isolated scores.
+         */
+        [[nodiscard]] std::optional<MoEOverlayResidencyTransaction>
+        reproposeFromCommittedObservation(const CommittedObservation &observation);
+
+        /**
          * @brief Export the exact executable part of a root-owned proposal.
          * @param transaction Valid live placement transaction from this authority.
          * @return Dense pointer-free candidate suitable for authenticated publication.
@@ -1403,6 +1595,9 @@ namespace llaminar2
     private:
         /** Device-free regression access for holding a real proposal lock. */
         friend struct test::MoEOverlayResidencyAuthorityConcurrencyPeer;
+        friend class MoEOverlayEconomyCalibrationPlanner;
+        friend class MoEOverlayInferenceTransactionCoordinator;
+        friend struct test::MoEOverlayJointPlacementCandidateTestAccess;
 
         /** Sole typed owner of the shared runtime-histogram drain lane. */
         enum class HistogramDrainState : std::uint8_t
@@ -1465,6 +1660,88 @@ namespace llaminar2
             const char *operation) const;
 
         /**
+         * @brief Seal the unchanged source placement at a private shadow-calibration epoch.
+         * @param live Original retained immutable source snapshot, never a rebuilt owner map.
+         * @return Same source/preparation/placement owners with only the private epoch advanced.
+         * @throws std::invalid_argument For missing, invalid or exhausted source epochs.
+         * @note Only the existing calibration planner can author this non-publication metadata.
+         */
+        static std::shared_ptr<const MoEOverlayResidencySnapshot> buildCalibrationShadowSnapshot(
+            const std::shared_ptr<const MoEOverlayResidencySnapshot> &live);
+
+        /**
+         * @brief Reconstruct a source-bound proposal without granting maintenance/publication.
+         * @param plan Complete original-stage dense target proposal.
+         * @return Checked unpublished transaction, never readiness or a live epoch.
+         * @throws std::invalid_argument For foreign or missing complete fixed targets.
+         * @note The public entrypoint retains its existing runtime policy guards.
+         */
+        MoEOverlayResidencyTransaction reconstructAuthoritativeResidencyPlan(
+            const MoEOverlayAuthoritativeResidencyPlan &plan);
+
+        /**
+         * @brief Derive an unpublished fixed-cohort candidate from this authority's real current
+         * epoch.
+         * @param expected_live Exact current snapshot retained by the real transition caller.
+         * @param expected_epoch Exact live epoch carried by that caller.
+         * @param placements Complete candidate tier assignments; all other policies stay original.
+         * @param whole_owner_changes Checked paired whole-owner corrections after canonical tier projection.
+         * @return Closed source-authenticated live placement, without physical
+         * readiness/publication.
+         * @throws std::logic_error For ordinary ownership or an unavailable original source
+         * definition.
+         * @throws std::invalid_argument For changed capacity, source geometry or fixed
+         * membership/cuts.
+         * @note This private producer does not enable Static maintenance or bypass physical fanout.
+         */
+        std::shared_ptr<const MoEOverlayResidencySnapshot> prepareCPUJointPlacementCandidate(
+            const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
+            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
+            std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {}) const;
+
+        /**
+         * @brief Author complete physical edges from a genuine fixed-cohort placement proposal.
+         * @param expected_live Exact current publication retained by the transition caller.
+         * @param expected_epoch Current publication epoch, never an unpublished candidate.
+         * @param placements Complete tier assignments with unchanged per-member capacities.
+         * @param whole_owner_changes Checked whole-owner corrections, never CPU cohort members.
+         * @return Source-authenticated placement transaction with complete cycles and shadows.
+         * @throws std::logic_error For a stale source, invalid transaction or changed capacity.
+         * @throws std::invalid_argument For foreign topology, source geometry or fixed cuts.
+         * @note This construction grants neither physical readiness nor runtime publication;
+         * the existing maintenance and execution qualification guards remain authoritative.
+         */
+        MoEOverlayResidencyTransaction prepareCPUJointPlacementTransaction(
+            const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
+            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
+            std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {}) const;
+
+        /**
+         * @brief Compose source-bound restoration without granting maintenance or readiness.
+         * @return Complete or bounded restoration from the actual current epoch.
+         * @throws std::logic_error For invalid original/current source identity.
+         * @throws std::runtime_error If no complete cycle fits the admitted wave.
+         */
+        MoEOverlayResidencyTransaction buildInitialPreparedPlacementRestoration() const;
+
+        /** @brief Keep the original derivation lock alive through production cadence. */
+        struct FrozenHistogramDerivation
+        {
+            MoEOverlayResidencyTransaction transaction;
+            std::unique_lock<std::mutex> economy_lock;
+        };
+        /**
+         * @brief Shared source-bound histogram candidate derivation, without runtime admission.
+         * @param window Original validated recorded logical routing observations.
+         * @param continuation Optional committed witness; validates same source/current identity under the economy lock.
+         * @return Existing heuristic's transaction with its original economy lock retained.
+         * @throws std::logic_error For unsupported fixed-target axes or missing economy prices.
+         */
+        FrozenHistogramDerivation buildFromFrozenHistogramWindow(
+            std::shared_ptr<const DecodeExpertHistogramWindow> window,
+            const CommittedObservation *continuation = nullptr);
+
+        /**
          * @brief Validate and materialize one immutable residency epoch.
          * @param epoch Positive publication generation.
          * @param plan Complete logical tier placement for the generation.
@@ -1481,7 +1758,8 @@ namespace llaminar2
             MoERoutedExpertPlacementPlan plan,
             const MoERoutedExpertModelMetadata &metadata,
             const MoEExpertOwnerMap *previous_owners,
-            const MoELayeredExpertOwnership *explicit_ownership = nullptr);
+            const MoELayeredExpertOwnership *explicit_ownership = nullptr,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> joint_preparation = {});
         /** @brief Validate profiles and build allocation-free lookup state. */
         static std::unique_ptr<EconomyState> buildEconomyState(
             const Config &config,
@@ -1492,7 +1770,7 @@ namespace llaminar2
          * @param candidate Proposed next immutable placement.
          * @param histogram_window Optional authenticated demand view for edge
          *        evidence. The borrowed window must outlive this call.
-         * @param estimated_weight_bytes Complete packed expert payload size.
+         * @param estimated_weight_bytes Source-format planning estimate, never a wire extent.
          * @param participant_changes Exact participant-planner destinations;
          *        entries absent from a bounded candidate are ignored.
          * @return Canonically ordered physical movement edges.
@@ -1504,20 +1782,22 @@ namespace llaminar2
             size_t estimated_weight_bytes,
             std::span<const MoELayeredExpertOwnershipChange>
                 participant_changes = {});
-        /**
-         * @brief Decompose edges and normalize each cycle's objective axis.
-         * @param migrations Mutable canonical edges; every edge in a closed
-         *        cycle receives that cycle's aggregate typed objective.
-         * @return Complete deterministic capacity-preserving cycle cover.
-         */
-        static std::vector<MoEOverlayTierMigrationCycle> buildMigrationCycles(
-            std::vector<MoEOverlayTierMigration> &migrations);
-        static std::vector<MoEOverlayTierShadowRequirement>
-        buildShadowRequirements(
-            const std::vector<MoEOverlayTierMigration> &migrations);
         static void requireCapacityPreserving(
             const MoEOverlayResidencySnapshot &previous,
             const MoEOverlayResidencySnapshot &candidate);
+        /**
+         * @brief Borrow the exact epoch of an already admitted graph sequence.
+         * @param parent Live sequence lease from this same original authority.
+         * @return Independent existing sequence/ticket ownership of that epoch.
+         * @throws std::invalid_argument For empty, moved, foreign or dispatch parents.
+         * @throws std::logic_error If the retained original publication state changed.
+         * @note The coordinator serializes access to parent against its move/destruction.
+         * A parent already excludes publication, so a reserved publication gate
+         * cannot block its descendants. Every returned lease releases its own
+         * original counters; this method neither selects an epoch nor opens a gate.
+         */
+        [[nodiscard]] TicketLease borrowGraphSequenceSnapshot(const TicketLease& parent);
+
         /** @brief Acquire the current publication for one typed reader class. */
         std::optional<TicketLease> tryAcquireCurrentSnapshot(
             TicketLeasePurpose purpose);
@@ -1543,6 +1823,7 @@ namespace llaminar2
             const MoEOverlayResidencyTransaction &transaction);
 
         Config config_;
+        std::optional<MoEOverlayNoPeerResidency> no_peer_residency_;
         MoERoutedExpertPlacementPlan planning_template_;
         /** Initial short cadence restored whenever a proposal selects movement. */
         int initial_histogram_window_tokens_ = 0;

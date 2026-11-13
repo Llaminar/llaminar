@@ -818,11 +818,11 @@ Expert weights are pre-packed into device-specific VNNI layouts at graph-build t
 
 | Format | Owner | Layout | Key Arrays |
 |--------|-------|--------|------------|
-| **CPU Native VNNI** (`CPUNativeVNNIPackedWeights`) | `CPUNativeVNNIGemmKernel` | Interleaved: `[block][1024B data + 256B inline metadata]` | `native_interleaved`, `payload`, `int8_flat` |
-| **ROCm Batch VNNI** (`MoEBatchPackedWeightsROCm`) | `ROCmQuantisedGemmKernel` | Separated: `payload[]`, `scales[]`, `mins[]`, `emins[]` per expert slab | `all_native_vnni`, `all_native_scales`, `all_native_mins`, `all_native_emins` |
+| **CPU NativeQuantised** (`CPUNativeQuantisedPackedWeights`) | `CPUNativeQuantisedGemmKernel` | Interleaved: `[block][1024B data + 256B inline metadata]` | `native_interleaved`, `payload`, `int8_flat` |
+| **ROCm Batch VNNI** (`MoEBatchPackedWeightsROCm`) | `ROCmQuantisedGemmKernel` | Separated: `payload[]`, `scales[]`, `mins[]`, `emins[]` per expert slab | `all_native_quantised`, `all_native_scales`, `all_native_mins`, `all_native_emins` |
 | **CUDA Batch VNNI** (`MoEBatchPackedWeightsCUDA`) | `CUDAQuantisedGemmKernel` | Separated (identical structure to ROCm) | `all_vnni`, `all_scales`, `all_mins`, `all_emins` |
 
-**Key insight:** CUDA and ROCm batch-packed formats are **layout-identical** — both call `packVnniBlock()` into separated `{payload, scales, mins, emins}` arrays with the same offsets. Only the naming convention differs (`all_vnni` vs `all_native_vnni`). This means **any GPU can directly consume any other GPU's packed weights with zero conversion** — CUDA↔CUDA, ROCm↔ROCm, and CUDA↔ROCm are all plain memcpy. CPU packed format uses a fundamentally different interleaved layout with inline metadata, requiring a format translation step — **performed on the GPU side** (faster memory bandwidth, massively parallel scatter/gather).
+**Key insight:** CUDA and ROCm batch-packed formats are **layout-identical** — both call `packVnniBlock()` into separated `{payload, scales, mins, emins}` arrays with the same offsets. Only the naming convention differs (`all_vnni` vs `all_native_quantised`). This means **any GPU can directly consume any other GPU's packed weights with zero conversion** — CUDA↔CUDA, ROCm↔ROCm, and CUDA↔ROCm are all plain memcpy. CPU packed format uses a fundamentally different interleaved layout with inline metadata, requiring a format translation step — **performed on the GPU side** (faster memory bandwidth, massively parallel scatter/gather).
 
 **Design convention:** All format conversion between CPU-interleaved and GPU-separated layouts is performed by GPU kernels (HIP or CUDA). The CPU never runs conversion code — it only sends/receives raw bytes. This keeps the CPU free for other work during rebalancing and exploits GPU memory bandwidth (~900 GB/s MI50, ~2 TB/s A100) for the scatter/gather operations.
 
@@ -946,8 +946,8 @@ When experts migrate from GPU back to a CPU socket, the GPU first re-interleaves
    → reads d_vnni, d_scales, d_mins, d_emins; writes to d_interleaved_buf
 2. GPU: hipMemcpyAsync(h_pinned, d_interleaved_buf, interleaved_bytes, D2H, prep_stream)
 3. GPU: hipStreamSynchronize(prep_stream)
-4. CPU: memcpy from pinned host buffer → CPUNativeVNNIPackedWeights.native_interleaved
-5. CPU: Create CPUNativeVNNIGemmKernel from received interleaved data
+4. CPU: memcpy from pinned host buffer → CPUNativeQuantisedPackedWeights.native_interleaved
+5. CPU: Create CPUNativeQuantisedGemmKernel from received interleaved data
 ```
 
 **GPU re-interleave kernel:**
@@ -1045,7 +1045,7 @@ bool MoEExpertWeightService::asyncTransferExperts(
             hipMemcpyAsync(h_pinned, d_interleaved_tmp, interleaved_bytes,
                           hipMemcpyDeviceToHost, source.stream);
             hipStreamSynchronize(source.stream);
-            // CPU: wrap received interleaved blob as CPUNativeVNNIPackedWeights
+            // CPU: wrap received interleaved blob as CPUNativeQuantisedPackedWeights
             buildCPUPackedWeightsFromInterleaved(h_pinned, ctx, expert_id);
         }
     }
@@ -1070,11 +1070,11 @@ bool MoEExpertWeightService::asyncTransferExperts(
 
 #### Serialization Format Extension
 
-The current `PackedWeightsSerialization` only handles `CPU_NATIVE_VNNI`. For cross-device transfer, we extend it to support `GPU_BATCH_VNNI`:
+The current `PackedWeightsSerialization` only handles `CPU_NATIVE_QUANTISED`. For cross-device transfer, we extend it to support `GPU_BATCH_VNNI`:
 
 ```cpp
 enum class PackedWeightsFormat : uint32_t {
-    CPU_NATIVE_VNNI  = 1,       // Existing: interleaved blocks
+    CPU_NATIVE_QUANTISED  = 1,       // Existing: interleaved blocks
     GPU_BATCH_VNNI   = 2,       // NEW: separated {payload, scales, mins, emins}
                                 // Used by BOTH CUDA and ROCm (identical layout)
 };
@@ -1110,14 +1110,14 @@ ExpertWeightBlobs MoEExpertWeightService::serializeExpert(
 {
     if (ctx.device_id.is_gpu()) {
         if (/* target is CPU */) {
-            // GPU → CPU: re-interleave on GPU, D2H, wrap as CPU_NATIVE_VNNI
+            // GPU → CPU: re-interleave on GPU, D2H, wrap as CPU_NATIVE_QUANTISED
             return serializeExpertGPU_ForCPU(ctx, expert_id);
         } else {
             // GPU → GPU: D2H the separated arrays, wrap as GPU_BATCH_VNNI
             return serializeExpertGPU(ctx, expert_id);
         }
     } else {
-        // CPU → any: send raw interleaved blob as CPU_NATIVE_VNNI
+        // CPU → any: send raw interleaved blob as CPU_NATIVE_QUANTISED
         // Receiving GPU will deinterleave on its side
         return serializeExpertCPU(ctx, expert_id);
     }
@@ -1132,17 +1132,17 @@ bool MoEExpertWeightService::registerTransferredExpert(
         if (format == PackedWeightsFormat::GPU_BATCH_VNNI) {
             // GPU blob → GPU target: direct H2D upload (no conversion)
             return registerExpertGPU_DirectUpload(ctx, expert_id, blobs);
-        } else if (format == PackedWeightsFormat::CPU_NATIVE_VNNI) {
+        } else if (format == PackedWeightsFormat::CPU_NATIVE_QUANTISED) {
             // CPU blob → GPU target: H2D raw interleaved, deinterleave on GPU
             return registerExpertGPU_FromCPU(ctx, expert_id, blobs);
         }
     } else { // CPU target
-        if (format == PackedWeightsFormat::CPU_NATIVE_VNNI) {
+        if (format == PackedWeightsFormat::CPU_NATIVE_QUANTISED) {
             // CPU blob → CPU target: existing deserialization path
             return registerTransferredExpertCPU(ctx, expert_id, blobs);
         } else if (format == PackedWeightsFormat::GPU_BATCH_VNNI) {
             // GPU blob → CPU target: this shouldn't normally happen
-            // (serializeExpert for CPU targets produces CPU_NATIVE_VNNI)
+            // (serializeExpert for CPU targets produces CPU_NATIVE_QUANTISED)
             // Fallback: upload to temporary GPU buffer, re-interleave, D2H
             return registerExpertCPU_FromGPUBlob(ctx, expert_id, blobs);
         }
@@ -1151,7 +1151,7 @@ bool MoEExpertWeightService::registerTransferredExpert(
 }
 ```
 
-**Note on serialize dispatch:** When a GPU serializes an expert destined for a CPU target, it runs the `interleave_vnni_weights` kernel first and produces a `CPU_NATIVE_VNNI` blob. When destined for another GPU (any vendor), it produces a `GPU_BATCH_VNNI` blob. The `TransferManifest` provides the target device type so the serializer knows which format to produce. This means the `GPU_BATCH_VNNI → CPU` path in `registerTransferredExpert` is only a defensive fallback — it should not occur in normal operation.
+**Note on serialize dispatch:** When a GPU serializes an expert destined for a CPU target, it runs the `interleave_vnni_weights` kernel first and produces a `CPU_NATIVE_QUANTISED` blob. When destined for another GPU (any vendor), it produces a `GPU_BATCH_VNNI` blob. The `TransferManifest` provides the target device type so the serializer knows which format to produce. This means the `GPU_BATCH_VNNI → CPU` path in `registerTransferredExpert` is only a defensive fallback — it should not occur in normal operation.
 
 #### Files to Create
 

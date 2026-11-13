@@ -1,0 +1,243 @@
+--- a/rocclr/device/rocm/rocblit.hpp
++++ b/rocclr/device/rocm/rocblit.hpp
+@@ -5,6 +5,12 @@
+  */
+
+ #pragma once
++/**
++ * @file rocblit.hpp
++ * @brief Native ROCm blits and exact profiled SDMA event-marker submission.
++ * Timing markers reuse the required-SDMA engine, dependency and signal owners;
++ * the caller retains its private endpoints through original queue retirement.
++ */
+
+ #include "top.hpp"
+ #include "platform/command.hpp"
+@@ -40,6 +46,18 @@
+   //! Creates DmaBlitManager object
+   virtual bool create(amd::Device& device) { return true; }
+
++  /**
++   * @brief Submit one finite timing marker without an unrelated compute FIFO.
++   * @param host_destination Original virtual queue's private mapped endpoint.
++   * @param device_source Original virtual queue's private device endpoint.
++   * @param bytes Positive extent admitted during original queue creation.
++   * @return True only if required SDMA accepted the exact profiled operation.
++   * The caller has already opened this command's SDMA profiling scope and
++   * authenticated that no unrepresented compute/cache frontier is pending.
++   */
++  bool submitTimingMarker(void* host_destination, const void* device_source,
++                          size_t bytes) const;
++
+   //! Copies a buffer object to system memory
+   virtual bool readBuffer(
+       device::Memory& srcMemory,                            //!< Source memory object
+--- a/rocclr/device/rocm/rocblit.cpp
++++ b/rocclr/device/rocm/rocblit.cpp
+@@ -13,6 +13,12 @@
+ #include "utils/debug.hpp"
+ #include <algorithm>
+ #include <map>
++/**
++ * @file rocblit.cpp
++ * @brief Native copy submission, including profiled finite SDMA event markers.
++ * Event markers reuse mandatory-SDMA selection and exact command signals; no
++ * alternate copy, compute submission or host timestamp can repair rejection.
++ */
+
+ namespace amd::roc {
+ DmaBlitManager::DmaBlitManager(VirtualGPU& gpu, Setup setup)
+@@ -615,6 +621,21 @@
+
+
+ // ================================================================================================
++bool DmaBlitManager::submitTimingMarker(void* host_destination, const void* device_source,
++                                        size_t bytes) const {
++  if (host_destination == nullptr || device_source == nullptr || bytes == 0 ||
++      gpu().timestamp() == nullptr) {
++    return false;
++  }
++  hsa_agent_t source_agent = dev().getBackendDevice();
++  hsa_agent_t destination_agent = dev().getCpuAgent();
++  amd::CopyMetadata metadata(true, amd::CopyMetadata::CopyEnginePreference::SDMA);
++  return rocrCopyBuffer(reinterpret_cast<address>(host_destination), destination_agent,
++                        reinterpret_cast<const_address>(device_source), source_agent,
++                        bytes, metadata);
++}
++
++// ================================================================================================
+ bool DmaBlitManager::hsaCopy(const Memory& srcMemory, const Memory& dstMemory,
+                              const amd::Coord3D& srcOrigin, const amd::Coord3D& dstOrigin,
+                              const amd::Coord3D& size, amd::CopyMetadata& copyMetadata) const {
+--- a/rocclr/device/rocm/rocvirtual.hpp
++++ b/rocclr/device/rocm/rocvirtual.hpp
+@@ -5,6 +5,12 @@
+  */
+
+ #pragma once
++/**
++ * @file rocvirtual.hpp
++ * @brief Original virtual-queue execution, native frontier and timestamp owners.
++ * Finite SDMA timing markers have exclusive cold endpoint storage in this owner;
++ * tracked signals retain event identity independently of physical queue reuse.
++ */
+
+ #include "platform/commandqueue.hpp"
+ #include "rocdefs.hpp"
+@@ -900,6 +906,11 @@
+   };
+
+   Timestamp* timestamp_;
++  //! Opaque bytes are never interpreted; only their real SDMA timing is consumed.
++  static constexpr size_t kSdmaTimingMarkerBytes = sizeof(uint64_t);
++  //! Exclusive cold endpoints; released only after this virtual queue's drain.
++  void* sdma_timing_marker_device_ = nullptr;
++  void* sdma_timing_marker_host_ = nullptr;
+   bool sdma_profiling_for_cmd_ = false;  //!< SDMA profiling enabled for current command
+   amd::Command* command_;   //!< Current command
+   //! Monotonic client coalesce id of the last barrier from submitMarker, used to
+--- a/rocclr/device/rocm/rocvirtual.cpp
++++ b/rocclr/device/rocm/rocvirtual.cpp
+@@ -4,6 +4,13 @@
+  * SPDX-License-Identifier: MIT
+  */
+
++/**
++ * @file rocvirtual.cpp
++ * @brief Native queue frontiers, hardware timestamps and original resource retirement.
++ * Eligible timing records submit real finite SDMA markers using private cold
++ * endpoints. Their tracked signals retain timestamps and system-coherent FIFO
++ * completion without borrowing an unrelated physical compute queue.
++ */
+ #include "device/devhostcall.hpp"
+ #include "device/rocm/rocdevice.hpp"
+ #include "device/rocm/rocvirtual.hpp"
+@@ -498,6 +505,8 @@
+   // Guard against invalid timestamps from GPU (e.g. HW didn't write start_ts/end_ts).
+   // TranslateTime returns 0 for these cases. Skip accumulation to avoid corrupting timing.
+   if (sig_start == 0 || sig_end == 0 || sig_end < sig_start) {
++    guarantee(!(IsSdmaEngine(signal->engine_) && command().isMarkerCommand()),
++              "Profiled SDMA timing marker lacks valid native timestamps");
+     ClPrint(amd::LOG_WARNING, amd::LOG_TS,
+             "Invalid signal timing: start=%lu, end=%lu, signal=0x%lx",
+             sig_start, sig_end, signal->signal_.handle);
+@@ -2466,6 +2475,18 @@
+     releaseGpuMemoryFence();
+   }
+
++  // The existing original-queue drain above completes every marker transfer.
++  // Events may outlive this queue, but retain its completed/cached signal, not
++  // these opaque payload addresses. No capture packet embeds these endpoints.
++  if (sdma_timing_marker_device_ != nullptr) {
++    roc_device_.memFree(sdma_timing_marker_device_, kSdmaTimingMarkerBytes);
++    sdma_timing_marker_device_ = nullptr;
++  }
++  if (sdma_timing_marker_host_ != nullptr) {
++    roc_device_.hostFree(sdma_timing_marker_host_, kSdmaTimingMarkerBytes);
++    sdma_timing_marker_host_ = nullptr;
++  }
++
+   // Release any retained coalescing-window signal not freed via releaseGpuMemoryFence.
+   {
+     std::scoped_lock l(execution());
+@@ -2574,6 +2595,19 @@
+     LogError("Could not create managed buffer for this queue!");
+     return false;
+   }
++  // Original stream creation owns these exclusive physical bytes before any
++  // recording/submission. The payload is opaque and never read by the host;
++  // only the real SDMA operation's hardware timestamps are consumed. Distinct
++  // addresses prevent a self-copy shortcut, and no other queue writes them.
++  sdma_timing_marker_device_ = roc_device_.deviceLocalAlloc(
++      kSdmaTimingMarkerBytes, amd::Device::AllocationFlags{}, false);
++  sdma_timing_marker_host_ = roc_device_.hostAlloc(
++      kSdmaTimingMarkerBytes, alignof(uint64_t), Device::MemorySegment::kNoAtomics,
++      nullptr, false);
++  if (sdma_timing_marker_device_ == nullptr || sdma_timing_marker_host_ == nullptr) {
++    LogError("Could not allocate original queue's SDMA timing-marker storage");
++    return false;
++  }
+   // Release HW queue until the first usage
+   ReleaseHwQueue();
+   return true;
+@@ -5264,7 +5298,14 @@
+     flush(vcmd.GetBatchHead());
+     SetCoalesceWindow(0, nullptr);
+   } else {
+-    profilingBegin(vcmd);
++    // A fresh finite SDMA marker provides its own hardware timestamp, including
++    // the first start on an empty FIFO. Pending compute/cache work still needs
++    // the ordinary barrier path; capture, callbacks and IPC are unchanged.
++    const bool sdma_timing_marker = vcmd.profilingInfo().enabled_ &&
++        vcmd.profilingInfo().marker_ts_ && !vcmd.getPktCapturingState() &&
++        vcmd.Callback() == nullptr && vcmd.ipcCompletionSignal() == nullptr &&
++        vcmd.ipcDepSignal() == nullptr && !hasPendingDispatch_ && !isFenceDirty();
++    profilingBegin(vcmd, sdma_timing_marker);
+     const Settings& settings = dev().settings();
+     hsa_signal_t ipc_s{0};
+     if (vcmd.ipcCompletionSignal() != nullptr) {
+@@ -5272,13 +5313,27 @@
+           reinterpret_cast<uintptr_t>(vcmd.ipcCompletionSignal()->getHandle()));
+     }
+
++    // profilingBegin imports real wait-list dependencies and may propagate a
++    // dirty producer cache frontier. Such a frontier still requires its normal
++    // system barrier. Otherwise required-SDMA carries every original signal
++    // dependency and attaches a fresh profiled signal to THIS marker command.
++    if (sdma_timing_marker && !isFenceDirty()) {
++      const bool accepted = static_cast<DmaBlitManager&>(blitMgr()).submitTimingMarker(
++          sdma_timing_marker_host_, sdma_timing_marker_device_, kSdmaTimingMarkerBytes);
++      guarantee(accepted, "Required profiled SDMA timing marker was rejected");
++      SetCoalesceWindow(0, nullptr);
++      profilingEnd();
++      force_irq_ = false;
++      return;
++    }
++
+     // A required SDMA copy already publishes system-coherent completion. An
+     // ordering-only event names that exact frontier; routing its receipt
+     // through a shared compute queue can place it behind an unrelated graph
+     // waiting for this very receipt. Retain the native signal instead. The
+     // reference prevents signal-pool reuse until every event consumer retires.
+-    // Real timing, IPC, capture, callbacks and outstanding compute/cache work
+-    // still require their ordinary marker implementation and fence scopes.
++    // Eligible real timing uses its own profiled SDMA operation above. IPC,
++    // capture, callbacks and pending compute/cache work retain ordinary fences.
+     if (vcmd.coalesceEvent() != 0 && !vcmd.profilingInfo().enabled_ &&
+         !vcmd.getPktCapturingState() && vcmd.Callback() == nullptr &&
+         ipc_s.handle == 0 && vcmd.ipcDepSignal() == nullptr &&
+--- a/rocclr/device/rocm/rocdevice.cpp
++++ b/rocclr/device/rocm/rocdevice.cpp
+@@ -4,6 +4,12 @@
+  * SPDX-License-Identifier: MIT
+  */
+
++/**
++ * @file rocdevice.cpp
++ * @brief Native ROCm device resources and exact engine-specific event timing.
++ * Profiled SDMA markers consume their retained copy timestamps. Missing native
++ * timing is fatal for that marker arm rather than replaced with host clocks.
++ */
+ #include "cl.h"
+ #include "platform/program.hpp"
+ #include "platform/kernel.hpp"
+@@ -3268,6 +3274,19 @@
+     ClPrint(amd::LOG_INFO, amd::LOG_SIG, "No HW event to read time");
+     *start = *end = 0;
+   } else {
++    auto* signal = reinterpret_cast<ProfilingSignal*>(hw_event);
++    if (event.command().isMarkerCommand() && event.profilingInfo().enabled_ &&
++        IsSdmaEngine(signal->engine_)) {
++      // A finite SDMA marker owns COPY timestamps, not dispatch timestamps.
++      // ElapsedTime has already authenticated readiness. Cache through the
++      // original signal before reuse; an absent native time must never select
++      // EventDD's CPU-profiling substitution and manufacture a valid interval.
++      signal->CacheTimingData(getBackendDevice());
++      signal->GetCachedTiming(*start, *end);
++      guarantee(*start != 0 && *end >= *start,
++                "Profiled SDMA timing marker lacks valid native timestamps");
++      return;
++    }
+     fetchSignalTime(reinterpret_cast<ProfilingSignal*>(hw_event)->signal_, getBackendDevice(),
+                     start, end);
+   }

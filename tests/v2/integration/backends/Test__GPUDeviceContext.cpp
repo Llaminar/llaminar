@@ -7,7 +7,11 @@
  * - GPUDeviceContextPool singleton
  * - NvidiaDeviceContext (if CUDA available)
  * - AMDDeviceContext (if ROCm available)
+ *
+ * Backend-specific cases are registered only in their matching native binary;
+ * missing runtime hardware remains a failed native qualification, not a pass.
  * - Ordering receipts cover retained compute after DMA on reused stream lanes
+ * - Actual backend-owned workers inherit admitted OpenMP places and restore their creator
  * - Admission prices every retained verifier width before request execution
  *
  * **Thread Safety Model**:
@@ -33,10 +37,14 @@
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #include <hip/hip_runtime.h>
+#include "backends/rocm/AMDDeviceContext.h"
 #elif defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 #include <cuda_runtime_api.h>
+#include "backends/cuda/NvidiaDeviceContext.h"
 #endif
 
+#include <omp.h>
+#include <sched.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -558,6 +566,9 @@ namespace
  * and transaction owners. Both algorithms may serve this admitted model, even
  * when the current request has MTP disabled. Price their shared parent once and
  * the additional ordinary owners through the same typed runtime inventory.
+ * Retained controller capacity additionally owns one bounded scalar direct-token
+ * history publisher, independent of verifier width or current Off request. Its
+ * executable adds one to total/bounded counts without adding a general owner.
  */
 TEST(Test__GPUDeviceContextPool,
      RetainedMTPGraphCapacityIsPricedBeforeExecution)
@@ -566,17 +577,33 @@ TEST(Test__GPUDeviceContextPool,
     retained_mtp.enabled = false;
     retained_mtp.graph_capacity_draft_tokens = 15;
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    const auto planned_device = DeviceId::rocm(0);
+#else
+    const auto planned_device = DeviceId::cuda(0);
+#endif
+    const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+        declaredDeviceGenerationExecutionPolicy(planned_device.type, DeviceGenerationExecutionDomain::NativeDomain)));
+    const bool exact = family == MTPVerifierGraphFamily::ExactRows;
     const CapturedServingGraphMemoryInventory inventory =
         resolveCapturedServingGraphMemoryInventory(
             {32, 64, 128},
-            retained_mtp);
-    const MTPGraphOwnerPlan owner_plan(retained_mtp);
-    ASSERT_EQ(inventory.fixed_executable_count, 12u);
+            retained_mtp,
+            family,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain);
+    const MTPGraphOwnerPlan owner_plan(retained_mtp, family, MTPGenerationParentRole::Controller);
+    ASSERT_EQ(inventory.fixed_executable_count, exact ? 34u : 12u);
+    // The one controller-owned direct history helper is retained even for
+    // this Off request. It is a bounded flat executable, not a general parent.
+    ASSERT_EQ(inventory.mtp_graph_owners.directTokenHistoryGraphSlots(), 1u);
+    ASSERT_EQ(owner_plan.directTokenHistoryGraphSlots(), 1u);
+    ASSERT_EQ(owner_plan.controllerGraphSlots(), exact ? 47u : 5u);
     ASSERT_EQ(
         inventory.mtp_graph_owners.auxiliaryExecutableSlotCount(),
-        107u);
-    ASSERT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
-    ASSERT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+        exact ? 150u : 108u);
+    ASSERT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), exact ? 67u : 25u);
+    ASSERT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 83u);
 
     ModelMemoryProfile profile;
     // Workspace planning consults the production architecture's typed
@@ -616,14 +643,17 @@ TEST(Test__GPUDeviceContextPool,
             cfg.device,
             CapturedGraphExecutableInventory{
                 .model_graph_identity_count =
-                    /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u,
+                    /*Two admitted prefill buckets plus the canonical fixed family.*/2u + inventory.fixed_executable_count,
                 .model_graph_topology_variant_count = 1u,
                 // Match the physical classes declared by runtime graph owners;
                 // the total slot count alone overprices bounded CUDA helpers.
                 .auxiliary_executable_count =
                     owner_plan.generalAuxiliaryExecutableSlotCount() +
                     OrdinaryGenerationGraphPlan::additionalExecutableCount(
-                        cfg.device, /*has_mtp_graph_owners=*/true),
+                        cfg.device,
+                        /*has_mtp_graph_owners=*/true,
+                        declaredDeviceGenerationExecutionPolicy(cfg.device.type, *inventory.generation_domain),
+                        MTPGenerationParentRole::Controller),
                 .bounded_helper_executable_count =
                     owner_plan.boundedHelperExecutableSlotCount(),
             }));
@@ -631,7 +661,7 @@ TEST(Test__GPUDeviceContextPool,
         plan.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
             cfg.device,
-            /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u));
+            /*Two admitted prefill buckets plus the canonical fixed family.*/2u + inventory.fixed_executable_count));
 }
 
 TEST(Test__GPUDeviceContextPool, SingletonInstance)
@@ -683,6 +713,7 @@ TEST(Test__GPUDeviceContextPool, DeviceCountQueries)
     }
 }
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool, GetContextByType_CUDA)
 {
     SKIP_IF_NO_CUDA();
@@ -699,7 +730,9 @@ TEST(Test__GPUDeviceContextPool, GetContextByType_CUDA)
     // Both should return the same context (same device ordinal)
     EXPECT_EQ(&ctx1, &ctx2);
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool, GetContextByType_ROCm)
 {
     SKIP_IF_NO_ROCM();
@@ -724,6 +757,7 @@ TEST(Test__GPUDeviceContextPool, GetContextByType_ROCm)
     EXPECT_EQ(&ctx2, &ctx3);
     EXPECT_EQ(&ctx3, &ctx4);
 }
+#endif
 
 TEST(Test__GPUDeviceContextPool, GetContextInvalidType)
 {
@@ -742,11 +776,11 @@ TEST(Test__GPUDeviceContextPool, GetContextInvalidOrdinal)
     // Negative ordinal should throw
     if (pool.hasNvidiaSupport())
     {
-        EXPECT_THROW(pool.getNvidiaContext(-1), std::runtime_error);
+        EXPECT_THROW(pool.getNvidiaContext(-1), std::invalid_argument);
     }
     if (pool.hasAMDSupport())
     {
-        EXPECT_THROW(pool.getAMDContext(-1), std::runtime_error);
+        EXPECT_THROW(pool.getAMDContext(-1), std::invalid_argument);
     }
 
     // Ordinal beyond device count should throw
@@ -770,6 +804,7 @@ TEST(Test__GPUDeviceContextPool, ExclusiveRetirementRejectsCPU)
         std::invalid_argument);
 }
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool, CUDAExclusiveRetirementCreatesFreshGeneration)
 {
     SKIP_IF_NO_CUDA();
@@ -792,7 +827,9 @@ TEST(Test__GPUDeviceContextPool, CUDAExclusiveRetirementCreatesFreshGeneration)
     // Leave a live context for the remaining backend integration cases.
     ASSERT_TRUE(pool.getNvidiaContext(0).isInitialized());
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool, ROCmExclusiveRetirementCreatesFreshGeneration)
 {
     SKIP_IF_NO_ROCM();
@@ -813,21 +850,27 @@ TEST(Test__GPUDeviceContextPool, ROCmExclusiveRetirementCreatesFreshGeneration)
     // Later tests consume the ordinary live generation, not a retired handle.
     ASSERT_TRUE(pool.getAMDContext(0).isInitialized());
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool,
      CUDAAcquisitionIsExcludedAcrossRuntimeRetirementScope)
 {
     SKIP_IF_NO_CUDA();
     expectContextAcquisitionExcludedDuringRetirement(DeviceId::cuda(0));
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool,
      ROCmAcquisitionIsExcludedAcrossRuntimeRetirementScope)
 {
     SKIP_IF_NO_ROCM();
     expectContextAcquisitionExcludedDuringRetirement(DeviceId::rocm(0));
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool,
      CUDAExclusiveModelRetirementResetsRuntimeGeneration)
 {
@@ -839,7 +882,9 @@ TEST(Test__GPUDeviceContextPool,
         expectExclusiveRuntimeGenerationRetirement(DeviceId::cuda(0));
     }
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool,
      ROCmExclusiveModelRetirementResetsRuntimeGeneration)
 {
@@ -851,7 +896,9 @@ TEST(Test__GPUDeviceContextPool,
         expectExclusiveRuntimeGenerationRetirement(DeviceId::rocm(0));
     }
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool,
      CUDAExclusiveMultiDeviceModelRetirementIsStableForTwentyCycles)
 {
@@ -868,7 +915,9 @@ TEST(Test__GPUDeviceContextPool,
             DeviceId::cuda(0), DeviceId::cuda(1));
     }
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool,
      ROCmExclusiveMultiDeviceModelRetirementIsStableForTwentyCycles)
 {
@@ -885,6 +934,7 @@ TEST(Test__GPUDeviceContextPool,
             DeviceId::rocm(0), DeviceId::rocm(1));
     }
 }
+#endif
 
 TEST(Test__GPUDeviceContextPool, ConcurrentAccess)
 {
@@ -924,6 +974,7 @@ TEST(Test__GPUDeviceContextPool, ConcurrentAccess)
 // NvidiaDeviceContext Tests
 // ===========================================================================
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__NvidiaDeviceContext, CreationAndInitialization)
 {
     SKIP_IF_NO_CUDA();
@@ -1284,11 +1335,13 @@ TEST(Test__NvidiaDeviceContext, CollectiveCommInitiallyNull)
     // Don't assert null - it may have been set by previous tests
     (void)comm;
 }
+#endif
 
 // ===========================================================================
 // AMDDeviceContext Tests (mirror NVIDIA tests)
 // ===========================================================================
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, CreationAndInitialization)
 {
     SKIP_IF_NO_ROCM();
@@ -1413,7 +1466,9 @@ TEST(Test__AMDDeviceContext, StreamCreationAndDestruction)
     ctx.submitAndWait([&]()
                       { ctx.destroyStream(stream); });
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, StreamCreationUsesContextDeviceWhenCallerDeviceDiffers)
 {
@@ -1458,7 +1513,9 @@ TEST(Test__AMDDeviceContext, StreamCreationUsesContextDeviceWhenCallerDeviceDiff
     }
 }
 #endif
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, MultipleStreams)
 {
     SKIP_IF_NO_ROCM();
@@ -1680,6 +1737,7 @@ TEST(Test__AMDDeviceContext, CollectiveCommInitiallyNull)
     void *comm = ctx.collectiveComm();
     (void)comm;
 }
+#endif
 
 // ===========================================================================
 // Cross-Platform Interface Tests
@@ -1843,3 +1901,106 @@ TEST(Test__GPUDeviceContext_Stress, StreamEventChurn)
             ctx->destroyStream(stream); });
     }
 }
+
+namespace
+{
+/** @return Calling thread's actual Linux eligibility, without a device probe. */
+cpu_set_t backendAffinityMask()
+{
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0)
+        throw std::runtime_error("Cannot read backend worker affinity");
+    return mask;
+}
+
+/**
+ * @brief Independently enumerate initial-host OpenMP places for the expected child mask.
+ * @param parent Exact original mask preserved when binding is disabled.
+ * @return Current admitted partition; no guessed socket, CPU ordinal or worker budget.
+ */
+cpu_set_t backendExpectedPartition(const cpu_set_t &parent)
+{
+    if (omp_get_proc_bind() == omp_proc_bind_false) return parent;
+    const int count = omp_get_partition_num_places();
+    if (count <= 0) throw std::runtime_error("Bound backend fixture has no partition places");
+    std::vector<int> places(static_cast<size_t>(count));
+    omp_get_partition_place_nums(places.data());
+    cpu_set_t result;
+    CPU_ZERO(&result);
+    for (int place : places)
+    {
+        const int width = omp_get_place_num_procs(place);
+        if (width <= 0) throw std::runtime_error("Empty backend fixture place");
+        std::vector<int> cpus(static_cast<size_t>(width));
+        omp_get_place_proc_ids(place, cpus.data());
+        for (int cpu : cpus)
+        {
+            if (cpu < 0 || cpu >= CPU_SETSIZE) throw std::runtime_error("Backend fixture CPU exceeds affinity mask");
+            CPU_SET(cpu, &result);
+        }
+    }
+    return result;
+}
+
+/**
+ * @brief Prove placement on the actual newly constructed native backend owner.
+ * @param construct Concrete native constructor, never a pool hit or synthetic worker.
+ *
+ * Normal submitAndWait dispatch identifies the owned child and observes its mask.
+ * No kernel, event, GPU synchronization or all-thread mask inference is used.
+ * Context destruction retires its ordinary owned thread before final parent checks.
+ */
+template<class Factory>
+void expectBackendWorkerAffinity(Factory construct)
+{
+    ASSERT_EQ(omp_get_level(), 0);
+    const auto parent = backendAffinityMask();
+    const auto expected = backendExpectedPartition(parent);
+    const auto parent_id = std::this_thread::get_id();
+    const int team = omp_get_max_threads();
+    auto context = construct();
+    ASSERT_NE(context, nullptr);
+    ASSERT_TRUE(context->isInitialized());
+    const auto restored = backendAffinityMask();
+    EXPECT_TRUE(CPU_EQUAL(&parent, &restored));
+    std::thread::id owner;
+    for (int task = 0; task < 3; ++task)
+    {
+        cpu_set_t observed;
+        std::thread::id current;
+        context->submitAndWait([&] {
+            current = std::this_thread::get_id();
+            observed = backendAffinityMask();
+        });
+        EXPECT_NE(current, parent_id);
+        if (task == 0) owner = current;
+        EXPECT_EQ(current, owner);
+        EXPECT_TRUE(CPU_EQUAL(&expected, &observed)) << "owned task=" << task;
+    }
+    context.reset();
+    const auto retired = backendAffinityMask();
+    EXPECT_TRUE(CPU_EQUAL(&parent, &retired));
+    EXPECT_EQ(omp_get_max_threads(), team);
+}
+} // namespace
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+/** @test Real CUDA context construction preserves its parent and places its own task worker. */
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+TEST(Test__NvidiaDeviceContext, OwnedWorkerInheritsPartitionAndRestoresParent)
+{
+    SKIP_IF_NO_CUDA();
+    expectBackendWorkerAffinity([] { return std::make_unique<NvidiaDeviceContext>(0); });
+}
+#endif
+#elif defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+/** @test Real ROCm context construction preserves its parent and places its own task worker. */
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+TEST(Test__AMDDeviceContext, OwnedWorkerInheritsPartitionAndRestoresParent)
+{
+    SKIP_IF_NO_ROCM();
+    expectBackendWorkerAffinity([] { return std::make_unique<AMDDeviceContext>(0); });
+}
+#endif
+#endif

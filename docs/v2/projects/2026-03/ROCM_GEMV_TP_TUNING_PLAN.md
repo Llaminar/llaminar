@@ -156,7 +156,7 @@ Shapes that fall out of QWO-LDS into grid-kpar or scatter:
 **Impact**: +8.4% E2E decode for 0.5B TP=2, neutral for 7B  
 **Risk**: LOW — same kernel, just changes dispatch routing
 
-**Investigation Finding**: The original Phase 3 plan (fused QKV projection) was based on the assumption of 3 individual GEMV launches per QKV stage. Investigation of `multiply_fused_tensor` revealed that for Q8_0 models (`has_native_vnni=false`), K+V are **already batched into a single pair kernel launch** via `rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched`. Production QKV decode was already 2 launches (1× Q individual, 1× K+V pair), not 3.
+**Investigation Finding**: The original Phase 3 plan (fused QKV projection) was based on the assumption of 3 individual GEMV launches per QKV stage. Investigation of `multiply_fused_tensor` revealed that for Q8_0 models (`has_native_quantised=false`), K+V are **already batched into a single pair kernel launch** via `rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched`. Production QKV decode was already 2 launches (1× Q individual, 1× K+V pair), not 3.
 
 **Real Issue**: The `is_tiny_kv_pair` gate in the batched dispatch had a `K >= 2048` restriction that excluded small models (0.5B: K=896) from the LDS k-reduce pair kernel. These fell through to the inferior `grid_kpar_pair` path. Additionally, the pair dispatch function used the legacy `select_blockwise_tiny_kv_outer_splits` KB selector instead of Phase 1's unified `select_blockwise_qwo_outer_splits`.
 

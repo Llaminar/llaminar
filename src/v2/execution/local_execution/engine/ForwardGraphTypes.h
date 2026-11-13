@@ -19,6 +19,7 @@
 #include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
 #include "../../mtp/MTPConditionForwardPurpose.h"
+#include "../../moe/MoEOverlayActivationEpochABI.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -262,6 +263,7 @@ namespace llaminar2
         ForwardStateTransaction state_transaction =
             ForwardStateTransaction::Ordinary; ///< Persistent-state topology embedded by this graph.
         bool decode = false;
+        SparseQueryExecutionProgram sparse_query_execution_program = SparseQueryExecutionProgram::RankingPossible; ///< Exact captured query topology.
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
         bool all_position_logits = false;
         bool live_mtp_request_batch_condition = false; ///< True for one live main-model row per MTP request.
@@ -273,9 +275,13 @@ namespace llaminar2
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
         const int32_t *device_sequence_lengths = nullptr; ///< Exact borrowed row-count owner embedded by captured stages.
         std::optional<DeviceDecodePositionBinding> device_decode_position; ///< Exact scalar KV snapshot topology and borrowed addresses.
+        uint64_t device_request_query_capture_identity = 0; ///< Exact original arena request ingress/count geometry.
         uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
         const void *pipeline_forward_edges = nullptr; ///< Frozen transport/participant/bank owner; exact graph identity.
+        ForwardPipelineActivationOwnership pipeline_activation_ownership =
+            ForwardPipelineActivationOwnership::ForwardGraph; ///< Exact transport owner, independent of submission intent.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
+        uint64_t mtp_main_terminal_logits_capture_identity = 0; ///< Exact canonical raw-logit publication bindings.
         uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
         bool standard_path = true;
         bool pp_stage_enabled = false;
@@ -317,6 +323,7 @@ namespace llaminar2
                    execution_role == other.execution_role &&
                    state_transaction == other.state_transaction &&
                    decode == other.decode &&
+                   sparse_query_execution_program == other.sparse_query_execution_program &&
                    decode_has_history == other.decode_has_history &&
                    all_position_logits == other.all_position_logits &&
                    live_mtp_request_batch_condition ==
@@ -329,11 +336,14 @@ namespace llaminar2
                    position_policy == other.position_policy &&
                    device_sequence_lengths == other.device_sequence_lengths &&
                    device_decode_position == other.device_decode_position &&
+                   device_request_query_capture_identity == other.device_request_query_capture_identity &&
                    device_prefill_chunk_capture_identity ==
                        other.device_prefill_chunk_capture_identity &&
                    pipeline_forward_edges == other.pipeline_forward_edges &&
+                   pipeline_activation_ownership == other.pipeline_activation_ownership &&
                    shifted_mtp_prefill_capture_identity ==
                        other.shifted_mtp_prefill_capture_identity &&
+                   mtp_main_terminal_logits_capture_identity == other.mtp_main_terminal_logits_capture_identity &&
                    mtp_main_terminal_hidden_capture_identity ==
                        other.mtp_main_terminal_hidden_capture_identity &&
                    standard_path == other.standard_path &&
@@ -351,6 +361,184 @@ namespace llaminar2
                        other.snapshot_configuration_identity;
         }
     };
+
+    /**
+     * @brief Cold borrowed identity of an actually materialized finite forward graph.
+     *
+     * The exact cache signature distinguishes prefill, decode, verifier and
+     * diagnostic variants. A null source is a proved source-free graph,
+     * never permission to substitute another graph's preparation token.
+     * The owning engine must outlive every follower attachment borrowing it.
+     */
+    class RetainedForwardSourceDefinition final
+    {
+    public:
+        const std::optional<ForwardGraphSignature> signature; ///< Exact FEE key; learned sidecars have their original distinct graph owner.
+        const MoEOverlayInferenceGraphRole role;
+        const int physical_rows;
+        const void* const graph_identity; ///< Opaque cold identity only; source-free consumers never dereference it.
+        const uint64_t topology_generation;
+        const uint64_t capture_variant_signature;
+        const std::shared_ptr<const RetainedGraphParticipantPreparationStream> source;
+        /**
+         * @brief Project the actual finite graph declaration after its owning cache materializes.
+         * @param signature Original FEE key, absent only for an actual learned-sidecar cache.
+         * @param role Original serving transaction role.
+         * @param physical_rows Actual finite graph row specialization.
+         * @param graph Actual cache-owned declaration, inspected only at this cold frontier.
+         * @param variant Original cache's immutable capture variant.
+         * @param source Exact original preparation token, absent only when this graph declares no source.
+         * @return Immutable declaration metadata; this grants no native launch or physical authority.
+         */
+        static RetainedForwardSourceDefinition checked(std::optional<ForwardGraphSignature> signature,
+            MoEOverlayInferenceGraphRole role, int physical_rows, const ComputeGraph& graph, uint64_t variant,
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> source)
+        {
+            if (role == MoEOverlayInferenceGraphRole::None || physical_rows <= 0 || !variant || !graph.topologyGeneration())
+                throw std::invalid_argument("Finite source projection requires its complete original graph declaration");
+            if (static_cast<bool>(graph.retainedParticipantSourcePlan()) != static_cast<bool>(source) ||
+                (!source && graph.retainedParticipantDefinitionDomain()))
+                throw std::invalid_argument("Finite source projection changed its actual optional source declaration");
+            if (source) {
+                source->requireCurrentDefinition();
+                if (source->definition().graph != &graph || source->definition().plan != graph.retainedParticipantSourcePlan() ||
+                    source->definition().variant != variant || source->definition().topology_generation != graph.topologyGeneration())
+                    throw std::invalid_argument("Finite source projection substituted its exact original cache definition");
+            }
+            return RetainedForwardSourceDefinition(std::move(signature),role,physical_rows,&graph,
+                graph.topologyGeneration(),variant,std::move(source));
+        }
+        /**
+         * @brief Export only a cache's owned source, authenticating associated reader bodies separately.
+         * @param signature Exact owning forward-cache key.
+         * @param role Original serving role and physical_rows its live row specialization.
+         * @param physical_rows Actual row specialization, never retained capacity.
+         * @param graph Actual materialized cache graph.
+         * @param variant Exact immutable cache capture variant.
+         * @param source This graph's whole-source preparation, if it owns the source.
+         * @param recorded_source Exact coordinator definition received at the original capture boundary.
+         * @param auxiliary This graph's original participant-body preparation, if present.
+         * @param attachment Cache-owned sealed original parent/body borrow.
+         * @return Owned/source-free projection, or no entry for an authenticated associated reader.
+         *
+         * A reader is neither source-free nor another source owner. Its preparation
+         * proves the exact received source association before it is excluded from
+         * source-owner discovery. No launch, source seal or new authority is issued.
+         */
+        static std::optional<RetainedForwardSourceDefinition> projectOwned(
+            ForwardGraphSignature signature, MoEOverlayInferenceGraphRole role, int physical_rows,
+            const ComputeGraph& graph, uint64_t variant,
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> source,
+            const std::shared_ptr<const RetainedGraphParticipantPreparationStream>& recorded_source,
+            const std::shared_ptr<const RetainedGraphParticipantPreparationStream>& auxiliary,
+            const IRetainedGraphParticipantStorageAttachment* attachment)
+        {
+            if (source || !graph.retainedParticipantDefinitionDomain())
+                return checked(std::move(signature),role,physical_rows,graph,variant,std::move(source));
+            const auto& range=graph.retainedParticipantAuxiliaryRange();
+            if (graph.retainedParticipantSourcePlan() || !range || !recorded_source || !auxiliary || !attachment ||
+                range->role!=RetainedGraphParticipantAuxiliaryRole::Reader ||
+                range->participant!=signature.device || physical_rows<=0 || !variant ||
+                static_cast<int64_t>(signature.batch_size)*signature.seq_len!=physical_rows ||
+                role!=(signature.execution_role==ForwardExecutionRole::GroupedMTPVerifier
+                    ?MoEOverlayInferenceGraphRole::MTPGroupedVerifier
+                    :signature.decode?MoEOverlayInferenceGraphRole::MainDecode:MoEOverlayInferenceGraphRole::MainPrefill))
+                throw std::invalid_argument("Finite reader projection lost its exact associated source/body declaration");
+            graph.requireRetainedParticipantAuxiliaryRange();
+            recorded_source->requireCurrentDefinition();
+            auxiliary->requireCurrentDefinition();
+            const auto& original=recorded_source->definition();
+            const auto& body=auxiliary->definition();
+            const auto& received=body.original_source_definition;
+            if (original.scope!=RetainedGraphParticipantDefinitionScope::WholeSource ||
+                body.scope!=RetainedGraphParticipantDefinitionScope::AuxiliaryReader ||
+                body.graph!=&graph || body.topology_generation!=graph.topologyGeneration() ||
+                body.variant!=variant || body.participant!=range->participant || body.range_identity!=range->identity ||
+                body.domain!=*graph.retainedParticipantDefinitionDomain() || original.domain!=body.domain ||
+                body.plan!=original.plan || !received || received.get()!=recorded_source.get() ||
+                received.owner_before(recorded_source) || recorded_source.owner_before(received))
+                throw std::invalid_argument("Finite reader projection substituted its original source/cache association");
+            // Reauthenticate the actual sealed enclosing parent after both cache
+            // definitions. An unsealed or retired body cannot disappear as if it
+            // had never owned participant work.
+            attachment->requireCurrent();
+            return std::nullopt;
+        }
+        /** @brief Reauthenticate a borrowed source before accessing its original graph; source-free values own no graph borrow. */
+        void requireCurrent() const
+        {
+            if (!source) return;
+            source->requireCurrentDefinition();
+            const auto& original = source->definition();
+            if (original.graph != graph_identity || original.topology_generation != topology_generation ||
+                original.variant != capture_variant_signature)
+                throw std::invalid_argument("Finite source projection changed its original live definition");
+        }
+    private:
+        RetainedForwardSourceDefinition(std::optional<ForwardGraphSignature> signature,
+            MoEOverlayInferenceGraphRole role,int rows,const void* graph,uint64_t topology,uint64_t variant,
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> source)
+            :signature(std::move(signature)),role(role),physical_rows(rows),graph_identity(graph),
+             topology_generation(topology),capture_variant_signature(variant),source(std::move(source)) {}
+    };
+
+    /**
+     * @brief Select the exact optional source association of an original finite expert parent.
+     * @param definitions Actual retained continuation/sidecar cache projections.
+     * @param draft Select the existing learned-sidecar family, rather than Main.
+     * @param physical_rows Exact follower specialization, never allocation capacity.
+     * @return All compatible original signature tokens, or empty for proved source-free work.
+     * @throws std::exception For missing, stale, foreign or conflicting source declarations.
+     * This is cold metadata validation. It neither launches nor grants an
+     * executable/source capability, and it never guesses an absent family.
+     */
+    inline std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>>
+    retainedExpertSourceVariants(std::span<const RetainedForwardSourceDefinition> definitions,
+        bool draft, int physical_rows)
+    {
+        if (physical_rows <= 0)
+            throw std::invalid_argument("Expert source family requires positive original row geometry");
+        bool found = false;
+        std::optional<bool> source_bearing;
+        std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> result;
+        for (const auto& definition : definitions)
+        {
+            const bool is_draft = definition.role == MoEOverlayInferenceGraphRole::MTPDraft;
+            if (is_draft != draft || definition.physical_rows != physical_rows) continue;
+            definition.requireCurrent();
+            if (definition.signature) {
+                const auto& signature = *definition.signature;
+                const auto rows = static_cast<int64_t>(signature.batch_size) * signature.seq_len;
+                const auto role = signature.execution_role == ForwardExecutionRole::GroupedMTPVerifier
+                    ? MoEOverlayInferenceGraphRole::MTPGroupedVerifier
+                    : signature.decode ? MoEOverlayInferenceGraphRole::MainDecode : MoEOverlayInferenceGraphRole::MainPrefill;
+                if (rows != definition.physical_rows || role != definition.role)
+                    throw std::invalid_argument("Expert source family changed its original forward role or physical rows");
+            } else if (!is_draft) {
+                throw std::invalid_argument("Main expert source family lost its exact original forward signature");
+            }
+            found = true;
+            const bool has_source = static_cast<bool>(definition.source);
+            if (source_bearing && *source_bearing != has_source)
+                throw std::invalid_argument("One expert parent cannot mix source-bearing and source-free continuation variants");
+            source_bearing = has_source;
+            if (!has_source) continue;
+            definition.source->requireCurrentDefinition();
+            const auto& original = definition.source->definition();
+            if (original.graph != definition.graph_identity || original.topology_generation != definition.topology_generation ||
+                original.variant != definition.capture_variant_signature)
+                throw std::invalid_argument("Expert source family substituted its exact original cache definition");
+            if (!result.empty() && result.front()->definition().domain != original.domain)
+                throw std::invalid_argument("Expert source family contains a foreign original source domain");
+            const auto prior = std::find(result.begin(),result.end(),definition.source);
+            if (prior == result.end()) result.push_back(definition.source);
+            else if (prior->owner_before(definition.source) || definition.source.owner_before(*prior))
+                throw std::invalid_argument("Expert source family substituted a source token control block");
+        }
+        if (!found)
+            throw std::invalid_argument("Expert owner has no complete original source-family row association");
+        return result;
+    }
 
     /**
      * @brief Derive diagnostic-arena sharing solely from captured graph identity.
@@ -390,6 +578,13 @@ namespace llaminar2
         {
             reuse_class = ReuseClass::MTPConditionAlternative;
         }
+        else if (signature.state_transaction == ForwardStateTransaction::ForwardOnlyCondition)
+        {
+            // The sampler-free one-shot retires before generation resumes and
+            // cannot overlap prefill or verification. Reuse their admitted
+            // wide diagnostic bank rather than retaining another scalar bank.
+            reuse_class = ReuseClass::PrefillOrMTPVerifierAlternative;
+        }
         else if (!signature.decode &&
                  signature.execution_role ==
                      ForwardExecutionRole::MainInference)
@@ -423,6 +618,8 @@ namespace llaminar2
                       static_cast<uint8_t>(sig.state_transaction)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(static_cast<int>(sig.sparse_query_execution_program)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.live_mtp_request_batch_condition) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -436,6 +633,7 @@ namespace llaminar2
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<const int32_t *>{}(sig.device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(sig.device_request_query_capture_identity) + 0x9e3779b9 + (h << 6) + (h >> 2));
             if (sig.device_decode_position)
             {
                 const auto &binding = *sig.device_decode_position;
@@ -448,11 +646,15 @@ namespace llaminar2
                       sig.device_prefill_chunk_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<const void *>{}(sig.pipeline_forward_edges) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(static_cast<int>(sig.pipeline_activation_ownership)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.shifted_mtp_prefill_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.mtp_main_terminal_hidden_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(sig.mtp_main_terminal_logits_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -747,17 +949,6 @@ namespace llaminar2
         // Stable buffers — stages point to these, contents updated each step
         std::vector<int> token_ids;    ///< Persistent decode token storage
         std::vector<int> position_ids; ///< Persistent decode position IDs
-
-        // PP hidden state copy — for non-embedding PP stages, the external
-        // hidden state must be copied to the working buffer on every forward.
-        // During graph build (cache MISS) this copy happens inline in
-        // QwenStandardGraph::buildPartialForwardGraph(). On cache HIT we must redo
-        // the copy here because the graph build code is not re-executed.
-        TensorBase *pp_external_hidden_state = nullptr; ///< Source (stage N-1 output)
-        TensorBase *pp_working_buffer = nullptr;        ///< Destination (local residual/hidden)
-        size_t pp_copy_bytes = 0;
-        DeviceId pp_device;
-        bool pp_needs_copy = false;
 
         // Pre-computed collective stage names for fast decode intercept
         std::unordered_set<std::string> collective_nodes;
@@ -1116,10 +1307,6 @@ namespace llaminar2
             gpu_ctx = nullptr;
             phase3_active = false;
             graph_replay_live_state_epoch = 0;
-            pp_external_hidden_state = nullptr;
-            pp_working_buffer = nullptr;
-            pp_copy_bytes = 0;
-            pp_needs_copy = false;
         }
     };
 

@@ -7,6 +7,11 @@
  * each reach the common planning-publication consensus before any rank advances.
  * Selected apply configurations use that same transport and failure lifecycle.
  * These are startup collectives, not host decisions in a captured request loop.
+ * Native calibration samples use the same original-coordinate window reader as
+ * model preparation. Reads populate the existing final sample owner directly;
+ * there is no second matrix-sized reader allocation or retained source parent.
+ * Derived role/layer indices retain only source ordinals and canonical enums;
+ * tensor metadata and its wire format remain the original profile authority.
  */
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PlanningPublication.h"
@@ -14,6 +19,9 @@
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelLoader.h"
+#include "loaders/WeightIdentity.h"
+#include "loaders/NativeWeightLoadStaging.h"
+#include "tensors/NativeWeightSourceRange.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
 #include <array>
@@ -29,36 +37,103 @@ namespace llaminar2
 
     }
 
-    PlanningModelMetadata::PlanningModelMetadata(ModelMemoryProfile profile, int main_layer_count)
-        : profile_(std::move(profile)), main_layer_count_(main_layer_count)
+    PlanningTensorIndex::PlanningTensorIndex(ModelMemoryProfile profile):profile_(std::move(profile))
     {
-        if (main_layer_count <= 0 || main_layer_count > profile_.n_layers)
-            throw std::invalid_argument("Planning metadata has an invalid main-layer interval");
-        const auto errors = executionModelConfig().validate();
-        if (!errors.empty())
-            throw std::invalid_argument("Invalid planning model geometry: " + errors.front());
+        if(profile_.n_layers<=0)throw std::invalid_argument("Planning source has no positive layer geometry");
+        roles_.reserve(profile_.tensors.size());
+        for(size_t index=0;index<profile_.tensors.size();++index) {
+            const auto &tensor=profile_.tensors[index];roles_.push_back(inferWeightRole(tensor.name));
+            first_roles_.try_emplace(roles_.back(),index);names_.try_emplace(tensor.name,index);
+            for(size_t dot=tensor.name.find('.');dot!=std::string::npos;dot=tensor.name.find('.',dot+1))
+                layer_suffixes_.try_emplace(std::pair{tensor.layer_index,std::string_view(tensor.name).substr(dot)},index);
+            if(tensor.layer_index<0)globals_.push_back(index);
+            else layers_[tensor.layer_index].push_back(index);
+        }
     }
+
+    PlanningClassifiedTensor PlanningTensorIndex::classifiedTensor(size_t index) const
+    { return PlanningClassifiedTensor(profile_,index,roles_.at(index)); }
+
+    std::span<const size_t> PlanningTensorIndex::layerTensorIndices(int layer) const
+    {
+        if(layer<0)throw std::invalid_argument("Planning tensor layer is outside original source");
+        const auto found=layers_.find(layer);
+        if(found!=layers_.end())return found->second;
+        if(layer>=profile_.n_layers)throw std::invalid_argument("Planning tensor layer is outside original source");
+        return {};
+    }
+
+    std::optional<size_t> PlanningTensorIndex::firstTensorWithRole(WeightRole role) const noexcept
+    {
+        const auto found=first_roles_.find(role);if(found==first_roles_.end())return std::nullopt;return found->second;
+    }
+
+    const TensorSizeInfo *PlanningTensorIndex::findTensor(std::string_view name) const noexcept
+    {
+        const auto found=names_.find(name);return found==names_.end()?nullptr:&profile_.tensors[found->second];
+    }
+
+    void PlanningTensorIndex::requireProfile(const ModelMemoryProfile &profile) const
+    { if(&profile!=&profile_)throw std::invalid_argument("Planning source index belongs to another immutable profile"); }
+
+    std::optional<WeightRole> PlanningTensorIndex::roleForOriginal(const TensorSizeInfo &tensor) const noexcept
+    {
+        const auto view=classifyOriginal(tensor);return view?std::optional<WeightRole>(view->role()):std::nullopt;
+    }
+
+    std::optional<PlanningClassifiedTensor> PlanningTensorIndex::classifyOriginal(const TensorSizeInfo &tensor) const noexcept
+    {
+        const auto begin=reinterpret_cast<std::uintptr_t>(profile_.tensors.data());
+        const auto address=reinterpret_cast<std::uintptr_t>(&tensor);
+        if(address<begin || (address-begin)%sizeof(TensorSizeInfo)!=0)return std::nullopt;
+        const auto index=(address-begin)/sizeof(TensorSizeInfo);
+        return index<roles_.size()?std::optional<PlanningClassifiedTensor>(PlanningClassifiedTensor(profile_,index,roles_[index])):std::nullopt;
+    }
+
+    const TensorSizeInfo *PlanningTensorIndex::findLayerTensor(int layer,std::string_view suffix) const noexcept
+    {
+        const auto found=layer_suffixes_.find({layer,suffix});
+        return found==layer_suffixes_.end()?nullptr:&profile_.tensors[found->second];
+    }
+
+    PlanningModelMetadata::PlanningModelMetadata(ModelMemoryProfile profile,int main_layer_count)
+        :source_index_(std::make_shared<const PlanningTensorIndex>(std::move(profile))),main_layer_count_(main_layer_count)
+    {
+        if(main_layer_count<=0 || main_layer_count>memoryProfile().n_layers)
+            throw std::invalid_argument("Planning metadata has an invalid main-layer interval");
+        const auto errors=executionModelConfig().validate();
+        if(!errors.empty())throw std::invalid_argument("Invalid planning model geometry: "+errors.front());
+    }
+
+    PlanningClassifiedTensor PlanningModelMetadata::classifiedTensor(size_t index) const
+    { return source_index_->classifiedTensor(index); }
+
+    std::span<const size_t> PlanningModelMetadata::layerTensorIndices(int layer) const
+    { return source_index_->layerTensorIndices(layer); }
+
+    std::optional<size_t> PlanningModelMetadata::firstTensorWithRole(WeightRole role) const noexcept
+    { return source_index_->firstTensorWithRole(role); }
 
     ModelConfig PlanningModelMetadata::executionModelConfig() const
     {
-        NativeVnniSourceIdentity terminal_head_source;
+        NativeQuantisedSourceIdentity terminal_head_source;
         // Tensor-directory provenance bounds measured defaults without loading
         // weights or inferring a quantizer from a model filename.
-        for (const auto &tensor : profile_.tensors)
+        for (const auto &tensor : memoryProfile().tensors)
             if (tensor.name == "output.weight")
-                if (const auto *format = native_vnni_formats::forQuantType(tensor.quant_type))
+                if (const auto *format = native_quantised_formats::forQuantType(tensor.quant_type))
                     terminal_head_source = {.codebook_id = format->codebook_id,
                         .is_superblock = format->is_superblock, .present = true};
         return {
-            .name = profile_.architecture,
+            .name = memoryProfile().architecture,
             .n_layers = main_layer_count_,
-            .n_heads = profile_.n_heads,
-            .n_kv_heads = profile_.n_kv_heads,
-            .hidden_size = profile_.d_model,
-            .intermediate_size = profile_.d_ff,
-            .vocab_size = profile_.vocab_size,
-            .head_dim = profile_.head_dim,
-            .estimated_weight_bytes = profile_.total_native_bytes,
+            .n_heads = memoryProfile().n_heads,
+            .n_kv_heads = memoryProfile().n_kv_heads,
+            .hidden_size = memoryProfile().d_model,
+            .intermediate_size = memoryProfile().d_ff,
+            .vocab_size = memoryProfile().vocab_size,
+            .head_dim = memoryProfile().head_dim,
+            .estimated_weight_bytes = memoryProfile().total_native_bytes,
             .terminal_head_source = terminal_head_source,
         };
     }
@@ -67,12 +142,12 @@ namespace llaminar2
     {
         const int layers = mainLayerCountExcludingMTP(
             loader, loader.architecture(), static_cast<int>(loader.blockCount()));
-        return PlanningModelMetadata(ModelMemoryProfile::fromGGUF(loader.getModel()), layers);
+        return PlanningModelMetadata(ModelMemoryProfile::fromLoader(loader), layers);
     }
 
     std::vector<uint8_t> PlanningModelMetadata::serialize() const
     {
-        auto payload = profile_.serialize();
+        auto payload = memoryProfile().serialize();
         std::vector<uint8_t> bytes(kDescriptorHeaderBytes);
         std::copy(kDescriptorMagic.begin(), kDescriptorMagic.end(), bytes.begin());
         const auto layers = static_cast<uint32_t>(main_layer_count_);
@@ -104,30 +179,35 @@ namespace llaminar2
     struct PlanningModelSource::Storage
     {
         std::string path;
+        std::optional<SharedPredictorGGUFSource> predictor;
         std::shared_ptr<IMPIContext> local_context;
         TensorFactory factory;
         ModelLoader loader;
         PlanningModelMetadata metadata;
 
         /** @brief Bind process-local metadata infrastructure before reading once. */
-        explicit Storage(const std::string &model_path)
-            : path(model_path), local_context(MPIContextFactory::self()), factory(*local_context),
-              loader(&factory), metadata(read(loader, model_path)) {}
+        Storage(const std::string &model_path, const std::optional<SharedPredictorGGUFSource> &predictor_source)
+            : path(model_path), predictor(predictor_source), local_context(MPIContextFactory::self()), factory(*local_context),
+              loader(&factory), metadata(read(loader, model_path, predictor)) {}
 
         /** @return Metadata from this exact loader, without touching weight payloads. */
-        static PlanningModelMetadata read(ModelLoader &loader, const std::string &path)
+        static PlanningModelMetadata read(ModelLoader &loader, const std::string &path,
+            const std::optional<SharedPredictorGGUFSource> &predictor)
         {
             loader.setUseMmap(false);
             if (!loader.loadModel(path))
                 throw std::runtime_error("Cannot read planning metadata from " + path);
+            if (predictor) loader.bindSharedPredictor(*predictor, SharedPredictorMaterialization::Active);
+            loader.sealTensorSources();
             return PlanningModelMetadata::fromLoader(loader);
         }
     };
 
-    PlanningModelSource::PlanningModelSource(const std::string &model_path)
+    PlanningModelSource::PlanningModelSource(const std::string &model_path,
+        const std::optional<SharedPredictorGGUFSource> &predictor)
     {
         if (model_path.empty()) throw std::invalid_argument("Planning requires a GGUF model path");
-        storage_ = std::make_unique<Storage>(model_path);
+        storage_ = std::make_unique<Storage>(model_path, predictor);
     }
     PlanningModelSource::~PlanningModelSource() = default;
     PlanningModelSource::PlanningModelSource(PlanningModelSource &&) noexcept = default;
@@ -150,9 +230,15 @@ namespace llaminar2
         return storage_->path;
     }
 
+    const std::optional<SharedPredictorGGUFSource> &PlanningModelSource::predictorSource() const
+    {
+        if (!storage_) throw std::logic_error("Planning model source was moved from");
+        return storage_->predictor;
+    }
+
     PlanningModelSampleGeometry PlanningModelSource::sampleGeometry(const PlanningModelSampleRequest &request) const
     {
-        const auto *info = loader().getModel().findTensor(request.tensor_name);
+        const auto *info = loader().tensorInfo(request.tensor_name);
         if (!info) throw std::invalid_argument("Planning sample tensor is absent: " + request.tensor_name);
         const bool expert = std::holds_alternative<PlanningExpertMatrix>(request.selection);
         if (info->dimensions.size() != (expert ? 3u : 2u))
@@ -205,11 +291,9 @@ namespace llaminar2
         return {n, k, multiply(n, multiply(k / block, block_bytes))};
     }
 
-    /** @brief Keep the matrix borrow, parent allocation and claim in retirement order. */
+    /** @brief Retain the final native sample whose storage carries its own admission lease. */
     struct PlanningLoadedModelSample::Storage final
     {
-        PhysicalMemoryAllocationLease claim;
-        std::shared_ptr<TensorBase> parent;
         std::shared_ptr<TensorBase> matrix;
     };
 
@@ -229,17 +313,21 @@ namespace llaminar2
         if (!memory || !host_device.is_cpu())
             throw std::invalid_argument("Planning sample reception requires an admitted CPU allocator");
         auto payload = std::make_shared<Storage>();
-        payload->claim = memory->claimNewAllocation(host_device, PhysicalMemoryOwner::ModelSourcePayload,
-            geometry.source_bytes);
-        const auto context = MPIContextFactory::self();
-        TensorFactory factory(*context);
+        const auto allocate = [&]<typename T>(size_t count) {
+            return CPUStorageRoot<T>(count, PhysicalMemoryOwner::ModelSourcePayload, host_device,
+                CPUStoragePlacement::local(), CPUStorageInitialization::Uninitialized).allocate(memory);
+        };
         const std::vector<size_t> shape{geometry.n, geometry.k};
         // Allocation/first touch runs on the rank's affined setup thread. The
         // initialized tensor is the final receive address, not a staging copy.
-        if (type == TensorType::FP32) payload->matrix = factory.createFP32(shape, host_device);
-        else if (type == TensorType::FP16) payload->matrix = factory.createFP16(shape);
-        else if (type == TensorType::BF16) payload->matrix = factory.createBF16(shape);
-        else payload->matrix = factory.createQuantizedOwned(type, shape, AlignedVector<uint8_t>(geometry.source_bytes));
+        if (type == TensorType::FP32) payload->matrix = std::make_shared<FP32Tensor>(
+            shape, allocate.template operator()<float>(geometry.n * geometry.k), host_device);
+        else if (type == TensorType::FP16) payload->matrix = std::make_shared<FP16Tensor>(
+            shape, allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t)), host_device);
+        else if (type == TensorType::BF16) payload->matrix = std::make_shared<BF16Tensor>(
+            shape, allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t)), host_device);
+        else payload->matrix = TensorFactory::adoptQuantizedFinalStorage(
+            type, shape, allocate.template operator()<uint8_t>(geometry.source_bytes), host_device);
         if (!payload->matrix || payload->matrix->size_bytes() != geometry.source_bytes)
             throw std::runtime_error("Planning sample receive allocation disagrees with native extent");
         return PlanningLoadedModelSample(std::move(payload));
@@ -257,40 +345,50 @@ namespace llaminar2
         const auto geometry = sampleGeometry(request);
         if (!memory || !host_device.is_cpu())
             throw std::invalid_argument("Planning source sampling requires an admitted CPU allocator");
-        auto payload = std::make_shared<PlanningLoadedModelSample::Storage>();
-        payload->claim = memory->claimNewAllocation(host_device, PhysicalMemoryOwner::ModelSourcePayload,
-            geometry.source_bytes);
-        const auto reader_claim = memory->claimNewAllocation(host_device, PhysicalMemoryOwner::WeightLoadStaging,
-            geometry.source_bytes);
-        payload->parent = std::visit([&](const auto &selection) -> std::shared_ptr<TensorBase> {
+        // Share the original authority's source transaction with every model
+        // manager. The final sample survives this scope, but no temporary input
+        // allocation escapes it (the reader writes directly to final storage).
+        const auto transaction = memory->acquireCPUWeightSourceTransaction(host_device);
+        const auto original = storage_->loader.nativeWeightSourceGeometry(request.tensor_name);
+        auto result = PlanningLoadedModelSample::allocateReceive(
+            original.original_type, geometry, memory, host_device);
+        NativeWeightSourceWindow range{
+            .rows = geometry.n,
+            .columns = geometry.k,
+            .native_row_bytes = geometry.source_bytes / geometry.n};
+        std::visit([&](const auto &selection) {
             using Selection = std::decay_t<decltype(selection)>;
             if constexpr (std::is_same_v<Selection, PlanningMatrixColumns>)
-                return storage_->loader.loadTensorColumnSlice(request.tensor_name, selection.first, selection.last, host_device);
+                range.first_column = selection.first;
             else if constexpr (std::is_same_v<Selection, PlanningExpertMatrix>)
-                return storage_->loader.loadTensorExpertSlice(request.tensor_name, selection.index, selection.index + 1, host_device);
-            else
-            {
-                const size_t first = [&] {
-                    if constexpr (std::is_same_v<Selection, PlanningMatrixRows>) return selection.first;
-                    else return size_t{0};
-                }();
-                return storage_->loader.loadTensorRowSlice(request.tensor_name, first, first + geometry.n, host_device);
-            }
+                range.original_expert = selection.index;
+            else if constexpr (std::is_same_v<Selection, PlanningMatrixRows>)
+                range.first_row = selection.first;
         }, request.selection);
-        if (!payload->parent || !payload->parent->raw_data() || payload->parent->size_bytes() != geometry.source_bytes)
-            throw std::runtime_error("Planning source sample did not materialize its exact native extent");
-        payload->matrix = std::holds_alternative<PlanningExpertMatrix>(request.selection)
-            ? payload->parent->create_view({geometry.n, geometry.k}) : payload->parent;
-        if (!payload->matrix || payload->matrix->shape() != std::vector<size_t>{geometry.n, geometry.k})
-            throw std::runtime_error("Planning source sample did not publish its exact matrix geometry");
-        return PlanningLoadedModelSample(std::move(payload));
+        const auto budget = configuredNativeWeightLoadStagingBudgetBytes();
+        const size_t capacity = budget ? std::min(*budget, geometry.source_bytes) : geometry.source_bytes;
+        auto destination = std::span<std::byte>(static_cast<std::byte *>(result.receiveData()), geometry.source_bytes);
+        forEachNativeWeightSourceWindow(original, range, capacity, [&](const NativeWeightSourceWindow &window) {
+            // A complete-row window is contiguous in the final selected matrix.
+            // Oversized rows instead write one native-group strip at a time.
+            const size_t offset = (window.first_row - range.first_row) * range.native_row_bytes +
+                ((window.first_column - range.first_column) / original.native_group_elements) * original.native_group_bytes;
+            if (offset > destination.size() || window.nativeBytes() > destination.size() - offset)
+                throw std::logic_error("Planning source window exceeds its final native sample");
+            storage_->loader.readNativeWeightSourceWindow(request.tensor_name, window,
+                destination.subspan(offset, window.nativeBytes()));
+        });
+        return result;
     }
 
     size_t maximumGGUFTensorPayloadBytes(const GGUFModel &model)
     {
         uint64_t maximum = 0;
         for (const auto &tensor : model.tensors)
+        {
+            if (inferWeightRole(tensor.name) == WeightRole::ImmutableRowTable) continue;
             maximum = std::max(maximum, tensor.size_bytes);
+        }
         if (maximum == 0)
             throw std::invalid_argument("GPU upload admission requires a nonempty GGUF tensor manifest");
         if (maximum > std::numeric_limits<size_t>::max())
@@ -298,9 +396,10 @@ namespace llaminar2
         return static_cast<size_t>(maximum);
     }
 
-    PlanningModelMetadata readPlanningModelMetadata(const std::string &model_path)
+    PlanningModelMetadata readPlanningModelMetadata(const std::string &model_path,
+        const std::optional<SharedPredictorGGUFSource> &predictor)
     {
-        return PlanningModelSource(model_path).metadata();
+        return PlanningModelSource(model_path, predictor).metadata();
     }
 
     PlanningModelMetadata exchangePlanningModelMetadata(

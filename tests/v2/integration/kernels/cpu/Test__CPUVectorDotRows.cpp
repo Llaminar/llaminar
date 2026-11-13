@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../../utils/CPURouterKernelTestAdmission.h"
 #include "kernels/cpu/primitives/VectorPrimitives.h"
 
 #include <algorithm>
@@ -104,6 +105,8 @@ namespace
             value *= 0.0001f;
         constexpr int top_k = 4;
         CPUMoEKernel grouped_kernel, serial_kernel;
+        llaminar2::test::admitCPURouterKernelForTest(grouped_kernel, rows, width);
+        llaminar2::test::admitCPURouterKernelForTest(serial_kernel, 1, width);
         MoERoutingResult grouped, serial;
         ASSERT_TRUE(grouped_kernel.route(hidden.data(), weights.data(), rows,
             width, experts, top_k, normalize, grouped));

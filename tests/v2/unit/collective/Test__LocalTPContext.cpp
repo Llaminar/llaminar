@@ -31,11 +31,17 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include "../../fixtures/collective/PooledNativeCollectiveReplayAccess.h"
+#include <functional>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 
 #include "collective/LocalTPContext.h"
+#include "execution/moe/MoELocalTPMaintenanceDomain.h"
+#include "../../mocks/MockLocalTPContext.h"
+#include "backends/NativeDeviceBinding.h"
+#include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "collective/ICollectiveBackend.h"
 #include "collective/DeviceGroup.h"
@@ -768,17 +774,44 @@ TEST_F(Test__LocalTPContext, GDNLinkedReassemblyWrappersFailFastOnDeviceBindAndC
                               "hipLaunchKernelGGL");
 }
 
-TEST_F(Test__LocalTPContext, RCCLCoordinatorKeepsHipDeviceGuardTrackingInSync)
+/** @test Every direct collective authenticates actual native state instead of remembering a per-kind device. */
+TEST_F(Test__LocalTPContext, RCCLCoordinatorBindsActualCurrentDeviceWithoutShadow)
 {
     const std::string source = readTextFile(LLAMINAR_RCCL_COORDINATOR_SOURCE);
     ASSERT_FALSE(source.empty());
+    for (const char *method : {"allreduceSingleDeviceOnStream", "reduceSingleDeviceOnStream",
+                              "allgatherSingleDeviceOnStream", "broadcastSingleDeviceOnStream",
+                              "groupedP2PSingleDeviceOnStream"})
+    {
+        SCOPED_TRACE(method);
+        const std::string signature = std::string("bool RCCLCoordinator::") + method + "(";
+        const auto begin = source.find(signature);
+        ASSERT_NE(begin, std::string::npos);
+        const auto end = source.find("\n    bool RCCLCoordinator::", begin + signature.size());
+        const auto body = source.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        EXPECT_NE(body.find("bindNativeDevice(ordinal,"), std::string::npos);
+        EXPECT_NE(body.find("hipGetDevice(observed)"), std::string::npos);
+        EXPECT_EQ(body.find("thread_local"), std::string::npos)
+            << "A prior call of this collective kind cannot authenticate ambient native device state.";
+    }
+    EXPECT_EQ(source.find("trackedHipSetDevice("), std::string::npos);
+    EXPECT_EQ(source.find("tl_last_hip_device"), std::string::npos);
 
-    EXPECT_NE(source.find("trackedHipSetDevice("), std::string::npos);
-    EXPECT_NE(source.find("HipDeviceGuard::forceSetDevice(device_ordinal)"), std::string::npos);
-    EXPECT_EQ(source.find("hipSetDevice("), std::string::npos)
-        << "RCCL coordinator runs direct grouped collectives on worker threads; "
-           "raw hipSetDevice leaves HipDeviceGuard's thread-local cache stale and "
-           "can make the next kernel launch use a stream from the wrong device.";
+    // Exercise the same actual checked helper here; the explicit pure original-
+    // body controls and native backend replays additionally guard its real adapters.
+    int actual_device = 0;
+    const auto bind = [&](int ordinal) {
+        return bindNativeDevice(ordinal,
+            [&](int *current) { *current = actual_device; return 0; },
+            [&](int selected) { actual_device = selected; return 0; });
+    };
+    ASSERT_TRUE(bind(0).succeeded());
+    ASSERT_TRUE(bind(1).succeeded());
+    ASSERT_TRUE(bind(0).succeeded());
+    EXPECT_EQ(actual_device, 0);
+    actual_device = 1; // An external native selection must invalidate no host shadow.
+    ASSERT_TRUE(bind(0).succeeded());
+    EXPECT_EQ(actual_device, 0);
 }
 
 TEST_F(Test__LocalTPContext, WorkerGpuCheckedEventHelpersBindContextDevice)
@@ -3135,4 +3168,230 @@ TEST_F(Test__LocalTPContext, GatherFromDevicesOutputTooSmallFails)
 
     std::vector<const TensorBase *> shards = {shard0.get(), shard1.get()};
     EXPECT_FALSE(ctx->gatherFromDevices(shards, output.get()));
+}
+
+/** @brief Cold clique admission rejects same-size foreign recurrence formats before capture. */
+TEST_F(Test__LocalTPContext, GDNLayoutIdentityRejectsSameSizeForeignParticipantBeforeCapture)
+{
+    using L = GDNRecurrenceStateLayout;
+    for (const bool mismatch : {false, true})
+    {
+        auto ctx = createLocalTPContext(
+            {cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+        ASSERT_NE(ctx, nullptr);
+        GDNLinkedLiveStateGeometry first{
+            .global_key_heads = 8,
+            .global_value_heads = 24,
+            .key_width = 64,
+            .value_width = 65,
+            .conv_history_length = 3,
+            .recurrence_layout = L::ValueMajorKeyContiguous,
+        };
+        auto second = first;
+        if (mismatch)
+            second.recurrence_layout = L::KeyMajorValueContiguous;
+        bool first_ok = false;
+        bool second_ok = false;
+        std::thread left(
+            [&] {
+                first_ok =
+                    ctx->graphCaptureBoundaryRendezvous(first.captureLayoutIdentity(7), 0, 30000);
+            });
+        std::thread right(
+            [&] {
+                second_ok =
+                    ctx->graphCaptureBoundaryRendezvous(second.captureLayoutIdentity(7), 1, 30000);
+            });
+        left.join();
+        right.join();
+        EXPECT_EQ(first_ok, !mismatch);
+        EXPECT_EQ(second_ok, !mismatch);
+        if (mismatch)
+            EXPECT_FALSE(
+                ctx->graphCaptureBoundaryRendezvous(first.captureLayoutIdentity(7), 0, 30000));
+    }
+}
+
+
+/**
+ * @brief Metadata-only backend double for actual LocalTP cancellation ownership.
+ * Recorded pointers prove construction/control ordering, never native readiness,
+ * transport completion or executable capture. Literal SDK barrier replay is a
+ * separate prerequisite; the actual native pair gate remains required.
+ */
+class OriginalNativeAbortBackend final : public MockCollectiveBackend
+{
+public:
+    bool all_authorities_present = true;
+    int missing_participant = -1;
+    std::atomic<int> signal_calls{0};
+    std::uint32_t original_abort[2]{};
+    std::uint64_t original_communicator[2]{71, 73};
+    std::function<void()> signal_observer;
+
+    /** @return Original recorded pointer identity only; no device value is read. */
+    NativeCompletionAuthority nativeCompletionAuthority(int participant) override
+    {
+        if (!all_authorities_present || participant < 0 || participant >= 2 ||
+            participant == missing_participant)
+            return {};
+        return PooledNativeCollectiveReplayAccess::recorded(
+            {&original_abort[participant], &original_communicator[participant]});
+    }
+
+    /** @brief Observe actual host publication before the original absorbing flag write. */
+    bool signalNativeCompletionAbort() override
+    {
+        signal_calls.fetch_add(1, std::memory_order_relaxed);
+        if (signal_observer)
+            signal_observer();
+        for (auto& flag : original_abort)
+            __atomic_store_n(&flag, std::uint32_t{1}, __ATOMIC_RELEASE);
+        return true;
+    }
+};
+
+/** @test Actual cancellation releases host waiters before non-destructive native signaling. */
+TEST_F(Test__LocalTPContext, ReadyNativeAbortSignalsAfterHostWakeAndDefersDestruction)
+{
+    for (const auto type : {CollectiveBackendType::NCCL, CollectiveBackendType::RCCL})
+    {
+        std::atomic<int> destroyed{0};
+        auto context = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {},
+            CollectiveBackendType::HOST);
+        auto* actual = dynamic_cast<LocalTPContext*>(context.get());
+        ASSERT_NE(actual, nullptr);
+        auto backend = std::make_unique<OriginalNativeAbortBackend>();
+        auto* recorded = backend.get();
+        recorded->external_abort_call_count = &destroyed;
+        actual->setBackendForTesting(std::move(backend), type, true);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        std::promise<void> entered;
+        auto waiter = std::async(std::launch::async, [&] {
+            entered.set_value();
+            return actual->graphCaptureBoundaryRendezvous("native_abort_original_waiter", 0, 1000);
+        });
+        entered.get_future().wait();
+        EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(5)), std::future_status::timeout);
+        recorded->signal_observer = [&] {
+            EXPECT_TRUE(actual->isAbortRequested());
+            // Reenter the same actual abort path: it must acquire the original
+            // HOST mutex, return idempotently, and never recursively signal.
+            actual->requestAbort();
+            EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+        };
+        actual->requestAbort();
+        ASSERT_EQ(waiter.wait_until(deadline), std::future_status::ready);
+        EXPECT_FALSE(waiter.get());
+        actual->requestAbort();
+        EXPECT_EQ(recorded->signal_calls.load(std::memory_order_relaxed), 1);
+        for (const auto& flag : recorded->original_abort)
+            EXPECT_EQ(__atomic_load_n(&flag, __ATOMIC_ACQUIRE), 1u);
+        EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+        context.reset();
+        EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
+    }
+}
+
+/** @test Uninitialized, incomplete and foreign backends acquire no native abort capability. */
+TEST_F(Test__LocalTPContext, NativeAbortIgnoresUnreadyOrForeignBackend)
+{
+    struct Case { CollectiveBackendType backend; bool initialized; bool all_present; int missing; };
+    for (const auto scenario : {
+        Case{CollectiveBackendType::NCCL, false, true, -1},
+        Case{CollectiveBackendType::NCCL, true, false, -1},
+        Case{CollectiveBackendType::RCCL, true, true, 1},
+        Case{CollectiveBackendType::HOST, true, true, -1},
+        Case{CollectiveBackendType::HETEROGENEOUS, true, true, -1}})
+    {
+        auto context = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {},
+            CollectiveBackendType::HOST);
+        auto* actual = dynamic_cast<LocalTPContext*>(context.get());
+        ASSERT_NE(actual, nullptr);
+        auto backend = std::make_unique<OriginalNativeAbortBackend>();
+        auto* recorded = backend.get();
+        recorded->all_authorities_present = scenario.all_present;
+        recorded->missing_participant = scenario.missing;
+        actual->setBackendForTesting(std::move(backend), scenario.backend, scenario.initialized);
+        actual->requestAbort();
+        actual->requestAbort();
+        EXPECT_TRUE(actual->isAbortRequested());
+        EXPECT_EQ(recorded->signal_calls.load(std::memory_order_relaxed), 0);
+        for (const auto& flag : recorded->original_abort)
+            EXPECT_EQ(__atomic_load_n(&flag, __ATOMIC_ACQUIRE), 0u);
+    }
+}
+
+/**
+ * @test Replay qualified-host and sparse-ordinal maintenance declarations through the production predicate.
+ * The original LocalTP scope owns locality; lexical address aliases cannot grant
+ * or withdraw ownership. Capture capability and exact native membership remain mandatory.
+ */
+TEST(LocalTPMaintenanceDomain, QualifiedOriginalStageMembershipReplay)
+{
+    class DomainContext final : public MockLocalTPContext
+    {
+    public:
+        /** @return Recorded resolved scope, with adversarial non-local traces supported. */
+        TPScope scope() const override { return recorded_scope; }
+        /** @return Recorded degree when corrupt, otherwise exact context membership. */
+        int degree() const override { return recorded_degree.value_or(MockLocalTPContext::degree()); }
+        TPScope recorded_scope = TPScope::RANK_LOCAL;
+        std::optional<int> recorded_degree;
+    };
+    for (const auto family : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int width : {2, 4, 8})
+    {
+        const auto backend = family == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        std::vector<GlobalDeviceAddress> original;
+        for (int index = 0; index != width; ++index)
+            original.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId(family, 23 - index * 3),
+                "original-worker.example.test", 7));
+        for (const auto &address : original) EXPECT_FALSE(address.isLocal()); // Original failure witness.
+        DomainContext context;
+        for (int replay = 0; replay != 3; ++replay)
+        {
+            context.setDevices(original);
+            context.setBackend(backend);
+            context.setRawAllgatherGraphCaptureSupported(true);
+            context.recorded_scope = TPScope::RANK_LOCAL;
+            context.recorded_degree.reset();
+            for (int index = 0; index != width; ++index)
+                EXPECT_TRUE(isHomogeneousGPULocalTPMaintenanceDomain(context, original[index].toLocalDeviceId(), index, 8));
+            const auto device = original.front().toLocalDeviceId();
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, -1, 8));
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, width, 8));
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, width - 1));
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, original.back().toLocalDeviceId(), 0, 8));
+            context.setRawAllgatherGraphCaptureSupported(false);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.setRawAllgatherGraphCaptureSupported(true);
+            for (const auto scope : {TPScope::AUTO, TPScope::NODE_LOCAL, TPScope::GLOBAL})
+            {
+                context.recorded_scope = scope;
+                EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            }
+            context.recorded_scope = TPScope::RANK_LOCAL;
+            context.setBackend(family == DeviceType::CUDA ? CollectiveBackendType::RCCL : CollectiveBackendType::NCCL);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.setBackend(backend);
+            context.recorded_degree = width + 1;
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.recorded_degree.reset();
+            auto changed = original;
+            changed.back() = GlobalDeviceAddress::fromLocalDeviceId(device, "another-display-alias", 7);
+            context.setDevices(changed);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            changed = original;
+            changed.back() = GlobalDeviceAddress::fromLocalDeviceId(
+                DeviceId(family == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA, 91),
+                "original-worker.example.test", 7);
+            context.setDevices(changed);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.setDevices({original.front()});
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+        }
+        EXPECT_EQ(context.allreduceCallCount(), 0);
+    }
 }

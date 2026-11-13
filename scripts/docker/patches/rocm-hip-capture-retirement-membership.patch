@@ -1,0 +1,50 @@
+From: Llaminar native capture retirement regression
+Subject: [PATCH] Retire fork membership before recursive EndCapture descent
+
+Auxiliary-stream reentry can form cyclic parallel stream membership while
+the captured event/node graph remains acyclic. Detach children and reset
+local capture bookkeeping before recursion, so repeated visits terminate without
+removing any graph dependency, changing native execution or retaining a ledger.
+The caller's preserveInvalidated value propagates unchanged to every visit.
+
+Pinned base: ROCm/rocm-systems 7da43026e4f2ef7600433c38c820732f7a205d22
+             (therock-10.1, ROCm Core SDK 10.1.0)
+
+--- a/hipamd/src/hip_stream.cpp
++++ b/hipamd/src/hip_stream.cpp
+@@ -62,21 +62,26 @@
+     }
+     captureEvents_.clear();
+   }
+-  // Recursively end capture on all parallel (forked) streams.
+-  for (auto stream : parallelCaptureStreams_) {
+-    [[maybe_unused]] const auto err =
+-        reinterpret_cast<hip::Stream*>(stream)->EndCapture(preserveInvalidated);
+-    assert(err == hipSuccess);
+-  }
+-
+-  // Reset all capture state to defaults.
++  // Fork/rejoin event dependencies are acyclic in time, but stream membership
++  // may revisit an earlier stream. Detach that membership before descending:
++  // an already visited stream then has no children to follow a second time.
++  // This changes cleanup ownership only, never the captured node/event DAG.
++  auto parallel_capture_streams = std::move(parallelCaptureStreams_);
++  parallelCaptureStreams_.clear();
++
++  // Reset this stream before recursion so cyclic and diamond membership is
++  // idempotent. Preserve invalidation exactly as the original caller requests.
+   captureStatus_ = preserveInvalidated ? hipStreamCaptureStatusInvalidated
+                                        : hipStreamCaptureStatusNone;
+   pCaptureGraph_ = nullptr;
+   originStream_ = false;
+   parentStream_ = nullptr;
+   lastCapturedNodes_.clear();
+-  parallelCaptureStreams_.clear();
++  for (auto stream : parallel_capture_streams) {
++    [[maybe_unused]] const auto err =
++        reinterpret_cast<hip::Stream*>(stream)->EndCapture(preserveInvalidated);
++    assert(err == hipSuccess);
++  }
+ 
+   return hipSuccess;
+ }

@@ -7,10 +7,13 @@
  *
  * @author David Sanftenberg
  * @date February 2026
+ * The existing explicit worker startup also admits immutable physical metadata;
+ * repeated context creation or reset cannot re-enumerate that physical identity.
  */
 
 #include <hip/hip_runtime.h>
 #include "ROCmRuntimeStartup.h"
+#include "ROCmHardwareMetadata.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
@@ -31,6 +34,7 @@ namespace llaminar2
         bool initializeContext(int ordinal, void **out_stream, void **out_context)
         {
             requireROCmRuntimeStartup();
+            initializeROCmHardwareMetadata();
             // Set the device
             hipError_t err = hipSetDevice(ordinal);
             if (err != hipSuccess)

@@ -641,10 +641,11 @@ namespace llaminar2
             for (const auto &[device, role] : participants)
             {
                 (void)role;
-                PerfStatsCollector::addCounter(
-                    "server", "execution_participant", 1.0, "startup", device.toString(),
-                    serverExecutionParticipantTags(device, inventory->ranks.at(mpi_ctx->rank()),
-                                                   runner->executionPlan().numa_node));
+                for (const auto &record : serverExecutionParticipantRecords(
+                         device, inventory->ranks.at(mpi_ctx->rank()), runner->executionPlan(),
+                         runner->config(), mpi_ctx->world_size()))
+                    PerfStatsCollector::addCounter(
+                        "server", "execution_participant", 1.0, "startup", device.toString(), record);
             }
             // Only the service authority publishes request policy. Expert-only
             // followers do not own an independent MTP/prefix configuration.

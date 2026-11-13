@@ -14,11 +14,13 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include <algorithm>
+#include "../../KVCacheMetadataInitialization.h"
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <exception>
 
 namespace llaminar2
 {
@@ -153,8 +155,16 @@ namespace llaminar2
     // Graph Capture Device Params Management
     // =========================================================================
 
+    /**
+     * @brief Construct and complete canonical sequence rows before publishing raw device pointers.
+     * @throws std::logic_error If invoked inside captured execution.
+     * @throws std::runtime_error If original allocation, zero submission or cold event completion fails.
+     * @note Constructor/allocation only; ordinary reset and append keep their caller-stream ordering.
+     */
     void ROCmRingKVCacheBase::allocateDeviceParams()
     {
+        if (isGraphCaptureActive())
+            throw std::logic_error("ROCmRingKVCacheBase metadata construction is cold setup, never captured execution");
         // Recurrent-only slices still checkpoint one frontier per request;
         // payload entry tables remain empty and no attention horizon is allocated.
         const int num_entries = sequence_geometry_.rows() * batch_size_;
@@ -193,6 +203,20 @@ namespace llaminar2
             throw std::runtime_error(
                 "[ROCmRingKVCacheBase] Failed to initialize mandatory device sequence metadata");
         }
+        // These two zeroes were enqueued on the exact original setup stream,
+        // while later callers may append/reset/capture on unrelated nonblocking
+        // streams. Complete only this cold producer event before publishing raw
+        // sequence pointers. No request/token operation waits or rerecords it.
+        try
+        {
+            detail::completeColdKVMetadataInitialization(*backend, device_id_, init_stream);
+        }
+        catch (...)
+        {
+            freeDeviceParams();
+            throw;
+        }
+
         LOG_DEBUG("[ROCmRingKVCacheBase] Allocated device params for graph capture: "
                   << num_entries << " entries (" << num_entries * sizeof(int) * 2 << " bytes)");
     }
@@ -354,8 +378,19 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Reset committed metadata and auxiliary state on one exact stream.
+     * @param context Named owner boundary and original producer stream.
+     * @return Whether every metadata reset was accepted by the native backend.
+     * @throws Propagates the original cache-owned exception after logging it.
+     *
+     * The function-try-block observes the original exception before the
+     * orchestrator's unpublished-reset guard terminates during unwinding.
+     * Rethrowing preserves its type and all existing fatal semantics.
+     */
     bool ROCmRingKVCacheBase::resetRequestState(
         const StateResetContext &context)
+    try
     {
         requireGPUExecutionStream(
             context.execution_stream,
@@ -434,7 +469,37 @@ namespace llaminar2
             for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
                 onResetLayerSequenceState(layer, seq_idx);
         }
+        if(auto *aux=auxiliaryState())aux->reset({0,2147483647,0,batch_size_},context.execution_stream);
         return true;
+    }
+
+    catch (const std::exception &error)
+    {
+        std::fprintf(
+            stderr,
+            "[FATAL] ROCm KV request reset threw: "
+            "device=%d reason=%s boundary=%d stream=%p exception=%s\n",
+            device_id_,
+            context.reason ? context.reason : "<unnamed>",
+            static_cast<int>(context.boundary),
+            context.execution_stream,
+            error.what());
+        std::fflush(stderr);
+        throw;
+    }
+    catch (...)
+    {
+        std::fprintf(
+            stderr,
+            "[FATAL] ROCm KV request reset threw: "
+            "device=%d reason=%s boundary=%d stream=%p "
+            "exception=<non-standard exception>\n",
+            device_id_,
+            context.reason ? context.reason : "<unnamed>",
+            static_cast<int>(context.boundary),
+            context.execution_stream);
+        std::fflush(stderr);
+        throw;
     }
 
     bool ROCmRingKVCacheBase::resetSequenceState(
@@ -459,6 +524,7 @@ namespace llaminar2
             append_count_sources_[static_cast<size_t>(
                 layer * batch_size_ + seq_idx)] = nullptr;
         }
+        if(auto *aux=auxiliaryState())aux->reset({0,2147483647,seq_idx,1},context.execution_stream);
         return true;
     }
 
@@ -490,6 +556,7 @@ namespace llaminar2
             return false;
         }
         onResetLayerSequenceState(layer, seq_idx);
+        if(auto *aux=auxiliaryState())aux->reset({modelLayerForAttentionStorage(layer),1,seq_idx,1},context.execution_stream);
         return true;
     }
 
@@ -535,6 +602,7 @@ namespace llaminar2
                 nullptr;
             onResetLayerSequenceState(layer, seq_idx);
         }
+        if(auto *aux=auxiliaryState())aux->reset({modelLayerForAttentionStorage(layer),1,0,batch_size_},context.execution_stream);
         return true;
     }
 
@@ -639,7 +707,11 @@ namespace llaminar2
     {
         if (!d_head_params_ || !d_count_params_)
             return 0;
-        return sequence_geometry_.checkpointBytes();
+        size_t auxiliaryBytes=0;
+        if(const auto *aux=auxiliaryState())
+            for(int sequence=0;sequence<batch_size_;++sequence)
+                auxiliaryBytes=std::max(auxiliaryBytes,aux->checkpointCapacity(sequence));
+        return sequence_geometry_.checkpointBytes()+auxiliaryBytes;
     }
 
     bool ROCmRingKVCacheBase::captureDeviceSequenceStateCheckpoint(
@@ -684,6 +756,10 @@ namespace llaminar2
             *error =
                 "failed to enqueue ROCm device sequence-state checkpoint capture";
         }
+        if(enqueued)if(const auto *aux=auxiliaryState())
+            aux->captureCheckpoint(seq_idx,
+                {static_cast<std::byte *>(checkpoint_device)+sequence_geometry_.checkpointBytes(),
+                 checkpoint_bytes-sequence_geometry_.checkpointBytes(),CacheAuxiliaryMemoryDomain::Device},stream);
         return enqueued;
     }
 
@@ -738,6 +814,9 @@ namespace llaminar2
         {
             onResetLayerSequenceState(layer, seq_idx);
         }
+        if(auto *aux=auxiliaryState())aux->restoreCheckpoint(seq_idx,
+            {const_cast<std::byte *>(static_cast<const std::byte *>(checkpoint_device))+sequence_geometry_.checkpointBytes(),
+             checkpoint_bytes-sequence_geometry_.checkpointBytes(),CacheAuxiliaryMemoryDomain::Device},stream);
         return true;
     }
 

@@ -6,6 +6,8 @@
  *
  * Tests the graph merging functionality added for Phase 3 of the
  * declarative QwenStandardGraph refactoring project.
+ * Storage-lifetime cases exercise the production merge using inert metadata
+ * identities; they grant no native readiness or execution capability.
  */
 
 #include <gtest/gtest.h>
@@ -15,6 +17,36 @@
 #include <unordered_set>
 
 using namespace llaminar2;
+
+namespace {
+/** @brief Construction-only lane identity; every native operation is deliberately unavailable. */
+class MergeStorageBoundary final : public IRetainedGraphStorageBoundary
+{
+public:
+    /** @return Declared metadata device, never a materialized worker. */
+    DeviceId device() const noexcept override { return DeviceId::cuda(0); }
+    /** @return Nonzero construction identity. */
+    std::uint64_t captureIdentity() const noexcept override { return 29; }
+    /** @brief Reject native mutation in this device-free fixture. */
+    void bindGenerationControl(RetainedStorageGenerationControl) override { throw std::logic_error("No native service"); }
+    /** @brief Reject fabricated retirement for a construction-only identity. */
+    void retireGenerationControl(RetainedStorageGenerationControl) override { throw std::logic_error("No native service"); }
+    /** @return No admitted controller. */
+    RetainedStorageGenerationControl generationControl() const override { return {}; }
+    /** @brief Reject execution admission. */
+    void beginAdmission(std::uint64_t, void*) override { throw std::logic_error("No native service"); }
+    /** @return No active native work. */
+    bool hasActiveInterval() const noexcept override { return false; }
+    /** @brief Reject execution of metadata. */
+    void requireArmedForLaunch() const override { throw std::logic_error("No native service"); }
+    /** @brief Reject fabricated native completion. */
+    void recordTerminalClose(void*, const int*, const int*) const override { throw std::logic_error("No native service"); }
+    /** @brief Reject native waits. */
+    void awaitTerminal() override { throw std::logic_error("No native service"); }
+    /** @brief Reject fabricated terminal evidence. */
+    RetainedStorageTerminalObservation terminalObservation() const override { throw std::logic_error("No native service"); }
+};
+}
 
 // =============================================================================
 // Test Stage Implementation
@@ -331,6 +363,71 @@ TEST_F(Test__ComputeGraphMerge, Merge_NonEmptyIntoEmpty)
 
     // Source should be empty after move
     EXPECT_EQ(source.size(), 0);
+}
+
+/** @test Source lanes and query-only relations follow the actual merge without inventing ownership. */
+TEST_F(Test__ComputeGraphMerge, RetainedStorageBoundaryFollowsOriginalSourceAndReaderRoles)
+{
+    for (const bool empty_fragment : {true, false})
+    {
+        auto original = std::make_shared<MergeStorageBoundary>();
+        std::weak_ptr<MergeStorageBoundary> lifetime = original;
+        int transport_identity = 0;
+        const RetainedGraphParticipantDefinitionDomain domain{DeviceId::cuda(0), &transport_identity};
+        ComputeGraph source_parent;
+        {
+            ComputeGraph source_fragment;
+            source_fragment.setRetainedStorageBoundary(original);
+            source_fragment.setRetainedParticipantDefinitionDomain(domain);
+            if (!empty_fragment) source_fragment.addNode("source", createTestStage("source"));
+            source_parent.merge(std::move(source_fragment));
+            EXPECT_EQ(source_parent.retainedStorageBoundary(), original);
+            ASSERT_TRUE(source_parent.retainedParticipantDefinitionDomain());
+            EXPECT_EQ(*source_parent.retainedParticipantDefinitionDomain(), domain);
+        }
+        original.reset();
+        EXPECT_FALSE(lifetime.expired());
+
+        ComputeGraph reader_parent, reader_fragment;
+        reader_fragment.setRetainedParticipantDefinitionDomain(domain);
+        if (!empty_fragment) reader_fragment.addNode("reader", createTestStage("reader"));
+        // The former PLE glue unconditionally passed this absent lane to the
+        // setter; retain that failing predicate without weakening the setter.
+        EXPECT_THROW(reader_parent.setRetainedStorageBoundary(reader_fragment.retainedStorageBoundary()),
+            std::invalid_argument);
+        EXPECT_NO_THROW(reader_parent.merge(std::move(reader_fragment)));
+        EXPECT_FALSE(reader_parent.retainedStorageBoundary());
+        ASSERT_TRUE(reader_parent.retainedParticipantDefinitionDomain());
+        EXPECT_EQ(*reader_parent.retainedParticipantDefinitionDomain(), domain);
+
+        const auto generation = source_parent.topologyGeneration();
+        const auto count = source_parent.size();
+        ComputeGraph foreign;
+        foreign.setRetainedStorageBoundary(std::make_shared<MergeStorageBoundary>());
+        foreign.addNode("foreign", createTestStage("foreign"));
+        EXPECT_THROW(source_parent.merge(std::move(foreign)), std::invalid_argument);
+        EXPECT_EQ(source_parent.topologyGeneration(), generation);
+        EXPECT_EQ(source_parent.size(), count);
+        EXPECT_NE(foreign.getNode("foreign"), nullptr);
+        EXPECT_FALSE(source_parent.getNode("foreign"));
+        // A reader has no lane. Reject an incoming foreign domain before its
+        // source lane can partially mutate that reader's reusable topology.
+        int foreign_transport = 0;
+        foreign.setRetainedParticipantDefinitionDomain({DeviceId::cuda(0), &foreign_transport});
+        const auto reader_generation = reader_parent.topologyGeneration();
+        const auto reader_count = reader_parent.size();
+        EXPECT_THROW(reader_parent.merge(std::move(foreign)), std::invalid_argument);
+        EXPECT_EQ(reader_parent.topologyGeneration(), reader_generation);
+        EXPECT_EQ(reader_parent.size(), reader_count);
+        EXPECT_FALSE(reader_parent.retainedStorageBoundary());
+        EXPECT_EQ(*reader_parent.retainedParticipantDefinitionDomain(), domain);
+        EXPECT_NE(foreign.getNode("foreign"), nullptr);
+        source_parent.clear();
+        EXPECT_TRUE(lifetime.expired());
+        reader_parent.clear();
+        EXPECT_FALSE(reader_parent.retainedStorageBoundary());
+        EXPECT_FALSE(reader_parent.retainedParticipantDefinitionDomain());
+    }
 }
 
 TEST_F(Test__ComputeGraphMerge, Merge_TwoGraphsWithoutConnect)

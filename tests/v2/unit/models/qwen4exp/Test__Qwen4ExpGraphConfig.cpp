@@ -1,0 +1,463 @@
+/**
+ * @file Test__Qwen4ExpGraphConfig.cpp
+ * @brief Graph role widths, exact PP layer spans and predictor exclusion regressions.
+ *
+ * Synthetic immutable directories exercise model configuration without loading
+ * weights or devices. The tests prevent a widened residual from accidentally
+ * widening attention/expert GEMMs or the vocabulary head.
+ */
+#include "Qwen4ExpMetadataFixture.h"
+#include "models/qwen4exp/Qwen4ExpGraph.h"
+#include "execution/prefix_cache/PrefixCacheFingerprint.h"
+#include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
+#include "models/qwen4exp/Qwen4ExpSchema.h"
+#include "models/GraphTypes.h"
+#include "execution/config/RuntimeConfig.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
+#include "../../../fixtures/execution/RetainedHostServiceReplayAccess.h"
+#include "models/TerminalInputWeights.h"
+#include "tensors/Tensors.h"
+#include <gtest/gtest.h>
+
+namespace llaminar2::test
+{
+/** @test Actual model hook retains parent state and its base snapshot after setup reload. */
+TEST(Qwen4ExpGraphConfig, AttentionBasePrefixIdentitySurvivesSetupReload)
+{
+    using A=qwen4exp::QwenSparseAttentionArithmetic;
+    auto &setup=mutableDebugEnv().attention;
+    struct Restore { AttentionConfig &setup; AttentionConfig previous; ~Restore(){setup=previous;} } restore{setup,setup};
+    GraphConfig config;config.default_device=DeviceId::rocm(0);
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),config);
+    config.attention_phase_schedule=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+    config.attention_arithmetic = A::FixedFP32;
+    Qwen4ExpGraph ordinary(config);
+    config.attention_arithmetic = A::TileFP16WithFP32Totals;
+    Qwen4ExpGraph candidate(config);
+    PrefixFingerprintMaterial before;candidate.appendPrefixCacheFingerprintMaterial(before);
+    setup.reload();setup.qfn_sparse_attention=A::FixedFP32;
+    PrefixFingerprintMaterial after,control,parent;
+    candidate.appendPrefixCacheFingerprintMaterial(after);
+    ordinary.appendPrefixCacheFingerprintMaterial(control);
+    candidate.Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(parent);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime",before.runtime),hashPrefixFingerprintFields("runtime",after.runtime));
+    EXPECT_NE(hashPrefixFingerprintFields("runtime",after.runtime),hashPrefixFingerprintFields("runtime",control.runtime));
+    ASSERT_FALSE(parent.moe.empty());ASSERT_EQ(after.moe.size(),parent.moe.size());
+    for(std::size_t i=0;i<parent.moe.size();++i) {
+        EXPECT_EQ(after.moe[i].name,parent.moe[i].name);EXPECT_EQ(after.moe[i].value,parent.moe[i].value);
+    }
+}
+
+/** @brief An admitted graph owns its policy even if a later diagnostic changes setup. */
+TEST(Qwen4ExpGraphConfig, HCUpActivationPolicyIsFrozenForPlanningAndReplay)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision previous;
+        ~Restore() { setup.qfn_hc_up_activation = previous; }
+    } restore{setup, setup.qfn_hc_up_activation};
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    GraphConfig candidate;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), candidate);
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    GraphConfig ordinary;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), ordinary);
+    EXPECT_EQ(candidate.qfn_hc_up_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(ordinary.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    const auto copied = candidate;
+    EXPECT_EQ(copied.qfn_hc_up_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    setup.qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+    GraphConfig default_graph;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), default_graph);
+    EXPECT_EQ(default_graph.qfn_hc_up_activation, candidate.qfn_hc_up_activation);
+    EXPECT_NE(default_graph.qfn_hc_up_activation, ordinary.qfn_hc_up_activation);
+    EXPECT_EQ(GraphConfig{}.qfn_hc_up_activation, kDefaultQwen4ExpHCUpActivation);
+}
+
+TEST(Qwen4ExpTerminalWeights, NativeHeadInventoryAndFrozenBindingsReplaceOrdinaryNorm)
+{
+    Qwen4ExpSchemaFactory schema;
+    const auto names = schema.terminalInputWeightNames();
+    ASSERT_EQ(names.size(), 3u);
+    EXPECT_STREQ(names[0], "output_hc_norm.weight");
+    EXPECT_STREQ(names[1], "output_hc_down.weight");
+    EXPECT_STREQ(names[2], "output_hc_up.weight");
+    Qwen35MoESchemaFactory ordinary;
+    ASSERT_EQ(ordinary.terminalInputWeightNames().size(), 1u);
+    EXPECT_STREQ(ordinary.terminalInputWeightNames()[0], "output_norm.weight");
+
+    InferenceStrategy strategy;
+    strategy.model_id = ModelContextId{19};
+    strategy.devices = {DeviceId::cpu()};
+    ModelWeightSetBuilder builder(strategy);
+    std::array<std::unique_ptr<FP32Tensor>, 3> operands;
+    for (std::size_t index = 0; index < names.size(); ++index)
+    {
+        EXPECT_FALSE(schema.isWeightOptional(names[index]));
+        operands[index] = std::make_unique<FP32Tensor>(std::vector<std::size_t>{1, 4});
+        WeightBinding binding;
+        binding.identity = makeSourceWeightIdentity(names[index], strategy.model_id, 0);
+        binding.tensor = operands[index].get();
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        builder.addBinding(std::move(binding));
+    }
+    FrozenModelWeightSet frozen(strategy, builder.freezeBindings());
+    const auto bindings = makeModelWeightBindings(frozen);
+    ASSERT_NE(bindings.hyper_connection_head.norm, nullptr);
+    ASSERT_NE(bindings.hyper_connection_head.down, nullptr);
+    ASSERT_NE(bindings.hyper_connection_head.up, nullptr);
+    EXPECT_EQ(bindings.hyper_connection_head.norm->identity.role, WeightRole::HyperConnectionNorm);
+    EXPECT_EQ(bindings.hyper_connection_head.down->identity.role, WeightRole::HyperConnectionProjection);
+    EXPECT_EQ(bindings.hyper_connection_head.up->identity.role, WeightRole::HyperConnectionProjection);
+    const auto views = toLegacyModelWeights(bindings);
+    EXPECT_EQ(views.hyper_connection_head.norm, operands[0].get());
+    EXPECT_EQ(views.hyper_connection_head.down, operands[1].get());
+    EXPECT_EQ(views.hyper_connection_head.up, operands[2].get());
+    EXPECT_EQ(views.hyper_connection_head.inject, nullptr);
+    EXPECT_EQ(views.final_norm, nullptr);
+    GraphConfig flash;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), flash);
+    EXPECT_TRUE(hasRequiredTerminalInputWeights(flash, views));
+    for (const auto member : {&HyperConnectionWeights<TensorBase *>::norm,
+                              &HyperConnectionWeights<TensorBase *>::down,
+                              &HyperConnectionWeights<TensorBase *>::up})
+    {
+        auto incomplete = views;
+        incomplete.hyper_connection_head.*member = nullptr;
+        incomplete.final_norm = operands[0].get();
+        EXPECT_FALSE(hasRequiredTerminalInputWeights(flash, incomplete));
+    }
+    GraphConfig ordinary_config;
+    EXPECT_FALSE(hasRequiredTerminalInputWeights(ordinary_config, views));
+    auto ordinary_weights = views;
+    ordinary_weights.final_norm = operands[0].get();
+    EXPECT_TRUE(hasRequiredTerminalInputWeights(ordinary_config, ordinary_weights));
+}
+
+TEST(Qwen4ExpGraphConfig, SeparatesResidualTransportFromComputeAndOutputHead)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(), config);
+    ASSERT_NE(config.flash_next, nullptr);
+    EXPECT_EQ(config.n_layers, 48);
+    EXPECT_EQ(config.total_n_layers, 48);
+    EXPECT_EQ(config.d_model, 2560);
+    EXPECT_EQ(config.residualWidth(), 10240);
+    EXPECT_EQ(config.terminalHeadWidth(), 2560);
+    EXPECT_EQ(config.n_heads, 24);
+    EXPECT_EQ(config.n_kv_heads, 2);
+    EXPECT_EQ(config.moe.intermediate_size, 640);
+    EXPECT_EQ(config.moe.num_experts, 512);
+    EXPECT_EQ(config.moe.top_k, 10);
+    EXPECT_EQ(config.gdn.inner_size, 6144);
+    EXPECT_FLOAT_EQ(config.partial_rotary_factor, 0.25f);
+    config.d_model = 10240;
+    EXPECT_THROW(config.residualWidth(), std::invalid_argument);
+    EXPECT_THROW(config.terminalHeadWidth(), std::invalid_argument);
+}
+
+TEST(Qwen4ExpGraphConfig, PipelineRangesPreserveGlobalMixerIdentity)
+{
+    for (const int stages : {1, 2, 4, 8})
+    {
+        for (int rank = 0; rank < stages; ++rank)
+        {
+            GraphConfig config;
+            config.n_layers = 48 / stages;
+            config.pp_layer_offset = rank * config.n_layers;
+            config.default_device = DeviceId::cpu();
+            Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(), config);
+            EXPECT_EQ(config.n_layers, 48 / stages);
+            EXPECT_EQ(config.pp_layer_offset, rank * (48 / stages));
+            EXPECT_EQ(config.default_device, DeviceId::cpu());
+            EXPECT_EQ(config.moe.decode_histogram_token_boundary_layer, config.n_layers - 1);
+            ASSERT_EQ(config.layer_types.size(), 48u);
+            ASSERT_EQ(config.layer_head_dim.size(), 48u);
+            for (int layer = config.pp_layer_offset; layer < config.pp_layer_offset + config.n_layers; ++layer)
+            {
+                const bool sparse = (layer + 1) % 4 == 0;
+                EXPECT_EQ(config.layer_types[layer], sparse ? "full_attention" : "gdn");
+                EXPECT_EQ(config.layer_head_dim[layer], sparse ? 256 : 128);
+            }
+        }
+    }
+    GraphConfig invalid;
+    invalid.pp_layer_offset = 24;
+    invalid.n_layers = 25;
+    EXPECT_THROW(Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(), invalid),
+                 std::invalid_argument);
+    invalid.pp_layer_offset = -1;
+    EXPECT_THROW(Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(), invalid),
+                 std::invalid_argument);
+}
+
+TEST(Qwen4ExpGraphConfig, PredictorIsExcludedOnlyFromACompleteExportInterval)
+{
+    GraphConfig full;
+    full.n_layers = 49;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(), full);
+    EXPECT_EQ(full.n_layers, 48);
+    EXPECT_EQ(full.flash_next->predictorLayers(), 1u);
+    GraphConfig plain;
+    plain.d_model = 896;
+    EXPECT_EQ(plain.residualWidth(), 896);
+    EXPECT_EQ(plain.terminalHeadWidth(), 896);
+    GraphConfig without_predictor;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), without_predictor);
+    EXPECT_EQ(without_predictor.flash_next->predictorLayers(), 0u);
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/** @test A frozen output-projection policy is independent of later setup and HC-up selection. */
+TEST(Qwen4ExpGraphConfig, GDNOutputActivationPolicyIsFrozenAndIndependent)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision hc, gdn;
+        ~Restore() { setup.qfn_hc_up_activation = hc; setup.qfn_gdn_output_activation = gdn; }
+    } restore{setup, setup.qfn_hc_up_activation, setup.qfn_gdn_output_activation};
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    setup.qfn_gdn_output_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    GraphConfig candidate;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), candidate);
+    setup.qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    GraphConfig ordinary;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), ordinary);
+    EXPECT_EQ(candidate.qfn_gdn_output_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(candidate.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(ordinary.qfn_gdn_output_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    const auto frozen = candidate;
+    EXPECT_EQ(frozen.qfn_gdn_output_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(GraphConfig{}.qfn_gdn_output_activation, QuantizedActivationOperandPrecision::SingleQ8);
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test FA selection freezes at setup and leaves independent HC/GDN defaults unchanged. */
+TEST(Qwen4ExpGraphConfig, FAOutputActivationPolicyIsFrozenAndIndependent)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision hc, gdn;
+        ~Restore() { setup.qfn_hc_up_activation = hc; setup.qfn_fa_output_activation = gdn; }
+    } restore{setup, setup.qfn_hc_up_activation, setup.qfn_fa_output_activation};
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    setup.qfn_fa_output_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    GraphConfig candidate;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), candidate);
+    setup.qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    GraphConfig ordinary;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), ordinary);
+    EXPECT_EQ(candidate.qfn_fa_output_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(candidate.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(ordinary.qfn_fa_output_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    const auto frozen = candidate;
+    EXPECT_EQ(frozen.qfn_fa_output_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(GraphConfig{}.qfn_fa_output_activation, QuantizedActivationOperandPrecision::SingleQ8);
+}
+
+/** @test A copied graph retains QKV-only policy after setup changes; default remains SingleQ8. */
+TEST(Qwen4ExpGraphConfig, GDNQKVActivationPolicyIsFrozenAndIndependent)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision hc, gdn;
+        ~Restore() { setup.qfn_hc_up_activation = hc; setup.qfn_gdn_qkv_activation = gdn; }
+    } restore{setup, setup.qfn_hc_up_activation, setup.qfn_gdn_qkv_activation};
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    setup.qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    GraphConfig candidate;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), candidate);
+    setup.qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    GraphConfig ordinary;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), ordinary);
+    EXPECT_EQ(candidate.qfn_gdn_qkv_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(candidate.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(ordinary.qfn_gdn_qkv_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    const auto frozen = candidate;
+    EXPECT_EQ(frozen.qfn_gdn_qkv_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_EQ(GraphConfig{}.qfn_gdn_qkv_activation, QuantizedActivationOperandPrecision::SingleQ8);
+}
+
+/** @test The actual factory binding copies admission before the graph freezes its arithmetic
+ * identity. */
+TEST(Qwen4ExpGraphConfig, AttentionDefaultGraphBindsOnlyItsAdmittedParticipant)
+{
+    using namespace qwen4exp;
+    using A = QwenSparseAttentionArithmetic;
+    using S = QwenSparseAttentionPhaseSchedule;
+    const auto admitted = sealQwenSparseAttentionParticipants(
+        {{DeviceId::cpu(), {}, 0, 47},
+         {DeviceId::rocm(0), {A::TileFP16WithFP32Totals, S::Prefill8Decode33}, 0, 47}});
+    GraphConfig config;
+    config.default_device = DeviceId::rocm(0);
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), config);
+    config.max_request_count = 1;
+    config.kv_cache_precision = KVCachePrecision::FP16;
+    config.bindAdmittedQwenSparseAttentionProgram(admitted);
+    EXPECT_EQ(config.attention_arithmetic, A::TileFP16WithFP32Totals);
+    EXPECT_EQ(config.attention_phase_schedule, S::Prefill8Decode33);
+    Qwen4ExpGraph graph(config);
+    PrefixFingerprintMaterial material;
+    graph.appendPrefixCacheFingerprintMaterial(material);
+    config.default_device = DeviceId::rocm(1);
+    EXPECT_THROW(config.bindAdmittedQwenSparseAttentionProgram(admitted), std::invalid_argument);
+    EXPECT_EQ(config.attention_arithmetic, A::TileFP16WithFP32Totals);
+    EXPECT_EQ(config.attention_phase_schedule, S::Prefill8Decode33);
+    config.default_device = DeviceId::cpu();
+    config.bindAdmittedQwenSparseAttentionProgram(admitted);
+    EXPECT_EQ(config.attention_arithmetic, A::FixedFP32);
+    EXPECT_EQ(config.attention_phase_schedule, S::Uniform);
+    GraphConfig gdn_only;
+    gdn_only.default_device = DeviceId::cpu();
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), gdn_only);
+    gdn_only.n_layers = 3;
+    EXPECT_NO_THROW(gdn_only.bindAdmittedQwenSparseAttentionProgram({}));
+    EXPECT_EQ(gdn_only.attention_arithmetic, A::FixedFP32);
+    gdn_only.n_layers = 4;
+    EXPECT_THROW(gdn_only.bindAdmittedQwenSparseAttentionProgram({}), std::invalid_argument);
+}
+
+/** @test Complete retained admission selects original CPU I/O and QSA programs without replacing active request state. */
+TEST(Qwen4ExpGraphConfig, RetainedAdmittedRuntimePreservesOriginalProgramsAndFactoryGuards)
+{
+    using namespace qwen4exp;
+    using A=QwenSparseAttentionArithmetic;
+    using S=QwenSparseAttentionPhaseSchedule;
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+    {
+        const QwenSparseAttentionResolvedPolicy policy=backend==DeviceType::ROCm
+            ? QwenSparseAttentionResolvedPolicy{A::TileFP16WithFP32Totals,S::Prefill8Decode33}
+            : QwenSparseAttentionResolvedPolicy{A::FixedFP32,S::Uniform};
+        const std::vector<DeviceId> devices=backend==DeviceType::CPU
+            ? std::vector<DeviceId>{DeviceId::cpu()}
+            : std::vector<DeviceId>{{backend,0},{backend,1}};
+        std::vector<QwenSparseAttentionParticipantProgram> programs;
+        for(const auto device:devices)programs.emplace_back(device,policy,7,10);
+        RuntimeConfig prepared;
+        prepared.attention_participants=sealQwenSparseAttentionParticipants(std::move(programs));
+        prepared.resident_graph_rows=16;
+        prepared.moe_routed_prefill.overlay_segment_rows=8;
+        prepared.ngram_table_policy.storage=ImmutableRowStoragePreference::RAM;
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),64u<<20,64u<<20};
+        std::vector<PhysicalMemoryResource> consumers;
+        PhysicalMemoryPlanBuilder frozen;
+        for(const auto device:devices){
+            consumers.push_back({0,device,64u<<20,64u<<20});
+            frozen.add(consumers.back(),PhysicalMemoryOwner::PrimaryModelWeights,1u);
+        }
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,32,90),host,consumers);
+        prepared.ngram_table_placement=ImmutableRowTablePlacementPlanner::select(
+            prepared.ngram_table_policy,input,frozen.build(),{}).placement;
+        RetainedHostServiceDeclarations::Builder services(0);
+        for(const auto device:devices)
+            services.add({0,device,RetainedHostServiceRole::ImmutableLookupIO},
+                RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO));
+        prepared.retained_host_services=std::move(services).freeze();
+        const auto cpu_envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(
+            DeviceId::cpu(),16,2,64,2,std::vector<int>{8,16},8,2,false,CPUSerialExpertFamilyPolicy::LocalPowerOfTwo);
+        const auto cpu_storage=std::make_shared<const CPUSerialExpertStorageAdmission>(CPUSerialExpertStorageAdmission{
+            .allocator={0,DeviceId::cpu()},.participant_ids={3},.controller_devices={DeviceId::cpu()},.envelope=cpu_envelope});
+        EXPECT_GT(cpu_storage->physicalBytes(),0u);
+        prepared.cpu_serial_expert_storage={cpu_storage};
+        RuntimeConfig reused;
+        reused.ngram_table_policy=prepared.ngram_table_policy;
+        reused.mtp.enabled=true;reused.mtp.draft_tokens=1;reused.mtp.graph_capacity_draft_tokens=3;
+        reused.max_seq_len=777;reused.prefix_cache.enabled=true;
+        reused.activation_precision=ActivationPrecision::BF16;
+        EXPECT_FALSE(reused.attention_participants);
+        // Original second failure: declared I/O roles cannot select without
+        // their final source-selected placement, even when weights were reused.
+        EXPECT_THROW(prepared.retained_host_services->selectedForLookup(reused.ngram_table_placement.get()),std::logic_error);
+        for(const auto device:devices)
+        {
+            SCOPED_TRACE(device.toString());
+            GraphConfig graph;
+            graph.default_device=device;
+            Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),graph);
+            graph.pp_layer_offset=7;graph.n_layers=4;
+            graph.max_request_count=1;graph.kv_cache_precision=KVCachePrecision::FP16;
+            // Original failure: a retained fast path supplied no admitted projection.
+            EXPECT_THROW(graph.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            restoreRetainedAdmittedRuntime(reused,prepared,0);
+            EXPECT_EQ(reused.attention_participants.get(),prepared.attention_participants.get());
+            EXPECT_EQ(reused.ngram_table_placement,prepared.ngram_table_placement);
+            EXPECT_EQ(reused.retained_host_services,prepared.retained_host_services);
+            EXPECT_EQ(reused.retained_host_services->selectedForLookup(reused.ngram_table_placement.get()).size(),devices.size());
+            EXPECT_EQ(reused.cpu_serial_expert_storage,prepared.cpu_serial_expert_storage);
+            EXPECT_EQ(reused.resident_graph_rows,16);
+            EXPECT_EQ(reused.moe_routed_prefill.overlay_segment_rows,8);
+            EXPECT_TRUE(reused.mtp.enabled);EXPECT_EQ(reused.mtp.draft_tokens,1);EXPECT_EQ(reused.mtp.graph_capacity_draft_tokens,3);
+            EXPECT_EQ(reused.max_seq_len,777);EXPECT_TRUE(reused.prefix_cache.enabled);
+            EXPECT_EQ(reused.activation_precision,ActivationPrecision::BF16);
+            EXPECT_FALSE(reused.attention_participants.owner_before(prepared.attention_participants));
+            EXPECT_FALSE(prepared.attention_participants.owner_before(reused.attention_participants));
+            EXPECT_NO_THROW(graph.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants));
+            EXPECT_EQ(graph.attention_arithmetic,policy.arithmetic);
+            EXPECT_EQ(graph.attention_phase_schedule,policy.schedule);
+            reused.attention_participants.reset();
+            // Repeated handoff borrows the original object, rather than resolving
+            // defaults from a new request or accumulating copied participant rows.
+            restoreRetainedAdmittedRuntime(reused,prepared,0);
+            EXPECT_EQ(reused.attention_participants,prepared.attention_participants);
+            auto foreign=graph;foreign.default_device={backend,99};
+            EXPECT_THROW(foreign.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            // Keep the actual attention layer inside the changed interval;
+            // a GDN-only interval correctly performs no QSA policy lookup.
+            auto interval=graph;interval.n_layers=3;
+            EXPECT_THROW(interval.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            if(backend==DeviceType::ROCm){
+                auto precision=graph;precision.kv_cache_precision=KVCachePrecision::FP32;
+                EXPECT_THROW(precision.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+                auto capacity=graph;capacity.max_request_count=2;
+                EXPECT_THROW(capacity.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            }
+            reused.attention_participants.reset();
+        }
+        RuntimeConfig changed;
+        changed.attention_setup_request.arithmetic=backend==DeviceType::ROCm?A::FixedFP32:A::TileFP16WithFP32Totals;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(changed,prepared,0),std::invalid_argument);
+        EXPECT_FALSE(changed.attention_participants);
+        EXPECT_FALSE(changed.ngram_table_placement);EXPECT_FALSE(changed.retained_host_services);
+        EXPECT_EQ(changed.resident_graph_rows,0);EXPECT_TRUE(changed.cpu_serial_expert_storage.empty());
+        RuntimeConfig wrong_request;
+        wrong_request.ngram_table_policy.storage=ImmutableRowStoragePreference::VRAM;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(wrong_request,prepared,0),std::invalid_argument);
+        EXPECT_FALSE(wrong_request.ngram_table_placement);EXPECT_FALSE(wrong_request.attention_participants);
+        RuntimeConfig wrong_rank;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(wrong_rank,prepared,1),std::logic_error);
+        EXPECT_FALSE(wrong_rank.ngram_table_placement);EXPECT_FALSE(wrong_rank.retained_host_services);
+        auto missing_placement=prepared;missing_placement.ngram_table_placement.reset();
+        RuntimeConfig no_partial;
+        no_partial.ngram_table_policy=prepared.ngram_table_policy;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(no_partial,missing_placement,0),std::logic_error);
+        EXPECT_EQ(no_partial.resident_graph_rows,0);EXPECT_FALSE(no_partial.attention_participants);
+        EXPECT_TRUE(no_partial.cpu_serial_expert_storage.empty());EXPECT_FALSE(no_partial.retained_host_services);
+        // A corrupted/missing retained projection is never repaired by handoff.
+        auto absent=prepared;absent.attention_participants.reset();
+        restoreRetainedAdmittedRuntime(reused,absent,0);
+        EXPECT_FALSE(reused.attention_participants);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(reused.attention_participants,devices.front(),7,10),std::invalid_argument);
+        auto duplicate=prepared;
+        duplicate.attention_participants=std::make_shared<const std::vector<QwenSparseAttentionParticipantProgram>>(
+            std::vector<QwenSparseAttentionParticipantProgram>{{devices.front(),policy,7,10},{devices.front(),policy,7,10}});
+        restoreRetainedAdmittedRuntime(reused,duplicate,0);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(reused.attention_participants,devices.front(),7,10),std::invalid_argument);
+    }
+}
+
+} // namespace llaminar2::test

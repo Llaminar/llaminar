@@ -27,9 +27,15 @@
  */
 
 #pragma once
+#include "IRetainedGraphParticipants.h"
+#include "RetainedParentInputAuthority.h"
+#include "OriginalSlotCaptureTerminals.h"
+#include "backends/NativeOrderingEventGroup.h"
 
 #include "ComputeGraph.h"
+#include "../../../kernels/common/DiagnosticSnapshotCopy.h"
 #include "GraphCaptureGuard.h"
+#include "SnapshotRecordingOwnership.h"
 #include "IGraphCaptureAuxiliaryBranch.h"
 #include "IGraphExecutor.h"
 #include "../device/DeviceContext.h"
@@ -52,14 +58,18 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <type_traits>
 
 namespace llaminar2
 {
+    class PreparedFollowerCaptureTerminalPopulation;
 
     // Forward declarations
     class TensorBase;
     class FP32Tensor;
     class RetainedParentTicketServiceWorker;
+    class PreparedRetainedHostService;
+    class RetainedHostServiceProgram;
 
     /**
      * @brief Policy controlling what happens during stage execution.
@@ -96,11 +106,7 @@ namespace llaminar2
          * same copy and prevents an eager stage call from reaching for the
          * executor's unrelated transient manifest.
          */
-        enum class SnapshotRecordingAuthority : uint8_t
-        {
-            StageExecutor = 0,      ///< `runStage()` records the snapshot copy.
-            GraphCaptureController, ///< The graph controller records it after the stage.
-        };
+        using SnapshotRecordingAuthority = StageSnapshotRecordingAuthority;
 
         bool coherence = true;            ///< Arena contract-based input/output coherence
         bool weight_coherence = true;     ///< Upload weights to device
@@ -221,8 +227,10 @@ namespace llaminar2
      */
     class DeviceGraphExecutor : public IGraphExecutor
     {
+        friend struct test::RetainedGraphParticipantsReplayAccess;
         // Device-free regression access to immutable capture/publication boundaries.
         friend struct GraphSnapshotRowLayoutTestAccess;
+        friend struct GraphSnapshotSemanticExtentTestAccess;
     public:
         /**
          * @brief One immutable, graph-owned GPU snapshot output descriptor.
@@ -246,6 +254,9 @@ namespace llaminar2
             const void *source_ptr = nullptr;
             /** Frozen ownership must survive replay before logical-row projection. */
             SnapshotRowLayout row_layout;
+            SnapshotSemanticExtent semantic_extent; ///< Frozen mathematical axis and native count identities.
+            DiagnosticSnapshotCopyArgs semantic_copy; ///< Prepared pointers; no execution-state mirror.
+            size_t metadata_offset_bytes=0; ///< Relative to this slot; payload retains admitted capacity.
             /**
              * True after launch preparation froze the complete source and
              * destination descriptor. The producer has not executed at that
@@ -382,6 +393,8 @@ namespace llaminar2
             uint64_t storage_allocation_count = 0;
             /** Successful whole-arena D2H acquisitions over this allocation. */
             uint64_t bulk_download_count = 0;
+            std::optional<DiagnosticSnapshotCopy> semantic_copier; ///< Setup-selected native diagnostic launcher.
+            uint64_t observed_download_bytes=0; ///< Exact metadata and authored payload bytes acquired.
             StorageState storage_state = StorageState::Empty;
             GraphSnapshotArenaReusePolicy storage_reuse_policy;
 
@@ -421,6 +434,7 @@ namespace llaminar2
                 filtered_stages.clear();
                 storage_required_bytes = 0;
                 bound_slot_count = 0;
+                semantic_copier.reset();
                 storage_state = StorageState::CollectingDescriptors;
             }
 
@@ -508,6 +522,8 @@ namespace llaminar2
                 bound_slot_count = 0;
                 storage_allocation_count = 0;
                 bulk_download_count = 0;
+                semantic_copier.reset();
+                observed_download_bytes=0;
                 storage_state = StorageState::Empty;
             }
         };
@@ -1133,7 +1149,7 @@ namespace llaminar2
          *
          * Retained composition is stricter than immediate replay. The capture
          * owner must be pristine, every graph node must target @p ctx exactly,
-         * collectives and manual host boundaries are rejected, and no stage may
+         * runtime collectives and manual host boundaries are rejected, and no stage may
          * require per-replay launch preparation. The caller must retain the
          * graph, arena, tensors, prepared weights, capture owner, and exact
          * stream for at least as long as every parent graph importing the child.
@@ -1148,6 +1164,20 @@ namespace llaminar2
             ComputeGraph &graph,
             IDeviceContext *ctx,
             IGPUGraphCapture *capture,
+            const char *context = nullptr);
+
+        /**
+         * @brief Record immutable setup addresses on the exact original worker.
+         * @param graph Complete original participant-local setup graph.
+         * @param ctx Exact GPU context for the original source participant.
+         * @param capture Pristine original facade with its non-null recording stream.
+         * @param original Original prepared-source worker/PMA/generation capability.
+         * @param context Stable cold-recording diagnostic label.
+         * @return True after recording only; never instantiate, launch or publish completion.
+         * @throws std::logic_error If called outside the original worker thread.
+         */
+        bool captureSetupGraphFragment(ComputeGraph &graph, IDeviceContext *ctx,
+            IGPUGraphCapture *capture, const PreparedGPUContextUsePermit &original,
             const char *context = nullptr);
 
         /**
@@ -1510,6 +1540,8 @@ namespace llaminar2
                 void *stream = nullptr;
                 size_t stage_count = 0;
                 size_t captured_node_count = 0;
+                std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary; ///< Explicit I/O owner surrounding the complete parent.
+                std::shared_ptr<ReadAheadNativeResourceFamily> read_ahead_resources; ///< Original lane/events retained by native parent composition.
             };
 
             /**
@@ -1751,6 +1783,10 @@ namespace llaminar2
             /** External producer -> capture-stream handoff event. */
             void *capture_input_event = nullptr;
             void *terminal_event = nullptr;           ///< Dedicated event for one exact deferred host terminal
+            bool terminal_event_is_prepared_borrow=false; ///< Physical population outlives this runner; receipts do not.
+            std::unique_ptr<OriginalSlotCaptureTerminals> original_slot_terminals; ///< Same admitted protocol slots; no independent ring.
+            std::unique_ptr<NativeOrderingEventGroup> terminal_event_obligation; ///< Optional original same-PMA singleton creator ownership.
+            std::shared_ptr<const std::uint8_t> terminal_receipt_identity; ///< Cold immutable exact event-lifetime identity, transferred on cache move.
             uint64_t terminal_fence_published_generation = 0; ///< Latest exact terminal recorded after submission
             uint64_t terminal_fence_observed_generation = 0; ///< Latest exact terminal acquired by its host owner
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
@@ -1759,11 +1795,24 @@ namespace llaminar2
             std::vector<ReplayGpuTimingSlot> replay_gpu_timing_slots; ///< Fixed event ring allocated before capture
             std::string replay_gpu_timing_device_name; ///< Stable PerfStats device label for completed slots
             uint64_t replay_gpu_timing_busy_samples = 0; ///< Replays intentionally not sampled while every slot is in flight
+            /** @brief Strongest actual collective dependency found during capture planning; no replay graph scan. */
+            enum class RuntimeCollectiveCaptureRequirement:uint8_t {NotRequired,Required};
+            RuntimeCollectiveCaptureRequirement runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
             GraphReplayPlanPolicy graph_replay_plan_policy =
                 GraphReplayPlanPolicy::RequireFullGraph; ///< Exact materialization/replay authority represented by this cache.
             SteadyReplayHostPolicy steady_replay_host_policy =
                 SteadyReplayHostPolicy::GeneralController; ///< Explicit steady host-launch authority.
             RetainedFullGraphReplayPlan retained_full_graph_replay; ///< Optional prevalidated steady replay plan.
+            /** @brief Original source seal and remote lifetime owned by this exact composed transaction. */
+            struct ParticipantSourceBinding final {
+                RetainedGraphParticipantSourceSeal seal;
+                std::shared_ptr<IRetainedGraphParticipantInvocation> invocation;
+                std::uint64_t plan_identity;
+            };
+            std::shared_ptr<ParticipantSourceBinding> participant_source_binding;
+            std::shared_ptr<RetainedGraphParticipantPreparationStream> participant_preparation_stream; ///< Revoked before this cache releases its actual stream.
+            std::shared_ptr<RetainedGraphParticipantPreparationStream> participant_auxiliary_preparation; ///< Exact finite-body scope, revoked after native retirement and before stream teardown.
+            std::shared_ptr<const RetainedParentInputAuthority> prior_child_input_authority; ///< Original wire source outlives its composed native parent.
             std::unique_ptr<IGPUGraphCapture> retained_parent_capture; ///< Sole executable for a topology-composed transaction.
             RetainedComposedParentReplayPlan retained_composed_parent_replay; ///< Frozen identity/publication plan for @ref retained_parent_capture.
             const void *auxiliary_branch_authority = nullptr; ///< Stable owner identity embedded in every captured branch node.
@@ -1802,6 +1851,10 @@ namespace llaminar2
                   sync_event(other.sync_event),
                   capture_input_event(other.capture_input_event),
                   terminal_event(other.terminal_event),
+                  terminal_event_is_prepared_borrow(std::exchange(other.terminal_event_is_prepared_borrow,false)),
+                  original_slot_terminals(std::move(other.original_slot_terminals)),
+                  terminal_event_obligation(std::move(other.terminal_event_obligation)),
+                  terminal_receipt_identity(std::move(other.terminal_receipt_identity)),
                   terminal_fence_published_generation(
                       other.terminal_fence_published_generation),
                   terminal_fence_observed_generation(
@@ -1812,17 +1865,24 @@ namespace llaminar2
                   replay_gpu_timing_slots(std::move(other.replay_gpu_timing_slots)),
                   replay_gpu_timing_device_name(std::move(other.replay_gpu_timing_device_name)),
                   replay_gpu_timing_busy_samples(other.replay_gpu_timing_busy_samples),
+                  runtime_collective_capture_requirement(other.runtime_collective_capture_requirement),
                   graph_replay_plan_policy(other.graph_replay_plan_policy),
                   steady_replay_host_policy(other.steady_replay_host_policy),
                   retained_full_graph_replay(
                       std::move(other.retained_full_graph_replay)),
+                  participant_source_binding(std::move(other.participant_source_binding)),
+                  participant_preparation_stream(std::move(other.participant_preparation_stream)),
+                  participant_auxiliary_preparation(std::move(other.participant_auxiliary_preparation)),
+                  prior_child_input_authority(std::move(other.prior_child_input_authority)),
                   retained_parent_capture(
                       std::move(other.retained_parent_capture)),
                   retained_composed_parent_replay(
                       std::move(other.retained_composed_parent_replay)),
                   auxiliary_branch_authority(
                       other.auxiliary_branch_authority),
-                  auxiliary_branch(std::move(other.auxiliary_branch))
+                  auxiliary_branch(std::move(other.auxiliary_branch)),
+                  original_storage_attachment(std::move(other.original_storage_attachment)),
+                  recorded_source_definition(std::move(other.recorded_source_definition))
             {
                 other.capture_stream = nullptr;
                 other.capture_stream_ownership = CaptureStreamOwnership::None;
@@ -1845,6 +1905,7 @@ namespace llaminar2
                 other.replay_gpu_timing_slots.clear();
                 other.replay_gpu_timing_device_name.clear();
                 other.replay_gpu_timing_busy_samples = 0;
+                other.runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
                 other.graph_replay_plan_policy =
                     GraphReplayPlanPolicy::RequireFullGraph;
                 other.steady_replay_host_policy =
@@ -1887,6 +1948,10 @@ namespace llaminar2
                     sync_event = other.sync_event;
                     capture_input_event = other.capture_input_event;
                     terminal_event = other.terminal_event;
+                    terminal_event_is_prepared_borrow=std::exchange(other.terminal_event_is_prepared_borrow,false);
+                    original_slot_terminals = std::move(other.original_slot_terminals);
+                    terminal_event_obligation = std::move(other.terminal_event_obligation);
+                    terminal_receipt_identity = std::move(other.terminal_receipt_identity);
                     terminal_fence_published_generation =
                         other.terminal_fence_published_generation;
                     terminal_fence_observed_generation =
@@ -1897,11 +1962,18 @@ namespace llaminar2
                     replay_gpu_timing_slots = std::move(other.replay_gpu_timing_slots);
                     replay_gpu_timing_device_name = std::move(other.replay_gpu_timing_device_name);
                     replay_gpu_timing_busy_samples = other.replay_gpu_timing_busy_samples;
+                    runtime_collective_capture_requirement=other.runtime_collective_capture_requirement;
                     graph_replay_plan_policy = other.graph_replay_plan_policy;
                     steady_replay_host_policy =
                         other.steady_replay_host_policy;
                     retained_full_graph_replay =
                         std::move(other.retained_full_graph_replay);
+                    participant_source_binding = std::move(other.participant_source_binding);
+                    recorded_source_definition = std::move(other.recorded_source_definition);
+                    original_storage_attachment = std::move(other.original_storage_attachment);
+                    participant_preparation_stream = std::move(other.participant_preparation_stream);
+                    participant_auxiliary_preparation = std::move(other.participant_auxiliary_preparation);
+                    prior_child_input_authority = std::move(other.prior_child_input_authority);
                     retained_parent_capture =
                         std::move(other.retained_parent_capture);
                     retained_composed_parent_replay =
@@ -1930,6 +2002,7 @@ namespace llaminar2
                     other.replay_gpu_timing_slots.clear();
                     other.replay_gpu_timing_device_name.clear();
                     other.replay_gpu_timing_busy_samples = 0;
+                    other.runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
                     other.graph_replay_plan_policy =
                         GraphReplayPlanPolicy::RequireFullGraph;
                     other.steady_replay_host_policy =
@@ -2006,7 +2079,7 @@ namespace llaminar2
                     segments.empty() && snapshot_manifest.empty() &&
                     decode_step == 0 && capture_variant_signature == 0 &&
                     replay_gpu_timing_slots.empty() &&
-                    !retained_parent_capture &&
+                    !retained_parent_capture && !participant_auxiliary_preparation && !original_storage_attachment &&
                     !auxiliary_branch &&
                     auxiliary_branch_authority == nullptr &&
                     !retained_full_graph_replay.valid() &&
@@ -2092,12 +2165,26 @@ namespace llaminar2
             struct CaptureStreamTerminalTicket
             {
                 uint64_t generation = 0;
+                std::optional<OriginalSlotCaptureTerminalReceipt> original_slot; ///< Sealed original invocation, absent for singleton API.
+                CaptureStreamTerminalTicket() = default;
 
                 /** @return Whether this ticket names a real publication. */
                 [[nodiscard]] constexpr bool valid() const noexcept
                 {
-                    return generation != 0;
+                    return generation != 0 && generation == issued_generation_ && bool(identity_);
                 }
+            private:
+                friend struct GraphSegmentCache;
+                /** @brief Issue only at the actual exact event record boundary. */
+                CaptureStreamTerminalTicket(uint64_t serial,std::shared_ptr<const std::uint8_t> identity,
+                    IWorkerGPUContext* worker,void* event,void* stream,
+                    std::optional<OriginalSlotCaptureTerminalReceipt> original = {})
+                    :generation(serial),original_slot(std::move(original)),identity_(std::move(identity)),worker_(worker),event_(event),stream_(stream),issued_generation_(serial){}
+                std::shared_ptr<const std::uint8_t> identity_;
+                IWorkerGPUContext* worker_ = nullptr;
+                void* event_ = nullptr;
+                void* stream_ = nullptr;
+                uint64_t issued_generation_ = 0; ///< Sealed issuance; public diagnostic generation cannot relabel a receipt.
             };
 
             /**
@@ -2109,12 +2196,21 @@ namespace llaminar2
              */
             void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
+                if (original_slot_terminals)
+                {
+                    while (const auto receipt = original_slot_terminals->nextOutstanding())
+                        waitForPublishedCaptureStreamTerminal(
+                            CaptureStreamTerminalTicket{receipt->generation(),terminal_receipt_identity,gpu_ctx_ref,
+                                original_slot_terminals->eventForObservation(*receipt,gpu_ctx_ref,capture_stream),
+                                capture_stream,*receipt});
+                }
                 if (terminal_fence_published_generation >
                     terminal_fence_observed_generation)
                 {
                     waitForPublishedCaptureStreamTerminal(
                         CaptureStreamTerminalTicket{
-                            terminal_fence_published_generation});
+                            terminal_fence_published_generation,terminal_receipt_identity,
+                            gpu_ctx_ref,terminal_event,capture_stream});
                 }
                 else
                 {
@@ -2122,10 +2218,18 @@ namespace llaminar2
                 }
                 // The parent owns clones of every child graph. Destroy it first
                 // so no backend child-node lifetime can outlive its source cache.
+                if(participant_auxiliary_preparation)participant_auxiliary_preparation->retire();
+                participant_auxiliary_preparation.reset();
+                if(participant_preparation_stream)participant_preparation_stream->retire();
+                participant_preparation_stream.reset();
                 retained_parent_capture.reset();
+                prior_child_input_authority.reset();
+                participant_source_binding.reset();
                 segments.clear();
                 evidence_family = 0;
+                original_storage_attachment.reset();
                 auxiliary_branch.reset();
+                recorded_source_definition.reset();
                 auxiliary_branch_authority = nullptr;
                 initialized = false;
                 needs_capture = false;
@@ -2134,8 +2238,13 @@ namespace llaminar2
                 decode_step = 0;
                 capture_variant_signature = 0;
                 snapshot_selection_identity.clear();
-                terminal_fence_published_generation = 0;
-                terminal_fence_observed_generation = 0;
+                // Retaining this same event retains its monotonic ticket namespace.
+                // A stale receipt must not alias generation1 after a topology reset.
+                if(stream_policy == StreamResetPolicy::Destroy) {
+                    terminal_fence_published_generation = 0;
+                    terminal_fence_observed_generation = 0;
+                }
+                runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
                 graph_replay_plan_policy =
                     GraphReplayPlanPolicy::RequireFullGraph;
                 retained_full_graph_replay.clear();
@@ -2189,6 +2298,21 @@ namespace llaminar2
                 bool context_from_process_pool = false);
 
             /**
+             * @brief Bind fresh runner receipts to original prepared-model terminal handles.
+             * @param domain Actual current runner's submitted-slot authority.
+             * @param population Exclusive physical loan from the same prepared model.
+             * @param memory Same admitted source PMA and ownership control block.
+             * @throws std::exception If the cache is materialized/already bound, or any
+             *         original worker, stream, source or slot geometry differs.
+             * @note Bind on the exact worker before capture. Cache reset observes all
+             *       receipts and destroys parent/child graphs before returning this loan;
+             *       the prepared model retains the physical events across runner replacement.
+             */
+            void bindPreparedFollowerCaptureTerminals(
+                std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+                std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> population,
+                const std::shared_ptr<PhysicalMemoryAuthority>& memory);
+            /**
              * @brief Allocate the dedicated exact-terminal event during setup.
              *
              * The event is separate from both directional handoff events
@@ -2201,6 +2325,32 @@ namespace llaminar2
              */
             [[nodiscard]] bool prepareCaptureStreamTerminal(
                 IWorkerGPUContext *ctx);
+            /**
+             * @brief Bind one explicitly admitted same-source event obligation before the existing creator.
+             * @param ctx Actual original worker owning this exact cache stream.
+             * @param memory SAME prepared source PMA, with the singleton capture-terminal BOM admitted.
+             * @return The same original event preparation result; never retrofits an existing unpriced event.
+             * @note This overload shares the exact original creator/destructor. It does not add
+             *       an event or alter execution/receipt semantics. Existing callers remain unchanged.
+             */
+            [[nodiscard]] bool prepareCaptureStreamTerminal(IWorkerGPUContext *ctx,
+                const std::shared_ptr<PhysicalMemoryAuthority>& memory);
+
+            /**
+             * @brief Cold-bind exact native terminals to the original submitted-slot authority.
+             * @param domain SAME original protocol roster, retained through all native drains.
+             * @param memory SAME prepared source PMA that admitted K−1 extra event obligations.
+             * @param original_geometry Original retained-capacity declaration used by cold BOM.
+             * @note Singleton event preparation must precede this one-time binding; no native
+             *       allocation or authority replacement is permitted after graph materialization.
+             */
+            void bindOriginalCaptureTerminalSlots(
+                std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+                std::shared_ptr<PhysicalMemoryAuthority> memory,
+                const MoEOverlayInferenceOriginalSlotGeometry& original_geometry);
+            /** @brief Record one exact original-slot event after its graph launch without observing earlier invocations. */
+            [[nodiscard]] CaptureStreamTerminalTicket publishCaptureStreamTerminal(
+                const MoEOverlayInferenceOriginalSlot& original_slot);
 
             /**
              * @brief Record the exact terminal immediately after graph launch.
@@ -2215,6 +2365,20 @@ namespace llaminar2
              */
             [[nodiscard]] CaptureStreamTerminalTicket
             publishCaptureStreamTerminal();
+
+            /**
+             * @brief Enqueue a same-participant device dependency on an exact current terminal.
+             * @param ticket Original predecessor publication; foreign/stale receipts reject before native work.
+             * A current receipt remains a valid device edge after host observation;
+             * this operation neither repeats nor consumes its host retirement proof.
+             * @param exact_consumer_stream Non-null original successor capture stream.
+             * @param same_original_worker Exact predecessor/consumer worker, currently owning this thread.
+             * @throws std::exception For changed owners, invalid tickets or failed native wait enqueue.
+             * @note This only inserts the original event edge. It neither records/rebinds
+             *       the event nor queries/synchronizes, marks host observation, or retires a slot.
+             */
+            void enqueuePublishedCaptureStreamTerminalWait(CaptureStreamTerminalTicket ticket,
+                void* exact_consumer_stream,IWorkerGPUContext* same_original_worker);
 
             /**
              * @brief Observe a terminal that was already recorded at launch.
@@ -2344,6 +2508,8 @@ namespace llaminar2
              * @return Non-null context that owns the live backend resource.
              */
             IWorkerGPUContext *requireLifecycleContext(const char *operation);
+            std::unique_ptr<IRetainedGraphParticipantStorageAttachment> original_storage_attachment; ///< Native parent dies before its original finite-body borrow.
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> recorded_source_definition; ///< Exact matched source token, never a newest-token lookup.
         };
 
         /**
@@ -2355,11 +2521,35 @@ namespace llaminar2
          * synchronize, allocate replay-time storage, or mutate the source cache.
          * Returning true requires a non-empty, uninstantiated destination graph.
          */
-        using RetainedParentCompositionHook = std::function<bool(
-            IGPUGraphCapture &destination,
-            const ComputeGraph &graph,
-            std::span<const GraphSegmentCache::RetainedCaptureUnitTemplateView>
-                units)>;
+        class RetainedParentCompositionHook final
+        {
+        public:
+            using Function = std::function<bool(IGPUGraphCapture &, const ComputeGraph &,
+                std::span<const GraphSegmentCache::RetainedCaptureUnitTemplateView>)>;
+            /** @brief Empty hooks carry neither a composer nor input authority. */
+            RetainedParentCompositionHook() = default;
+            /** @brief Ordinary topology composers cannot grant prior-child input authority. */
+            template<class F> requires (!std::is_same_v<std::remove_cvref_t<F>, RetainedParentCompositionHook> &&
+                std::is_constructible_v<Function, F>)
+            RetainedParentCompositionHook(F &&function) : function_(std::forward<F>(function)) {}
+            /** @return Whether a concrete topology composer is present. */
+            explicit operator bool() const noexcept { return bool(function_) || bool(closed_function_); }
+            /** @brief Compose the exact recorded children; a closed proof validates its original owner again. */
+            bool operator()(IGPUGraphCapture &destination, const ComputeGraph &graph,
+                std::span<const GraphSegmentCache::RetainedCaptureUnitTemplateView> units) const
+            {
+                if (authority_) authority_->require(graph, authority_->device(), destination.executionStream());
+                return (closed_function_ ? *closed_function_ : function_)(destination, graph, units);
+            }
+            /** @return Closed transport proof, absent for every ordinary callback. */
+            const std::shared_ptr<const RetainedParentInputAuthority>& inputAuthority() const noexcept { return authority_; }
+        private:
+            friend class PipelineForwardGraphEdges;
+            friend struct test::PipelinePublicationCaptureReplayAccess; ///< Recorded interface replay, no production authority constructor.
+            std::shared_ptr<const RetainedParentInputAuthority> authority_; ///< Outlives the callable's native source borrow.
+            Function function_;
+            std::shared_ptr<const Function> closed_function_; ///< Original cold pipeline callback; replay copies only its immutable owner.
+        };
 
         /**
          * @brief Execute a cached GPU graph replay plan.
@@ -2398,6 +2588,34 @@ namespace llaminar2
          *        becomes part of immutable graph-cache identity.
          * @return true on success
          */
+        /**
+         * @brief Attach only the exact matched source definition to its actual sealed parent.
+         * @param graph Actual receiver graph with its original declared source domain.
+         * @param cache Original final-address graph cache and exact capture stream.
+         * @param receiver Actual per-device execution identity, not source/coordinator inference.
+         * @param parent Original sealed native parent, still uninstantiated.
+         * @return True after finite storage and/or original progress attachment completes.
+         * @throws std::exception Before foreign/stale source, parent, stream or duplicate ownership.
+         */
+        bool attachRetainedParticipantStorageParent(ComputeGraph& graph,GraphSegmentCache& cache,DeviceId receiver,IGPUGraphCapture& parent);
+        /**
+         * @brief Authenticate the existing cache stream on its original worker.
+         * @details Early forward setup derives the immutable graph identity before
+         * cache variant selection. Ready caches validate their sealed borrow without
+         * rescanning the graph. Control-thread callers dispatch to the original
+         * worker; calls already on that worker run inline.
+         * @param graph Actual source graph carrying its original participant plan.
+         * @param cache Original cache retaining its exact preparation stream.
+         * @param worker Original source worker, never a same-device substitute.
+         * @throws std::invalid_argument For missing/foreign workers or default streams.
+         * @throws std::logic_error For changed provenance or failed worker dispatch.
+         */
+        void bindRetainedParticipantPreparationStream(ComputeGraph&,GraphSegmentCache&,IWorkerGPUContext*);
+        /** @brief Authenticate the exact native parent capture on its original worker during cold sealing.
+         * @throws std::invalid_argument For foreign workers or incomplete/changed native capture streams.
+         * @throws std::logic_error If worker dispatch fails to enter its original owner.
+         */
+        void authenticateRetainedParticipantRecordingOwner(ComputeGraph&,GraphSegmentCache&,IWorkerGPUContext*);
         bool executeWithCachedGraphReplay(ComputeGraph &graph, IDeviceContext *ctx,
                                               GraphSegmentCache &segment_cache,
                                               void *gpu_stream,
@@ -2490,23 +2708,32 @@ namespace llaminar2
         {
             ImmediateReplay,     ///< Instantiate and launch immediately afterward.
             RetainedComposition, ///< Import later into one parent transaction.
+            SetupOnly,           ///< Record addresses without request coherence/completion.
         };
 
         /**
          * @brief Record the shared native graph body without publishing it.
          *
          * This is the sole direct-capture implementation used by immediate
-         * replay and retained child composition. Keeping the capture interval in
-         * one method prevents the two lifecycles from drifting on arena
-         * prebinding, launch metadata, dependency-ledger ordering, or failure
-         * cleanup.
+         * replay, retained child composition and setup-only recording. Keeping
+         * the interval in one method prevents their storage, dependency and
+         * failure lifecycles from drifting. Setup never publishes request writes
+         * or completed nodes and retains its exact worker software capture flag.
+         * @param graph Original complete participant-local executable definition.
+         * @param ctx Exact selected GPU context.
+         * @param capture Original native recording facade and non-null stream.
+         * @param purpose Typed execution/publication lifecycle.
+         * @param context Stable cold-recording diagnostic label.
+         * @param setup_worker Exact original worker, required only for SetupOnly.
+         * @return True after a nonempty native definition was recorded.
          */
         bool recordGraphCaptureBody(
             ComputeGraph &graph,
             IDeviceContext *ctx,
             IGPUGraphCapture *capture,
             GraphCaptureRecordPurpose purpose,
-            const char *context);
+            const char *context,
+            IWorkerGPUContext *setup_worker = nullptr);
 
         /**
          * @brief Submit one retained parent while an independent CPU service runs.
@@ -2550,8 +2777,7 @@ namespace llaminar2
         bool weights_session_cohered_ = false;         ///< True after first forward completes weight coherence for all nodes
         uint64_t snapshot_configuration_epoch_ = 1;   ///< Current semantic snapshot graph-topology identity.
         /** Setup-created worker that lets CPU tickets progress during GPU submission. */
-        std::unique_ptr<RetainedParentTicketServiceWorker>
-            retained_parent_ticket_service_worker_;
+        RetainedHostServiceBorrow retained_parent_ticket_service_worker_;
 
         /**
          * @brief Allocate one stage's arena bindings without changing authority.
@@ -2923,6 +3149,18 @@ namespace llaminar2
          *        for an isolated test executor.
          * @throws std::logic_error after any snapshot allocation exists.
          */
+        /** @brief Install one pre-quota declared/admitted executor-ticket role before capture.
+         * @param worker Exact original CPU0 owner, never an inference-time creator.
+         * @throws std::logic_error For a missing/wrong role, active/replaced owner or nonidle worker.
+         */
+        void setRetainedParentTicketServiceWorker(std::unique_ptr<PreparedRetainedHostService> worker,const std::shared_ptr<PhysicalMemoryAuthority>& originalMemory);
+        /** @brief Bind one exclusive idle borrow of the model-retained original worker. */
+        void setRetainedParentTicketServiceWorker(RetainedHostServiceBorrow worker,const std::shared_ptr<PhysicalMemoryAuthority>& originalMemory);
+        /** @return Whether the one declared CPU executor role has already been materialized. */
+        bool hasRetainedParentTicketServiceWorker()const noexcept;
+        /** @brief Authenticate unchanged declared program/source on repeated setup; never creates/replaces a worker. */
+        void requireRetainedParentTicketServiceProgram(const RetainedHostServiceProgram&,const std::shared_ptr<PhysicalMemoryAuthority>&)const;
+
         void setGraphSnapshotMemoryReservation(
             std::shared_ptr<PhysicalMemoryOwnerReservation> reservation);
 

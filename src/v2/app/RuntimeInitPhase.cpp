@@ -307,14 +307,22 @@ namespace llaminar2
     RuntimeInitResult RuntimeInitPhase::execute(OrchestrationConfig &config,
                                                 int &argc, char **&argv)
     {
-        const auto mpi_env = MPIBootstrap::detectMPIEnvironment();
-        if (mpi_env.is_mpi_process &&
-            debugEnv().mpi_bootstrap.ompi_mca_btl_vader_single_copy_mechanism.empty())
-            setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
+        return executeWithLifetime(config,argc,argv,MPIProcessSession::initialize(argc,argv));
+    }
 
-        // Declared before every dependent owner. Early returns and exceptions
-        // release those owners before this scope finalizes the process.
-        auto session = MPIProcessSession::initialize(argc, argv);
+    RuntimeInitResult RuntimeInitPhase::executeInSession(OrchestrationConfig& config,int& argc,char**& argv,
+        const MPIProcessSession& original)
+    {
+        if (!original.ownsMPI()) throw std::invalid_argument("Runtime initialization requires its original owned MPI process session");
+        return executeWithLifetime(config,argc,argv,MPIProcessSession{});
+    }
+
+    RuntimeInitResult RuntimeInitPhase::executeWithLifetime(OrchestrationConfig& config,int& argc,char**& argv,
+        MPIProcessSession session)
+    {
+        // The parameter owns finalization for ordinary entry. Borrowed entry
+        // leaves it empty while its caller retains the sole canonical owner.
+        // Every local context and runner below retires before that owner.
         try
         {
             auto mpi_ctx = MPIContextFactory::global();

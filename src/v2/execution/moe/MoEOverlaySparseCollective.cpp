@@ -10,19 +10,24 @@
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 
+#include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
 #include "transfer/TransferEngine.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <omp.h>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -136,6 +141,7 @@ namespace llaminar2
         d_model_ = 0;
         workspace_generation_ = 0;
         ticket_ = {};
+        construction_intent_.reset();
     }
 
     void MoEOverlayDispatchTicketStorage::bindFixedCapacity(
@@ -148,6 +154,27 @@ namespace llaminar2
         std::shared_ptr<MappedHostTransferArena> mapped_arena,
         const DeviceMoEOverlayEpochTicket *captured_request_epoch)
     {
+        bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            layer_idx, bucket_rows, top_k, d_model, source_device,
+            workspace_generation, std::move(mapped_arena), captured_request_epoch);
+    }
+
+    void MoEOverlayDispatchTicketStorage::bindForGraphConstruction(
+        ForwardGraphSubmissionIntent intent, int layer_idx,
+        int bucket_rows,
+        int top_k,
+        int d_model,
+        DeviceId source_device,
+        uint64_t workspace_generation,
+        std::shared_ptr<MappedHostTransferArena> mapped_arena,
+        const DeviceMoEOverlayEpochTicket *captured_request_epoch)
+    {
+        if (intent != ForwardGraphSubmissionIntent::Execute &&
+            intent != ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch &&
+            intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            throw std::invalid_argument("MoE dispatch ticket has an unknown forward construction intent");
+        if (construction_intent_)
+            throw std::logic_error("MoE dispatch ticket construction purpose is immutable");
         if (layer_idx < 0 || bucket_rows <= 0 || top_k <= 0 ||
             d_model <= 0 || !source_device.is_valid() ||
             workspace_generation == 0)
@@ -202,6 +229,19 @@ namespace llaminar2
             checkedTicketProduct(hidden_count, sizeof(float), "return rows"),
             "return rows");
         allocation_bytes_ = offset;
+        construction_intent_ = intent;
+        source_device_ = source_device;
+        layer_idx_ = layer_idx;
+        bucket_rows_ = bucket_rows;
+        top_k_ = top_k;
+        d_model_ = d_model;
+        workspace_generation_ = workspace_generation;
+        captured_request_epoch_ = captured_request_epoch;
+        // Workspace graphs declare the same immutable capacity but never own
+        // an executable payload. Retained graph materialization creates a fresh
+        // physical ticket, so no published pointer is rebound or recycled.
+        if (intent == ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            return;
 
         if (source_device.is_gpu())
         {
@@ -238,9 +278,17 @@ namespace llaminar2
                 sizeof(std::max_align_t);
             cpu_storage_.resize(words);
             allocation_ = cpu_storage_.data();
+            // Value initialization of max_align_t does not promise every byte
+            // of its object representation is zero. Preserve CPU's explicit
+            // complete-payload initialization before publishing its header.
+            std::memset(allocation_, 0, allocation_bytes_);
         }
 
-        std::memset(allocation_, 0, allocation_bytes_);
+        // GPU arena slices are fresh, disjoint and already byte-zeroed by the
+        // original backing allocation/first-touch. Retouching the payload here
+        // repeats that complete pass for every layer/bucket without adding an
+        // initialization or NUMA guarantee. Header and atomic publication-word
+        // initialization remain explicit; no live/reset payload is cleared.
         auto *const base = static_cast<std::byte *>(allocation_);
         ticket_.header =
             reinterpret_cast<MoEOverlayDispatchTicketHeader *>(base);
@@ -275,6 +323,35 @@ namespace llaminar2
         d_model_ = d_model;
         workspace_generation_ = workspace_generation;
         captured_request_epoch_ = captured_request_epoch;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::isWorkspaceDeclaration() const noexcept
+    {
+        return construction_intent_ == ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::hasValidConstructionIdentity() const noexcept
+    {
+        return isWorkspaceDeclaration()
+            ? !allocation_ && !payload_region_ && !publication_region_ &&
+                !ticket_.header && allocation_bytes_ > 0u && layer_idx_ >= 0 &&
+                bucket_rows_ > 0 && top_k_ > 0 && d_model_ > 0 &&
+                workspace_generation_ > 0u && source_device_.is_valid()
+            : hasValidBoundIdentity();
+    }
+
+    MoEOverlayDispatchTicket &MoEOverlayDispatchTicketStorage::ticket()
+    {
+        if (isWorkspaceDeclaration())
+            throw std::logic_error("Workspace-only MoE dispatch ticket has no executable payload");
+        return ticket_;
+    }
+
+    const MoEOverlayDispatchTicket &MoEOverlayDispatchTicketStorage::ticket() const
+    {
+        if (isWorkspaceDeclaration())
+            throw std::logic_error("Workspace-only MoE dispatch ticket has no executable payload");
+        return ticket_;
     }
 
     bool MoEOverlayDispatchTicketStorage::hasValidBoundIdentity() const noexcept
@@ -316,6 +393,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot publish a dispatch payload";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!stream || !hasCapturedPublicationContract() ||
@@ -419,6 +501,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot arm a dispatch publication";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!hasCapturedPublicationContract())
@@ -447,6 +534,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot publish a dispatch completion";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!stream || !hasCapturedPublicationContract())
@@ -492,6 +584,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot await a dispatch completion";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!hasCapturedPublicationContract())
@@ -549,6 +646,29 @@ namespace llaminar2
         }
     }
 
+    MoEOverlayCanonicalRouteReturnTicketStorage::MetadataLayout
+    MoEOverlayCanonicalRouteReturnTicketStorage::metadataLayout(size_t route_capacity)
+    {
+        if (!route_capacity) throw std::invalid_argument("Canonical ticket requires positive route capacity");
+        size_t offset = sizeof(MoEOverlayCanonicalRouteTicketControl);
+        offset = alignTicketOffset(offset, alignof(int32_t));
+        const auto original = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(
+                route_capacity, sizeof(int32_t), "original route slots"),
+            "original route slots");
+        offset = alignTicketOffset(offset, alignof(int32_t));
+        const auto compact = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(
+                route_capacity, sizeof(int32_t), "compact route slots"),
+            "compact route slots");
+
+        return {offset, original, compact};
+    }
+
     void MoEOverlayCanonicalRouteReturnTicketStorage::bindFixedCapacity(
         int layer_idx,
         size_t route_capacity,
@@ -558,6 +678,26 @@ namespace llaminar2
         std::shared_ptr<MappedHostTransferRegion> contribution_region,
         std::shared_ptr<MappedHostTransferArena> metadata_arena)
     {
+        bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            layer_idx, route_capacity, d_model, continuation_device,
+            workspace_generation, std::move(contribution_region), std::move(metadata_arena));
+    }
+
+    void MoEOverlayCanonicalRouteReturnTicketStorage::bindForGraphConstruction(
+        ForwardGraphSubmissionIntent intent, int layer_idx,
+        size_t route_capacity,
+        int d_model,
+        DeviceId continuation_device,
+        uint64_t workspace_generation,
+        std::shared_ptr<MappedHostTransferRegion> contribution_region,
+        std::shared_ptr<MappedHostTransferArena> metadata_arena)
+    {
+        if (intent != ForwardGraphSubmissionIntent::Execute &&
+            intent != ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch &&
+            intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            throw std::invalid_argument("Canonical MoE ticket has an unknown forward construction intent");
+        if (construction_intent_)
+            throw std::logic_error("Canonical MoE ticket construction purpose is immutable");
         if (metadata_region_ || contribution_region_)
         {
             throw std::logic_error(
@@ -569,8 +709,9 @@ namespace llaminar2
                 static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
             !contribution_region || !contribution_region->isBound() ||
             !contribution_region->hasDevice(continuation_device) ||
-            !metadata_arena || metadata_arena->devices().size() != 1u ||
-            metadata_arena->devices().front() != continuation_device)
+            (intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
+             (!metadata_arena || metadata_arena->devices().size() != 1u ||
+              metadata_arena->devices().front() != continuation_device)))
         {
             throw std::invalid_argument(
                 "canonical route return ticket requires complete layer, route, mapped contribution, exact GPU, and model-owned metadata arena identity");
@@ -590,21 +731,20 @@ namespace llaminar2
                 "canonical route return contribution region is smaller than immutable ticket geometry");
         }
 
-        size_t offset = sizeof(MoEOverlayCanonicalRouteTicketControl);
-        offset = alignTicketOffset(offset, alignof(int32_t));
-        original_route_slots_offset_ = offset;
-        offset = checkedTicketAdd(
-            offset,
-            checkedTicketProduct(
-                route_capacity, sizeof(int32_t), "original route slots"),
-            "original route slots");
-        offset = alignTicketOffset(offset, alignof(int32_t));
-        compact_route_slots_offset_ = offset;
-        offset = checkedTicketAdd(
-            offset,
-            checkedTicketProduct(
-                route_capacity, sizeof(int32_t), "compact route slots"),
-            "compact route slots");
+        const auto metadata = metadataLayout(route_capacity);
+        const auto offset = metadata.bytes;
+        original_route_slots_offset_ = metadata.original_route_slots_offset;
+        compact_route_slots_offset_ = metadata.compact_route_slots_offset;
+
+        construction_intent_ = intent;
+        contribution_region_ = contribution_region;
+        continuation_device_ = continuation_device;
+        layer_idx_ = layer_idx;
+        route_capacity_ = route_capacity;
+        d_model_ = d_model;
+        workspace_generation_ = workspace_generation;
+        if (intent == ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            return;
 
         constexpr size_t kControlCacheLineBytes = 64u;
         metadata_region_ = metadata_arena->allocate(
@@ -662,6 +802,20 @@ namespace llaminar2
         owner_ = std::exchange(other.owner_, nullptr);
         sequence_ = std::exchange(other.sequence_, 0u);
         return *this;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::Publication::authorizes(
+        const MoEOverlayCanonicalRouteReturnTicketStorage& storage,
+        uint64_t residency_epoch) const noexcept
+    {
+        if(owner_ != &storage || sequence_ == 0u || residency_epoch == 0u ||
+            !storage.hasValidBoundIdentity() ||
+            storage.producer_lifecycle_ != ProducerLifecycle::Armed ||
+            storage.armed_sequence_ != sequence_ ||
+            storage.control_host_->residency_epoch != residency_epoch)return false;
+        const auto published=std::atomic_ref<uint64_t>(storage.control_host_->published_sequence).load(std::memory_order_acquire);
+        const auto consumed=std::atomic_ref<uint64_t>(storage.control_host_->consumed_sequence).load(std::memory_order_acquire);
+        return published==consumed && published!=std::numeric_limits<uint64_t>::max() && sequence_==published+1u;
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::Publication::publish(
@@ -824,6 +978,269 @@ namespace llaminar2
                control_host_->live_entry_count <= route_capacity_;
     }
 
+    MoEOverlayCanonicalRouteSourceLayout MoEOverlayCanonicalRouteSourceLayout::originalSlots() noexcept
+    {
+        return {MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot, 0};
+    }
+
+    MoEOverlayCanonicalRouteSourceLayout MoEOverlayCanonicalRouteSourceLayout::compactSlots() noexcept
+    {
+        return {MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot, 0};
+    }
+
+    MoEOverlayCanonicalRouteSourceLayout MoEOverlayCanonicalRouteSourceLayout::compactExecutionRows(size_t route_width)
+    {
+        if (!route_width)
+            throw std::invalid_argument("CPU canonical route execution requires a positive source stride");
+        return {MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot, route_width};
+    }
+
+    bool MoEOverlayCanonicalRouteSourceLayout::compatibleWith(int packet_top_k) const noexcept
+    {
+        return packet_top_k > 0 && execution_width_ <= static_cast<size_t>(packet_top_k);
+    }
+
+    std::optional<size_t> MoEOverlayCanonicalRouteSourceLayout::rowIndex(
+        int32_t original_slot, int32_t compact_slot, int packet_top_k) const noexcept
+    {
+        if (!compatibleWith(packet_top_k) || original_slot < 0 || compact_slot < 0)
+            return std::nullopt;
+        if (index_ == MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot)
+            return static_cast<size_t>(original_slot);
+        const size_t compact = static_cast<size_t>(compact_slot);
+        if (!execution_width_)
+            return compact;
+        const size_t row = compact / static_cast<size_t>(packet_top_k);
+        const size_t route = compact % static_cast<size_t>(packet_top_k);
+        if (route >= execution_width_ ||
+            row > (std::numeric_limits<size_t>::max() - route) / execution_width_)
+            return std::nullopt;
+        return row * execution_width_ + route;
+    }
+
+    bool preweightMoEOverlayCanonicalRouteRows(const MoEOverlaySparseRows& input,
+        std::span<const float> source,MoEOverlayCanonicalRouteSourceLayout source_layout,
+        std::span<float> destination,MoEOverlayCanonicalRouteSourceIndex destination_index) noexcept
+    {
+        const auto valid_index=[](auto index) {return index==MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot ||
+            index==MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot;};
+        if(!source_layout.compatibleWith(input.top_k) || !valid_index(destination_index) || input.d_model<=0 ||
+           input.top_k<=0 || input.live_row_count>input.row_capacity ||
+           input.live_entry_count>input.entry_capacity || (input.live_entry_count && !input.live_row_count))return false;
+        const size_t width=static_cast<size_t>(input.d_model),count=input.live_entry_count;
+        if(count==0)return true; // Empty work publishes protocol metadata, never touches inactive row storage.
+        const auto maximum=std::numeric_limits<size_t>::max();
+        if(source.size()%width || destination.size()%width || source.size()>maximum/sizeof(float) ||
+           destination.size()>maximum/sizeof(float) || count>maximum/sizeof(int32_t) ||
+           (source.size() && !source.data()) || (destination.size() && !destination.data()) ||
+           (count && (!input.original_route_slots_host || !input.compact_route_slots_host || !input.route_weights_host)))return false;
+        const auto overlaps=[](const void* a,size_t an,const void* b,size_t bn) {
+            if(!an || !bn)return false;
+            const auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
+            if(!a || !b || an>std::numeric_limits<uintptr_t>::max()-x || bn>std::numeric_limits<uintptr_t>::max()-y)return true;
+            return x<y+bn && y<x+an;
+        };
+        if(overlaps(source.data(),source.size_bytes(),destination.data(),destination.size_bytes()) ||
+           overlaps(input.original_route_slots_host,count*sizeof(int32_t),destination.data(),destination.size_bytes()) ||
+           overlaps(input.compact_route_slots_host,count*sizeof(int32_t),destination.data(),destination.size_bytes()) ||
+           overlaps(input.route_weights_host,count*sizeof(float),destination.data(),destination.size_bytes()))return false;
+        const auto source_capacity=source.size()/width,destination_capacity=destination.size()/width;
+        int32_t previous_original=-1,previous_compact=-1;
+        for(size_t entry=0;entry<count;++entry) {
+            const auto original=input.original_route_slots_host[entry],compact=input.compact_route_slots_host[entry];
+            if(original<=previous_original || compact<=previous_compact || !std::isfinite(input.route_weights_host[entry]))return false;
+            const auto source_slot=source_layout.rowIndex(original,compact,input.top_k);
+            const auto destination_slot=static_cast<size_t>(destination_index==MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot?original:compact);
+            if(!source_slot || *source_slot>=source_capacity || destination_slot>=destination_capacity)return false;
+            previous_original=original;previous_compact=compact;
+        }
+        // Metadata validation is complete. Rows are disjoint, so the original
+        // per-element multiply has one writer and the same arithmetic order on
+        // either side of the local/remote publication boundary.
+        const auto write_entry=[&](size_t entry) {
+            const auto source_slot=*source_layout.rowIndex(input.original_route_slots_host[entry],
+                input.compact_route_slots_host[entry],input.top_k);
+            const auto destination_slot=static_cast<size_t>(destination_index==MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot
+                ?input.original_route_slots_host[entry]:input.compact_route_slots_host[entry]);
+            const float weight=input.route_weights_host[entry];
+            for(size_t column=0;column<width;++column)
+                destination[destination_slot*width+column]=source[source_slot*width+column]*weight;
+        };
+        constexpr size_t parallel_entries=8;
+        if(!omp_in_parallel() && count>=parallel_entries) {
+#pragma omp parallel for schedule(static)
+            for(int64_t entry=0;entry<static_cast<int64_t>(count);++entry)write_entry(static_cast<size_t>(entry));
+        } else for(size_t entry=0;entry<count;++entry)write_entry(entry);
+        // Preserve the original publication diagnostic policy: normal serving
+        // does not add a second serial pass over the complete routed payload.
+        if(debugEnv().validation.fail_on_nan) for(size_t entry=0;entry<count;++entry) {
+            const auto slot=static_cast<size_t>(destination_index==MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot
+                ?input.original_route_slots_host[entry]:input.compact_route_slots_host[entry]);
+            for(size_t column=0;column<width;++column)if(!std::isfinite(destination[slot*width+column]))return false;
+        }
+        return true;
+    }
+
+    bool copyMoEOverlayCanonicalRouteRowsToHostReturn(const MoEOverlaySparseRows& input,
+        std::span<const float> source,MoEOverlayReturnRows& output) noexcept
+    {
+        const auto maximum=std::numeric_limits<size_t>::max();
+        if(input.d_model<=0 || input.top_k<=0 || input.live_row_count>input.row_capacity ||
+            input.live_entry_count>input.entry_capacity || (input.live_entry_count && !input.live_row_count) ||
+            output.layout!=MoEOverlayReturnLayout::CanonicalExpertRoutes || output.d_model!=input.d_model ||
+            input.live_entry_count>output.row_capacity) return false;
+        const auto width=static_cast<size_t>(input.d_model),count=input.live_entry_count;
+        if(source.size()%width || source.size()>maximum/sizeof(float) ||
+            output.row_capacity>maximum/width/sizeof(float) || output.row_capacity>maximum/sizeof(int32_t) ||
+            input.entry_capacity>maximum/sizeof(int32_t) || input.entry_capacity>maximum/sizeof(float)) return false;
+        const auto overlaps=[](const void* a,size_t an,const void* b,size_t bn) {
+            if(!an || !bn) return false;
+            const auto left=reinterpret_cast<uintptr_t>(a),right=reinterpret_cast<uintptr_t>(b);
+            if(!a || !b || an>std::numeric_limits<uintptr_t>::max()-left || bn>std::numeric_limits<uintptr_t>::max()-right)
+                return true;
+            return left<right+bn && right<left+an;
+        };
+        const auto payload_bytes=output.row_capacity*width*sizeof(float),id_bytes=output.row_capacity*sizeof(int32_t);
+        if(count && (!input.original_route_slots_host || !input.compact_route_slots_host || !input.route_weights_host ||
+            !output.output_rows_fp32 || !output.row_ids_host || !source.data())) return false;
+        if(overlaps(source.data(),source.size_bytes(),output.output_rows_fp32,payload_bytes) ||
+            overlaps(source.data(),source.size_bytes(),output.row_ids_host,id_bytes) ||
+            overlaps(output.row_ids_host,id_bytes,output.output_rows_fp32,payload_bytes)) return false;
+        for(const auto* original:{static_cast<const void*>(input.original_route_slots_host),
+                static_cast<const void*>(input.compact_route_slots_host),static_cast<const void*>(input.route_weights_host)})
+            if(overlaps(original,input.entry_capacity*sizeof(int32_t),output.output_rows_fp32,payload_bytes) ||
+                overlaps(original,input.entry_capacity*sizeof(int32_t),output.row_ids_host,id_bytes)) return false;
+        int32_t previous_original=-1,previous_compact=-1;
+        for(size_t entry=0;entry<count;++entry) {
+            const auto slot=input.original_route_slots_host[entry],compact=input.compact_route_slots_host[entry];
+            if(slot<=previous_original || compact<=previous_compact || static_cast<size_t>(slot)>=source.size()/width ||
+                !std::isfinite(input.route_weights_host[entry])) return false;
+            previous_original=slot;previous_compact=compact;
+        }
+        // Validation precedes all stores. Copy raw FP32 bytes without weighting
+        // or reduction, so the original continuation's ordered FMA remains the
+        // sole top-k arithmetic authority. Inactive packet tails are untouched.
+        for(size_t entry=0;entry<count;++entry) {
+            const auto slot=input.original_route_slots_host[entry];
+            output.row_ids_host[entry]=slot;
+            std::copy_n(source.data()+static_cast<size_t>(slot)*width,width,output.output_rows_fp32+entry*width);
+        }
+        output.key=input.key;
+        output.residency_epoch=input.residency_epoch;
+        output.source_participant=input.target_participant;output.target_participant=input.source_participant;
+        output.live_row_count=count;
+        return true;
+    }
+
+    bool publishMoEOverlayCanonicalRouteRows(MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& input,std::span<const float> source,
+        MoEOverlayCanonicalRouteSourceLayout source_layout) noexcept
+    {
+        if(!publication || !publication.belongsTo(ticket) || !ticket.hasValidBoundIdentity() ||
+           input.residency_epoch==0 || input.key.layer_idx!=ticket.layerIndex() || input.d_model!=ticket.dModel() ||
+           input.live_entry_count>ticket.routeCapacity() || !ticket.originalRouteSlotsHost() ||
+           !ticket.compactRouteSlotsHost() || !ticket.contributionRowsHost())return false;
+        const size_t width=static_cast<size_t>(ticket.dModel());
+        if(ticket.routeCapacity()>std::numeric_limits<size_t>::max()/width)return false;
+        // Original slots are consumer coordinates even when source values are
+        // compact. They must fit the exact captured ticket before any write.
+        for(size_t entry=0;entry<input.live_entry_count;++entry)
+            if(!input.original_route_slots_host || input.original_route_slots_host[entry]<0 ||
+               static_cast<size_t>(input.original_route_slots_host[entry])>=ticket.routeCapacity())return false;
+        if(!preweightMoEOverlayCanonicalRouteRows(input,source,source_layout,
+            {ticket.contributionRowsHost(),ticket.routeCapacity()*width},
+            MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot))return false;
+        for(size_t entry=0;entry<input.live_entry_count;++entry) {
+            ticket.originalRouteSlotsHost()[entry]=input.original_route_slots_host[entry];
+            ticket.compactRouteSlotsHost()[entry]=input.compact_route_slots_host[entry];
+        }
+        return publication.publish(input.live_entry_count);
+    }
+
+    bool combineAndPublishMoEOverlayCanonicalShardRouteRows(
+        MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& input,
+        const cpu::moe::CanonicalShardRouteRecordArgs& original) noexcept
+    {
+        if (!publication.authorizes(ticket,input.residency_epoch) ||
+            input.key.layer_idx!=ticket.layerIndex() || input.d_model!=ticket.dModel() ||
+            input.top_k<=0 || input.live_row_count>input.row_capacity ||
+            input.live_entry_count>input.entry_capacity ||
+            input.live_entry_count>ticket.routeCapacity() ||
+            (input.live_entry_count && !input.live_row_count) ||
+            original.columns!=input.d_model || original.top_k!=input.top_k ||
+            !original.sparse_routes || original.preweighted_output ||
+            !ticket.originalRouteSlotsHost() || !ticket.compactRouteSlotsHost() ||
+            !ticket.contributionRowsHost()) return false;
+        const auto &sparse=*original.sparse_routes;
+        const size_t count=input.live_entry_count,width=static_cast<size_t>(input.d_model);
+        const auto maximum=std::numeric_limits<size_t>::max();
+        if(ticket.routeCapacity()>maximum/width || ticket.routeCapacity()*width>maximum/sizeof(float) ||
+           count>maximum/sizeof(int32_t) ||
+           sparse.original_slots.size()!=count || sparse.expert_ids.size()!=count || sparse.weights.size()!=count ||
+           sparse.original_slots.data()!=input.original_route_slots_host ||
+           sparse.expert_ids.data()!=input.expert_ids_host || sparse.weights.data()!=input.route_weights_host ||
+           (count && !input.compact_route_slots_host))return false;
+        if(original.records.size()>maximum/sizeof(float) ||
+           original.source_ranges.size()>maximum/sizeof(RootedFloatRecordRange) ||
+           original.selected_expert_ids.size()>maximum/sizeof(int) ||
+           original.participant_route_maps.size()>maximum/sizeof(int32_t) ||
+           original.required_route_weights.size()>maximum/sizeof(float) ||
+           original.combined_route_rows.size()>maximum/sizeof(float))return false;
+        int32_t previous_original=-1,previous_compact=-1;
+        for(size_t entry=0;entry<count;++entry) {
+            const auto slot=input.original_route_slots_host[entry],compact=input.compact_route_slots_host[entry];
+            if(slot<=previous_original || static_cast<size_t>(slot)>=ticket.routeCapacity() ||
+               compact<=previous_compact)return false;
+            previous_original=slot;previous_compact=compact;
+        }
+        // Ticket metadata and payload are all outputs. Validate their complete
+        // roots against each other and the original borrowed sources/scratch
+        // before the fused kernel writes either raw or weighted FP32 output.
+        const auto overlaps=[](const void* a,size_t an,const void* b,size_t bn) {
+            if(!an || !bn)return false;
+            const auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
+            return !a || !b || an>std::numeric_limits<uintptr_t>::max()-x ||
+                bn>std::numeric_limits<uintptr_t>::max()-y || (x<y+bn && y<x+an);
+        };
+        const std::array<std::pair<const void*,size_t>,3> outputs{{
+            {ticket.contributionRowsHost(),ticket.routeCapacity()*width*sizeof(float)},
+            {ticket.originalRouteSlotsHost(),ticket.routeCapacity()*sizeof(int32_t)},
+            {ticket.compactRouteSlotsHost(),ticket.routeCapacity()*sizeof(int32_t)}}};
+        const std::array<std::pair<const void*,size_t>,10> inputs{{
+            {original.records.data(),original.records.size_bytes()},
+            {original.source_ranges.data(),original.source_ranges.size_bytes()},
+            {original.selected_expert_ids.data(),original.selected_expert_ids.size_bytes()},
+            {original.participant_route_maps.data(),original.participant_route_maps.size_bytes()},
+            {original.required_route_weights.data(),original.required_route_weights.size_bytes()},
+            {original.combined_route_rows.data(),original.combined_route_rows.size_bytes()},
+            {input.original_route_slots_host,count*sizeof(int32_t)},
+            {input.compact_route_slots_host,count*sizeof(int32_t)},
+            {input.expert_ids_host,count*sizeof(int32_t)},
+            {input.route_weights_host,count*sizeof(float)}}};
+        for(size_t i=0;i<outputs.size();++i) {
+            for(const auto &in:inputs)if(overlaps(outputs[i].first,outputs[i].second,in.first,in.second))return false;
+            for(size_t j=0;j<i;++j)if(overlaps(outputs[i].first,outputs[i].second,outputs[j].first,outputs[j].second))return false;
+        }
+        auto args=original;
+        args.preweighted_output=cpu::moe::CanonicalRoutePreweightedOutput{
+            {ticket.contributionRowsHost(),ticket.routeCapacity()*width},sparse.original_slots,
+            {input.compact_route_slots_host,count},sparse.weights};
+        if(!cpu::moe::combineCanonicalShardRouteRecords(args))return false;
+        // Retain the existing diagnostic: NaN validation is outside normal
+        // serving and must still reject before releasing an invalid ticket.
+        if(debugEnv().validation.fail_on_nan)
+            for(size_t entry=0;entry<count;++entry)for(size_t column=0;column<width;++column)
+                if(!std::isfinite(ticket.contributionRowsHost()[static_cast<size_t>(input.compact_route_slots_host[entry])*width+column]))return false;
+        for(size_t entry=0;entry<count;++entry) {
+            ticket.originalRouteSlotsHost()[entry]=input.original_route_slots_host[entry];
+            ticket.compactRouteSlotsHost()[entry]=input.compact_route_slots_host[entry];
+        }
+        return publication.publish(count);
+    }
+
     bool MoEOverlayCanonicalRouteReturnTicketStorage::payloadReadyFor(
         uint64_t residency_epoch) const noexcept
     {
@@ -859,6 +1276,21 @@ namespace llaminar2
                        MoEOverlayCanonicalRouteTicketStatus::Success) &&
                control_host_->residency_epoch == residency_epoch &&
                control_host_->live_entry_count <= route_capacity_;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::isWorkspaceDeclaration() const noexcept
+    {
+        return construction_intent_ == ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidConstructionIdentity() const noexcept
+    {
+        return isWorkspaceDeclaration()
+            ? !metadata_region_ && !control_host_ && contribution_region_ &&
+                contribution_region_->isBound() && contribution_region_->hasDevice(continuation_device_) &&
+                continuation_device_.is_gpu() && layer_idx_ >= 0 && route_capacity_ > 0u &&
+                d_model_ > 0 && workspace_generation_ > 0u
+            : hasValidBoundIdentity();
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidBoundIdentity()

@@ -5,6 +5,8 @@
  * The capture borrows one exact HIP stream and owns its graph/executable
  * handles. Read-only recursive kernel inspection mirrors the CUDA contract so
  * graph-level performance diagnostics remain backend-symmetric.
+ * Projection exclusion covers the complete native recording interval, including
+ * error/abort termination; a per-launch token cannot outlive forked stream membership.
  */
 
 #pragma once
@@ -12,10 +14,14 @@
 #ifdef HAVE_ROCM
 
 #include "../IGPUGraphCapture.h"
+#include "../NativeParallelGraphBranch.h"
+#include "../GPUProjectionSubmission.h"
 #include <hip/hip_runtime.h>
+#include <optional>
 
 namespace llaminar2
 {
+    class AMDDeviceContext;
 
     /// HIP Graph capture/replay implementation for AMD ROCm GPUs.
     ///
@@ -27,7 +33,11 @@ namespace llaminar2
         /// @param stream The HIP stream to capture on. Must remain valid for the
         ///               lifetime of this object.
         /// @param device_ordinal Immutable ROCm device owning the stream/graph.
+        /// @note Standalone recording does not borrow a pooled projection owner;
+        ///       concurrent projection capture requires the exact-owner overload.
         HIPGraphCapture(hipStream_t stream, int device_ordinal);
+        /** @brief Bind native capture to the exact worker generation, retained through graph teardown. */
+        HIPGraphCapture(hipStream_t stream, int device_ordinal, AMDDeviceContext &owner);
         ~HIPGraphCapture() override;
 
         // Move-only (graph handles are not copyable)
@@ -47,7 +57,10 @@ namespace llaminar2
         {
             if (graph_ || exec_)
                 return nullptr;
-            return std::make_unique<HIPGraphCapture>(stream_, device_ordinal_);
+            auto fragment = projection_owner_
+                ? std::make_unique<HIPGraphCapture>(stream_, device_ordinal_, *projection_owner_)
+                : std::make_unique<HIPGraphCapture>(stream_, device_ordinal_);
+            return fragment;
         }
         bool buildOrderedTimelineTransaction(
             std::span<const GPUOrderedTimelineStep> ordered_steps,
@@ -55,6 +68,14 @@ namespace llaminar2
                 GPUOrderedTimelineInstrumentation::Disabled) override;
         [[nodiscard]] GPUOrderedTimelineTimingSnapshot
         consumeOrderedTimelineTiming() override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodySiblings */
+        bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodyAfterCapturedFragment */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            const IGPUGraphCapture& producer, const IGPUGraphCapture& body) override;
+        /** @brief Join exact original main and already appended finite-body frontiers; see base contract. */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body) override;
         /** @copydoc IGPUGraphCapture::appendParallelBranch */
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;
@@ -70,6 +91,9 @@ namespace llaminar2
             return resident_memory_bytes_;
         }
         size_t nodeCount() const override;
+        /** @copydoc IGPUGraphCapture::inspectFlatGraphStructure */
+        bool inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,std::span<std::byte> scratch,
+            GPUFlatGraphStructure& observed,std::string* error=nullptr)const override;
         bool inspectKernelNodes(
             std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
             std::string *error = nullptr) const override;
@@ -86,8 +110,28 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        /** @copydoc IGPUGraphCapture::appendActiveCaptureChild */
+        [[nodiscard]] bool appendActiveCaptureChild(const IGPUGraphCapture &child) override;
+
+        /** Unique cold recording lifetime, invalidated by reset/re-recording. */
+        mutable std::shared_ptr<const void> definition_scope_;
+        /** @return This exact cold native definition lifetime, created before its first import. */
+        const std::shared_ptr<const void>& definitionScope() const
+        {
+            if(!definition_scope_)definition_scope_=std::make_shared<const std::byte>();
+            return definition_scope_;
+        }
+        /** Exact original fragment exits in THIS composed parent, not live inference state. */
+        detail::NativeCapturedFragmentFrontiers<hipGraph_t,hipGraphNode_t> fragment_frontiers_;
         /** @brief Select the immutable HIP owner before a runtime operation. */
         bool activateOwner(const char *operation) const noexcept;
+        /**
+         * @brief End native recording before releasing side-stream exclusion.
+         * @param captured_graph Receives the native recording or null for an invalidated capture.
+         * @return Native end status after proving that no capture membership remains.
+         * @note Unproved termination is fatal because another parent must never reuse live side handles.
+         */
+        hipError_t endNativeCapture(hipGraph_t *captured_graph);
 
         /** @brief One persistent event pair embedded around a timeline step. */
         struct OrderedTimelineTimingEvents
@@ -106,6 +150,10 @@ namespace llaminar2
         int device_ordinal_ = -1;             ///< Immutable HIP resource owner.
         hipGraph_t graph_ = nullptr;          ///< Captured graph (owned)
         hipGraphExec_t exec_ = nullptr;       ///< Instantiated executable (owned)
+        AMDDeviceContext *projection_owner_ = nullptr; ///< Exact retained generation or explicit standalone borrower.
+        std::shared_ptr<IWorkerGPUContext> projection_context_lifetime_; ///< Retained through native graph teardown, including replay.
+        std::optional<GPUProjectionSubmission> projection_submission_; ///< Whole native capture interval.
+        bool native_capture_active_ = false; ///< Only native end may retire this interval.
         size_t node_count_ = 0;               ///< Cached node count from last capture
         std::size_t resident_memory_bytes_ = 0u; ///< Setup-observed opaque driver VRAM.
         std::vector<OrderedTimelineTimingEvents>

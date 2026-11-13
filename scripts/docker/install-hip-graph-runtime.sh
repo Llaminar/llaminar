@@ -4,16 +4,22 @@
 # The pinned monorepo release already owns race-free graph identities, queue
 # placement, ordered packet publication and launch entry/exit dependencies.
 # Do not stack obsolete backports on those upstream implementations. Remaining
-# repairs publish consumed empty-segment completions (ROCm/rocm-systems#12638),
-# backport #9643's TLS-safe native host-thread stack admission and #9652's SDMA
-# sharing when streams outnumber physical engines. Ordering-only SDMA events
+# repairs publish consumed empty-segment completions (ROCm/rocm-systems#12638).
+# The 10.1 source already includes #9643's TLS-safe native thread stacks and
+# #9652's SDMA sharing; those backports are retired. Ordering-only SDMA events
 # retain their exact DMA completion rather than waiting behind unrelated
-# captured compute frontiers on a shared hardware queue. The graph ROI
+# captured compute frontiers on a shared hardware queue. Eligible timing events
+# use finite profiled SDMA markers, preserving actual device timestamps and
+# cold-owned storage without introducing an unrelated compute dependency. The graph ROI
 # repair preserves independent progress for waits and opaque child/callback
 # work. Packet capture, concurrent builders and the existing queue bound remain
 # enabled; finite compute graphs retain the upstream single-queue optimization.
 # Retained events authenticate a live producer generation under the native
 # stream registry before inspecting capture state, including after retirement.
+# Capture retirement detaches stream membership before traversal, preserving
+# legal multi-stream event DAGs even when fork/rejoin revisits an earlier stream.
+# Final node-device argument metadata sizes retained graph pools, so large
+# by-value arguments do not roll over pools sized from stale constructor caches.
 #
 # Both development and release builders call this after installing ROCm's
 # compiler/SDK. The release image copies the resulting standard-SONAME DSO
@@ -22,6 +28,8 @@
 # that same artifact. Otherwise ldconfig can silently resurrect a stock DSO
 # even though a separately named repaired file still has a valid receipt.
 # HIP_RUNTIME_INSTALL_PREFIX may stage an isolated installation for validation.
+# HIP_RUNTIME_STAGE_PREFIX exports that authenticated component for SDK-relative
+# shipping without compiling, downloading, or creating another runtime authority.
 set -euo pipefail
 
 hip_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,17 +38,29 @@ hip_sdk_root="${ROCM_PATH:-${LLAMINAR_ROCM_SDK_PREFIX}}"
 hip_prefix="${HIP_RUNTIME_INSTALL_PREFIX:-${hip_sdk_root}}"
 hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-graph-empty-segment-publication.patch"
-    "${hip_script_dir}/patches/rocm-hip-host-queue-native-stack.patch"
-    "${hip_script_dir}/patches/rocm-hip-sdma-stream-sharing.patch"
     "${hip_script_dir}/patches/rocm-hip-sdma-event-publication.patch"
     "${hip_script_dir}/patches/rocm-hip-graph-progress-safe-collapse.patch"
     "${hip_script_dir}/patches/rocm-hip-event-producer-lifetime.patch"
+    "${hip_script_dir}/patches/rocm-hip-graph-kernarg-metadata.patch"
+    "${hip_script_dir}/patches/rocm-hip-preferred-queue-unshared.patch"
+    "${hip_script_dir}/patches/rocm-hip-timed-sdma-marker.patch"
+    "${hip_script_dir}/patches/rocm-hip-capture-retirement-membership.patch"
+)
+# Builder implementation and host fixture are part of the immutable proof
+# identity, so fast reuse cannot silently retain an older contract.
+hip_proof_files=(
+    "${hip_script_dir}/hip-preferred-queue/proof.py"
+    "${hip_script_dir}/hip-preferred-queue/selector-contract.cpp.in"
+    "${hip_script_dir}/hip-end-capture/proof.py"
+    "${hip_script_dir}/hip-end-capture/end-capture-contract.cpp.in"
 )
 hip_library="${hip_prefix}/lib/libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}"
 # ROCm's package uses a zero Git stamp. Preserve its filename as an alias, not
 # a competing stock artifact: ldconfig prefers the longer versioned filename.
 hip_package_library="${hip_library}-0000000"
 hip_marker="${hip_prefix}/share/llaminar/hip-graph-runtime.txt"
+hip_queue_proof="${hip_prefix}/share/llaminar/hip-preferred-queue-proof.json"
+hip_capture_proof="${hip_prefix}/share/llaminar/hip-end-capture-proof.json"
 
 # This source pin is an ABI dependency, not an independently upgradable plugin.
 # Reject a future SDK override until its source revision and repair are reviewed.
@@ -54,6 +74,10 @@ for hip_patch in "${hip_patches[@]}"; do
     hip_identity+=":$(sha256sum "${hip_patch}" | cut -d ' ' -f 1)"
 done
 
+for hip_proof_file in "${hip_proof_files[@]}"; do
+    hip_identity+=":$(sha256sum "${hip_proof_file}" | cut -d ' ' -f 1)"
+done
+
 # Only tiny dependency receipts are hashed, never model files. Including the
 # installed DSO digest detects an apt reinstall that replaces the repaired DSO
 # but leaves our receipt intact. Reuse does not hide a changed runtime.
@@ -62,8 +86,66 @@ if [[ -f "${hip_library}" && -f "${hip_marker}" &&
       "${hip_library}" -ef "${hip_prefix}/lib/libamdhip64.so.7" &&
       "${hip_library}" -ef "${hip_prefix}/lib/libamdhip64.so" &&
       "$(<"${hip_marker}")" == "${hip_identity}:$(sha256sum "${hip_library}" | cut -d ' ' -f 1)" ]]; then
-    echo "HIP graph runtime already installed: ${hip_library}"
+    # Verification is device/compiler-free and precedes all reuse/export writes.
+    python3 "${hip_script_dir}/hip-preferred-queue/proof.py" \
+        --verify "${hip_queue_proof}" --library "${hip_library}" \
+        --source-identity "${hip_identity}"
+    python3 "${hip_script_dir}/hip-end-capture/proof.py" \
+        --verify "${hip_capture_proof}" --library "${hip_library}" \
+        --source-identity "${hip_identity}"
+    if [[ -n "${HIP_RUNTIME_STAGE_PREFIX:-}" ]]; then
+        # Export only the installer-owned component, including the package name
+        # that must replace stock HIP in the runtime SDK. Relative aliases make
+        # this component relocatable; no second /usr/local authority is created.
+        hip_stage_requested="${HIP_RUNTIME_STAGE_PREFIX}"
+        [[ "${hip_stage_requested}" == /* ]] || {
+            echo "HIP staging requires an absolute component prefix" >&2; exit 1;
+        }
+        hip_stage="$(realpath -m -- "${hip_stage_requested}")"
+        hip_installed_prefix="$(realpath -e -- "${hip_prefix}")"
+        if [[ "${hip_stage}" == "${hip_installed_prefix}" ||
+              "${hip_stage}" == "${hip_installed_prefix}/"* ]]; then
+            echo "HIP staging must not resolve to the installed SDK or its descendants" >&2; exit 1;
+        fi
+        if [[ -L "${hip_stage_requested}" ||
+              ( -e "${hip_stage_requested}" && ! -d "${hip_stage_requested}" ) ]]; then
+            echo "HIP staging requires a fresh prefix or an owned directory, not a link/file" >&2; exit 1;
+        fi
+        # Check both existence and links: -e alone misses dangling symlinks.
+        # No destination path is created or copied before the complete check.
+        for hip_component in lib share; do
+            if [[ -e "${hip_stage}/${hip_component}" || -L "${hip_stage}/${hip_component}" ]]; then
+                echo "HIP staging destination already owns ${hip_component}" >&2; exit 1;
+            fi
+        done
+        [[ ! -L "${hip_library}" &&
+           "$(readlink "${hip_package_library}")" == "libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}" &&
+           "$(readlink "${hip_prefix}/lib/libamdhip64.so.7")" == "libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}" &&
+           "$(readlink "${hip_prefix}/lib/libamdhip64.so")" == libamdhip64.so.7 ]] || {
+            echo "HIP component requires canonical self-contained aliases" >&2; exit 1;
+        }
+        for hip_patch in "${hip_patches[@]}"; do
+            cmp -s "${hip_patch}" "${hip_prefix}/share/licenses/llaminar-hip/$(basename -- "${hip_patch}")" || {
+                echo "HIP installed repair differs from staging authority" >&2; exit 1;
+            }
+        done
+        install -d "${hip_stage}/lib" "${hip_stage}/share/llaminar" "${hip_stage}/share/licenses"
+        cp -P "${hip_library}" "${hip_package_library}" \
+            "${hip_prefix}/lib/libamdhip64.so.7" "${hip_prefix}/lib/libamdhip64.so" "${hip_stage}/lib/"
+        cp "${hip_marker}" "${hip_queue_proof}" "${hip_capture_proof}" "${hip_stage}/share/llaminar/"
+        cp -a "${hip_prefix}/share/licenses/llaminar-hip" "${hip_stage}/share/licenses/"
+        echo "HIP graph runtime component staged: ${hip_stage}"
+    else
+        echo "HIP graph runtime already installed: ${hip_library}"
+    fi
     exit 0
+fi
+
+# Packaging consumes an already authenticated builder installation. It must
+# never turn an absent/stale component into a hidden source build or download.
+if [[ -n "${HIP_RUNTIME_STAGE_PREFIX:-}" ]]; then
+    echo "HIP staging requires an authenticated installed runtime" >&2
+    exit 1
 fi
 
 for dependency in cmake ninja ccache curl git python3; do
@@ -123,5 +205,18 @@ install -m 644 "${hip_build_dir}/systems/projects/clr/LICENSE.md" "${hip_license
 for hip_patch in "${hip_patches[@]}"; do
     install -m 644 "${hip_patch}" "${hip_licenses}/$(basename -- "${hip_patch}")"
 done
+# Retain original-code RED and actual candidate GREEN before publishing success.
+python3 "${hip_script_dir}/hip-preferred-queue/proof.py" \
+    --source-root "${hip_build_dir}/systems/projects/clr" \
+    --patch "${hip_script_dir}/patches/rocm-hip-preferred-queue-unshared.patch" \
+    --compiler "${hip_sdk_root}/lib/llvm/bin/clang++" \
+    --library "${hip_library}" --source-identity "${hip_identity}" \
+    --output "${hip_queue_proof}"
+python3 "${hip_script_dir}/hip-end-capture/proof.py" \
+    --source-root "${hip_build_dir}/systems/projects/clr" \
+    --patch "${hip_script_dir}/patches/rocm-hip-capture-retirement-membership.patch" \
+    --compiler "${hip_sdk_root}/lib/llvm/bin/clang++" \
+    --library "${hip_library}" --source-identity "${hip_identity}" \
+    --output "${hip_capture_proof}"
 printf '%s:%s\n' "${hip_identity}" "$(sha256sum "${hip_library}" | cut -d ' ' -f 1)" > "${hip_marker}"
 echo "HIP graph runtime installed: ${hip_library}"

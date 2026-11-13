@@ -817,6 +817,35 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPCopyInfo_ResolvedOnCacheMiss)
     EXPECT_GE(host.resolve_pp_copy_calls, 1);
 }
 
+/** @test Retained CPU graph replay refreshes actual PP ingress bytes and preserves dirty inactive capacity. */
+TEST_F(Test__ForwardExecutionEngineAdvanced, PPCopyInfo_CacheHitRefreshesLargeSmallEmptyLiveExtent)
+{
+    FactoryPPStageConfig pp{.first_layer=12,.last_layer=24,.has_embedding=false,.has_lm_head=true};
+    auto engine=makeEngine(/*cache_enabled=*/true,pp);
+    TrackingHost host(&mock_ctx_);host.graph_node_count=3;
+    FP32Tensor external_hidden(std::vector<size_t>{16,4},DeviceId::cpu());
+    FP32Tensor working_buffer(std::vector<size_t>{16,4},DeviceId::cpu());
+    std::memset(external_hidden.mutable_data(),0x37,external_hidden.size_bytes());
+    host.mock_pp_copy.external_hidden=&external_hidden;
+    host.mock_pp_copy.working_buffer=&working_buffer;
+    host.mock_pp_copy.needs_copy=true;host.mock_pp_copy.device=DeviceId::cpu();
+    TestInput input(8);input.input.external_hidden_state=&external_hidden;
+    ForwardOutput output{};
+    for (int rows : {8,3,0,1,0})
+    {
+        auto *destination=reinterpret_cast<unsigned char *>(working_buffer.mutable_data());
+        std::memset(destination,0xa5,working_buffer.size_bytes());
+        input.input.host_pipeline_activation_rows=HostPipelineActivationRows::admitted(
+            &external_hidden,DeviceId::cpu(),1,rows);
+        host.mock_pp_copy.copy_bytes=static_cast<size_t>(rows)*4u*sizeof(float);
+        ASSERT_TRUE(engine.execute(input.input,output,host));
+        for (size_t i=0;i<working_buffer.size_bytes();++i)
+            ASSERT_EQ(destination[i],i<host.mock_pp_copy.copy_bytes?0x37:0xa5)<<i<<" rows="<<rows;
+    }
+    EXPECT_EQ(host.build_calls,1)<<"Same physical graph shape must stay retained";
+    EXPECT_GE(host.resolve_pp_copy_calls,5)<<"Every host-owned boundary resolves its current live extent";
+}
+
 // =========================================================================
 // Cache Invalidation and Clearing
 // =========================================================================
@@ -1125,4 +1154,61 @@ TEST(Test__GraphCacheConfig_Extended, AllDisabled)
     EXPECT_FALSE(config.enabled);
     EXPECT_FALSE(config.cache_attention);
     EXPECT_FALSE(config.cache_ffn);
+}
+
+/** @test Non-executable and unknown intents fail before any context, graph/cache or workspace callback. */
+TEST_F(Test__ForwardExecutionEngineAdvanced, WorkspaceDeclarationAndUnknownIntentNeverReachHost)
+{
+    for(const auto intent:{ForwardGraphSubmissionIntent::WorkspaceDeclaration,static_cast<ForwardGraphSubmissionIntent>(255)})
+        for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+        {
+            auto engine=makeEngine();TrackingHost host(&mock_ctx_);
+            TestInput frame(512,1,device);frame.input.graph_submission_intent=intent;
+            ForwardOutput output{};std::optional<ForwardGraphSignature> signature;
+            EXPECT_FALSE(engine.execute(frame.input,output,host,&signature));
+            EXPECT_TRUE(host.call_sequence.empty());EXPECT_EQ(host.get_context_calls,0);
+            EXPECT_EQ(host.build_calls,0);EXPECT_EQ(host.ensure_workspace_calls,0);
+            EXPECT_FALSE(signature);
+        }
+}
+
+/** @test Direct executor/capture entrypoints cannot reinterpret a moved/merged declaration as an executable. */
+TEST_F(Test__ForwardExecutionEngineAdvanced, WorkspaceGraphPurposeSurvivesMoveMergeAndRejectsDirectCapture)
+{
+    ComputeGraph declaration;declaration.markWorkspaceDeclaration();
+    const auto initial=declaration.topologyGeneration();declaration.markWorkspaceDeclaration();
+    EXPECT_EQ(declaration.topologyGeneration(),initial);
+    ComputeGraph moved(std::move(declaration));ASSERT_TRUE(moved.isWorkspaceDeclaration());
+    ComputeGraph graph;graph.merge(std::move(moved));ASSERT_TRUE(graph.isWorkspaceDeclaration());
+    EXPECT_THROW(executor_.execute(graph,nullptr),std::invalid_argument);
+    EXPECT_THROW(executor_.executeFastDecode(graph,nullptr),std::invalid_argument);
+    EXPECT_THROW(executor_.captureRetainedGraphFragment(graph,nullptr,nullptr),std::invalid_argument);
+    EXPECT_THROW(executor_.executeWithGraphCapture(graph,nullptr,nullptr,{}),std::invalid_argument);
+    graph.reset();EXPECT_TRUE(graph.isWorkspaceDeclaration());
+    graph.clear();EXPECT_FALSE(graph.isWorkspaceDeclaration());
+    EXPECT_NO_THROW(graph.requireExecutable());
+}
+
+/** @test Canonical request storage is required before any binding can be minted, without backend startup. */
+TEST_F(Test__ForwardExecutionEngineAdvanced, OriginalRequestQueryCannotBindMissingOrHostStorage)
+{
+    EXPECT_THROW(DeviceRequestQueryBinding::fromArena(arena_,DeviceId::cpu()),std::invalid_argument);
+    EXPECT_THROW(DeviceRequestQueryBinding::fromArena(arena_,DeviceId::cuda(0)),std::invalid_argument);
+    EXPECT_THROW(DeviceRequestQueryBinding::fromArena(arena_,DeviceId::rocm(0)),std::invalid_argument);
+    ForwardInput input;input.device=DeviceId::cuda(0);input.seq_len=512;
+    EXPECT_THROW(requireDeviceRequestQueryOwnsInput(input),std::invalid_argument);
+}
+
+/** @test Original arena query capability is an independent part of executable graph-cache identity. */
+TEST_F(Test__ForwardExecutionEngineAdvanced, OriginalRequestQueryIdentityCannotCrossMatchCachedSources)
+{
+    ForwardGraphSignature original;original.seq_len=512;original.batch_size=1;original.device=DeviceId::cuda(0);
+    original.device_request_query_capture_identity=17;
+    const auto copy=original;EXPECT_EQ(original,copy);
+    const auto hash=ForwardGraphSignatureHash{};
+    EXPECT_EQ(hash(original),hash(copy));
+    auto foreign=original;foreign.device_request_query_capture_identity=18;
+    EXPECT_NE(original,foreign);
+    foreign=original;foreign.device_request_query_capture_identity=0;
+    EXPECT_NE(original,foreign);
 }

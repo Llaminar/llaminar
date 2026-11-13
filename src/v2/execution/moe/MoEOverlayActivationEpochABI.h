@@ -48,6 +48,10 @@ namespace llaminar2
         MainDecode = 2, ///< Main-model one-row decode per logical request.
         MTPDraft = 3, ///< One NextN/MTP sidecar depth per logical request.
         MTPGroupedVerifier = 4, ///< Main-model grouped verifier transaction.
+        MTPConditionSpeculativeContinuation = 5, ///< Accepted-state publication owns this scalar condition's cadence.
+        GenerationAdmission = 8, ///< Immutable request-policy envelope; no device computation.
+        OrdinaryForwardOnly = 7, ///< Sampler-free one-row condition commit; never a response-loop step.
+        MTPConditionCommittedSerialToken = 6, ///< This scalar condition owns one new serial commit.
     };
 
     /** Number of alternating payload banks in one activation transaction slot. */
@@ -78,7 +82,9 @@ namespace llaminar2
     inline constexpr std::uint32_t kMoEOverlayActivationMagic = 0x41454f4du;
 
     /** Current binary layout and semantic-contract version. */
-    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 5u;
+    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 10u;
+    /** Original host-ordered identities have no native roster index. */
+    inline constexpr std::uint32_t kMoEOverlayActivationOriginalNoSlot = 0xffffffffu;
 
     /** Device endpoint participating in one sparse activation round trip. */
     enum class MoEOverlayActivationEndpoint : std::uint32_t
@@ -162,6 +168,38 @@ namespace llaminar2
      * change therefore requires a new channel instead of accepting a vaguely
      * compatible transaction.
      */
+    /** @brief Immutable logical return role derived from original source ownership. */
+    enum class MoEOverlayActivationReturnRole : std::uint32_t
+    {
+        Ordinary = 0,         ///< Existing one-participant logical expert result.
+        JointRoot = 1,        ///< One combined result after original CPU fragment collective.
+        JointContributor = 2, ///< Metadata-only completion after actual fragment gather.
+    };
+    /** @param role Exact wire policy word.
+     * @return Whether this ABI declares the immutable return policy. */
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationReturnRoleValid(std::uint32_t role) noexcept {
+        return role <= static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::JointContributor);
+    }
+    /**
+     * @brief Validate actual return counts without confusing completed work and payload.
+     * @param role Original immutable channel policy.
+     * @param returned_rows Actual payload rows in the return descriptor.
+     * @param returned_entries Actual payload entries in the return descriptor.
+     * @param dispatched_rows Actual original work rows.
+     * @param dispatched_entries Actual original work entries.
+     * @return True only for an ordinary exact return or the explicit no-payload contributor.
+     */
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationReturnCountsMatch(std::uint32_t role,
+        std::uint64_t returned_rows,std::uint64_t returned_entries,
+        std::uint64_t dispatched_rows,std::uint64_t dispatched_entries) noexcept {
+        return moeOverlayActivationReturnRoleValid(role) &&
+               (role == static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::JointContributor)
+                    ? returned_rows == 0 && returned_entries == 0
+                    : returned_rows == dispatched_rows && returned_entries == dispatched_entries);
+    }
+
     struct alignas(64) MoEOverlayActivationChannelHeader
     {
         std::uint32_t magic = kMoEOverlayActivationMagic;
@@ -184,7 +222,9 @@ namespace llaminar2
         std::uint32_t lane_ordinal = 0u;
         /** Bit N admits @ref MoEOverlayInferenceGraphRole value N. */
         std::uint32_t graph_role_mask = 0u;
-        std::uint64_t reserved[4] = {};
+        std::uint32_t return_role = 0u; ///< Original logical contribution policy, never live routing state.
+        std::int32_t cohort_target = -1; ///< Original fixed CPU cohort tag; no expert membership.
+        std::uint64_t reserved[3] = {};
     };
 
     /**
@@ -263,7 +303,11 @@ namespace llaminar2
         std::int32_t sidecar_depth = -1;
         std::uint32_t stage_count = 0u;
         std::uint32_t lane_ordinal = 0u;
-        std::uint32_t reserved[5] = {};
+        std::uint32_t return_role = 0u; ///< Authenticated original channel return policy.
+        std::int32_t cohort_target = -1; ///< Same immutable channel cohort tag.
+        /** Actual original protocol index; device-selected, never capture-depth-derived. */
+        std::uint32_t original_slot_index = kMoEOverlayActivationOriginalNoSlot;
+        std::uint32_t reserved[2] = {};
 
         bool operator==(
             const MoEOverlayActivationEpochIdentity &) const = default;
@@ -346,6 +390,9 @@ namespace llaminar2
         LLAMINAR_MOE_ACTIVATION_MIX(sidecar_depth);
         LLAMINAR_MOE_ACTIVATION_MIX(stage_count);
         LLAMINAR_MOE_ACTIVATION_MIX(lane_ordinal);
+        LLAMINAR_MOE_ACTIVATION_MIX(return_role);
+        LLAMINAR_MOE_ACTIVATION_MIX(cohort_target);
+        LLAMINAR_MOE_ACTIVATION_MIX(original_slot_index);
 #undef LLAMINAR_MOE_ACTIVATION_MIX
         if (digest.low == 0u)
             digest.low = 0x9e3779b97f4a7c15ull;
@@ -445,6 +492,16 @@ namespace llaminar2
         /** Number of authenticated payload descriptors this endpoint published. */
         std::uint64_t published_stage_count = 0u;
 
+        /**
+         * Actual shared hidden-matrix bytes written once by this group's GPU
+         * publisher. Other consumers report zero; logical descriptor totals
+         * remain separate. Read only after the original terminal publication.
+         */
+        std::uint64_t published_shared_hidden_bytes = 0u;
+
+        /** Exact post-payload release marker; semantic Complete alone cannot rearm a native lane. */
+        std::uint64_t payload_retired_generation = 0u;
+
         /*
          * These totals are deliberately part of the endpoint-owned ABI rather
          * than host-side mirrors.  The continuation accumulates dispatch
@@ -537,6 +594,26 @@ namespace llaminar2
         return leased == 0u
                    ? 0u
                    : (generation << kMoEOverlayActivationVisitBits) | leased;
+    }
+
+    /**
+     * @brief Authenticate the current identity before its final publication acquire.
+     * @param identity_generation Generation copied with the immutable record.
+     * @param current_generation Fresh generation read before the final ready acquire.
+     * @param ready_signal Final system-acquired publication, never a cached prior ready.
+     * @return Whether the same nonzero record is currently published.
+     * A queued reader can acquire a prior ready word before the native source
+     * closes it. That earlier acquire cannot authorize newly installed fields.
+     */
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationAdmissionPublicationMatches(
+        std::uint64_t identity_generation,
+        std::uint64_t current_generation,
+        std::uint64_t ready_signal) noexcept
+    {
+        return identity_generation != 0u &&
+               current_generation == identity_generation &&
+               ready_signal == kMoEOverlayActivationAdmissionTimeline;
     }
 
     static_assert(kMoEOverlayActivationBufferCount == 2u);

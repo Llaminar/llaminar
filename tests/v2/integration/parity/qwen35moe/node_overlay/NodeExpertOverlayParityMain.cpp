@@ -6,11 +6,17 @@
  * translation-unit boundary does not change request ownership, reference
  * mathematics, graph execution, or evidence publication ordering.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "NodeExpertOverlayParitySupport.h"
 
 /** Run registered cells inside one explicit MPI/backend process lifetime. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
@@ -32,7 +38,7 @@ int main(int argc, char **argv)
     MPI_Allreduce(MPI_IN_PLACE, &result, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
 
     MPI_Finalize();
 

@@ -17,8 +17,11 @@
  */
 
 #pragma once
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "DeviceType.h"
+#include "collective/NativeCollectiveCompletion.h"
+#include "backends/NativeAllocationCaptureLease.h"
 #include "GenerationPenaltyHistory.h"
 #include "kernels/common/GenerationLogicalState.h"
 #include "kernels/common/DeviceGenerationInitialization.h"
@@ -28,8 +31,14 @@
 
 namespace llaminar2
 {
+    enum class NativeCountedAllGatherPreparation : std::uint8_t;
+    enum class NativePipelineByteOperation : std::uint8_t;
+    struct NativePipelineByteInvocation;
+
     class TransferEngine;
     struct CapturedTransferChannelDeviceBinding;
+    struct PipelineActivationFanoutValidation;
+    struct CapturedTransferChannelBatch;
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
@@ -216,6 +225,7 @@ namespace llaminar2
 
     namespace sampling_math
     {
+        struct MTPDepthTransactionTrace;
         struct DeviceGenerationPolicy;
         struct OrdinaryGenerationPublication;
         enum class DeviceGenerationLeadingRowDisposition : int32_t;
@@ -249,6 +259,41 @@ namespace llaminar2
     class IBackend
     {
     public:
+        /**
+         * @brief Seal one collective-owned native completion frame on its exact stream.
+         * @param memory Persistent admitted participant metadata, cleared once during setup.
+         * @param degree Actual original membership, without a fixed participant cap.
+         * @param table Capture-frozen semantic message key.
+         * @param admission Capture-frozen admitted packet bytes.
+         * @param preparation Cold Initialize clears the admitted bank/resolves kernels; captured Advance only seals the next invocation.
+         * @param device_id Original local GPU ordinal.
+         * @param stream Exact non-null stream after local extent production.
+         * @param outgoing Optional original aligned request counter for actual native sends.
+         * @return Whether the preparation launch was accepted; never reads a count on host.
+         */
+        virtual bool enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing = nullptr)
+        { (void)memory;(void)degree;(void)table;(void)admission;(void)preparation;(void)device_id;(void)stream;(void)outgoing;return false; }
+        /**
+         * @brief Prepare/validate one native pipeline endpoint using its original live row root.
+         * @param invocation Exact admitted frame, message, signed rows and native authority.
+         * @param operation Cold initialization or one captured scalar preparation/validation node.
+         * @param device_id Original local GPU ordinal. @param stream Exact non-null producer stream.
+         * @return Whether the native scalar operation was accepted; no host count readback occurs.
+         */
+        virtual bool enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+            NativePipelineByteOperation operation, int device_id, void *stream)
+        { (void)invocation; (void)operation; (void)device_id; (void)stream; return false; }
+        /** @brief Validate actual native receipts on the exact stream before dependent publication.
+         * @param memory Same persistent participant frame. @param degree Actual original membership.
+         * @param original Native authority captured before retirement. @param device_id Original GPU ordinal.
+         * @param stream Exact stream after all native payload launches.
+         * @return Whether validation was enqueued; unsupported implementations reject. */
+        virtual bool validateNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            ncclLlaminarCompletionAuthority original, int device_id, void *stream)
+        { (void)memory;(void)degree;(void)original;(void)device_id;(void)stream;return false; }
+
+
         virtual ~IBackend() = default;
 
         // ====================================================================
@@ -559,6 +604,20 @@ namespace llaminar2
          */
         virtual void free(void *ptr, int device_id) = 0;
 
+        /** @brief Borrow a positive span from the exact existing native allocation record.
+         * @param pointer First consumed byte, including legal interior views.
+         * @param bytes Consumed retained extent.
+         * @param device_id Exact backend-local allocator ordinal.
+         * @return Immutable allocation-record borrow, without device work.
+         * @throws std::logic_error If this backend has no native GPU allocation authority.
+         * @throws std::invalid_argument If the span is missing, foreign or undersized.
+         */
+        virtual NativeAllocationCaptureLease retainNativeAllocation(
+            const void* pointer, size_t bytes, int device_id) {
+            (void)pointer; (void)bytes; (void)device_id;
+            throw std::logic_error("Backend has no captured native-allocation authority");
+        }
+
         /**
          * @brief Set device memory to a byte value
          *
@@ -609,6 +668,7 @@ namespace llaminar2
          * @param pad_token_id Token id written to inactive bucket rows.
          * @param device_id GPU ordinal owning every pointer.
          * @param stream Exact graph execution stream.
+         * @param require_exact_rows Reject a device-computed extent shorter than the frozen graph width.
          * @param out_token_ids_device Stable INT32 token bucket.
          * @param out_position_ids_device Stable INT32 absolute-position bucket.
          * @param out_real_rows_device Device INT32 logical row count for this bucket.
@@ -623,6 +683,7 @@ namespace llaminar2
             int request_row_capacity,
             int bucket_seq_len,
             int pad_token_id,
+            bool require_exact_rows,
             int device_id,
             void *stream,
             void *out_token_ids_device,
@@ -637,6 +698,7 @@ namespace llaminar2
             (void)request_row_capacity;
             (void)bucket_seq_len;
             (void)pad_token_id;
+            (void)require_exact_rows;
             (void)device_id;
             (void)stream;
             (void)out_token_ids_device;
@@ -1427,6 +1489,43 @@ namespace llaminar2
         }
 
         /**
+         * @brief Commit one direct MTP output and its successor fresh-logits frontier.
+         *
+         * The same captured scalar launch increments the original target token's
+         * durable history and clears only the resident first-token history bit.
+         * A successful nonterminal direct output is then committed through the
+         * shifted/main model row before any successor sampler may execute; its
+         * successor first target is therefore new and not yet in durable history.
+         * Grouped carry publication and AlreadyPublished dispositions never call
+         * this interface. It does not rewrite admitted penalty magnitudes.
+         *
+         * @param token_device Original device scalar containing this direct output.
+         * @param vocab_size Exact admitted vocabulary extent.
+         * @param generated_token_counts_device Existing durable history owner.
+         * @param penalty_policy_device Original mutable MTPGreedyPenaltyPolicy owner.
+         * @param device_id Exact backend-local participant ordinal.
+         * @param stream Exact non-null original target producer stream.
+         * @return True only when the complete single-writer transition was queued.
+         */
+        virtual bool enqueueCommitMTPDirectTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            void *penalty_policy_device,
+            int device_id,
+            void *stream)
+        {
+            (void)token_device;
+            (void)vocab_size;
+            (void)generated_token_counts_device;
+            (void)penalty_policy_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+
+        /**
          * @brief GPU-side top-k selection over FP32 data
          *
          * Finds the k largest elements (value and index) entirely on the GPU.
@@ -1634,6 +1733,53 @@ namespace llaminar2
             (void)scratch_indices_device;
             (void)scratch_capacity;
             (void)active_rows_device;
+            return false;
+        }
+
+        /**
+         * @brief Build compact distributions without modifying canonical logits.
+         * @copydetails enqueueBuildTopKTopPDistributionsF32Device
+         * @param history Original complete durable/speculative history binding.
+         *
+         * Apply the serial penalty law when each candidate is loaded, before
+         * Top-K selection. Reduction, tie breaking, top-p and normalization are
+         * identical to the raw builder. Only admitted compact/scratch outputs
+         * are written; inactive rows and the entire raw input remain untouched.
+         */
+        virtual bool enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            int out_stride,
+            void *out_probs_device,
+            void *scratch_values_device,
+            void *scratch_indices_device,
+            int scratch_capacity,
+            const GenerationPenaltyHistory &history)
+        {
+            (void)data_device;
+            (void)row_count;
+            (void)n;
+            (void)row_stride;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_stride;
+            (void)out_probs_device;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            (void)history;
             return false;
         }
 
@@ -3212,6 +3358,8 @@ namespace llaminar2
          * The call is allocation-free, graph-capturable, and requires the exact
          * non-null producer stream.  A validation failure publishes `out_ok=0`
          * and terminally invalidates the controller row.
+         * @param depth_transaction_trace_device Optional typed transaction trace view of the
+         * existing exclusive diagnostic bank; only a scalar request may bind it.
          */
         virtual bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
             const void *output_tokens_device,
@@ -3239,7 +3387,8 @@ namespace llaminar2
             void *out_next_verifier_condition_tokens_device = nullptr,
             const void *verifier_input_tokens_device = nullptr,
             int verifier_input_token_stride = 0,
-            void *out_committed_verifier_identity_device = nullptr)
+            void *out_committed_verifier_identity_device = nullptr,
+            sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device = nullptr)
         {
             (void)output_tokens_device;
             (void)output_token_stride;
@@ -3267,6 +3416,7 @@ namespace llaminar2
             (void)verifier_input_tokens_device;
             (void)verifier_input_token_stride;
             (void)out_committed_verifier_identity_device;
+            (void)depth_transaction_trace_device;
             return false;
         }
 
@@ -3353,13 +3503,15 @@ namespace llaminar2
             void *stream,
             void *out_target_cached_tokens_device,
             void *out_accepted_state_counts_device,
-            void *out_ok_device)
+            void *out_ok_device,
+            MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly)
         {
             (void)base_cached_tokens_device;
             (void)main_target_cached_tokens_device;
             (void)main_publication_ok_device;
             (void)request_count;
             (void)mtp_depth;
+            (void)origin;
             (void)device_id;
             (void)stream;
             (void)out_target_cached_tokens_device;
@@ -4206,6 +4358,34 @@ namespace llaminar2
             return false;
         }
 
+        /** @brief Validate completed native activation fanout before dependent model/KV nodes.
+         * @param binding Original received header, local rows and actual native completion authority.
+         * @param device_id Exact local GPU. @param stream Explicit original participant stream.
+         * @return Whether one bounded validation node was enqueued; semantic mismatches trap on device.
+         * Production calls this through TransferEngine after the WHOLE native prefix operation.
+         * No allocation, host count readback or alternate payload path is permitted. */
+        virtual bool enqueuePipelineActivationFanoutValidation(
+            const PipelineActivationFanoutValidation &binding, int device_id, void *stream)
+        { (void)binding; (void)device_id; (void)stream; return false; }
+
+        /**
+         * @brief Lower independent original endpoints in bounded same-role native packets.
+         * @param batch Immutable retained aliases; backend fills only copy launch geometry.
+         * @param device_id Exact GPU of every original cursor.
+         * @param stream Exact non-null acquired or ordinary stream.
+         * @return True only after every selected native launch is accepted.
+         *
+         * This changes launch scheduling, never ownership, useful wire bytes,
+         * timeout, count authority or retirement. There is no shared batch state.
+         * Unsupported backends fail before submission; no alternate path is tried.
+         */
+        virtual bool enqueueCapturedTransferChannelBatch(
+            const CapturedTransferChannelBatch &batch, int device_id, void *stream)
+        {
+            (void)batch; (void)device_id; (void)stream;
+            return false;
+        }
+
         /**
          * @brief Submit a mapped copy with progress independent of peer-held graphs.
          * @param device_region Stable device source or inactive destination.
@@ -4481,6 +4661,7 @@ namespace llaminar2
          * that a GPU stream matches the backend before calling recordEvent).
          */
         virtual DeviceType backendDeviceType() const = 0;
+
     };
 
 } // namespace llaminar2

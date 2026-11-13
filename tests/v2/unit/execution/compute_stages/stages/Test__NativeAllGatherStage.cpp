@@ -2,10 +2,13 @@
  * @file Test__NativeAllGatherStage.cpp
  * @brief Device-free validation of the native byte collective's graph contract.
  *
- * Host tensors supply metadata only. No test calls a GPU allocator or presents
- * host storage as executable GPU data. Native capture/replay and publication
+ * Host tensors supply metadata only. No test initializes a native GPU allocator or presents
+ * host storage as executable GPU data. Mock-backed allocation tests exercise
+ * ordinary storage preparation and immutable seals without native enqueue. Native capture/replay and publication
  * are proved separately by the CUDA/ROCm integration registrations.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/NativeAllGatherStage.h"
 #include "execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
@@ -20,8 +23,14 @@
 #include "tensors/Tensors.h"
 #include "../../../../mocks/MockLocalTPContext.h"
 #include "../../../../mocks/MockComputeStage.h"
+#include "../../../../mocks/MockBackend.h"
+#include "../../../../mocks/MockWorkerGPUContext.h"
+#include "transfer/TransferEngine.h"
+#include "tensors/TensorFactory.h"
+#include "../../../../mocks/MockMPIContext.h"
 
 #include <limits>
+#include <algorithm>
 #include <array>
 
 using namespace llaminar2;
@@ -302,7 +311,7 @@ namespace
     }
 } // namespace
 
-/** @brief Native terminal geometry is validated without GPU discovery or allocation. */
+/** @brief Validate native geometry and compiled capture support without device access. */
 TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwnership)
 {
     NativeVocabularyAllGatherStage::Params declaration;
@@ -316,7 +325,12 @@ TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwn
     declaration.participant = 0;
     declaration.stage_name = "lm_head_allgather";
     NativeVocabularyAllGatherStage stage(declaration);
+#ifdef HAVE_ROCM
     EXPECT_TRUE(stage.isGraphCapturable());
+#else
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "A CPU-only build must not advertise native ROCm capture support";
+#endif
     EXPECT_EQ(stage.getWorkspaceRequirements(4).buffers.front().size_bytes, 4u * 32u * sizeof(float));
     EXPECT_EQ(stage.bufferContract().inputs.front().id, BufferId::LOGITS_LOCAL);
     EXPECT_EQ(stage.bufferContract().outputs.front().id, BufferId::LOGITS);
@@ -327,7 +341,8 @@ TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwn
     config.tp_ctx = &tp;
     config.lm_head_column_parallel = true;
     config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
-    EXPECT_FALSE(config.mtpPublishesNativeGatheredVocabulary());
+    EXPECT_FALSE(retainsMTPGraphCapacity(config.mtp));
+    EXPECT_TRUE(config.mtpPublishesNativeGatheredVocabulary());
     config.mtp.graph_capacity_draft_tokens = 4;
     EXPECT_TRUE(config.mtpParticipantLogitsAreVocabularySharded());
     EXPECT_FALSE(config.mtpUsesMirroredTerminalHeadBinding());
@@ -462,4 +477,321 @@ TEST_F(NativeAllGatherContract, ShardedVerifierRequiresCompletedVocabularyProduc
     ASSERT_NE(outcome, nullptr);
     EXPECT_TRUE(outcome->getParams().participant_full_vocabulary);
     EXPECT_EQ(outcome->getParams().logits, &output);
+}
+
+namespace {
+/** @brief Physical storage generation model; no native backend is initialized. */
+class CountStorageBackend final : public test::MockBackend {
+public:
+    explicit CountStorageBackend(DeviceType type) : test::MockBackend(type) {}
+    /** @return Existing backend generation, independently mutable for stale-runtime controls. */
+    std::uint64_t deviceRuntimeGeneration(int) const override { return generation; }
+    std::uint64_t generation = 1;
+};
+
+TEST_F(NativeAllGatherContract, ArenaCountDeclarationRejectsAmbiguousOrForeignGeometry) {
+    INT32Tensor count({2});
+    params.arena_rows = NativeAllGatherStage::ArenaRows{&count, BufferId::MTP_VERIFIER_REQUEST_LENGTHS, 4, 4, 32};
+    NativeAllGatherStage declared(params);
+    EXPECT_EQ(declared.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::CaptureOnly);
+    EXPECT_FALSE(declared.isGraphCapturable());
+    const auto contract = declared.bufferContract();
+    ASSERT_EQ(contract.inputs.size(), 2u);
+    EXPECT_EQ(contract.inputs[1].id, BufferId::MTP_VERIFIER_REQUEST_LENGTHS);
+    EXPECT_EQ(declared.exchangeBuffers().companion_input, &count);
+    const auto signature = declared.graphCaptureVariantSignature();
+    count.mutable_typed_data()[1] = 0;
+    EXPECT_EQ(declared.graphCaptureVariantSignature(), signature); // Contents never enter identity.
+    auto rejected = params;
+    rejected.live_rows = NativeCollectiveRows(DeviceRowRange::fullyActive(4), 32);
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->byte_offset = 2;
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->byte_offset = count.size_bytes();
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->buffer = *params.input_buffer_id;
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->capacity = 0;
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->bytes_per_row = 31;
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->owner = nullptr;
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    FP32Tensor wrong_type({2}, DeviceId::cpu());
+    rejected = params; rejected.arena_rows->owner = &wrong_type;
+    EXPECT_THROW(NativeAllGatherStage{rejected}, std::invalid_argument);
+    rejected = params; rejected.arena_rows->byte_offset = 0;
+    EXPECT_NE(NativeAllGatherStage(rejected).graphCaptureVariantSignature(), signature);
+}
+
+TEST_F(NativeAllGatherContract, ArenaCountSealsOnlyOrdinaryPreparedStorageAndRejectsDrift) {
+    CountStorageBackend backend(DeviceType::ROCm);
+    INT32Tensor count({2});
+    count.setBackendForTesting(&backend);
+    params.arena_rows = NativeAllGatherStage::ArenaRows{&count, BufferId::MTP_VERIFIER_REQUEST_LENGTHS, 4, 4, 32};
+    NativeAllGatherStage stage(params);
+    const auto signature = stage.graphCaptureVariantSignature();
+    llaminar2::testing::MockDeviceContext context(params.device_id, ComputeBackendType::GPU_ROCM);
+    auto *stream = reinterpret_cast<void *>(0x123400);
+    EXPECT_THROW(stage.prepareGraphLaunch(&context, stream), std::invalid_argument);
+    EXPECT_EQ(count.gpu_data_ptr(), nullptr); // No eager materialization in preparation.
+    TransferEngine::prepareDeviceOutput(&count, params.device_id, stream);
+    EXPECT_NO_THROW(stage.prepareGraphLaunch(&context, stream));
+    EXPECT_EQ(stage.graphCaptureVariantSignature(), signature);
+    EXPECT_NO_THROW(stage.prepareGraphLaunch(&context, stream));
+    EXPECT_THROW(stage.prepareGraphLaunch(&context, nullptr), std::invalid_argument);
+    {
+        GraphCaptureGuard capture;
+        EXPECT_THROW(stage.prepareGraphLaunch(&context, stream), std::logic_error);
+    }
+    ++backend.generation;
+    EXPECT_THROW(stage.graphCaptureVariantSignature(), std::logic_error);
+    --backend.generation;
+    EXPECT_NO_THROW(stage.graphCaptureVariantSignature());
+    EXPECT_TRUE(count.releaseDeviceMemory()); // Write-only owner has no payload to download.
+    EXPECT_THROW(stage.graphCaptureVariantSignature(), std::logic_error);
+    EXPECT_THROW(stage.prepareGraphLaunch(&context, stream), std::logic_error);
+}
+
+TEST_F(NativeAllGatherContract, ArenaCountOverlapPreservesCountLifetimeAndRejectsMutation) {
+    INT32Tensor count({1});
+    params.arena_rows = NativeAllGatherStage::ArenaRows{&count, BufferId::MTP_VERIFIER_REQUEST_LENGTHS, 0, 4, 32};
+    declareWindow();
+    const auto signature = graph.getNode(params.stage_name)->stage->graphCaptureVariantSignature();
+    overlapTPLocalAllGather(graph, params.stage_name, "compute");
+    for (const auto *name : {"intermediate_packet_submit", "intermediate_packet"}) {
+        const auto *stage = graph.getNode(name)->stage.get();
+        EXPECT_EQ(stage->graphCaptureVariantSignature(), signature);
+        const auto contract = stage->bufferContract();
+        ASSERT_EQ(contract.inputs.size(), 2u);
+        EXPECT_EQ(contract.inputs[1].id, BufferId::MTP_VERIFIER_REQUEST_LENGTHS);
+    }
+    graph.clear();
+    declareWindow();
+    auto *compute = static_cast<llaminar2::testing::MockComputeStage *>(graph.getNode("compute")->stage.get());
+    compute->setBufferContract(StageBufferContract::build().addInput(BufferId::MTP_VERIFIER_REQUEST_LENGTHS));
+    EXPECT_THROW(overlapTPLocalAllGather(graph, params.stage_name, "compute"), std::invalid_argument);
+    EXPECT_NE(dynamic_cast<NativeAllGatherStage *>(graph.getNode(params.stage_name)->stage.get()), nullptr);
+}
+} // namespace
+
+namespace {
+TEST_F(NativeAllGatherContract, ArenaCountForkRejectsMissingOrForeignCompanionBeforeEnqueue) {
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    CountStorageBackend backend(DeviceType::ROCm);
+    FP32Tensor packet({4,16},DeviceId::cpu()), received({8,16},DeviceId::cpu());
+    params.local_input = &packet;
+    params.rank_major_output = &received;
+    INT32Tensor count({1}), foreign({1});
+    for (auto *tensor : std::array<TensorBase *,4>{&packet,&received,&count,&foreign}) {
+        tensor->setBackendForTesting(&backend);
+        TransferEngine::prepareDeviceOutput(tensor,params.device_id,reinterpret_cast<void *>(0x1010));
+    }
+    params.arena_rows = NativeAllGatherStage::ArenaRows{&count,BufferId::MTP_VERIFIER_REQUEST_LENGTHS,0,4,32};
+    NativeAllGatherStage stage(params);
+    llaminar2::testing::MockDeviceContext context(params.device_id,ComputeBackendType::GPU_ROCM);
+    auto *producer = reinterpret_cast<void *>(0x1010);
+    auto *consumer = reinterpret_cast<void *>(0x1020);
+    auto *ready = reinterpret_cast<void *>(0x1030);
+    ASSERT_TRUE(stage.prepareGraphLaunch(&context,producer));
+    for (auto *tensor : std::array<TensorBase *,3>{&packet,&count,&foreign})
+        TransferEngine::publishGraphOwnedDeviceWrite(tensor,params.device_id);
+    auto &transfers = TransferEngine::instance();
+    const auto packet_only = transfers.acquireDeviceInputFork(
+        transfers.recordDeviceInputFork(&packet,params.device_id,producer,ready),consumer);
+    EXPECT_THROW(stage.enqueueAcquiredInput(packet_only),std::invalid_argument);
+    const auto foreign_count = transfers.acquireDeviceInputFork(transfers.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,foreign),params.device_id,producer,ready),consumer);
+    EXPECT_THROW(stage.enqueueAcquiredInput(foreign_count),std::invalid_argument);
+    // Neither rejected token can reach MockLocalTPContext's transport. They
+    // fail at exact canonical count provenance, after real owner preparation.
+    // Local owners retire before their injected backend on all exits.
+}
+} // namespace
+
+namespace {
+/** @brief Actual canonical arena/controller with mock native storage, never a raw receipt mint. */
+struct ReceiptController {
+    CountStorageBackend backend{DeviceType::ROCm};
+    test::MockMPIContext mpi;
+    TensorFactory factory{mpi};
+    BufferArena arena{::llaminar2::test::cpuArenaFixtureConfig(&factory)};
+    /** @brief Ordinary setup allocation and publication, without native startup. */
+    explicit ReceiptController(DeviceId device,void *stream) {
+        if(!arena.registerBuffer(BufferId::MTP_GENERATION_CONTROL,2,sampling_math::kDeviceGenerationControlCount,"INT32",DeviceId::cpu()) ||
+            !arena.allocate())throw std::runtime_error("Receipt fixture canonical arena allocation failed");
+        owner()->setBackendForTesting(&backend);TransferEngine::prepareDeviceOutput(owner(),device,stream);
+    }
+    /** @return Original owned root; no copied counters or independent alias. */
+    TensorBase *owner(){return arena.getSharedTensor(BufferId::MTP_GENERATION_CONTROL).get();}
+    /** @return Real checked row borrow after ordinary storage preparation. */
+    DeviceGenerationControlBinding binding(DeviceId device,int request=0){return DeviceGenerationControlBinding::admit(arena,device,request);}
+};
+/** @test A controller receipt is a real InOut lifetime and immutable identity, including overlap lowering. */
+TEST_F(NativeAllGatherContract, ReceiptControllerInOutAndOverlapIdentityRemainExplicit) {
+    auto *stream=reinterpret_cast<void *>(0x3010);ReceiptController control(params.device_id,stream);
+    INT32Tensor count({1});params.arena_rows=NativeAllGatherStage::ArenaRows{&count,BufferId::MTP_VERIFIER_REQUEST_LENGTHS,0,4,32};
+    params.payload_receipt=DeviceGenerationCollectiveReceipt::fixedHead(control.binding(params.device_id),
+        DeviceGenerationCollectiveReceiptKind::FixedHeadPayload,4,8,4);
+    NativeAllGatherStage stage(params);const auto signature=stage.graphCaptureVariantSignature();
+    const auto c=stage.bufferContract();ASSERT_EQ(c.inouts.size(),1u);
+    EXPECT_EQ(c.inouts.front().id,BufferId::MTP_GENERATION_CONTROL);EXPECT_FALSE(c.inouts.front().prepare_write_storage);
+    EXPECT_EQ(stage.exchangeBuffers().observation_inout,control.owner());
+    auto changed=params;changed.payload_receipt=DeviceGenerationCollectiveReceipt::fixedHead(control.binding(params.device_id,1),
+        DeviceGenerationCollectiveReceiptKind::FixedHeadPayload,4,8,4);
+    EXPECT_NE(NativeAllGatherStage(changed).graphCaptureVariantSignature(),signature);
+    changed=params;changed.payload_receipt=DeviceGenerationCollectiveReceipt::fixedHead(control.binding(params.device_id),
+        DeviceGenerationCollectiveReceiptKind::FixedHeadPayload,8,8,2);
+    EXPECT_NE(NativeAllGatherStage(changed).graphCaptureVariantSignature(),signature);
+    declareWindow();overlapTPLocalAllGather(graph,params.stage_name,"compute");
+    const auto *submit=graph.getNode("intermediate_packet_submit")->stage.get();
+    const auto *join=graph.getNode("intermediate_packet")->stage.get();
+    EXPECT_EQ(submit->graphCaptureVariantSignature(),signature);EXPECT_EQ(join->graphCaptureVariantSignature(),signature);
+    const auto submitted=submit->bufferContract();const auto joined=join->bufferContract();
+    EXPECT_TRUE(submitted.inouts.empty());EXPECT_TRUE(submitted.outputs.empty());
+    EXPECT_EQ(std::count_if(submitted.inputs.begin(),submitted.inputs.end(),[](const auto &b){return b.id==BufferId::MTP_GENERATION_CONTROL;}),1);
+    ASSERT_EQ(joined.inouts.size(),1u);EXPECT_EQ(joined.inouts[0].id,BufferId::MTP_GENERATION_CONTROL);
+    graph.clear();declareWindow();auto *compute=static_cast<llaminar2::testing::MockComputeStage *>(graph.getNode("compute")->stage.get());
+    compute->setBufferContract(StageBufferContract::build().addInput(BufferId::MTP_GENERATION_CONTROL,"INT32"));
+    EXPECT_THROW(overlapTPLocalAllGather(graph,params.stage_name,"compute"),std::invalid_argument);
+    EXPECT_NE(dynamic_cast<NativeAllGatherStage *>(graph.getNode(params.stage_name)->stage.get()),nullptr);
+    changed=params;changed.arena_rows->buffer=BufferId::MTP_GENERATION_CONTROL;
+    EXPECT_THROW(NativeAllGatherStage{changed},std::invalid_argument);
+    changed=params;changed.input_buffer_id=BufferId::MTP_GENERATION_CONTROL;
+    EXPECT_THROW(NativeAllGatherStage{changed},std::invalid_argument);
+    changed=params;changed.local_input=control.owner();
+    EXPECT_THROW(NativeAllGatherStage{changed},std::invalid_argument);
+    changed=params;changed.arena_rows->owner=control.owner();
+    EXPECT_THROW(NativeAllGatherStage{changed},std::invalid_argument);
+    ++control.backend.generation;
+    EXPECT_THROW(stage.graphCaptureVariantSignature(),std::invalid_argument);
+    graph.clear(); // Drop borrowed stages before the controller/backend owners.
+}
+/** @test Packet+count readiness cannot conceal absent or foreign controller provenance. */
+TEST_F(NativeAllGatherContract, ReceiptForkRejectsMissingForeignOrUnpublishedController) {
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    auto *producer=reinterpret_cast<void *>(0x4010);auto *consumer=reinterpret_cast<void *>(0x4020);
+    auto *ready=reinterpret_cast<void *>(0x4030);ReceiptController control(params.device_id,producer);
+    FP32Tensor packet({4,16},DeviceId::cpu()),received({8,16},DeviceId::cpu());INT32Tensor count({1}),foreign({72});
+    for(auto *tensor:std::array<TensorBase *,4>{&packet,&received,&count,&foreign}) {
+        tensor->setBackendForTesting(&control.backend);TransferEngine::prepareDeviceOutput(tensor,params.device_id,producer);
+    }
+    params.local_input=&packet;params.rank_major_output=&received;
+    params.arena_rows=NativeAllGatherStage::ArenaRows{&count,BufferId::MTP_VERIFIER_REQUEST_LENGTHS,0,4,32};
+    params.payload_receipt=DeviceGenerationCollectiveReceipt::fixedHead(control.binding(params.device_id),
+        DeviceGenerationCollectiveReceiptKind::FixedHeadPayload,4,8,4);
+    NativeAllGatherStage stage(params);llaminar2::testing::MockDeviceContext context(params.device_id,ComputeBackendType::GPU_ROCM);
+    ASSERT_TRUE(stage.prepareGraphLaunch(&context,producer));
+    for(auto *tensor:std::array<TensorBase *,3>{&packet,&count,&foreign})TransferEngine::publishGraphOwnedDeviceWrite(tensor,params.device_id);
+    auto &transfers=TransferEngine::instance();
+    EXPECT_THROW((void)transfers.recordDeviceInputFork(DeviceTransferForkSources::withCompanionAndObservation(packet,count,*control.owner()),
+        params.device_id,producer,ready),std::runtime_error);
+    const auto missing=transfers.acquireDeviceInputFork(transfers.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),params.device_id,producer,ready),consumer);
+    EXPECT_THROW(stage.enqueueAcquiredInput(missing),std::invalid_argument);
+    const auto wrong=transfers.acquireDeviceInputFork(transfers.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanionAndObservation(packet,count,foreign),params.device_id,producer,ready),consumer);
+    EXPECT_THROW(stage.enqueueAcquiredInput(wrong),std::invalid_argument);
+    TransferEngine::publishGraphOwnedDeviceWrite(control.owner(),params.device_id);
+    const auto exact=transfers.acquireDeviceInputFork(transfers.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanionAndObservation(packet,count,*control.owner()),params.device_id,producer,ready),consumer);
+    EXPECT_TRUE(exact.includesSource(control.owner())); // Native execution remains integration-only.
+}
+} // namespace
+
+/** @test Ordinary native vocabulary publication depends on domain/layout, never MTP capacity. */
+TEST_F(NativeAllGatherContract, OrdinaryVocabularyExcludesCPUAncillaryAndGlobalDomains)
+{
+    /** @brief A global metadata scope must never advertise a native rank-local edge. */
+    class GlobalScope final : public test::MockLocalTPContext
+    {
+    public:
+        /** @return Explicit global scope; no transport executes in this fixture. */
+        TPScope scope() const override { return TPScope::GLOBAL; }
+    };
+    GraphConfig config;
+    config.default_device = params.device_id;
+    config.tp_ctx = &tp;
+    config.lm_head_column_parallel = true;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    EXPECT_FALSE(retainsMTPGraphCapacity(config.mtp));
+    EXPECT_TRUE(config.hasNativeLocalVocabularyGather());
+    EXPECT_TRUE(config.mtpPublishesNativeGatheredVocabulary());
+    auto changed = config;
+    changed.default_device = DeviceId::cpu();
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    changed = config; changed.tp_ctx = nullptr;
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    test::MockLocalTPContext singleton;
+    singleton.setDevices({GlobalDeviceAddress::rocm(0)});
+    singleton.setBackend(CollectiveBackendType::RCCL);
+    changed = config; changed.tp_ctx = &singleton;
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    GlobalScope global;
+    global.setDevices(tp.devices());
+    global.setBackend(CollectiveBackendType::RCCL);
+    changed = config; changed.tp_ctx = &global;
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    changed = config; changed.lm_head_column_parallel = false;
+    EXPECT_FALSE(changed.mtpPublishesNativeGatheredVocabulary());
+    changed = config; changed.mtp.terminal_head_policy = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    EXPECT_FALSE(changed.mtpPublishesNativeGatheredVocabulary());
+
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::fullyActive(1);
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    NativeVocabularyAllGatherStage stage(declaration);
+    EXPECT_TRUE(stage.getWorkspaceRequirements(1).buffers.empty());
+    EXPECT_EQ(stage.bufferContract().inputs.front().id, BufferId::LOGITS_LOCAL);
+    EXPECT_EQ(stage.bufferContract().outputs.front().id, BufferId::LOGITS);
+}
+
+/** @test Explicit ordinary storage preview keeps the executable's one-row live extent. */
+TEST_F(NativeAllGatherContract, OrdinaryProjectedCapacityKeepsFrozenOperationRows)
+{
+    GraphConfig config;
+    config.default_device = params.device_id;
+    config.tp_ctx = &tp;
+    config.lm_head_column_parallel = true;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    config.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
+    auto excluded = config;
+    excluded.default_device = DeviceId::cpu();
+    EXPECT_FALSE(excluded.requiresEagerWorkspaceFamilyManifest());
+    excluded = config;
+    excluded.lm_head_column_parallel = false;
+    EXPECT_FALSE(excluded.requiresEagerWorkspaceFamilyManifest());
+    excluded = config;
+    excluded.tp_ctx = nullptr;
+    EXPECT_FALSE(excluded.requiresEagerWorkspaceFamilyManifest());
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::fullyActive(1);
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    NativeVocabularyAllGatherStage stage(declaration);
+    const auto rows = config.ordinary_terminal_projection.resolveForSequence(1, 512);
+    const auto preview = stage.getWorkspaceRequirements(rows);
+    ASSERT_EQ(preview.buffers.size(), 1u);
+    EXPECT_EQ(preview.buffers.front().size_bytes, 16u * 32u * sizeof(float));
+    EXPECT_EQ(stage.params().rows.physicalRows(), 1);
+    EXPECT_FALSE(stage.params().rows.countOwner());
+    EXPECT_TRUE(stage.getWorkspaceRequirements(1).buffers.empty());
 }

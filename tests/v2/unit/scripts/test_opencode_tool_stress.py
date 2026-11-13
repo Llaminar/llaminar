@@ -90,6 +90,39 @@ def conversation(directory, stream=False):
     return rows, events
 
 
+def compaction_prompt_fixture(transcript, previous=None):
+    """Use the pinned buildPrompt outer separators, preserving unescaped payload text."""
+    content = "Here is the conversation so far:\n\n<conversation>\n" + transcript + "\n</conversation>\n\n"
+    if previous is None:
+        return content + ("Create a new anchored summary from the conversation history in the <conversation> "
+                          "tags above so another coding agent can continue the work.\n\nSummary instructions.")
+    return content + ("Here is the summary of the conversation before the <conversation> above:\n\n"
+        "<prior-summary>\n" + previous + "\n</prior-summary>\n\n"
+        "The <prior-summary> summarizes everything that happened before the <conversation>. "
+        "Construct a new summary that combines both. The <prior-summary> is discarded after "
+        "this: anything you do not carry into the new summary is lost.\n\nSummary instructions.")
+
+
+def compacted_conversation(directory, *, stream=False, output="123", serialized_output=None):
+    """Replay a full-head native compaction that legitimately removes structured IDs."""
+    rows, events = conversation(directory, stream)
+    events[1]["part"]["state"]["output"] = output
+    transcript = '[Assistant tool call]: read({"filePath":"result.txt"})\n[Tool result]: '
+    transcript += output if serialized_output is None else serialized_output
+    summary = {"path": "/v1/chat/completions", "request": {"stream": stream, "messages": [
+        {"role": "system", "content": "You are a context summarization agent.\n"},
+        {"role": "user", "content": compaction_prompt_fixture(transcript)}]},
+        "response": wire({"role": "assistant", "content": "Read exact result bytes."}, stream)}
+    rows.insert(2, summary)
+    rows[-1]["request"]["messages"] = [
+        {"role": "system", "content": "Normal coding system prompt"},
+        {"role": "user", "content": "What did we do so far?"},
+        {"role": "assistant", "content": "Read exact result bytes."},
+        {"role": "user", "content": "Continue if you have next steps."}]
+    (directory / "client.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+    return rows, events
+
+
 def amend_call(rows, events, index, arguments):
     """Change generated arguments consistently at wire, history and client boundaries."""
     message, _ = stress.response_message(rows[index]["response"], rows[index]["request"].get("stream", False))
@@ -188,6 +221,97 @@ class OpenCodeStressTests(unittest.TestCase):
                 self.assertFalse(Path(receipt["live_workspace"]).exists())
                 self.assertEqual((root / "session-0000-number/workspace/result.txt").read_bytes(), b"123")
 
+    def test_reply_reserve_configures_actual_client_without_reducing_output_limit(self):
+        """Run the real session configuration path across default and explicit budgets."""
+        for context, output_limit, reserve in ((47168, 32768, None), (47168, 32768, 16384),
+                (262144, 32768, 16384), (8192, 2048, 1024), (100, 50, 50)):
+            with self.subTest(context=context, reserve=reserve), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                seed = root / "seed"
+                seed.mkdir()
+                evidence, events = conversation(seed, True)
+                rows, observed = [], []
+                proxy = Mock()
+                proxy.__enter__ = Mock(return_value=("http://127.0.0.1:1234/v1", rows))
+                proxy.__exit__ = Mock(return_value=False)
+                args = SimpleNamespace(output=root, base_url="http://127.0.0.1:1234",
+                    request_timeout=None, session_timeout=None, model="test-model",
+                    context_length=context, max_tokens=output_limit, opencode="fixture-client",
+                    reply_reserve_tokens=reserve)
+
+                def client(command, *, prompt, workspace, env, output, error, wall_time_limit):
+                    """Inspect the actual subprocess environment, preserving normal fixture evidence."""
+                    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+                    observed.append(config)
+                    limit = config["provider"]["llaminar"]["models"][args.model]["limit"]
+                    self.assertEqual(limit["context"], context)
+                    self.assertEqual(limit["output"], output_limit)
+                    if reserve is None:
+                        self.assertNotIn("input", limit)
+                        self.assertNotIn("compaction", config)
+                    else:
+                        self.assertEqual(limit["input"], context)
+                        self.assertEqual(config["compaction"], {"reserved": reserve})
+                    evidence[0]["request"]["messages"][0]["content"] = prompt.read_text()
+                    rows.extend(evidence)
+                    (workspace / "result.txt").write_bytes(b"123")
+                    output.write_text("\n".join(json.dumps(event) for event in events))
+                    error.write_text("")
+                    return 0, False
+
+                with patch.object(stress, "recording_proxy", return_value=proxy), \
+                     patch.object(stress, "run_client_with_prompt", side_effect=client):
+                    result = stress.run_session(args, 0, "number", "123")
+                self.assertTrue(result["passed"], result["errors"])
+                self.assertEqual(len(observed), 1)
+                policy = result["client_context_policy"]
+                self.assertEqual(policy, stress.client_context_policy(context, output_limit, reserve))
+                self.assertEqual(policy, json.loads((root / "session-0000-number/client-context-policy.json").read_text()))
+                self.assertEqual(policy["input_budget_tokens"], None if reserve is None else context - reserve)
+                if context == 47168 and reserve == 16384:
+                    self.assertEqual(policy["input_budget_tokens"], 30784)
+                    self.assertEqual(policy["model_limit"]["output"], 32768)
+
+    def test_reply_reserve_rejects_invalid_policy_before_client_or_network(self):
+        """Only a positive integer below context and within output allowance is admitted."""
+        for reserve in (0, -1, True, False, 1.5, "16384", 47168, 50000, 32769):
+            with self.subTest(reserve=reserve), self.assertRaises(ValueError):
+                stress.client_context_policy(47168, 32768, reserve)
+        for reserve in ("0", "-1", "47168", "32769", "1.5"):
+            with self.subTest(cli=reserve), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "not-created"
+                argv = ["stress", "--base-url", "http://127.0.0.1:1", "--model", "fixture",
+                    "--context-length", "47168", "--max-tokens", "32768", "--output", str(output),
+                    "--reply-reserve-tokens", reserve]
+                with patch.object(sys, "argv", argv), patch.object(sys, "stderr", Mock()), \
+                     patch.object(stress, "require_ready") as ready:
+                    with self.assertRaises(SystemExit) as rejected:
+                        stress.main()
+                self.assertEqual(rejected.exception.code, 2)
+                ready.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_reply_reserve_is_explicit_in_campaign_report(self):
+        """Default and operator reserve choices remain visible in top-level stress evidence."""
+        for reserve in (None, 16384):
+            with self.subTest(reserve=reserve), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "campaign"
+                argv = ["stress", "--base-url", "http://127.0.0.1:1", "--model", "fixture",
+                    "--context-length", "47168", "--max-tokens", "32768", "--output", str(output), "--gate", "protocol"]
+                if reserve is not None:
+                    argv += ["--reply-reserve-tokens", str(reserve)]
+                result = {**stress.assessment([], []), "case": "webapp",
+                          "successful_tools": sorted(stress.required_tools("webapp"))}
+                with patch.object(sys, "argv", argv), patch.object(stress, "require_ready"), \
+                     patch.object(stress.subprocess, "check_output", return_value="1.18.34-llaminar.1"), \
+                     patch.object(stress, "run_session", return_value=result) as session:
+                    self.assertEqual(stress.main(), 0)
+                report = json.loads((output / "stress.json").read_text())
+                self.assertEqual(report["reply_reserve_tokens"], reserve)
+                self.assertEqual(report["context_length"], 47168)
+                self.assertEqual(report["max_tokens"], 32768)
+                self.assertEqual(session.call_args.args[0].reply_reserve_tokens, reserve)
+
     def test_prompt_stdin_preserves_quotes_unicode_and_large_inputs(self):
         """A real child receives exact input bytes with no prompt argument or pipe deadlock."""
         prompts = [stress.coding_prompt(case, value) for case, value in stress.fixture_cases().items()
@@ -236,6 +360,66 @@ class OpenCodeStressTests(unittest.TestCase):
                     self.assertFalse(stress.authenticate_phase_prompt([], prompt)["passed"])
                     row["request"]["messages"] = []
                     self.assertFalse(stress.authenticate_phase_prompt([row], prompt)["passed"])
+
+    def test_phase_prompt_authenticates_first_coding_request_after_leading_compaction(self):
+        """Replay the native summary-prefix/adjacent-user shape with exact prompt bytes."""
+        summary = {"request": {"messages": [
+            {"role": "system", "content": "You are a context summarization agent. Summarize history."},
+            {"role": "user", "content": "History\n<conversation>\nold turns\n</conversation>\nSummary"}],
+            "tools": []}}
+        continuation = ("Continue if you have next steps, or stop and ask for clarification "
+                        "if you are unsure how to proceed.")
+        for prompt in stress.session_prompts("webapp", "123"):
+            for count in (1, 2):
+                for suffix in ([], [{"role": "user", "content": continuation}],
+                               [{"role": "user", "content": [{"type": "text", "text": continuation}]}]):
+                    with self.subTest(prompt=prompt[:30], summaries=count, suffix=suffix):
+                        request = {"request": {"messages": [
+                            {"role": "assistant", "content": "prior phase complete"},
+                            {"role": "user", "content": prompt}, *suffix]}}
+                        result = stress.authenticate_phase_prompt([summary] * count + [request], prompt)
+                        self.assertTrue(result["passed"], result)
+                        self.assertEqual(result["observed_sha256"], result["expected_sha256"])
+
+    def test_phase_compaction_cannot_hide_missing_changed_or_late_prompts(self):
+        """Only a recognized leading summary and exact adjacent suffix are admissible."""
+        prompt = 'Exact new phase: "quoted" 🙂\n'
+        summary = {"request": {"messages": [
+            {"role": "system", "content": "You are a context summarization agent. Summarize history."},
+            {"role": "user", "content": "History\n<conversation>\nold turns\n</conversation>\nSummary"}],
+            "tools": []}}
+        continuation = ("Continue if you have next steps, or stop and ask for clarification "
+                        "if you are unsure how to proceed.")
+        intended = {"role": "user", "content": prompt}
+        followup = {"role": "user", "content": continuation}
+        valid = {"request": {"messages": [intended, followup]}}
+        invalid_tails = [
+            [], [followup], [{"role": "user", "content": prompt + " "}, followup],
+            [{"role": "user", "content": [{"type": "text", "text": prompt},
+                                           {"type": "text", "text": "extra"}]}, followup],
+            [intended, {"role": "user", "content": continuation + "\n"}],
+            [intended, {"role": "user", "content": "unknown synthetic continuation"}],
+            [intended, {"role": "assistant", "content": "interleaved"}, followup],
+            [intended, {"role": "tool", "content": "interleaved"}, followup],
+            [intended, followup, {"role": "assistant", "content": "trailing"}],
+            [intended, followup, followup],
+            [intended, followup, {"role": "user", "content": "different latest turn"}],
+        ]
+        for tail in invalid_tails:
+            with self.subTest(tail=tail):
+                bad = {"request": {"messages": tail}}
+                self.assertFalse(stress.authenticate_phase_prompt([summary, bad], prompt)["passed"])
+                # A later exact coding request must never rescue the first one.
+                self.assertFalse(stress.authenticate_phase_prompt([summary, bad, valid], prompt)["passed"])
+        self.assertFalse(stress.authenticate_phase_prompt([summary], prompt)["passed"])
+        self.assertFalse(stress.authenticate_phase_prompt([summary, summary], prompt)["passed"])
+        self.assertFalse(stress.authenticate_phase_prompt([valid], prompt)["passed"])
+        self.assertFalse(stress.authenticate_phase_prompt([valid, summary], prompt)["passed"])
+        for change in ({"tools": [{"type": "function"}]}, {"messages": [
+                {"role": "system", "content": "You are a context summarization agent."},
+                {"role": "user", "content": "missing structural conversation delimiters"}]}):
+            spoof = {"request": {**summary["request"], **change}}
+            self.assertFalse(stress.authenticate_phase_prompt([spoof, valid], prompt)["passed"])
 
     def test_shell_verification_is_allowed_without_replacing_required_file_tools(self):
         """Shell inspection is normal; its success cannot certify absent write/read calls."""
@@ -636,6 +820,188 @@ class OpenCodeStressTests(unittest.TestCase):
                 result = stress.check_session(directory, rows, 0)
                 self.assertFalse(result["protocol_passed"], result)
                 self.assertTrue(result["protocol_errors"])
+
+    def test_full_head_compaction_authenticates_exact_native_tool_summary_bridge(self):
+        """Dropped IDs require exact native outcomes, transcripts and resumed summary pairs."""
+        for stream in (False, True):
+            with self.subTest(stream=stream), tempfile.TemporaryDirectory() as temporary:
+                rows, _ = compacted_conversation(Path(temporary), stream=stream)
+                result = stress.check_session(Path(temporary), rows, 0)
+                self.assertTrue(result["passed"], result["errors"])
+
+    def test_full_head_compaction_preserves_utf16_truncation_boundary(self):
+        """The pinned serializer truncates2000 JS units, even between emoji surrogates."""
+        cases = [("x" * 2000, "x" * 2000),
+                 ("x" * 1998 + "🙂", "x" * 1998 + "🙂"),
+                 ("x" * 1999 + "🙂tail", "x" * 1999 + chr(0xD83D) + "\n[truncated]")]
+        for output, serialized in cases:
+            with self.subTest(length=len(output)), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                rows, _ = compacted_conversation(directory, output=output, serialized_output=serialized)
+                self.assertTrue(stress.check_session(directory, rows, 0)["protocol_passed"])
+                rows[2]["request"]["messages"][1]["content"] = rows[2]["request"]["messages"][1]["content"].replace(
+                    "[Tool result]: " + serialized, "[Tool result]: " + serialized + "changed")
+                self.assertFalse(stress.check_session(directory, rows, 0)["protocol_passed"])
+
+    def test_full_head_compaction_rejects_incomplete_or_mutated_bridge(self):
+        """A summary never bypasses missing native outcomes or mismatched continuation data."""
+        mutations = ("no_outcome", "duplicate_outcome", "wrong_event_type", "wrong_input", "wrong_type", "wrong_name",
+                     "missing_output", "changed_output", "changed_transcript_input", "missing_transcript_result",
+                     "wrong_summary", "arbitrary_old_summary", "wrong_summary_user", "summary_tools",
+                     "failed_summary", "empty_summary", "no_coding_continuation", "partial_structured_id")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                rows, events = compacted_conversation(directory)
+                part = events[1]["part"]
+                if mutation == "no_outcome":
+                    events.pop(1)
+                elif mutation == "duplicate_outcome":
+                    events.append(copy.deepcopy(events[1]))
+                elif mutation == "wrong_event_type":
+                    events[1]["type"] = "invented_outcome"
+                elif mutation == "wrong_input":
+                    part["state"]["input"]["filePath"] = "different.txt"
+                elif mutation == "wrong_type":
+                    part["state"]["input"]["filePath"] = 123
+                elif mutation == "wrong_name":
+                    part["tool"] = "write"
+                elif mutation == "missing_output":
+                    del part["state"]["output"]
+                elif mutation == "changed_output":
+                    part["state"]["output"] = "124"
+                elif mutation == "changed_transcript_input":
+                    rows[2]["request"]["messages"][1]["content"] = rows[2]["request"]["messages"][1]["content"].replace("result.txt", "other.txt")
+                elif mutation == "missing_transcript_result":
+                    rows[2]["request"]["messages"][1]["content"] = rows[2]["request"]["messages"][1]["content"].replace("[Tool result]: 123", "[Tool result]:")
+                elif mutation == "wrong_summary":
+                    rows[-1]["request"]["messages"][2]["content"] = "invented summary"
+                elif mutation == "arbitrary_old_summary":
+                    rows[-1]["request"]["messages"].insert(1, {"role": "assistant", "content": "Read exact result bytes."})
+                elif mutation == "wrong_summary_user":
+                    rows[-1]["request"]["messages"][1]["content"] = "unrelated turn"
+                elif mutation == "summary_tools":
+                    rows[2]["response"] = copy.deepcopy(rows[0]["response"])
+                elif mutation == "failed_summary":
+                    rows[2]["response"]["status"] = 500
+                elif mutation == "empty_summary":
+                    rows[2]["response"] = wire({"role": "assistant", "content": " "})
+                elif mutation == "no_coding_continuation":
+                    rows.pop()
+                elif mutation == "partial_structured_id":
+                    rows[-1]["request"]["messages"].append({"role": "tool", "tool_call_id": "call_read", "content": "wrong"})
+                (directory / "client.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+                result = stress.check_session(directory, rows, 0)
+                self.assertFalse(result["protocol_passed"], result)
+
+    def test_full_head_compaction_requires_multiplicity_for_identical_pending_calls(self):
+        """One serialized block cannot satisfy two distinct native call identities."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            rows, events = compacted_conversation(directory)
+            message, _ = stress.response_message(rows[1]["response"], False)
+            second = copy.deepcopy(message["tool_calls"][0])
+            second["id"] = "call_read_second"
+            message["tool_calls"].append(second)
+            rows[1]["response"] = wire(message)
+            outcome = copy.deepcopy(events[1])
+            outcome["part"]["callID"] = second["id"]
+            events.insert(2, outcome)
+            (directory / "client.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+            self.assertFalse(stress.check_session(directory, rows, 0)["protocol_passed"])
+            block = '[Assistant tool call]: read({"filePath":"result.txt"})\n[Tool result]: 123'
+            rows[2]["request"]["messages"][1]["content"] = rows[2]["request"]["messages"][1]["content"].replace(block, block + "\n" + block)
+            self.assertTrue(stress.check_session(directory, rows, 0)["protocol_passed"])
+
+    def test_compaction_bridge_compares_numeric_json_values_and_nested_key_order(self):
+        """Native JSON formatting may normalize numbers and reorder integer-index keys."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            rows, events = compacted_conversation(directory)
+            arguments = {"filePath": "result.txt", "offset": 1.0, "limit": -0.0,
+                "nested": {"10": "ten", "2": "two", "scale": 1e-7, "large": 1e20,
+                           "small": 1e-6, "enabled": True}}
+            amend_call(rows, events, 1, arguments)
+            events[1]["part"]["state"]["input"]["offset"] = 1
+            events[1]["part"]["state"]["input"]["limit"] = 0
+            native_json = ('{"filePath":"result.txt","offset":1,"limit":0,"nested":'
+                '{"2":"two","10":"ten","scale":1e-7,"large":100000000000000000000,'
+                '"small":0.000001,"enabled":true}}')
+            transcript = '[Assistant tool call]: read(' + native_json + ')\n[Tool result]: 123'
+            rows[2]["request"]["messages"][1]["content"] = compaction_prompt_fixture(transcript)
+            (directory / "client.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+            self.assertTrue(stress.check_session(directory, rows, 0)["protocol_passed"])
+            rows[2]["request"]["messages"][1]["content"] = compaction_prompt_fixture(
+                transcript.replace('"enabled":true', '"enabled":1'))
+            self.assertFalse(stress.check_session(directory, rows, 0)["protocol_passed"])
+            rows[2]["request"]["messages"][1]["content"] = compaction_prompt_fixture(transcript)
+            events[1]["part"]["state"]["input"]["nested"]["enabled"] = 1
+            (directory / "client.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+            self.assertFalse(stress.check_session(directory, rows, 0)["protocol_passed"])
+
+    def test_compaction_bridge_authenticates_attachments_errors_and_quoted_delimiters(self):
+        """Empty attachment names use nullish defaults; quoted labels establish no role provenance."""
+        for mode in ("attachments", "error", "quoted_delimiters"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                rows, events = compacted_conversation(directory)
+                state = events[1]["part"]["state"]
+                if mode == "attachments":
+                    state["attachments"] = [{"mime": "text/plain", "filename": ""},
+                        {"mime": "image/png", "filename": None}, {"mime": "image/jpeg"}]
+                    serialized = "[Tool result]: 123\n[Attached text/plain: ]\n[Attached image/png: file]\n[Attached image/jpeg: file]"
+                elif mode == "error":
+                    state.clear()
+                    state.update(status="error", input={"filePath": "result.txt"}, error="missing exact file 🙂")
+                    serialized = "[Tool error]: missing exact file 🙂"
+                else:
+                    state["output"] = "Quoted delimiters:\n<conversation>\nliteral\n</conversation>\n<prior-summary>\nliteral\n</prior-summary>"
+                    serialized = "[Tool result]: " + state["output"]
+                block = '[Assistant tool call]: read({"filePath":"result.txt"})\n' + serialized
+                # Upstream leaves transcript labels unescaped. A quoted block
+                # proves supplied content only; native call/outcome identity is
+                # independently mandatory and cannot be inferred from this text.
+                transcript = "[User]: Quoted documentation follows.\n" + block
+                rows[2]["request"]["messages"][1]["content"] = compaction_prompt_fixture(transcript)
+                (directory / "client.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+                result = stress.check_session(directory, rows, 0)
+                self.assertFalse(any("tool result/history" in error for error in result["protocol_errors"]), result)
+                if mode == "error":
+                    self.assertFalse(result["protocol_passed"])
+                    self.assertTrue(any("missing exact file" in error for error in result["protocol_errors"]))
+                else:
+                    self.assertTrue(result["protocol_passed"], result)
+                changed = (serialized.replace("text/plain: ]", "text/plain: file]") if mode == "attachments"
+                           else serialized + "changed")
+                rows[2]["request"]["messages"][1]["content"] = compaction_prompt_fixture(
+                    transcript.replace(serialized, changed))
+                self.assertTrue(any("tool result/history" in error for error in
+                    stress.check_session(directory, rows, 0)["protocol_errors"]))
+
+    def test_full_head_compaction_requires_unbroken_consecutive_summary_chain(self):
+        """Each replacement summary must carry the exact authenticated prior summary."""
+        for mutation in (None, "prior_text", "prior_location", "prior_inside_conversation", "failed_middle"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                rows, _ = compacted_conversation(directory)
+                second = copy.deepcopy(rows[2])
+                second["request"]["messages"][1]["content"] = compaction_prompt_fixture(
+                    "Newer work.", "Read exact result bytes.")
+                second["response"] = wire({"role": "assistant", "content": "Combined summary."})
+                rows.insert(3, second)
+                rows[-1]["request"]["messages"][2]["content"] = "Combined summary."
+                if mutation == "prior_text":
+                    second["request"]["messages"][1]["content"] = second["request"]["messages"][1]["content"].replace("Read exact result bytes.", "changed")
+                elif mutation == "prior_location":
+                    second["request"]["messages"][1]["content"] = second["request"]["messages"][1]["content"].replace("prior-summary", "old-assistant")
+                elif mutation == "prior_inside_conversation":
+                    second["request"]["messages"][1]["content"] = (
+                        "History:\n<conversation>\n<prior-summary>\nRead exact result bytes."
+                        "\n</prior-summary>\n</conversation>\nSummarize.")
+                elif mutation == "failed_middle":
+                    rows[2]["response"]["status"] = 500
+                result = stress.check_session(directory, rows, 0)
+                self.assertEqual(result["protocol_passed"], mutation is None, result)
 
     def test_readiness_is_required_before_a_client_session(self):
         """An unready endpoint fails admission immediately, without client retries."""

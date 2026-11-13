@@ -10,10 +10,10 @@
  * reference-count increment, lock, environment lookup, or allocation in the
  * inference path.
  *
- * Actual enabled records remain protected by the collector mutex. Callers that
- * need expensive arguments or tags should still guard their construction with
- * @ref PerfStatsCollector::isDomainEnabled; the policy cache makes that guard
- * economical in both enabled and disabled configurations.
+ * Only admitted record families enter the mutex-protected retained map; an export
+ * filter must not hide accumulating sibling diagnostics. Callers constructing
+ * expensive arguments or tags should additionally use the same immutable
+ * @ref PerfStatsCollector::isRecordFamilyEnabled gate before construction.
  */
 
 #include "PerfStatsCollector.h"
@@ -543,7 +543,7 @@ namespace llaminar2
         /** Append one delimited step to both independent digest lanes. */
         void appendSequenceStep(
             PerfStatAccumulator &record,
-            std::initializer_list<uint64_t> words) noexcept
+            std::span<const uint64_t> words) noexcept
         {
             constexpr uint64_t kLowOffset = 14695981039346656037ull;
             constexpr uint64_t kLowPrime = 1099511628211ull;
@@ -577,7 +577,7 @@ namespace llaminar2
 
         /** @brief Retain exact extrema using one fixed-width vector pair per counter family. */
         void observeSequenceRanges(PerfStatAccumulator &record,
-            std::initializer_list<uint64_t> words)
+            std::span<const uint64_t> words)
         {
             if (record.count == 0u)
             {
@@ -692,7 +692,69 @@ namespace llaminar2
             out << contents;
             return true;
         }
+        /** @brief Mutate the sole counter map for bound, ordinary and batched producers.
+         * @param key Original complete semantic key; no caller retains an accumulator.
+         * @param batch Actual observation count and summed value.
+         * @throws std::invalid_argument If an empty batch claims a nonzero value.
+         * @throws std::logic_error If an existing family requires sequence evidence.
+         * @throws std::overflow_error Before changing an existing overflowing count.
+         */
+        void addCounterObservationBatch(const PerfStatKey &key,
+            PerfStatsCollector::CounterObservationBatch batch)
+        {
+            if (batch.observations == 0)
+            {
+                if (batch.value != 0.0)
+                    throw std::invalid_argument("An empty counter observation batch has a nonzero value");
+                return;
+            }
+            if (!PerfStatsCollector::isRecordFamilyEnabled(key.domain, key.name))
+                return;
+            auto &s = state();
+            std::lock_guard<std::mutex> lock(s.mutex);
+            auto entry = s.records.try_emplace(key).first;
+            auto &record = entry->second;
+            if (record.sequence_word_count != 0u)
+                throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
+            if (batch.observations > std::numeric_limits<uint64_t>::max() - record.count)
+                throw std::overflow_error("PerfStats counter observation count overflow");
+            record.kind = PerfStatRecord::Kind::Counter;
+            record.count += batch.observations;
+            record.value += batch.value;
+            ++s.version;
+        }
+
     } // namespace
+
+    /** @brief Stable metadata only; the collector owns all mutable accumulators. */
+    struct PerfStatsCollector::CounterIdentity::Impl
+    {
+        PerfStatKey key;
+    };
+
+    PerfStatsCollector::CounterIdentity PerfStatsCollector::bindCounter(
+        std::string domain, std::string name, std::string phase,
+        std::string device, Tags tags)
+    {
+        if (domain.empty() || name.empty())
+            throw std::invalid_argument("Counter identity requires domain and name");
+        return CounterIdentity(std::make_shared<const CounterIdentity::Impl>(
+            CounterIdentity::Impl{PerfStatKey{PerfStatRecord::Kind::Counter,
+                std::move(domain), std::move(name), std::move(phase),
+                std::move(device), std::move(tags)}}));
+    }
+
+    void PerfStatsCollector::addCounter(const CounterIdentity &identity, double value)
+    {
+        addCounter(identity, CounterObservationBatch{.observations=1u, .value=value});
+    }
+
+    void PerfStatsCollector::addCounter(const CounterIdentity &identity, CounterObservationBatch batch)
+    {
+        if (!identity.impl_)
+            throw std::invalid_argument("Counter identity has been moved from");
+        addCounterObservationBatch(identity.impl_->key, batch);
+    }
 
     bool PerfStatsCollector::isEnabled()
     {
@@ -702,6 +764,24 @@ namespace llaminar2
     bool PerfStatsCollector::isDomainEnabled(std::string_view domain)
     {
         return collectionPolicy().requestsDomain(domain);
+    }
+
+    bool PerfStatsCollector::isRecordFamilyEnabled(std::string_view domain, std::string_view name)
+    {
+        const auto& policy=collectionPolicy();
+        if(name.empty() || !policy.requestsDomain(domain))return false;
+        if(policy.collect_all_domains ||
+           ((domain=="stage_cpu" || domain=="stage_cpu_detail") && policy.collect_cpu_stage_family) ||
+           ((domain=="stage_gpu" || domain=="mtp_stage_gpu") && policy.collect_gpu_stage_family))return true;
+        for(const auto& filter:policy.filters) {
+            if(filter=="*" || filter=="all" || filter==domain)return true;
+            if(filter.size()>domain.size() && filter.starts_with(domain) && filter[domain.size()]=='.') {
+                const auto requested=std::string_view(filter).substr(domain.size()+1u);
+                if(name==requested || (name.size()>requested.size() && name.starts_with(requested) &&
+                   name[requested.size()]=='.'))return true;
+            }
+        }
+        return false;
     }
 
     bool PerfStatsCollector::cpuStageTimingEnabled()
@@ -786,39 +866,27 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isDomainEnabled(domain))
-            return;
-
-        PerfStatKey key;
-        key.kind = PerfStatRecord::Kind::Counter;
-        key.domain = std::move(domain);
-        key.name = std::move(name);
-        key.phase = std::move(phase);
-        key.device = std::move(device);
-        key.tags = std::move(tags);
-
-        auto &s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
-        auto &record = s.records[key];
-        if (record.sequence_word_count != 0u)
-            throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
-        record.kind = PerfStatRecord::Kind::Counter;
-        record.count += 1;
-        record.value += value;
-        ++s.version;
+        addCounter(std::move(domain), std::move(name),
+            CounterObservationBatch{.observations = 1u, .value = value},
+            std::move(phase), std::move(device), std::move(tags));
     }
 
-    void PerfStatsCollector::addCounterWithSequence(
-        std::string domain, std::string name, double value,
-        std::initializer_list<uint64_t> words,
-        std::string phase, std::string device, Tags tags)
+    void PerfStatsCollector::addCounter(std::string domain, std::string name,
+        CounterObservationBatch batch, std::string phase, std::string device, Tags tags)
     {
-        if (!isDomainEnabled(domain))
-            return;
-        if (words.size() == 0u)
-            throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
-        PerfStatKey key{PerfStatRecord::Kind::Counter, std::move(domain),
+        const PerfStatKey key{PerfStatRecord::Kind::Counter, std::move(domain),
             std::move(name), std::move(phase), std::move(device), std::move(tags)};
+        addCounterObservationBatch(key, batch);
+    }
+
+    /** @brief Shared collector mutation for both cold-bound and ordinary sequence counters.
+     * @param key Original immutable counter dimensions, prepared by the existing caller API.
+     * @param value Completed observation increment.
+     * @param words Nonempty fixed lifecycle schema, already validated before locking.
+     * @throws std::logic_error For incompatible prior sequence dimensions, before mutation.
+     */
+    static void addCounterSequence(const PerfStatKey& key,double value,std::initializer_list<uint64_t> words)
+    {
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         auto &record = s.records[key];
@@ -836,6 +904,47 @@ namespace llaminar2
         ++s.version;
     }
 
+    void PerfStatsCollector::addCounterWithSequence(
+        std::string domain,std::string name,double value,std::initializer_list<uint64_t> words,
+        std::string phase,std::string device,Tags tags)
+    {
+        if(!isRecordFamilyEnabled(domain,name))return;
+        if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
+        const PerfStatKey key{PerfStatRecord::Kind::Counter,std::move(domain),std::move(name),
+            std::move(phase),std::move(device),std::move(tags)};
+        addCounterSequence(key,value,words);
+    }
+    void PerfStatsCollector::addCounterWithSequence(const CounterIdentity& identity,double value,
+        std::initializer_list<uint64_t> words)
+    {
+        if(!identity.impl_)throw std::invalid_argument("Counter identity has been moved from");
+        if(!isRecordFamilyEnabled(identity.impl_->key.domain,identity.impl_->key.name))return;
+        if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
+        addCounterSequence(identity.impl_->key,value,words);
+    }
+
+    bool PerfStatsCollector::matchesCounterSequence(const PerfStatRecord &record,
+        std::span<const uint64_t> words, std::size_t words_per_step)
+    {
+        if (record.kind != PerfStatRecord::Kind::Counter || words.empty() || words_per_step == 0 ||
+            words.size() % words_per_step != 0 || record.count != words.size() / words_per_step ||
+            record.sequence_word_count != words.size())
+            return false;
+
+        PerfStatAccumulator expected;
+        for (std::size_t offset = 0; offset < words.size(); offset += words_per_step)
+        {
+            const auto step = words.subspan(offset, words_per_step);
+            observeSequenceRanges(expected, step);
+            appendSequenceStep(expected, step);
+            ++expected.count;
+        }
+        return record.sequence_digest_lo == expected.sequence_digest_lo &&
+            record.sequence_digest_hi == expected.sequence_digest_hi &&
+            record.sequence_minimum_words == expected.sequence_minimum_words &&
+            record.sequence_maximum_words == expected.sequence_maximum_words;
+    }
+
     void PerfStatsCollector::recordTimingNs(
         std::string domain,
         std::string name,
@@ -844,7 +953,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isDomainEnabled(domain))
+        if (!isRecordFamilyEnabled(domain, name))
             return;
 
         PerfStatKey key;
@@ -873,7 +982,7 @@ namespace llaminar2
         std::initializer_list<uint64_t> words,
         std::string phase, std::string device, Tags tags)
     {
-        if (!isDomainEnabled(domain))
+        if (!isRecordFamilyEnabled(domain, name))
             return;
         if (words.size() == 0u)
             throw std::invalid_argument("PerfStats timer sequence requires lifecycle words");
@@ -904,7 +1013,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isDomainEnabled(domain))
+        if (!isRecordFamilyEnabled(domain, name))
             return;
         if (words.size() == 0u)
         {
@@ -1365,7 +1474,7 @@ namespace llaminar2
           device_(std::move(device)),
           tags_(std::move(tags))
     {
-        enabled_ = PerfStatsCollector::isDomainEnabled(domain_);
+        enabled_ = PerfStatsCollector::isRecordFamilyEnabled(domain_, name_);
         if (device_.empty() && ProfilingContext::hasDeviceContext())
             device_ = ProfilingContext::getCurrentDeviceKey();
         if (enabled_)

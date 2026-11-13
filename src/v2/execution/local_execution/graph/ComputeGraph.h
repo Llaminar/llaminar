@@ -9,10 +9,15 @@
  */
 
 #pragma once
+#include "collective/LocalTPCaptureSourceDefinition.h"
+#include "IRetainedGraphParticipants.h"
 
 #include "../../compute_stages/ComputeStages.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/GPUGraphMemoryContract.h"
+#include "IRetainedGraphStorageBoundary.h"
+#include "ReadAheadScheduling.h"
+#include <stdexcept>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -23,6 +28,13 @@
 
 namespace llaminar2
 {
+
+    /** @brief Select the complete DAG or only nodes executed by its main native units. */
+    enum class GraphLeafScope : uint8_t
+    {
+        All,           ///< Include the separately retained finite auxiliary body.
+        MainExecution, ///< Exclude auxiliary nodes and their outgoing dependency edges.
+    };
 
     /**
      * @brief Domain-wide identity for one participant-local capture unit.
@@ -168,6 +180,26 @@ namespace llaminar2
                    HeterogeneousTicketFollowerTransaction;
     }
 
+    class ReadAheadNativeResourceFamily;
+
+    /**
+     * @brief One immutable participant-local GPU read-ahead fork/gather/join.
+     *
+     * Hash publishes query IDs on the primary lane. Exactly one producer runs
+     * on the admitted side lane while independent primary work proceeds; the
+     * consumer imports its exact event. This is scheduling topology, never
+     * execution state. All source/output storage remains owned by graph stages.
+     */
+    struct GraphReadAheadBranch
+    {
+        std::string fork_node; ///< Primary producer of the complete device query.
+        std::string producer_node; ///< Sole independent side-lane gather/transfer stage.
+        std::string consume_node; ///< First primary reader of the side result.
+        std::shared_ptr<ReadAheadNativeResourceFamily> resources; ///< Shared native parent lifetime.
+        ReadAheadJoinPolicy join_policy=ReadAheadJoinPolicy::AtConsumer; ///< Explicit cold native-unit closure rule.
+        std::string join_node; ///< Frozen exact join anchor; actual PLE consumption remains distinct.
+    };
+
     /**
      * @brief Represents a node in the compute graph
      */
@@ -196,6 +228,18 @@ namespace llaminar2
     };
 
     /**
+     * @brief Shared rendezvous identity of one indivisible native graph transaction.
+     * This names the logical transaction only; participant-local stage/pointer
+     * signatures remain separate. It never turns internal packet waves into cuts.
+     */
+    struct GraphNativeTransactionCaptureContract
+    {
+        std::string identity; ///< Original source/invocation/geometry identity shared by participants.
+        std::string terminal_node; ///< Original sealed logical terminal retained in this complete graph.
+        bool operator==(const GraphNativeTransactionCaptureContract &) const = default;
+    };
+
+    /**
      * @brief Compute graph for execution
      *
      * A directed acyclic graph (DAG) of ComputeNodes with dependency tracking.
@@ -216,6 +260,148 @@ namespace llaminar2
         ComputeGraph(ComputeGraph &&) = default;
         ComputeGraph &operator=(ComputeGraph &&) = default;
 
+        /** @brief Execution permission belongs to graph topology, not current request data. */
+        enum class ExecutionPurpose { Executable, WorkspaceDeclaration };
+        /** @brief Permanently classify this topology as a geometry-only workspace declaration until clear(). */
+        void markWorkspaceDeclaration()
+        {
+            if(purpose_!=ExecutionPurpose::WorkspaceDeclaration){purpose_=ExecutionPurpose::WorkspaceDeclaration;noteTopologyMutation();}
+        }
+        /** @return Whether this graph is forbidden from every execution/capture path. */
+        bool isWorkspaceDeclaration() const noexcept {return purpose_==ExecutionPurpose::WorkspaceDeclaration;}
+        /** @brief Fail before context/cache/native access if geometry-only topology reaches execution. */
+        void requireExecutable() const
+        {
+            if(isWorkspaceDeclaration())throw std::invalid_argument("Workspace declaration graph is not executable or capturable");
+        }
+
+        /** @brief Declare one exclusive immutable-storage lane before graph capture.
+         * @param boundary Stable participant-local lifetime shared by serialized graph variants.
+         * @details Rebinding a declared lane is forbidden; concurrent graphs
+         * require distinct lanes. This declaration cannot submit model work.
+         */
+        void setRetainedStorageBoundary(std::shared_ptr<IRetainedGraphStorageBoundary> boundary)
+        {
+            if(!boundary||!boundary->device().is_gpu()||!boundary->captureIdentity()||
+                (storage_boundary_&&storage_boundary_!=boundary))
+                throw std::invalid_argument("ComputeGraph immutable storage boundary is invalid or was rebound");
+            if(!storage_boundary_){storage_boundary_=std::move(boundary);noteTopologyMutation();}
+        }
+        /** @brief Retain complete I/O lifetime when exporting this graph into a native parent. */
+        const std::shared_ptr<IRetainedGraphStorageBoundary> &retainedStorageBoundary() const noexcept
+        {return storage_boundary_;}
+
+        /** @brief Declare the actual source/reader transport relation; this is metadata, not query authority. */
+        void setRetainedParticipantDefinitionDomain(RetainedGraphParticipantDefinitionDomain domain){
+            if(!domain.source.is_gpu() || !domain.authority ||
+               (participant_definition_domain_ && *participant_definition_domain_!=domain))
+                throw std::invalid_argument("Graph changed its original source definition domain");
+            if(!participant_definition_domain_){participant_definition_domain_=domain;noteTopologyMutation();}
+        }
+        /**
+         * @brief Associate exact source signature variants with one original expert follower parent.
+         * @param definitions Complete checked source variants of the same finite family/row shape.
+         * Every token retains the same original transport domain. This cold
+         * graph metadata grants neither an independent enqueue nor a source permit.
+         * A source-free family leaves this association absent.
+         */
+        void setRetainedParticipantSourceVariants(
+            std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> definitions)
+        {
+            if (definitions.empty() || !participant_source_variants_.empty() || participant_source_plan_)
+                throw std::invalid_argument("Expert parent source variants are missing or already bound");
+            const auto domain = definitions.front() ? definitions.front()->definition().domain
+                : RetainedGraphParticipantDefinitionDomain{};
+            for (const auto& definition : definitions)
+            {
+                if (!definition || definition->definition().domain != domain)
+                    throw std::invalid_argument("Expert parent source variants have foreign original domains");
+                definition->requireCurrentDefinition();
+            }
+            if (participant_definition_domain_ && *participant_definition_domain_ != domain)
+                throw std::invalid_argument("Expert parent source variants changed the declared domain");
+            setRetainedParticipantDefinitionDomain(domain);
+            participant_source_variants_ = std::move(definitions);
+            noteTopologyMutation();
+        }
+        /** @return Original cold source associations, never a newest-token lookup. */
+        const auto& retainedParticipantSourceVariants() const noexcept { return participant_source_variants_; }
+
+        /**
+         * @brief Declare one finite participant-local body beside the model timeline.
+         * @param range Actual source/reader stages and exact model-ready/retirement frontiers.
+         * @throws std::invalid_argument For incomplete, cross-device, repeated or foreign declarations.
+         * The existing parent owns this graph-only body; it is never an independent executable.
+         */
+        void setRetainedParticipantAuxiliaryRange(RetainedGraphParticipantAuxiliaryRange range);
+        /** @return Immutable auxiliary stages, absent for the ordinary shared-only path. */
+        const auto& retainedParticipantAuxiliaryRange() const noexcept { return participant_auxiliary_range_; }
+        /** @brief Revalidate the full declared range only at cold construction/capture boundaries. */
+        void requireRetainedParticipantAuxiliaryRange() const;
+        /**
+         * @brief Authenticate the original rank-local mixed-GPU native-parent declaration.
+         * @throws std::invalid_argument If the envelope, original execution ownership,
+         * participant or stage topology cannot form one complete native executable.
+         * This cold eligibility check never grants source or native storage authority.
+         */
+        void requireRetainedParticipantNativeAuxiliaryParent() const;
+        /** @return Whether a named stage belongs exclusively to the declared finite body. */
+        bool isRetainedParticipantAuxiliaryNode(const std::string& name) const noexcept;
+
+        /** @return Original graph-declared source relation; no-PLE graphs have none. */
+        const auto& retainedParticipantDefinitionDomain()const noexcept{return participant_definition_domain_;}
+
+        /** @brief Declare one actual collective participant plan before source capture.
+         * @param plan Original closed source/participant declaration, never a substitute source executable.
+         * @throws std::invalid_argument For null, incomplete or conflicting invocation declarations.
+         */
+        void setRetainedParticipantSourcePlan(std::shared_ptr<const IRetainedGraphParticipantSourcePlan> plan)
+        {
+            if(!plan || !plan->captureIdentity() || (participant_source_plan_ && participant_source_plan_!=plan))
+                throw std::invalid_argument("ComputeGraph retained participant source plan is invalid or duplicated");
+            if(!participant_source_plan_){participant_source_plan_=std::move(plan);noteTopologyMutation();}
+        }
+        /** @return Original collective metadata; it never launches or captures model work. */
+        const std::shared_ptr<const IRetainedGraphParticipantSourcePlan>& retainedParticipantSourcePlan()const noexcept
+        {return participant_source_plan_;}
+
+        /** @brief Freeze explicit phase/implementation selection in native capture identity.
+         * @throws std::logic_error If a graph attempts to change an existing phase policy.
+         */
+        void setReadAheadPhasePolicy(ForwardExecutionPhase phase,ImmutableLookupInvocationSchedule selected)
+        {
+            const auto identity=immutableLookupPhaseIdentity(phase,selected);
+            if(read_ahead_phase_identity_ && read_ahead_phase_identity_!=identity)
+                throw std::logic_error("Graph cannot replace its immutable lookup phase policy");
+            if(!read_ahead_phase_identity_){read_ahead_phase_identity_=identity;noteTopologyMutation();}
+        }
+        /** @brief Declare and seal one admitted branch before capture.
+         * @param branch Exact existing nodes and original native resource owner.
+         * @throws std::invalid_argument On invalid topology, device or rebinding.
+         */
+        void setReadAheadBranch(GraphReadAheadBranch branch);
+        /** @return Frozen branch declaration; absent means the ordinary main lane. */
+        const std::optional<GraphReadAheadBranch>& readAheadBranch() const noexcept
+        {return read_ahead_branch_;}
+        /** @brief Plan the exact cache-owned recording stream before identity/preparation. */
+        void planReadAheadRecordingStream(void* recording);
+        /** @brief Freeze the source-derived native-unit join before preparation/cache identity. */
+        void resolveReadAheadJoin();
+        /** @brief Seal only the actual native capture owner's recording stream. */
+        void sealReadAheadRecordingStream(void* actual)
+        {if(read_ahead_branch_)read_ahead_recording_binding_.seal(actual);}
+        /** @brief Reject unsealed/mismatched recording before native event emission. */
+        void requireReadAheadRecordingSealed(void* actual)const
+        {if(read_ahead_branch_)read_ahead_recording_binding_.requireSealed(actual);}
+        /** @brief Resolve the executor-owned exact lane, rejecting parent-stream drift.
+         * @param name Existing stage name.
+         * @param primary Exact current native recording stream; parent submission is a separate authority.
+         * @return Exact non-null primary or admitted side stream.
+         */
+        void* executionStreamForNode(const std::string& name,void* primary) const;
+        /** @return Complete immutable native read-ahead closure identity, or zero. */
+        std::uint64_t readAheadCaptureIdentity() const noexcept;
+
         /**
          * @brief Add a node to the graph
          * @param name Unique node identifier
@@ -235,6 +421,18 @@ namespace llaminar2
          */
         ComputeGraph &addDependency(const std::string &node_name,
                                     const std::string &depends_on);
+
+        /**
+         * @brief Name the whole native transaction without enabling internal segmentation.
+         * @param contract Original shared transaction identity and exact sealed terminal.
+         * @return This original graph for declarative composition.
+         * @throws std::invalid_argument For empty/foreign terminal or conflicting identity/envelope.
+         * @note Merging changes transaction scope and drops standalone contracts on both graphs.
+         */
+        ComputeGraph &setNativeTransactionCaptureContract(GraphNativeTransactionCaptureContract contract);
+        /** @return Original whole-transaction contract, separate from per-node packet waves. */
+        const std::optional<GraphNativeTransactionCaptureContract> &nativeTransactionCaptureContract() const noexcept
+        { return native_transaction_capture_contract_; }
 
         /**
          * @brief Attach an explicit LocalTP capture-wave contract to one node.
@@ -391,6 +589,8 @@ namespace llaminar2
          *         reports true.
          */
         std::unordered_set<std::string> collectiveNodeNames() const;
+        /** @return Whether cold planning contains a collective requiring runtime-backend capture support, preserving all semantic collective identities. */
+        bool requiresCollectiveRuntimeCapture(const std::unordered_set<std::string>* named=nullptr)const;
 
         /**
          * @brief Clear the graph
@@ -417,10 +617,11 @@ namespace llaminar2
         std::vector<std::string> getRootNodes() const;
 
         /**
-         * @brief Get the names of all leaf nodes (nodes with no dependents)
-         * @return Vector of leaf node names
+         * @brief Get leaf names in the selected execution projection
+         * @param scope Complete DAG by default; main decorators exclude finite auxiliary work.
+         * @return Names with no dependents inside the selected projection.
          */
-        std::vector<std::string> getLeafNodes() const;
+        std::vector<std::string> getLeafNodes(GraphLeafScope scope = GraphLeafScope::All) const;
 
         /**
          * @brief Set the terminal node name for this graph
@@ -535,11 +736,21 @@ namespace llaminar2
         bool execution_stages_dirty_ = true;                    ///< Invalidated whenever graph topology/ownership changes.
         std::vector<FastScheduleEntry> fast_schedule_;   ///< Pre-computed decode schedule
         std::string terminal_node_;                      ///< Explicit terminal node (set by sub-graph builders)
+        std::optional<GraphNativeTransactionCaptureContract> native_transaction_capture_contract_; ///< Graph-scoped logical parent identity, never inherited from a merged child.
         GraphNativeCaptureEnvelope native_capture_envelope_ =
             GraphNativeCaptureEnvelope::Ordinary;        ///< Typed graph-wide capture lifecycle selected by lowering.
         uint64_t topology_generation_ = 1;               ///< Monotonic captured-topology identity; zero is never published.
         GPUGraphExecutableClass executable_memory_class_ =
             GPUGraphExecutableClass::General; ///< Admission/capture shape, preserved across request reset.
+        ExecutionPurpose purpose_=ExecutionPurpose::Executable; ///< Monotone non-executable purpose; moves/merges preserve it.
+        std::shared_ptr<const IRetainedGraphParticipantSourcePlan> participant_source_plan_;
+        std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary_;
+        ReadAheadRecordingBinding read_ahead_recording_binding_; ///< Exact recording/submission lifecycle, not GPU execution state.
+        std::uint64_t read_ahead_phase_identity_=0; ///< Typed phase and selected implementation, independent of M.
+        std::optional<RetainedGraphParticipantAuxiliaryRange> participant_auxiliary_range_; ///< Immutable same-parent finite body, never live cache state.
+        std::optional<GraphReadAheadBranch> read_ahead_branch_; ///< Immutable native stream/event topology. ///< Explicit retained native I/O lane.
+        std::optional<RetainedGraphParticipantDefinitionDomain> participant_definition_domain_;
+        std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> participant_source_variants_;
     };
 
 } // namespace llaminar2

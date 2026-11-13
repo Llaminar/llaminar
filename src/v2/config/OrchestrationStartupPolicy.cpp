@@ -55,6 +55,10 @@ namespace llaminar2
 
     void publishOrchestrationStartupPolicy(const OrchestrationConfig &config)
     {
+        // A lossless metadata document may describe an internal runtime scope;
+        // public startup must reject it before publishing any process policy.
+        if (config.mtp.depth_policy.scope != MTPDepthPolicyScope{})
+            throw std::invalid_argument("MTP learned-policy scope is runtime-derived and cannot be authored in startup configuration");
         std::optional<std::string> buckets;
         if (config.prefill_max_bucket_size)
         {

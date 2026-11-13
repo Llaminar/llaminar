@@ -131,6 +131,8 @@ namespace llaminar2
         std::optional<OrchestrationPlanningWorkload> workload;
         /** Unlisted backends remain governed by only_backends, not implicitly excluded. */
         std::optional<std::vector<AutomaticBackendDeviceCount>> device_counts;
+        /** Exact ordered PP participant counts; device identities and layer cuts remain automatic. */
+        std::optional<std::vector<int>> pipeline_stage_widths;
 
         /** @return Whether any hard constraint or soft hint was explicitly supplied. */
         [[nodiscard]] bool specified() const noexcept;
@@ -188,6 +190,8 @@ namespace llaminar2
     std::vector<OrchestrationStrategy> parseOrchestrationStrategyList(std::string_view value);
     /** @return Exact positive backend=count pairs; duplicate backends are errors. */
     std::vector<AutomaticBackendDeviceCount> parseAutomaticDeviceCounts(std::string_view value);
+    /** @return Nonempty ordered positive PP widths; repetition is legal, overflow is fatal. */
+    std::vector<int> parseAutomaticPipelineStageWidths(std::string_view value);
     /**
      * @brief Resolve search versus apply once from explicit configuration intent.
      * @param config Shared runtime configuration after CLI/YAML merge.

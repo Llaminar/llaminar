@@ -2,8 +2,8 @@
  * @file CUDARouterQ8Prefill.cu
  * @brief Geometry-driven tensor-core router launch with fixed block32 arithmetic.
  *
- * Hardware queries are explicit setup operations. Captured launches consume
- * those immutable limits and persistent operands. Power-of-two hidden widths
+ * Setup authenticates the exact stream and borrows already admitted hardware
+ * limits. Captured launches consume that binding and persistent operands. Power-of-two hidden widths
  * permit constant propagation independently of model, expert count and M.
  * Other widths retain the same first-class tensor-core implementation and tree.
  */
@@ -19,14 +19,10 @@ namespace llaminar2::cuda
         const auto native = static_cast<cudaStream_t>(stream);
         cudaStreamCaptureStatus status{};
         int actual_device = -1;
-        RouterQ8PrefillHardware observed{.device = device};
         if (cudaStreamIsCapturing(native, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone ||
-            cudaStreamGetDevice(native, &actual_device) != cudaSuccess || actual_device != device ||
-            cudaDeviceGetAttribute(&observed.multiprocessors, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&observed.block_slots_per_sm, cudaDevAttrMaxBlocksPerMultiprocessor, device) != cudaSuccess ||
-            !observed.valid()) return false;
-        result = observed;
-        return true;
+            cudaStreamGetDevice(native, &actual_device) != cudaSuccess || actual_device != device) return false;
+        return bindRouterQ8PrefillHardware(device, actual_device,
+            status != cudaStreamCaptureStatusNone, cudaHardwareMetadata().at(device), result);
     }
 
     namespace

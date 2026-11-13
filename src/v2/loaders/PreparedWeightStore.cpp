@@ -1,10 +1,15 @@
 #include "PreparedWeightStore.h"
+#include "tensors/PreparedCPUWeightTensor.h"
+#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "loaders/PreparedWeightIdentityContract.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "GPUVramPreflight.h"
 #include "transfer/TransferEngine.h"
 #include "../tensors/TensorClasses.h"
 #include "../tensors/TensorKernels.h"
 
+#include <algorithm>
+#include <type_traits>
 #include <stdexcept>
 #include <limits>
 #include <unordered_set>
@@ -19,6 +24,10 @@
  * cleanup by resetting dynamic kernel state while preserving long-lived packed
  * weights. Real kernel registration also authenticates the sealed floating
  * operand policy before publishing tensor state or an adoptable prepared ref.
+ * Adoption and physical weight-plan lowering share one representation identity
+ * contract, including normalized intervals and original projection control blocks.
+ * CPU packed preparation binds final allocator-rounded storage directly to the
+ * persistent owner; borrowed floating sources create no second storage claim.
  */
 
 namespace llaminar2
@@ -115,81 +124,14 @@ namespace llaminar2
                    stored.cols_per_expert == requested.cols_per_expert;
         }
 
-        bool isEmptySlice(const WeightSliceSpec &slice)
+        /** @brief Compare the shared production identity after existing store/source checks. */
+        bool compatiblePreparedAdoptionBinding(const WeightBinding &stored, const WeightBinding &requested)
         {
-            return slice.source_rows == 0 &&
-                   slice.source_cols == 0 &&
-                   slice.row_start == 0 &&
-                   slice.row_count == 0 &&
-                   slice.col_start == 0 &&
-                   slice.col_count == 0 &&
-                   slice.expert_start == 0 &&
-                   slice.expert_count == 0 &&
-                   slice.expert_ids.empty() &&
-                   !slice.inner_is_presliced;
+            const auto a = PreparedWeightIdentityContract::fromBinding(stored);
+            const auto b = PreparedWeightIdentityContract::fromBinding(requested);
+            return a && b && a->compatible(*b);
         }
 
-        bool isFullTensorSlice(const WeightSliceSpec &slice, const TensorBase *tensor)
-        {
-            if (!tensor || tensor->shape().size() < 2)
-                return false;
-            const auto &shape = tensor->shape();
-            return slice.row_start == 0 &&
-                   slice.col_start == 0 &&
-                   slice.expert_start == 0 &&
-                   slice.expert_count == 0 &&
-                   slice.expert_ids.empty() &&
-                   !slice.inner_is_presliced &&
-                   slice.row_count == shape[0] &&
-                   slice.col_count == shape[1] &&
-                   (slice.source_rows == 0 || slice.source_rows == shape[0]) &&
-                   (slice.source_cols == 0 || slice.source_cols == shape[1]);
-        }
-
-        bool sameWeightSliceForAdoption(
-            const WeightSliceSpec &stored,
-            const TensorBase *stored_tensor,
-            const WeightSliceSpec &requested,
-            const TensorBase *requested_tensor)
-        {
-            const bool stored_empty = isEmptySlice(stored);
-            const bool requested_empty = isEmptySlice(requested);
-            if (stored_empty && requested_empty)
-                return true;
-            if (stored_empty)
-                return isFullTensorSlice(requested, requested_tensor);
-            if (requested_empty)
-                return isFullTensorSlice(stored, stored_tensor);
-
-            return stored.source_rows == requested.source_rows &&
-                   stored.source_cols == requested.source_cols &&
-                   stored.row_start == requested.row_start &&
-                   stored.row_count == requested.row_count &&
-                   stored.col_start == requested.col_start &&
-                   stored.col_count == requested.col_count &&
-                   stored.expert_start == requested.expert_start &&
-                   stored.expert_count == requested.expert_count &&
-                   stored.expert_ids == requested.expert_ids &&
-                   stored.inner_is_presliced == requested.inner_is_presliced;
-        }
-
-        bool compatiblePreparedAdoptionBinding(
-            const WeightBinding &stored,
-            const WeightBinding &requested)
-        {
-            if (!stored.tensor || !requested.tensor)
-                return false;
-            if (stored.tensor->shape() != requested.tensor->shape())
-                return false;
-            if (stored.tensor->native_type() != requested.tensor->native_type() ||
-                stored.floating_operand_precision != requested.floating_operand_precision)
-                return false;
-            return sameWeightSliceForAdoption(
-                stored.slice,
-                stored.tensor,
-                requested.slice,
-                requested.tensor);
-        }
     }
 
     PreparedWeightStore::PreparedWeightStore(ModelContextId model_id)
@@ -284,9 +226,58 @@ namespace llaminar2
         const PreparedWeightKind kind = inferPreparedKind(device);
         validateBindingForStore(binding, model_id_, kind);
 
-        auto owned = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(
-            binding.tensor, device, llaminar::v2::kernels::KernelFactory::GemmPreparationKind::AUTO,
-            binding.floating_operand_precision);
+        auto requested_placement = CPUWeightStoragePlacement::local();
+        if(binding.cpu_joint_source) {
+            const auto& selection=*binding.cpu_joint_source;
+            const auto& member=selection.participant();
+            if(device!=DeviceId::cpu() || !binding.projection_ownership ||
+               selection.ownership()!=*binding.projection_ownership ||
+               selection.layer()!=binding.identity.layer || !selection.contains(binding.identity.expert) ||
+               member.domain_name!=binding.identity.overlay_domain ||
+               member.world_rank!=binding.identity.overlay_participant_world_rank ||
+               member.domain_participant_index!=binding.identity.overlay_participant_index)
+                throw std::invalid_argument("CPU joint preparation changed its original source/NUMA member");
+            requested_placement=CPUWeightStoragePlacement::onNode(member.address.numa_node);
+        }
+        // Resolve the requested physical node before the single accounting
+        // boundary. Final factory calls receive only this normalized placement;
+        // no joint-fragment branch may overwrite its admitted authority.
+        auto placement = CPUWeightStoragePlacement::local();
+        if (device.is_cpu())
+        {
+            if (const auto authority = physicalMemoryAuthority())
+                placement = CPUWeightStoragePlacement::accounted(authority, device, memory_owner, requested_placement);
+            else
+                throw std::logic_error("CPU GEMM preparation requires the admitted physical-memory authority");
+        }
+
+        using Factory=llaminar::v2::kernels::KernelFactory;
+        std::shared_ptr<Factory::PreparedGemmHandle> owned;
+        if(binding.cpu_joint_source) {
+            if(binding.floating_operand_precision!=FloatingActivationOperandPrecision::Native)
+                throw std::invalid_argument("CPU joint source requires its original native arithmetic");
+            // The existing expert factory owns final floating bytes as well as
+            // native packed bytes on the declared NUMA node. Dense GEMM's
+            // borrowed floating source is not a fragment placement certificate.
+            auto kernel=Factory::prepareExpertGemmLocal(
+                std::shared_ptr<const TensorBase>(binding.tensor_owner),device,
+                Factory::GemmPreparationKind::AUTO, placement);
+            if(kernel) {
+                const auto* unpackable=IINT8Unpackable::fromTensor(binding.tensor);
+                const auto kind=unpackable && unpackable->vnniFormatInfo()
+                    ? Factory::GemmPreparationKind::CPU_PACKED : Factory::GemmPreparationKind::FLOATING_POINT;
+                owned=std::make_shared<Factory::PreparedGemmHandle>();
+                owned->tensor=binding.tensor;owned->device_id=device;owned->kind=kind;
+                owned->variant=static_cast<int>(binding.tensor->native_type());
+                owned->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();
+                owned->prepared_weights->kind=kind;
+                owned->prepared_weights->owned_kernel=std::move(kernel);
+                owned->prepared_weights->kernel=owned->prepared_weights->owned_kernel.get();
+            }
+        } else {
+            owned=Factory::prepareGemmHandleLocal(binding.tensor,device,Factory::GemmPreparationKind::AUTO,
+                binding.floating_operand_precision, placement);
+        }
         if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareGemm failed for: " + binding.identity.canonical_name);
 
@@ -295,7 +286,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(owned)};
+        publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, std::move(owned), memory_owner});
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -317,7 +308,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, nullptr};
+        publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, nullptr});
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -332,8 +323,11 @@ namespace llaminar2
         const WeightBinding &binding,
         PreparedWeightKind kind,
         DeviceId device,
-        std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle)
+        std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle,
+        std::optional<PhysicalMemoryOwner> memory_owner)
     {
+        if (memory_owner && !isPersistentWeightOwner(*memory_owner))
+            throw std::invalid_argument("Registered prepared GEMM requires an explicit persistent owner");
         validateBindingForStore(binding, model_id_, kind);
         // A real engine is the arithmetic authority. Reject a contradictory
         // advertised binding before publishing either tensor state or a ref.
@@ -352,7 +346,7 @@ namespace llaminar2
             stored.tensor->publishPreparedDeviceState();
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle)};
+        publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, std::move(handle), memory_owner});
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -361,6 +355,56 @@ namespace llaminar2
             device,
             toString(kind));
         return ref;
+    }
+
+    void PreparedWeightStore::removeGemmMembership(const AdoptionNameKey& name,
+        AdoptionTensorKey tensor, PreparedBindingKey key) noexcept
+    {
+        const auto remove = [&](auto& index, const auto& lookup) {
+            const auto found = index.find(lookup);
+            if (found == index.end()) return;
+            auto& keys = found->second;
+            const auto member = std::find(keys.begin(), keys.end(), key);
+            if (member != keys.end()) keys.erase(member);
+            if (keys.empty()) index.erase(found);
+        };
+        if (!name.name.empty()) remove(adoption_names_, name);
+        if (tensor.tensor) remove(adoption_tensors_, tensor);
+    }
+
+    void PreparedWeightStore::publishGemmEntry(PreparedBindingKey key, Entry entry)
+    {
+        static_assert(std::is_nothrow_move_assignable_v<Entry>);
+        const AdoptionNameKey name{entry.binding.identity.canonical_name, key.device};
+        const AdoptionTensorKey tensor{entry.binding.tensor, key.device};
+        const auto old = entries_.find(key);
+        // Copy all potentially allocating old metadata before touching the store.
+        const AdoptionNameKey old_name{old == entries_.end() ? std::string{} : old->second.binding.identity.canonical_name, key.device};
+        const AdoptionTensorKey old_tensor{old == entries_.end() ? nullptr : old->second.binding.tensor, key.device};
+        const AdoptionNameKey absent_name{{}, key.device};
+        bool name_added = false, tensor_added = false;
+        try {
+            if (!name.name.empty()) {
+                auto [bucket, inserted] = adoption_names_.try_emplace(name);
+                try { bucket->second.push_back(key); }
+                catch (...) { if (inserted) adoption_names_.erase(bucket); throw; }
+                name_added = true;
+            }
+            if (tensor.tensor) {
+                auto [bucket, inserted] = adoption_tensors_.try_emplace(tensor);
+                try { bucket->second.push_back(key); }
+                catch (...) { if (inserted) adoption_tensors_.erase(bucket); throw; }
+                tensor_added = true;
+            }
+            // Allocation failure leaves an existing owner untouched; replacing
+            // its Entry is noexcept, so both memberships commit together.
+            entries_.insert_or_assign(key, std::move(entry));
+        } catch (...) {
+            removeGemmMembership(name_added ? name : absent_name,
+                tensor_added ? tensor : AdoptionTensorKey{nullptr, key.device}, key);
+            throw;
+        }
+        removeGemmMembership(old_name, old_tensor, key);
     }
 
     bool PreparedWeightStore::adoptPreparedGemmForBinding(
@@ -409,31 +453,40 @@ namespace llaminar2
             return true;
         }
 
-        for (const auto &[id, entry] : entries_)
-        {
-            (void)id;
-            if (entry.ref.device != device)
-                continue;
-
-            const bool same_tensor = entry.binding.tensor == binding.tensor;
-            const bool same_canonical_name = !entry.binding.identity.canonical_name.empty() &&
-                                             entry.binding.identity.canonical_name == binding.identity.canonical_name;
-            if (!same_tensor && !same_canonical_name)
-                continue;
-            if (!compatiblePreparedAdoptionBinding(entry.binding, binding))
-                continue;
-
-            auto handle = entry.owned_handle;
-            if (!handle || !handle->prepared_weights)
-                continue;
-
-            validateBindingForStore(binding, model_id_, entry.ref.kind);
+        const Entry* selected = nullptr;
+        const auto consider = [&](const AdoptionKeys& candidates) {
+            for (const auto& key : candidates) {
+                const auto found = entries_.find(key);
+                if (found == entries_.end())
+                    throw std::logic_error("Prepared GEMM candidate lost its original entry");
+                const auto& entry = found->second;
+                if (entry.ref.device != device ||
+                    (binding.prepared->kind != PreparedWeightKind::None && binding.prepared->kind != entry.ref.kind) ||
+                    !compatiblePreparedAdoptionBinding(entry.binding, binding) ||
+                    !entry.owned_handle || !entry.owned_handle->prepared_weights)
+                    continue;
+                selected = &entry;
+                return;
+            }
+        };
+        // Tensor and name are two original ways to identify a candidate, never
+        // permission to reuse it: full source/slice/arithmetic checks run above.
+        const auto tensor_candidates = adoption_tensors_.find({binding.tensor, device});
+        if (tensor_candidates != adoption_tensors_.end()) consider(tensor_candidates->second);
+        if (!selected && !binding.identity.canonical_name.empty()) {
+            const auto named = adoption_names_.find({binding.identity.canonical_name, device});
+            if (named != adoption_names_.end()) consider(named->second);
+        }
+        if (selected) {
+            validateBindingForStore(binding, model_id_, selected->ref.kind);
             WeightBinding stored = binding;
-            auto ref = makeRef(binding.binding_id, entry.ref.kind, device);
+            auto ref = makeRef(binding.binding_id, selected->ref.kind, device);
             stored.prepared = ref;
-            if (stored.tensor)
-                stored.tensor->publishPreparedDeviceState();
-            entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle)};
+            if (stored.tensor) stored.tensor->publishPreparedDeviceState();
+            // Copy the actual handle/owner before publish can rehash entries_.
+            auto handle = selected->owned_handle;
+            const auto owner = selected->memory_owner;
+            publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, std::move(handle), owner});
             return true;
         }
 
@@ -556,6 +609,51 @@ namespace llaminar2
         return false;
     }
 
+    OriginalOutputSlice PreparedWeightStore::originalOutputSlice(
+        const PreparedWeightRef &ref, const TensorBase &source) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(keyFor(ref));
+        if (found == entries_.end() || !samePreparedRef(found->second.ref, ref))
+            throw std::invalid_argument("Original output slice requires an exact prepared reference");
+        const auto &entry = found->second;
+        const auto &binding = entry.binding;
+        const auto *handle = entry.activeHandle();
+        const auto *kernel = handle && handle->prepared_weights
+            ? handle->prepared_weights->kernel : nullptr;
+        const auto &slice = binding.slice;
+        constexpr auto limit = static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (!binding.immutable || binding.tensor != &source || !kernel ||
+            !binding.tensor_owner || binding.tensor_owner.get() != &source ||
+            !handle->prepared_weights->owned_kernel ||
+            handle->prepared_weights->owned_kernel.get() != kernel ||
+            handle->tensor != &source || handle->device_id != ref.device ||
+            source.shape().size() != 2 || kernel->get_n() <= 0 || kernel->get_k() <= 0 ||
+            slice.source_rows == 0 || slice.source_rows > limit ||
+            slice.source_cols == 0 || slice.source_cols > limit ||
+            slice.row_count == 0 || slice.row_count > slice.source_rows ||
+            slice.row_start > slice.source_rows - slice.row_count ||
+            slice.col_start != 0 || slice.col_count != slice.source_cols ||
+            slice.expert_start != 0 || slice.expert_count != 0 || !slice.expert_ids.empty() ||
+            slice.row_count != static_cast<std::size_t>(kernel->get_n()) ||
+            slice.source_cols != static_cast<std::size_t>(kernel->get_k()) ||
+            source.rows() != slice.row_count || source.cols() != slice.source_cols)
+            throw std::invalid_argument("Original output slice requires a frozen original matrix row interval with complete K");
+        const auto *native_source = IINT8Unpackable::fromTensor(&source);
+        const auto *format = native_source ? native_source->vnniFormatInfo() : nullptr;
+        NativeQuantisedSourceIdentity prepared_source;
+        if (!format || !kernel->exportNativeQuantisedSourceIdentity(prepared_source) ||
+            !prepared_source.present || prepared_source.codebook_id != format->codebook_id ||
+            prepared_source.is_superblock != format->is_superblock)
+            throw std::invalid_argument("Original output slice requires matching original native quantized source/prepared format; floating ordinary arithmetic is unsupported");
+        // Canonical Factory-to-store publication is the source/payload affinity
+        // boundary. Freeze actual owners, not mutable handle/weights wrappers:
+        // replacing an index later cannot destroy or substitute this binding.
+        return OriginalOutputSlice(handle->prepared_weights->owned_kernel, binding.tensor_owner,
+            ref.binding_id, ref.model_id.value, ref.kind, ref.device, static_cast<int>(slice.source_rows), static_cast<int>(slice.row_start),
+            kernel->get_n(), kernel->get_k(), prepared_source);
+    }
+
     ITensorGemm *PreparedWeightStore::gemmKernel(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -567,6 +665,16 @@ namespace llaminar2
             return nullptr;
         // Phase 8: Direct kernel resolution — no KernelFactory delegation.
         return handle->prepared_weights->kernel;
+    }
+
+    std::shared_ptr<ITensorGemm> PreparedWeightStore::gemmKernelLifetime(const PreparedWeightRef& ref) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found=entries_.find(keyFor(ref));
+        if(found==entries_.end() || !samePreparedRef(found->second.ref,ref))return {};
+        const auto& handle=found->second.owned_handle;
+        if(!handle || !handle->prepared_weights || !handle->prepared_weights->kernel)return {};
+        return std::shared_ptr<ITensorGemm>(handle,handle->prepared_weights->kernel);
     }
 
     std::optional<PreparedWeightRef> PreparedWeightStore::preparedRefForBinding(
@@ -688,6 +796,33 @@ namespace llaminar2
             throw std::runtime_error("PreparedWeightStore::prepareEmbedding requires a tensor binding: " + binding.identity.canonical_name);
 
         const DeviceId device = binding.residency.resident_device.value_or(binding.residency.home_device);
+
+        if(device.is_cpu() && binding.prepared && binding.prepared->kind==PreparedWeightKind::CPUResidentTensor) {
+            // The common reader has already committed the only persistent raw
+            // root. Embedding execution borrows that exact Store-owned tensor;
+            // it must neither copy nor acquire another physical allocation.
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto it=entries_.find(keyFor(*binding.prepared));
+                if(it==entries_.end() || !samePreparedRef(it->second.ref,*binding.prepared) ||
+                   !it->second.binding.identity.sameSourceDefinition(binding.identity) ||
+                   !(it->second.binding.slice==binding.slice) ||
+                   it->second.binding.native_source!=binding.native_source ||
+                   it->second.binding.tensor_owner!=binding.tensor_owner ||
+                   !binding.tensor_owner || binding.tensor_owner.get()!=binding.tensor)
+                    throw std::invalid_argument("CPU embedding alias requires its exact completed final source owner");
+            }
+            auto handle=llaminar::v2::kernels::KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(
+                std::shared_ptr<const TensorBase>(binding.tensor_owner),d_model,vocab_offset,total_vocab);
+            validatePreparedEmbeddingHandle(binding,device,handle.get());
+            auto ref=makeRef(binding.binding_id,PreparedWeightKind::PreparedEmbedding,device);
+            auto stored=binding;stored.prepared=ref;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(embedding_entries_.contains(keyFor(ref)))throw std::logic_error("CPU embedding final owner already published");
+            embedding_entries_.emplace(keyFor(ref),EmbeddingEntry{std::move(stored),ref,std::move(handle),nullptr});
+            binding.tensor->publishPreparedDeviceState();
+            return ref;
+        }
 
         /*
          * Acquire the exact claim before entering the backend allocator. The
@@ -822,8 +957,13 @@ namespace llaminar2
         if (cache_it != sliced_cache_.end())
             return cache_it->second.get();
 
+        if (!ref.device.is_cpu() || !physical_memory_authority_ || !entry_it->second.memory_owner)
+            throw std::logic_error("Prepared CPU GEMM slice requires its original admitted allocation owner");
+        const auto placement = CPUWeightStoragePlacement::accounted(
+            physical_memory_authority_, ref.device, *entry_it->second.memory_owner,
+            CPUWeightStoragePlacement::local());
         auto kernel = llaminar::v2::kernels::KernelFactory::createGemmSlicedLocal(
-            tensor, row_start, row_end);
+            tensor, row_start, row_end, placement);
         if (kernel)
         {
             auto *raw = kernel.get();
@@ -989,6 +1129,8 @@ namespace llaminar2
     void PreparedWeightStore::clear()
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        adoption_names_.clear();
+        adoption_tensors_.clear();
         entries_.clear();
         fused_cache_.clear();
         embedding_entries_.clear();
@@ -1016,6 +1158,8 @@ namespace llaminar2
         // releases owned kernels through PreparedGemmWeights::owned_kernel. Expert
         // slabs own MoE expert GEMM engines through ExpertEntry::engine_lifetime.
 
+        adoption_names_.clear();
+        adoption_tensors_.clear();
         entries_.clear();
         fused_cache_.clear();
         embedding_entries_.clear();
@@ -1239,4 +1383,6 @@ namespace llaminar2
         }
         return count;
     }
+#include "CPUPreparedWeightStore.inc"
+
 }

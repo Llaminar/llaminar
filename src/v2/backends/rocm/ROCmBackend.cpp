@@ -9,25 +9,35 @@
  * backend observations a second physical-memory admission authority.
  *
  * @author David Sanftenberg
+ * Immutable hardware identity is admitted once; these queries never reopen
+ * a context or confuse physical facts with runtime-resource generations.
+ * HSA interop opens only the real library selected from ROCM_PATH by CMake;
+ * bare runtime names cannot select an older SDK through the system cache.
  */
 
 #include "ROCmBackend.h"
 #include "../DeviceId.h"
 #include "ROCmRuntimeStartup.h"
+#include "ROCmHardwareMetadata.h"
 #include "HipDeviceGuard.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
-#include "../../memory/HostRegistrationPageBoundary.h"
+#include "../../memory/HostRegistrationPageRange.h"
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
+#include "../../transfer/PipelineActivationFanoutProtocol.h"
 #include "../../transfer/CapturedTransferKernelPlan.h"
+#include "../../transfer/CapturedTransferChannelBatch.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include <hip/hip_runtime.h>
+#include "../../collective/NativeCountedAllGatherFrame.h"
+#include "../../collective/NativePipelineByteFrame.h"
+#include "../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -35,6 +45,11 @@
 #include <sstream>
 #include <cstring>
 #include <dlfcn.h> // For HSA runtime loading
+
+#ifndef LLAMINAR_HSA_RUNTIME_LIBRARY_PATH
+#error "ROCm backend requires its CMake-selected SDK HSA runtime path"
+#endif
+
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -405,8 +420,21 @@ namespace llaminar2
         // Immortal: heap-allocated and never destroyed to avoid static
         // destruction order issues during process exit.
         std::mutex &g_ptr_registry_mutex = *new std::mutex();
-        std::unordered_map<void *, ROCmPointerOwnerInfo> &g_active_ptrs =
-            *new std::unordered_map<void *, ROCmPointerOwnerInfo>();
+        /** @brief Canonical HIP live record; diagnostic copies do not borrow storage. */
+        struct ROCmNativeAllocationRecord : ROCmPointerOwnerInfo {
+            std::shared_ptr<const NativeAllocationCaptureIdentity> capture_identity;
+        };
+        std::unordered_map<void *, ROCmNativeAllocationRecord> &g_active_ptrs =
+            *new std::unordered_map<void *, ROCmNativeAllocationRecord>();
+        /** @brief Validate native retirement under lifecycle then pointer-registry locks. */
+        void requireHIPNativeRelease(const void* pointer, int device_id) {
+            std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+            const auto record = g_active_ptrs.find(const_cast<void*>(pointer));
+            if (record == g_active_ptrs.end() || record->second.device_id != device_id)
+                throw std::invalid_argument("HIP native free requires its exact live allocation base/device");
+            NativeAllocationCaptureLease::requireUnborrowed(record->second.capture_identity);
+        }
+
         std::deque<PointerEvent> &g_ptr_events = *new std::deque<PointerEvent>();
         uint64_t g_ptr_sequence = 0;
         constexpr size_t kMaxPointerEvents = 512;
@@ -442,12 +470,8 @@ namespace llaminar2
         : device_count_(0)
     {
         requireROCmRuntimeStartup();
-        hipError_t err = hipGetDeviceCount(&device_count_);
-        if (err != hipSuccess)
-        {
-            device_count_ = 0;
-            // Log warning but don't throw - allow CPU-only execution
-        }
+        initializeROCmHardwareMetadata();
+        device_count_ = static_cast<int>(rocmHardwareMetadata().size());
         penalty_buffers_.resize(
             static_cast<size_t>(std::max(device_count_, 0)));
         runtime_generations_.assign(
@@ -484,6 +508,53 @@ namespace llaminar2
     // ====================================================================
     // Memory Transfer Operations
     // ====================================================================
+
+    bool ROCmBackend::validateNativeCountedAllGatherFrame(void *memory,std::size_t degree,
+        ncclLlaminarCompletionAuthority original,int device_id,void *stream)
+    {
+        const auto native=requireExplicitStream(stream,"validateNativeCountedAllGatherFrame");
+        if(!memory || !degree || !original.abortFlag || !original.deviceCommunicator || !setDevice(device_id))return false;
+        ::llaminar2::validateNativeCountedAllGatherFrame<<<1u,1u,0u,native>>>(memory,degree,original);
+        return hipGetLastError()==hipSuccess;
+    }
+
+    bool ROCmBackend::enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+        std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing)
+    {
+        const auto native=requireExplicitStream(stream,"enqueueNativeCountedAllGatherFrame");
+        if(!memory || !degree || !table || !admission ||
+           (outgoing && reinterpret_cast<std::uintptr_t>(outgoing) % alignof(unsigned long long)) || !setDevice(device_id))return false;
+        if(preparation==NativeCountedAllGatherPreparation::Initialize) {
+            if(isGraphCaptureActive() || outgoing)return false;
+            hipFuncAttributes attributes{};
+            if(hipFuncGetAttributes(&attributes,reinterpret_cast<const void *>(::llaminar2::prepareNativeCountedAllGatherFrame))!=hipSuccess ||
+               hipFuncGetAttributes(&attributes,reinterpret_cast<const void *>(::llaminar2::validateNativeCountedAllGatherFrame))!=hipSuccess)return false;
+            return hipMemsetAsync(memory,0,NativeCountedAllGatherLayout(degree).bytes(),native)==hipSuccess;
+        }
+        if(preparation!=NativeCountedAllGatherPreparation::Advance)return false;
+        ::llaminar2::prepareNativeCountedAllGatherFrame<<<1u,1u,0u,native>>>(memory,degree,table,admission,outgoing);
+        return hipGetLastError()==hipSuccess;
+    }
+
+    bool ROCmBackend::enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+        NativePipelineByteOperation operation, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "enqueueNativePipelineByteFrame");
+        if (!invocation.valid() || !setDevice(device_id)) return false;
+        if (operation == NativePipelineByteOperation::Initialize) {
+            if (isGraphCaptureActive()) return false;
+            hipFuncAttributes attributes{};
+            if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(::llaminar2::prepareNativePipelineByteFrame)) != hipSuccess ||
+                hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(::llaminar2::validateNativePipelineByteFrame)) != hipSuccess) return false;
+            return hipMemsetAsync(invocation.memory, 0, NativeCountedAllGatherLayout(1).bytes(), native) == hipSuccess;
+        }
+        if (operation == NativePipelineByteOperation::Prepare)
+            ::llaminar2::prepareNativePipelineByteFrame<<<1u, 1u, 0u, native>>>(invocation);
+        else if (operation == NativePipelineByteOperation::Validate)
+            ::llaminar2::validateNativePipelineByteFrame<<<1u, 1u, 0u, native>>>(invocation);
+        else return false;
+        return hipGetLastError() == hipSuccess;
+    }
 
     bool ROCmBackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
@@ -568,9 +639,10 @@ namespace llaminar2
                      << device_id << " ptr=" << ptr << " bytes=" << bytes);
             return false;
         }
-        // Fence shared huge-PMD edges before HIP owns the pages. Otherwise a
-        // neighbouring heap trim can evict all queues for this live process.
-        HostRegistrationPageBoundary::prepare(ptr, bytes);
+        // Exclude every registered page before HIP owns the range. Edge-only
+        // protection still permits khugepaged to invalidate interior USERPTR
+        // pages and evict all live process queues. This does not alter payload.
+        HostRegistrationPageRange::prepare(ptr, bytes);
         hipError_t err = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
         if (err != hipSuccess)
         {
@@ -631,19 +703,22 @@ namespace llaminar2
         HipDeviceSaveRestore device_guard;
         if (hipSetDevice(registration_device_id) != hipSuccess)
             return false;
-        /* Portable registration mutates every ROCm page table and is
-         * materially more expensive on multi-GPU IOMMU hosts. In particular,
-         * thousands of one-device retained-graph tickets used to create an
-         * iova_depot backlog and IH-ring overflow storm. Only a genuinely
-         * shared same-family region is allowed to pay that cost. */
+        /* Registration scope declares which original device aliases this
+         * region must support. Only an explicitly shared same-family region
+         * requests portable registration; singleton storage keeps its narrower
+         * alias contract. This does not constrain IOMMU maintenance to those
+         * aliases: devices sharing a translation domain can still receive
+         * device-TLB invalidations. IH2 overflow causality is not established
+         * by the registration flag or ownership choice alone. */
         const unsigned int flags = hipHostRegisterMapped |
                                    hipExtHostRegisterUncached |
                                    (scope == MappedHostRegistrationScope::BackendPortable
                                         ? hipHostRegisterPortable
                                         : 0u);
-        // External shared channels need the same edge ownership as tensor
-        // uploads; portable registration must not retain a neighbour's PMD.
-        HostRegistrationPageBoundary::prepare(ptr, bytes);
+        // External channels require the same complete-page policy as tensor
+        // uploads, including interior PMDs shared by portable GPU aliases.
+        // Unregister retains this advice while any storage owner may reuse it.
+        HostRegistrationPageRange::prepare(ptr, bytes);
         const hipError_t error = hipHostRegister(ptr, bytes, flags);
         if (error != hipSuccess)
         {
@@ -791,6 +866,7 @@ namespace llaminar2
         const int *token,
         int vocab_size,
         int *generated_token_counts,
+        MTPGreedyPenaltyPolicy *direct_output_policy,
         int device_idx,
         void *stream);
 
@@ -1116,6 +1192,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || rows <= 0 || cols <= 0 ||
             !history.admitsRows(rows) ||
+            (history.branchTokens() && !history.activeRows()) ||
             !stream || !out_values_device || !out_indices_device ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
             output_stride <= 0)
@@ -1280,6 +1357,32 @@ namespace llaminar2
             static_cast<const int *>(token_device),
             vocab_size,
             static_cast<int *>(generated_token_counts_device),
+            nullptr, // Ordinary publication does not own an MTP frontier transition.
+            device_id,
+            stream);
+    }
+
+    /** @brief One native scalar launch owns the direct history/frontier transition. */
+    bool ROCmBackend::enqueueCommitMTPDirectTokenHistoryDevice(
+        const void *token_device,
+        int vocab_size,
+        void *generated_token_counts_device,
+        void *penalty_policy_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !token_device || vocab_size <= 0 ||
+            !generated_token_counts_device || !penalty_policy_device || !stream)
+        {
+            return false;
+        }
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_commit_generation_token_history(
+            static_cast<const int *>(token_device),
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            static_cast<MTPGreedyPenaltyPolicy *>(penalty_policy_device),
             device_id,
             stream);
     }
@@ -1308,6 +1411,14 @@ namespace llaminar2
         int *out_token_ids, int out_stride, float *out_probs,
         float *scratch_values, int *scratch_indices, int scratch_capacity,
         const int *active_rows,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_topk_topp_distributions_f32_with_history(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        int *out_token_ids, int out_stride, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        const int *active_rows,
+        const int *counts, const MTPGreedyPenaltyPolicy *policy, const int *tokens,
         int device_idx, void *stream);
     extern "C" bool rocmOps_topk_topp_processed_logits_f32(
         const float *data, int row_count, int n, int row_stride, int k,
@@ -1749,6 +1860,7 @@ namespace llaminar2
         int verifier_input_token_stride,
         sampling_math::MTPCommittedVerifierIdentityRecord *
             out_committed_verifier_identity,
+        sampling_math::MTPDepthTransactionTrace *depth_transaction_trace,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_derive_speculative_publication_metadata(
@@ -1781,7 +1893,7 @@ namespace llaminar2
         int *out_accepted_state_counts,
         int *out_ok,
         int device_idx,
-        void *stream);
+        void *stream, llaminar2::MTPShiftedCacheOrigin origin);
     extern "C" bool rocmOps_prepare_speculative_shifted_kv_tokens(
         const int *meta,
         int meta_stride,
@@ -2094,6 +2206,56 @@ namespace llaminar2
             static_cast<int *>(scratch_indices_device),
             scratch_capacity,
             static_cast<const int *>(active_rows_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        int out_stride,
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity,
+        const GenerationPenaltyHistory &history)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !history.admitsRows(row_count) ||
+            !data_device || row_count <= 0 || n <= 0 || row_stride < n ||
+            top_k <= 0 || top_k > 256 || top_k > n || out_stride <= 0 || out_stride < top_k ||
+            !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_topk_topp_distributions_f32_with_history(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            out_stride,
+            static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            static_cast<const int *>(history.activeRows()),
+            static_cast<const int *>(history.counts()),
+            static_cast<const MTPGreedyPenaltyPolicy *>(history.policy()),
+            static_cast<const int *>(history.branchTokens()),
             device_id,
             stream);
     }
@@ -3554,7 +3716,8 @@ namespace llaminar2
         void *out_next_verifier_condition_tokens_device,
         const void *verifier_input_tokens_device,
         int verifier_input_token_stride,
-        void *out_committed_verifier_identity_device)
+        void *out_committed_verifier_identity_device,
+        sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device)
     {
         const bool has_verifier_identity_binding =
             verifier_input_tokens_device != nullptr ||
@@ -3568,7 +3731,7 @@ namespace llaminar2
             !output_tokens_device || output_token_stride <= 0 ||
             !meta_device || !base_cached_tokens_device ||
             meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
-            request_count <= 0 || padded_state_rows_per_request <= 0 ||
+            request_count <= 0 || (depth_transaction_trace_device && request_count != 1) || padded_state_rows_per_request <= 0 ||
             !response_tokens_device ||
             response_token_stride <= 0 || !control_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
@@ -3615,6 +3778,7 @@ namespace llaminar2
             static_cast<
                 sampling_math::MTPCommittedVerifierIdentityRecord *>(
                 out_committed_verifier_identity_device),
+            depth_transaction_trace_device,
             device_id,
             stream);
     }
@@ -3693,14 +3857,14 @@ namespace llaminar2
         void *stream,
         void *out_target_cached_tokens_device,
         void *out_accepted_state_counts_device,
-        void *out_ok_device)
+        void *out_ok_device, MTPShiftedCacheOrigin origin)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !base_cached_tokens_device ||
             !main_target_cached_tokens_device ||
             !main_publication_ok_device ||
             request_count <= 0 ||
-            mtp_depth < 0 ||
+            mtpShiftedPrefixOffset(origin,mtp_depth)<0 ||
             !stream ||
             !out_target_cached_tokens_device ||
             !out_accepted_state_counts_device ||
@@ -3720,7 +3884,7 @@ namespace llaminar2
             static_cast<int *>(out_accepted_state_counts_device),
             static_cast<int *>(out_ok_device),
             device_id,
-            stream);
+            stream,origin);
     }
 
     bool ROCmBackend::enqueuePrepareSpeculativeShiftedKVTokens(
@@ -4261,17 +4425,32 @@ namespace llaminar2
         return reinterpret_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @param device_id Exact original event device ordinal.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void ROCmBackend::destroyEvent(void *event, int device_id)
     {
-        if (!event || device_id >= device_count_ || device_id < 0)
+        if (!event) return;
+        if (device_id < 0 || device_id >= device_count_)
         {
-            return;
+            LOG_ERROR("[ROCmBackend::destroyEvent] Non-null event has an invalid original device");
+            std::terminate();
         }
-
         HipDeviceSaveRestore device_guard;
-        HIP_WARN_IF_FAIL(hipSetDevice(device_id));
-        hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
-        HIP_WARN_IF_FAIL(hipEventDestroy(hip_event));
+        if (const auto error = hipSetDevice(device_id); error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::destroyEvent] Original event device selection failed, status=" << error);
+            std::terminate();
+        }
+        const auto hip_event = reinterpret_cast<hipEvent_t>(event);
+        if (const auto error = hipEventDestroy(hip_event); error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
+        }
     }
 
     bool ROCmBackend::recordEvent(void *event, int device_id, void *stream)
@@ -4456,6 +4635,9 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Create setup-only record identity before native bytes exist.
+        auto capture_identity = std::make_shared<const NativeAllocationCaptureIdentity>();
+
         // Set device before allocation
         HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
@@ -4483,7 +4665,7 @@ namespace llaminar2
             // Include memory diagnostics in the error message
             size_t free_bytes = 0, total_bytes = 0;
             (void)hipMemGetInfo(&free_bytes, &total_bytes);  // diagnostic-only; OK if it fails
-            LOG_ERROR("[ROCmBackend] hipMalloc failed for " << bytes << " bytes on device "
+            LOG_ERROR("[ROCmBackend] Native device allocation failed for " << bytes << " bytes on device "
                                                             << device_id << ": " << hipGetErrorString(err)
                                                             << " (free: " << (free_bytes / (1024 * 1024))
                                                             << " MB, total: " << (total_bytes / (1024 * 1024)) << " MB)");
@@ -4506,7 +4688,8 @@ namespace llaminar2
 
         {
             std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
-            ROCmPointerOwnerInfo info;
+            ROCmNativeAllocationRecord info;
+            info.capture_identity = std::move(capture_identity);
             info.base_ptr = ptr;
             info.size_bytes = bytes;
             info.device_id = device_id;
@@ -4634,8 +4817,10 @@ namespace llaminar2
         if (hipSetDevice(device_id) != hipSuccess)
             return nullptr;
 
-        /* Native KFD/GTT ownership avoids retrofitting already-touched pages
-         * with hipHostRegisterPortable, which can flood Vega20's IH2 ring. */
+        /* Native KFD/GTT ownership retains the allocation and portable aliases
+         * together, without registering a separately owned anonymous range.
+         * It still permits IOMMU/device-TLB maintenance; native backing alone
+         * is not an IH2 overflow-prevention guarantee. */
         void *host_ptr = nullptr;
         const hipError_t allocation_error = hipHostMalloc(
             &host_ptr,
@@ -4706,6 +4891,24 @@ namespace llaminar2
         }
     }
 
+    NativeAllocationCaptureLease ROCmBackend::retainNativeAllocation(
+        const void* pointer, size_t bytes, int device_id)
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            throw std::invalid_argument("HIP captured allocation needs an exact existing device");
+        std::lock_guard<std::mutex> lifecycle(rocmRuntimeResourceLifecycleMutex());
+        std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        for (const auto& [base, record] : g_active_ptrs) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(base);
+            if (address >= begin && address - begin < record.size_bytes)
+                return NativeAllocationCaptureLease::acquire(record.capture_identity,
+                    base, record.size_bytes, DeviceId::rocm(record.device_id),
+                    pointer, bytes, DeviceId::rocm(device_id));
+        }
+        throw std::invalid_argument("HIP captured span is not a live native allocation");
+    }
+
     void ROCmBackend::free(void *ptr, int device_id)
     {
         std::lock_guard<std::mutex> lifecycle_lock(
@@ -4717,27 +4920,21 @@ namespace llaminar2
 
         if (device_id >= device_count_ || device_id < 0)
         {
-            LOG_ERROR("[ROCmBackend] Invalid device ID " << device_id << " for hipFree");
-            return;
+            throw std::invalid_argument("HIP native free requires an existing allocator device");
         }
+
+        // Borrow acquisition and native retirement share this lifecycle lock.
+        // Do not send mapped aliases or foreign allocator bytes to hipFree.
+        requireHIPNativeRelease(ptr, device_id);
 
         // Set device before freeing
         HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
-            // During shutdown, hipSetDevice may fail - this is expected
-            if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed)
-            {
-                LOG_DEBUG("[ROCmBackend] hipSetDevice failed during shutdown (expected): "
-                          << hipGetErrorString(err));
-            }
-            else
-            {
-                LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipFree: "
-                                                                << hipGetErrorString(err));
-            }
-            return;
+            // Preserve the original record and caller's storage metadata.
+            throw std::runtime_error(std::string("HIP native free could not select its owner: ") +
+                hipGetErrorString(err));
         }
 
         size_t recorded_size = 0;
@@ -4753,18 +4950,9 @@ namespace llaminar2
         err = hipFree(ptr);
         if (err != hipSuccess)
         {
-            // During shutdown, hipFree may fail with "invalid argument" if the memory
-            // was already cleaned up by the HIP runtime or the pointer is stale.
-            // Also handle explicit deinitialization errors.
-            if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed ||
-                err == hipErrorInvalidValue)
-            {
-                LOG_TRACE("[ROCmBackend] hipFree skipped (driver shutting down or memory already freed)");
-            }
-            else
-            {
-                LOG_ERROR("[ROCmBackend] hipFree failed: " << hipGetErrorString(err));
-            }
+            // A failed free cannot retire accounting or clear a tensor pointer.
+            throw std::runtime_error(std::string("HIP native free failed; allocation remains owned: ") +
+                hipGetErrorString(err));
         }
         else
         {
@@ -4894,6 +5082,7 @@ namespace llaminar2
         int request_row_capacity,
         int bucket_seq_len,
         int pad_token_id,
+        bool require_exact_rows,
         int device_id,
         void *stream,
         void *out_token_ids_device,
@@ -4921,6 +5110,7 @@ namespace llaminar2
             request_row_capacity,
             bucket_seq_len,
             static_cast<int32_t>(pad_token_id),
+            require_exact_rows,
             static_cast<int32_t *>(out_token_ids_device),
             static_cast<int32_t *>(out_position_ids_device),
             static_cast<int32_t *>(out_real_rows_device),
@@ -4978,14 +5168,7 @@ namespace llaminar2
             return "Invalid Device";
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return "Unknown Device";
-        }
-
-        return std::string(prop.name);
+        return rocmHardwareMetadata().at(device_id).name;
     }
 
     size_t ROCmBackend::deviceMemoryTotal(int device_id) const
@@ -4995,14 +5178,7 @@ namespace llaminar2
             return 0;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return 0;
-        }
-
-        return prop.totalGlobalMem;
+        return rocmHardwareMetadata().at(device_id).total_memory;
     }
 
     size_t ROCmBackend::deviceMemoryFree(int device_id) const
@@ -5341,7 +5517,6 @@ namespace llaminar2
                                 std::to_string(device_id) + ": " +
                                 hipGetErrorString(error);
             (void)hipGetLastError();
-            HipDeviceGuard::resetTracking();
             return result;
         }
 
@@ -5371,12 +5546,11 @@ namespace llaminar2
         }
 
         /*
-         * The retired device must remain absent from HipDeviceGuard's
-         * thread-local identity. Forcing a device or querying memory here
+         * No host device-selection shadow remains to invalidate. Forcing
+         * a device or querying memory here
          * would initialize the successor context and consume the capacity
          * that retirement is meant to expose to the next model admission.
          */
-        HipDeviceGuard::resetTracking();
 
         /*
          * AMD HIP's deprecated primary-context APIs intentionally cannot
@@ -5413,26 +5587,9 @@ namespace llaminar2
             return false;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return false;
-        }
-
-        // BF16 support on AMD GPUs:
-        // - MI200 series (gfx90a): Full BF16 support
-        // - MI100 (gfx908): Limited BF16 support
-        // GCN architecture ID (gcnArch) is deprecated in newer ROCm versions
-        // Use compute capability via prop.major/minor or architecture string
-
-        // Conservative check: Assume MI200+ (gfx90a and later) for full BF16
-        // This is a heuristic - may need refinement based on actual hardware
-        std::string arch_name(prop.gcnArchName);
-        return (arch_name.find("gfx90a") != std::string::npos ||
-                arch_name.find("gfx940") != std::string::npos ||
-                arch_name.find("gfx941") != std::string::npos ||
-                arch_name.find("gfx942") != std::string::npos);
+        // Cached compatibility answer retains the existing public API semantics;
+        // it does not qualify an instruction, wave geometry or matrix variant.
+        return rocmHardwareMetadata().at(device_id).legacy_precision.bf16;
     }
 
     bool ROCmBackend::supportsFP16(int device_id) const
@@ -5442,19 +5599,9 @@ namespace llaminar2
             return false;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return false;
-        }
-
-        // FP16 support widely available on AMD GPUs (Vega and later)
-        // gfx900 (Vega 10) and later all support FP16
-        std::string arch_name(prop.gcnArchName);
-        return (arch_name.find("gfx9") != std::string::npos ||
-                arch_name.find("gfx10") != std::string::npos ||
-                arch_name.find("gfx11") != std::string::npos);
+        // Cached compatibility answer retains the existing public API semantics;
+        // it does not qualify an instruction, wave geometry or matrix variant.
+        return rocmHardwareMetadata().at(device_id).legacy_precision.fp16;
     }
 
     bool ROCmBackend::supportsINT8(int device_id) const
@@ -5464,19 +5611,9 @@ namespace llaminar2
             return false;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return false;
-        }
-
-        // INT8 support widely available on modern AMD GPUs
-        // Conservatively assume gfx9 and later (Vega+)
-        std::string arch_name(prop.gcnArchName);
-        return (arch_name.find("gfx9") != std::string::npos ||
-                arch_name.find("gfx10") != std::string::npos ||
-                arch_name.find("gfx11") != std::string::npos);
+        // Cached compatibility answer retains the existing public API semantics;
+        // it does not qualify an instruction, wave geometry or matrix variant.
+        return rocmHardwareMetadata().at(device_id).legacy_precision.int8;
     }
 
     // ====================================================================
@@ -5597,14 +5734,9 @@ namespace llaminar2
         if (device_id < 0 || device_id >= device_count_)
             return false;
 
-        HipDeviceSaveRestore device_guard;
-        int supported = 0;
-        return hipSetDevice(device_id) == hipSuccess &&
-               hipDeviceGetAttribute(
-                   &supported,
-                   hipDeviceAttributeCanUseStreamWaitValue,
-                   device_id) == hipSuccess &&
-               supported != 0;
+        // This is a process-stable device/runtime primitive capability, not a
+        // loaded-function resource or mutable stream/context observation.
+        return rocmHardwareMetadata().at(device_id).can_use_stream_wait_value;
     }
 
     void *ROCmBackend::allocateStreamTimelineSignal32(int device_id)
@@ -5975,18 +6107,30 @@ namespace llaminar2
             return false;
         *timeout_ticks = 0;
         hipFuncAttributes attributes{};
-        int clock_khz = 0;
-        if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
+        if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(pipelineActivationFanoutValidationKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<true>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<false>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<true>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<false>)) != hipSuccess ||
-            hipDeviceGetAttribute(&clock_khz, hipDeviceAttributeWallClockRate, device_id) != hipSuccess || clock_khz <= 0)
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchFusedKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchAcquireKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchCopyPublishKernel)) != hipSuccess)
             return false;
         // wall_clock64 uses this fixed-rate clock. Shader clockRate is a
         // maximum and cannot define a wall deadline under power management.
-        *timeout_ticks = static_cast<std::uint64_t>(clock_khz) * static_cast<std::uint64_t>(timeout_ms);
+        *timeout_ticks = rocmServiceWallClockRateKHz(rocmHardwareMetadata().at(device_id)) *
+            static_cast<std::uint64_t>(timeout_ms);
         return prepareMappedHostCopyKernels(device_id);
+    }
+
+    bool ROCmBackend::enqueuePipelineActivationFanoutValidation(
+        const PipelineActivationFanoutValidation &binding, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueuePipelineActivationFanoutValidation");
+        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        hipLaunchKernelGGL(pipelineActivationFanoutValidationKernel, dim3(1), dim3(1), 0, native, binding);
+        return hipGetLastError() == hipSuccess;
     }
 
     bool ROCmBackend::enqueueCapturedTransferChannel(
@@ -5996,7 +6140,8 @@ namespace llaminar2
         const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannel");
         if (!binding.valid() || !destination || !source || device_id < 0 || device_id >= device_count_ ||
             !setDevice(device_id)) return false;
-        const bool aligned = reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
+        // A live slice may be unaligned even when its immutable base is aligned.
+        const bool aligned = !binding.source_slice && reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
             reinterpret_cast<std::uintptr_t>(source) % alignof(uint4) == 0;
         // The same immutable policy and system-publication proof serve both
         // vendors. No device count readback or HIP host scheduling ticket is needed.
@@ -6019,6 +6164,38 @@ namespace llaminar2
         else
             hipLaunchKernelGGL(capturedTransferCopyPublishKernel<false>, dim3(mappedHostCopyBlocks(binding.message.bytes)),
                 dim3(kMappedHostCopyThreads), 0, native, binding, destination, source);
+        return hipGetLastError() == hipSuccess;
+    }
+
+    bool ROCmBackend::enqueueCapturedTransferChannelBatch(
+        const CapturedTransferChannelBatch &original, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannelBatch");
+        if (!original.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        auto batch = original;
+        unsigned maximum_blocks = 1;
+        bool single = true;
+        for (unsigned i = 0; i < batch.count; ++i)
+        {
+            auto &entry = batch.entries[i];
+            entry.vector_aligned = !entry.binding.source_slice &&
+                reinterpret_cast<std::uintptr_t>(entry.destination) % alignof(uint4) == 0 &&
+                reinterpret_cast<std::uintptr_t>(entry.source) % alignof(uint4) == 0;
+            const auto bytes = entry.binding.message.bytes;
+            entry.copy_blocks = entry.vector_aligned
+                ? mappedHostCopyBlocks(bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0))
+                : mappedHostCopyBlocks(bytes);
+            if (entry.copy_blocks > maximum_blocks) maximum_blocks = entry.copy_blocks;
+            single = single && capturedTransferBatchKernelPlan(bytes) == CapturedTransferKernelPlan::SingleBlock;
+        }
+        if (single)
+            hipLaunchKernelGGL(capturedTransferBatchFusedKernel, dim3(1, batch.count), dim3(kMappedHostCopyThreads), 0, native, batch);
+        else
+        {
+            hipLaunchKernelGGL(capturedTransferBatchAcquireKernel, dim3(1, batch.count), dim3(64), 0, native, batch);
+            if (hipGetLastError() != hipSuccess) return false;
+            hipLaunchKernelGGL(capturedTransferBatchCopyPublishKernel, dim3(maximum_blocks, batch.count), dim3(kMappedHostCopyThreads), 0, native, batch);
+        }
         return hipGetLastError() == hipSuccess;
     }
 
@@ -6541,7 +6718,7 @@ namespace llaminar2
         // But this doesn't exist either...
 
         // Let's try to use HSA directly via dlsym
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::hsaMemoryLock] Failed to load HSA runtime: " << dlerror());
@@ -6590,7 +6767,7 @@ namespace llaminar2
             return;
         }
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_WARN("[ROCmBackend::hsaMemoryUnlock] Failed to load HSA runtime");
@@ -6625,7 +6802,7 @@ namespace llaminar2
 
         LOG_INFO("[ROCmBackend::hsaInteropMapBuffer] Attempting to map dmabuf fd=" << dmabuf_fd);
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::hsaInteropMapBuffer] Failed to load HSA runtime: " << dlerror());
@@ -6702,7 +6879,7 @@ namespace llaminar2
             return;
         }
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_WARN("[ROCmBackend::hsaInteropUnmapBuffer] Failed to load HSA runtime");
@@ -6789,29 +6966,19 @@ namespace llaminar2
         // HIP exposes hipDeviceGetAttribute for getting the HSA agent
         // But we need to use HSA directly for this
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::getHsaAgent] Failed to load HSA runtime");
             return false;
         }
 
-        // We need to iterate agents to find GPU agents
-        // This is complex - for now, we'll use hipGetDeviceProperties to get the agent
-
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            dlclose(hsa_handle);
-            return false;
-        }
-
-        // The gcnArchName contains arch info but not the HSA agent handle directly
-        // For proper implementation, we'd need to iterate HSA agents
+        // This API does not own a live HSA-agent resolver. Its diagnostic
+        // identity still comes from the immutable physical inventory.
+        const auto &prop = rocmHardwareMetadata().at(device_id);
 
         LOG_INFO("[ROCmBackend::getHsaAgent] Device " << device_id << ": " << prop.name
-                                                      << ", arch=" << prop.gcnArchName);
+                                                      << ", arch=" << prop.isa_target);
 
         dlclose(hsa_handle);
 

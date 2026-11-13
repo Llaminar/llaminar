@@ -1,0 +1,1793 @@
+/**
+ * @file Test__ImmutableLookupSubordinate.cpp
+ * @brief Source-only authored CPU proofs for the actual subordinate processor/cache authority.
+ *
+ * Tiny original native files, exact source-owned PMA plans and real host processor
+ * acquisitions exercise the capability. Wire publications below simulate the
+ * documented GPU producer; they do not certify GPU reservation/copy/publication.
+ * No proof factory, substitute provider, device startup or table hash is used.
+ */
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "execution/qwen4exp/ImmutableLookupService.h"
+#include "fixtures/qwen4exp/ImmutableLookupWorkerGateReplayAccess.h"
+#include "execution/local_execution/graph/RetainedStoragePerfStats.h"
+#include "loaders/ImmutableLookupSetupObservation.h"
+#include "execution/local_execution/orchestrators/TPWorkerPool.h"
+#include "kernels/qwen4exp/PooledImmutableSourceOps.h"
+#include <gtest/gtest.h>
+#include "../../../mocks/MockBackend.h"
+#include <chrono>
+#include <future>
+#include <thread>
+#include <cstdio>
+#include <limits>
+#include <sys/resource.h>
+#include <array>
+#include <algorithm>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <atomic>
+#include <cstring>
+#include <fcntl.h>
+#include <memory>
+#include <new>
+#include <vector>
+#include <unistd.h>
+
+namespace llaminar2::test {
+/** @brief Exercise the original enqueue/cancellation bodies without constructing a native-ready expert runner. */
+struct PooledExpertSourceFailureContractAccess final {
+    template<class Work,class Cancel> static bool enqueue(Work work,Cancel cancel) {
+        return MoEOverlayParticipantGraphRunner::runOriginalEndpointEnqueue(std::move(work),std::move(cancel));
+    }
+    static void beforeAdmission() {
+        using Runner=MoEOverlayParticipantGraphRunner;
+        Runner::requireColdSourceAliasRefresh(Runner::ServingGraphFamilyLifecycle::Built);
+        Runner::requireColdSourceAliasRefresh(Runner::ServingGraphFamilyLifecycle::Sealed);
+    }
+    static void afterAdmission() {
+        using Runner=MoEOverlayParticipantGraphRunner;
+        Runner::requireColdSourceAliasRefresh(Runner::ServingGraphFamilyLifecycle::ExecutionAdmitted);
+    }
+    static void cancel(const std::function<void()>& original,std::mutex& mutex,std::exception_ptr& failure) noexcept {
+        MoEOverlayParticipantGraphRunner::cancelOriginalPooledSource(original,mutex,failure);
+    }
+};
+}
+
+namespace llaminar2::qwen4exp {
+/** @brief Deterministic interleaving at the real serial borrow boundary; no capability constructor or copied pin logic. */
+struct ImmutableLookupSubordinateTestAccess final {
+    /** @return Recorded abort action bound by actual service ticket validation; grants no GPU readiness/completion. */
+    static std::function<void()> nativeAbort(ImmutableLookupService& service,
+        const ImmutableLookupService::GroupAdmission& original, std::function<void()> signal)
+    {
+        return service.failureCallbackWithNativeAbort(original, std::move(signal));
+    }
+    /** @brief Inspect only joined CPU-owned state; callers have already awaited this actual service worker. */
+    static bool ownsAcquiredGrant(const ImmutableLookupService &service) {
+        if(!service.worker_.idle())throw std::logic_error("Grant observation requires joined worker");
+        return service.processor_.subordinateGrant_.has_value();
+    }
+    /** @brief Serial host-only replay of one real channel processor without dispatching its idle worker. */
+    static ImmutableLookupPoll pollChannel(ImmutableLookupService& service,std::size_t channel,std::uint64_t generation){
+        if(!service.worker_.idle())throw std::logic_error("Manual replay requires the original idle worker");
+        return service.processor(channel).poll(generation);
+    }
+    /** @brief Borrow from the exact successful outstanding channel, after another channel has progressed. */
+    static auto borrowChannel(ImmutableLookupService& service,std::size_t channel,std::size_t row){
+        return service.processor(channel).borrowSubordinateResponseRow(row);
+    }
+    /** @return Whether an actual terminal waiter owns the join mutex; metadata-only replay synchronization. */
+    static bool terminalJoinHeld(ImmutableLookupService& service){
+        if(service.terminal_join_.try_lock()){service.terminal_join_.unlock();return false;}
+        return true;
+    }
+    /** @return Original immutable worker error while an adopted peer still owns its await right. */
+    static std::string joinedFailureBeforePeerRetirement(const ImmutableLookupService& service,std::size_t peer){
+        std::lock_guard lock(service.lifecycle_);
+        if(!service.joined_ || !service.worker_.idle() || service.state_!=ImmutableLookupService::Lifecycle::Serving ||
+           !service.adopted_.at(peer) || service.retired_.at(peer))
+            throw std::logic_error("Failure replay requires the joined worker and an unretired adopted peer");
+        return service.serviceFailure_;
+    }
+    /** @brief Insert a wire retirement/refill after the production acquire, before its production completion. */
+    template<class Mutation>
+    static auto borrowAcross(ImmutableLookupHostProcessor &processor,std::size_t row,Mutation mutate) {
+        const auto borrow=processor.acquireSubordinateRead();
+        mutate();
+        return processor.finishSubordinateRead(borrow,row);
+    }
+};
+}
+
+using namespace llaminar2;
+using namespace llaminar2::qwen4exp;
+namespace {
+using Intent=ImmutableRowSubordinateIntent;
+using Operation=ImmutableRowReadIntent;
+const PhysicalMemoryAllocatorIdentity hostId{0,DeviceId::cpu()};
+/** @return Complete canonical host observation; no independent free-memory balance. */
+PhysicalMemoryResource hostResource(){return {0,DeviceId::cpu(),1ull<<30,1ull<<30};}
+/** @brief Retain a small nonzero-offset original native tensor through every source owner. */
+struct NativeFile {
+    int fd=-1;std::string path;std::vector<std::byte> bytes;ImmutableRowTableSource source;
+    /** @brief Author distinguishable original IQ4_NL bytes without quantization or a payload hash. */
+    NativeFile(){
+        char name[]="/tmp/llaminar-subordinate-source-XXXXXX";fd=::mkstemp(name);
+        if(fd<0)throw std::runtime_error("Cannot create subordinate source fixture");
+        path=name;source={.path=path,.tensor_name="fixture.ple",.file_offset=37,
+            .rows=128,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+        bytes.resize(source.file_offset+source.tensorBytes());
+        for(std::size_t i=0;i<bytes.size();++i)bytes[i]=std::byte((i*13+i/31)%251);
+        if(::write(fd,bytes.data(),bytes.size())!=static_cast<ssize_t>(bytes.size())) {
+            ::close(fd);fd=-1;::unlink(path.c_str());
+            throw std::runtime_error("Cannot write subordinate source fixture");
+        }
+    }
+    /** @brief Remove only this authored source after all fixture owners have retired. */
+    ~NativeFile(){if(fd>=0)::close(fd);::unlink(path.c_str());}
+};
+/** @return Checked source/endpoint geometry with legal zero-capacity native endpoints. */
+ImmutableRowTableLayoutGeometry layoutFor(const NativeFile &file,DeviceId gpu,std::size_t ramSlots,std::size_t gpuSlots){
+    const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+    const PhysicalMemoryAllocatorIdentity requester{0,gpu};
+    return ImmutableRowTableLayoutGeometry::checked(
+        ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
+        ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+        {{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}},{{requester,ImmutableRowStorage::VRAM},0,gpuSlots,{}}},
+        {requester},{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+        {},gpuSlots?std::optional(requester):std::nullopt,8);
+}
+/** @brief Matching owner for this actual aligned CPU protocol allocation. */
+struct AlignedDelete {/** @brief Release only the corresponding admitted test bytes. */
+    void operator()(std::byte *p)const noexcept{::operator delete(p,std::align_val_t{64});}};
+/** @brief Actual CPU component, exact PMA leases and existing acquired-request processor. */
+struct Lane {
+    NativeFile file;
+    ImmutableLookupLayout layout;
+    CpuAdaptiveImmutableRowCacheGeometry geometry;
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    std::shared_ptr<HostImmutableRowProvider> provider;
+    CpuAdaptiveImmutableRowCache *cache=nullptr; // Retained pre-adoption identity, never a production source escape.
+    PhysicalMemoryAllocationLease channelLease;
+    std::unique_ptr<std::byte,AlignedDelete> bytes;
+    std::atomic<ImmutableLookupStatus> fatal{ImmutableLookupStatus::Success};
+    std::atomic<bool> cancelled{false};
+    std::unique_ptr<ImmutableLookupHostProcessor> processor;
+    /** @brief Admit and materialize only CPU source/cache/scratch/channel owners; GPU slots are metadata here. */
+    Lane(DeviceId gpu=DeviceId::cuda(0),std::size_t ramSlots=2,std::size_t gpuSlots=2)
+        :layout(ImmutableLookupLayout::createSubordinate(8,file.source.rowBytes())),
+         geometry(CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layoutFor(file,gpu,ramSlots,gpuSlots),hostId,{0,gpu})) {
+        PhysicalMemoryPlanBuilder plan(geometry.bom(hostResource()));
+        plan.add(hostResource(),PhysicalMemoryOwner::ImmutableLookupStaging,layout.bytes());
+        memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+        auto owner=CpuAdaptiveImmutableRowCache::create(file.source,geometry,memory);cache=owner.get();
+        provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(std::move(owner));
+        channelLease=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,layout.bytes());
+        bytes.reset(static_cast<std::byte*>(::operator new(layout.bytes(),std::align_val_t{64})));
+        std::fill_n(bytes.get(),layout.bytes(),std::byte{0xa5});
+        processor=std::make_unique<ImmutableLookupHostProcessor>(*provider,layout,
+            std::span<std::byte>{bytes.get(),layout.bytes()},17,&fatal,&cancelled);
+    }
+    /** @brief Retire ingress before its provider or channel, matching actual retained service ownership. */
+    ~Lane(){processor.reset();provider.reset();bytes.reset();channelLease={};}
+    /** @return Original request frame; tests mutate only the declared wire boundary. */
+    ImmutableLookupRequest &request(){return *reinterpret_cast<ImmutableLookupRequest*>(bytes.get()+layout.requestOffset());}
+    /** @return Exact response header; padding is never treated as traffic. */
+    ImmutableLookupCompletion &completion(){return *reinterpret_cast<ImmutableLookupCompletion*>(bytes.get()+layout.completionOffset());}
+    /** @return Existing response retirement metadata, never a new sequence ledger. */
+    ImmutableLookupAcknowledgement &ack(){return *reinterpret_cast<ImmutableLookupAcknowledgement*>(bytes.get()+layout.acknowledgementOffset());}
+    /** @return Full admitted payload for inactive-suffix poison checks only. */
+    std::span<std::byte> payload(){return {bytes.get()+layout.payloadOffset(),layout.maximumIds()*layout.rowBytes()};}
+    /** @return Full admitted ACK metadata capacity for untouched-suffix checks only. */
+    std::span<ImmutableRowInvalidationAcknowledgement> invalidations(){return {
+        reinterpret_cast<ImmutableRowInvalidationAcknowledgement*>(bytes.get()+layout.invalidationsOffset()),layout.maximumIds()};}
+    /** @brief Simulate only an immutable GPU compact-ID/intent publication, with exact live extents. */
+    void publish(std::uint64_t sequence,std::uint64_t generation,std::span<const std::int64_t> ids,std::span<const Intent> intents){
+        if(ids.size()!=intents.size() || ids.size()>layout.maximumIds())throw std::invalid_argument("Invalid test frame");
+        if(!ids.empty()){
+            std::memcpy(bytes.get()+layout.idsOffset(),ids.data(),ids.size_bytes());
+            std::memcpy(bytes.get()+layout.intentsOffset(),intents.data(),intents.size_bytes());
+        }
+        ImmutableLookupRequest frame;frame.sequenceComplement=~sequence;
+        frame.generation=generation;frame.generationComplement=~generation;frame.table=17;frame.tableComplement=~frame.table;
+        frame.idCount=ids.size();frame.idCountComplement=~frame.idCount;frame.idBytes=ids.size_bytes();frame.idBytesComplement=~frame.idBytes;
+        frame.rowBytes=layout.rowBytes();frame.rowBytesComplement=~frame.rowBytes;
+        frame.protocol=layout.protocol();frame.protocolComplement=~frame.protocol;
+        std::memcpy(reinterpret_cast<std::byte*>(&request())+8,reinterpret_cast<const std::byte*>(&frame)+8,kLookupRequestLiveBytes-8);
+        std::atomic_ref(request().publication).store(sequence,std::memory_order_release);
+    }
+    /** @brief Publish the actual consumer's response-retirement word. */
+    void consume(std::uint64_t sequence){std::atomic_ref(ack().consumedSequence).store(sequence,std::memory_order_release);}
+    /** @brief Compare native output directly against the authored source, preserving duplicates. */
+    void expectRows(std::span<const std::int64_t> ids){
+        for(std::size_t i=0;i<ids.size();++i)EXPECT_EQ(std::memcmp(payload().data()+i*layout.rowBytes(),
+            file.bytes.data()+file.source.file_offset+ids[i]*layout.rowBytes(),layout.rowBytes()),0);
+        for(std::size_t i=ids.size()*layout.rowBytes();i<payload().size();++i)EXPECT_EQ(payload()[i],std::byte{0xa5});
+    }
+    /** @brief Fill only test payload/ACK storage after its previous consumer retired. */
+    void poison(){std::fill(payload().begin(),payload().end(),std::byte{0xa5});
+        std::memset(invalidations().data(),0xa5,invalidations().size_bytes());}
+};
+}
+
+/** @test Exact endpoints and zero GPU residency preserve subordinate mode without a fake coordinator. */
+TEST(ImmutableLookupSubordinate, GeometryAuthenticatesEndpointsAndZeroGpuCapacity){
+    NativeFile file;
+    for(auto gpu:{DeviceId::cuda(0),DeviceId::rocm(0)})for(auto gpuSlots:{0u,2u}){
+        const auto layout=layoutFor(file,gpu,0,gpuSlots);
+        EXPECT_EQ(layout.gpuCoordinator().has_value(),gpuSlots!=0);
+        EXPECT_NO_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,{0,gpu}));
+        if(gpuSlots){EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::fromLayout(layout,hostId,8),std::invalid_argument);}
+        else {EXPECT_NO_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::fromLayout(layout,hostId,8));}
+        EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,{0,DeviceId::cpu()}),std::invalid_argument);
+        EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,{1,gpu}),std::invalid_argument);
+        EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,{0,DeviceId(gpu.type,1)}),std::invalid_argument);
+    }
+}
+
+/** @test Original sole-consumer identity survives C0 and never aliases a distinct GPU storage role. */
+TEST(ImmutableLookupSubordinate, DeclaredRequesterRemainsIndependentOfStorageCapacityAndBackend){
+    NativeFile file;
+    const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+    for(const auto consumerDevice:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+        const PhysicalMemoryAllocatorIdentity consumer{0,consumerDevice};
+        const auto otherDevice=consumerDevice.is_cuda()?DeviceId::rocm(0):DeviceId::cuda(0);
+        const std::array storageDevices{consumerDevice,DeviceId(consumerDevice.type,1),otherDevice};
+        for(const auto storageDevice:storageDevices)for(const auto slots:{0u,2u}){
+            const PhysicalMemoryAllocatorIdentity storage{0,storageDevice};
+            const auto layout=[&](std::vector<PhysicalMemoryAllocatorIdentity> consumers){
+                return ImmutableRowTableLayoutGeometry::checked(
+                    ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
+                    ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+                    {{{hostId,ImmutableRowStorage::RAM},0,2,{}},{{storage,ImmutableRowStorage::VRAM},0,slots,{}}},
+                    std::move(consumers),{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+                    {},slots?std::optional(consumer):std::nullopt,8);
+            };
+            const auto original=layout({consumer});
+            EXPECT_NO_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(original,hostId,consumer));
+            // A declared storage endpoint grants no authority to impersonate the
+            // query consumer, whether it owns positive slots or zero slots.
+            EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(
+                original,hostId,{0,DeviceId(consumerDevice.type,1)}),std::invalid_argument);
+            EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(
+                original,hostId,{0,otherDevice}),std::invalid_argument);
+            EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(
+                original,hostId,{1,consumerDevice}),std::invalid_argument);
+            const auto shared=layout({consumer,{0,DeviceId(consumerDevice.type,2)}});
+            EXPECT_THROW((void)CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(shared,hostId,consumer),std::invalid_argument);
+        }
+    }
+}
+
+/** @test The same provider cannot escape to independent gather/pin or an ordinary channel. */
+TEST(ImmutableLookupSubordinate, ClosedOwnerRejectsIndependentReadsAndWrongChannelMode){
+    Lane lane;const std::array<std::int64_t,1> ids{3};std::array<std::byte,90> out{};
+    EXPECT_THROW((void)lane.provider->gather(ids,out),std::invalid_argument);
+    EXPECT_THROW((void)lane.cache->gather(ids,out),std::invalid_argument);
+    EXPECT_THROW((void)lane.cache->tryPinResident(3),std::invalid_argument);
+    EXPECT_TRUE(lane.memory->rankComplete());
+    const auto ordinary=ImmutableLookupLayout::create(8,lane.layout.rowBytes());
+    EXPECT_THROW((void)ImmutableLookupHostProcessor(*lane.provider,ordinary,
+        std::span<std::byte>{lane.bytes.get(),lane.layout.bytes()},19),std::invalid_argument);
+    EXPECT_THROW((void)ImmutableLookupHostProcessor(*lane.provider,lane.layout,
+        std::span<std::byte>{lane.bytes.get(),lane.layout.bytes()},19),std::invalid_argument);
+    EXPECT_EQ(lane.cache->stats().completed_batches,0u);
+}
+
+/** @test Fill then detach precedes ACK; old pins retain backing, all-pinned responses progress and slot ABA cannot reuse live bytes. */
+TEST(ImmutableLookupSubordinate, PromotionDetachesBeforeAckAndRetainsOldPinnedBacking){
+    Lane lane;const std::array<std::int64_t,3> seed{3,3,4};const std::array<Intent,3> reads{};
+    lane.publish(1,1,seed,reads);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);lane.expectRows(seed);
+    auto old=lane.processor->borrowSubordinateResponseRow(0);auto other=lane.processor->borrowSubordinateResponseRow(2);
+    ASSERT_TRUE(old);ASSERT_TRUE(other);const auto oldGeneration=old->generation();
+    lane.consume(1);lane.poison();
+    const std::array<std::int64_t,2> promote{3,3};const std::array<Intent,2> intents{{{Operation::ReadAndInvalidate,99},{Operation::ReadAndInvalidate,99}}};
+    lane.publish(2,2,promote,intents);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);lane.expectRows(promote);
+    ASSERT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+    EXPECT_EQ(lane.cache->stats().invalidations,1u);EXPECT_EQ(lane.cache->stats().resident_rows,1u);
+    EXPECT_EQ(lane.invalidations()[0].destination_grant,99u);EXPECT_EQ(lane.invalidations()[1].destination_grant,99u);
+    EXPECT_EQ(lane.invalidations()[2].destination_grant,0xa5a5a5a5a5a5a5a5ULL);
+    EXPECT_THROW((void)lane.processor->borrowSubordinateResponseRow(0),std::invalid_argument);
+    EXPECT_EQ(std::memcmp(old->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+3*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+    lane.consume(2);lane.poison();const std::array<std::int64_t,1> miss{7};const std::array<Intent,1> read{};
+    lane.publish(3,3,miss,read);ASSERT_EQ(lane.processor->poll(3),ImmutableLookupPoll::Completed);lane.expectRows(miss);
+    EXPECT_FALSE(lane.processor->borrowSubordinateResponseRow(0));EXPECT_EQ(lane.cache->stats().all_pinned_responses,1u);
+    EXPECT_EQ(old->generation(),oldGeneration);old.reset();lane.consume(3);lane.poison();
+    lane.publish(4,4,miss,read);ASSERT_EQ(lane.processor->poll(4),ImmutableLookupPoll::Completed);lane.expectRows(miss);
+    auto replacement=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(replacement);EXPECT_GT(replacement->generation(),oldGeneration);
+    EXPECT_EQ(lane.cache->stats().resident_rows,2u);
+    const auto before=lane.provider->retainedOwnerObservation();lane.processor.reset();lane.provider.reset();
+    EXPECT_EQ(other->bytes().size(),lane.layout.rowBytes());EXPECT_EQ(replacement->bytes().size(),lane.layout.rowBytes());
+    EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableTableStorage,
+        PhysicalMemoryMaterializationKind::NewAllocation),before.tableStorageBytes());
+    EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+        PhysicalMemoryMaterializationKind::NewAllocation),before.lookupStagingBytes()+lane.channelLease.bytes());
+    other.reset();replacement.reset();
+    EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableTableStorage,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+        PhysicalMemoryMaterializationKind::NewAllocation),lane.channelLease.bytes());
+}
+
+/** @test Zero GPU/RAM capacities retain this explicit mode and exact live traffic, including empty batches and duplicates. */
+TEST(ImmutableLookupSubordinate, ZeroSlotsDuplicatesAndEmptyHaveExactLiveExtents){
+    for(auto gpu:{DeviceId::cuda(0),DeviceId::rocm(0)})for(auto gpuSlots:{0u,2u}){
+        Lane lane(gpu,0,gpuSlots);const std::array<std::int64_t,4> ids{45,3,45,127};
+        const std::array<Intent,4> intents{{{Operation::ReadAndInvalidate,101},{Operation::Read,0},{Operation::ReadAndInvalidate,101},{Operation::ReadAndInvalidate,103}}};
+        lane.publish(1,1,ids,intents);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);lane.expectRows(ids);
+        EXPECT_EQ(lane.cache->stats().source_rows,3u);EXPECT_EQ(lane.cache->stats().duplicate_rows,1u);
+        EXPECT_EQ(lane.cache->stats().resident_rows,0u);EXPECT_EQ(lane.cache->stats().invalidations,0u);
+        EXPECT_EQ(lane.invalidations()[0].destination_grant,101u);EXPECT_EQ(lane.invalidations()[1].destination_grant,0u);
+        EXPECT_EQ(lane.invalidations()[2].destination_grant,101u);EXPECT_EQ(lane.invalidations()[3].destination_grant,103u);
+        auto stats=lane.processor->stats();EXPECT_EQ(stats.nativeBytes,ids.size()*lane.layout.rowBytes());
+        EXPECT_EQ(stats.idBytes,ids.size()*sizeof(std::int64_t));
+        EXPECT_EQ(stats.metadataBytes,kLookupRequestLiveBytes+kLookupCompletionLiveBytes+ids.size()*(sizeof(Intent)+sizeof(ImmutableRowInvalidationAcknowledgement)));
+        EXPECT_EQ(lane.provider->mode(),HostImmutableRowMode::AdaptiveRAMSSD);
+        lane.consume(1);lane.poison();lane.publish(2,2,{},{});ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);lane.expectRows({});
+        const auto empty=lane.processor->stats();EXPECT_EQ(empty.nativeBytes,stats.nativeBytes);
+        EXPECT_EQ(empty.metadataBytes-stats.metadataBytes,kLookupRequestLiveBytes+kLookupCompletionLiveBytes);
+        EXPECT_EQ(ImmutableLookupProtocol::validateCompletion(lane.completion(),2,2,2,17,0,lane.layout.rowBytes(),lane.layout.protocol()),ImmutableLookupStatus::Success);
+        EXPECT_EQ(ImmutableLookupProtocol::validateCompletion(lane.completion(),2,2,2,17,0,lane.layout.rowBytes()),ImmutableLookupStatus::InvalidProtocol);
+    }
+}
+
+/** @test All malformed bodies reject before native output, ACK, source/cache work or policy mutation. */
+TEST(ImmutableLookupSubordinate, InvalidFramesCannotMutatePayloadOrCpuResidency){
+    for(int variant=0;variant<14;++variant){
+        SCOPED_TRACE(variant);Lane lane;std::array<std::int64_t,2> ids{3,4};std::array<Intent,2> intents{};
+        switch(variant){
+        case 0:intents[1].intent=static_cast<Operation>(77);break;
+        case 1:intents[1].destination_grant=9;break;
+        case 2:intents[1].intent=Operation::ReadAndInvalidate;break;
+        case 3:ids[1]=3;intents[1]={Operation::ReadAndInvalidate,9};break;
+        case 4:ids[1]=3;intents={{{Operation::ReadAndInvalidate,9},{Operation::ReadAndInvalidate,10}}};break;
+        case 5:intents={{{Operation::ReadAndInvalidate,9},{Operation::ReadAndInvalidate,9}}};break;
+        case 6:ids[1]=-1;break;
+        case 7:ids[1]=128;break;
+        default:break;
+        }
+        lane.publish(1,1,ids,intents);
+        if(variant==8){lane.request().protocol=kImmutableLookupProtocol;lane.request().protocolComplement=~kImmutableLookupProtocol;}
+        if(variant==9){lane.request().table=29;lane.request().tableComplement=~std::uint64_t{29};}
+        if(variant==10){lane.request().generation=2;lane.request().generationComplement=~std::uint64_t{2};}
+        if(variant==11){lane.request().idCount=9;lane.request().idCountComplement=~std::uint64_t{9};lane.request().idBytes=72;lane.request().idBytesComplement=~std::uint64_t{72};}
+        if(variant==12){lane.request().rowBytes=1;lane.request().rowBytesComplement=~std::uint64_t{1};}
+        if(variant==13)lane.request().sequenceComplement=0;
+        const auto before=lane.cache->stats();const auto source=lane.provider->sourceStats();
+        ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+        EXPECT_NE(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+        lane.expectRows({});for(const auto &ack:lane.invalidations())EXPECT_EQ(ack.destination_grant,0xa5a5a5a5a5a5a5a5ULL);
+        EXPECT_EQ(lane.cache->stats().completed_batches,before.completed_batches);EXPECT_EQ(lane.cache->stats().failures,before.failures);
+        EXPECT_EQ(lane.cache->stats().resident_rows,before.resident_rows);EXPECT_EQ(lane.cache->stats().invalidations,before.invalidations);
+        EXPECT_EQ(lane.provider->sourceStats().source_metadata_checks,source.source_metadata_checks);
+        EXPECT_NO_THROW(lane.provider->authenticateSource()); // Validation failure is a failed channel, not an I/O-poisoned source.
+        EXPECT_THROW((void)lane.processor->poll(1),std::runtime_error);
+    }
+}
+
+/** @test Future/regressed consumed ACKs cannot release a different outstanding batch; premature reuse cannot fill. */
+TEST(ImmutableLookupSubordinate, StaleAcknowledgementsAndUnconsumedReuseAreFatal){
+    for(auto badAck:{0u,2u}){
+        Lane lane;const std::array<std::int64_t,1> id{3};const std::array<Intent,1> intent{};
+        lane.publish(1,1,id,intent);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+        lane.consume(badAck);lane.publish(2,2,id,intent);
+        const auto before=lane.cache->stats().completed_batches;
+        EXPECT_THROW((void)lane.processor->poll(2),std::runtime_error);
+        EXPECT_EQ(lane.cache->stats().completed_batches,before);
+        EXPECT_THROW((void)lane.processor->borrowSubordinateResponseRow(0),std::logic_error);
+    }
+    Lane lane;const std::array<std::int64_t,1> id{3};const std::array<Intent,1> intent{};
+    lane.publish(1,1,id,intent);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);lane.consume(1);
+    lane.publish(2,2,id,intent);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+    lane.consume(0);std::atomic_ref(lane.ack().closedGeneration).store(2,std::memory_order_release);
+    EXPECT_THROW((void)lane.processor->closed(2),std::runtime_error);
+}
+
+/** @test Cancellation bars later capabilities without claiming CPU cancellation can prevent an already-visible GPU completion. */
+TEST(ImmutableLookupSubordinate, CancellationIsStickyAndPreservesOldReaderBacking){
+    Lane lane;const std::array<std::int64_t,1> id{3};const std::array<Intent,1> intent{};
+    lane.publish(1,1,id,intent);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    auto old=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(old);
+    lane.cancelled.store(true,std::memory_order_release);
+    EXPECT_THROW((void)lane.processor->borrowSubordinateResponseRow(0),std::logic_error);
+    EXPECT_THROW((void)lane.processor->poll(1),std::runtime_error);
+    lane.cancelled.store(false,std::memory_order_release);EXPECT_THROW((void)lane.processor->poll(1),std::runtime_error);
+    EXPECT_EQ(old->bytes().size(),lane.layout.rowBytes());EXPECT_EQ(lane.cache->stats().completed_batches,1u);
+    EXPECT_EQ(lane.processor->lastStatus(),ImmutableLookupStatus::Cancelled);
+}
+
+/** @test Source failure poisons this same CPU authority; old warm pins and future requests cannot bypass it. */
+TEST(ImmutableLookupSubordinate, FailedSourcePublishesNoPromotionAckAndPoisonsPins){
+    Lane lane;const std::array<std::int64_t,1> id{3};const std::array<Intent,1> read{};
+    lane.publish(1,1,id,read);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    auto pin=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(pin);lane.consume(1);lane.poison();
+    ASSERT_EQ(::ftruncate(lane.file.fd,0),0);const std::array<Intent,1> promote{{{Operation::ReadAndInvalidate,123}}};
+    lane.publish(2,2,id,promote);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+    EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::StorageFailure));
+    EXPECT_EQ(lane.invalidations()[0].destination_grant,0xa5a5a5a5a5a5a5a5ULL);lane.expectRows({});
+    EXPECT_EQ(lane.cache->stats().completed_batches,1u);EXPECT_EQ(lane.cache->stats().invalidations,0u);
+    EXPECT_THROW((void)pin->bytes(),std::runtime_error);
+    EXPECT_THROW(lane.provider->authenticateSource(),std::runtime_error);
+    EXPECT_THROW((void)lane.processor->poll(2),std::runtime_error);
+}
+
+/** @test A deterministic GPU ACK/refill between the actual acquire and pin operations cannot change the borrowed source row. */
+TEST(ImmutableLookupSubordinate, AcquiredGrantUsesOwnedRowsAcrossAckAndMappedFrameOverwrite){
+    Lane lane;const std::array<std::int64_t,2> seed{3,4};const std::array<Intent,2> reads{};
+    lane.publish(1,1,seed,reads);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    auto original=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(original);
+    const auto generation=original->generation();
+    auto old=ImmutableLookupSubordinateTestAccess::borrowAcross(*lane.processor,0,[&]{
+        // Even an illicit early shared-frame overwrite cannot alter CPU grant metadata.
+        auto *ids=reinterpret_cast<std::int64_t*>(lane.bytes.get()+lane.layout.idsOffset());ids[0]=4;
+        auto *intents=reinterpret_cast<Intent*>(lane.bytes.get()+lane.layout.intentsOffset());intents[0]={Operation::ReadAndInvalidate,999};
+    });
+    ASSERT_TRUE(old);EXPECT_EQ(old->row(),3u);EXPECT_EQ(old->generation(),generation);
+    EXPECT_THROW((void)ImmutableLookupSubordinateTestAccess::borrowAcross(*lane.processor,0,[&]{
+        lane.consume(1);const std::array<std::int64_t,2> next{7,7};const std::array<Intent,2> read{};
+        lane.publish(2,2,next,read);
+    }),std::logic_error);
+    EXPECT_EQ(original->row(),3u);EXPECT_EQ(original->generation(),generation);
+    EXPECT_EQ(original->bytes().size(),lane.layout.rowBytes());
+    EXPECT_EQ(lane.cache->stats().pinned_rows,1u); // No tentative leaked pin or redirected row7 grant.
+    EXPECT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+    auto next=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(next);EXPECT_EQ(next->row(),7u);
+    EXPECT_EQ(original->row(),3u);EXPECT_EQ(original->generation(),generation);
+}
+
+/** @test An acquired response cannot be reused under a later admission until its original generation closes its read grant. */
+TEST(ImmutableLookupSubordinate, OutstandingGrantRejectsChangedAdmissionBeforeAnyNewPublication){
+    Lane lane;const std::array<std::int64_t,1> id{3};const std::array<Intent,1> read{};
+    lane.publish(1,1,id,read);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    EXPECT_THROW((void)lane.processor->poll(2),std::runtime_error);
+    EXPECT_EQ(lane.processor->lastStatus(),ImmutableLookupStatus::StaleGeneration);
+    EXPECT_THROW((void)lane.processor->borrowSubordinateResponseRow(0),std::logic_error);
+    EXPECT_EQ(lane.cache->stats().completed_batches,1u);
+}
+
+/** @test A later successful CPU poll may reuse its bounded row bank but cannot turn an old acquire into a new row permit. */
+TEST(ImmutableLookupSubordinate, OldHostBorrowRejectsAfterNewSuccessfulPollReusesGrantedRowBank){
+    Lane lane;const std::array<std::int64_t,1> first{3};const std::array<Intent,1> read{};
+    lane.publish(1,1,first,read);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    auto original=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(original);
+    const auto oldGeneration=original->generation();
+    EXPECT_THROW((void)ImmutableLookupSubordinateTestAccess::borrowAcross(*lane.processor,0,[&]{
+        lane.consume(1);const std::array<std::int64_t,1> second{7};lane.poison();
+        lane.publish(2,2,second,read);EXPECT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+    }),std::logic_error);
+    auto current=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(current);EXPECT_EQ(current->row(),7u);
+    EXPECT_EQ(original->row(),3u);EXPECT_EQ(original->generation(),oldGeneration);
+    EXPECT_EQ(original->bytes().size(),lane.layout.rowBytes());
+}
+
+/** @test Exact mandatory staging remains a canonical PMA obligation, including zero native RAM capacity. */
+TEST(ImmutableLookupSubordinate, SourceAndGrantScratchRequireExactPmaAndNoForeignSource){
+    NativeFile file;
+    for(auto ramSlots:{0u,2u}){
+        const auto layout=layoutFor(file,DeviceId::cuda(0),ramSlots,0);
+        const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,{0,DeviceId::cuda(0)});
+        PhysicalMemoryPlanBuilder shortPlan;
+        shortPlan.add(hostResource(),PhysicalMemoryOwner::ImmutableTableStorage,geometry.storageBytes()+geometry.sourceBytes());
+        shortPlan.add(hostResource(),PhysicalMemoryOwner::ImmutableLookupStaging,geometry.executionBytes()-1);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(shortPlan.build()),0);
+        EXPECT_THROW((void)CpuAdaptiveImmutableRowCache::create(file.source,geometry,memory),std::exception);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableTableStorage,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        auto foreign=file.source;foreign.rows-=1;
+        EXPECT_THROW((void)CpuAdaptiveImmutableRowCache::create(foreign,geometry,memory),std::invalid_argument);
+    }
+}
+
+namespace {
+/** @brief CPU-only mapped allocator; no vendor runtime, kernel or GPU memory query is used. */
+class WorkerMappedBackend final : public llaminar2::test::MockBackend {
+public:
+    WorkerMappedBackend():MockBackend(DeviceType::CUDA) {}
+    /** @brief Materialize the real TransferEngine request with the wire's required alignment. */
+    void *allocateMapped(std::size_t bytes,int,void **alias) override {
+        if(address)throw std::logic_error("Worker fixture allocated its one mapped channel twice");
+        address=std::aligned_alloc(64,(bytes+63)/64*64);
+        if(alias)*alias=address;
+        return address;
+    }
+    /** @brief Count actual final mapping destruction, independently of CPU worker completion. */
+    void freeMapped(void *pointer,int) override {
+        if(pointer!=address)std::terminate();
+        std::free(address);address=nullptr;++frees;
+    }
+    bool supportsPortableMappedAllocation() const noexcept override{return true;}
+    void* allocatePortableMapped(std::size_t bytes,int ordinal,void** alias)override{return allocateMapped(bytes,ordinal,alias);}
+    bool externalMappedHostDevicePointer(void* host,int,void** alias)override{*alias=host;return true;}
+    void *address=nullptr;unsigned frees=0;
+};
+WorkerMappedBackend *workerBackend=nullptr;
+unsigned workerMappingCount=2;
+/** @return One explicitly installed hardware-free mapping endpoint. */
+IBackend *resolveWorkerMapping(DeviceId device) {
+    return (device.is_cuda() && device.gpu_ordinal()>=0 && static_cast<unsigned>(device.gpu_ordinal())<workerMappingCount)?workerBackend:nullptr;
+}
+/** @brief Explicit replay or installed original fixture selection; never an automatic fallback. */
+enum class ServiceLaneOrigin {Recorded,InstalledOriginal};
+/** @brief Actual PMA provider, service, mapped backing and persistent worker with simulated GPU wire publications. */
+struct ServiceLane {
+    WorkerMappedBackend backend;
+    TransferEngine transfers{&resolveWorkerMapping};
+    NativeFile file;
+    ImmutableLookupLayout layout=ImmutableLookupLayout::createSubordinate(8,file.source.rowBytes());
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    std::shared_ptr<HostImmutableRowProvider> provider;
+    std::shared_ptr<ImmutableLookupService> service;
+    std::optional<ImmutableSubordinateLookupBinding> binding,secondBinding;
+    std::vector<ImmutableSubordinateLookupBinding> laterBindings;
+    /**
+     * @brief Use original service creation, worker and PMA ownership without a vendor runtime.
+     * @param gpuSlots Explicit test-local cache capacity, never a source replica.
+     * @param ramSlots Bounded shared RAM cache slots; full-RAM backing requires zero.
+     * @param origin Recorded host-service metadata or actual installed declaration.
+     * @param grouped Whether the source has multiple actual consumer channels.
+     * @param fullRAM Whether the original source is fully RAM-backed.
+     * @param groupCount Exact declared test endpoint count; original callers retain two.
+     * @throws std::exception If original geometry, admission or mapping rejects setup.
+     */
+    explicit ServiceLane(std::size_t gpuSlots=2,std::size_t ramSlots=2,ServiceLaneOrigin origin=ServiceLaneOrigin::Recorded,bool grouped=false,bool fullRAM=false,unsigned groupCount=2) {
+        if(workerBackend)throw std::logic_error("Overlapping serial mapping fixture");
+        workerBackend=&backend;workerMappingCount=grouped?groupCount:2;
+        try {
+            const auto sourceLayout=[&]{
+                if(!grouped)return layoutFor(file,DeviceId::cuda(0),ramSlots,gpuSlots);
+                std::vector<ImmutableRowTableLayoutOwner> owners{{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}}};
+                std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+                for(unsigned i=0;i<groupCount;++i){
+                    consumers.push_back({0,DeviceId::cuda(static_cast<int>(i))});
+                    owners.push_back({{consumers.back(),ImmutableRowStorage::VRAM},0,gpuSlots,{}});
+                }
+                return ImmutableRowTableLayoutGeometry::checked(
+                    ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
+                    ImmutableRowTableTiers::of(fullRAM?std::vector{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM}:
+                        std::vector{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped}),
+                    ImmutableRowTableResidency::Adaptive,std::move(owners),consumers,{},
+                    {{hostId,ImmutableRowTableStoragePolicy::forStorage(fullRAM?ImmutableRowStorage::RAM:ImmutableRowStorage::MemoryMapped,4096,2)}},{},
+                    groupCount==2 && gpuSlots?std::optional(consumers.front()):std::nullopt,8,
+                    groupCount==2?ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator:ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal);
+            }();
+            const auto geometry=grouped?CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(sourceLayout,hostId)
+                :CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(sourceLayout,hostId,{0,DeviceId::cuda(0)});
+            std::vector<DeviceId> endpoints{DeviceId::cuda(0)};
+            if(grouped)for(unsigned i=1;i<groupCount;++i)endpoints.push_back(DeviceId::cuda(static_cast<int>(i)));
+            auto io=origin==ServiceLaneOrigin::InstalledOriginal
+                ?llaminar2::test::RetainedHostServiceFixture::original(RetainedHostServiceRole::ImmutableLookupIO,{0,DeviceId::cuda(0)})
+                :llaminar2::test::RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ImmutableLookupIO,{0,DeviceId::cuda(0)});
+            PhysicalMemoryPlanBuilder plan(geometry.bom(hostResource()));const auto workerBOM=io.bom(hostResource());for(const auto& row:workerBOM.resources())plan.add(row);
+            plan.add(hostResource(),PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupServiceGeometry::checked(layout,endpoints).hostBytes());
+            memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+            provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(CpuAdaptiveImmutableRowCache::create(file.source,geometry,memory));
+            service=ImmutableLookupService::create(provider,layout,endpoints,memory,DeviceId::cpu(),io.take(memory),transfers);
+            binding.emplace(service->bindSubordinate(endpoints[0]));
+            if(grouped){secondBinding.emplace(service->bindSubordinate(endpoints[1]));
+                for(std::size_t i=2;i<endpoints.size();++i)laterBindings.push_back(service->bindSubordinate(endpoints[i]));}
+        } catch(...) {workerBackend=nullptr;throw;}
+    }
+    /** @brief Final captured binding retires before its mapped backend and source fixture. */
+    ~ServiceLane(){laterBindings.clear();secondBinding.reset();binding.reset();service.reset();provider.reset();workerBackend=nullptr;}
+    /** @param channel Original sealed channel index. @return Exact binding, without frame aliasing. @throws std::out_of_range For a foreign later channel. */
+    ImmutableSubordinateLookupBinding& channelBinding(std::size_t channel){return channel<2?*(channel?secondBinding:binding):laterBindings.at(channel-2);}
+    /** @return Exact shared metadata retained by the original source binding. */
+    ImmutableLookupAcknowledgement &ack(std::size_t channel=0){return *channelBinding(channel).deviceView().base.acknowledgement;}
+    /** @return Original acquired-completion channel, never a copied successful observation. */
+    ImmutableLookupCompletion &completion(std::size_t channel=0){return *channelBinding(channel).deviceView().base.completion;}
+    /** @brief Release an exact live request through the real protocol2 ABI. */
+    void publish(std::uint64_t sequence,std::uint64_t generation,std::span<const std::int64_t> ids,
+                 std::span<const Intent> intents,std::size_t channel=0) {
+        auto &view=channelBinding(channel).deviceView();
+        if(ids.size()!=intents.size() || ids.size()>layout.maximumIds())throw std::invalid_argument("Invalid service fixture frame");
+        if(!ids.empty()) {
+            std::memcpy(view.base.ids,ids.data(),ids.size_bytes());
+            std::memcpy(view.intents,intents.data(),intents.size_bytes());
+        }
+        ImmutableLookupRequest request;
+        request.sequenceComplement=~sequence;request.generation=generation;request.generationComplement=~generation;
+        request.table=view.base.table;request.tableComplement=~request.table;
+        request.idCount=ids.size();request.idCountComplement=~request.idCount;
+        request.idBytes=ids.size_bytes();request.idBytesComplement=~request.idBytes;
+        request.rowBytes=layout.rowBytes();request.rowBytesComplement=~request.rowBytes;
+        request.protocol=layout.protocol();request.protocolComplement=~request.protocol;
+        std::memcpy(reinterpret_cast<std::byte*>(view.base.request)+8,reinterpret_cast<const std::byte*>(&request)+8,kLookupRequestLiveBytes-8);
+        std::atomic_ref(view.base.request->publication).store(sequence,std::memory_order_release);
+    }
+    /** @brief Acquire one actual worker publication with a bounded test-only wait. */
+    static void wait(std::uint64_t &word,std::uint64_t expected) {
+        const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        while(std::atomic_ref(word).load(std::memory_order_acquire)!=expected) {
+            if(std::chrono::steady_clock::now()>=until)throw std::runtime_error("Actual immutable worker publication did not retire");
+            std::this_thread::yield();
+        }
+    }
+    /** @brief Simulate the GPU's separate exact I/O abort release, never CPU cancellation or graph close. */
+    void abort(ImmutableLookupService::Ticket ticket){
+        std::atomic_ref(ack().abortGeneration).store(ticket.generation,std::memory_order_release);
+        std::atomic_ref(ack().abortInvocation).store(ticket.invocation,std::memory_order_release);
+    }
+    /** @brief Simulate complete consumer retirement and graph terminal, never before actual completion. */
+    void close(std::uint64_t sequence,std::uint64_t generation,std::size_t channel=0) {
+        std::atomic_ref(ack(channel).consumedSequence).store(sequence,std::memory_order_release);
+        std::atomic_ref(ack(channel).closedGeneration).store(generation,std::memory_order_release);
+    }
+};
+}
+
+/** @test Cancellation without any acquired completion releases an exact worker witness and keeps captured backing alive. */
+TEST(ImmutableLookupSubordinate, WorkerCancelBeforePublicationAndBeforePollRetiresExactInvocation) {
+    for(auto gpuSlots:{0u,2u})for(bool publishAfterCancel:{false,true}) {
+        GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(gpuSlots);
+        const auto retained=lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation);
+        ASSERT_GE(retained,ImmutableLookupService::hostBytes(lane.layout));
+        const auto ticket=lane.service->arm(17);
+        EXPECT_FALSE(lane.service->cancel({ticket.generation+1,ticket.invocation}));
+        EXPECT_FALSE(lane.service->cancel({ticket.generation,ticket.invocation+1}));
+        ASSERT_TRUE(lane.service->cancel(ticket));
+        // A queued GPU producer can publish after CPU cancellation. Wait for
+        // actual retirement first so the before-poll interleaving is exact,
+        // independent of host thread scheduling, and cannot fabricate a reply.
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        if(publishAfterCancel) {
+            const std::array<std::int64_t,1> ids{3};const std::array<Intent,1> read{};
+            lane.publish(1,ticket.generation,ids,read);
+        }
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(lane.ack().retiredInvocation,
+            lane.ack().retiredGeneration,ticket.generation,ticket.invocation));
+        EXPECT_EQ(lane.completion().publication,0u); // Retirement never manufactures Consumed.
+        EXPECT_EQ(lane.ack().consumedSequence,0u);
+        EXPECT_FALSE(lane.service->cancel(ticket)); // Retirement rejects late writes, including await's missing-close path.
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_EQ(lane.service->stats().terminalBytes,4*sizeof(std::uint64_t));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_FALSE(lane.service->cancel(ticket));
+        lane.service.reset();lane.provider.reset();
+        EXPECT_EQ(lane.backend.frees,0u); // Captured binding, not worker retirement, owns backing.
+        EXPECT_EQ(lane.ack().retiredGeneration,ticket.generation);
+        EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),retained);
+        lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
+        EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+}
+
+/** @test An actual failed completion published between source polls remains acquired after exact worker retirement.
+ * @note The first load is genuinely sampled before publishing the request/cancellation. The existing
+ * worker alone authors completion/retirement. This replays the production GPU acquisition helper's
+ * exact late-publication order, including the no-completion cancellation control, without a GPU.
+ */
+TEST(ImmutableLookupSubordinate, WorkerRetirementReacquiresOriginalFailureCompletion) {
+    namespace source=llaminar2::qwen4exp::pooled_source;
+    for(const auto slots:{0u,2u})for(const bool noCompletion:{false,true}) {
+        GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(slots);const auto ticket=lane.service->arm(7);
+        if(!noCompletion)ASSERT_EQ(::ftruncate(lane.file.fd,0),0);
+        struct Publications {
+            ServiceLane& lane;ImmutableLookupService::Ticket ticket;bool noCompletion;unsigned reads=0;
+            std::vector<char> trace;
+            /** @brief Sample the real publication, then force the actual worker into the intervening retired state. */
+            std::uint64_t completion(){
+                trace.push_back('C');const auto publication=std::atomic_ref(lane.completion().publication).load(std::memory_order_acquire);
+                if(reads++==0){
+                    EXPECT_EQ(publication,0u);
+                    if(noCompletion)EXPECT_TRUE(lane.service->cancel(ticket));
+                    else {const std::array<std::int64_t,2> ids{11,12};const std::array<Intent,2> intents{};lane.publish(1,ticket.generation,ids,intents);}
+                    ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+                }
+                return publication;
+            }
+            /** @return The original worker's actual acquired generation/invocation retirement pair. */
+            bool retirement(){
+                trace.push_back('R');const auto invocation=std::atomic_ref(lane.ack().retiredInvocation).load(std::memory_order_acquire);
+                const auto generation=std::atomic_ref(lane.ack().retiredGeneration).load(std::memory_order_acquire);
+                return ImmutableLookupProtocol::matchesInvocation(invocation,generation,ticket.generation,ticket.invocation);
+            }
+        } publications{lane,ticket,noCompletion};
+        const auto observation=source::acquireResponsePublication(publications,1);
+        EXPECT_EQ(publications.trace,(std::vector<char>{'C','R','C'}));
+        EXPECT_EQ(observation,noCompletion?source::ResponsePublication::WorkerRetired:source::ResponsePublication::Completion);
+        EXPECT_EQ(lane.ack().consumedSequence,0u); // Neither the helper nor worker fabricates consumption.
+        if(!noCompletion){
+            EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::StorageFailure));
+            EXPECT_EQ(ImmutableLookupProtocol::validateCompletion(lane.completion(),1,1,ticket.generation,
+                lane.binding->deviceView().base.table,2,lane.layout.rowBytes(),lane.layout.protocol()),ImmutableLookupStatus::StorageFailure);
+            lane.close(1,ticket.generation); // Authenticated failed envelope permits true consumption.
+        }
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_EQ(lane.service->stats().terminalBytes,noCompletion?32u:16u);
+        if(noCompletion)EXPECT_EQ(lane.ack().consumedSequence,0u);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+}
+
+/** @test A completed but unconsumed source grant retires on cancellation; original invalidation tokens remain immutable. */
+TEST(ImmutableLookupSubordinate, WorkerCancelAcquiredRequestDropsGrantWithoutFakeConsumption) {
+    for(auto gpuSlots:{0u,2u}) {
+        GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(gpuSlots);const auto ticket=lane.service->arm(2);
+        const std::array<std::int64_t,2> ids{3,4};
+        const std::array<Intent,2> intents{{{Operation::Read,0},{Operation::ReadAndInvalidate,0xfedcba9876543210ULL}}};
+        lane.publish(1,ticket.generation,ids,intents);ServiceLane::wait(lane.completion().publication,1);
+        ASSERT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+        EXPECT_EQ(lane.binding->deviceView().acknowledgements[0].destination_grant,0u);
+        EXPECT_EQ(lane.binding->deviceView().acknowledgements[1].destination_grant,intents[1].destination_grant);
+        ASSERT_TRUE(lane.service->cancel(ticket));ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_EQ(lane.ack().consumedSequence,0u);
+        EXPECT_EQ(lane.completion().publication,1u);
+        EXPECT_EQ(lane.binding->deviceView().acknowledgements[1].destination_grant,intents[1].destination_grant);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+}
+
+/** @test Request reset reuses one worker/channel and rejects old cancellation/retirement pairs across large-to-small frames. */
+/** @brief Replay the same real IO task/reset protocol with an explicit worker declaration origin. */
+void runWorkerLargeSmallReset(ServiceLaneOrigin origin)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(0,2,origin);ImmutableLookupService::Ticket previous{};
+    std::uint64_t sequence=0;
+    for(const auto count:{8u,1u,0u,3u}) {
+        const auto ticket=lane.service->arm(100+sequence);
+        if(previous.valid()) {
+            EXPECT_FALSE(lane.service->cancel(previous));
+            EXPECT_FALSE(ImmutableLookupProtocol::matchesInvocation(lane.ack().retiredInvocation,
+                lane.ack().retiredGeneration,ticket.generation,ticket.invocation));
+            EXPECT_FALSE(ImmutableLookupProtocol::matchesInvocation(ticket.invocation,
+                previous.generation,ticket.generation,ticket.invocation));
+        }
+        std::array<std::int64_t,8> ids{0,1,2,3,4,5,6,7};std::array<Intent,8> intents{};
+        ++sequence;lane.publish(sequence,ticket.generation,std::span(ids).first(count),std::span(intents).first(count));
+        ServiceLane::wait(lane.completion().publication,sequence);
+        EXPECT_EQ(lane.completion().idCount,count);EXPECT_EQ(lane.completion().nativeBytes,count*lane.layout.rowBytes());
+        lane.close(sequence,ticket.generation);
+        EXPECT_TRUE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(lane.ack().retiredInvocation,
+            lane.ack().retiredGeneration,ticket.generation,ticket.invocation));
+        previous=ticket;
+    }
+    EXPECT_EQ(lane.backend.frees,0u);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+TEST(ImmutableLookupSubordinate, WorkerLargeSmallResetRejectsStaleCancellationAndRetirement){
+    runWorkerLargeSmallReset(ServiceLaneOrigin::Recorded);
+}
+#ifdef LLAMINAR_HOST_SERVICE_ORIGINAL_CONSUMERS
+TEST(ImmutableLookupSubordinate, OriginalInstalledWorkerLargeSmallReset){
+    runWorkerLargeSmallReset(ServiceLaneOrigin::InstalledOriginal);
+}
+#endif
+
+
+/** @test Concurrent publication/cancellation permits either truthful completion or absence, and never invents consumption. */
+TEST(ImmutableLookupSubordinate, WorkerCancelPublicationRaceHasOnlyTruthfulTerminalOutcomes) {
+    for(unsigned repeat=0;repeat<20;++repeat) {
+        GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(repeat%2?0:2);const auto ticket=lane.service->arm(9);
+        const std::array<std::int64_t,2> ids{11,12};
+        const std::array<Intent,2> intents{{{Operation::Read,0},{Operation::ReadAndInvalidate,0x123456789abcdef0ULL}}};
+        lane.publish(1,ticket.generation,ids,intents);
+        ASSERT_TRUE(lane.service->cancel(ticket));
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        EXPECT_EQ(lane.ack().retiredGeneration,ticket.generation);
+        const auto acquired=std::atomic_ref(lane.completion().publication).load(std::memory_order_acquire);
+        if(acquired) {
+            const auto status=ImmutableLookupProtocol::validateCompletion(lane.completion(),acquired,1,ticket.generation,
+                lane.binding->deviceView().base.table,ids.size(),lane.layout.rowBytes(),lane.layout.protocol());
+            EXPECT_TRUE(status==ImmutableLookupStatus::Success || status==ImmutableLookupStatus::Cancelled);
+            EXPECT_EQ(lane.completion().nativeBytes,status==ImmutableLookupStatus::Success?ids.size()*lane.layout.rowBytes():0u);
+        }
+        EXPECT_EQ(lane.ack().consumedSequence,0u);
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_EQ(lane.binding->deviceView().intents[1].destination_grant,intents[1].destination_grant);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+}
+
+/** @test The actual SSD worker can copy a payload prefix and fail without releasing any promotion ACK or successful bytes. */
+TEST(ImmutableLookupSubordinate, WorkerFailedPartialPayloadRetainsOriginalIntentAndBacking) {
+    struct DeathStyle {
+        std::string previous=GTEST_FLAG_GET(death_test_style);
+        /** @brief Isolate the address-space bound from other test workers in a fresh process. */
+        DeathStyle(){GTEST_FLAG_SET(death_test_style,"threadsafe");}
+        /** @brief Restore process-wide GTest policy. */
+        ~DeathStyle(){GTEST_FLAG_SET(death_test_style,previous);}
+    } deathStyle;
+    for(const bool abortAfterPrefix:{false,true}) {
+    ASSERT_EXIT(([abortAfterPrefix] {
+        ServiceLane lane(0,0);
+        const std::array<std::int64_t,1> first{0};const std::array<Intent,1> read{};
+        const auto warm=lane.service->arm(1);lane.publish(1,1,first,read);
+        ServiceLane::wait(lane.completion().publication,1);lane.close(1,1);
+        if(!lane.service->await(warm))::_exit(2);
+        auto &view=lane.binding->deviceView();
+        std::memset(view.base.nativeRows,0xa5,2*lane.layout.rowBytes());
+        std::memset(view.acknowledgements,0xa5,2*sizeof(ImmutableRowInvalidationAcknowledgement));
+        const std::array<std::int64_t,2> ids{0,64};
+        const std::array<Intent,2> intents{{{Operation::ReadAndInvalidate,0x100000001ULL},
+                                          {Operation::ReadAndInvalidate,0xfedcba9876543210ULL}}};
+        const auto ticket=lane.service->arm(2);
+        rlimit saved{};
+        if(::getrlimit(RLIMIT_AS,&saved)!=0)::_exit(3);
+        auto *statm=std::fopen("/proc/self/statm","r");unsigned long long pages=0;
+        if(!statm)::_exit(4);
+        const auto parsed=std::fscanf(statm,"%llu",&pages);std::fclose(statm);
+        const auto pageBytes=::sysconf(_SC_PAGESIZE);
+        if(parsed!=1 || pageBytes<=0 || pages>std::numeric_limits<rlim_t>::max()/static_cast<unsigned long long>(pageBytes))::_exit(5);
+        rlimit bounded=saved;bounded.rlim_cur=pages*static_cast<rlim_t>(pageBytes);
+        if(::setrlimit(RLIMIT_AS,&bounded)!=0)::_exit(6);
+        lane.publish(2,2,ids,intents);
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        if(::setrlimit(RLIMIT_AS,&saved)!=0)std::terminate();
+        EXPECT_EQ(lane.completion().publication,2u);
+        EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::StorageFailure));
+        EXPECT_EQ(lane.completion().nativeBytes,0u);
+        EXPECT_EQ(std::memcmp(view.base.nativeRows,lane.file.bytes.data()+lane.file.source.file_offset,lane.layout.rowBytes()),0);
+        for(std::size_t i=lane.layout.rowBytes();i<2*lane.layout.rowBytes();++i)EXPECT_EQ(view.base.nativeRows[i],std::byte{0xa5});
+        for(std::size_t i=0;i<2;++i) {
+            EXPECT_EQ(view.acknowledgements[i].destination_grant,0xa5a5a5a5a5a5a5a5ULL);
+            EXPECT_EQ(view.intents[i].destination_grant,intents[i].destination_grant);
+        }
+        if(abortAfterPrefix)lane.abort(ticket); // Original failed payload prefix exists; no successful ACK is invented.
+        lane.close(2,2);EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_EQ(lane.service->stats().terminalBytes,abortAfterPrefix?56u:40u);
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        lane.service.reset();lane.provider.reset();EXPECT_EQ(lane.backend.frees,0u);
+        lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
+        ::_exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+    }
+}
+
+/** @test Late cancellation before await cannot publish uncounted metadata after the actual CPU worker retires. */
+TEST(ImmutableLookupSubordinate, WorkerLateCancelBeforeAwaitRejectsWithoutPublication) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(0);const auto ticket=lane.service->arm(71);
+    const std::array<std::int64_t,1> ids{7};const std::array<Intent,1> read{};
+    lane.publish(1,ticket.generation,ids,read);ServiceLane::wait(lane.completion().publication,1);
+    ASSERT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+    lane.close(1,ticket.generation);ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+    EXPECT_FALSE(lane.service->cancel(ticket));
+    EXPECT_FALSE(lane.service->cancel(ticket));
+    EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_EQ(lane.ack().cancelledGeneration,0u);
+    EXPECT_TRUE(lane.service->await(ticket));
+    EXPECT_EQ(lane.service->stats().terminalBytes,3*sizeof(std::uint64_t));
+    EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+    const auto next=lane.service->arm(72);
+    EXPECT_FALSE(lane.service->cancel(ticket));
+    EXPECT_TRUE(lane.service->cancel(next));ServiceLane::wait(lane.ack().retiredInvocation,next.invocation);
+    EXPECT_FALSE(lane.service->cancel(next));EXPECT_FALSE(lane.service->await(next));
+    EXPECT_EQ(lane.service->stats().terminalBytes,7*sizeof(std::uint64_t));
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test A GPU abort before request publication retires only the actual worker and preserves captured backing. */
+TEST(ImmutableLookupSubordinate, WorkerSourceAbortBeforePublicationRetiresWithoutConsumed){
+    static_assert(sizeof(ImmutableLookupAcknowledgement)==64);
+    for(const auto slots:{0u,2u}){
+        GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane(slots);const auto ticket=lane.service->arm(17);lane.abort(ticket);
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        const std::array<std::int64_t,1> ids{3};const std::array<Intent,1> read{};
+        lane.publish(1,ticket.generation,ids,read); // Deterministic publication after actual retirement.
+        EXPECT_EQ(lane.completion().publication,0u);EXPECT_EQ(lane.ack().consumedSequence,0u);EXPECT_EQ(lane.ack().closedGeneration,0u);
+        EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_EQ(lane.service->stats().terminalBytes,32u);EXPECT_EQ(lane.service->stats().requests,0u);
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        lane.service.reset();lane.provider.reset();EXPECT_EQ(lane.backend.frees,0u);
+        lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
+        EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+}
+
+/** @test Stale generation, partial pair and previous dispatch cannot abort a later acquired request. */
+TEST(ImmutableLookupSubordinate, WorkerSourceAbortRejectsStalePartialAndPreviousInvocation){
+    GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane;ImmutableLookupService::Ticket previous{};
+    for(std::uint64_t generation=1;generation<=4;++generation){
+        const auto ticket=lane.service->arm(generation);
+        if(previous.valid())lane.abort(previous);
+        std::atomic_ref(lane.ack().abortGeneration).store(generation,std::memory_order_release); // Old/zero publication does not acquire this body.
+        const std::array<std::int64_t,1> ids{static_cast<std::int64_t>(generation+2)};const std::array<Intent,1> read{};
+        lane.publish(generation,generation,ids,read);ServiceLane::wait(lane.completion().publication,generation);
+        lane.abort({generation+1,ticket.invocation}); // Correct invocation with wrong generation remains foreign.
+        lane.close(generation,generation);EXPECT_TRUE(lane.service->await(ticket));
+        EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_EQ(lane.service->stats().terminalBytes,generation*24u);
+        previous=ticket;
+    }
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test A distinct GPU abort racing CPU retirement is accounted after join once, never as fake payload consumption. */
+TEST(ImmutableLookupSubordinate, WorkerLateSourceAbortBeforeAwaitCountsExactMessageOnce){
+    GTEST_FLAG_SET(death_test_style,"threadsafe"); ASSERT_EXIT(([&] { {
+ServiceLane lane;const auto ticket=lane.service->arm(1);
+    const std::array<std::int64_t,1> ids{3};const std::array<Intent,1> read{};
+    lane.publish(1,1,ids,read);ServiceLane::wait(lane.completion().publication,1);
+    lane.close(1,1);ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+    lane.abort(ticket);EXPECT_FALSE(lane.service->await(ticket));
+    EXPECT_EQ(lane.service->stats().terminalBytes,40u);EXPECT_EQ(lane.service->stats().nativeBytes,lane.layout.rowBytes());
+    EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_EQ(lane.ack().consumedSequence,1u);
+    EXPECT_THROW((void)lane.service->await(ticket),std::logic_error);
+    EXPECT_EQ(lane.service->stats().terminalBytes,40u);
+
+} llaminar2::GPUDeviceProcessLifetime::retireActive(); std::_Exit(::testing::Test::HasFailure()?2:0); }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test One actual host worker fairly serves disjoint live frames and original group terminals. */
+TEST(ImmutableLookupSubordinate, SharedSourceGroupInterleavesExactFramesAndRepeatedReset) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            EXPECT_THROW(lane.service->arm(1),std::logic_error);
+            EXPECT_NE(lane.binding->deviceView().base.request,lane.secondBinding->deviceView().base.request);
+            for(std::uint64_t generation=1;generation<=20;++generation){
+                auto group=lane.service->armGroup(generation);
+                const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+                const auto second=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+                EXPECT_EQ(first.invocation,second.invocation);
+                EXPECT_THROW(lane.service->adoptGroupChannel(group,DeviceId::cuda(0)),std::logic_error);
+                EXPECT_THROW(lane.service->adoptGroupChannel(group,DeviceId::rocm(0)),std::invalid_argument);
+                const std::array<std::int64_t,3> ids{1,2,1};
+                const std::array<Intent,3> intents{};
+                const auto sequence=generation*3-2;
+                const auto firstSequence=generation;
+                // The second consumer publishes first; an idle first frame may
+                // not starve it or substitute its request/response storage.
+                lane.publish(sequence,generation,ids,intents,1);
+                ServiceLane::wait(lane.completion(1).publication,sequence);
+                lane.publish(firstSequence,generation,{}, {},0);
+                ServiceLane::wait(lane.completion(0).publication,firstSequence);
+                EXPECT_EQ(lane.completion(0).idCount,0u);
+                EXPECT_EQ(lane.completion(1).nativeBytes,ids.size()*lane.layout.rowBytes());
+                const auto& view=lane.secondBinding->deviceView();
+                for(std::size_t i=0;i<ids.size();++i)
+                    EXPECT_EQ(std::memcmp(view.base.nativeRows+i*lane.layout.rowBytes(),
+                        lane.file.bytes.data()+lane.file.source.file_offset+ids[i]*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                const std::array<std::int64_t,8> large{7,8,9,10,11,12,13,14};
+                const std::array<Intent,8> largeIntents{};
+                const std::array<std::int64_t,1> small{15};
+                const std::array<Intent,1> smallIntents{};
+                for(std::size_t frame=0;frame<2;++frame){
+                    std::atomic_ref(lane.ack(1).consumedSequence).store(sequence+frame,std::memory_order_release);
+                    auto* payload=lane.secondBinding->deviceView().base.nativeRows;
+                    std::fill_n(payload,8*lane.layout.rowBytes(),std::byte{0xa5});
+                    if(frame==0)lane.publish(sequence+1,generation,large,largeIntents,1);
+                    else lane.publish(sequence+2,generation,small,smallIntents,1);
+                    ServiceLane::wait(lane.completion(1).publication,sequence+frame+1);
+                    const auto active=frame==0?std::span<const std::int64_t>(large):std::span<const std::int64_t>(small);
+                    EXPECT_EQ(lane.completion(1).nativeBytes,active.size()*lane.layout.rowBytes());
+                    for(std::size_t row=0;row<active.size();++row)
+                        EXPECT_EQ(std::memcmp(payload+row*lane.layout.rowBytes(),lane.file.bytes.data()+lane.file.source.file_offset+
+                            active[row]*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                    for(std::size_t byte=active.size()*lane.layout.rowBytes();byte<8*lane.layout.rowBytes();++byte)
+                        EXPECT_EQ(payload[byte],std::byte{0xa5});
+                }
+                lane.close(firstSequence,generation,0);lane.close(sequence+2,generation,1);
+                EXPECT_TRUE(lane.service->await(second));
+                EXPECT_TRUE(lane.service->await(first));
+                EXPECT_THROW(lane.service->await(first),std::logic_error);
+                EXPECT_EQ(lane.service->stats(DeviceId::cuda(0)).ids,0u);
+                EXPECT_EQ(lane.service->stats(DeviceId::cuda(1)).ids,generation*(ids.size()+8+1));
+            }
+            auto failed=lane.service->armGroup(21);
+            const auto failedFirst=lane.service->adoptGroupChannel(failed,DeviceId::cuda(0));
+            const auto failedSecond=lane.service->adoptGroupChannel(failed,DeviceId::cuda(1));
+            const std::array<std::int64_t,1> bad{static_cast<std::int64_t>(lane.file.source.rows)};
+            const std::array<Intent,1> read{};
+            lane.publish(61,21,bad,read,1);
+            ServiceLane::wait(lane.completion(1).publication,61);
+            EXPECT_NE(lane.completion(1).status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+            EXPECT_FALSE(lane.service->finishGroup(failed));
+            EXPECT_FALSE(lane.service->await(failedFirst));
+            EXPECT_FALSE(lane.service->await(failedSecond));
+            EXPECT_THROW(lane.service->requireHealthy(),std::runtime_error);
+            EXPECT_THROW(lane.service->armGroup(22),std::logic_error);
+            for(std::size_t i=0;i<2;++i)
+                EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredGeneration).load(std::memory_order_acquire),21u);
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test Outstanding native responses retain disjoint row identities and original pins across peer progress. */
+TEST(ImmutableLookupSubordinate, SharedSourceOutstandingGrantsKeepOriginalRowsAndPins) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            const std::array<std::int64_t,1> firstIds{1},secondIds{2};
+            const std::array<Intent,1> intents{};
+            lane.publish(1,1,firstIds,intents,0);
+            EXPECT_EQ(ImmutableLookupSubordinateTestAccess::pollChannel(*lane.service,0,1),ImmutableLookupPoll::Completed);
+            lane.publish(1,1,secondIds,intents,1);
+            EXPECT_EQ(ImmutableLookupSubordinateTestAccess::pollChannel(*lane.service,1,1),ImmutableLookupPoll::Completed);
+            auto first=ImmutableLookupSubordinateTestAccess::borrowChannel(*lane.service,0,0);
+            auto second=ImmutableLookupSubordinateTestAccess::borrowChannel(*lane.service,1,0);
+            ASSERT_TRUE(first);ASSERT_TRUE(second);
+            EXPECT_EQ(std::memcmp(first->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+            EXPECT_EQ(std::memcmp(second->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+2*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+            EXPECT_THROW(ImmutableLookupSubordinateTestAccess::borrowChannel(*lane.service,0,1),std::out_of_range);
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test Partial parent admission cancels and joins every original frame without inventing a GPU close. */
+TEST(ImmutableLookupSubordinate, SharedSourcePartialAdmissionUsesOriginalGroupCancellation) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true);
+            ImmutableLookupService::Ticket ticket;
+            {
+                auto group=lane.service->armGroup(1);
+                ticket=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+                EXPECT_TRUE(ticket.valid());
+                // Scope failure occurs before the first peer source graph can
+                // launch. RAII uses the exact existing IO cancellation words.
+            }
+            EXPECT_FALSE(lane.service->await(ticket)); // Group abort preserves the adopted boundary's retirement right.
+            EXPECT_THROW(lane.service->armGroup(2),std::logic_error);
+            EXPECT_THROW(lane.service->requireHealthy(),std::runtime_error);
+            for(std::size_t i=0;i<2;++i){
+                EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredGeneration).load(std::memory_order_acquire),1u);
+                EXPECT_NE(std::atomic_ref(lane.ack(i).retiredInvocation).load(std::memory_order_acquire),0u);
+                EXPECT_EQ(std::atomic_ref(lane.ack(i).closedGeneration).load(std::memory_order_acquire),0u);
+            }
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test One participant's legitimate terminal await never cancels an active peer frame. */
+TEST(ImmutableLookupSubordinate, SharedSourceEarlyTerminalWaitsForLegitimatePeerClose) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto second=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+            lane.publish(1,1,{}, {},0);
+            ServiceLane::wait(lane.completion(0).publication,1);
+            lane.close(1,1,0);
+            std::promise<void> entered;
+            auto enteredFuture=entered.get_future();
+            auto firstResult=std::async(std::launch::async,[&]{
+                entered.set_value();
+                return lane.service->await(first);
+            });
+            struct CancelBeforeJoin final {
+                std::shared_ptr<ImmutableLookupService> service;
+                ImmutableLookupService::Ticket ticket;
+                ~CancelBeforeJoin(){(void)service->cancel(ticket);}
+            } cleanup{lane.service,second};
+            enteredFuture.wait();
+            EXPECT_EQ(firstResult.wait_for(std::chrono::milliseconds(20)),std::future_status::timeout);
+            // This live response must still be served while the first caller
+            // waits at its whole-transaction terminal. No GPU/model work is simulated.
+            const std::array<std::int64_t,1> ids{7};
+            const std::array<Intent,1> read{};
+            lane.publish(1,1,ids,read,1);
+            ServiceLane::wait(lane.completion(1).publication,1);
+            EXPECT_NO_THROW(lane.service->requireHealthy());
+            EXPECT_EQ(lane.completion(1).nativeBytes,lane.layout.rowBytes());
+            lane.close(1,1,1);
+            EXPECT_TRUE(firstResult.get());
+            EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(group));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test A concrete missing peer close cancels before waiting behind an already active terminal join. */
+TEST(ImmutableLookupSubordinate, SharedSourceMissingPeerCloseCancelsConcurrentTerminalWait) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto second=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+            lane.publish(1,1,{}, {},0);
+            ServiceLane::wait(lane.completion(0).publication,1);
+            lane.close(1,1,0);
+            auto firstResult=std::async(std::launch::async,[&]{return lane.service->await(first);});
+            struct CancelBeforeJoin final {
+                std::shared_ptr<ImmutableLookupService> service;
+                ImmutableLookupService::Ticket ticket;
+                ~CancelBeforeJoin(){(void)service->cancel(ticket);}
+            } cleanup{lane.service,second};
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            while(!ImmutableLookupSubordinateTestAccess::terminalJoinHeld(*lane.service) &&
+                  std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+            EXPECT_TRUE(ImmutableLookupSubordinateTestAccess::terminalJoinHeld(*lane.service));
+            // The second caller has retired its native producer but omitted its
+            // required close. It must cancel before waiting on the first join.
+            auto secondResult=std::async(std::launch::async,[&]{return lane.service->await(second);});
+            const bool prompt=secondResult.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+            EXPECT_TRUE(prompt);
+            if(!prompt)(void)lane.service->cancel(second); // Bounded old-code control also retires its real worker.
+            EXPECT_FALSE(firstResult.get());
+            EXPECT_FALSE(secondResult.get());
+            EXPECT_FALSE(lane.service->finishGroup(group));
+            EXPECT_THROW(lane.service->requireHealthy(),std::runtime_error);
+            EXPECT_EQ(std::atomic_ref(lane.ack(1).closedGeneration).load(std::memory_order_acquire),0u);
+            for(std::size_t i=0;i<2;++i)
+                EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredGeneration).load(std::memory_order_acquire),1u);
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test Joined failure text is immutable before the remaining adopted participant retires. */
+TEST(ImmutableLookupSubordinate, SharedSourceJoinedFailureRemainsObservableBeforePeerRetirement) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto second=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+            EXPECT_THROW(lane.service->lastFailure(),std::logic_error);
+            EXPECT_TRUE(lane.service->cancel(first));
+            EXPECT_FALSE(lane.service->await(first));
+            const auto original=ImmutableLookupSubordinateTestAccess::joinedFailureBeforePeerRetirement(*lane.service,1);
+            EXPECT_FALSE(original.empty());
+            EXPECT_EQ(lane.service->lastFailure(),original);
+            EXPECT_FALSE(lane.service->await(second));
+            EXPECT_EQ(lane.service->lastFailure(),original);
+            EXPECT_FALSE(lane.service->finishGroup(group));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test The existing TP failure worker releases the original source group before waiting for peers. */
+TEST(ImmutableLookupSubordinate, OriginalGroupFailureCallbackReleasesMissingParticipant)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto fail=lane.service->failureCallback(group);
+            TPWorkerPool workers(2);workers.setFailureCallback(fail);
+            std::atomic<bool> observed{false};
+            workers.dispatch([&](std::size_t participant){
+                if(!participant)return false;
+                const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
+                while(std::chrono::steady_clock::now()<deadline){
+                    const auto invocation=std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire);
+                    const auto generation=std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire);
+                    if(ImmutableLookupProtocol::matchesInvocation(invocation,generation,first.generation,first.invocation)){
+                        observed.store(true,std::memory_order_release);break;
+                    }
+                    std::this_thread::yield();
+                }
+                return false;
+            });
+            const auto results=workers.collectAll(1000);
+            EXPECT_EQ(results.size(),2u);EXPECT_TRUE(observed.load(std::memory_order_acquire));
+            EXPECT_FALSE(lane.service->finishGroup(group));
+            EXPECT_FALSE(lane.service->await(first)); // The group cannot steal an adopted channel's original retirement right.
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        ::_exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
+/** @test A retained original failure callback cannot cancel a later source group or mint its identity. */
+TEST(ImmutableLookupSubordinate, OriginalGroupFailureCallbackCannotCancelSuccessor)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto old=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(old,DeviceId::cuda(0));
+            const auto second=lane.service->adoptGroupChannel(old,DeviceId::cuda(1));
+            const auto oldFailure=lane.service->failureCallback(old);
+            lane.close(0,1,0);lane.close(0,1,1);
+            EXPECT_TRUE(lane.service->await(first));EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(old));
+            auto current=lane.service->armGroup(2);
+            const auto active=lane.service->adoptGroupChannel(current,DeviceId::cuda(0));
+            EXPECT_THROW(lane.service->failureCallback(old),std::logic_error);
+            oldFailure();
+            EXPECT_FALSE(ImmutableLookupProtocol::matchesInvocation(
+                std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire),
+                std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire),
+                active.generation,active.invocation));
+            const auto currentFailure=lane.service->failureCallback(current);currentFailure();oldFailure();
+            EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(
+                std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire),
+                std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire),
+                active.generation,active.invocation));
+            EXPECT_FALSE(lane.service->finishGroup(current));EXPECT_FALSE(lane.service->await(active));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        ::_exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
+namespace llaminar2::qwen4exp {
+/** @test Real original two-channel worker serves full native RAM, retains one source and retires both exact ACKs. */
+TEST(ImmutableLookupSubordinate, FullRAMSharedSourceUsesOneOwnerAcrossActualChannelReset){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup",1);
+            PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true,true);
+            EXPECT_EQ(lane.provider->mode(),HostImmutableRowMode::AdaptiveFullRAM);
+            const auto fullLayout=ImmutableRowTableLayoutGeometry::checked(
+                ImmutableRowTableExtent::fromNative(lane.file.source.format,lane.file.source.rows,lane.file.source.rowBytes()),
+                ImmutableRowTableTiers::of(std::array{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM}),ImmutableRowTableResidency::Adaptive,
+                {{{hostId,ImmutableRowStorage::RAM},0,0,{}},{{{0,DeviceId::cuda(0)},ImmutableRowStorage::VRAM},0,0,{}},
+                 {{{0,DeviceId::cuda(1)},ImmutableRowStorage::VRAM},0,0,{}}},{{0,DeviceId::cuda(0)},{0,DeviceId::cuda(1)}},{},
+                {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM)}},{},std::nullopt,8);
+            const auto hostGeometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(fullLayout,hostId);
+            const auto setup=ImmutableLookupSetupObservation::hostOwner(hostGeometry,lane.service);
+            EXPECT_EQ(setup.admitted_slots,0u);EXPECT_EQ(setup.payload_bytes,0u);EXPECT_EQ(setup.metadata_bytes,0u);
+            EXPECT_EQ(setup.source_storage_bytes,hostGeometry.sourceBytes());
+            EXPECT_EQ(setup.table_storage_bytes,setup.source_storage_bytes);
+
+            const auto initial=lane.provider->retainedOwnerObservation();
+            EXPECT_EQ(initial.tableStorageBytes(),ImmutableRowTable::physicalBytes(lane.file.source,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM)));
+            const auto provider=lane.provider;lane.provider.reset(); // Original service retains the SAME source; no replacement/duplicate materialization.
+            std::array<RetainedStoragePerfStats,2> publications;
+            for(std::uint64_t generation=1;generation<=20;++generation){
+                const std::array before{lane.service->stats(DeviceId::cuda(0)),lane.service->stats(DeviceId::cuda(1))};
+                auto group=lane.service->armGroup(generation);
+                const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+                const auto second=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+                const std::array<std::int64_t,3> ids{7,31,7};const std::array<Intent,3> intents{};
+                for(std::size_t channel=0;channel<2;++channel){
+                    lane.publish(generation,generation,ids,intents,channel);ServiceLane::wait(lane.completion(channel).publication,generation);
+                    EXPECT_EQ(lane.completion(channel).nativeBytes,ids.size()*lane.layout.rowBytes());
+                    const auto& view=(channel?lane.secondBinding:lane.binding)->deviceView();
+                    for(std::size_t row=0;row<ids.size();++row)
+                        EXPECT_EQ(std::memcmp(view.base.nativeRows+row*lane.layout.rowBytes(),lane.file.bytes.data()+lane.file.source.file_offset+ids[row]*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                }
+                lane.close(generation,generation,0);lane.close(generation,generation,1);
+                EXPECT_TRUE(lane.service->await(second));EXPECT_TRUE(lane.service->await(first));EXPECT_TRUE(lane.service->finishGroup(group));
+                for(std::size_t channel=0;channel<2;++channel)EXPECT_EQ(std::atomic_ref(lane.ack(channel).retiredGeneration).load(std::memory_order_acquire),generation);
+                EXPECT_EQ(provider->retainedOwnerObservation().tableStorageBytes(),initial.tableStorageBytes());
+                for(std::size_t channel=0;channel<2;++channel){
+                    const auto device=DeviceId::cuda(channel);
+                    auto terminal=RetainedStorageTerminalObservation::between(generation,provider->mode(),before[channel],lane.service->stats(device));
+                    terminal.transport=RetainedStorageTransport::PooledSubordinate;
+                    EXPECT_NO_THROW(publications[channel].publish(terminal,device.toString()));
+                }
+            }
+            EXPECT_EQ(provider->sourceStats().storage,ImmutableRowStorage::RAM);
+            EXPECT_EQ(provider->sourceStats().window_hits,0u);EXPECT_EQ(provider->sourceStats().window_misses,0u);EXPECT_EQ(provider->sourceStats().window_evictions,0u);
+            EXPECT_EQ(lane.service->stats().ramRows,0u); // No redundant bounded RAM row-cache hits.
+            EXPECT_GT(lane.service->stats().sourceRows,0u); // Completed ORIGINAL full-RAM source reads, distinguished by actual mode.
+            const auto collected=PerfStatsCollector::snapshot({"immutable_lookup"});ASSERT_EQ(collected.size(),40u);
+            for(const auto& record:collected){
+                EXPECT_EQ(record.tags.at("storage"),"gpu_subordinate_full_ram");EXPECT_EQ(record.tags.at("transport"),"pooled_subordinate");
+                EXPECT_EQ(record.count,20u);
+                if(record.name=="source_rows")EXPECT_EQ(record.value,40);
+                if(record.name=="terminal_bytes")EXPECT_EQ(record.value,20*3*sizeof(std::uint64_t));
+            }
+
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+} // namespace llaminar2::qwen4exp
+
+/** @test The original shared provider and sole CPU worker serve every declared TP4/8 channel without aliasing. */
+TEST(ImmutableLookupSubordinate, ConsumerLocalTP4AndTP8OriginalServiceRetiresEveryChannel){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto count:{4u,8u})for(const bool fullRAM:{false,true})
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true,fullRAM,count);
+            for(std::uint64_t generation=1;generation<=20;++generation){
+                auto group=lane.service->armGroup(generation);
+                std::vector<ImmutableLookupService::Ticket> tickets;
+                for(unsigned i=0;i<count;++i)tickets.push_back(lane.service->adoptGroupChannel(group,DeviceId::cuda(static_cast<int>(i))));
+                for(unsigned i=count;i-->0;){
+                    const std::array<std::int64_t,1> ids{static_cast<std::int64_t>(i+1)};
+                    const std::array<Intent,1> intent{};
+                    lane.publish(generation,generation,i%2?std::span<const std::int64_t>{}:std::span<const std::int64_t>{ids},
+                        i%2?std::span<const Intent>{}:std::span<const Intent>{intent},i);
+                }
+                // Publish every real frame before joining any response; the
+                // one original worker must make progress for all ready peers.
+                for(unsigned i=count;i-->0;){
+                    ServiceLane::wait(lane.completion(i).publication,generation);
+                    EXPECT_EQ(lane.completion(i).nativeBytes,i%2?0:lane.layout.rowBytes());
+                    if(i%2==0)EXPECT_EQ(std::memcmp(lane.channelBinding(i).deviceView().base.nativeRows,
+                        lane.file.bytes.data()+lane.file.source.file_offset+(i+1)*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                    if(i)EXPECT_NE(lane.channelBinding(i).deviceView().base.request,lane.binding->deviceView().base.request);
+                }
+                for(unsigned i=count;i-->0;)lane.close(generation,generation,i);
+                for(auto& ticket:tickets)EXPECT_TRUE(lane.service->await(ticket));
+                EXPECT_TRUE(lane.service->finishGroup(group));
+                for(unsigned i=0;i<count;++i)EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredInvocation).load(std::memory_order_acquire),tickets[i].invocation);
+            }
+            ImmutableLookupService::Ticket partial;
+            {auto group=lane.service->armGroup(21);partial=lane.service->adoptGroupChannel(group,DeviceId::cuda(static_cast<int>(count-1)));}
+            EXPECT_FALSE(lane.service->await(partial));
+            EXPECT_THROW(lane.service->armGroup(22),std::logic_error);
+            for(unsigned i=0;i<count;++i){
+                EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredGeneration).load(std::memory_order_acquire),21u);
+                EXPECT_NE(std::atomic_ref(lane.ack(i).retiredInvocation).load(std::memory_order_acquire),0u);
+            }
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+
+namespace llaminar2::qwen4exp {
+/** @brief Actual service callback authenticates original ticket before a recorded native signal, including late CPU-close success. */
+TEST(ImmutableLookupSubordinate, OriginalNativeAbortBindingRejectsSuccessorAndPreservesCPUOutcome)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&] {
+        {
+            ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+            unsigned signals = 0;
+            auto old = lane.service->armGroup(1);
+            const auto first = lane.service->adoptGroupChannel(old, DeviceId::cuda(0));
+            const auto second = lane.service->adoptGroupChannel(old, DeviceId::cuda(1));
+            const auto oldFailure = ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service, old, [&] { ++signals; });
+            lane.close(0, 1, 0); lane.close(0, 1, 1);
+            EXPECT_TRUE(lane.service->await(first));
+            EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(old));
+            oldFailure(); // CPU success does not prevent this same original GPU request from failing later.
+            EXPECT_EQ(signals, 1u);
+            EXPECT_TRUE(lane.service->finishGroup(old)); // Never relabel successful CPU I/O as failure.
+            auto current = lane.service->armGroup(2);
+            const auto active = lane.service->adoptGroupChannel(current, DeviceId::cuda(0));
+            EXPECT_THROW(ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service, old, [&] { ++signals; }), std::logic_error);
+            oldFailure();
+            EXPECT_EQ(signals, 1u); // Old callback cannot abort the successor communicator/request.
+            const auto fail = ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service, current, [&] { ++signals; });
+            fail(); fail(); // Original cancellation is absorbing and duplicate signal is harmless.
+            EXPECT_EQ(signals, 3u);
+            EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(
+                std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire),
+                std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire),
+                active.generation, active.invocation));
+            EXPECT_FALSE(lane.service->finishGroup(current));
+            EXPECT_FALSE(lane.service->await(active));
+            oldFailure();
+            EXPECT_EQ(signals, 3u);
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+    })(), ::testing::ExitedWithCode(0), "");
+}
+/** @test The original follower lifecycle permits cold aliases only before coordinator execution admission. */
+TEST(ImmutableLookupSubordinate, ExpertAliasRefreshRejectsExecutionAdmission)
+{
+    using Access=llaminar2::test::PooledExpertSourceFailureContractAccess;
+    EXPECT_NO_THROW(Access::beforeAdmission());
+    EXPECT_THROW(Access::afterAdmission(),std::invalid_argument);
+}
+
+/** @test Actual original source cancellation wakes an unfinished zero-row peer after another consumer retired; the enqueue error remains primary. */
+TEST(ImmutableLookupSubordinate, ExpertEnqueueFailureCancelsOriginalSourceBeforePartialDrain)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto missing=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+            std::atomic<unsigned> original_native_signals{0};
+            const auto original=ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service,group,[&] {
+                original_native_signals.fetch_add(1,std::memory_order_release);
+                throw std::runtime_error("recorded original native cancellation fault");
+            });
+            // One accepted empty channel publishes its real close while the
+            // group still owns the missing channel. Group retirement must wait
+            // for exact cancellation; no per-channel terminal is fabricated.
+            lane.close(0,1,0);
+            const auto first_retired=[&] {
+                return ImmutableLookupProtocol::matchesInvocation(
+                    std::atomic_ref(lane.ack(0).retiredInvocation).load(std::memory_order_acquire),
+                    std::atomic_ref(lane.ack(0).retiredGeneration).load(std::memory_order_acquire),first.generation,first.invocation);
+            };
+            std::mutex failure_mutex;std::exception_ptr cancellation_failure;
+            std::atomic<bool> entered_original_throw{false};
+            auto failed=std::async(std::launch::async,[&] {
+                return llaminar2::test::PooledExpertSourceFailureContractAccess::enqueue([&]() -> bool {
+                    entered_original_throw.store(true,std::memory_order_release);
+                    throw std::runtime_error("original expert enqueue failed after source started");
+                },[&]() noexcept {
+                    llaminar2::test::PooledExpertSourceFailureContractAccess::cancel(original,failure_mutex,cancellation_failure);
+                });
+            });
+            try { (void)failed.get();FAIL()<<"Original enqueue failure disappeared"; }
+            catch (const std::runtime_error& error) { EXPECT_STREQ(error.what(),"original expert enqueue failed after source started"); }
+            EXPECT_TRUE(entered_original_throw.load(std::memory_order_acquire));
+            EXPECT_EQ(original_native_signals.load(std::memory_order_acquire),1u);
+            ASSERT_TRUE(cancellation_failure);
+            try { std::rethrow_exception(cancellation_failure); }
+            catch (const std::runtime_error& error) { EXPECT_STREQ(error.what(),"recorded original native cancellation fault"); }
+            EXPECT_FALSE(lane.service->await(missing));EXPECT_FALSE(lane.service->await(first));
+            EXPECT_FALSE(lane.service->finishGroup(group));
+            // The failed original group now owns exact retirement of the
+            // accepted empty channel as well; no retry/new invocation exists.
+            EXPECT_TRUE(first_retired());
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test The closed fixture delays only the original native CPU worker and preserves exact source/retirement on release, cancellation and exceptions. */
+TEST(ImmutableLookupSubordinate, ClosedWorkerGatePreservesOriginalSourceTaskAndRetirement){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(int mode=0;mode<4;++mode){
+    ASSERT_EXIT(([&]{ {
+            ServiceLane lane;using Access=llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+            std::optional<ImmutableLookupService::Ticket> ticket;
+            EXPECT_THROW((Access::Gate({})),std::invalid_argument);
+            const std::shared_ptr<ImmutableLookupService> foreign_alias(lane.service.get(),[](auto*){});
+            EXPECT_THROW((Access::Gate(foreign_alias)),std::invalid_argument);
+            try{
+                Access::Gate gate(lane.service);ticket=Access::arm(gate,17);
+                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+                while(!gate.entered()){if(std::chrono::steady_clock::now()>=deadline)throw std::runtime_error("Original worker did not enter causal gate");std::this_thread::yield();}
+                EXPECT_TRUE(gate.held());EXPECT_EQ(lane.completion().publication,0u);
+                EXPECT_THROW(lane.service->arm(18),std::logic_error);
+                if(mode==2)throw std::runtime_error("original fixture assertion exception");
+                if(mode==3){
+                    // Gate destruction alone must unblock original teardown;
+                    // the worker must not own a strong cycle to its service.
+                }else if(mode==1){
+                    ASSERT_TRUE(lane.service->cancel(*ticket));
+                    ServiceLane::wait(lane.ack().retiredInvocation,ticket->invocation);
+                    EXPECT_FALSE(lane.service->await(*ticket));EXPECT_EQ(lane.completion().publication,0u);
+                }else{
+                    const std::array<std::int64_t,3> ids{3,45,3};const std::array<Intent,3> intents{};
+                    lane.publish(1,ticket->generation,ids,intents);
+                    EXPECT_EQ(lane.completion().publication,0u);gate.release();
+                    ServiceLane::wait(lane.completion().publication,1);
+                    const auto view=lane.binding->deviceView();
+                    for(std::size_t row=0;row<ids.size();++row)EXPECT_EQ(std::memcmp(view.base.nativeRows+row*lane.layout.rowBytes(),
+                        lane.file.bytes.data()+lane.file.source.file_offset+ids[row]*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                    lane.close(1,ticket->generation);EXPECT_TRUE(lane.service->await(*ticket));
+                    const auto actual=lane.service->stats();EXPECT_EQ(actual.ids,ids.size());EXPECT_EQ(actual.nativeBytes,ids.size()*lane.layout.rowBytes());
+                }
+                EXPECT_FALSE(gate.timedOut());
+            }catch(const std::runtime_error& failure){
+                EXPECT_EQ(mode,2);EXPECT_STREQ(failure.what(),"original fixture assertion exception");
+                ASSERT_TRUE(ticket);lane.service->cancel(*ticket);EXPECT_FALSE(lane.service->await(*ticket));
+            }
+            if(mode==3){
+                lane.binding.reset();lane.service.reset();
+                EXPECT_EQ(lane.backend.frees,1u);
+                EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RetainedHostServiceStorage,
+                    PhysicalMemoryMaterializationKind::NewAllocation),0u);
+            }else EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        } GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+    }
+}
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test The actual original group dispatch owns each one-shot gate and every rejection. */
+TEST(ImmutableLookupSubordinate, ClosedOriginalGroupWorkerGatePreservesAdmissionAndWithdraws)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    for (int mode = 0; mode < 6; ++mode)
+    {
+        ASSERT_EXIT(([&] {
+            {
+                using Access = llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+                ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+                const auto program = llaminar2::test::RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO);
+                EXPECT_EQ(program.resourceDeclaration().objectBytes, sizeof(RetainedParentTicketServiceWorker));
+                {
+                    Access::Gate gate(lane.service);
+                    Access::installNextOriginalDispatch(gate);
+                    EXPECT_FALSE(Access::dispatched(gate));
+                    EXPECT_THROW(Access::installNextOriginalDispatch(gate), std::logic_error);
+                    if (mode == 0)
+                    {
+                        // The lexical owner withdraws an installed but unsent
+                        // descriptor. No ticket or task has been manufactured.
+                    }
+                    else if (mode <= 2)
+                    {
+                        if (mode == 1)
+                            EXPECT_THROW(Access::rejectIncompleteDispatch(gate), std::invalid_argument);
+                        else
+                            EXPECT_THROW(Access::rejectForeignDispatch(gate), std::logic_error);
+                        EXPECT_FALSE(Access::dispatched(gate));
+                        EXPECT_TRUE(Access::rejected(gate));
+                    }
+                    else
+                    {
+                        // This is the same public group arm used by the Rank
+                        // source boundary, not the old single-channel arm hook.
+                        auto group = lane.service->armGroup(1);
+                        const auto first = lane.service->adoptGroupChannel(group, DeviceId::cuda(0));
+                        const auto second = lane.service->adoptGroupChannel(group, DeviceId::cuda(1));
+                        EXPECT_EQ(first.invocation, second.invocation);
+                        EXPECT_TRUE(Access::dispatched(gate));
+                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                        while (!gate.entered())
+                        {
+                            if (std::chrono::steady_clock::now() >= deadline)
+                                throw std::runtime_error("Original group worker did not enter its gate");
+                            std::this_thread::yield();
+                        }
+                        EXPECT_TRUE(gate.held());
+                        Access::Gate duplicate(lane.service);
+                        EXPECT_THROW(Access::installNextOriginalDispatch(duplicate), std::logic_error);
+                        EXPECT_THROW(lane.service->armGroup(2), std::logic_error);
+                        if (mode == 4)
+                        {
+                            ASSERT_TRUE(lane.service->cancel(first));
+                            EXPECT_FALSE(lane.service->finishGroup(group));
+                        }
+                        else if (mode == 5)
+                        {
+                            // Original group destruction cancels/drains first;
+                            // the wrapper sees that cancellation and departs.
+                        }
+                        else
+                        {
+                            const std::array<std::int64_t, 3> ids{3, 45, 3};
+                            const std::array<Intent, 3> intents{};
+                            lane.publish(1, 1, {}, {}, 0);
+                            lane.publish(1, 1, ids, intents, 1);
+                            EXPECT_EQ(lane.completion(0).publication, 0u);
+                            EXPECT_EQ(lane.completion(1).publication, 0u);
+                            gate.release();
+                            ServiceLane::wait(lane.completion(0).publication, 1);
+                            ServiceLane::wait(lane.completion(1).publication, 1);
+                            const auto view = lane.secondBinding->deviceView();
+                            for (std::size_t row = 0; row < ids.size(); ++row)
+                                EXPECT_EQ(std::memcmp(view.base.nativeRows + row * lane.layout.rowBytes(),
+                                    lane.file.bytes.data() + lane.file.source.file_offset + ids[row] * lane.layout.rowBytes(),
+                                    lane.layout.rowBytes()), 0);
+                            lane.close(1, 1, 0);
+                            lane.close(1, 1, 1);
+                            EXPECT_TRUE(lane.service->await(first));
+                            EXPECT_TRUE(lane.service->await(second));
+                            EXPECT_TRUE(lane.service->finishGroup(group));
+                            EXPECT_EQ(lane.service->stats(DeviceId::cuda(0)).ids, 0u);
+                            EXPECT_EQ(lane.service->stats(DeviceId::cuda(1)).ids, ids.size());
+                        }
+                        EXPECT_FALSE(gate.timedOut());
+                    }
+                }
+                if (mode <= 2)
+                {
+                    // Both withdrawal and actual rejected dispatch leave the
+                    // original worker usable without any stale stack wrapper.
+                    auto group = lane.service->armGroup(1);
+                    const auto first = lane.service->adoptGroupChannel(group, DeviceId::cuda(0));
+                    const auto second = lane.service->adoptGroupChannel(group, DeviceId::cuda(1));
+                    lane.publish(1, 1, {}, {}, 0);
+                    lane.publish(1, 1, {}, {}, 1);
+                    ServiceLane::wait(lane.completion(0).publication, 1);
+                    ServiceLane::wait(lane.completion(1).publication, 1);
+                    lane.close(1, 1, 0);
+                    lane.close(1, 1, 1);
+                    EXPECT_TRUE(lane.service->await(first));
+                    EXPECT_TRUE(lane.service->await(second));
+                    EXPECT_TRUE(lane.service->finishGroup(group));
+                }
+            }
+            GPUDeviceProcessLifetime::retireActive();
+            std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        })(), ::testing::ExitedWithCode(0), "");
+    }
+}
+/** @test Acquired future frames preserve native bytes and hit pins without demand credit. */
+TEST(ImmutableLookupSubordinate, FutureLookupOnlyUsesOriginalGrantAndConsumptionAck)
+{
+    Lane lane;
+    const std::array<std::int64_t,2> seed{3,4};const std::array<Intent,2> reads{};
+    lane.publish(1,1,seed,reads);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    lane.consume(1);lane.poison();const auto before=lane.cache->stats();
+    const std::array<std::int64_t,4> ids{3,7,7,4};
+    const std::array<Intent,4> future{{{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0},
+        {Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0}}};
+    lane.publish(2,2,ids,future);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+    lane.expectRows(ids);EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+    const auto after=lane.cache->stats();EXPECT_EQ(after.admissions,before.admissions);
+    EXPECT_EQ(after.evictions,before.evictions);EXPECT_EQ(after.invalidations,before.invalidations);
+    EXPECT_EQ(after.resident_rows,before.resident_rows);
+    auto hit=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(hit);
+    EXPECT_FALSE(lane.processor->borrowSubordinateResponseRow(1));
+    for(std::size_t at=0;at<ids.size();++at)EXPECT_EQ(lane.invalidations()[at].destination_grant,0u);
+    lane.consume(2);lane.poison();
+    lane.publish(3,3,seed,reads);ASSERT_EQ(lane.processor->poll(3),ImmutableLookupPoll::Completed);
+    EXPECT_EQ(std::memcmp(hit->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+3*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+}
+/** @test Future purpose cannot smuggle an invalidation token or mix ordinary operations. */
+TEST(ImmutableLookupSubordinate, FutureLookupOnlyRejectsMixedAndNonzeroDestinationBeforeCopy)
+{
+    for(unsigned variant=0;variant<3;++variant){
+        Lane lane;const auto before=lane.cache->stats();
+        const std::array<std::int64_t,2> ids{3,3};
+        std::array<Intent,2> intents{{{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0}}};
+        if(variant==0)intents[0].destination_grant=9;
+        if(variant==1)intents[1].intent=Operation::Read;
+        if(variant==2)intents[1]={Operation::ReadAndInvalidate,9};
+        lane.publish(1,1,ids,intents);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+        EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::InvalidProtocol));
+        EXPECT_EQ(lane.cache->stats().admissions,before.admissions);
+        for(auto byte:lane.payload())EXPECT_EQ(byte,std::byte{0xa5});
+    }
+}
+
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test The actual invalid-descriptor guard consumes no ticket and retains no fixture pointer. */
+TEST(ImmutableLookupSubordinate, ClosedOriginalWorkerDispatchFailureWithdrawsBorrow)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(([&] {
+        {
+            ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+            using Access = llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+            Access::Gate gate(lane.service);
+            Access::installNextOriginalDispatch(gate);
+            EXPECT_THROW(Access::rejectIncompleteDispatch(gate), std::invalid_argument);
+            EXPECT_TRUE(Access::rejected(gate));
+            EXPECT_FALSE(Access::dispatched(gate));
+            EXPECT_FALSE(gate.entered());
+            Access::Gate successor(lane.service);
+            EXPECT_NO_THROW(Access::installNextOriginalDispatch(successor));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    })(), ::testing::ExitedWithCode(0), "");
+}
+}
+
+namespace llaminar2::qwen4exp {
+/** @test A new actual group request frontier rejects stale publication and new unsealed metadata. */
+TEST(ImmutableLookupSubordinate, ClosedOriginalGroupRequestFrontierRejectsStaleReadyEvidence)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(([&] {
+        {
+            using Access = llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+            ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+            {
+                auto warm = lane.service->armGroup(1);
+                const auto first = lane.service->adoptGroupChannel(warm, DeviceId::cuda(0));
+                const auto second = lane.service->adoptGroupChannel(warm, DeviceId::cuda(1));
+                for (std::size_t channel = 0; channel < 2; ++channel)
+                {
+                    lane.publish(1, 1, {}, {}, channel);
+                    ServiceLane::wait(lane.completion(channel).publication, 1);
+                    lane.close(1, 1, channel);
+                }
+                EXPECT_TRUE(lane.service->await(first));
+                EXPECT_TRUE(lane.service->await(second));
+                EXPECT_TRUE(lane.service->finishGroup(warm));
+            }
+            Access::Gate gate(lane.service);
+            const auto previous = Access::retiredSequence(gate, DeviceId::cuda(0));
+            ASSERT_EQ(previous, 1u);
+            Access::installNextOriginalDispatch(gate);
+            auto current = lane.service->armGroup(2);
+            const auto first = lane.service->adoptGroupChannel(current, DeviceId::cuda(0));
+            const auto second = lane.service->adoptGroupChannel(current, DeviceId::cuda(1));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!gate.entered())
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("Original group observer worker did not enter its gate");
+                std::this_thread::yield();
+            }
+            EXPECT_FALSE(Access::currentRequest(gate, DeviceId::cuda(0), previous));
+            auto* original = lane.binding->deviceView().base.request;
+            // Recorded producer interleaving: new admission metadata exists,
+            // but the original release publication is still the retired one.
+            original->generation = first.generation;
+            original->generationComplement = ~first.generation;
+            EXPECT_FALSE(Access::currentRequest(gate, DeviceId::cuda(0), previous));
+            const std::array<std::int64_t, 3> ids{3, 45, 3};
+            const std::array<Intent, 3> intents{};
+            lane.publish(2, 2, ids, intents, 0);
+            lane.publish(2, 2, {}, {}, 1);
+            const auto observed = Access::currentRequest(gate, DeviceId::cuda(0), previous);
+            ASSERT_TRUE(observed);
+            EXPECT_EQ(observed->publication, previous + 1);
+            EXPECT_EQ(observed->generation, first.generation);
+            EXPECT_EQ(observed->idCount, ids.size());
+            EXPECT_EQ(observed->idBytes, ids.size() * sizeof(std::int64_t));
+            EXPECT_EQ(lane.completion(0).publication, 1u);
+            gate.release();
+            for (std::size_t channel = 0; channel < 2; ++channel)
+            {
+                ServiceLane::wait(lane.completion(channel).publication, 2);
+                lane.close(2, 2, channel);
+            }
+            EXPECT_TRUE(lane.service->await(first));
+            EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(current));
+            EXPECT_FALSE(Access::currentRequest(gate, DeviceId::cuda(0), previous));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    })(), ::testing::ExitedWithCode(0), "");
+}
+}
+
+
+namespace llaminar2::qwen4exp {
+/** @test Free-only retained future rows use the existing acquired grant and exact ACK pin lifetime. */
+TEST(ImmutableLookupSubordinate, FutureLookupOnlyFreeRetentionUsesOriginalPinAndAckReplay) {
+    for(int replay=0;replay<20;++replay) {
+        Lane lane(DeviceId::cuda(0),3,0);
+        const std::array<std::int64_t,3> ids{3,7,7};
+        const std::array<Intent,3> future{{{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0}}};
+        lane.publish(1,1,ids,future);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+        lane.expectRows(ids);EXPECT_EQ(lane.cache->stats().admissions,2u);EXPECT_EQ(lane.cache->stats().resident_rows,2u);
+        auto pin=lane.processor->borrowSubordinateResponseRow(1);ASSERT_TRUE(pin);const auto generation=pin->generation();
+        lane.consume(1);std::atomic_ref(lane.ack().closedGeneration).store(1,std::memory_order_release);
+        EXPECT_TRUE(lane.processor->closed(1));
+        // The original packet pin is gone; this genuine read loan remains valid.
+        EXPECT_EQ(pin->generation(),generation);
+        EXPECT_EQ(std::memcmp(pin->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+7*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+        lane.poison();const std::array<Intent,3> demand{};
+        lane.publish(2,2,ids,demand);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+        lane.expectRows(ids);EXPECT_EQ(lane.cache->stats().evictions,0u);EXPECT_EQ(lane.cache->stats().admissions,2u);
+        lane.consume(2);std::atomic_ref(lane.ack().closedGeneration).store(2,std::memory_order_release);
+        EXPECT_TRUE(lane.processor->closed(2));pin.reset();
+        lane.cache->authenticateSource(); // Same owner remains reusable after exact original acknowledgements.
+    }
+}
+} // namespace llaminar2::qwen4exp

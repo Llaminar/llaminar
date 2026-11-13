@@ -23,6 +23,7 @@
 #pragma once
 
 #include "ITPContext.h"
+#include "RootedFloatRecordRange.h"
 #include "../backends/GlobalDeviceAddress.h"
 #include <mpi.h>
 #include <vector>
@@ -222,6 +223,26 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool recv(TensorBase *tensor, int source_index) = 0;
+        /**
+         * @brief Gather the same live records and return authenticated source ranges.
+         * @param local_records Original local compact record prefix.
+         * @param local_record_count Actual local record count.
+         * @param root_records Original admitted root receive storage.
+         * @param root_record_capacity Root capacity in records.
+         * @param record_width_elements Native record width in FP32 elements.
+         * @param root_index Original communicator root.
+         * @param gathered_record_count Completed root count; zero until success.
+         * @param stage_name Original stage identity.
+         * @param source_ranges Caller-owned range per domain member on root; empty elsewhere.
+         * @return False for contexts without this explicit source-preserving operation.
+         */
+        virtual bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &gathered_record_count, const std::string &,
+            std::span<RootedFloatRecordRange>) {
+            gathered_record_count=0;
+            return false;
+        }
     };
 
 } // namespace llaminar2

@@ -124,11 +124,11 @@ For communication-free scaling, use the shared
 [local-shape ranking and executed-DAG procedure](../../cuda-tuning/references/native-graph-events.md#rank-local-shard-shapes-without-communication).
 ROCm counterparts are `v2_perf_rocm_gdn_verifier_rows`
 (`PrefillHeadShardCapturedSweep`), `v2_perf_rocm_flash_attention_prefill`
-(`CapturedPrefillShardScaling`), `v2_perf_native_vnni_sweep`
+(`CapturedPrefillShardScaling`), `v2_perf_native_quantised_sweep`
 (`CapturedProductionShapes`) and the shared `v2_perf_gpu_expert_pipeline`
 (`ROCm_Qwen36WholeExpertShard*`). Pin one physical ROCm device for the entire
 1/2/4 curve and retain the logical-to-physical mapping. The dense sweep's
-`LLAMINAR_ROCM_NVNNI_PROBE_OPERATION=producer` and `pipeline` modes isolate
+`LLAMINAR_ROCM_NATIVE_QUANTISED_PROBE_OPERATION=producer` and `pipeline` modes isolate
 different work: collect both separately before blaming poor GEMM scaling on
 replicated quantization. Timing remains unprofiled; native DOT plus a separate
 kernel trace corroborates actual graph identity and critical-path relevance.
@@ -181,7 +181,7 @@ env LLAMINAR_PROFILER_NORMAL_EXIT=1 \
   OMP_NUM_THREADS="$LLAMINAR_PROFILE_THREADS" OMP_PLACES=cores OMP_PROC_BIND=close \
   taskset -c "$LLAMINAR_PROFILE_CORES" \
   mpirun -np 1 --bind-to none \
-    --mca mpi_leave_pinned 1 --mca btl_vader_single_copy_mechanism none \
+    --mca mpi_leave_pinned 1 \
   rocprofv3 --kernel-trace --stats --output-directory "$LLAMINAR_PROFILE_RESULT" \
   -- "$LLAMINAR_PROFILE_BIN" benchmark \
     --config "$LLAMINAR_PROFILE_PLAN" --no-mpi-bootstrap \

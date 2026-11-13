@@ -17,9 +17,12 @@
  * arenas retain a bounded power-of-two ladder through one captured prefill
  * segment, keeping transfer and fixed-launch padding below two times the live
  * route count without sizing transient state from the full KV context.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #pragma once
+#include "../../../loaders/ExpertGemmRegistry.h"
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
@@ -33,6 +36,7 @@
 #include "../../../backends/CPUExecutionGeometry.h"
 #include "../../../tensors/TensorType.h"
 
+#include "memory/CPUSerialExpertStorageLayout.h"
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
@@ -142,6 +146,10 @@ namespace llaminar2
              */
             std::optional<int> logical_participant_id;
             std::string debug_name;
+            /// Exact immutable CPU root declaration used by admission and construction.
+            std::shared_ptr<const CPUSerialExpertStorageLayout> cpu_storage_layout;
+            /// Existing rank/model PMA issuer; backing storage owns every resulting claim.
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
         };
 
         /**
@@ -332,6 +340,19 @@ namespace llaminar2
             return cpu_canonical_routes_;
         }
 
+        /** @return Exact immutable joint root declaration, absent for ordinary CPU1 execution. */
+        const CPUJointExpertRouteStorageLayout *cpuJointLayout() const noexcept {
+            return cpu_storage_layout_ && cpu_storage_layout_->jointRoutes()?&*cpu_storage_layout_->jointRoutes():nullptr;
+        }
+        /** @return Same serial packed producer/receive bank for every mutually exclusive layer. */
+        const std::shared_ptr<FP32Tensor>& cpuJointPackedRecords() const noexcept {return cpu_joint_packed_;}
+        /** @return Original root-only source range scratch; contributors return an empty span. */
+        std::span<RootedFloatRecordRange> cpuJointSourceRanges() noexcept {return {cpu_joint_ranges_.data(),cpu_joint_ranges_.size()};}
+        /** @return Original root-only route map scratch. */
+        std::span<int32_t> cpuJointRouteMaps() noexcept {return {cpu_joint_maps_.data(),cpu_joint_maps_.size()};}
+        /** @return Original root-only required-route scratch. */
+        std::span<float> cpuJointRequiredRoutes() noexcept {return {cpu_joint_required_.data(),cpu_joint_required_.size()};}
+
         /**
          * @brief Return the publication bank prebound to one GPU consumer.
          *
@@ -362,7 +383,12 @@ namespace llaminar2
             return cpu_grouped_workspace_;
         }
 
+        /** @return Canonical CPU issuer already retained by every serial backing root. */
+        const std::shared_ptr<PhysicalMemoryAuthority>& physicalMemoryAuthority() const noexcept
+        { return physical_memory_authority_; }
+
     private:
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_; ///< Dependency identity, not a byte ledger.
         DeviceId device_id_ = DeviceId::invalid();
         size_t row_capacity_ = 0;
         int d_model_ = 0;
@@ -371,6 +397,11 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         size_t pinned_transfer_bytes_ = 0;
         std::vector<TensorFamily> families_;
+        std::shared_ptr<const CPUSerialExpertStorageLayout> cpu_storage_layout_; ///< Original frozen declaration, not an allocation ledger.
+        std::shared_ptr<FP32Tensor> cpu_joint_packed_; ///< Sole packed native producer/receive root for this serial participant.
+        AlignedVector<RootedFloatRecordRange> cpu_joint_ranges_;
+        AlignedVector<int32_t> cpu_joint_maps_;
+        AlignedVector<float> cpu_joint_required_;
         std::shared_ptr<FP32Tensor> cpu_canonical_routes_; ///< Cached maximum-capacity raw rows shared by serial CPU families.
         /** Distinct TransferEngine publication bank consumed by one GPU. */
         std::shared_ptr<MappedHostTransferRegion>
@@ -403,6 +434,24 @@ namespace llaminar2
          * and writes the result into the source GPU's canonical route slot.
          * Timeline publication remains outside this stage.
          */
+        /**
+         * @brief Original graph-owned packed down-partial bank for the explicit CPU cohort collective.
+         *
+         * This producer never applies weights or publishes a return signal.
+         * The following rooted collective owns completion and the original
+         * channel publishes only after that closed witness exists.
+         */
+        struct CPUJointRouteProducerBinding {
+            std::shared_ptr<FP32Tensor> packed_rows;
+            const int32_t *original_route_slots=nullptr;
+            const int32_t *compact_route_slots=nullptr;
+            size_t route_slot_capacity=0;
+            /** Immutable scheduling borrow only. The following explicit collective alone owns publication. */
+            std::shared_ptr<const MoEOverlayCanonicalRouteReturnTicketStorage> deferred_canonical_ticket;
+            /** @return Whether all original setup-owned roots and capacity exist. */
+            bool valid()const noexcept{return packed_rows && original_route_slots && compact_route_slots && route_slot_capacity>0;}
+        };
+
         struct CPUCanonicalRouteReturnBinding
         {
             const int32_t *original_route_slots = nullptr; ///< `[route_slot_capacity]` source-graph slot identities.
@@ -504,6 +553,7 @@ namespace llaminar2
              */
             std::optional<CPUCanonicalRouteReturnBinding>
                 cpu_canonical_route_return;
+            std::optional<CPUJointRouteProducerBinding> cpu_joint_route_producer; ///< Explicit unweighted fragment producer; not a return authority.
             /** Optional same-rank CPU-to-GPU compact canonical return ticket. */
             std::optional<CPUCanonicalRouteTicketReturnBinding>
                 cpu_canonical_route_ticket_return;
@@ -601,12 +651,16 @@ namespace llaminar2
             std::vector<std::shared_ptr<TensorBase>> expert_down_views;
             /// Keeps MoE batch-constructed kernel objects alive alongside the stage.
             std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
+            /** Original selected source triplets and native engines; never a whole-owner alias. */
+            std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
             /// Retains backend-native packed slabs when ownership is stage-local.
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
             std::shared_ptr<void> moe_packed_down_lifetime;
             /// Pointer to model-context-owned PreparedWeightStore.  Not owned here.
             PreparedWeightStore *prepared_store = nullptr;
+            /// Canonical issuer for this explicit CPU packet allocation dependency.
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
             /// Pointer to model-context-owned ExpertGemmRegistry.  Not owned here.
             ExpertGemmRegistry *expert_registry = nullptr;
             /**
@@ -697,6 +751,14 @@ namespace llaminar2
          * @return True after the return rows and completion evidence are ready.
          */
         bool completeDeferredOutput(IDeviceContext *ctx);
+        /**
+         * @brief Read the last completed endpoint's post-service host duration.
+         * @return Nanoseconds of telemetry/cleanup after the service timestamp;
+         * zero when disabled, failed or empty. Nested in local execute time.
+         * The existing participant timeline alone publishes this observation.
+         */
+        std::uint64_t completedPostServiceNanoseconds() const noexcept
+        { return last_post_service_ns_; }
         /** @return Whether this stage requires an explicit completion node. */
         bool usesDeferredCompletion() const noexcept
         {
@@ -749,8 +811,11 @@ namespace llaminar2
         manualGraphBoundaryScheduling() const noexcept override
         {
             return params_.device_id.is_cpu() &&
-                           params_.cpu_canonical_route_ticket_return &&
-                           params_.cpu_canonical_route_ticket_return->valid()
+                           ((params_.cpu_canonical_route_ticket_return &&
+                             params_.cpu_canonical_route_ticket_return->valid()) ||
+                            (params_.cpu_joint_route_producer &&
+                             params_.cpu_joint_route_producer->deferred_canonical_ticket &&
+                             params_.cpu_joint_route_producer->deferred_canonical_ticket->hasValidBoundIdentity()))
                        ? ManualGraphBoundaryScheduling::ConcurrentTicketService
                        : ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
         }
@@ -758,8 +823,8 @@ namespace llaminar2
         ConcurrentManualFailureRole
         concurrentManualFailureRole() const noexcept override
         {
-            return manualGraphBoundaryScheduling() ==
-                           ManualGraphBoundaryScheduling::ConcurrentTicketService
+            return params_.cpu_canonical_route_ticket_return &&
+                           manualGraphBoundaryScheduling() == ManualGraphBoundaryScheduling::ConcurrentTicketService
                        ? ConcurrentManualFailureRole::DeviceIngressPublisher
                        : ConcurrentManualFailureRole::None;
         }
@@ -834,7 +899,8 @@ namespace llaminar2
         /** @copydoc ICPUCurrentBatchLLEPExpertConsumer::cloneCPUCurrentBatchLLEPPreparedExpert */
         ExpertPackedWeights cloneCPUCurrentBatchLLEPPreparedExpert(
             int expert_id,
-            uint64_t durable_parent_epoch) const override;
+            uint64_t durable_parent_epoch,
+            CPUWeightStoragePlacement destination) const override;
 
         /** @copydoc ICPUCurrentBatchLLEPExpertConsumer::installCPUCurrentBatchLLEPTransientResidency */
         bool installCPUCurrentBatchLLEPTransientResidency(
@@ -946,13 +1012,22 @@ namespace llaminar2
             Submitted, ///< GPU work and its exact producer event are in flight.
         };
 
-        /** @brief Bind a private or serial-family compact tensor set at fixed capacity. */
+        /**
+         * @brief Bind a retained family or validate immutable CPU packet capacity.
+         * @param rows Live/setup token rows requested by this packet.
+         * @param routing_top_k Fixed metadata route width.
+         * @return Whether the complete requested packet binding is valid.
+         * @throws std::logic_error For CPU private growth or missing setup backing.
+         * @details CPU private roots allocate only during construction from the
+         * frozen graph/packet capacity. Replay never replaces their storage.
+         */
         bool ensureCompactCapacity(size_t rows, int routing_top_k) const;
         /** @return Whether compute must retain raw per-expert rows until publication. */
         bool preservesCanonicalRouteRows() const noexcept
         {
             return params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes ||
                    params_.cpu_canonical_route_return.has_value() ||
+                   params_.cpu_joint_route_producer.has_value() ||
                    params_.cpu_canonical_route_ticket_return.has_value();
         }
         /**
@@ -1069,6 +1144,8 @@ namespace llaminar2
         DeferredGPUReplayFamily *pending_deferred_replay_ = nullptr;
         DeferredLifecycle deferred_lifecycle_ = DeferredLifecycle::Idle;
         MoEOverlayParticipantBankLease deferred_residency_bank_;
+        /** Host-only completed timing observation; never an execution decision. */
+        std::uint64_t last_post_service_ns_ = 0u;
         bool pending_economy_timing_enabled_ = false;
         bool pending_endpoint_detail_enabled_ = false;
         bool pending_profiling_enabled_ = false;
@@ -1077,6 +1154,8 @@ namespace llaminar2
         std::chrono::steady_clock::time_point pending_stage_setup_start_{};
         std::chrono::steady_clock::time_point pending_compute_start_{};
         std::chrono::steady_clock::time_point pending_compute_end_{};
+        /// Immutable setup declaration; absent on GPU and serial-family paths.
+        std::shared_ptr<const CPUCompactPacketStorageLayout> cpu_compact_packet_layout_;
         mutable size_t compact_capacity_ = 0;
         mutable std::shared_ptr<FP32Tensor> compact_hidden_;
         mutable std::shared_ptr<FP32Tensor> compact_routing_indices_;

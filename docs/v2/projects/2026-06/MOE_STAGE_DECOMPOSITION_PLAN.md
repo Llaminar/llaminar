@@ -23,7 +23,7 @@
 | EP filtering (expert_mask + local_expert_start) | 30 | No |
 | GEMM engine lazy init / caching | 60 | **Yes** — device-specific dispatch |
 | Weight view extraction (3D→2D) | 110 | No |
-| VNNI/CPU weight packing | 80 | **Yes** — `CPUNativeVNNIGemmKernel.h`, `CPUPackedWeights.h` |
+| VNNI/CPU weight packing | 80 | **Yes** — `CPUNativeQuantisedGemmKernel.h`, `CPUPackedWeights.h` |
 | CUDA batch packing | 90 | **Yes** — `#ifdef HAVE_CUDA` |
 | ROCm batch packing | 90 | **Yes** — `#ifdef HAVE_ROCM` |
 | Dynamic rebalance lifecycle | 200 | **Yes** — VNNI repack, madvise, NUMA audit |
@@ -32,7 +32,7 @@
 | Scratch buffer management | 60 | No |
 | Dump info / diagnostics | 80 | No |
 
-The stage directly includes CPU-specific headers (`CPUNativeVNNIGemmKernel.h`, `CPUPackedWeights.h`, `numaif.h`, `sched.h`) and has `#ifdef HAVE_CUDA` / `#ifdef HAVE_ROCM` blocks constructing device-specific kernel objects. This makes it impossible to unit-test routing or expert computation without pulling in an entire backend toolchain.
+The stage directly includes CPU-specific headers (`CPUNativeQuantisedGemmKernel.h`, `CPUPackedWeights.h`, `numaif.h`, `sched.h`) and has `#ifdef HAVE_CUDA` / `#ifdef HAVE_ROCM` blocks constructing device-specific kernel objects. This makes it impossible to unit-test routing or expert computation without pulling in an entire backend toolchain.
 
 `TPMode::ExpertParallel` exists in the enum ([GraphSchema.h](../../../../src/v2/execution/local_execution/graph/GraphSchema.h)) but `GraphResolver::resolveTPCollective()` has a TODO stub. EP is instead handled imperatively in `Qwen35MoEGraph::buildFFNGraph()` with `local_expert_start`/`local_expert_count` and a `FusedAddAllreduceStage`.
 
@@ -162,7 +162,7 @@ output             TensorBase* [seq_len, d_model]     WRITE
 - **Prefill path** (`seq_len > 1`): Group tokens by expert → `gatherTokenBatch()` → gate+up GEMM → SwiGLU → down GEMM → `scatterAddWeighted()`
 - **Decode path** (`seq_len == 1`): Batched gate+up GEMV → fused SwiGLU+down → weighted accumulate
 - Dispatches all compute via `ITensorGemm` (device-agnostic) and `IMoEKernel` (gather/scatter/SwiGLU)
-- **No device-specific `#include`s** — no `CPUNativeVNNIGemmKernel.h`, no `numaif.h`, no `#ifdef HAVE_CUDA`
+- **No device-specific `#include`s** — no `CPUNativeQuantisedGemmKernel.h`, no `numaif.h`, no `#ifdef HAVE_CUDA`
 
 ### Service: `MoEExpertWeightService` (~500 lines)
 
@@ -346,7 +346,7 @@ struct MoEWeightContext {
 **Files to modify:**
 - `src/v2/execution/compute_stages/stages/MoEFFNStage.h` → rename to `MoEExpertComputeStage.h`
 - `src/v2/execution/compute_stages/stages/MoEFFNStage.cpp` → rename to `MoEExpertComputeStage.cpp`
-- Remove `#include` of `CPUNativeVNNIGemmKernel.h`, `CPUPackedWeights.h`, `numaif.h`, `sched.h`
+- Remove `#include` of `CPUNativeQuantisedGemmKernel.h`, `CPUPackedWeights.h`, `numaif.h`, `sched.h`
 - Remove `#ifdef HAVE_CUDA` / `#ifdef HAVE_ROCM` blocks (already extracted to service in Phase 1)
 - Update all references in graph builders, factory, tests
 - Wire `createMoEExpert()` factory method to `MoEExpertComputeStage`

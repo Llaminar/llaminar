@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1159,6 +1160,129 @@ TEST(Test__PerfStatsCollector, QualifiedFilterEnablesItsOwningDomain)
     EXPECT_FALSE(PerfStatsCollector::isDomainEnabled("moe"));
 }
 
+/** @test Optional producer guards reuse immutable domain/name-prefix policy. */
+TEST(Test__PerfStatsCollector, RecordFamilyGateAvoidsSiblingDiagnostics)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel.projection");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("kernel"));
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","projection"));
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","projection.child"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel","projection_sibling"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("mtp","projection"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel",""));
+    ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_FILTER","kernel",1),0);
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
+}
+
+/** @test Qualified filters reject sibling storage, even with distinct per-command tags. */
+TEST(Test__PerfStatsCollector, QualifiedFamilyAdmissionKeepsRetainedMapBounded)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv cpu_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
+    ScopedEnv gpu_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel.retained");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    using Batch = PerfStatsCollector::CounterObservationBatch;
+    constexpr uint64_t observations = 64;
+    const auto emit = [](const std::string &domain, const std::string &family,
+                         uint64_t command, bool changing_tags)
+    {
+        // Rejected records deliberately have a fresh key on every iteration.
+        // Accepted records use one stable key per API, as production requires.
+        const PerfStatsCollector::Tags tags{
+            {"fixture", changing_tags ? std::to_string(command) : "stable"}};
+        const auto bound = PerfStatsCollector::bindCounter(
+            domain, family + ".bound", "fixture", "cpu", tags);
+        const auto bound_batch = PerfStatsCollector::bindCounter(
+            domain, family + ".bound_batch", "fixture", "cpu", tags);
+        const auto bound_sequence = PerfStatsCollector::bindCounter(
+            domain, family + ".bound_sequence", "fixture", "cpu", tags);
+        PerfStatsCollector::addCounter(domain, family + ".scalar", 2.0, "fixture", "cpu", tags);
+        PerfStatsCollector::addCounter(domain, family + ".batch",
+            Batch{.observations = 2u, .value = 3.0}, "fixture", "cpu", tags);
+        PerfStatsCollector::addCounter(bound, 4.0);
+        PerfStatsCollector::addCounter(bound_batch, Batch{.observations = 3u, .value = 5.0});
+        PerfStatsCollector::addCounterWithSequence(domain, family + ".sequence",
+            6.0, {command}, "fixture", "cpu", tags);
+        PerfStatsCollector::addCounterWithSequence(bound_sequence, 7.0, {command});
+        PerfStatsCollector::recordTimingNs(domain, family + ".timer", 8u, "fixture", "cpu", tags);
+        PerfStatsCollector::recordTimingNsWithSequence(domain, family + ".timer_sequence",
+            9u, {command}, "fixture", "cpu", tags);
+        PerfStatsCollector::recordOrderedSequenceStep(domain, family + ".ordered",
+            {command}, "fixture", "cpu", tags);
+        PerfStatsCollector::ScopedTimer timer(domain, family + ".scoped", "fixture", "cpu", tags);
+    };
+    for (uint64_t command = 0; command < observations; ++command)
+    {
+        emit("kernel", "retained", command, false);
+        emit("kernel", "retained_sibling", command, true);
+        emit("other_domain", "retained", command, true);
+    }
+
+    // No snapshot filter: an export-only fix would conceal the defect here.
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 10u);
+    for (const auto &record : records)
+    {
+        EXPECT_EQ(record.domain, "kernel");
+        EXPECT_EQ(record.tags.at("fixture"), "stable");
+        const auto expected_count = record.name == "retained.batch" ? observations * 2u
+            : record.name == "retained.bound_batch" ? observations * 3u : observations;
+        EXPECT_EQ(record.count, expected_count) << record.name;
+        if (record.name == "retained.sequence" || record.name == "retained.bound_sequence" ||
+            record.name == "retained.timer_sequence")
+        {
+            EXPECT_EQ(record.sequence_word_count, observations);
+            EXPECT_EQ(record.sequence_minimum_words, (std::vector<uint64_t>{0u}));
+            EXPECT_EQ(record.sequence_maximum_words, (std::vector<uint64_t>{observations - 1u}));
+        }
+        if (record.name == "retained.timer") EXPECT_EQ(record.total_ns, observations * 8u);
+        if (record.name == "retained.timer_sequence") EXPECT_EQ(record.total_ns, observations * 9u);
+        if (record.name == "retained.scalar") EXPECT_DOUBLE_EQ(record.value, observations * 2.0);
+        if (record.name == "retained.batch") EXPECT_DOUBLE_EQ(record.value, observations * 3.0);
+    }
+    PerfStatsCollector::reset();
+}
+
+/** @test A cold-bound identity follows current family policy without resurrecting rejected keys. */
+TEST(Test__PerfStatsCollector, BoundFamilyAdmissionUsesReloadedPolicyWithoutHiddenRecords)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel.selected");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    const auto selected = PerfStatsCollector::bindCounter("kernel", "selected");
+    const auto sibling = PerfStatsCollector::bindCounter("kernel", "sibling");
+    PerfStatsCollector::addCounter(selected, 1.0);
+    PerfStatsCollector::addCounter(sibling, 100.0);
+    ASSERT_EQ(PerfStatsCollector::snapshot().size(), 1u);
+    {
+        ScopedEnv broad("LLAMINAR_PERF_STATS_FILTER", "kernel");
+        // Reload is not reset: previously rejected observations must be absent.
+        ASSERT_EQ(PerfStatsCollector::snapshot().size(), 1u);
+        PerfStatsCollector::addCounter(sibling, 2.0);
+        ASSERT_EQ(PerfStatsCollector::snapshot().size(), 2u);
+    }
+    PerfStatsCollector::addCounter(sibling, 1000.0);
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 2u);
+    const auto found = std::find_if(records.begin(), records.end(),
+        [](const auto &record) { return record.name == "sibling"; });
+    ASSERT_NE(found, records.end());
+    EXPECT_EQ(found->count, 1u);
+    EXPECT_DOUBLE_EQ(found->value, 2.0);
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__PerfStatsCollector, CpuStageFilterEnablesCpuStageTiming)
 {
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
@@ -1573,4 +1697,350 @@ TEST(Test__PerfStatsCollector, FlushFromEnvWritesMultipleFilteredDomainsForMTPGr
 
     std::filesystem::remove(json_path);
     std::filesystem::remove(csv_path);
+}
+
+/** @test Bound dimensions survive reset without retaining an old accumulator or publishing at setup. */
+TEST(PerfStatsCollector, BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "-");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel");
+    PerfStatsCollector::reset();
+    const auto key = PerfStatsCollector::bindCounter("kernel", "bound_identity", "submission", "cpu:0", {{"operation", "ordinary"}});
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    PerfStatsCollector::addCounter(key);
+    PerfStatsCollector::addCounter(key, 2.0);
+    auto rows=PerfStatsCollector::snapshot();
+    ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,2u); EXPECT_DOUBLE_EQ(rows[0].value,3.0);
+    PerfStatsCollector::reset();
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    PerfStatsCollector::addCounter(key);
+    rows=PerfStatsCollector::snapshot();
+    ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,1u); EXPECT_DOUBLE_EQ(rows[0].value,1.0);
+    {
+        ScopedEnv disabled("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        PerfStatsCollector::addCounter(key);
+    }
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,1u);
+    // Batch the original observations, not merely one larger numeric value.
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=3u, .value=0.0});
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,4u); EXPECT_DOUBLE_EQ(rows[0].value,1.0);
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=7.0});
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,6u); EXPECT_DOUBLE_EQ(rows[0].value,8.0);
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=0u, .value=0.0});
+    EXPECT_THROW(PerfStatsCollector::addCounter(key,
+        (PerfStatsCollector::CounterObservationBatch{.observations=0u, .value=1.0})),std::invalid_argument);
+    EXPECT_THROW(PerfStatsCollector::addCounter(key,
+        (PerfStatsCollector::CounterObservationBatch{.observations=std::numeric_limits<std::uint64_t>::max(), .value=0.0})),std::overflow_error);
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,6u); EXPECT_DOUBLE_EQ(rows[0].value,8.0);
+    {
+        ScopedEnv disabled("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=9u, .value=11.0});
+    }
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,6u);
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=0.0});
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,2u); EXPECT_DOUBLE_EQ(rows[0].value,0.0);
+    const auto sequenced=PerfStatsCollector::bindCounter("kernel","bound_sequence","submission","cpu:0");
+    PerfStatsCollector::addCounterWithSequence("kernel","bound_sequence",1.0,{7u},"submission","cpu:0");
+    EXPECT_THROW(PerfStatsCollector::addCounter(sequenced,
+        (PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=0.0})),std::logic_error);
+    PerfStatsCollector::reset();
+}
+
+namespace {
+/**
+ * @brief Replay the three real producer schemas through the actual bounded collector.
+ * @param repeatedDepth Add a later admission at the original first depth with distinct epoch/workspace.
+ * @param reorderSubmission Reverse only the actual first-branch witness producer order.
+ * @param dropObservation Omit only the final repeated-depth observation witness.
+ * @return Existing certified transactions plus actual collected continuation admission records.
+ */
+std::vector<PerfStatRecord> hostedContinuationAdmissionRecords(
+    bool repeatedDepth=false, bool reorderSubmission=false, bool dropObservation=false)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    const std::vector<uint64_t> depths=repeatedDepth?std::vector<uint64_t>{1,3,1}:std::vector<uint64_t>{1,3};
+    for(const auto* device:{"ROCm:0","ROCm:1"}) {
+        for(size_t step=0;step<depths.size();++step){
+            const auto depth=depths[step];
+            const auto epoch=40+step,workspace=70+step;
+            const auto depthText=std::to_string(depth),rows=std::to_string(depth+1);
+            PerfStatsCollector::addCounterWithSequence("mtp","device_generation_continuation_admission_tickets",1.0,
+                {0,epoch,workspace},"decode",device,{{"depth",depthText},{"physical_rows",rows},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"}});
+            if(!(dropObservation && step==2))
+            PerfStatsCollector::addCounterWithSequence("mtp","device_generation_dispatch_tickets_observed",1.0,
+                {0,epoch,workspace},"decode",device,{{"next_depth",depthText},{"physical_rows",rows},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"},{"complete","false"},{"maintenance_due","false"}});
+            if(!reorderSubmission)
+            PerfStatsCollector::addCounterWithSequence("mtp","hosted_device_generation_transaction_submissions",1.0,
+                {0,epoch,workspace},"decode",device,{{"depth",depthText},{"physical_rows",rows},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"},{"fragments","5"},
+                {"dynamic_depth_source","device_controller_ticket"}});
+        }
+        if(reorderSubmission)for(size_t remaining=depths.size();remaining>0;--remaining){
+            const auto step=remaining-1,depth=depths[step];
+            PerfStatsCollector::addCounterWithSequence("mtp","hosted_device_generation_transaction_submissions",1.0,
+                {0,40+step,70+step},"decode",device,{{"depth",std::to_string(depth)},
+                {"physical_rows",std::to_string(depth+1)},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"},{"fragments","5"},
+                {"dynamic_depth_source","device_controller_ticket"}});
+        }
+    }
+    auto records=certifiedHostedTicketRecords();
+    for(auto& record:records)
+        if(record.name=="device_generation_dispatch_ticket_d2h_submissions")record.value+=depths.size();
+    const auto admissions=PerfStatsCollector::snapshot();
+    records.insert(records.end(),admissions.begin(),admissions.end());
+    PerfStatsCollector::reset();
+    return records;
+}
+}
+
+/** @test Native admission ticket zero is authenticated separately from completed transactions. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionHasExactIndependentWitnesses)
+{
+    const auto records=hostedContinuationAdmissionRecords();
+    const auto evidence=collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)<<evidence.certification_detail;
+    EXPECT_TRUE(collectProductionDeviceGenerationEvidence(certifiedHostedTicketRecords()).hosted_ticket_boundary_certified);
+}
+
+/** @test Missing, foreign, stale or relabelled admission evidence cannot hide a lost committed transaction. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionRejectsIncompleteAndForeignEvidence)
+{
+    for(unsigned mutation=0;mutation<22;++mutation){
+        SCOPED_TRACE(mutation);
+        auto records=hostedContinuationAdmissionRecords();
+        const auto find=[&](const char* name){return std::find_if(records.begin(),records.end(),[&](const auto& record){
+            const auto entry=record.tags.find("entry_source");
+            return record.device=="ROCm:0" && record.name==name && entry!=record.tags.end() &&
+                entry->second=="native_continue_response_admission";
+        });};
+        auto observed=find("device_generation_dispatch_tickets_observed");
+        auto admission=find("device_generation_continuation_admission_tickets");
+        auto submitted=find("hosted_device_generation_transaction_submissions");
+        ASSERT_NE(observed,records.end());ASSERT_NE(admission,records.end());ASSERT_NE(submitted,records.end());
+        switch(mutation){
+        case 0:records.erase(admission);break;
+        case 1:records.erase(observed);break;
+        case 2:records.erase(submitted);break;
+        case 3:++observed->sequence_digest_lo;break;
+        case 4:++submitted->sequence_digest_hi;break;
+        case 5:observed->sequence_minimum_words[1]=0;break;
+        case 6:observed->sequence_minimum_words[2]=0;break;
+        case 7:observed->sequence_maximum_words[0]=1;break;
+        case 8:observed->sequence_word_count=1;break;
+        case 9:observed->tags["physical_rows"]="99";break;
+        case 10:observed->tags["complete"]="true";break;
+        case 11:observed->tags["maintenance_due"]="true";break;
+        case 12:observed->tags["entry_source"]="unknown";break;
+        case 13:submitted->tags["dynamic_depth_source"]="host";break;
+        case 14:observed->tags["transaction"]="0";break;
+        case 15:records.push_back(*admission);break;
+        case 16:for(auto& record:records)if(record.device=="ROCm:0"&&record.name=="device_generation_dispatch_ticket_d2h_submissions")--record.value;break;
+        case 17:for(auto& record:records)if(record.device=="ROCm:0"&&record.name=="device_generation_terminal_transactions")--record.value;break;
+        case 18:observed->device="ROCm:7";break;
+        case 19:observed->tags.erase("entry_source");break;
+        case 20:observed->phase="prefill";break;
+        case 21:observed->tags["next_depth"]="0";break;
+        }
+        EXPECT_FALSE(collectProductionDeviceGenerationEvidence(records).hosted_ticket_boundary_certified);
+    }
+}
+
+
+/** @test Same-depth admissions aggregate their distinct epochs in the same original producer order. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionAggregatesRepeatedDepthEpochs)
+{
+    const auto records=hostedContinuationAdmissionRecords(true);
+    unsigned repeated=0;
+    for(const auto& record:records){
+        if(record.name!="device_generation_continuation_admission_tickets" || record.tags.at("depth")!="1")continue;
+        ++repeated;
+        EXPECT_EQ(record.count,2u);EXPECT_EQ(record.value,2.0);EXPECT_EQ(record.sequence_word_count,6u);
+        EXPECT_EQ(record.sequence_minimum_words,(std::vector<uint64_t>{0,40,70}));
+        EXPECT_EQ(record.sequence_maximum_words,(std::vector<uint64_t>{0,42,72}));
+    }
+    EXPECT_EQ(repeated,2u);
+    const auto evidence=collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)<<evidence.certification_detail;
+}
+
+/** @test Equal-depth witness loss or reordering cannot be hidden by equal aggregate ranges. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionRejectsDroppedOrReorderedEpochWitness)
+{
+    for(const bool reorder:{false,true}){
+        const auto records=hostedContinuationAdmissionRecords(true,reorder,!reorder);
+        if(reorder){
+            const auto find=[&](const char* name)->const PerfStatRecord&{
+                return *std::find_if(records.begin(),records.end(),[&](const auto& record){
+                    const auto entry=record.tags.find("entry_source"),depth=record.tags.find("depth");
+                    return record.device=="ROCm:0" && record.name==name && entry!=record.tags.end() &&
+                        entry->second=="native_continue_response_admission" && depth!=record.tags.end() && depth->second=="1";
+                });
+            };
+            const auto& admission=find("device_generation_continuation_admission_tickets");
+            const auto& submission=find("hosted_device_generation_transaction_submissions");
+            EXPECT_EQ(admission.count,submission.count);
+            EXPECT_EQ(admission.sequence_minimum_words,submission.sequence_minimum_words);
+            EXPECT_EQ(admission.sequence_maximum_words,submission.sequence_maximum_words);
+            EXPECT_NE(admission.sequence_digest_lo,submission.sequence_digest_lo);
+        }
+        EXPECT_FALSE(collectProductionDeviceGenerationEvidence(records).hosted_ticket_boundary_certified)<<reorder;
+    }
+}
+
+/** @test Ordinary batches and single observations share reset, filtering and overflow authority. */
+TEST(PerfStatsCollector, OrdinaryCounterBatchesPreserveMultiplicityAndEpoch)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "-");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel");
+    PerfStatsCollector::reset();
+    using Batch = PerfStatsCollector::CounterObservationBatch;
+    const auto emit = [](Batch batch) {
+        PerfStatsCollector::addCounter("kernel", "ordinary_batch", batch, "gemm", "cpu", {{"geometry", "stable"}});
+    };
+    emit({.observations = 3u, .value = 0.0});
+    PerfStatsCollector::addCounter("kernel", "ordinary_batch", 2.0, "gemm", "cpu", {{"geometry", "stable"}});
+    auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 4u);
+    EXPECT_DOUBLE_EQ(records[0].value, 2.0);
+    emit({.observations = 0u, .value = 0.0});
+    EXPECT_THROW(emit((Batch{.observations = 0u, .value = 1.0})), std::invalid_argument);
+    EXPECT_THROW(emit((Batch{.observations = std::numeric_limits<uint64_t>::max(), .value = 1.0})), std::overflow_error);
+    records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 4u);
+    EXPECT_DOUBLE_EQ(records[0].value, 2.0);
+    PerfStatsCollector::reset();
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    emit({.observations = 5u, .value = 5.0});
+    {
+        ScopedEnv disabled("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        emit({.observations = 7u, .value = 7.0});
+    }
+    records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 5u);
+    EXPECT_DOUBLE_EQ(records[0].value, 5.0);
+    PerfStatsCollector::reset();
+}
+
+/** @test Ordering publications alone cannot turn numerical model work into a generation loop. */
+TEST(Test__ProductionParityEvidence, ModelForwardPublicationsDoNotClaimGenerationExecution)
+{
+    const PerfStatRecord publication{
+        .kind = PerfStatRecord::Kind::Counter, .domain = "mtp",
+        .name = "device_generation_state_publications", .phase = "decode", .device = "ROCm:7",
+        .tags = {{"producer", "device_generation_parent_terminal"}, {"ordering", "event_wait"}}, .value = 2.0};
+    const auto evidence = collectProductionDeviceGenerationEvidence({publication});
+    EXPECT_FALSE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.model_forward_only_observed);
+    EXPECT_FALSE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_EQ(evidence.policy, ProductionDeviceGenerationPolicy::NotObserved);
+}
+
+/** @test Replay the original eight-device zero-output admission and authenticated parent completion schema. */
+TEST(Test__ProductionParityEvidence, ForwardOnlyRequiresEveryOriginalCapturedAndCompletedModelForward)
+{
+    std::vector<PerfStatRecord> records;
+    for (const int ordinal : {7, 6, 8, 9, 1, 3, 4, 2}) {
+        const auto device = "ROCm:" + std::to_string(ordinal);
+        records.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "mtp",
+            .name = "device_generation_admissions", .phase = "decode", .device = device,
+            .tags = {{"depth_policy_mode", std::to_string(static_cast<int>(sampling_math::DeviceGenerationPolicyMode::ForwardOnly))},
+                {"max_new_tokens", "0"}}, .value = 2.0});
+        records.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "forward_graph",
+            .name = "full_graph_capture_executable_nodes", .phase = "decode", .device = device,
+            .tags = {{"context", "main_decode"}}, .value = 1800.0});
+        records.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "forward_graph",
+            .name = "decode_graph_phase", .phase = "decode", .device = device,
+            .tags = {{"context", "main_decode"}, {"phase", "replay"},
+                {"source", "captured_generation_parent"}, {"observation", "authenticated_terminal"}}, .value = 2.0});
+    }
+    const auto certify = [](const auto &input) {
+        return collectProductionParityEvidence(input, true, ProductionParityExecutionTopology::HomogeneousGPU,
+            ProductionParityGraphContract::HomogeneousGPUCaptured, false, 1.0, 4500.0);
+    };
+    for (int replay = 0; replay < 3; ++replay) {
+        const auto evidence = certify(records);
+        EXPECT_TRUE(evidence.model_forward_only_observed);
+        EXPECT_TRUE(evidence.model_forward_only_certified);
+        EXPECT_FALSE(evidence.device_generation_controller);
+        EXPECT_FALSE(evidence.generation_loop_certified);
+        EXPECT_FALSE(evidence.native_generation_parent);
+        EXPECT_EQ(certifyProductionParityGraphExecution(evidence), ProductionParityGraphCertification::Certified);
+    }
+    // A single missing/foreign/partial completion or prefill-only witness must
+    // invalidate the original complete model-forward proof on every replay.
+    for (int defect = 0; defect < 7; ++defect) {
+        auto candidate = records;
+        switch (defect) {
+        case 0: candidate.pop_back(); break;
+        case 1: candidate.back().device = "ROCm:0"; break;
+        case 2: candidate.back().value = 1.0; break;
+        case 3: candidate.back().tags.erase("observation"); break;
+        case 4: candidate.back().tags["context"] = "prefill"; break;
+        case 5: candidate[candidate.size()-2].value = 0.0; break;
+        case 6: candidate[candidate.size()-2].device = "ROCm:0"; break;
+        }
+        const auto evidence = certify(candidate);
+        EXPECT_FALSE(evidence.model_forward_only_certified) << defect;
+        EXPECT_EQ(certifyProductionParityGraphExecution(evidence),
+            ProductionParityGraphCertification::MissingNativeCapturedGraph) << defect;
+    }
+    // Every new extent is a positive exact integer. Invalid observations must
+    // fail even beside a valid original capture/completion on the same device.
+    for (const std::size_t role : {0u, 1u, 2u}) {
+        for (const double value : {0.0, -1.0, 0.5, std::numeric_limits<double>::quiet_NaN(),
+                std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::max(), 9007199254740992.0}) {
+            auto candidate = records;
+            candidate[role].value = value;
+            const auto evidence = certify(candidate);
+            EXPECT_TRUE(evidence.model_forward_only_observed);
+            EXPECT_FALSE(evidence.model_forward_only_certified) << role << ":" << value;
+            EXPECT_EQ(certifyProductionParityGraphExecution(evidence),
+                ProductionParityGraphCertification::MissingNativeCapturedGraph);
+        }
+    }
+    // Individually representable observations must also fail closed when their
+    // sum leaves the exact integer range of the underlying PerfStats format.
+    for (const std::size_t role : {0u, 2u}) {
+        auto candidate = records;
+        candidate[0].value = 9007199254740991.0;
+        candidate[2].value = 9007199254740991.0;
+        auto extra = candidate[role];
+        extra.value = 1.0;
+        candidate.push_back(extra);
+        EXPECT_FALSE(certify(candidate).model_forward_only_certified) << role;
+        EXPECT_EQ(certifyProductionParityGraphExecution(certify(candidate)),
+            ProductionParityGraphCertification::MissingNativeCapturedGraph);
+    }
+    // Supporting forward evidence never certifies an ordinary, malformed, or
+    // unknown generation request. Preserve the existing generation-policy gate.
+    for (int defect = 0; defect < 5; ++defect) {
+        auto candidate = records;
+        switch (defect) {
+        case 0: candidate.front().tags["depth_policy_mode"] = "3"; break;
+        case 1: candidate.front().tags["max_new_tokens"] = "1"; break;
+        case 2: candidate.front().tags.erase("max_new_tokens"); break;
+        case 3: candidate.front().tags["depth_policy_mode"] = "2"; break;
+        case 4: candidate.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "mtp",
+            .name = "device_generation_terminal_transactions", .phase = "decode", .device = "ROCm:7", .value = 1.0}); break;
+        }
+        const auto evidence = certify(candidate);
+        EXPECT_TRUE(evidence.device_generation_controller) << defect;
+        EXPECT_EQ(evidence.generation_execution_policy, ProductionDeviceGenerationPolicy::Unclassified) << defect;
+        EXPECT_FALSE(evidence.generation_loop_certified) << defect;
+        EXPECT_EQ(certifyProductionParityGraphExecution(evidence),
+            ProductionParityGraphCertification::MissingNativeCapturedGraph) << defect;
+    }
 }

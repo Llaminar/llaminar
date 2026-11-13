@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""Gate hardware-eligible QFN source cells from installed CTest/GTest metadata.
+
+This is setup admission, separate from numerical parity and model-free preflight.
+No topology/depth list or vendor-count heuristic lives here. The exact image's
+native startup inventory selects typed participants; unavailable cells remain
+unqualified. Every selected cell, including candidates, must pass without skips
+and publish per-rank retirement. Canonical GGUF paths are read-only inputs, never
+rewritten into another source tier. An explicit --exact-cell diagnostic uses the
+same lifecycle but has a disjoint, certification-ineligible receipt; default
+selection and the full gate are unchanged. Broad optional downloads are suppressed only
+after every selected REQUIRED_FILES input has been validated.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+from enum import Enum
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import secrets
+import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
+from production_artifacts import artifact_identity_path, digest, write_json
+
+SOURCE_ADMISSION_REPORT_SCHEMA = 2  # Runner cleanup plus terminal native lifetime proof.
+SOURCE_ADMISSION_DIAGNOSTIC_SCHEMA = 'llaminar.qfn-source-admission-diagnostic.v1'
+PREFIX = 'V2_Integration_Parity_Qwen4Exp_Production_'
+class SourceAdmissionContract(str, Enum):
+    """Disjoint native proof obligations; capacity is not structural support."""
+    POSITIVE = 'positive-source-admission'
+    UNSUPPORTED_REJECTION = 'expected-native-rejection'
+    CAPACITY_REJECTION = 'expected-capacity-rejection'
+
+
+SOURCE_METHOD_CONTRACTS = {
+    'FullSourceAdmission': SourceAdmissionContract.POSITIVE,
+    'CandidateSourceAdmission': SourceAdmissionContract.POSITIVE,
+    'RejectUnsupportedSourceAdmission': SourceAdmissionContract.UNSUPPORTED_REJECTION,
+    'RejectCapacitySourceAdmission': SourceAdmissionContract.CAPACITY_REJECTION,
+}
+METHODS = tuple(SOURCE_METHOD_CONTRACTS)
+
+
+def source_contract(exact: str) -> SourceAdmissionContract:
+    """Read the explicit GTest method contract, never a topology or capacity guess."""
+    matches = [contract for method, contract in SOURCE_METHOD_CONTRACTS.items()
+               if f'.{method}/' in exact]
+    if len(matches) != 1:
+        raise ValueError('unknown or ambiguous source admission contract')
+    return matches[0]
+
+
+def identity(device: dict) -> tuple[str, int, int]:
+    """Validate an exact physical address; CPU NUMA is not CPU ordinal."""
+    backend, ordinal, numa = (device.get(key) for key in ('backend', 'ordinal', 'numa_node'))
+    if (backend not in ('cpu', 'cuda', 'rocm') or type(ordinal) is not int or ordinal < 0
+            or type(numa) is not int or numa < -1 or (backend == 'cpu' and (ordinal != 0 or numa < 0))):
+        raise ValueError('invalid exact source-admission device identity')
+    # GPU locality is observed but does not rename the backend address.
+    return backend, ordinal, numa if backend == 'cpu' else -1
+
+
+def provisioning_requirements(record: dict) -> dict[str, int]:
+    """Read each authored vendor's physical test class, never a memory estimate."""
+    result = {}
+    participants = record.get('participants')
+    for backend in ('cuda', 'rocm'):
+        field = f'minimum_{backend}_total_memory_bytes'
+        if field not in record:
+            continue
+        minimum = record[field]
+        if not isinstance(participants, list) or not all(isinstance(p, dict) for p in participants):
+            raise ValueError('physical provisioning requires typed participant identities')
+        if (type(minimum) is not int or minimum <= 0
+                or record.get('mtp_enabled') is not True
+                or record.get('retained_mtp_draft_capacity') != 15
+                or 'gpu_memory_cap_mb' in record
+                or not any(p.get('backend') == backend for p in participants)):
+            raise ValueError(f'invalid authored {backend} physical provisioning prerequisite')
+        result[backend] = minimum
+    return result
+
+
+def valid_unqualified(row: dict) -> bool:
+    """Authenticate disjoint missing-device and explicit physical-class evidence."""
+    if row.get('qualification') == 'hardware-ineligible-unqualified':
+        return bool(row.get('missing'))
+    if row.get('qualification') != 'hardware-capacity-ineligible-unqualified':
+        return False
+    evidence = row.get('insufficient')
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    for entry in evidence:
+        required, observed = entry.get('required_total_memory_bytes'), entry.get('observed_total_memory_bytes')
+        if (type(required) is not int or type(observed) is not int or not 0 < observed < required
+                or not isinstance(entry.get('participant'), dict)
+                or type(entry['participant'].get('rank')) is not int or entry['participant']['rank'] < 0):
+            return False
+        try:
+            if identity(entry['participant'])[0] not in ('cuda', 'rocm'):
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def cpu_joint_socket_requirements(record: dict, declared: set, observed: dict) -> list[dict]:
+    """Join original CPU-joint roles to one original local-host socket observation.
+
+    Missing/stale facts cannot become eligibility. Authoritative socket aliasing
+    is an unavailable physical deployment, not another rank mapping or launch.
+    Ordinary source records have no such requirement and retain their contract.
+    """
+    if 'cpu_expert_socket_membership' not in record:
+        return []
+    members = record['cpu_expert_socket_membership']; world = record['mpi_ranks']
+    if (not isinstance(members, list) or len(members) != world or not 2 <= world <= 8):
+        raise ValueError('incomplete original CPU-joint socket requirement')
+    ranks = set(); nodes = set(); required = []
+    for member in members:
+        if not isinstance(member, dict):
+            raise ValueError('invalid original CPU-joint socket member')
+        rank = member.get('rank'); address = identity(member)
+        if (type(rank) is not int or not 0 <= rank < world or address[0] != 'cpu'
+                or (rank, address) not in declared or rank in ranks or address[2] in nodes):
+            raise ValueError('foreign or duplicate original CPU-joint socket member')
+        ranks.add(rank); nodes.add(address[2]); required.append((member, address))
+    if ranks != set(range(world)):
+        raise ValueError('original CPU-joint socket members omit an original rank')
+    # Missing device identities already have the existing explicit unavailable
+    # record. Do not manufacture socket facts for those missing observations.
+    if any(address not in observed for _, address in required):
+        return []
+    sockets = set(); aliased = []
+    for member, address in required:
+        socket = observed[address].get('socket_id')
+        if type(socket) is not int or socket < 0:
+            raise ValueError('missing or stale original CPU physical-socket evidence')
+        if socket in sockets:
+            aliased.append({**member, 'role': 'cpu_expert_distinct_physical_socket',
+                            'observed_socket_id': socket,
+                            'reason': 'original_cpu_socket_alias'})
+        sockets.add(socket)
+    return aliased
+
+
+def source_hardware_devices(hardware: dict) -> dict:
+    """Validate one complete original native publication and index exact addresses."""
+    if (not isinstance(hardware, dict) or type(hardware.get('qfn_source_hardware_schema')) is not int
+            or hardware.get('qfn_source_hardware_schema') != 2
+            or hardware.get('scope') != 'local-host-all-ranks'
+            or not isinstance(hardware.get('devices'), list) or not hardware['devices']):
+        raise ValueError('missing or foreign native source hardware metadata')
+    available = [identity(device) for device in hardware['devices']]
+    if len(set(available)) != len(available):
+        raise ValueError('duplicate native hardware identity')
+    return {identity(device): device for device in hardware['devices']}
+
+
+def observed_pipeline_request(record: dict) -> dict | None:
+    """Validate a deferred ISA/cardinality request without inventing physical addresses."""
+    if 'observed_pipeline_request' not in record:
+        return None
+    request = record['observed_pipeline_request']
+    if (not isinstance(request, dict) or set(request) != {'backend', 'native_isa', 'stage_sizes'}
+            or request['backend'] not in ('cuda', 'rocm')
+            or not isinstance(request['native_isa'], str) or not request['native_isa']
+            or ':' in request['native_isa'] or not isinstance(request['stage_sizes'], list)
+            or len(request['stage_sizes']) < 2
+            or any(type(size) is not int or size <= 0 for size in request['stage_sizes'])
+            or record.get('participants') != []
+            or any(field in record for field in ('storage_participants', 'storage_coordinator',
+                                                'cpu_expert_socket_membership', 'gpu_memory_cap_mb',
+                                                'minimum_cuda_total_memory_bytes', 'minimum_rocm_total_memory_bytes'))):
+        raise ValueError('invalid observed pipeline ISA/cardinality request')
+    return request
+
+
+def observed_native_isa_cohorts(observed: dict, backend: str, native_isa: str) -> dict[int, list[dict]]:
+    """Project exact UUID-unique ISA cohorts from the original hardware observation."""
+    by_numa = {}
+    uuids = set()
+    for address, device in observed.items():
+        if address[0] != backend:
+            continue
+        isa = device.get('native_isa', '')
+        if not isinstance(isa, str):
+            raise ValueError('invalid native ISA observation')
+        if isa.partition(':')[0] != native_isa:
+            continue
+        uuid = device.get('uuid')
+        numa = device.get('numa_node')
+        if (not isinstance(uuid, str) or not uuid or uuid in uuids
+                or type(numa) is not int or numa < 0):
+            raise ValueError('missing or duplicate observed pipeline UUID/NUMA authority')
+        uuids.add(uuid)
+        by_numa.setdefault(numa, []).append(device)
+    return by_numa
+
+
+def observed_pipeline_hardware_requirement(record: dict, observed: dict) -> list[dict]:
+    """Check the requested ISA cohort on one actual NUMA; runtime still owns MPI binding."""
+    request = observed_pipeline_request(record)
+    assert request is not None
+    by_numa = observed_native_isa_cohorts(observed, request['backend'], request['native_isa'])
+    required = sum(request['stage_sizes'])
+    cpu_nodes = {device['numa_node'] for address, device in observed.items() if address[0] == 'cpu'}
+    # Visibility alone cannot supply an MPI owner. A complete GPU cohort must
+    # share a NUMA node with an actual observed CPU discovery participant.
+    eligible = [numa for numa, devices in by_numa.items()
+                if numa in cpu_nodes and len(devices) >= required]
+    if len(eligible) > 1:
+        raise ValueError('observed pipeline request has ambiguous original NUMA ownership')
+    if not eligible or len(cpu_nodes) < record['mpi_ranks']:
+        return [{'role': 'observed_pipeline_cohort', **request, 'required_devices': required,
+                 'observed_eligible_devices_by_numa': {str(numa): len(devices) for numa, devices in by_numa.items()},
+                 'original_discovery_ranks': record['mpi_ranks']}]
+    return []
+
+
+def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
+    """Select exact typed participants against one native local-host observation."""
+    observed_devices = source_hardware_devices(hardware)
+    available = set(observed_devices)
+    selected, unavailable = [], {}
+    for exact, record in records.items():
+        ranks = record.get('mpi_ranks')
+        participants = record.get('participants')
+        if (type(record.get('qfn_source_admission_schema')) is not int
+                or record.get('qfn_source_admission_schema') != 2 or type(ranks) is not int or ranks <= 0
+                or not isinstance(record.get('id'), str) or not record['id']
+                or Path(record['id']).name != record['id'] or record['id'] in ('.', '..')
+                or any(c in record['id'] for c in '/\\:*?"<>|\x00')
+                or not isinstance(participants, list)
+                or (not participants and 'observed_pipeline_request' not in record)):
+            raise ValueError('missing or stale typed source-admission metadata')
+        if observed_pipeline_request(record) is not None:
+            missing = observed_pipeline_hardware_requirement(record, observed_devices)
+            if missing:
+                unavailable[exact] = {'qualification': 'hardware-ineligible-unqualified', 'missing': missing}
+            else:
+                selected.append(exact)
+            continue
+        minimums = provisioning_requirements(record)
+        declared = set()
+        missing = []
+        insufficient = []
+        for participant in participants:
+            rank = participant.get('rank')
+            address = identity(participant)
+            if type(rank) is not int or not 0 <= rank < ranks or (rank, address) in declared:
+                raise ValueError('invalid or duplicate typed source participant')
+            declared.add((rank, address))
+            if address not in available:
+                missing.append(participant)
+            elif address[0] in minimums:
+                minimum = minimums[address[0]]
+                total = observed_devices[address].get('total_memory_bytes')
+                if type(total) is not int or total <= 0:
+                    raise ValueError(f'required {address[0]} physical total is missing or stale')
+                if total < minimum:
+                    insufficient.append({'participant': participant,
+                        'required_total_memory_bytes': minimum, 'observed_total_memory_bytes': total})
+        # Storage participants are hardware requirements, never additional
+        # compute/expert domains. Shared compute/storage endpoints are legal;
+        # duplicates inside either independently declared role are not.
+        storage = record.get('storage_participants', [])
+        coordinator = record.get('storage_coordinator')
+        if not isinstance(storage, list) or (bool(storage) != (coordinator is not None)):
+            raise ValueError('incomplete typed source storage participant/coordinator metadata')
+        storage_declared = set()
+        for participant in storage:
+            if not isinstance(participant, dict):
+                raise ValueError('invalid typed source storage participant')
+            rank = participant.get('rank')
+            address = identity(participant)
+            if type(rank) is not int or not 0 <= rank < ranks or address[0] not in ('cuda', 'rocm') or (rank, address) in storage_declared:
+                raise ValueError('invalid or duplicate typed source storage participant')
+            storage_declared.add((rank, address))
+            if address not in available:
+                missing.append({**participant, 'role': 'storage'})
+        if storage:
+            if not isinstance(coordinator, dict) or (coordinator.get('rank'), identity(coordinator)) not in storage_declared:
+                raise ValueError('source storage coordinator is absent from its declared owner population')
+            if (coordinator['rank'], identity(coordinator)) not in declared:
+                raise ValueError('source storage coordinator is not an actual compute consumer')
+        if {rank for rank, _ in declared} != set(range(ranks)):
+            raise ValueError('typed source participants do not cover the declared world')
+        missing.extend(cpu_joint_socket_requirements(record, declared, observed_devices))
+        if missing:
+            unavailable[exact] = {'qualification': 'hardware-ineligible-unqualified', 'missing': missing}
+        elif insufficient:
+            unavailable[exact] = {'qualification': 'hardware-capacity-ineligible-unqualified',
+                                  'insufficient': insufficient}
+        else:
+            selected.append(exact)
+    if not selected:
+        raise ValueError('source admission has no hardware-eligible cells')
+    return selected, unavailable
+
+
+def exact_cell_selection(exact_cell: str | None, records: dict, eligible: list[str],
+                         unavailable: dict) -> list[str]:
+    """Restrict only an explicit diagnostic to one authenticated hardware-eligible GTest ID.
+
+    The caller first authenticates complete CTest/GTest membership and runs the
+    original typed hardware selector. No regex, topology inference, retry or
+    visibility filter can manufacture a missing or unavailable source cell.
+    """
+    if exact_cell is None:
+        return eligible
+    if exact_cell not in records:
+        raise ValueError(f'unknown exact QFN source cell: {exact_cell}')
+    if exact_cell not in eligible:
+        raise ValueError(f'exact QFN source cell is hardware-ineligible: {exact_cell}; {unavailable.get(exact_cell)}')
+    return [exact_cell]
+
+
+def source_parameters(document: dict) -> dict:
+    """Read complete source-only GTest JSON; ordinary numerical JSON is untouched."""
+    records = {}
+    for suite in document['testsuites']:
+        for test in suite['testsuite']:
+            if test['name'].split('/', 1)[0] not in METHODS:
+                continue
+            exact = suite['name'] + '.' + test['name']
+            if exact in records:
+                raise ValueError('duplicate source GTest identity')
+            record = json.loads(test['value_param'])
+            capacity = SOURCE_METHOD_CONTRACTS[test['name'].split('/', 1)[0]] == SourceAdmissionContract.CAPACITY_REJECTION
+            if type(record.get('qfn_source_admission_schema')) is not int or record['qfn_source_admission_schema'] != 2:
+                raise ValueError('stale source provisioning metadata schema; rebuild discovery')
+            minimums = provisioning_requirements(record)
+            if minimums and SOURCE_METHOD_CONTRACTS[test['name'].split('/', 1)[0]] != SourceAdmissionContract.POSITIVE:
+                raise ValueError('physical provisioning belongs only to authored positive source coverage')
+            retained = record.get('retained_mtp_draft_capacity')
+            active = record.get('mtp_enabled')
+            if (type(retained) is not int or retained < 0 or type(active) is not bool
+                    or (active and retained == 0)):
+                raise ValueError('source metadata lacks its typed MTP activation/retained bound')
+            cap = record.get('gpu_memory_cap_mb')
+            if capacity and (type(cap) is not int or cap <= 0):
+                raise ValueError('capacity source metadata requires its positive authored GPU cap')
+            if not capacity and 'gpu_memory_cap_mb' in record:
+                raise ValueError('GPU cap metadata belongs only to the explicit capacity contract')
+            if capacity and record.get('capacity_boundary') not in ('fixed-head-table', 'routed-expert-residency'):
+                raise ValueError('capacity source metadata requires its exact authored boundary; rebuild discovery')
+            if not capacity and 'capacity_boundary' in record:
+                raise ValueError('invalid explicit source capacity boundary')
+            if record.get('id') != test['name'].split('/', 1)[1]:
+                raise ValueError('stale source parameter name/identity')
+            records[exact] = record
+    if not records:
+        raise ValueError('missing source-only GTest inventory')
+    return records
+
+
+def registrations(document: dict) -> dict:
+    """Require exact, reference-free CTest source contracts without reconstructing axes."""
+    result = {}
+    for test in document['tests']:
+        if not test['name'].startswith(PREFIX):
+            continue
+        command = test['command']
+        filters = [arg.removeprefix('--gtest_filter=') for arg in command if arg.startswith('--gtest_filter=')]
+        if len(filters) != 1 or not any('.' + method + '/' in filters[0] for method in METHODS):
+            continue
+        exact = filters[0]
+        props = {prop['name']: prop['value'] for prop in test['properties']}
+        labels = set(props.get('LABELS', []))
+        contract = source_contract(exact)
+        requirements = {
+            'GTEST_FILTER': exact not in result and not any(char in exact for char in '*?:\n\r'),
+            'LABELS': {'Admission', 'RealModel', 'FullModel'} <= labels and not labels & {
+                'PyTorch', 'GoldenReference', 'Parity', 'ProductionTestPreflight'},
+            'CONTRACT_LABELS': ('NegativeAdmission' in labels) == (contract != SourceAdmissionContract.POSITIVE)
+                and ('CapacityAdmission' in labels) == (contract == SourceAdmissionContract.CAPACITY_REJECTION)
+                and ('UnqualifiedCandidate' in labels) == ('.CandidateSourceAdmission/' in exact),
+            'DISABLED': not props.get('DISABLED'),
+            'WILL_FAIL': not props.get('WILL_FAIL'),
+            'FIXTURES_REQUIRED': props.get('FIXTURES_REQUIRED') == ['V2_Models'],
+            'RESOURCE_LOCK': props.get('RESOURCE_LOCK') == ['Integration_Serial'],
+            'RUN_SERIAL': props.get('RUN_SERIAL') is True,
+            'REQUIRED_FILES': bool(props.get('REQUIRED_FILES')),
+            'TIMEOUT': type(props.get('TIMEOUT')) in (int, float)
+                and math.isfinite(props['TIMEOUT']) and props['TIMEOUT'] > 0,
+        }
+        failed = [field for field, valid in requirements.items() if not valid]
+        if failed:
+            raise ValueError(f"invalid source-only CTest admission contract: {test['name']}: {', '.join(failed)}")
+        binaries = [arg for arg in command if Path(arg).name == 'v2_integration_parity_qwen4exp_production_matrix']
+        if len(binaries) != 1:
+            raise ValueError('ambiguous source executable')
+        world_options = [i for i, arg in enumerate(command) if arg in ('-np', '-n', '--np')]
+        if len(world_options) != 1 or world_options[0] + 1 >= len(command):
+            raise ValueError('source CTest has no exact MPI launch world')
+        world_text = command[world_options[0] + 1]
+        if not world_text.isdecimal() or int(world_text) <= 0:
+            raise ValueError('invalid source CTest MPI world')
+        result[exact] = {'test': test['name'], 'properties': props, 'binary': binaries[0],
+                         'mpi_ranks': int(world_text)}
+    if not result:
+        raise ValueError('empty QFN source CTest inventory')
+    return result
+
+
+def authenticate_membership(registered: dict, records: dict) -> None:
+    """Reject stale membership and a typed world different from its exact MPI launch."""
+    if set(records) != set(registered):
+        raise ValueError('stale or foreign CTest/GTest source membership')
+    if any(record['mpi_ranks'] != registered[exact]['mpi_ranks'] for exact, record in records.items()):
+        raise ValueError('typed source world disagrees with its CTest MPI launch')
+
+
+def validate_outcome(xml: Path, log: str) -> None:
+    """Reject CTest/GTest skips and incomplete execution even when process exit is zero."""
+    cases = ET.parse(xml).getroot().findall('.//testcase')
+    if (len(cases) != 1 or any(cases[0].find(key) is not None for key in ('failure', 'error', 'skipped'))
+            or re.search(r'\[\s*SKIPPED\s*\]', log)):
+        raise ValueError('source admission did not execute exactly one passing, non-skipped CTest')
+
+
+def source_artifact_directory(root: Path, identity: str, rank: int) -> Path:
+    """Resolve one original source leaf without accepting traversal or symlink aliases."""
+    if type(rank) is not int or rank < 0:
+        raise ValueError('invalid source artifact rank')
+    if (not isinstance(identity, str) or not identity or identity in ('.', '..')
+            or any(c in identity for c in '/\\:*?"<>|\x00')):
+        raise ValueError('invalid source artifact identity')
+    directory = root / 'source-admission' / artifact_identity_path(identity) / f'rank-{rank}'
+    current = root
+    for component in directory.relative_to(root).parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError('foreign symlink in source artifact identity')
+    if not directory.resolve().is_relative_to(root.resolve()):
+        raise ValueError('foreign source artifact directory')
+    return directory
+
+
+def observed_pipeline_bindings(root: Path, record: dict) -> dict[int, dict]:
+    """Authenticate all original active/inactive ranks and their single physical owner."""
+    request = observed_pipeline_request(record)
+    if request is None:
+        return {}
+    hardware_input = json.loads((root / 'observed-pipeline-hardware.json').read_text())
+    observed = source_hardware_devices(hardware_input)
+    if observed_pipeline_hardware_requirement(record, observed):
+        raise ValueError('pipeline binding has no complete original hardware prerequisite')
+    return validate_observed_pipeline_receipts(record,
+        lambda rank: source_artifact_directory(root, record['id'], rank),
+        'source_work_succeeded', observed=observed,
+        inactive_artifacts=('admission.csv', 'retirement.csv', 'admission_memory.txt', 'mtp-setup.csv', 'prefix-cache'))
+
+
+def validate_observed_pipeline_receipts(record: dict, directory_for_rank, outcome_field: str,
+                                        *, observed=None, inactive_artifacts=()) -> dict[int, dict]:
+    """Authenticate one identical original selection and terminal receipt for every discovery rank."""
+    request = observed_pipeline_request(record)
+    if request is None:
+        raise ValueError('pipeline receipts require the original observed topology request')
+    bindings = {}
+    common = None
+    active_ranks = []
+    for rank in range(record['mpi_ranks']):
+        directory = directory_for_rank(rank)
+        path = directory / 'observed-pipeline-binding.json'
+        if directory.is_symlink() or path.is_symlink():
+            raise ValueError('pipeline membership evidence must be owned by its original artifact directory')
+        binding = json.loads(path.read_text())
+        if (not isinstance(binding, dict) or binding.get('schema') != 1
+                or type(binding.get('schema')) is not int or binding.get('cell') != record['id']
+                or type(binding.get('discovery_rank')) is not int or binding['discovery_rank'] != rank
+                or type(binding.get('discovery_size')) is not int or binding['discovery_size'] != record['mpi_ranks']
+                or binding.get('terminal_join_completed') is not True
+                or type(binding.get(outcome_field)) is not bool
+                or type(binding.get('active')) is not bool
+                or binding.get('requested_native_isa') != request['native_isa']
+                or binding.get('stage_sizes') != request['stage_sizes']
+                or any(type(size) is not int for size in binding['stage_sizes'])):
+            raise ValueError('missing or foreign original pipeline membership receipt')
+        selected = binding.get('selected_discovery_ranks')
+        owner = binding.get('original_owner')
+        numa = binding.get('original_numa_node')
+        hostname = binding.get('original_hostname')
+        if (not isinstance(selected, list) or len(selected) != 1 or type(selected[0]) is not int
+                or not 0 <= selected[0] < record['mpi_ranks'] or type(owner) is not int or owner != selected[0]
+                or type(numa) is not int or numa < 0 or not isinstance(hostname, str) or not hostname
+                or binding['active'] != (rank == owner)
+                or ((type(binding.get('execution_rank')) is not int or binding['execution_rank'] != 0)
+                    if binding['active'] else binding.get('execution_rank') is not None)):
+            raise ValueError('pipeline selection substituted an original active/inactive rank')
+        participants = binding.get('participants')
+        if not isinstance(participants, list) or len(participants) != sum(request['stage_sizes']):
+            raise ValueError('pipeline binding has incomplete original participant geometry')
+        uuids = set(); addresses = set(); stages = [0] * len(request['stage_sizes'])
+        for participant in participants:
+            if not isinstance(participant, dict):
+                raise ValueError('invalid pipeline participant receipt')
+            stage = participant.get('stage'); address = identity(participant)
+            uuid = participant.get('uuid'); isa = participant.get('native_isa')
+            if (type(stage) is not int or not 0 <= stage < len(stages)
+                    or address[0] != request['backend'] or participant.get('numa_node') != numa
+                    or not isinstance(uuid, str) or not uuid or uuid in uuids or address in addresses
+                    or not isinstance(isa, str) or isa.partition(':')[0] != request['native_isa']
+                    or not isinstance(participant.get('pcie_upstream_bdfs'), list)
+                    or any(not isinstance(bdf, str) or not bdf for bdf in participant['pcie_upstream_bdfs'])):
+                raise ValueError('pipeline participant lost original UUID/ISA/NUMA/stage identity')
+            if observed is not None:
+                original = observed.get(address)
+                if (original is None or original.get('uuid') != uuid or original.get('native_isa') != isa
+                        or original.get('numa_node') != numa):
+                    raise ValueError('pipeline receipt substituted original native hardware observation')
+            uuids.add(uuid); addresses.add(address); stages[stage] += 1
+        if stages != request['stage_sizes']:
+            raise ValueError('pipeline binding changed authored stage cardinalities')
+        shared = {key: binding[key] for key in ('selected_discovery_ranks', 'original_owner', 'original_hostname',
+                  'original_numa_node', 'requested_native_isa', 'stage_sizes', 'participants', outcome_field)}
+        if common is not None and shared != common:
+            raise ValueError('original ranks disagree on observed pipeline binding')
+        common = shared
+        if binding['active']:
+            active_ranks.append(rank)
+        elif any((directory / name).exists() for name in inactive_artifacts):
+            raise ValueError('inactive original pipeline rank fabricated model admission')
+        bindings[rank] = binding
+    if len(active_ranks) != 1:
+        raise ValueError('pipeline binding omitted or duplicated its actual original owner')
+    return bindings
+
+
+def validate_runner_retirement(root: Path, record: dict) -> None:
+    """Validate per-runner/model/prefix cleanup, before global native teardown."""
+    bindings = observed_pipeline_bindings(root, record)
+    for rank in range(record['mpi_ranks']):
+        if bindings and not bindings[rank]['active']:
+            continue
+        directory = source_artifact_directory(root, record['id'], rank)
+        with (directory / 'retirement.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        if (len(rows) != 1 or rows[0].get('cell') != record['id']
+                or any(rows[0].get(key) != '1' for key in ('runner_retired', 'model_retired', 'prefix_removed'))
+                or (directory / 'prefix-cache').exists()):
+            raise ValueError('missing or incomplete source runner retirement')
+
+
+def validate_native_retirement(root: Path, record: dict) -> None:
+    """Require runner cleanup AND post-GPU-lifetime completion, independently of assertions.
+
+    The runner CSV precedes process lifetime teardown and cannot prove that
+    teardown returned. The canonical child publishes the separate terminal
+    receipt only after its actual GPUDeviceProcessLifetime destructor completes.
+    """
+    validate_runner_retirement(root, record)
+    invocation = json.loads((root / 'native-lifetime-invocation.json').read_text())
+    if not isinstance(invocation, dict):
+        raise ValueError('missing source native lifetime invocation object')
+    token = invocation.get('invocation')
+    if (invocation.get('schema') != 1 or type(invocation.get('schema')) is not int
+            or invocation.get('cell') != record['id']
+            or type(invocation.get('mpi_ranks')) is not int or invocation.get('mpi_ranks') != record['mpi_ranks']
+            or not isinstance(token, str) or re.fullmatch(r'[0-9a-f]{32}', token) is None):
+        raise ValueError('missing or foreign source native lifetime invocation')
+    for rank in range(record['mpi_ranks']):
+        with (root / 'native-process-retirement' / f'rank-{rank}.csv').open() as stream:
+            terminal = list(csv.DictReader(stream))
+        if (len(terminal) != 1 or terminal[0].get('schema') != '1'
+                or terminal[0].get('invocation') != token or terminal[0].get('rank') != str(rank)
+                or terminal[0].get('native_lifetime_retired') != '1'
+                or terminal[0].get('test_result') not in ('0', '1')
+                or not isinstance(terminal[0].get('pid'), str)
+                or not terminal[0]['pid'].isdecimal() or int(terminal[0]['pid']) <= 0):
+            raise ValueError('missing or incomplete source process native lifetime retirement')
+
+
+def validate_cpu_joint_rank_evidence(root: Path, record: dict) -> None:
+    """Consume the original bound-rank socket facts, never available-node counts."""
+    if 'cpu_expert_socket_membership' not in record:
+        return
+    members = record['cpu_expert_socket_membership']; world = record['mpi_ranks']
+    if not isinstance(members, list) or len(members) != world or not 2 <= world <= 8:
+        raise ValueError('incomplete original CPU-joint socket requirement')
+    expected = {}
+    for member in members:
+        rank = member.get('rank') if isinstance(member, dict) else None
+        if (type(rank) is not int or not 0 <= rank < world or rank in expected
+                or identity(member)[0] != 'cpu'):
+            raise ValueError('invalid original CPU-joint rank requirement')
+        expected[rank] = member['numa_node']
+    if len(set(expected.values())) != world:
+        raise ValueError('aliased original CPU-joint NUMA requirement')
+    nodes = set(); sockets = set()
+    for rank in range(world):
+        path = source_artifact_directory(root, record['id'], rank) / 'cpu-joint-socket-membership.csv'
+        if path.is_symlink():
+            raise ValueError('foreign symlink in original CPU-joint rank evidence')
+        with path.open() as stream:
+            rows = list(csv.DictReader(stream))
+        if len(rows) != 1 or rows[0].get('cell') != record['id']:
+            raise ValueError('missing original CPU-joint bound-rank evidence')
+        row = rows[0]
+        try:
+            values = {key: int(row[key]) for key in ('rank', 'original_node_id', 'numa_node', 'socket_id', 'worker_threads')}
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('malformed original CPU-joint socket evidence') from error
+        if (any(str(value) != row[key] for key, value in values.items())
+                or values['rank'] != rank or values['numa_node'] != expected[rank]
+                or min(values['original_node_id'], values['socket_id']) < 0 or values['worker_threads'] <= 0
+                or values['socket_id'] in sockets):
+            raise ValueError('foreign or aliased original CPU-joint bound-rank evidence')
+        nodes.add(values['original_node_id']); sockets.add(values['socket_id'])
+    if len(nodes) != 1:
+        raise ValueError('CPU-joint socket IDs cannot cross original physical-node namespaces')
+
+
+def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionContract) -> None:
+    """Require actual native retirement plus the exact source contract evidence."""
+    if not isinstance(contract, SourceAdmissionContract):
+        raise ValueError('source retirement requires an explicit typed contract')
+    validate_native_retirement(root, record)
+    if contract == SourceAdmissionContract.POSITIVE:
+        validate_cpu_joint_rank_evidence(root, record)
+    bindings = observed_pipeline_bindings(root, record)
+    if bindings and (contract != SourceAdmissionContract.POSITIVE or
+                     not all(binding['source_work_succeeded'] for binding in bindings.values())):
+        raise ValueError('observed pipeline requires completed positive original-source admission')
+    for rank in range(record['mpi_ranks']):
+        if bindings and not bindings[rank]['active']:
+            continue
+        directory = source_artifact_directory(root, record['id'], rank)
+        receipt = directory / {
+            SourceAdmissionContract.POSITIVE: 'admission.csv',
+            SourceAdmissionContract.UNSUPPORTED_REJECTION: 'rejection.csv',
+            SourceAdmissionContract.CAPACITY_REJECTION: 'capacity-rejection.csv',
+        }[contract]
+        with receipt.open() as stream:
+            rows = list(csv.DictReader(stream))
+        if len(rows) != 1 or rows[0].get('cell') != record['id']:
+            raise ValueError('missing source admission evidence')
+        if contract == SourceAdmissionContract.UNSUPPORTED_REJECTION:
+            if (rows[0].get('expected_rejection') != '1' or rows[0].get('initialized') != '0'
+                    or rows[0].get('numerical_inference_executed') != '0'
+                    or (directory / 'admission.csv').exists() or (directory / 'capacity-rejection.csv').exists()):
+                raise ValueError('missing explicit native rejection evidence')
+        elif contract == SourceAdmissionContract.CAPACITY_REJECTION:
+            cap = record.get('gpu_memory_cap_mb')
+            if (type(cap) is not int or cap <= 0 or rows[0].get('gpu_memory_cap_mb') != str(cap)
+                    or rows[0].get('initialized') != '0' or rows[0].get('capacity_rejected') != '1'
+                    or rows[0].get('numerical_inference_executed') != '0'
+                    or record.get('capacity_boundary') not in ('fixed-head-table', 'routed-expert-residency')
+                    or rows[0].get('capacity_boundary') != record['capacity_boundary']
+                    or (directory / 'admission.csv').exists() or (directory / 'rejection.csv').exists()
+                    or not (directory / 'capacity-diagnostic.txt').is_file()
+                    or not (directory / 'capacity-diagnostic.txt').read_text().strip()):
+                raise ValueError('missing explicit authored-capacity rejection evidence')
+        else:
+            if (rows[0].get('initialized') != '1' or rows[0].get('layers') != '48'
+                    or rows[0].get('snapshots_enabled') != '0'
+                    or rows[0].get('numerical_inference_executed') != '0'
+                    or (directory / 'rejection.csv').exists() or (directory / 'capacity-rejection.csv').exists()
+                    or not (directory / 'admission_memory.txt').is_file()
+                    or not (directory / 'admission_memory.txt').read_text().strip()):
+                raise ValueError('source admission receipt changed its setup-only contract')
+            with (directory / 'mtp-setup.csv').open() as stream:
+                mtp_rows = list(csv.DictReader(stream))
+            retained = record.get('retained_mtp_draft_capacity')
+            active = record.get('mtp_enabled')
+            if (len(mtp_rows) != 1 or mtp_rows[0].get('cell') != record['id']
+                    or type(retained) is not int or retained < 0 or type(active) is not bool
+                    or mtp_rows[0].get('retained_depth') != str(retained)
+                    or mtp_rows[0].get('active') != str(int(active))
+                    or mtp_rows[0].get('controller_execution_proved') != '0'):
+                raise ValueError('missing setup-only MTP observation')
+
+
+def cleanup_prefixes(root: Path) -> None:
+    """Retire only disposable caches within this invocation's private evidence root."""
+    owned = root / 'source-admission'
+    if owned.is_symlink():
+        raise ValueError('foreign symlink in source prefix cleanup')
+    if not owned.exists():
+        return
+    # Walk without following links, rejecting every symlink before selecting
+    # only original rank-owned disposable cache leaves. Evidence neighbors stay.
+    for directory, dirs, files in os.walk(owned, followlinks=False):
+        parent = Path(directory)
+        for name in files:
+            if (parent / name).is_symlink():
+                raise ValueError('foreign symlink in source prefix cleanup')
+        for name in list(dirs):
+            path = parent / name
+            if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+                raise ValueError('foreign symlink in source prefix cleanup')
+            if name == 'prefix-cache' and re.fullmatch(r'rank-[0-9]+', parent.name):
+                identity = parent.parent.relative_to(owned)
+                parts = identity.parts
+                if parts and parts[0] == 'long-identities':
+                    if len(parts) < 3 or parts[-1] != 'artifacts' or any(
+                            not chunk.startswith('c') or not chunk[1:] or len(os.fsencode(chunk[1:])) > 240
+                            for chunk in parts[1:-1]):
+                        raise ValueError('malformed source artifact identity in cleanup')
+                    logical = ''.join(chunk[1:] for chunk in parts[1:-1])
+                elif len(parts) == 1:
+                    logical = parts[0]
+                else:
+                    raise ValueError('malformed source artifact identity in cleanup')
+                if Path(artifact_identity_path(logical)) != identity:
+                    raise ValueError('noncanonical source artifact identity in cleanup')
+                shutil.rmtree(path)
+                dirs.remove(name)
+
+
+
+class SourceCaseFailure(RuntimeError):
+    """One executed selected contract failed; gather subsequent ordinary cases."""
+    def __init__(self, message: str, *, retirement_proved: bool = False, runner_retirement_proved: bool = False):
+        super().__init__(message)
+        self.retirement_proved = retirement_proved
+        self.runner_retirement_proved = runner_retirement_proved or retirement_proved
+
+
+
+def run_case(entry: dict, record: dict, output: Path, build: Path, environment: dict,
+             artifact: Path, index: int, exact: str) -> bool:
+    """Execute one registered contract; launch errors remain terminal infrastructure failures."""
+    xml = output / f'cell-{index:04d}.xml'
+    log_path = output / f'cell-{index:04d}.log'
+    if observed_pipeline_request(record) is not None:
+        hardware_input = json.loads((output / 'hardware.json').read_text())
+        if observed_pipeline_hardware_requirement(record, source_hardware_devices(hardware_input)):
+            raise ValueError('observed pipeline lost its original hardware admission before launch')
+        write_json(artifact / 'observed-pipeline-hardware.json', hardware_input)
+    invocation = secrets.token_hex(16)
+    write_json(artifact / 'native-lifetime-invocation.json', {'schema': 1,
+        'invocation': invocation, 'cell': record['id'], 'mpi_ranks': record['mpi_ranks']})
+    terminal_root = artifact / 'native-process-retirement'
+    terminal_root.mkdir()  # A fresh per-invocation root rejects stale terminal evidence.
+    with log_path.open('w') as log:
+        result = subprocess.run(['ctest', '--test-dir', str(build), '--output-on-failure',
+            '--no-tests=error', '--fixture-exclude-any', '.*', '--output-junit', str(xml),
+            '-R', '^' + re.escape(entry['test']) + '$'],
+            env={**environment, 'LLAMINAR_SKIP_MODEL_DOWNLOAD': '1',
+                 'LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT': str(artifact),
+                 'LLAMINAR_SOURCE_ADMISSION_PROCESS_RECEIPT_ROOT': str(terminal_root),
+                 'LLAMINAR_SOURCE_ADMISSION_PROCESS_INVOCATION': invocation},
+            stdout=log, stderr=subprocess.STDOUT)
+    try:
+        cases = ET.parse(xml).getroot().findall('.//testcase')
+    except (FileNotFoundError, ET.ParseError) as error:
+        raise RuntimeError('incomplete CTest execution envelope') from error
+    if len(cases) != 1:
+        raise RuntimeError('incomplete CTest execution envelope')
+    if any(re.search(r'timeout|timed out', failure.get('message', ''), re.I)
+           for failure in cases[0].findall('failure')):
+        raise RuntimeError('source CTest timeout is a terminal infrastructure failure')
+    runner_retired = False
+    try:
+        validate_runner_retirement(artifact, record)
+        runner_retired = True
+    except (ValueError, FileNotFoundError):
+        pass
+    retired = False
+    try:
+        validate_native_retirement(artifact, record)
+        retired = True
+    except (ValueError, FileNotFoundError, json.JSONDecodeError):
+        pass  # Unknown native retirement is recorded, never promoted to proof.
+    try:
+        if result.returncode:
+            raise ValueError(f'source CTest failed ({result.returncode}): {exact}')
+        validate_outcome(xml, log_path.read_text())
+        validate_retirement(artifact, record, contract=source_contract(exact))
+    except (ValueError, FileNotFoundError, ET.ParseError) as error:
+        raise SourceCaseFailure(str(error), retirement_proved=retired, runner_retirement_proved=runner_retired) from error
+    return retired
+
+
+def refresh_counts(report: dict) -> None:
+    """Keep attempted/red/unexecuted counts truthful on partial and complete reports."""
+    report['passed_cells'] = sum(row['passed'] for row in report['results'].values())
+    report['failed_cells'] = sum(not row['passed'] for row in report['results'].values())
+    report['unexecuted_selected'] = report.get('selected', 0) - report.get('attempted', 0)
+    report['all_resources_retired'] = bool(report['results']) and all(
+        row.get('retirement_proved') is True for row in report['results'].values())
+
+
+def gather_selected(selected: list, records: dict, registered: dict, output: Path,
+                    build: Path, environment: dict, report: dict) -> None:
+    """Record all ordinary selected failures, preserving exact ownership and cleanup."""
+    for index, exact in enumerate(selected):
+        for filename, previous in report.get('source_files', {}).items():
+            stat = Path(filename).stat()
+            if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != tuple(previous):
+                raise ValueError('canonical source file changed before next cell')
+        report['attempted'] = index + 1
+        print(f'[qfn-source-admission] {index + 1}/{len(selected)} {exact}', flush=True)
+        artifact = output / f'evidence-{index:04d}'
+        artifact.mkdir()
+        outcome = {'passed': False, 'retirement_proved': False, 'runner_retirement_proved': False, 'qualification': 'failed-source-contract', 'evidence': artifact.name,
+                   'contract': source_contract(exact).value}
+        try:
+            retired = run_case(registered[exact], records[exact], output, build, environment, artifact, index, exact)
+            outcome.update(passed=True, retirement_proved=retired, runner_retirement_proved=True, qualification='native-source-admission')
+        except SourceCaseFailure as error:
+            outcome.update(error=str(error), retirement_proved=error.retirement_proved,
+                           runner_retirement_proved=error.runner_retirement_proved)
+        finally:
+            report['results'][exact] = outcome
+            # Cleanup failures are infrastructure failures: retain the report,
+            # but never start another cell with unretired disposable storage.
+            try:
+                cleanup_prefixes(artifact)
+            except Exception as error:
+                outcome.update(passed=False, qualification='infrastructure-failure',
+                               error='prefix cleanup: ' + str(error))
+                raise
+            finally:
+                refresh_counts(report)
+                write_json(output / 'source-admission.json', report)
+
+
+def main(argv=None) -> int:
+    """Discover, select and execute the immutable installed source-only transaction."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--build-dir', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--exact-cell', action='append', metavar='GTEST_CASE',
+                        help='diagnostic only: one exact eligible source GTest ID; never a full-gate receipt')
+    args = parser.parse_args(argv)
+    if len(args.exact_cell or []) > 1:
+        parser.error('--exact-cell accepts exactly one source GTest identifier')
+    exact_cell = args.exact_cell[0] if args.exact_cell else None
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': False, 'passed': False, 'results': {}, 'all_resources_retired': False}
+    if exact_cell is not None:
+        report.update(schema=SOURCE_ADMISSION_DIAGNOSTIC_SCHEMA,
+                      scope='diagnostic-exact-cell', full_selected_gate=False,
+                      certification_eligible=False, requested_exact_cell=exact_cell)
+    report_path = args.output / 'source-admission.json'
+    write_json(report_path, report)
+    try:
+        listing = json.loads(subprocess.check_output(['ctest', '--test-dir', str(args.build_dir),
+                             '--show-only=json-v1'], text=True))
+        registered = registrations(listing)
+        binaries = {row['binary'] for row in registered.values()}
+        if len(binaries) != 1:
+            raise ValueError('source inventory belongs to more than one executable')
+        binary = binaries.pop()
+        environment = {**os.environ, 'HWLOC_COMPONENTS': '-gl,-opencl'}
+        with tempfile.TemporaryDirectory(prefix='qfn-source-metadata-') as temporary:
+            parameters = Path(temporary) / 'parameters.json'
+            subprocess.run([binary, '--gtest_list_tests', f'--gtest_output=json:{parameters}'],
+                           env={**environment, 'LLAMINAR_FORCE_CPU_ONLY_STARTUP': '1'},
+                           check=True, capture_output=True, timeout=30)
+            records = source_parameters(json.loads(parameters.read_text()))
+        authenticate_membership(registered, records)
+        hardware = args.output / 'hardware.json'
+        subprocess.run([binary, f'--qfn-source-hardware-inventory={hardware}'],
+                       env={**environment, 'LLAMINAR_FORCE_CPU_ONLY_STARTUP': '0',
+                            'LLAMINAR_SKIP_CUDA_STARTUP': '0', 'LLAMINAR_SKIP_ROCM_STARTUP': '0'},
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        eligible, unavailable = select(records, json.loads(hardware.read_text()))
+        selected = exact_cell_selection(exact_cell, records, eligible, unavailable)
+        if exact_cell is not None:
+            report.update(eligible_cases=eligible,
+                          omitted_eligible_cases=[case for case in eligible if case != exact_cell])
+            print('[qfn-source-admission] diagnostic exact-cell selection; '
+                  'full_selected_gate=false certification_eligible=false', flush=True)
+        print(f'[qfn-source-admission] discovered={len(records)} selected={len(selected)} '
+              f'hardware_ineligible_unqualified={len(unavailable)}', flush=True)
+        report.update(discovered=len(records), selected=len(selected), hardware_ineligible=len(unavailable),
+                      unqualified=unavailable, inventory_digest=digest({'ctest': registered, 'typed': records}),
+                      hardware_digest=digest(json.loads(hardware.read_text())), selected_cases=selected)
+        write_json(args.output / 'inventory.json', {'registered': registered, 'typed': records, 'hardware_ineligible': unavailable})
+        # No optional fetch can turn an absent required source into a skipped pass.
+        source_stats = {}
+        for exact in selected:
+            for filename in registered[exact]['properties']['REQUIRED_FILES']:
+                path = Path(filename)
+                if not path.is_absolute() or path.suffix.lower() != '.gguf' or not path.is_file():
+                    raise ValueError(f'missing canonical source GGUF: {filename}')
+                stat = path.stat()
+                source_stats[filename] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        report['source_files'] = source_stats
+        write_json(report_path, report)
+        gather_selected(selected, records, registered, args.output, args.build_dir, environment, report)
+        for filename, previous in source_stats.items():
+            stat = Path(filename).stat()
+            if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != previous:
+                raise ValueError('canonical source file changed during admission')
+        report.update(complete=True, passed=all(row['passed'] for row in report['results'].values()))
+    except Exception as error:
+        report['error'] = str(error)
+        raise
+    finally:
+        refresh_counts(report)
+        write_json(report_path, report)
+    return 0 if report['passed'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

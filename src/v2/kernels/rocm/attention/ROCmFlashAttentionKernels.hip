@@ -1,11 +1,12 @@
 /**
  * @file ROCmFlashAttentionKernels.hip
- * @brief HIP device kernels for Flash Attention 2 and Flash Decoding on MI50
+ * @brief Ordered-wave HIP device kernels for Flash Attention 2 and Flash Decoding.
  *
  * This file contains the HIP device kernels and extern "C" wrapper functions
  * called from the C++ implementation file.
  *
- * Target Architecture: AMD MI50 (gfx906 / Vega 20)
+ * Physical launch tiles bind the admitted participant's LDS limit before
+ * capture. Existing compiled tile sets and ordered arithmetic remain unchanged.
  *
  * Algorithms implemented:
  * - Flash Attention 2: Tiled attention with online softmax
@@ -34,8 +35,11 @@
  *   5. Explicit prefetching via buffer load instructions
  *
  * @author David Sanftenberg
+ * Physical device limits are immutable inventory facts, without an ordinal cap
+ * or a lazy MI50-only cache; compiled wave/reduction contracts remain separate.
  */
 
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -61,12 +65,6 @@ namespace
 
     // Wavefront size on GCN/CDNA architectures
     constexpr int WAVEFRONT_SIZE = 64;
-
-    // LDS (Local Data Share) size per CU on MI50
-    constexpr int LDS_SIZE_BYTES = 65536; // 64KB
-
-    // Maximum VGPRs per wavefront (for occupancy tuning)
-    constexpr int MAX_VGPRS_PER_WAVEFRONT = 256;
 
     /// Maximum compact verifier rows represented by DEVICE_PARAMS.
     constexpr int MAX_DYNAMIC_ATTENTION_PARAM_ROWS =
@@ -492,46 +490,6 @@ namespace
     // =========================================================================
     // Device Property Caching
     // =========================================================================
-
-    struct MI50DeviceConfig
-    {
-        int gcn_arch = 0;      // e.g., 906 for gfx906
-        int max_lds = 0;       // Max LDS per block
-        int max_vgprs = 0;     // Max VGPRs per wavefront
-        int num_cus = 60;      // Number of compute units
-        bool initialized = false;
-    };
-
-    // Per-device cached config
-    static MI50DeviceConfig g_device_config[8]; // Support up to 8 GPUs
-
-    /**
-     * @brief Get cached device configuration (lazy init)
-     */
-    inline MI50DeviceConfig &getDeviceConfig(int device)
-    {
-        if (device < 0 || device >= 8)
-            device = 0;
-        MI50DeviceConfig &cfg = g_device_config[device];
-
-        if (!cfg.initialized)
-        {
-            hipDeviceProp_t prop;
-            (void)hipGetDeviceProperties(&prop, device);
-
-            // Parse gcnArchName string (e.g., "gfx906") to extract arch number
-            // gcnArchName format: "gfx" + arch_number
-            cfg.gcn_arch = 0;
-            if (strncmp(prop.gcnArchName, "gfx", 3) == 0) {
-                cfg.gcn_arch = atoi(prop.gcnArchName + 3);
-            }
-            cfg.max_lds = static_cast<int>(prop.sharedMemPerBlock);
-            cfg.max_vgprs = MAX_VGPRS_PER_WAVEFRONT; // Could query via rocm-smi
-            cfg.num_cus = prop.multiProcessorCount;
-            cfg.initialized = true;
-        }
-        return cfg;
-    }
 
     // =========================================================================
     // HIP-specific Intrinsics and Helpers
@@ -3085,8 +3043,17 @@ static int launch_device_resident_prefill(
               .visibility = causal && window_size <= 0 && !mask
                   ? policy::ROCmFA2VisibilityPolicy::CausalFullContext
                   : policy::ROCmFA2VisibilityPolicy::General});
-    const auto tile_plan = policy::selectROCmFA2Tile(
-        head_dim, LDS_SIZE_BYTES, 0, schedule, score_storage);
+    // The current-device query authenticates the existing launch context only;
+    // immutable physical limits were admitted explicitly before graph recording.
+    // Use the same hardware binding as planning, including the guarded direct
+    // leg's own schedule, rather than silently assuming an MI50 LDS capacity.
+    const auto &hardware = llaminar2::requireROCmCurrentHardware(
+        [](int *ordinal) { return hipGetDevice(ordinal); },
+        [](int ordinal) -> const llaminar2::ROCmDeviceHardware & {
+            return llaminar2::rocmHardwareMetadata().at(ordinal);
+        });
+    const auto tile_plan = policy::selectROCmFA2TileForHardware(
+        hardware, head_dim, 0, schedule, score_storage);
     if (!tile_plan.valid)
     {
         printf("[launch_device_resident_prefill] No LDS tile fits head_dim=%d\n", head_dim);
@@ -3380,9 +3347,15 @@ static int launch_decode(
     const float softmax_scale =
         1.0f / sqrtf(static_cast<float>(head_dim));
 
-    int current_device = 0;
-    (void)hipGetDevice(&current_device);
-    const int num_cus = getDeviceConfig(current_device).num_cus;
+    // Host launch bridges run while recording/setup, never during native graph
+    // replay. Preserve the explicit current-device boundary; metadata lookup
+    // itself performs no runtime query or kernel-resource cache refresh.
+    const auto &hardware = llaminar2::requireROCmCurrentHardware(
+        [](int *ordinal) { return hipGetDevice(ordinal); },
+        [](int ordinal) -> const llaminar2::ROCmDeviceHardware & {
+            return llaminar2::rocmHardwareMetadata().at(ordinal);
+        });
+    const int num_cus = hardware.compute_units;
     const auto &rocm_env = llaminar2::debugEnv().rocm;
     const bool forced_splits_present =
         rocm_env.fa_decode_num_splits_present &&
@@ -3528,9 +3501,15 @@ static int launch_grouped_decode(
     const int forced_tpb =
         forced_tpb_present ? *rocm_env.fa_decode_tpb : 0;
 
-    int current_device = 0;
-    (void)hipGetDevice(&current_device);
-    const int num_cus = getDeviceConfig(current_device).num_cus;
+    // Host launch bridges run while recording/setup, never during native graph
+    // replay. Preserve the explicit current-device boundary; metadata lookup
+    // itself performs no runtime query or kernel-resource cache refresh.
+    const auto &hardware = llaminar2::requireROCmCurrentHardware(
+        [](int *ordinal) { return hipGetDevice(ordinal); },
+        [](int ordinal) -> const llaminar2::ROCmDeviceHardware & {
+            return llaminar2::rocmHardwareMetadata().at(ordinal);
+        });
+    const int num_cus = hardware.compute_units;
     const float softmax_scale =
         1.0f / sqrtf(static_cast<float>(head_dim));
     const size_t smem_size =

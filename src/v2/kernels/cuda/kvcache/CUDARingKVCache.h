@@ -67,6 +67,7 @@ namespace llaminar2
     class ICUDARingKVCache : public CUDARingKVCacheBase
     {
     public:
+
         virtual ~ICUDARingKVCache();
 
         // =====================================================================
@@ -336,6 +337,10 @@ namespace llaminar2
     class CUDARingKVCache : public ICUDARingKVCache, public IWorkspaceConsumer
     {
     public:
+        /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+        qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream) override;
         using DataT = typename detail::CUDAKVCacheType<Precision>::Type;
         using EntryT = CUDARingKVEntry<Precision>;
 

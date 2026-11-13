@@ -12,6 +12,8 @@
 #include "loaders/WeightLifecycleTrace.h"
 #include "loaders/WeightMetadataRegistry.h"
 #include "loaders/WeightManager.h"
+#include "loaders/PreparedWeightStore.h"
+#include "../../utils/CPUWeightPlanTestAdmission.h"
 #include "../../mocks/MockModelLoader.h"
 #include "config/TensorParallelConfig.h"
 #include "tensors/Tensors.h"
@@ -221,10 +223,20 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
 
     WeightManager manager(*loader);
 
+    InferenceStrategy strategy;strategy.model_id=ModelContextId{76};strategy.devices={DeviceId::cpu()};
+    WeightPlan sources(strategy);
+    WeightRequirement original;original.canonical_name="blk.0.attn_norm.weight";original.target_device=DeviceId::cpu();
+    sources.add(original);
+    ASSERT_TRUE(manager.preparedWeightStore()->bindModelIdIfUnset(strategy.model_id));
+    admitCPUWeightPlansForTest(manager,*loader,{&sources});
     auto first = manager.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cpu());
     ASSERT_NE(first, nullptr);
 
-    auto clone = manager.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cuda(0));
+    // GPU preparation has an independent original source, not an alias of
+    // the committed CPU execution root. Clone lineage names that actual source.
+    auto gpu_source=manager.getWeightForDevice("blk.0.attn_norm.weight",DeviceId::cuda(0));
+    ASSERT_NE(gpu_source,nullptr);
+    auto clone = manager.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cuda(1));
     ASSERT_NE(clone, nullptr);
     ASSERT_NE(clone.get(), first.get());
 
@@ -232,6 +244,9 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
     ASSERT_NE(registry, nullptr);
 
     auto source_meta = registry->metadata(first.get());
+    auto gpu_source_meta=registry->metadata(gpu_source.get());
+    ASSERT_TRUE(gpu_source_meta);
+    EXPECT_EQ(gpu_source_meta->identity.derivation,WeightDerivationKind::Source);
     auto clone_meta = registry->metadata(clone.get());
     ASSERT_TRUE(source_meta.has_value());
     ASSERT_TRUE(clone_meta.has_value());
@@ -240,8 +255,8 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
     EXPECT_EQ(source_meta->identity.derivation, WeightDerivationKind::Source);
     EXPECT_EQ(clone_meta->identity.derivation, WeightDerivationKind::DeviceClone);
     ASSERT_TRUE(clone_meta->identity.source_instance_id.has_value());
-    EXPECT_EQ(*clone_meta->identity.source_instance_id, source_meta->identity.instance_id);
-    EXPECT_EQ(clone_meta->residency.home_device, DeviceId::cuda(0));
+    EXPECT_EQ(*clone_meta->identity.source_instance_id, gpu_source_meta->identity.instance_id);
+    EXPECT_EQ(clone_meta->residency.home_device, DeviceId::cuda(1));
 }
 
 TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
@@ -251,24 +266,6 @@ TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
                       .build();
 
     WeightManager manager(*loader);
-    auto embedding = manager.getWeightForDevice("token_embd.weight", DeviceId::cpu());
-    ASSERT_NE(embedding, nullptr);
-
-    /*
-     * Simulate stale metadata for a reused TensorBase address.  Materialization
-     * may use metadata for slice and residency details, but the WeightPlan is
-     * the first-class owner of graph binding identity at runner construction.
-     */
-    auto stale_identity = makeSourceWeightIdentity(
-        "blk.31.ffn_down.weight",
-        ModelContextId{99},
-        123);
-    ASSERT_TRUE(manager.weightMetadataRegistry()->registerWeight(
-        embedding.get(),
-        stale_identity,
-        {},
-        WeightResidency{DeviceId::cpu(), DeviceId::cpu()}));
-
     InferenceStrategy strategy;
     strategy.model_id = ModelContextId{77};
     strategy.devices = {DeviceId::cpu()};
@@ -282,6 +279,26 @@ TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
 
     WeightPlan plan(strategy);
     plan.add(requirement);
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
+    const auto initial=manager.materialize(plan);
+    auto embedding=initial.global("token_embd.weight").tensor;
+    ASSERT_NE(embedding,nullptr);
+
+    /*
+     * Simulate stale metadata for a reused TensorBase address.  Materialization
+     * may use metadata for slice and residency details, but the WeightPlan is
+     * the first-class owner of graph binding identity at runner construction.
+     */
+    auto stale_identity = makeSourceWeightIdentity(
+        "blk.31.ffn_down.weight",
+        ModelContextId{99},
+        123);
+    ASSERT_TRUE(manager.weightMetadataRegistry()->registerWeight(
+        embedding,
+        stale_identity,
+        {},
+        WeightResidency{DeviceId::cpu(), DeviceId::cpu()}));
+
 
     auto frozen = manager.materialize(plan);
     ASSERT_NO_THROW((void)frozen.global("token_embd.weight"));
@@ -374,4 +391,57 @@ TEST(Test__WeightManagerMetadata, RegistersTiedEmbeddingAliasMetadata)
     EXPECT_EQ(meta->identity.role, WeightRole::LMHead);
     EXPECT_EQ(meta->slice.row_start, 64u);
     EXPECT_EQ(meta->slice.row_count, 64u);
+}
+
+/** @test HC/PLE/QSA operators have exact immutable or projection roles, including MTP. */
+TEST(Test__WeightIdentity, FlashNextOperatorsRetainExactSemanticRoles)
+{
+    const std::vector<std::pair<std::string, WeightRole>> expected{
+        {"per_layer_token_embd.weight", WeightRole::ImmutableRowTable},
+        {"blk.1.hc_attn_down.weight", WeightRole::HyperConnectionProjection},
+        {"blk.1.hc_attn_up.weight", WeightRole::HyperConnectionProjection},
+        {"blk.1.hc_attn_inject.weight", WeightRole::HyperConnectionProjection},
+        {"blk.1.hc_ffn_norm.weight", WeightRole::HyperConnectionNorm},
+        {"output_hc_down.weight", WeightRole::HyperConnectionProjection},
+        {"output_hc_up.weight", WeightRole::HyperConnectionProjection},
+        {"output_hc_norm.weight", WeightRole::HyperConnectionNorm},
+        {"blk.3.indexer.q_proj.weight", WeightRole::SparseIndexerProjection},
+        {"blk.3.indexer.k_proj.weight", WeightRole::SparseIndexerProjection},
+        {"blk.3.indexer.q_norm.weight", WeightRole::SparseIndexerNorm},
+        {"blk.3.indexer.k_norm.weight", WeightRole::SparseIndexerNorm},
+        {"blk.1.ple_key.weight", WeightRole::PerLayerEmbeddingProjection},
+        {"blk.1.ple_value.weight", WeightRole::PerLayerEmbeddingProjection},
+        {"blk.1.ple_norm_key.weight", WeightRole::PerLayerEmbeddingNorm},
+        {"blk.1.ple_norm_query.weight", WeightRole::PerLayerEmbeddingNorm},
+        {"blk.1.ple_norm_conv.weight", WeightRole::PerLayerEmbeddingNorm},
+        {"blk.1.ple_conv1d.weight", WeightRole::PerLayerEmbeddingConvolution},
+        {"blk.48.nextn.eh_proj.weight", WeightRole::PredictorProjection},
+        {"blk.48.nextn.hc_head_down.weight", WeightRole::HyperConnectionProjection},
+        {"blk.48.nextn.hc_head_up.weight", WeightRole::HyperConnectionProjection},
+        {"blk.48.nextn.hc_head_norm.weight", WeightRole::HyperConnectionNorm},
+        {"blk.48.nextn.hnorm.weight", WeightRole::HyperConnectionNorm}};
+    for (const auto &[name, role] : expected)
+    {
+        SCOPED_TRACE(name);
+        EXPECT_EQ(inferWeightRole(name), role);
+        EXPECT_NE(toString(role), "Unknown");
+        EXPECT_FALSE(isRoutedExpertRole(role));
+    }
+    EXPECT_FALSE(isFlashNextProjectionRole(WeightRole::ImmutableRowTable));
+    EXPECT_FALSE(isImmutableFP32WeightRole(WeightRole::ImmutableRowTable));
+}
+
+/** @test An immutable ngram row table can only be opened through its typed store authority. */
+TEST(Test__WeightManagerMetadata, FlashNextRowTableRejectsOrdinaryMaterialization)
+{
+    auto loader = MockModelLoaderBuilder().build();
+    WeightManager manager(*loader);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        EXPECT_THROW(manager.getWeightForDevice("per_layer_token_embd.weight", device), std::invalid_argument);
+    EXPECT_FALSE(manager.isGemmWeight("per_layer_token_embd.weight"));
+    EXPECT_FALSE(manager.isGemmWeight("blk.1.ple_conv1d.weight"));
+    EXPECT_FALSE(manager.isGemmWeight("blk.1.hc_attn_norm.weight"));
+    EXPECT_TRUE(manager.isGemmWeight("blk.1.ple_key.weight"));
+    EXPECT_TRUE(manager.isGemmWeight("blk.3.indexer.q_proj.weight"));
+    EXPECT_TRUE(manager.isGemmWeight("blk.48.nextn.eh_proj.weight"));
 }

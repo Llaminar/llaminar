@@ -14,11 +14,12 @@
 #include <cuda_runtime.h>
 
 #include "backends/cuda/CUDAGraphCapture.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "transfer/TransferEngine.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -38,8 +39,8 @@
 
 extern "C" bool cudaQuantGemm_quantizeActivationsBlockwise(
     const float *, int8_t *, float *, int, int, int, void *);
-extern "C" void cudaNativeVNNIGemvSweep_setGroupedRows(int);
-extern "C" void cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(int);
+extern "C" void cudaNativeQuantisedGemvSweep_setGroupedRows(int);
+extern "C" void cudaNativeQuantisedGroupedVerifier_setTensorCoreOverride(int);
 
 using namespace llaminar2;
 using namespace llaminar2::cuda;
@@ -67,10 +68,10 @@ public:
     /** @brief Select only row reuse; the serial arithmetic policy stays intact. */
     explicit ScopedVerifierRowCandidate(int rows)
     {
-        cudaNativeVNNIGemvSweep_setGroupedRows(rows);
+        cudaNativeQuantisedGemvSweep_setGroupedRows(rows);
     }
     /** @brief Retire the diagnostic selector before another graph is recorded. */
-    ~ScopedVerifierRowCandidate() { cudaNativeVNNIGemvSweep_setGroupedRows(0); }
+    ~ScopedVerifierRowCandidate() { cudaNativeQuantisedGemvSweep_setGroupedRows(0); }
     ScopedVerifierRowCandidate(const ScopedVerifierRowCandidate &) = delete;
     ScopedVerifierRowCandidate &operator=(const ScopedVerifierRowCandidate &) = delete;
 };
@@ -82,12 +83,12 @@ public:
     /** @brief Select tensor cores without changing the inherited M1 arithmetic. */
     ScopedVerifierTensorCoreCandidate()
     {
-        cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(1);
+        cudaNativeQuantisedGroupedVerifier_setTensorCoreOverride(1);
     }
     /** @brief Restore generated selection before the next independent test. */
     ~ScopedVerifierTensorCoreCandidate()
     {
-        cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(0);
+        cudaNativeQuantisedGroupedVerifier_setTensorCoreOverride(0);
     }
     ScopedVerifierTensorCoreCandidate(const ScopedVerifierTensorCoreCandidate &) = delete;
     ScopedVerifierTensorCoreCandidate &operator=(const ScopedVerifierTensorCoreCandidate &) = delete;
@@ -128,8 +129,8 @@ static void proveDeviceCountedRows(
         kernel->bindWorkspace(workspace.get());
         ASSERT_TRUE(kernel->prepareFusedProjectionGraphCapture(1));
         ASSERT_NE(workspace, nullptr);
-        DeviceNativeVNNIMatrixDesc matrix;
-        ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(matrix));
+        DeviceNativeQuantisedMatrixDesc matrix;
+        ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(matrix));
 
         auto input = TestTensorFactory::createFP32Random(
             {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 72042);
@@ -183,7 +184,7 @@ static void proveDeviceCountedRows(
         TransferEngine::requireDeviceInput(input.get(), device, stream);
         const auto rows = DeviceRowRange::deviceCounted(
             M, static_cast<const int32_t *>(count->gpu_data_ptr()));
-        auto graph = std::make_unique<CUDAGraphCapture>(stream, 0);
+        auto graph = GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
         {
             ScopedVerifierRowCandidate candidate(probe ? probe->grouped_rows : 0);
             auto arithmetic = kernel->beginVerifierDecodeEquivalentScope(rows);
@@ -197,7 +198,7 @@ static void proveDeviceCountedRows(
                 launched = kernel->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                     input.get(), input.get(), output.get(), M, N, K);
             else
-                launched = cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+                launched = cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
                 quant, matrix.payload, static_cast<const uint16_t *>(matrix.scales),
                 static_cast<const uint16_t *>(matrix.mins),
                 static_cast<const uint32_t *>(matrix.emins),

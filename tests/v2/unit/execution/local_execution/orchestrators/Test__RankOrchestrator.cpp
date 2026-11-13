@@ -14,6 +14,12 @@
  * publications independently of a model schema's default partial-sum layout.
  * Main host output capacity is checked independently of context length; the
  * all-position verifier owns a separate, explicitly requested output surface.
+ * Explicit query-KV regressions use real passive DGO graph configuration and
+ * retained mock publications to verify original-head subset assembly for1..8.
+ * Resident-condition regressions also prove that diagnostic host logits belong
+ * to the completed forward, while device-only execution performs no gather.
+ * Global pipeline completion replay proves failed native family construction
+ * or stage ownership cannot publish the shared model gate or release sources.
  */
 
 #include <gmock/gmock.h>
@@ -21,6 +27,9 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "models/qwen/QwenStandardGraph.h"
+#include "execution/config/KVHeadConsumerGeometry.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPSpecStateContract.h"
@@ -29,6 +38,8 @@
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
 #include "loaders/PreparedWeightStore.h"
+#include "execution/runner/PreparedPipelineGraphMaterialization.h"
+#include "mocks/MockModelLoader.h"
 #include "utils/DebugEnv.h"
 #include "mocks/MockModelContext.h"
 #include "utils/TestTensorFactory.h"
@@ -44,14 +55,32 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <set>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 #include <memory>
 #include <stdexcept>
 #include <utility>
+#include <type_traits>
 
 using namespace llaminar2;
+
+/** @test Native rank addresses stay stable while unique ownership remains transferable. */
+TEST(RankOrchestratorOwnershipContract, NativeOwnerHasStableAddress)
+{
+    static_assert(!std::is_copy_constructible_v<RankOrchestrator>);
+    static_assert(!std::is_copy_assignable_v<RankOrchestrator>);
+    static_assert(!std::is_move_constructible_v<RankOrchestrator>);
+    static_assert(!std::is_move_assignable_v<RankOrchestrator>);
+    static_assert(std::is_move_constructible_v<std::unique_ptr<RankOrchestrator>>);
+    static_assert(std::is_move_assignable_v<std::unique_ptr<RankOrchestrator>>);
+    EXPECT_FALSE(std::is_move_constructible_v<RankOrchestrator>);
+    EXPECT_FALSE(std::is_move_assignable_v<RankOrchestrator>);
+    EXPECT_TRUE(std::is_move_constructible_v<std::unique_ptr<RankOrchestrator>>);
+    EXPECT_TRUE(std::is_move_assignable_v<std::unique_ptr<RankOrchestrator>>);
+}
 
 struct ForwardMTPRendezvous
 {
@@ -188,6 +217,7 @@ public:
         snapshot.current_position = *prefix_probe_position_override_;
         snapshot.positions = {*prefix_probe_position_override_};
         snapshot.sequence_lengths = {*prefix_probe_position_override_};
+        snapshot.mtp_observed_verifier_condition_token = prefix_probe_verifier_condition_token_;
         snapshot.mtp_observed_verifier_draft_tokens =
             prefix_probe_verifier_draft_tokens_;
         if (!prefix_probe_verifier_draft_tokens_.empty())
@@ -2336,6 +2366,14 @@ public:
     void set_prefix_probe_verifier_draft_tokens(std::vector<int32_t> tokens)
     {
         prefix_probe_verifier_draft_tokens_ = std::move(tokens);
+        prefix_probe_verifier_condition_token_ = prefix_probe_verifier_draft_tokens_.empty()
+            ? std::nullopt : std::optional<int32_t>{17};
+    }
+    /** @brief Override the observed condition for malformed/mirrored trace tests.
+     * @param token Recorded condition or absence for an incomplete observation. */
+    void set_prefix_probe_verifier_condition(std::optional<int32_t> token)
+    {
+        prefix_probe_verifier_condition_token_ = token;
     }
     /**
      * @brief Seed the mock's device-owned pre-verifier sequence position.
@@ -2799,6 +2837,7 @@ private:
     std::optional<int> prefix_probe_position_override_;
     mutable PrefixProbeCapturePolicy observed_prefix_probe_policy_;
     std::vector<int32_t> prefix_probe_verifier_draft_tokens_;
+    std::optional<int32_t> prefix_probe_verifier_condition_token_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
@@ -3603,6 +3642,105 @@ struct HostedTicketObservationRendezvous
     std::mutex mutex;
     std::condition_variable cv;
 };
+
+/** @brief Closed host rendezvous for actual Rank admission fan-out, without native permits. */
+struct RankAdmissionFanoutReplay final
+{
+    explicit RankAdmissionFanoutReplay(int participants) : expected(participants) {}
+    int expected;
+    int arrived=0;
+    std::atomic<int> completed{0};
+    std::mutex mutex;
+    std::condition_variable ready;
+    /** @return True only when every original callback has entered before any can finish. */
+    bool enter()
+    {
+        std::unique_lock lock(mutex);
+        ++arrived;
+        ready.notify_all();
+        return ready.wait_for(lock,std::chrono::seconds(2),[&]{return arrived==expected;});
+    }
+};
+
+/** @brief Existing runner spy exercising only the original Rank host admission boundary. */
+class RankAdmissionFanoutParticipant final : public MockDeviceGraphOrchestrator
+{
+public:
+    enum class Result {Success,Reject,Throw};
+    /** @brief Retain the same closed host callback rendezvous and one authored result. */
+    RankAdmissionFanoutParticipant(std::shared_ptr<RankAdmissionFanoutReplay> replay,Result result)
+        :replay_(std::move(replay)),result_(result){}
+    /** @brief Model a peer setup enqueue that cannot complete before all peers enter.
+     * @param request The unchanged production admission request.
+     * @return Authored success/rejection after every callback has entered.
+     * @throws std::runtime_error For the deliberate originating participant failure.
+     */
+    bool beginDeviceResidentGeneration(const DeviceGenerationAdmissionRequest& request)override
+    {
+        const bool all_entered=request.valid() && replay_->enter();
+        ++replay_->completed;
+        if(!all_entered)return false;
+        if(result_==Result::Throw)throw std::runtime_error("original admission enqueue failed");
+        return result_==Result::Success;
+    }
+private:
+    std::shared_ptr<RankAdmissionFanoutReplay> replay_;
+    Result result_;
+};
+
+/** @test Full-prefix-hit admission fans out ordinary and fixed1 without relying on earlier main-forward callbacks. */
+TEST(Test__RankOrchestratorDeviceGeneration, AdmissionEntersAllOriginalParticipantsBeforeJoiningReplay)
+{
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+        for(const int count:{1,2,4,8})
+            for(const bool speculative:{false,true})
+                for(int replay=0;replay<20;++replay) {
+                    SCOPED_TRACE(::testing::Message()<<"backend="<<int(backend)<<" count="<<count<<" speculative="<<speculative<<" replay="<<replay);
+                    auto shared=std::make_shared<RankAdmissionFanoutReplay>(count);
+                    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+                    for(int i=0;i<count;++i) {
+                        auto runner=std::make_unique<RankAdmissionFanoutParticipant>(shared,RankAdmissionFanoutParticipant::Result::Success);
+                        runner->set_primary_device_id(DeviceId{backend,i});
+                        runners.push_back(std::move(runner));
+                    }
+                    auto rank=RankOrchestrator::createForTest(llaminar2::test::MockModelContext::createMinimal(),
+                        std::move(runners),makeTPContextForRunnerCount(count),makeRankConfigForRunnerCount(count));
+                    ASSERT_TRUE(rank);
+                    DeviceGenerationAdmissionRequest request;
+                    request.request_count=1;request.max_new_tokens=3;
+                    request.depth_policy=speculative?sampling_math::DeviceGenerationPolicy::fixed(1):sampling_math::DeviceGenerationPolicy::ordinary();
+                    request.initial_leading_row_disposition=sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+                    ASSERT_TRUE(request.valid());
+                    ASSERT_TRUE(rank->beginDeviceResidentGeneration(request));
+                    EXPECT_EQ(shared->arrived,count);EXPECT_EQ(shared->completed.load(),count);
+                }
+}
+
+/** @test Every entered callback drains before rejection/primary exception can unwind original source admission. */
+TEST(Test__RankOrchestratorDeviceGeneration, AdmissionDrainsAllCallbacksBeforeFailureReplay)
+{
+    for(const auto result:{RankAdmissionFanoutParticipant::Result::Reject,RankAdmissionFanoutParticipant::Result::Throw})
+        for(int replay=0;replay<20;++replay) {
+            auto shared=std::make_shared<RankAdmissionFanoutReplay>(2);
+            std::vector<std::unique_ptr<IInferenceRunner>> runners;
+            for(int i=0;i<2;++i) {
+                auto runner=std::make_unique<RankAdmissionFanoutParticipant>(shared,
+                    i==0?result:RankAdmissionFanoutParticipant::Result::Success);
+                runner->set_primary_device_id(DeviceId::cuda(i));runners.push_back(std::move(runner));
+            }
+            auto rank=RankOrchestrator::createForTest(llaminar2::test::MockModelContext::createMinimal(),
+                std::move(runners),makeTPContextForRunnerCount(2),makeRankConfigForRunnerCount(2));
+            ASSERT_TRUE(rank);
+            DeviceGenerationAdmissionRequest request;request.request_count=1;request.max_new_tokens=3;
+            request.depth_policy=sampling_math::DeviceGenerationPolicy::ordinary();
+            if(result==RankAdmissionFanoutParticipant::Result::Reject)EXPECT_FALSE(rank->beginDeviceResidentGeneration(request));
+            else {
+                try {rank->beginDeviceResidentGeneration(request);FAIL()<<"Original participant error was lost";}
+                catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"original admission enqueue failed");}
+            }
+            EXPECT_EQ(shared->arrived,2);EXPECT_EQ(shared->completed.load(),2);
+        }
+}
 
 /**
  * @brief Device-free publisher supporting rank-level overlay admission tests.
@@ -8780,9 +8918,16 @@ TEST_F(Test__RankOrchestrator,
 
     const PrefixRuntimeStateSnapshot snapshot =
         orchestrator->prefixStateProbe();
+    EXPECT_EQ(snapshot.mtp_observed_verifier_condition_token, std::optional<int32_t>{17});
     EXPECT_EQ(
         snapshot.mtp_observed_verifier_draft_tokens,
         committed_drafts);
+    runner0_ptr->set_prefix_probe_verifier_draft_tokens({});
+    runner1_ptr->set_prefix_probe_verifier_draft_tokens({});
+    const auto reset = orchestrator->prefixStateProbe();
+    EXPECT_FALSE(reset.mtp_observed_verifier_condition_token);
+    EXPECT_TRUE(reset.mtp_observed_verifier_draft_tokens.empty());
+    EXPECT_EQ(reset.mtp_observed_verifier_transaction_count, 0);
 }
 
 /**
@@ -8792,6 +8937,37 @@ TEST_F(Test__RankOrchestrator,
  * transaction-coherence failure and must never be silently attributed to one
  * participant.
  */
+/** @test Equal draft suffixes cannot hide missing, invalid or divergent original row-zero inputs. */
+TEST_F(Test__RankOrchestrator, PrefixStateProbeRejectsMissingOrDivergentVerifierCondition)
+{
+    auto a = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *first = a.get();
+    auto b = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *second = b.get();
+    first->set_primary_device_id(DeviceId::cuda(0));
+    second->set_primary_device_id(DeviceId::cuda(1));
+    for (auto *runner : {first, second})
+    {
+        runner->set_prefix_probe_position_override(64);
+        runner->set_prefix_probe_verifier_draft_tokens({41, 73, 109});
+    }
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(a));
+    runners.push_back(std::move(b));
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(runners),
+        makeTPContextForRunnerCount(2), makeRankConfigForRunnerCount(2));
+    for (const auto condition : {std::optional<int32_t>{}, std::optional<int32_t>{-1},
+                                 std::optional<int32_t>{19}})
+    {
+        second->set_prefix_probe_verifier_condition(condition);
+        EXPECT_THROW(static_cast<void>(orchestrator->prefixStateProbe()), std::runtime_error);
+    }
+    second->set_prefix_probe_verifier_condition(17);
+    EXPECT_EQ(orchestrator->prefixStateProbe().mtp_observed_verifier_condition_token,
+              std::optional<int32_t>{17});
+}
+
 TEST_F(Test__RankOrchestrator,
        PrefixStateProbeRejectsDivergentCommittedVerifierDraftIdentity)
 {
@@ -10703,6 +10879,30 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitAttentionUsesTypedMainPhase)
             else
                 ASSERT_TRUE(rank->forwardPrefill(tokens, static_cast<int>(rows)));
             verify("layer0_", rows, replicas);
+            // Retained prefill values keep their original sharding even when
+            // the most recent transaction switched to replicated decode.
+            publish("PREFILL_CHUNK_0_layer0_", 3, false);
+            verify("PREFILL_CHUNK_0_layer0_", 3, false);
+            for (const std::string stage : {"EMBEDDING", "layer0_ATTENTION_OUTPUT", "layer0_GDN_OUTPUT"})
+            {
+                const std::string key = "PREFILL_CHUNK_0_" + stage;
+                for (auto *participant : participants)
+                    participant->set_mock_snapshot(key, 1, 8,
+                        std::vector<float>(8, 4.0f / degree));
+                auto snapshot = rank->getTPSnapshot(key);
+                EXPECT_EQ(snapshot.mode, SnapshotShardingMode::ROW_PARALLEL);
+                ASSERT_TRUE(snapshot.computeCombined());
+                EXPECT_EQ(snapshot.combined_data, std::vector<float>(8, 4.0f));
+            }
+            // An explicit complete producer remains authoritative after the
+            // scope is resolved; the schema's gathered head is not a shard.
+            for (auto *participant : participants)
+                participant->set_mock_snapshot("PREFILL_CHUNK_0_LM_HEAD", 1, 8,
+                    std::vector<float>(8, 7.0f), SnapshotPublication::CompleteValue);
+            auto head = rank->getTPSnapshot("PREFILL_CHUNK_0_LM_HEAD");
+            EXPECT_EQ(head.mode, SnapshotShardingMode::REPLICATED);
+            ASSERT_TRUE(head.computeCombined());
+            EXPECT_EQ(head.combined_data, std::vector<float>(8, 7.0f));
         }
         // A grouped TensorParallel MTP depth retains packed/column assembly.
         publish("MTP0_", 3, false);
@@ -10770,6 +10970,17 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         /** @brief Publish the declared sharded or replicated producer bytes. */
         void publishSnapshots(bool decode)
         {
+            std::vector<float> logits(8);
+            for (size_t column = 0; column < logits.size(); ++column)
+                logits[column] = float((decode ? advances * 100 : 0) + column + 1);
+            set_mock_logits(logits);
+            if (!replicated_)
+            {
+                const size_t width = logits.size() / degree_;
+                set_mock_logits_local(static_cast<int>(width),
+                    std::vector<float>(logits.begin() + participant_ * width,
+                                       logits.begin() + (participant_ + 1) * width));
+            }
             const bool replicas=decode&&replicated_;
             for (const auto &stage:stages_)
             {
@@ -10829,8 +11040,21 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t,int slot,MTPConditionForwardPurpose) override
         { return complete(ready_&&slot==0); }
+        /** @brief Count explicit host observations of a replicated vocabulary. */
+        const float *logits() const override
+        {
+            ++host_observations;
+            return MockDeviceGraphOrchestrator::logits();
+        }
+        /** @brief Count explicit host observations of an actual vocabulary shard. */
+        LogitsLocalInfo consumeLogitsLocalInfoForHostGather() override
+        {
+            ++host_observations;
+            return getLogitsLocalInfo();
+        }
         bool advance_ok=true;
         int advances=0;
+        mutable int host_observations=0;
     private:
         /** @brief Publish snapshots only when this real child transaction succeeds. */
         bool complete(bool valid)
@@ -10850,21 +11074,25 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
     for (const int degree:{2,4})
     for (const bool replicated:{false,true})
     for (const int route:{0,1,2,3,4})
+    for (const bool observe_decode:{false,true})
     {
         SCOPED_TRACE(::testing::Message()<<static_cast<int>(backend)<<"/TP"<<degree
-                     <<"/replicated="<<replicated<<"/route="<<route);
+                     <<"/replicated="<<replicated<<"/route="<<route
+                     <<"/observe_decode="<<observe_decode);
         RankOrchestrator::Config config;
         std::vector<std::unique_ptr<IInferenceRunner>> children;
         std::vector<Participant *> participants;
         for (int index=0;index<degree;++index)
         {
             auto child=std::make_unique<Participant>(stages,index,degree,replicated);
+            child->set_vocab_size(8);
             child->set_primary_device_id(backend==DeviceType::CUDA?DeviceId::cuda(index):DeviceId::rocm(index));
             participants.push_back(child.get());children.push_back(std::move(child));
             config.devices.push_back(backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(index):GlobalDeviceAddress::rocm(index));
             config.weights.push_back(1.f/degree);
         }
         auto model=llaminar2::test::MockModelContext::createMinimal();
+        model->setVocabSize(8);
         model->setArchitecture("qwen35moe");model->setHeadCountKV(4);
         model->mockLoader().setIntParam("qwen35moe.ssm.group_count",4);
         model->mockLoader().setIntParam("qwen35moe.ssm.time_step_rank",8);
@@ -10877,7 +11105,21 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         MockLocalTPContext::Config tp;tp.devices=config.devices;tp.weights=config.weights;
         auto rank=RankOrchestrator::createForTest(model,std::move(children),
             std::make_unique<MockLocalTPContext>(tp),config);
-        rank->setSkipLogitsGatherPrefill(true);rank->setSkipLogitsGatherDecode(true);
+        rank->setSkipLogitsGatherPrefill(false);
+        rank->setSkipLogitsGatherDecode(!observe_decode);
+        const auto verify_logits = [&](int offset)
+        {
+            const float *logits = rank->logits();
+            ASSERT_NE(logits, nullptr);
+            for (int column = 0; column < 8; ++column)
+                EXPECT_FLOAT_EQ(logits[column], float(offset + column + 1));
+        };
+        const auto observation_count = [&]()
+        {
+            int count = 0;
+            for (const auto *child : participants) count += child->host_observations;
+            return count;
+        };
         const auto verify=[&](bool decode)
         {
             for (const auto &stage:stages)
@@ -10904,12 +11146,24 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         };
         const int token=42;
         for (auto *child:participants) child->publishSnapshots(false);
-        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);verify_logits(0);
+        const int prefill_observations = observation_count();
         ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));
-        verify(false); // First forced token is pending; no main row was forwarded.
-        ASSERT_FALSE(advance(-1));verify(false);
+        verify(false);verify_logits(0); // Pending input has not forwarded a row.
+        ASSERT_FALSE(advance(-1));verify(false);verify_logits(0);
+        EXPECT_EQ(observation_count(), prefill_observations);
         for (auto *child:participants) EXPECT_EQ(child->advances,0);
         ASSERT_TRUE(advance(0));verify(true);
+        if (observe_decode)
+        {
+            verify_logits(100);
+            EXPECT_EQ(observation_count(), prefill_observations + (replicated ? 1 : degree));
+        }
+        else
+        {
+            EXPECT_THROW(rank->logits(), std::logic_error);
+            EXPECT_EQ(observation_count(), prefill_observations);
+        }
         for (auto *child:participants) EXPECT_EQ(child->advances,1);
         if (replicated)
         {
@@ -10922,10 +11176,26 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         // Reset into explicit one-token prefill, then fail every actual child
         // advance: no successful completion means no new phase publication.
         for (auto *child:participants) child->publishSnapshots(false);
-        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);
-        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));verify(false);
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);verify_logits(0);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));verify(false);verify_logits(0);
         for (auto *child:participants) child->advance_ok=false;
         EXPECT_FALSE(advance(0));verify(false);
+        EXPECT_THROW(rank->logits(), std::logic_error)
+            << "A failed participant transaction must retire the preceding host row";
+        // Partial success is equally terminal: a mixture of old and new shards
+        // cannot be published as one complete vocabulary.
+        for (auto *child:participants)
+        {
+            child->publishSnapshots(false);
+            child->advance_ok=true;
+        }
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify_logits(0);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));
+        participants.back()->advance_ok=false;
+        const int observations_before_failure=observation_count();
+        EXPECT_FALSE(advance(0));
+        EXPECT_THROW(rank->logits(), std::logic_error);
+        EXPECT_EQ(observation_count(), observations_before_failure);
     }
 }
 
@@ -11471,6 +11741,39 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_MTPQualifiersPreserveSchemaLayout)
         SnapshotShardingMode::REPLICATED);
 }
 
+/** @brief Numbered chunk scopes preserve stage layout and reject malformed keys. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_PrefillChunkScopePreservesSchemaLayout)
+{
+    const StageShardingConfig sharding = {
+        {"FINAL_NORM", SnapshotShardingMode::REPLICATED},
+        {"LM_HEAD", SnapshotShardingMode::GATHERED},
+        {"GDN_OUTPUT", SnapshotShardingMode::ROW_PARALLEL},
+        {"QKV_PROJECTION", SnapshotShardingMode::PACKED_COLUMN_PARALLEL},
+    };
+    for (const std::string chunk : {"0", "12", "184467440737095516160"})
+    {
+        const std::string prefix = "PREFILL_CHUNK_" + chunk + "_";
+        for (const auto &[stage, mode] : sharding)
+        {
+            EXPECT_EQ(getStageShardingMode(prefix + stage, sharding), mode);
+            EXPECT_EQ(getStageShardingMode(prefix + "layer17_" + stage, sharding), mode);
+            EXPECT_EQ(getStageShardingMode(prefix + "LAYER17_" + stage, sharding), mode);
+        }
+        EXPECT_EQ(getStageShardingMode(prefix + "UNKNOWN_STAGE", sharding),
+                  SnapshotShardingMode::UNKNOWN);
+    }
+    for (const std::string malformed : {
+             "PREFILL_CHUNK_FINAL_NORM", "PREFILL_CHUNK__FINAL_NORM",
+             "PREFILL_CHUNK_-1_FINAL_NORM", "PREFILL_CHUNK_1x_FINAL_NORM",
+             "PREFILL_CHUNK_1", "PREFILL_CHUNK_1_",
+             "prefix_PREFILL_CHUNK_1_FINAL_NORM", "prefill_chunk_1_FINAL_NORM"})
+    {
+        EXPECT_EQ(prefillChunkSnapshotSemanticStageOffset(malformed), std::string_view::npos);
+        EXPECT_EQ(extractStageType(malformed), malformed);
+        EXPECT_EQ(getStageShardingMode(malformed, sharding), SnapshotShardingMode::UNKNOWN);
+    }
+}
+
 /**
  * @brief Capture spelling must not change a layer checkpoint's TP contract.
  */
@@ -11767,5 +12070,811 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitEmbeddingUsesTypedMainNamesp
         ASSERT_TRUE(rank->forwardPrefill(&token, 1));
         publish("EMBEDDING", true, SnapshotPublication::CompleteValue);
         verify("EMBEDDING", true);
+    }
+}
+
+/**
+ * @brief Retained heads use historical ownership and never current decode logits.
+ *
+ * Mock children own real CPU FP32 local tensors; production forward fills the
+ * rank's ordinary gatherer with deliberately different values. No device API
+ * or model weights are needed to reproduce the temporal ownership defect.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_RetainedPrefillHeadNeverUsesCurrentGatherer)
+{
+    for (const int degree : {2, 4})
+    for (const SnapshotPublication publication : {
+             SnapshotPublication::CompleteValue,
+             SnapshotPublication::ColumnPartition,
+             SnapshotPublication::SchemaPartition})
+    for (const auto policy : {MTPTerminalHeadPolicy::VocabularySharded,
+                              MTPTerminalHeadPolicy::MirroredFullVocabulary})
+    {
+        SCOPED_TRACE(::testing::Message() << "TP" << degree << "/publication="
+            << static_cast<int>(publication) << "/policy=" << static_cast<int>(policy));
+        MockDeviceGraphOrchestrator::Config child_config;
+        child_config.vocab_size = 4;
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::vector<MockDeviceGraphOrchestrator *> children;
+        const std::vector<float> historical{101.0f, 102.0f, 103.0f, 104.0f};
+        const std::string key = "PREFILL_CHUNK_3_LM_HEAD";
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            auto child = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+            child->set_primary_device_id(DeviceId::cuda(participant));
+            child->set_mock_logits_local(4 / degree, std::vector<float>(4 / degree, 1.0f));
+            const size_t columns = publication == SnapshotPublication::ColumnPartition
+                ? 4 / degree : 4;
+            const size_t offset = publication == SnapshotPublication::ColumnPartition
+                ? participant * columns : 0;
+            child->set_mock_snapshot(key, 1, columns,
+                std::vector<float>(historical.begin() + offset,
+                                   historical.begin() + offset + columns), publication);
+            children.push_back(child.get());
+            runners.push_back(std::move(child));
+        }
+        auto model = llaminar2::test::MockModelContextBuilder()
+            .usePreset(llaminar2::test::ModelPreset::MINIMAL).setVocabSize(4).build();
+        model->setArchitecture("qwen35moe");
+        auto config = makeRankConfigForRunnerCount(degree);
+        config.mtp.terminal_head_policy = policy;
+        auto rank = RankOrchestrator::createForTest(std::move(model), std::move(runners),
+            makeTPContextForRunnerCount(degree), config);
+        rank->setSkipLogitsGatherDecode(false);
+        const int32_t token = 17;
+        for (const float current : {7.0f, 19.0f})
+        {
+            for (auto *child : children)
+                child->set_mock_logits_local(4 / degree, std::vector<float>(4 / degree, current));
+            ASSERT_TRUE(rank->forward(&token, 1));
+            // Preserve the existing unscoped API: it exposes the CURRENT gather.
+            auto live = rank->getTPSnapshot("LM_HEAD");
+            ASSERT_TRUE(live.computeCombined());
+            EXPECT_EQ(live.combined_data, std::vector<float>(4, current));
+            if (publication == SnapshotPublication::SchemaPartition &&
+                policy == MTPTerminalHeadPolicy::VocabularySharded)
+            {
+                EXPECT_THROW(rank->getTPSnapshot(key), std::runtime_error);
+                continue;
+            }
+            auto retained = rank->getTPSnapshot(key);
+            EXPECT_EQ(retained.mode, publication == SnapshotPublication::ColumnPartition
+                ? SnapshotShardingMode::COLUMN_PARALLEL : SnapshotShardingMode::REPLICATED);
+            EXPECT_EQ(retained.device_data.size(), static_cast<size_t>(degree));
+            ASSERT_TRUE(retained.computeCombined());
+            EXPECT_EQ(retained.combined_rows, 1u);
+            EXPECT_EQ(retained.combined_cols, 4u);
+            EXPECT_EQ(retained.combined_data, historical);
+        }
+        if (publication == SnapshotPublication::SchemaPartition &&
+            policy == MTPTerminalHeadPolicy::MirroredFullVocabulary)
+        {
+            // Declared replication never licenses omission or disagreement.
+            children.back()->set_mock_snapshot(key, 1, 4, std::vector<float>(4, -9.0f));
+            auto disagreement = rank->getTPSnapshot(key);
+            EXPECT_FALSE(disagreement.computeCombined());
+            children.back()->set_mock_snapshot(key, 0, 0, {});
+            EXPECT_THROW(rank->getTPSnapshot(key), std::runtime_error);
+        }
+    }
+}
+
+namespace
+{
+/** @brief Host-only DGO fixture retaining the actual graph configuration used by production snapshot dispatch. */
+class QueryKVSnapshotOwner final : public DeviceGraphOrchestrator
+{
+public:
+    /**
+     * @brief Retain producer geometry without initialization, weights, backend access or cache allocation.
+     * @param config Actual graph metadata used by Rank snapshot geometry dispatch.
+     * @param member Original physical participant identity.
+     */
+    QueryKVSnapshotOwner(const GraphConfig &config, DeviceId member)
+        : DeviceGraphOrchestrator(std::make_shared<QwenStandardGraph>(config)), member_(member) {}
+    /** @return Original participant identity independently of any GPU execution state. */
+    DeviceId primaryDeviceId() const override { return member_; }
+    /**
+     * @brief Read the retained host fixture publication without observing execution state.
+     * @param key Original semantic transaction key.
+     * @return Exact immutable publication, or an absent result.
+     */
+    SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+    {
+        const auto it = values.find(key);
+        if (it == values.end()) return {};
+        return {.data = it->second.data(), .size = it->second.size(), .rows = 3,
+            .cols = it->second.size() / 3, .publication = publication};
+    }
+    std::unordered_map<std::string, std::vector<float>> values;
+    SnapshotPublication publication = SnapshotPublication::SchemaPartition;
+private:
+    DeviceId member_;
+};
+/** @brief Retained source owner and original participant handles used by adversarial snapshot regressions. */
+struct QueryKVSnapshotRank
+{
+    std::unique_ptr<RankOrchestrator> rank;
+    std::vector<QueryKVSnapshotOwner *> owners;
+};
+/**
+ * @brief Construct the real rank consumer with nonordinal members and original producer head intervals.
+ * @param degree Canonical participant count1..8.
+ * @param first_layer Absolute first owned PP layer; default0 is the original full test model.
+ * @param local_layers Actual number of owned layers.
+ * @param total_layers Original global source layer count.
+ * @return Real orchestration owner plus borrowed host-only producer handles.
+ */
+QueryKVSnapshotRank makeQueryKVSnapshotRank(int degree, int first_layer = 0, int local_layers = 4, int total_layers = 4)
+{
+    RankOrchestrator::Config rank_config;
+    std::vector<DeviceId> members;
+    for (int rank = 0; rank < degree; ++rank)
+    {
+        members.push_back(DeviceId::rocm(degree - 1 - rank));
+        rank_config.devices.push_back(GlobalDeviceAddress::rocm(degree - 1 - rank));
+        rank_config.weights.push_back(1.f / degree);
+    }
+    rank_config.mtp.enabled = true; rank_config.mtp.draft_tokens = 1;
+    rank_config.mtp.sidecar_dense_policy = MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    auto tp = std::make_shared<TensorParallelConfig>(TensorParallelConfig::equalSplit(degree, 24, 2, 10240, 248320,
+        members, KVHeadCoveragePolicy::QueryInterval,
+        QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}})));
+    QueryKVSnapshotRank result;
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    for (int participant = 0; participant < degree; ++participant)
+    {
+        const auto &a = tp->forRank(participant);
+        GraphConfig config; config.tp_config = tp; config.local_rank = participant; config.tp_device_idx = participant;
+        config.n_heads = 24; config.n_kv_heads = 2; config.head_dim = 2;
+        config.n_layers = local_layers; config.total_n_layers = total_layers; config.pp_layer_offset = first_layer;
+        config.layer_head_dim = std::vector<int>(static_cast<size_t>(total_layers), 2);
+        if (first_layer > 0) config.layer_head_dim[static_cast<size_t>(first_layer - 1)] = 4; // Wrong local rebasing must fail.
+
+        config.head_start = a.head_start; config.local_n_heads = a.head_count; config.local_n_kv_heads = a.kv_head_count;
+        auto owner = std::make_unique<QueryKVSnapshotOwner>(config, members[participant]);
+        for (const auto stage : {"K_PROJECTION", "V_PROJECTION", "K_NORM", "K_ROPE", "KV_APPEND_SOURCE_K", "KV_APPEND_SOURCE_V",
+                                "KV_CACHE_K", "KV_CACHE_V", "ATTENTION_EFFECTIVE_K", "ATTENTION_EFFECTIVE_V", "ATTENTION_EFFECTIVE_K_ROW0"})
+        {
+            std::vector<float> data;
+            for (int row = 0; row < 3; ++row) for (int head = a.kv_head_start; head < a.kvHeadEnd(); ++head)
+            { data.push_back(float(100 * row + 10 * head + 1)); data.push_back(float(100 * row + 10 * head + 2)); }
+            const auto key = "layer3_" + std::string(stage);
+            owner->values[key] = data;
+            owner->values["PREFILL_CHUNK_0_" + key] = data;
+            owner->values["MTP_SCALAR_CONDITION_" + key] = data;
+        }
+        owner->values["MTP0_K_PROJECTION"] = {1,2,11,12,101,102,111,112,201,202,211,212};
+        result.owners.push_back(owner.get()); runners.push_back(std::move(owner));
+    }
+    auto model = llaminar2::test::MockModelContext::createMinimal();
+    model->setArchitecture("qwen35moe"); model->setHeadCountKV(2);
+    MockLocalTPContext::Config context; context.devices = rank_config.devices; context.weights = rank_config.weights;
+    result.rank = RankOrchestrator::createForTest(model, std::move(runners), std::make_unique<MockLocalTPContext>(context), rank_config);
+    return result;
+}
+}
+/** @test Real rank assembly checks each subset replica and reconstructs original full heads for every count1..8. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVUsesActualProducerIntervalsEveryDegree)
+{
+    const std::vector<float> expected = {1,2,11,12,101,102,111,112,201,202,211,212};
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        SCOPED_TRACE(degree);
+        auto fixture = makeQueryKVSnapshotRank(degree);
+        for (const auto stage : {"K_PROJECTION", "V_PROJECTION", "K_NORM", "K_ROPE", "KV_APPEND_SOURCE_K", "KV_APPEND_SOURCE_V",
+                                "KV_CACHE_K", "KV_CACHE_V", "ATTENTION_EFFECTIVE_K", "ATTENTION_EFFECTIVE_V", "ATTENTION_EFFECTIVE_K_ROW0"})
+        for (const auto prefix : {"", "PREFILL_CHUNK_0_", "MTP_SCALAR_CONDITION_"})
+        {
+            const auto key = std::string(prefix) + "layer3_" + stage;
+            SCOPED_TRACE(key);
+            auto value = fixture.rank->getTPSnapshot(key);
+            EXPECT_EQ(value.mode, SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
+            ASSERT_EQ(value.column_groups.size(), 2u);
+            for (int participant = 0; participant < degree; ++participant)
+            {
+                EXPECT_EQ(value.device_data[participant].device_index, participant);
+                EXPECT_EQ(value.device_data[participant].device_id.local_device_id, degree - 1 - participant);
+            }
+            ASSERT_TRUE(value.computeCombined());
+            EXPECT_EQ(value.combined_data, expected);
+        }
+        auto full = fixture.rank->getTPSnapshot("MTP0_K_PROJECTION");
+        ASSERT_TRUE(full.computeCombined()); EXPECT_EQ(full.combined_data, expected);
+        for (const auto &group : full.column_groups) EXPECT_EQ(group.mode, degree > 1
+            ? SnapshotColumnGroupMode::REPLICATED : SnapshotColumnGroupMode::SUBSET_REPLICATED);
+    }
+}
+/** @test Missing/malformed retained producers never shrink, concatenate, or bypass replica agreement. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVRejectsMissingConflictingAndDivergentPublications)
+{
+    auto fixture = makeQueryKVSnapshotRank(4);
+    const auto original = fixture.owners[3]->values["layer3_K_PROJECTION"];
+    fixture.owners[3]->values["layer3_K_PROJECTION"][0] += 1.f;
+    auto diverged = fixture.rank->getTPSnapshot("layer3_K_PROJECTION");
+    EXPECT_FALSE(diverged.computeCombined()); // Both original head1 replicas must agree.
+    fixture.owners[3]->values["layer3_K_PROJECTION"] = original;
+    fixture.owners[3]->values.erase("layer3_K_PROJECTION");
+    EXPECT_THROW(fixture.rank->getTPSnapshot("layer3_K_PROJECTION"), std::invalid_argument);
+    fixture.owners[3]->values["layer3_K_PROJECTION"] = original;
+    fixture.owners[3]->publication = SnapshotPublication::ColumnPartition;
+    EXPECT_THROW(fixture.rank->getTPSnapshot("layer3_K_PROJECTION"), std::runtime_error);
+    fixture.owners[3]->publication = SnapshotPublication::CompleteValue;
+    fixture.owners[3]->values["layer3_K_PROJECTION"] = {1,2,11,12,101,102,111,112,201,202,211,212};
+    auto complete = fixture.rank->getTPSnapshot("layer3_K_PROJECTION");
+    EXPECT_EQ(complete.mode, SnapshotShardingMode::REPLICATED);
+    ASSERT_TRUE(complete.computeCombined()); EXPECT_EQ(complete.combined_data, fixture.owners[3]->values["layer3_K_PROJECTION"]);
+}
+
+/** @test Original absolute PP bounds and historical source names are checked before any default geometry lookup. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVRejectsForeignLayersAndKeepsAbsolutePPSource)
+{
+    auto fixture = makeQueryKVSnapshotRank(4, 4, 4, 12);
+    for (auto *owner : fixture.owners)
+    {
+        const auto data = owner->values.at("layer3_K_PROJECTION");
+        for (const auto key : {"layer7_K_PROJECTION", "PREFILL_CHUNK_2_layer7_K_PROJECTION",
+            "MTP_SCALAR_CONDITION_layer7_K_PROJECTION", "layer3_K_PROJECTION", "layer8_K_PROJECTION",
+            "layer12_K_PROJECTION", "layer2147483648_K_PROJECTION", "K_PROJECTION"})
+            owner->values[key] = data;
+    }
+    const std::vector<float> expected = {1,2,11,12,101,102,111,112,201,202,211,212};
+    for (const auto key : {"layer7_K_PROJECTION", "PREFILL_CHUNK_2_layer7_K_PROJECTION", "MTP_SCALAR_CONDITION_layer7_K_PROJECTION"})
+    {
+        auto value = fixture.rank->getTPSnapshot(key);
+        ASSERT_TRUE(value.computeCombined()); EXPECT_EQ(value.combined_data, expected);
+    }
+    for (const auto key : {"layer3_K_PROJECTION", "layer8_K_PROJECTION", "layer12_K_PROJECTION",
+                           "layer2147483648_K_PROJECTION", "K_PROJECTION"})
+        EXPECT_THROW(fixture.rank->getTPSnapshot(key), std::invalid_argument);
+    // A finalizer publishes the complete immutable value; obsolete/missing
+    // partial source layers must not be looked up before this authority wins.
+    fixture.owners[3]->publication = SnapshotPublication::CompleteValue;
+    fixture.owners[3]->values["layer999_K_PROJECTION"] = expected;
+    auto complete = fixture.rank->getTPSnapshot("layer999_K_PROJECTION");
+    EXPECT_EQ(complete.mode, SnapshotShardingMode::REPLICATED);
+    ASSERT_TRUE(complete.computeCombined()); EXPECT_EQ(complete.combined_data, expected);
+}
+
+namespace
+{
+/** @brief Passive setup owner; it records the real Rank call without running model arithmetic. */
+class HostServingMaterializationWitness final : public MockDeviceGraphOrchestrator
+{
+public:
+    /** @brief Retain a literal fixture participant and observable lifetime, not a hardware placement. */
+    HostServingMaterializationWitness(int participant,std::shared_ptr<std::atomic<int>> owners)
+        : logical_participant(participant),live_owners_(std::move(owners)) { ++*live_owners_; }
+    /** @brief Retire the injected owner after its real Rank and worker pool leave. */
+    ~HostServingMaterializationWitness() override { --*live_owners_; }
+    /** @return Actual CPU lifecycle unless a negative deliberately supplies a wrong declaration. */
+    ServingGraphPreparationKind servingGraphPreparationKind() const noexcept override
+    {
+        return declared_kind ? *declared_kind : MockDeviceGraphOrchestrator::servingGraphPreparationKind();
+    }
+    /** @brief Record every exact setup plan and the persistent worker that delivered it. */
+    bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override
+    {
+        plans.push_back(plan);
+        workers.push_back(std::this_thread::get_id());
+        if (throw_failure) throw std::runtime_error("literal CPU materialization failure");
+        if (fail || !plan.valid()) return false;
+        if (sealed && !sealed->sameCaptureIdentity(plan)) return false;
+        sealed=plan;
+        return true;
+    }
+    int logical_participant;
+    std::vector<ServingGraphFamilyMaterializationPlan> plans;
+    std::vector<std::thread::id> workers;
+    std::optional<ServingGraphPreparationKind> declared_kind;
+    bool fail=false,throw_failure=false;
+private:
+    std::shared_ptr<std::atomic<int>> live_owners_;
+    std::optional<ServingGraphFamilyMaterializationPlan> sealed;
+};
+/** @brief Distinct logical NUMA endpoints, with no native inventory or model allocation. */
+struct HostServingMaterializationFixture
+{
+    std::shared_ptr<std::atomic<int>> live=std::make_shared<std::atomic<int>>(0);
+    std::vector<std::unique_ptr<IInferenceRunner>> children;
+    std::vector<HostServingMaterializationWitness *> observed;
+    std::unique_ptr<MockLocalTPContext> context;
+    RankOrchestrator::Config config;
+    /** @brief Freeze the original declared order, including reversed physical-locality labels. */
+    explicit HostServingMaterializationFixture(int count,bool reverse=false)
+    {
+        MockLocalTPContext::Config local;
+        config.mode=RankOrchestrator::ParallelismMode::TP;
+        config.backend=CollectiveBackendType::HOST;
+        for(int index=0;index<count;++index)
+        {
+            const int endpoint=reverse ? count-index-1 : index;
+            local.devices.push_back(GlobalDeviceAddress::cpu(endpoint));
+            local.weights.push_back(1.0f/count);
+            auto child=std::make_unique<HostServingMaterializationWitness>(index,live);
+            observed.push_back(child.get());children.push_back(std::move(child));
+        }
+        config.devices=local.devices;config.weights=local.weights;
+        context=std::make_unique<MockLocalTPContext>(local);
+    }
+    /** @return The actual production Rank with passive children; no materialization is bypassed. */
+    std::unique_ptr<RankOrchestrator> build()
+    {
+        return RankOrchestrator::createForTest(llaminar2::test::MockModelContext::createMinimal(),
+            std::move(children),std::move(context),config);
+    }
+};
+/** @return An exact positive frozen setup plan; it contains no inference request or seed. */
+ServingGraphFamilyMaterializationPlan hostServingPlan(TensorBase *ingress=nullptr)
+{
+    return {.prefill_bucket_rows={1,4,16},.prefill_pad_token_id=3,
+        .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial,.pipeline_hidden_input=ingress};
+}
+}
+/** @test Actual Rank forwards the exact CPU family to1/2/4/8 owners with stable worker binding. */
+TEST(RankServingHostMaterialization, ExactPlanRepeatAndLogicalParticipantWorkersWithoutInference)
+{
+    for(int count:{1,2,4,8})
+    for(bool reverse:{false,true})
+    {
+        SCOPED_TRACE(::testing::Message()<<"count="<<count<<" reverse="<<reverse);
+        HostServingMaterializationFixture fixture(count,reverse);
+        const auto members=fixture.config.devices;
+        FP32Tensor ingress({1,4});
+        const auto plan=hostServingPlan(&ingress);
+        auto rank=fixture.build();
+        ASSERT_EQ(rank->servingGraphPreparationKind(),ServingGraphPreparationKind::EagerHostGraph);
+        const auto caller=std::this_thread::get_id();
+        for(int repeat=0;repeat<3;++repeat)
+            ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch(plan));
+        ASSERT_NE(rank->localTPContext(),nullptr);
+        EXPECT_EQ(rank->localTPContext()->devices(),members);
+        std::set<std::thread::id> workers;
+        for(int index=0;index<count;++index)
+        {
+            const auto *child=fixture.observed[index];
+            EXPECT_EQ(child->logical_participant,index);
+            ASSERT_EQ(child->plans.size(),3u);
+            ASSERT_EQ(child->workers.size(),3u);
+            for(size_t call=0;call<3;++call)
+            {
+                EXPECT_TRUE(child->plans[call].sameCaptureIdentity(plan));
+                EXPECT_EQ(child->workers[call],child->workers.front());
+            }
+            workers.insert(child->workers.front());
+            EXPECT_EQ(child->forward_call_count(),0u);
+            EXPECT_EQ(child->clear_cache_call_count(),0u);
+            EXPECT_EQ(child->servingGraphPreparationKind(),ServingGraphPreparationKind::EagerHostGraph);
+            if(count==1)EXPECT_EQ(child->workers.front(),caller);
+            else EXPECT_NE(child->workers.front(),caller);
+        }
+        EXPECT_EQ(workers.size(),size_t(count));
+        rank.reset();
+        EXPECT_EQ(fixture.live->load(),0);
+    }
+}
+/** @test An invalid plan is rejected before any materializer or model operation. */
+TEST(RankServingHostMaterialization, InvalidFrozenPlanDoesNotReachChildren)
+{
+    HostServingMaterializationFixture fixture(2);auto rank=fixture.build();
+    for(int fault:{0,1,2})
+    {
+        auto invalid=hostServingPlan();
+        if(fault==0)invalid.prefill_bucket_rows.clear();
+        if(fault==1)invalid.prefill_bucket_rows={0};
+        if(fault==2)invalid.main_decode_graph=ServingMainDecodeGraphKind::Unspecified;
+        EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(invalid));
+    }
+    for(const auto *child:fixture.observed)
+    { EXPECT_TRUE(child->plans.empty());EXPECT_EQ(child->forward_call_count(),0u); }
+}
+/** @test Missing owner and context/cardinality faults cannot produce a successful group. */
+TEST(RankServingHostMaterialization, MissingOwnerOrLocalTPAuthorityDoesNotPartiallyMaterialize)
+{
+    for(int fault:{0,1,2})
+    {
+        HostServingMaterializationFixture fixture(2);
+        if(fault==0)
+        {
+            fixture.children[1].reset();fixture.observed[1]=nullptr;
+            // The existing authority query rejects an absent participant
+            // during construction. Failed construction retires every moved
+            // owner; the observation pointers must never be dereferenced.
+            EXPECT_THROW(fixture.build(),std::logic_error);
+            EXPECT_EQ(fixture.live->load(),0);
+            continue;
+        }
+        if(fault==1)fixture.context.reset();
+        if(fault==2)
+        {
+            MockLocalTPContext::Config single;single.devices={GlobalDeviceAddress::cpu(0)};single.weights={1.0f};
+            fixture.context=std::make_unique<MockLocalTPContext>(single);
+        }
+        auto rank=fixture.build();
+        EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(hostServingPlan()));
+        for(const auto *child:fixture.observed)if(child)EXPECT_TRUE(child->plans.empty());
+    }
+}
+/** @test CPU cannot claim a native-GPU lifecycle or silently join an unresolved/mixed family. */
+TEST(RankServingHostMaterialization, WrongOrUnresolvedPreparationLocusFailsBeforeDispatch)
+{
+    for(int fault:{0,1,2})
+    {
+        HostServingMaterializationFixture fixture(2);
+        if(fault==0)fixture.observed[1]->declared_kind=ServingGraphPreparationKind::Unresolved;
+        if(fault==1)
+            for(auto *child:fixture.observed)child->declared_kind=ServingGraphPreparationKind::NativeDeviceExecutableFamily;
+        if(fault==2)fixture.observed[1]->set_primary_device_id(DeviceId::cuda(7));
+        auto rank=fixture.build();
+        EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(hostServingPlan()));
+        for(const auto *child:fixture.observed)EXPECT_TRUE(child->plans.empty());
+    }
+}
+/** @test False and exceptional child setup are never converted to successful materialization. */
+TEST(RankServingHostMaterialization, ChildFailureAndExceptionRemainFatalAfterCompleteFanout)
+{
+    for(bool throwing:{false,true})
+    {
+        HostServingMaterializationFixture fixture(2);
+        fixture.observed[1]->fail=!throwing;fixture.observed[1]->throw_failure=throwing;
+        auto rank=fixture.build();const auto plan=hostServingPlan();
+        if(throwing)EXPECT_THROW(rank->materializeServingGraphFamilyWithoutLaunch(plan),std::runtime_error);
+        else EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(plan));
+        for(const auto *child:fixture.observed)
+        {
+            ASSERT_EQ(child->plans.size(),1u);
+            EXPECT_TRUE(child->plans.front().sameCaptureIdentity(plan));
+            EXPECT_EQ(child->forward_call_count(),0u);
+        }
+    }
+}
+/** @test A repeated child seals its own exact plan; Rank never rewrites a changed identity to make it pass. */
+TEST(RankServingHostMaterialization, ChangedSealedPlanIsForwardedExactlyAndRejectedByOwner)
+{
+    HostServingMaterializationFixture fixture(2);auto rank=fixture.build();
+    const auto original=hostServingPlan();
+    ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch(original));
+    auto changed=original;changed.prefill_pad_token_id=4;
+    EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(changed));
+    for(const auto *child:fixture.observed)
+    {
+        ASSERT_EQ(child->plans.size(),2u);
+        EXPECT_TRUE(child->plans[0].sameCaptureIdentity(original));
+        EXPECT_TRUE(child->plans[1].sameCaptureIdentity(changed));
+        EXPECT_EQ(child->workers[0],child->workers[1]);
+        EXPECT_EQ(child->forward_call_count(),0u);
+    }
+}
+
+/**
+ * @brief Preserve original rank condition ownership across the existing packed TP probe.
+ * Distinct native child generations must authenticate locally, while logical
+ * pending values agree. No GPU mailbox pointer is dereferenced by this replay.
+ */
+TEST_F(Test__RankOrchestrator, PrefixStateProbeRetainsOriginalMirroredPendingCondition)
+{
+    class Participant final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Publish one existing typed mock mailbox through the actual rank adoption entrypoint. */
+        bool publishForcedDeviceResidentConditionToken(int32_t token,int slot) override
+        {
+            if (slot != 0) return false;
+            pending_token = token;
+            ready = true;
+            ++generation;
+            return true;
+        }
+        /** @brief Return stable participant-local addresses and its independent publication identity. */
+        DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override
+        {
+            if (!ready) return {};
+            DeviceResidentLogicalSequenceStateHandle state;
+            state.target_positions_device = words.data();
+            state.target_sequence_lengths_device = words.data()+1;
+            state.accepted_state_counts_device = words.data()+2;
+            state.next_condition_tokens_device = words.data()+3;
+            state.all_drafts_accepted_flags_device = words.data()+4;
+            state.stopped_flags_device = words.data()+5;
+            state.publication_ok_flags_device = words.data()+6;
+            state.request_count = 1;
+            state.device = primaryDeviceId();
+            state.stream = const_cast<int*>(&stream);
+            state.ready_event = const_cast<int*>(&event);
+            state.live_state_epoch = epoch;
+            state.publication_generation = generation;
+            return state;
+        }
+        /** @brief Attach the existing scalar packed observation to the real mock prefix snapshot. */
+        PrefixRuntimeStateSnapshot prefixStateProbe(const PrefixProbeCapturePolicy& policy) const override
+        {
+            auto snapshot = MockDeviceGraphOrchestrator::prefixStateProbe(policy);
+            const auto current = deviceResidentLogicalSequenceState();
+            if (policy.capture_device_logical_state && current.valid() && !omit)
+            {
+                snapshot.resident_condition = altered.value_or(PrefixResidentConditionProbe{
+                    .device=current.device,
+                    .publication_generation=current.publication_generation,
+                    .live_state_epoch=current.live_state_epoch,
+                    .target_position=snapshot.current_position,
+                    .next_condition_token=pending_token,
+                    .publication_ok=true,
+                    .stopped=false});
+            }
+            if (during_probe) during_probe();
+            return snapshot;
+        }
+        std::function<void()> during_probe;
+        bool ready = false, omit = false;
+        int pending_token = 760;
+        std::uint64_t epoch = 1, generation = 100;
+        std::optional<PrefixResidentConditionProbe> altered;
+    private:
+        std::array<int32_t,7> words{};
+        int stream=1,event=2;
+    };
+    for (const auto backend : {DeviceType::CUDA,DeviceType::ROCm})
+    for (const int degree : {2,4,8})
+    {
+        SCOPED_TRACE(::testing::Message()<<static_cast<int>(backend)<<"/TP"<<degree);
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::vector<Participant*> children(static_cast<std::size_t>(degree));
+        auto config = makeRankConfigForRunnerCount(degree);
+        for (std::size_t index=0;index<children.size();++index)
+        {
+            auto child=std::make_unique<Participant>();
+            child->set_primary_device_id({backend,static_cast<int>(index)});
+            child->set_prefix_probe_position_override(30);
+            child->generation += index*100;
+            child->epoch += index*10;
+            children[index]=child.get();
+            runners.push_back(std::move(child));
+            config.devices[index]=backend==DeviceType::CUDA
+                ?GlobalDeviceAddress::cuda(static_cast<int>(index))
+                :GlobalDeviceAddress::rocm(static_cast<int>(index));
+        }
+        MockLocalTPContext::Config tp;
+        tp.devices=config.devices;
+        tp.weights=config.weights;
+        auto rank=RankOrchestrator::createForTest(
+            llaminar2::test::MockModelContext::createMinimal(),std::move(runners),
+            std::make_unique<MockLocalTPContext>(tp),config);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(760,0));
+        const auto owner=rank->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(owner.valid());
+        PrefixProbeCapturePolicy policy;
+        policy.capture_device_logical_state=true;
+        const auto observed=rank->prefixStateProbe(policy);
+        ASSERT_TRUE(observed.resident_condition);
+        EXPECT_EQ(observed.current_position,30);
+        EXPECT_EQ(observed.resident_condition->device,owner.device);
+        EXPECT_EQ(observed.resident_condition->publication_generation,owner.publication_generation);
+        EXPECT_EQ(observed.resident_condition->live_state_epoch,owner.live_state_epoch);
+        EXPECT_EQ(observed.resident_condition->next_condition_token,760);
+        EXPECT_FALSE(observed.resident_condition->response_disposition);
+        EXPECT_NE(children[0]->generation,children[1]->generation);
+        EXPECT_NE(children[0]->epoch,children[1]->epoch);
+        children[1]->omit=true;
+        EXPECT_THROW(static_cast<void>(rank->prefixStateProbe(policy)),std::runtime_error);
+        children[1]->omit=false;
+        auto actual=*children[1]->prefixStateProbe(policy).resident_condition;
+        for (int defect=0;defect<7;++defect)
+        {
+            auto wrong=actual;
+            if(defect==0)wrong.device={backend,7};
+            if(defect==1)++wrong.publication_generation;
+            if(defect==2)++wrong.live_state_epoch;
+            if(defect==3)++wrong.target_position;
+            if(defect==4)++wrong.next_condition_token;
+            if(defect==5)wrong.publication_ok=false;
+            if(defect==6)wrong.stopped=true;
+            children[1]->altered=wrong;
+            EXPECT_THROW(static_cast<void>(rank->prefixStateProbe(policy)),std::runtime_error)<<defect;
+        }
+        children[1]->altered.reset();
+        // The final participant still returns its own exact observation. Its
+        // hook changes an ALREADY validated peer, so only the existing final
+        // aggregate-owner revalidation can reject this interleaving.
+        for (const bool replacement : {false,true})
+        {
+            children.back()->during_probe=[&]{
+                if (replacement) ++children.front()->generation;
+                else children.front()->ready=false;
+            };
+            try
+            {
+                static_cast<void>(rank->prefixStateProbe(policy));
+                FAIL()<<"Replaced/retired owner survived the completed probe";
+            }
+            catch (const std::runtime_error& error)
+            {
+                EXPECT_STREQ(error.what(),"Rank prefix-state diagnostics rejected a replaced logical condition owner");
+            }
+            children.back()->during_probe={};
+            ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(760,0));
+            ASSERT_TRUE(rank->prefixStateProbe(policy).resident_condition);
+        }
+        children[1]->ready=false;
+        EXPECT_FALSE(rank->deviceResidentLogicalSequenceState().valid());
+        EXPECT_FALSE(rank->prefixStateProbe(policy).resident_condition);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(760,0));
+        const auto successor=rank->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(successor.valid());
+        EXPECT_FALSE(successor.sameMailboxAs(owner));
+        const auto after_reset=rank->prefixStateProbe(policy);
+        ASSERT_TRUE(after_reset.resident_condition);
+        EXPECT_EQ(after_reset.resident_condition->publication_generation,successor.publication_generation);
+        EXPECT_EQ(after_reset.resident_condition->next_condition_token,760);
+        policy.capture_device_logical_state=false;
+        EXPECT_FALSE(rank->prefixStateProbe(policy).resident_condition);
+    }
+}
+
+namespace
+{
+    /** @brief Faults at the two real graph-completion boundaries, without device work. */
+    enum class PreparedPipelineCompletionOutcome { Complete, PartialFamily, CaptureThrows, OwnershipThrows };
+
+    /** @brief Replay the production boundary against an observable actual WeightManager. */
+    class PreparedPipelineCompletionWeights final : public WeightManager
+    {
+    public:
+        /** @param loader Empty source fixture; no prepared device state is advertised. */
+        explicit PreparedPipelineCompletionWeights(IModelLoader &loader) : WeightManager(loader) {}
+        /** @return Actual typed release count, observing its required lifecycle ordering. */
+        size_t releaseAllHostWeightData() override
+        {
+            EXPECT_TRUE(lifecycleGates().canReleaseHostData());
+            events.push_back("release");
+            return WeightManager::releaseAllHostWeightData();
+        }
+        std::vector<std::string> events;
+    };
+
+    /** @brief Stateful graph witness injected only at the public inference-runner interface. */
+    class PreparedPipelineCompletionRunner final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Replay completion or an actual materializer failure before ownership validation. */
+        bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override
+        {
+            events->push_back("materialize");
+            EXPECT_TRUE(plan.valid());
+            EXPECT_FALSE(weights->lifecycleGates().graph_materialization_complete);
+            if (outcome == PreparedPipelineCompletionOutcome::CaptureThrows)
+                throw std::runtime_error("recorded capture failure");
+            return outcome != PreparedPipelineCompletionOutcome::PartialFamily;
+        }
+        /** @brief Fail before model publication when any actual stage owner remains incomplete. */
+        void requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const override
+        {
+            EXPECT_EQ(frontier, MoEPipelineOwnershipValidation::ServingMaterialized);
+            EXPECT_FALSE(weights->lifecycleGates().graph_materialization_complete);
+            events->push_back("ownership");
+            if (outcome == PreparedPipelineCompletionOutcome::OwnershipThrows)
+                throw std::logic_error("recorded incomplete stage ownership");
+        }
+        PreparedPipelineCompletionOutcome outcome = PreparedPipelineCompletionOutcome::Complete;
+        PreparedPipelineCompletionWeights *weights = nullptr;
+        std::vector<std::string> *events = nullptr;
+    };
+
+    /** @brief Partial preparation cannot even enter graph construction or release shared source bytes. */
+    TEST(PreparedPipelineGraphCompletion, RejectsIncompletePreparedSourceBeforeMaterialization)
+    {
+        for (const auto [materialized, prepared] : {std::pair{false, false}, std::pair{true, false}, std::pair{false, true}})
+        {
+            llaminar2::test::MockModelLoader loader;
+            PreparedPipelineCompletionWeights weights(loader);
+            if (materialized) weights.markMaterializationComplete();
+            if (prepared) weights.markDevicePreparationComplete();
+            PreparedPipelineCompletionRunner runner;
+            runner.weights = &weights;
+            runner.events = &weights.events;
+            EXPECT_THROW(materializePreparedPipelineGraphFamily(runner, weights,
+                {.prefill_bucket_rows={32}, .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial}), std::logic_error);
+            EXPECT_TRUE(weights.events.empty());
+            EXPECT_FALSE(weights.lifecycleGates().graph_materialization_complete);
+            EXPECT_FALSE(weights.lifecycleGates().canReleaseHostData());
+        }
+    }
+
+    /** @brief Repeated failed materialization/proof never publishes completion or releases shared sources. */
+    TEST(PreparedPipelineGraphCompletion, ReplaysPartialCaptureAndOwnershipFailureWithoutPublication)
+    {
+        for (const auto outcome : {PreparedPipelineCompletionOutcome::PartialFamily,
+                 PreparedPipelineCompletionOutcome::CaptureThrows, PreparedPipelineCompletionOutcome::OwnershipThrows})
+        {
+            SCOPED_TRACE(static_cast<int>(outcome));
+            llaminar2::test::MockModelLoader loader;
+            PreparedPipelineCompletionWeights weights(loader);
+            weights.markMaterializationComplete();
+            weights.markDevicePreparationComplete();
+            PreparedPipelineCompletionRunner runner;
+            runner.outcome = outcome;
+            runner.weights = &weights;
+            runner.events = &weights.events;
+            for (int replay = 0; replay < 3; ++replay)
+            {
+                weights.events.clear();
+                const ServingGraphFamilyMaterializationPlan plan{.prefill_bucket_rows={32},
+                    .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial};
+                if (outcome == PreparedPipelineCompletionOutcome::PartialFamily)
+                    EXPECT_FALSE(materializePreparedPipelineGraphFamily(runner, weights, plan));
+                else
+                    EXPECT_THROW(materializePreparedPipelineGraphFamily(runner, weights, plan), std::exception);
+                const std::vector<std::string> expected = outcome == PreparedPipelineCompletionOutcome::OwnershipThrows
+                    ? std::vector<std::string>{"materialize", "ownership"} : std::vector<std::string>{"materialize"};
+                EXPECT_EQ(weights.events, expected);
+                EXPECT_FALSE(weights.lifecycleGates().graph_materialization_complete);
+                EXPECT_FALSE(weights.lifecycleGates().canReleaseHostData());
+            }
+        }
+    }
+
+    /** @brief Fresh/reset replay publishes only after the actual complete graph and ownership frontier. */
+    TEST(PreparedPipelineGraphCompletion, CompleteFamilyPublishesAfterOwnershipProof)
+    {
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            llaminar2::test::MockModelLoader loader;
+            PreparedPipelineCompletionWeights weights(loader);
+            weights.markMaterializationComplete();
+            weights.markDevicePreparationComplete();
+            PreparedPipelineCompletionRunner runner;
+            runner.weights = &weights;
+            runner.events = &weights.events;
+            ASSERT_TRUE(materializePreparedPipelineGraphFamily(runner, weights,
+                {.prefill_bucket_rows={32}, .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial}));
+            EXPECT_EQ(weights.events, (std::vector<std::string>{"materialize", "ownership", "release"}));
+            EXPECT_TRUE(weights.lifecycleGates().graph_materialization_complete);
+            EXPECT_TRUE(weights.lifecycleGates().canReleaseHostData());
+        }
+    }
+}
+
+/** @test PP diagnostics project only the original terminal child's acquired logical position across reset/replay. */
+TEST_F(Test__RankOrchestrator, PipelinePrefixProbeProjectsOriginalTerminalLogicalState)
+{
+    /** @brief Device-free immutable diagnostic publication independent of host scheduler metadata. */
+    class PublishedStage final : public MockDeviceGraphOrchestrator {
+    public:
+        PrefixRuntimeStateSnapshot publication;
+        mutable int observations=0;
+        /** @return Recorded original child observation; never a native probe or host cursor. */
+        PrefixRuntimeStateSnapshot prefixStateProbe(const PrefixProbeCapturePolicy&) const override
+        { ++observations;return publication; }
+    };
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm}) {
+        auto head=std::make_unique<PublishedStage>();auto tail=std::make_unique<PublishedStage>();
+        auto *first=head.get();auto *terminal=tail.get();
+        first->set_mock_device_position(9);terminal->set_mock_device_position(9);
+        std::vector<std::unique_ptr<IInferenceRunner>> stages;
+        stages.push_back(std::move(head));stages.push_back(std::move(tail));
+        auto pipeline=RankOrchestrator::createForTestWithPipelineStages(
+            llaminar2::test::MockModelContext::createMinimal(),std::move(stages),makeRankConfigForRunnerCount(2));
+        PrefixProbeCapturePolicy policy;policy.capture_device_logical_state=true;
+        // Tail observations cover first decode, repeated/partial work,
+        // truncation, full reset and restore. The head is deliberately newer
+        // on some calls: a max/head projection would corrupt terminal truth.
+        for(const int position:{10,11,11,4,0,9,10}) {
+            first->publication={};first->publication.initialized=true;
+            first->publication.primary_device={backend,0};first->publication.current_position=position+7;
+            first->publication.positions={position+7};first->publication.sequence_lengths={position+7};
+            terminal->publication={};terminal->publication.initialized=true;
+            terminal->publication.primary_device={backend,1};terminal->publication.current_position=position;
+            terminal->publication.positions={position,position+2};
+            terminal->publication.sequence_lengths={position,position+2};
+            const auto before_first=first->observations,before_terminal=terminal->observations;
+            const auto observed=pipeline->prefixStateProbe(policy);
+            EXPECT_EQ(observed.current_position,position);
+            EXPECT_EQ(observed.positions,terminal->publication.positions);
+            EXPECT_EQ(observed.sequence_lengths,terminal->publication.sequence_lengths);
+            EXPECT_EQ(first->observations,before_first+1);EXPECT_EQ(terminal->observations,before_terminal+1);
+            EXPECT_EQ(pipeline->get_position(),9)<<"Diagnostics cannot mutate host scheduler state";
+        }
+        terminal->publication.initialized=false;
+        EXPECT_THROW((void)pipeline->prefixStateProbe(policy),std::runtime_error)
+            <<"A partial pipeline cannot borrow the head's unrelated publication";
     }
 }

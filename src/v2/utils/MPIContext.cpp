@@ -8,6 +8,7 @@
  * and the parent owner, so later planning cannot rediscover or substitute WORLD.
  */
 #include "utils/MPIContext.h"
+#include "collective/GlobalTPContext.h"
 #include "planning/ExecutionRankMembership.h"
 #include "execution/runner/RankInitializationLifecycle.h"
 
@@ -32,6 +33,39 @@ namespace llaminar2
             MPI_Finalized(&finalized);
             if (!finalized) MPI_Comm_free(&comm_);
         }
+    }
+
+    std::shared_ptr<MPIContext> MPIContextFactory::borrowOriginalCPUStage(
+        const std::shared_ptr<IMPIContext>& parent, std::shared_ptr<IGlobalTPContext> stage)
+    {
+        const auto* native = dynamic_cast<const GlobalTPContext*>(stage.get());
+        if (!parent || !native || !native->authenticatesOriginalCPUExpertBorrow(stage, parent->communicator()))
+            throw std::invalid_argument("CPU stage graph context requires its original admitted split and parent");
+
+        const auto& ranks = stage->worldRanks();
+        const int index = stage->myIndex();
+        if (index < 0 || index >= stage->degree() || stage->degree() < 2 ||
+            ranks.size() != static_cast<std::size_t>(stage->degree()) || ranks[index] != parent->rank())
+            throw std::invalid_argument("CPU stage graph context changed its original rank coordinates");
+
+        const auto inventory = parent->clusterInventory();
+        if (!inventory || inventory->world_size != parent->world_size())
+            throw std::invalid_argument("CPU stage graph context requires the original parent inventory");
+        const auto membership = std::make_shared<const ExecutionRankMembership>(*inventory, ranks);
+        if (membership->executionRank(parent->rank()) != index)
+            throw std::invalid_argument("CPU stage graph context changed its original projected membership");
+
+        // The custom deleter retains the domain even if a graph view survives
+        // its immediate caller. Its derived topology retires before the native
+        // domain owner is released. Only the registry retires the actual split.
+        const auto comm = stage->communicator();
+        auto view = std::shared_ptr<MPIContext>(new MPIContext(parent, membership, index),
+            [stage = std::move(stage)](MPIContext* context) mutable {
+                delete context;
+                stage.reset();
+            });
+        view->comm_ = comm;
+        return view;
     }
 
     std::variant<InactiveMPIRank, std::shared_ptr<MPIContext>> MPIContextFactory::selectRanks(

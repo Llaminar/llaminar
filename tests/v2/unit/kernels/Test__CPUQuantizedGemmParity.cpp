@@ -21,7 +21,7 @@
  * @note Run with:  ctest -R V2_Unit_CPUQuantizedGemmParity
  */
 
-#include "../../utils/NativeVNNITestPartialStorage.h"
+#include "../../utils/NativeQuantisedTestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <omp.h>
 #include <algorithm>
@@ -37,7 +37,7 @@
 #include "../../utils/TestTensorFactory.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -176,7 +176,7 @@ namespace
      * @brief Execute one quantized parity cell through production dispatch.
      *
      * Positive OpenMP thread-count totality is part of the installed
-     * NativeVNNI policy contract.  The `M=1` cells therefore use `Auto`
+     * NativeQuantised policy contract.  The `M=1` cells therefore use `Auto`
      * dispatch while this unit test sweeps every width from one through 56.
      * Forcing the frozen serial oracle here would conceal a missing generated
      * rule or an invalid learned task-ownership schedule.  Ordinary `M>1`
@@ -206,10 +206,10 @@ namespace
                 true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
         }
 
-        using namespace llaminar2::cpu::native_vnni;
-        auto *native_vnni =
-            dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
-        if (native_vnni == nullptr)
+        using namespace llaminar2::cpu::native_quantised;
+        auto *native_quantised =
+            dynamic_cast<CPUNativeQuantisedGemmKernel *>(kernel);
+        if (native_quantised == nullptr)
             return false;
 
         const int k_blocks = (K + 31) / 32;
@@ -221,10 +221,10 @@ namespace
             /*M=*/1,
             K,
             k_blocks);
-        gemv_native_vnni_preq(
-            native_vnni->packedWeights(),
+        gemv_native_quantised_preq(
+            native_quantised->packedWeights(),
             quantized_input.data(),
-            output->mutable_data(), llaminar2::test::NativeVNNITestPartialStorage(native_vnni->packedWeights(), 1).span(),
+            output->mutable_data(), llaminar2::test::NativeQuantisedTestPartialStorage(native_quantised->packedWeights(), 1).span(),
             ISAPath::AUTO,
             DecodeSchedulePolicy::Auto);
         return true;
@@ -697,7 +697,7 @@ namespace
      */
     TEST(CPUQuantizedGemmParityRegression, PrefillTileGeometryHasPositiveThreadTotality)
     {
-        using namespace llaminar2::cpu::native_vnni;
+        using namespace llaminar2::cpu::native_quantised;
         constexpr int thread_counts[] = {
             1,
             2,
@@ -739,7 +739,7 @@ namespace
                 {
                     for (const PreparedFormatCase format : prepared_formats)
                     {
-                        const NativeVNNIPreparedFootprint footprint =
+                        const NativeQuantisedPreparedFootprint footprint =
                             preparedFootprintForFormat(
                                 format.codebook, format.asymmetric);
                         SCOPED_TRACE(
@@ -748,7 +748,7 @@ namespace
                             << " N=" << shape[0] << " K=" << shape[1]
                             << " prepared_stride="
                             << footprint.weight_bytes_per_n_chunk_k_block);
-                        const NativeVNNITileConfig config =
+                        const NativeQuantisedTileConfig config =
                             computeTileConfig(
                                 shape[0], shape[1], M, footprint, threads);
                         EXPECT_GT(config.n_block_chunks, 0);
@@ -761,7 +761,7 @@ namespace
             }
         }
 
-        const NativeVNNIPreparedFootprint footprint =
+        const NativeQuantisedPreparedFootprint footprint =
             preparedFootprintForFormat(/*Q4_0=*/0, false);
         EXPECT_THROW(
             (void)computeTileConfig(896, 896, 32, footprint, 0),
@@ -781,7 +781,7 @@ namespace
      */
     TEST(CPUQuantizedGemmParityRegression, PrefillTileGeometryUsesExactPreparedFootprint)
     {
-        using namespace llaminar2::cpu::native_vnni;
+        using namespace llaminar2::cpu::native_quantised;
 
         constexpr CPUCacheGeometry cache{
             .private_l2_bytes = 1024u * 1024u,
@@ -794,86 +794,86 @@ namespace
         constexpr int M = 32;
         constexpr int threads = 28;
 
-        const NativeVNNIPreparedFootprint nibble_symmetric_footprint =
+        const NativeQuantisedPreparedFootprint nibble_symmetric_footprint =
             preparedFootprintForFormat(/*Q4_0=*/0, false);
-        const NativeVNNIPreparedFootprint nibble_asymmetric_footprint =
+        const NativeQuantisedPreparedFootprint nibble_asymmetric_footprint =
             preparedFootprintForFormat(/*Q4_1=*/5, true);
-        const NativeVNNIPreparedFootprint expanded_symmetric_footprint =
+        const NativeQuantisedPreparedFootprint expanded_symmetric_footprint =
             preparedFootprintForFormat(/*Q5_0=*/6, false);
-        const NativeVNNIPreparedFootprint expanded_asymmetric_footprint =
+        const NativeQuantisedPreparedFootprint expanded_asymmetric_footprint =
             preparedFootprintForFormat(/*Q5_1=*/7, true);
-        const NativeVNNIPreparedFootprint q6_footprint =
+        const NativeQuantisedPreparedFootprint q6_footprint =
             preparedFootprintForFormat(/*Q6_K=*/8, false);
 
         EXPECT_EQ(
             nibble_symmetric_footprint.encoding,
-            CPUNativeVNNIEncoding::NibbleLUT);
+            CPUNativeQuantisedEncoding::NibbleLUT);
         EXPECT_FALSE(nibble_symmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             nibble_asymmetric_footprint.encoding,
-            CPUNativeVNNIEncoding::NibbleLUT);
+            CPUNativeQuantisedEncoding::NibbleLUT);
         EXPECT_TRUE(nibble_asymmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             expanded_symmetric_footprint.encoding,
-            CPUNativeVNNIEncoding::ExpandedInt8);
+            CPUNativeQuantisedEncoding::ExpandedInt8);
         EXPECT_FALSE(expanded_symmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             expanded_asymmetric_footprint.encoding,
-            CPUNativeVNNIEncoding::ExpandedInt8);
+            CPUNativeQuantisedEncoding::ExpandedInt8);
         EXPECT_TRUE(expanded_asymmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             q6_footprint.encoding,
-            CPUNativeVNNIEncoding::Q6KNativeDualScale);
+            CPUNativeQuantisedEncoding::Q6KNativeDualScale);
 
-        const NativeVNNIPreparedFootprint rotated_nibble =
+        const NativeQuantisedPreparedFootprint rotated_nibble =
             preparedFootprintForFormat(
                 /*Q4_0=*/0, false, /*rotation_enabled=*/true);
         EXPECT_EQ(
             rotated_nibble.encoding,
-            CPUNativeVNNIEncoding::ExpandedInt8);
+            CPUNativeQuantisedEncoding::ExpandedInt8);
         EXPECT_FALSE(rotated_nibble.is_asymmetric);
 
         EXPECT_EQ(
             prefillL2ResidencyFraction(nibble_symmetric_footprint, M),
-            (NativeVNNIL2ResidencyFraction{1, 4}));
+            (NativeQuantisedL2ResidencyFraction{1, 4}));
         EXPECT_EQ(
             prefillL2ResidencyFraction(q6_footprint, 4),
-            (NativeVNNIL2ResidencyFraction{1, 8}));
+            (NativeQuantisedL2ResidencyFraction{1, 8}));
         EXPECT_EQ(
             prefillL2ResidencyFraction(q6_footprint, 8),
-            (NativeVNNIL2ResidencyFraction{3, 4}));
+            (NativeQuantisedL2ResidencyFraction{3, 4}));
 
-        const NativeVNNITileConfig nibble_symmetric = computeTileConfig(
+        const NativeQuantisedTileConfig nibble_symmetric = computeTileConfig(
             N,
             K,
             M,
             nibble_symmetric_footprint,
             threads,
             cache);
-        const NativeVNNITileConfig nibble_asymmetric = computeTileConfig(
+        const NativeQuantisedTileConfig nibble_asymmetric = computeTileConfig(
             N,
             K,
             M,
             nibble_asymmetric_footprint,
             threads,
             cache);
-        const NativeVNNITileConfig expanded_symmetric = computeTileConfig(
+        const NativeQuantisedTileConfig expanded_symmetric = computeTileConfig(
             N,
             K,
             M,
             expanded_symmetric_footprint,
             threads,
             cache);
-        const NativeVNNITileConfig expanded_asymmetric = computeTileConfig(
+        const NativeQuantisedTileConfig expanded_asymmetric = computeTileConfig(
             N,
             K,
             M,
             expanded_asymmetric_footprint,
             threads,
             cache);
-        const NativeVNNITileConfig q6_shallow = computeTileConfig(
+        const NativeQuantisedTileConfig q6_shallow = computeTileConfig(
             N, K, 4, q6_footprint, threads, cache);
-        const NativeVNNITileConfig q6_deep = computeTileConfig(
+        const NativeQuantisedTileConfig q6_deep = computeTileConfig(
             N, K, M, q6_footprint, threads, cache);
 
         EXPECT_EQ(nibble_symmetric.k_tile_blocks, 181);
@@ -895,16 +895,16 @@ namespace
                 .k_tile_blocks,
             0);
 
-        NativeVNNIPreparedFootprint invalid_footprint{};
+        NativeQuantisedPreparedFootprint invalid_footprint{};
         EXPECT_THROW(
             (void)computeTileConfig(
                 N, K, M, invalid_footprint, threads, cache),
             std::invalid_argument);
 
-        NativeVNNIPreparedFootprint invalid_encoding =
+        NativeQuantisedPreparedFootprint invalid_encoding =
             expanded_symmetric_footprint;
         invalid_encoding.encoding =
-            static_cast<CPUNativeVNNIEncoding>(255);
+            static_cast<CPUNativeQuantisedEncoding>(255);
         EXPECT_THROW(
             (void)computeTileConfig(
                 N, K, M, invalid_encoding, threads, cache),

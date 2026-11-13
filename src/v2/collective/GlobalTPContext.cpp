@@ -6,6 +6,8 @@
  * tensor parallelism across multiple MPI ranks using UPI/MPI.
  * Parent rank numbers and the resolved local CPU endpoint are construction
  * inputs. Neither a WORLD query nor a fabricated CPU node supplies identity.
+ * Replicated CPU prefill uses original packet/source authority for live-size
+ * transport choice without adding a count exchange or changing generic gathers.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -16,6 +18,8 @@
 #include "DeviceGroup.h"
 #include "backends/ShmemSpinBackend.h"
 #include "execution/runner/RankInitializationLifecycle.h"
+#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
 #include "../tensors/Tensors.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -177,7 +181,8 @@ namespace llaminar2
         bool owns_communicator,
         CollectiveBackendType backend_type,
         std::vector<int> node_ids,
-        std::optional<GlobalDeviceAddress> local_device)
+        std::optional<GlobalDeviceAddress> local_device,
+        std::shared_ptr<PhysicalMemoryAuthority> original_memory)
         : domain_comm_(domain_comm),
           rooted_publication_comm_(MPI_COMM_NULL),
           domain_id_(domain_id),
@@ -278,7 +283,7 @@ namespace llaminar2
                 backend_type_ = effective_backend;
                 auto upi_fallback = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
                 auto shmem = std::make_unique<ShmemSpinBackend>(
-                    domain_id_, my_rank_in_domain_, std::move(upi_fallback));
+                    domain_id_, my_rank_in_domain_, std::move(upi_fallback),original_memory);
 
                 if (shmem->initialize(group))
                 {
@@ -289,6 +294,7 @@ namespace llaminar2
                 }
                 else
                 {
+                    if(original_memory)throw std::runtime_error("Admitted CPU expert domain failed its selected SharedSpin construction: "+shmem->lastError());
                     LOG_WARN("GlobalTPContext: ShmemSpinBackend unavailable for domain " << domain_id_
                                                                                          << "; falling back to UPI (error="
                                                                                          << shmem->lastError() << ")");
@@ -333,14 +339,103 @@ namespace llaminar2
     // Factory Methods
     // =============================================================================
 
-    std::unique_ptr<GlobalTPContext> GlobalTPContext::createWithSplit(
+    std::unique_ptr<GlobalTPContext> GlobalTPContext::createWithSplit(MPI_Comm base,int id,int color,
+        int key,std::optional<GlobalDeviceAddress> local,const std::string& hostfile,CollectiveBackendType backend) {
+        return createWithSplitImpl(base,id,color,key,std::move(local),hostfile,backend,{});
+    }
+
+    std::shared_ptr<GlobalTPContext> GlobalTPContext::createAdmittedCPUExpertDomain(MPI_Comm base,
+        const NativeCPUCollectiveProgram& program,
+        std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse> use) {
+        if(base==MPI_COMM_NULL)throw std::invalid_argument("CPU expert domain requires its original parent communicator");
+        int rank=-1;MPI_Comm_rank(base,&rank);
+        const auto members=program.participants();
+        const auto member=std::find_if(members.begin(),members.end(),[&](const auto& p){return p.world_rank==rank;});
+        const bool included=member!=members.end();
+        const auto ready=RankInitializationLifecycle::execute({0,"cpu_expert_domain_original_commitment"},[&]{
+            const bool original=std::visit([&](const auto& scope) {
+                return scope.originalWorldRank()==rank && scope.program()==program;
+            },use);
+            return original && (included?std::holds_alternative<NativeCPUCollectiveProgram::DomainUse>(use):
+                std::holds_alternative<NativeCPUCollectiveProgram::ProcessUse>(use));
+        },[&](auto identity,auto outcome){return MPIRankInitializationConsensus::reach(base,identity,outcome);});
+        if(!ready.succeeded())throw std::invalid_argument(ready.diagnostic("CPU expert domain admission"));
+        const auto memory=std::visit([](const auto& scope){return scope.originalMemory();},use);
+        std::visit([](auto& scope){scope.beginNative();},use);
+        try {
+            auto original=createWithSplitImpl(base,program.domainId(),included?0:MPI_UNDEFINED,
+                included?static_cast<int>(member-members.begin()):0,
+                included?std::optional{member->address}:std::nullopt,"",program.backend(),included?memory:std::shared_ptr<PhysicalMemoryAuthority>{});
+            if(!included) {
+                std::get<NativeCPUCollectiveProgram::ProcessUse>(use).retireAfterNativeSplit();
+                return {};
+            }
+            if(!original || !original->backend_ || !original->all_same_node_ ||
+               original->world_ranks_.size()!=members.size())throw std::runtime_error("CPU expert domain lost original native membership/backend");
+            for(size_t i=0;i<members.size();++i)if(original->world_ranks_[i]!=members[i].world_rank)
+                throw std::runtime_error("CPU expert domain reordered original members");
+            original->cpu_program_use_.emplace(std::move(std::get<NativeCPUCollectiveProgram::DomainUse>(use)));
+            auto retained=std::shared_ptr<GlobalTPContext>(std::move(original));
+            retained->original_cpu_owner_=retained;
+            retained->original_cpu_parent_=base;
+            return retained;
+        } catch(...) {
+            // A failed native collective construction cannot publish reusable
+            // duties or let another member continue a mismatched constructor.
+            MPI_Abort(base,1);std::terminate();
+        }
+    }
+
+    bool GlobalTPContext::authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower) const noexcept {
+        return borrower.get()==this && cpu_program_use_ && !cpu_program_retired_ && backend_ && domain_comm_!=MPI_COMM_NULL &&
+            !original_cpu_owner_.owner_before(borrower) && !borrower.owner_before(original_cpu_owner_);
+    }
+
+    bool GlobalTPContext::authenticatesOriginalCPUExpertBorrow(
+        const std::shared_ptr<IGlobalTPContext>& borrower, MPI_Comm parent) const noexcept
+    {
+        return parent != MPI_COMM_NULL && parent == original_cpu_parent_ &&
+            authenticatesOriginalCPUExpertBorrow(borrower);
+    }
+
+    bool GlobalTPContext::retireOriginalCPUExpertDomain() {
+        if(cpu_program_retired_)return true;
+        if(!cpu_program_use_)throw std::logic_error("Ordinary CPU domain has no admitted expert retirement duty");
+        if(original_cpu_owner_.use_count()!=1)
+            throw std::logic_error("CPU expert domain cannot retire while original graph/worker/completion borrowers remain");
+        for(const auto request:rooted_record_requests_)if(request!=MPI_REQUEST_NULL)
+            throw std::logic_error("CPU expert domain still owns a live original native request");
+        auto* shared=dynamic_cast<ShmemSpinBackend*>(backend_.get());
+        if(shared && !shared->closeOriginalExpertMapping()) {
+            MPI_Abort(domain_comm_,1);std::terminate();
+        }
+        // Existing original-domain bounded MPI control is the terminal
+        // acknowledgement: every member reaches it only AFTER local unmap.
+        MPI_Request retired=MPI_REQUEST_NULL;
+        if(MPI_Ibarrier(domain_comm_,&retired)!=MPI_SUCCESS ||
+           !waitForGlobalTPCollective(retired,"cpu_expert_terminal_unmap",domain_id_,my_rank_in_domain_,domain_size_,0)) {
+            MPI_Abort(domain_comm_,1);std::terminate();
+        }
+        if(shared)shared->retireOriginalExpertBacking();
+        backend_.reset();
+        if(rooted_publication_comm_!=MPI_COMM_NULL && MPI_Comm_free(&rooted_publication_comm_)!=MPI_SUCCESS) {
+            MPI_Abort(domain_comm_,1);std::terminate();
+        }
+        if(owns_communicator_ && domain_comm_!=MPI_COMM_NULL && MPI_Comm_free(&domain_comm_)!=MPI_SUCCESS)std::terminate();
+        cpu_program_use_->retireAfterNativeDestruction();
+        cpu_program_use_.reset();cpu_program_retired_=true;
+        abort_requested_.store(true,std::memory_order_release);
+        return true;
+    }
+
+    std::unique_ptr<GlobalTPContext> GlobalTPContext::createWithSplitImpl(
         MPI_Comm base_comm,
         int domain_id,
         int color,
         int key,
         std::optional<GlobalDeviceAddress> local_device,
         const std::string &hostfile_path,
-        CollectiveBackendType backend_type)
+        CollectiveBackendType backend_type,std::shared_ptr<PhysicalMemoryAuthority> original_memory)
     {
         if (base_comm == MPI_COMM_NULL)
         {
@@ -413,7 +508,7 @@ namespace llaminar2
             std::move(world_ranks),
             true, // owns_communicator = true (we created it)
             backend_type,
-            std::move(detection.node_ids), std::move(local_device)));
+            std::move(detection.node_ids), std::move(local_device),std::move(original_memory)));
     }
 
     std::unique_ptr<GlobalTPContext> GlobalTPContext::createForTest(
@@ -462,6 +557,7 @@ namespace llaminar2
 
     GlobalTPContext::~GlobalTPContext()
     {
+        if(cpu_program_use_)std::terminate(); // Explicit terminal owner, never a destructor collective.
         // Guard against static destruction after MPI_Finalize.
         int mpi_finalized = 0;
         MPI_Finalized(&mpi_finalized);
@@ -508,6 +604,7 @@ namespace llaminar2
           allreduce_sequence_(
               other.allreduce_sequence_.load(std::memory_order_acquire))
     {
+        if(other.cpu_program_use_)std::terminate(); // An admitted context is address-stable while borrowed.
         // Clear source to prevent double-free
         other.domain_comm_ = MPI_COMM_NULL;
         other.rooted_publication_comm_ = MPI_COMM_NULL;
@@ -523,6 +620,7 @@ namespace llaminar2
     {
         if (this != &other)
         {
+            if(cpu_program_use_ || other.cpu_program_use_)std::terminate();
             // Release both communicator contexts currently owned by this object.
             int mpi_finalized = 0;
             MPI_Finalized(&mpi_finalized);
@@ -902,6 +1000,78 @@ namespace llaminar2
     }
 
     bool GlobalTPContext::gatherVariableFloatRecordsToRoot(
+        const float *local, size_t count, float *root, size_t capacity, size_t width,
+        int root_index, size_t &gathered, const std::string &stage) {
+        return gatherVariableFloatRecordsToRootImpl(local,count,root,capacity,width,
+                                                   root_index,gathered,stage,{});
+    }
+
+    bool GlobalTPContext::gatherVariableFloatRecordsToRoot(
+        const float *local, size_t count, float *root, size_t capacity, size_t width,
+        int root_index, size_t &gathered, const std::string &stage,
+        std::span<RootedFloatRecordRange> ranges) {
+        gathered=0;
+        if ((my_rank_in_domain_==root_index && ranges.size()!=static_cast<size_t>(domain_size_)) ||
+            (my_rank_in_domain_!=root_index && !ranges.empty())) return false;
+        return gatherVariableFloatRecordsToRootImpl(local,count,root,capacity,width,
+                                                   root_index,gathered,stage,ranges);
+    }
+
+    bool GlobalTPContext::gatherReplicatedCPUExpertPrefillRoutesToRoot(
+        const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+        const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
+        size_t capacity,int root_index,size_t& gathered,const std::string& stage,
+        std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)
+    {
+        gathered=0;
+        selected=CPURootedPublicationTransport::MPIBandwidth;
+        const auto& cohort=source.cohort();
+        const size_t maximum=std::numeric_limits<size_t>::max();
+        const auto reject=[&](const char* reason) {
+            LOG_ERROR("GlobalTPContext replicated CPU prefill rejected: reason="<<reason
+                <<" domain="<<domain_id_<<" member="<<my_rank_in_domain_
+                <<" stage="<<stage<<" layer="<<source.layer()
+                <<" live_records="<<packet.live_entry_count);
+            return false;
+        };
+        if(!authenticatesOriginalCPUExpertBorrow(owner) || !cohort ||
+           scope()!=TPScope::NODE_LOCAL || domain_size_<=1 || my_rank_in_domain_<0 ||
+           my_rank_in_domain_>=domain_size_ || root_index<0 || root_index>=domain_size_ ||
+           (my_rank_in_domain_==root_index && local!=root) ||
+           source.participantIndex()!=static_cast<size_t>(my_rank_in_domain_) ||
+           cohort->participants().size()!=static_cast<size_t>(domain_size_) ||
+           world_ranks_.size()!=cohort->participants().size() ||
+           packet.key.histogram_source!=ExpertHistogramSource::PrefillChunk ||
+           !packet.key.isValid() || packet.key.layer_idx!=source.layer() ||
+           !packet.residency_epoch || packet.target_participant!=source.participant().participant_id ||
+           packet.d_model<=0 || packet.d_model!=source.ownership().geometry().model_columns ||
+           packet.top_k<=0 || packet.live_entry_count>packet.entry_capacity ||
+           packet.live_entry_count>capacity/static_cast<size_t>(domain_size_))
+            return reject("original_source_packet_authority");
+        for(size_t member=0;member<cohort->participants().size();++member)
+            if(world_ranks_[member]!=cohort->participants()[member].world_rank)
+                return reject("original_cohort_rank_order");
+        const size_t width=static_cast<size_t>(packet.d_model)+1u;
+        if(width>maximum/sizeof(float) || capacity>maximum/(width*sizeof(float)))
+            return reject("original_byte_geometry_overflow");
+        const size_t declared_bytes=capacity*width*sizeof(float);
+        const size_t per_member_bytes=packet.live_entry_count*width*sizeof(float);
+        // All members' producer lanes resolve the SAME acquired cohort target
+        // from the SAME pinned routing ledger. Their exact nonzero slot set is
+        // replicated; only down-projection channels differ. The canonical shard
+        // combiner independently requires this same slot set for every source.
+        // Thus every member selects identically before sending, without adding
+        // a shared header round to the original MPI message-envelope protocol.
+        if(dynamic_cast<ShmemSpinBackend*>(backend_.get()))
+            selected=CPURootedPublicationTransportPolicy::selectReplicatedPrefillGather(
+                declared_bytes,per_member_bytes);
+        static_assert(CPURootedPublicationTransportPolicy::kReplicatedParallelGatherMinMemberBytes==
+            ShmemSpinArena::CHUNK_CAPACITY*sizeof(float));
+        return gatherVariableFloatRecordsToRootImpl(local,packet.live_entry_count,root,capacity,width,
+            root_index,gathered,stage,ranges,selected);
+    }
+
+    bool GlobalTPContext::gatherVariableFloatRecordsToRootImpl(
         const float *local_records,
         size_t local_record_count,
         float *root_records,
@@ -909,9 +1079,12 @@ namespace llaminar2
         size_t record_width_elements,
         int root_index,
         size_t &gathered_record_count,
-        const std::string &stage_name)
+        const std::string &stage_name,
+        std::span<RootedFloatRecordRange> source_ranges,
+        std::optional<CPURootedPublicationTransport> original_selection)
     {
         gathered_record_count = 0u;
+        for (auto &range:source_ranges) range={};
         if (isAbortRequested())
         {
             LOG_ERROR("GlobalTPContext::gatherVariableFloatRecordsToRoot "
@@ -961,8 +1134,10 @@ namespace llaminar2
         /*
          * Same-node UPI has two first-class rooted transports. The typed policy
          * selects shared memory in the measured latency regime and the private
-         * MPI message lane once copy bandwidth dominates. Selection is complete
-         * before the transaction starts; a runtime failure is fatal and never
+         * MPI message lane through the original intermediate-size regime. The
+         * private replicated-prefill entry may select parallel shared copies for
+         * proven full remote chunks. Selection is complete before communication;
+         * a runtime failure is fatal and never
          * causes a retry through the other transport. Cross-node and explicitly
          * selected MPI domains always use the private message lane below.
          */
@@ -971,10 +1146,9 @@ namespace llaminar2
         if (auto *const shmem_backend =
                 dynamic_cast<ShmemSpinBackend *>(backend_.get());
             shmem_backend &&
-            CPURootedPublicationTransportPolicy::select(
+            original_selection.value_or(CPURootedPublicationTransportPolicy::select(
                 CPURootedPublicationOperation::PackedRecordGather,
-                packed_transaction_bytes) ==
-                CPURootedPublicationTransport::SharedMemoryLatency)
+                packed_transaction_bytes)) != CPURootedPublicationTransport::MPIBandwidth)
         {
             if (!shmem_backend->gatherVariableFloatRecordsToRoot(
                     local_records,
@@ -983,7 +1157,7 @@ namespace llaminar2
                     root_record_capacity,
                     record_width_elements,
                     root_index,
-                    gathered_record_count))
+                    gathered_record_count, source_ranges))
             {
                 LOG_ERROR("GlobalTPContext native shared-memory packed route "
                           "publication failed; stage="
@@ -1067,6 +1241,9 @@ namespace llaminar2
             uint8_t{0});
         rooted_record_source_seen_[static_cast<size_t>(root_index)] = uint8_t{1};
 
+        if (!source_ranges.empty())
+            source_ranges[static_cast<size_t>(root_index)]={root_index,0,local_record_count};
+
         size_t total_records = local_record_count;
         size_t total_elements = local_elements;
         int matched_remote_participants = 0;
@@ -1082,13 +1259,26 @@ namespace llaminar2
             int message_available = 0;
             MPI_Message message = MPI_MESSAGE_NULL;
             MPI_Status status{};
-            const int probe_result = MPI_Improbe(
-                MPI_ANY_SOURCE,
-                kRootedPublicationTag,
-                rooted_publication_comm_,
-                &message_available,
-                &message,
-                &status);
+            // A completed eager send may let a contributor enter the next
+            // gather while another contributor is still publishing this one.
+            // Match only missing sources: MPI's per-source ordering then keeps
+            // each source's next message queued for the next invocation, with
+            // no extra metadata, communicator, barrier or payload padding.
+            int probe_result = MPI_SUCCESS;
+            for (int candidate = 0; candidate < domain_size_; ++candidate)
+            {
+                if (rooted_record_source_seen_[static_cast<size_t>(candidate)] != 0u)
+                    continue;
+                probe_result = MPI_Improbe(
+                    candidate,
+                    kRootedPublicationTag,
+                    rooted_publication_comm_,
+                    &message_available,
+                    &message,
+                    &status);
+                if (probe_result != MPI_SUCCESS || message_available)
+                    break;
+            }
             if (probe_result != MPI_SUCCESS)
             {
                 LOG_ERROR("GlobalTPContext MPI_Improbe failed for packed route "
@@ -1181,6 +1371,8 @@ namespace llaminar2
                 return false;
             }
 
+            if (!source_ranges.empty())
+                source_ranges[static_cast<size_t>(source)]={source,total_records,remote_records};
             rooted_record_source_seen_[static_cast<size_t>(source)] = uint8_t{1};
             total_records += remote_records;
             total_elements += remote_elements;
@@ -1200,6 +1392,10 @@ namespace llaminar2
             return false;
         }
 
+        if (!source_ranges.empty() && !validRootedFloatRecordRanges(source_ranges,total_records)) {
+            requestAbort();
+            return false;
+        }
         gathered_record_count = total_records;
         return true;
     }

@@ -27,6 +27,7 @@
 #pragma once
 
 #include "../../attention/AttentionExecutionPolicy.h"
+#include "../../attention/AttentionHeadMapping.h"
 #include "CUDATensorPrefillGeometry.h"
 #include "CUDATensorContextPartition.cuh"
 
@@ -132,44 +133,17 @@ namespace llaminar2::cuda::fa2_policy
      * second form deliberately permits a local Q shard that is not divisible
      * by the global KV-head count, as occurs at TP=4/8 for compact GQA models.
      */
-    struct FA2HeadMappingGeometry
-    {
-        int local_query_heads = 0;   ///< Q heads executed by this participant.
-        int visible_kv_heads = 0;    ///< KV heads addressable from the pointer.
-        int head_start = 0;          ///< Global first Q head for replicated KV.
-        int replicated_gqa_n_rep = 0; ///< Global Q heads mapped to each KV head.
-    };
+    using FA2HeadMappingGeometry = attention::HeadMappingGeometry;
 
     /**
-     * @brief Validate local-sharded or global-replicated GQA head mapping.
-     *
-     * @param geometry Participant-visible head mapping.
-     * @return True exactly when every launched Q head maps to an addressable KV
-     *         head without relying on a local divisibility assumption.
+     * @brief Use the backend-independent local/global GQA mapping contract.
+     * @param geometry Participant-visible original head ownership.
+     * @return True exactly when every query maps into the visible KV bank.
      */
     [[nodiscard]] inline constexpr bool isValidFA2HeadMapping(
         const FA2HeadMappingGeometry &geometry)
     {
-        if (geometry.local_query_heads <= 0 ||
-            geometry.visible_kv_heads <= 0 ||
-            geometry.head_start < 0 ||
-            geometry.replicated_gqa_n_rep < 0)
-        {
-            return false;
-        }
-
-        if (geometry.replicated_gqa_n_rep == 0)
-        {
-            return geometry.local_query_heads % geometry.visible_kv_heads == 0;
-        }
-
-        const std::int64_t final_query_head =
-            static_cast<std::int64_t>(geometry.head_start) +
-            geometry.local_query_heads;
-        const std::int64_t represented_query_heads =
-            static_cast<std::int64_t>(geometry.visible_kv_heads) *
-            geometry.replicated_gqa_n_rep;
-        return final_query_head <= represented_query_heads;
+        return attention::isValidHeadMapping(geometry);
     }
 
     /**

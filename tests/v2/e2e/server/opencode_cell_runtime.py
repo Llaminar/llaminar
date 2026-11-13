@@ -26,7 +26,7 @@ import docker_paths
 from production_artifacts import write_json
 from run_model_parity_benchmarks import benchmark_profile
 from run_model_parity_e2e import readiness_timeout_seconds
-from flash_attention_perf_policy import validate_flash_attention_plan_policy
+from attention_execution_perf_policy import validate_attention_execution_policy
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
@@ -47,6 +47,19 @@ from server_execution_contract import (automatic_selection_policy, validate_auto
 OUTPUT_TOKENS = 32768
 RAM_MIB = 16384
 DISK_MIB = 32768
+
+# Retain serving/capture/placement evidence and every domain that can publish
+# semantic GPU-to-host operations. Per-kernel CPU geometry/timing diagnostics
+# belong in focused profiling runs: their Cartesian tag sets otherwise grow
+# throughout a long coding session. Broad transfer domains deliberately retain
+# unknown operation names so the forbidden-transfer validator still rejects them.
+PERF_STATS_FAMILIES = (
+    'server', 'physical_memory', 'forward_graph', 'gpu_graph_inventory', 'qsa',
+    'kernel.cpu_fa2_parallel_plan_executions', 'mtp', 'sampling', 'transfer',
+    'backend', 'heterogeneous_collective', 'prefix_cache', 'prefix_archive',
+    'moe_rebalance', 'moe_overlay_controller', 'moe_overlay_residency',
+    'moe_overlay_activation_epoch', 'moe_routed_execution', 'moe_placement',
+)
 
 
 @dataclass(frozen=True)
@@ -198,9 +211,22 @@ def admission_outcome(returncode: int, output: str) -> AdmissionOutcome:
     """Only a controlled native capacity rejection may probe a smaller context."""
     if returncode == 0 and '--dry-run complete: preflight validation passed' in output:
         return AdmissionOutcome.ACCEPTED
+    # Fixed-head placement publishes the authoritative frozen BOM rather than
+    # the generic MemoryPlan diagnostic. Require its actual positive deficit;
+    # a truncated quote or another startup failure must not trigger bisection.
+    fixed_head_marker = 'Explicit fixed head native ranges exceed complete frozen PMA capacity;'
+    fixed_head_lines = [line.split(fixed_head_marker, 1)[1]
+                        for line in output.splitlines() if fixed_head_marker in line]
+    fixed_head_capacity = bool(fixed_head_lines)
+    for line in fixed_head_lines:
+        quotes = re.findall(r'\btotal=(\d+) incremental=(\d+) available=(\d+) deficit_bytes=(\d+)(?=\s|;|$)', line)
+        fixed_head_capacity = fixed_head_capacity and bool(quotes) and all(
+            total >= incremental > available and deficit == incremental - available
+            for total, incremental, available, deficit in
+            (map(int, quote) for quote in quotes))
     capacity = ('Memory plan validation failed' in output or (
         'ExpertOverlay has no resident captured-prefill shape with complete expert coverage under the physical BOM'
-        in output and 'requires_additional_bytes=' in output))
+        in output and 'requires_additional_bytes=' in output) or fixed_head_capacity)
     if returncode == 1 and capacity:
         return AdmissionOutcome.CAPACITY_REJECTED
     raise ValueError('Unexpected native admission outcome; context was not retried')
@@ -311,12 +337,11 @@ def runtime_evidence(perf: dict, configuration: dict) -> dict:
             features.mtp_depth_policy != 'fixed'
             or features.mtp_max_depth != int(expected_mtp.removeprefix('depth_'))):
         raise ValueError('App runtime changed the selected fixed MTP depth')
-    checks = {}
+    checks = {'attention': validate_attention_execution_policy(records, contract)}
     if contract.uses_gpu:
         checks['graph'] = validate_graph_capture_policy(records, contract.device_kinds,
             require_prefill_lifecycle=True, decode_requirement=DecodeGraphRequirement.REPLAY)
         checks['transfers'] = validate_gpu_host_transfer_policy(records, device_kinds=contract.device_kinds)
-        checks['attention'] = validate_flash_attention_plan_policy(records, contract.attention_device_kinds)
         if features.mtp and features.mtp_depth_policy == 'dynamic':
             if contract.device_kinds == frozenset({'cuda'}):
                 checks['mtp'] = validate_cuda_dynamic_mtp_device_generation_policy(records,
@@ -414,6 +439,7 @@ def run_app(cell: CodingCell) -> dict:
                                  (perf_dir, '/perf', False)]),
             '--env', 'LLAMINAR_LOG_LEVEL=INFO', '--env', 'LLAMINAR_TRACE_GENERATED_TOKENS=1',
             '--env', 'LLAMINAR_PERF_STATS_JSON=/perf/perf.rank-{rank}.json',
+            '--env', 'LLAMINAR_PERF_STATS_FILTER=' + ','.join(PERF_STATS_FAMILIES),
             '--env', 'LLAMINAR_ENABLE_SERVER_SHUTDOWN_ENDPOINT=1',
             cell.image, *cell.server_arguments(admission['context_tokens'])]
         state.update(container_id=owners.create(name, launch),

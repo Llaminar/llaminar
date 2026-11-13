@@ -11,6 +11,8 @@
  * that background planning cannot stall an already-active inference request.
  * Pipeline tests retain global model-layer identities while exercising compact
  * ownership, observed phase costs, frozen proposals and epoch publication.
+ * Pre-cut witnesses retain isolated candidate scores separately from the
+ * admitted transaction's coherent service estimate.
  */
 
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
@@ -47,6 +49,16 @@ namespace llaminar2::test
      */
     struct MoEOverlayResidencyAuthorityConcurrencyPeer
     {
+        /** @return Actual private descendant primitive, without replacing any admission state. */
+        static MoEOverlayResidencyAuthority::TicketLease borrowSequence(
+            MoEOverlayResidencyAuthority& authority,
+            const MoEOverlayResidencyAuthority::TicketLease& parent)
+        { return authority.borrowGraphSequenceSnapshot(parent); }
+
+        /** @return Weak observation of the actual published lease state, never a new owner. */
+        static std::weak_ptr<const void> publishedEpochLifetime(const MoEOverlayResidencyAuthority& authority)
+        { return authority.published_epoch_.load(std::memory_order_acquire); }
+
         /** @return A lease holding the same mutex as background proposal scoring. */
         static std::unique_lock<std::mutex> holdProposalLock(
             MoEOverlayResidencyAuthority &authority)
@@ -782,7 +794,7 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
@@ -792,7 +804,7 @@ namespace llaminar2::test
                 {.participant_id = 2,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
-            };
+            });
             return profile;
         }
 
@@ -843,8 +855,8 @@ namespace llaminar2::test
                                   uint64_t,
                                   kExpertHistogramProductionSourceCount>{
                                   100, 200, 300};
-                    profile->participant_costs.push_back({
-                        .participant_id = participant,
+                    profile->target_costs.push_back({
+                        .target = MoEOverlayRouteTarget::whole(participant),
                         .layer = layer,
                         .nanoseconds_per_activation = cost,
                     });
@@ -868,14 +880,14 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
                 {.participant_id = 1,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
-            };
+            });
             return profile;
         }
 
@@ -894,14 +906,14 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {1, 1, 1}},
                 {.participant_id = 1,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
-            };
+            });
             return profile;
         }
 
@@ -931,10 +943,7 @@ namespace llaminar2::test
                     {
                         if (source == destination)
                             continue;
-                        profile->costs.push_back({
-                            .source_participant = source,
-                            .destination_participant = destination,
-                            .layer = layer,
+                        profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                             .transfer_and_repack_ns = transfer_and_repack_ns,
                             .inference_interference_ns =
                                 inference_interference_ns,
@@ -969,10 +978,7 @@ namespace llaminar2::test
                     {
                         if (source == destination)
                             continue;
-                        profile->costs.push_back({
-                            .source_participant = source,
-                            .destination_participant = destination,
-                            .layer = layer,
+                        profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                             .transfer_and_repack_ns =
                                 transfer_and_repack_ns,
                             .inference_interference_ns =
@@ -991,7 +997,7 @@ namespace llaminar2::test
             auto profile =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
             profile->identity = "two-participant-same-domain-v1";
-            profile->costs = {
+            profile->setWholeCosts(std::vector<MoEOverlayParticipantLayerMigrationCost>{
                 {.source_participant = 0,
                  .destination_participant = 1,
                  .layer = 0,
@@ -1002,7 +1008,7 @@ namespace llaminar2::test
                  .layer = 0,
                  .transfer_and_repack_ns = 1,
                  .inference_interference_ns = 1},
-            };
+            });
             return profile;
         }
 
@@ -1814,6 +1820,57 @@ namespace llaminar2::test
         EXPECT_EQ(
             authority.stats().current_batch_llep_lease_rejections,
             1u);
+    }
+
+    /** @test Positive interference is admitted and charged by canonical typed-target payoff. */
+    TEST(Test__MoEOverlayResidencyAuthority, TypedMigrationInterferencePreservesAcceptanceAndPayoff)
+    {
+        std::array<MoEOverlayResidencyTransaction, 3> proposals;
+        const std::array<uint64_t, 3> interference{0, 1, 1'000'000};
+        for (std::size_t trial = 0; trial < interference.size(); ++trial)
+        {
+            SCOPED_TRACE(interference[trial]);
+            auto histogram = oneTierHistogram(2);
+            auto movement = std::make_shared<MoEOverlayMigrationCostProfile>(
+                *twoParticipantMigrationProfile());
+            for (auto &row : movement->costs)
+                row.inference_interference_ns = interference[trial];
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan = oneTierTwoParticipantPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced),
+                .model_metadata = modelMetadata(), .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(), .phase_service_profile = oneTierServiceProfile(),
+                .migration_cost_profile = movement,
+                .migration_economy_policy = MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0, .current_window_weight = 1,
+                    .payoff_horizon_tokens = 2, .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0},
+                .participant_rebalance_policy = {.enabled = true,
+                    .imbalance_threshold_per_mille = 1300, .minimum_improvement_per_mille = 50,
+                    .maximum_swaps_per_layer = 1, .maximum_plan_entries_per_wave = 2,
+                    .minimum_window_activations = 1},
+                .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 1,
+            });
+            proposals[trial] = authority.proposeFromFrozenHistogramWindow(observedBatches({0, 1, 3, 4}));
+            ASSERT_TRUE(proposals[trial].valid());
+            if (trial < 2)
+            {
+                ASSERT_FALSE(proposals[trial].empty());
+                // Reciprocal rows price the SAME calibrated pair wave;
+                // preserve its max cost rather than double charging both edges.
+                EXPECT_EQ(proposals[trial].economy.projected_transfer_and_repack_ns, 1u);
+                EXPECT_EQ(proposals[trial].economy.projected_inference_interference_ns,
+                          interference[trial]);
+            }
+            else
+            {
+                EXPECT_TRUE(proposals[trial].empty());
+                EXPECT_GT(authority.stats().payoff_rejected_cycles, 0u);
+            }
+        }
+        EXPECT_EQ(proposals[0].economy.projected_service_gain_ns,
+                  proposals[1].economy.projected_service_gain_ns);
+        EXPECT_EQ(proposals[0].economy.projected_net_benefit_ns,
+                  proposals[1].economy.projected_net_benefit_ns + 1);
     }
 
     TEST(Test__MoEOverlayResidencyAuthority, BalancedMarginalsCanHideActionableDecodeBatchSkew)
@@ -4050,6 +4107,89 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Original solver exposes an isolated positive tail hidden by its tier cut.
+     *
+     * Four independently observed layers offer more positive tier exchanges
+     * than a two-tier-cycle subset admits. A larger bound exhausts that same
+     * candidate inventory; neither witness sums isolated forecasts or mutates
+     * the live placement. The production solver, not an authored counter, owns
+     * both observations.
+     */
+    TEST(Test__MoEOverlayResidencyAuthority,
+         PrecutTierWitnessRetainsIsolatedPositiveTailAndExhaustion)
+    {
+        for (const std::size_t cap : {3u, 9u})
+        {
+            SCOPED_TRACE(cap);
+            ScopedPerfStats perf;
+            constexpr int layer_count = 4;
+            auto histogram = fourParticipantHistogram(layer_count);
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan = twoTierThreeCpuParticipantPlan(),
+                .model_metadata = eightExpertMetadata(layer_count),
+                .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(),
+                .phase_service_profile = twoTierServiceProfile(4, layer_count),
+                .migration_cost_profile = fourParticipantMigrationProfile(1, 1, layer_count),
+                .migration_economy_policy = MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 370,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+                .participant_rebalance_policy = {.enabled = false},
+                .shadow_slots_per_endpoint_layer = 2,
+                .max_concurrent_cycles = cap,
+                .perf_device = "precut-tier-witness",
+            });
+            const auto window = observedPrefillLayers(1,
+                std::vector<std::vector<uint64_t>>(layer_count,
+                    {10, 9, 100, 90, 80, 70, 1, 1}));
+            const auto transaction = authority.proposeFromFrozenHistogramWindow(window);
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_FALSE(transaction.empty());
+            EXPECT_EQ(authority.snapshot()->epoch, 1u);
+            const auto records = PerfStatsCollector::snapshot({"moe_overlay_residency"});
+            const auto *cut = findRecord(records, "precut_tier_candidate_cut");
+            ASSERT_NE(cut, nullptr);
+            EXPECT_EQ(cut->value, 1.0);
+            const auto count = [&](const char *name) { return std::stoull(cut->tags.at(name)); };
+            EXPECT_EQ(count("histogram_generation"), window->generation);
+            EXPECT_EQ(count("source_epoch"), 1u);
+            EXPECT_EQ(count("maximum_concurrent_cycles"), cap);
+            EXPECT_EQ(count("tier_cycle_budget"), cap - 1u);
+            EXPECT_GT(count("isolated_positive_tier_cycles"), 0u);
+            EXPECT_EQ(cut->tags.at("score_scope"), "isolated_cycle_against_observed_source_epoch");
+            EXPECT_EQ(cut->tags.at("joint_remainder_eligibility"), "not_evaluated");
+            EXPECT_EQ(count("candidate_tier_cycles"), count("selected_tier_cycles") +
+                count("shadow_rejected_before_cut") + count("cap_unvisited_tier_cycles"));
+            if (cap == 3u)
+            {
+                EXPECT_EQ(count("selected_tier_cycles"), 2u);
+                EXPECT_GT(count("isolated_positive_tier_cycles"),
+                          count("selected_isolated_positive_tier_cycles"));
+                EXPECT_GT(count("cap_unvisited_isolated_positive_tier_cycles"), 0u);
+                EXPECT_EQ(cut->tags.at("has_best_cap_unvisited_positive_cycle"), "true");
+                EXPECT_GT(count("best_cap_unvisited_isolated_projected_service_gain_ns"), 0u);
+                EXPECT_GT(count("best_cap_unvisited_isolated_projected_net_benefit_ns"), 0u);
+            }
+            else
+            {
+                EXPECT_EQ(count("cap_unvisited_tier_cycles"), 0u);
+                EXPECT_EQ(count("cap_unvisited_isolated_positive_tier_cycles"), 0u);
+                EXPECT_EQ(cut->tags.at("has_best_cap_unvisited_positive_cycle"), "false");
+                EXPECT_EQ(cut->tags.count("best_cap_unvisited_isolated_projected_service_gain_ns"), 0u);
+            }
+            // This existing record is the joint admitted-transaction estimate;
+            // the pre-cut family deliberately carries no sum of its scores.
+            const auto *joint = findRecord(records, "projected_service_gain_ns");
+            ASSERT_NE(joint, nullptr);
+            EXPECT_EQ(joint->tags.at("histogram_generation"), cut->tags.at("histogram_generation"));
+        }
+    }
+
+    /**
      * @brief A one-slot Dynamic wave must compare both independent axes.
      *
      * Tier promotion and same-tier skew repair are policy alternatives when
@@ -4322,10 +4462,7 @@ namespace llaminar2::test
                     const bool expensive_layer_zero_tier_edge =
                         layer == 0 &&
                         (source == 0 || destination == 0);
-                    migration_profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = layer,
+                    migration_profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                         .transfer_and_repack_ns =
                             expensive_layer_zero_tier_edge ? 100'000u : 1u,
                         .inference_interference_ns =
@@ -4469,8 +4606,8 @@ namespace llaminar2::test
                 std::uint64_t cost = participant == 0 ? 10u : 100u;
                 if (layer == 0 && participant == 3)
                     cost = 1'000u;
-                service_profile->participant_costs.push_back({
-                    .participant_id = participant,
+                service_profile->target_costs.push_back({
+                    .target = MoEOverlayRouteTarget::whole(participant),
                     .layer = layer,
                     .nanoseconds_per_activation = {cost, cost, cost},
                 });
@@ -4489,10 +4626,7 @@ namespace llaminar2::test
                 {
                     if (source == destination)
                         continue;
-                    migration_profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = layer,
+                    migration_profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                         .transfer_and_repack_ns = 1,
                         .inference_interference_ns = 1,
                     });
@@ -4730,10 +4864,14 @@ namespace llaminar2::test
                 return migration.crossesTier() &&
                        migration.direction !=
                            MoEOverlayTierMigrationDirection::SamePriority &&
-                       migration.axis ==
-                           MoEOptimizationMovementAxis::Combined;
-            }))
-            << "participant intent must survive when every physical edge crosses tiers";
+                       advancesTierResidency(migration.axis);
+            }));
+        EXPECT_TRUE(std::any_of(transaction.migrations.begin(), transaction.migrations.end(),
+            [](const auto &migration) { return advancesParticipantPlacement(migration.axis); }))
+            << "the complete physical cycle must retain its participant objective";
+        EXPECT_TRUE(std::any_of(transaction.migrations.begin(), transaction.migrations.end(),
+            [](const auto &migration) { return migration.axis == MoEOptimizationMovementAxis::TierResidency; }))
+            << "a tier-only command must not acquire another command's participant objective";
 
         RecordingTransport transport(&authority);
         ASSERT_EQ(
@@ -4752,15 +4890,19 @@ namespace llaminar2::test
         const auto ledger = authority.movementLedger();
         ASSERT_TRUE(ledger.complete());
         ASSERT_EQ(ledger.edges.size(), transaction.migrations.size());
-        EXPECT_TRUE(std::all_of(
-            ledger.edges.begin(),
-            ledger.edges.end(),
-            [](const auto &edge)
-            {
-                return edge.valid() &&
-                       edge.axis == MoEOptimizationMovementAxis::Combined;
-            }))
-            << "the durable authority ledger must retain both completed objectives";
+        for (const auto &migration : transaction.migrations)
+        {
+            const auto edge = std::find_if(ledger.edges.begin(), ledger.edges.end(),
+                [&](const auto &record) { return record.layer == migration.layer_idx && record.expert == migration.expert_id; });
+            ASSERT_NE(edge, ledger.edges.end());
+            EXPECT_TRUE(edge->valid());
+            EXPECT_EQ(edge->axis, migration.axis)
+                << "the durable journal must preserve each authored command objective";
+        }
+        EXPECT_TRUE(std::any_of(ledger.edges.begin(), ledger.edges.end(),
+            [](const auto &edge) { return advancesTierResidency(edge.axis); }));
+        EXPECT_TRUE(std::any_of(ledger.edges.begin(), ledger.edges.end(),
+            [](const auto &edge) { return advancesParticipantPlacement(edge.axis); }));
 
         const auto records = PerfStatsCollector::snapshot(
             {"moe_overlay_residency"});
@@ -4971,6 +5113,89 @@ namespace llaminar2::test
         auto successor_sequence = authority.tryAcquireGraphSequenceSnapshot();
         ASSERT_TRUE(successor_sequence.has_value());
         EXPECT_EQ(successor_sequence->epoch(), 2u);
+    }
+
+    /** @test Descendants remain admitted through a pending publisher; every original reader must retire. */
+    TEST(Test__MoEOverlayResidencyAuthority, GraphSequenceDescendantsDrainReservedPublication)
+    {
+        for(int replay=0;replay<20;++replay) {
+            auto histogram=histogramWithCounts({90,20,80,10,100,70});
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan=threeTierPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced,RoutedExpertOwnerOrder::Ordinal),
+                .model_metadata=modelMetadata(),.maintenance_mode=MoERebalanceRuntimeMode::Dynamic,
+                .histogram=histogram.get(),.perf_device="sequence-descendant"});
+            RecordingTransport transport(&authority);
+            auto transaction=authority.proposeFromHistogram();
+            // Initial snapshot metadata intentionally remains model-owned. Observe
+            // reclamation of the actual published reader/counter state instead.
+            const auto old=MoEOverlayResidencyAuthorityConcurrencyPeer::publishedEpochLifetime(authority);
+            auto parent=authority.tryAcquireGraphSequenceSnapshot();ASSERT_TRUE(parent);
+            auto dispatch=authority.tryAcquireTicketSnapshot();ASSERT_TRUE(dispatch);
+            auto early=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(authority,*parent);
+            ASSERT_EQ(authority.beginApply(transaction,transport).status,MoEOverlayResidencyApplyStatus::Started);
+            transaction={}; // The proposal must not itself retain the old snapshot oracle.
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Preparing);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary);
+            // This actual call would deadlock if it reentered current admission.
+            auto child=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(authority,*parent);
+            EXPECT_EQ(child.epoch(),parent->epoch());EXPECT_EQ(&*child,&**parent);
+            EXPECT_EQ(child.purpose(),MoEOverlayResidencyAuthority::TicketLeasePurpose::InferenceGraphSequence);
+            EXPECT_EQ(authority.activeTicketCount(),4u);
+            bool reached_injected_failure=false;
+            try {
+                auto partial=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(authority,child);
+                EXPECT_EQ(authority.activeTicketCount(),5u);
+                reached_injected_failure=true;
+                throw std::runtime_error("original child failure");
+            } catch(const std::runtime_error& failure) {
+                EXPECT_TRUE(reached_injected_failure);
+                EXPECT_STREQ(failure.what(),"original child failure");
+            }
+            EXPECT_TRUE(reached_injected_failure);
+            EXPECT_EQ(authority.activeTicketCount(),4u);
+            parent.reset();early={};
+            EXPECT_EQ(authority.activeTicketCount(),2u);
+            EXPECT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary);
+            EXPECT_EQ(transport.calls,(std::vector<std::string>{"stage","prepare"}));
+            child={};
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Publishing);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Published);
+            EXPECT_EQ(authority.snapshot()->epoch,2u);EXPECT_FALSE(old.expired());
+            EXPECT_EQ(authority.pendingRetirementCount(),1u);
+            EXPECT_EQ(authority.stats().old_epoch_retirements,0u);
+            dispatch.reset();
+            EXPECT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Idle);
+            EXPECT_EQ(authority.activeTicketCount(),0u);
+            EXPECT_EQ(authority.pendingRetirementCount(),0u);
+            EXPECT_EQ(authority.stats().old_epoch_retirements,1u);
+            EXPECT_TRUE(old.expired());
+            auto next=authority.tryAcquireGraphSequenceSnapshot();ASSERT_TRUE(next);EXPECT_EQ(next->epoch(),2u);
+        }
+    }
+
+    /** @test Empty, moved, foreign and wrong-purpose parents cannot mint a reader or alter publication. */
+    TEST(Test__MoEOverlayResidencyAuthority, GraphSequenceDescendantsRejectInvalidParents)
+    {
+        const auto config=[] {return MoEOverlayResidencyAuthority::Config{
+            .initial_plan=threeTierPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced,RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata=modelMetadata()};};
+        MoEOverlayResidencyAuthority original(config()),foreign(config());
+        MoEOverlayResidencyAuthority::TicketLease empty;
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,empty),std::invalid_argument);
+        auto dispatch=original.tryAcquireTicketSnapshot();ASSERT_TRUE(dispatch);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,*dispatch),std::invalid_argument);
+        auto exact=original.tryAcquireTicketSnapshot(1);ASSERT_TRUE(exact);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,*exact),std::invalid_argument);
+        auto parent=original.tryAcquireGraphSequenceSnapshot();ASSERT_TRUE(parent);
+        auto moved=std::move(*parent);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,*parent),std::invalid_argument);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(foreign,moved),std::invalid_argument);
+        EXPECT_EQ(original.activeTicketCount(),3u);EXPECT_EQ(foreign.activeTicketCount(),0u);
+        auto child=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,moved);
+        EXPECT_EQ(original.activeTicketCount(),4u);moved={};child={};dispatch.reset();exact.reset();
+        EXPECT_EQ(original.activeTicketCount(),0u);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,child),std::invalid_argument);
+        EXPECT_EQ(original.snapshot()->epoch,1u);EXPECT_EQ(foreign.snapshot()->epoch,1u);
     }
 
     /**
@@ -5481,11 +5706,10 @@ namespace llaminar2::test
                         .nanoseconds_per_activation = {price, 2 * price, 3 * price}});
                     for (int participant = 0; participant < 2; ++participant)
                     {
-                        service->participant_costs.push_back({.participant_id = participant,
+                        service->target_costs.push_back({.target = MoEOverlayRouteTarget::whole(participant),
                             .layer = layer,
                             .nanoseconds_per_activation = {price, 2 * price, 3 * price}});
-                        movement->costs.push_back({.source_participant = participant,
-                            .destination_participant = 1 - participant, .layer = layer,
+                        movement->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(participant), .destination_target = MoEOverlayRouteTarget::whole(1 - participant), .layer = layer},
                             .transfer_and_repack_ns = 1, .inference_interference_ns = 1});
                     }
                 }
@@ -5680,10 +5904,10 @@ namespace llaminar2::test
             case 0: fixture.service->production_topology = ExpertHistogramProductionTopology::uniform(
                         2, kAllExpertHistogramProductionSources, 0); break;
             case 1: fixture.service->costs[0].layer = 0; break;
-            case 2: fixture.service->participant_costs[0].layer = 0; break;
-            case 3: fixture.movement->costs[0].layer = 0; break;
+            case 2: fixture.service->target_costs[0].layer = 0; break;
+            case 3: fixture.movement->costs[0].coordinate.layer = 0; break;
             case 4: fixture.service->costs.pop_back(); break;
-            case 5: fixture.service->participant_costs.pop_back(); break;
+            case 5: fixture.service->target_costs.pop_back(); break;
             case 6: fixture.movement->costs.pop_back(); break;
             case 7: fixture.movement->costs.back() = fixture.movement->costs.front(); break;
             }
@@ -5692,3 +5916,14 @@ namespace llaminar2::test
     }
 
 } // namespace llaminar2::test
+
+#include "CPUJointPlacementCandidateContract.inc"
+#include "CPUJointWholeGPUOwnerTransitionContract.inc"
+#include "MoEMigrationCommandAxisContract.inc"
+#include "CPUJointPlacementTransactionContract.inc"
+
+#include "CPUJointAuthoritativeTargetContract.inc"
+
+#include "CPUJointCalibrationTargetContract.inc"
+
+#include "CPUJointWholeGPUAuthorityReplay.inc"

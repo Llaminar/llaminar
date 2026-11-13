@@ -26,14 +26,15 @@ namespace llaminar2
         plan.architecture_ = source.metadata().memoryProfile().architecture;
         plan.request_ = request;
         plan.geometry_ = source.sampleGeometry(request);
-        const auto *tensor = source.loader().getModel().findTensor(request.tensor_name);
+        const auto *tensor = source.loader().tensorInfo(request.tensor_name);
         plan.gguf_type_ = static_cast<uint32_t>(tensor->type);
         plan.format_ = planning_sample_wire::sourceFormat(plan.tensorType());
         if (PreparedWeightRepresentationContract::isGDNProjectionSource(
                 inferWeightRole(request.tensor_name), request.tensor_name, plan.architecture_))
             plan.arithmetic_ = debugEnv().gemm.gdn_projection_arithmetic;
         if (inferWeightRole(request.tensor_name) == WeightRole::MoERouter)
-            plan.router_arithmetic_ = debugEnv().gemm.moe_router_arithmetic;
+            plan.router_arithmetic_ = resolveMoERouterArithmetic(
+                debugEnv().gemm.moe_router_arithmetic, plan.architecture_);
         return deserialize(plan.serialize());
     }
 

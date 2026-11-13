@@ -4,8 +4,9 @@
  *
  * Initialization first-touches host pages with the same CPU workshare used by
  * inference. Nonconstant inputs prevent compressible fill patterns from
- * exaggerating GPU bandwidth. Exact native events delimit GPU replay; source
- * uploads, graph construction and warmup are outside the service observation.
+ * exaggerating GPU bandwidth. Captured fixed device clocks delimit three
+ * complete GPU invocations; source uploads, graph construction, host enqueue
+ * gaps and the sole original warmup are outside the service observation.
  */
 #include "planning/PlanningMemoryBandwidthMeasurement.h"
 #include "planning/RankHardwareOwnership.h"
@@ -112,8 +113,7 @@ namespace llaminar2
         if (request.device().is_gpu())
         {
             builder.add(execution, PhysicalMemoryOwner::ExecutionWorkspace, request.usefulBytes());
-            builder.add(execution, PhysicalMemoryOwner::NativeGraphExecutable,
-                GPUGraphMemoryContract::reservationBytesPerExecutable(request.device()));
+            PlanningExecutionMeasurement::contributeGPUObservationMemory(host, execution, builder);
         }
     }
 
@@ -172,20 +172,20 @@ namespace llaminar2
         TransferEngine::prepareDeviceOutput(&output, device, stream.get());
         TransferEngine::requireDeviceInput(&input, device, stream.get());
         TransferEngine::requireDeviceInput(&residual, device, stream.get());
-        const size_t graph_bytes = GPUGraphMemoryContract::reservationBytesPerExecutable(device);
+        const size_t graph_bytes = PlanningExecutionMeasurement::kPreparedGraphCount *
+            GPUGraphMemoryContract::reservationBytesPerExecutable(device);
         auto graph_claim = memory->reserveNewAllocations(device, PhysicalMemoryOwner::NativeGraphExecutable, graph_bytes);
         auto graph = worker.createGraphCapture(stream.get());
         require(bool(graph), "native graph creation failed");
+        auto clock = std::make_unique<PlanningNativeGPUClockBuffer>(worker, device, stream, 2, memory);
         ScopedBackendGraphCapture capture(worker, *graph, "planning streaming memory bandwidth");
         require(capture.begin(), "native graph begin failed");
         require(execute(), "captured production residual failed");
         capture.finish();
-        require(graph->prepareRuntimeContextStorage(memory), "streaming context storage preparation failed");
-        require(graph->nodeCount() && graph->instantiate(), "nonempty native graph instantiation failed");
-        require(GPUGraphMemoryContract::acceptsFamilyObservation(device, graph->residentMemoryBytes(), graph_bytes),
+        auto timing = PlanningExecutionMeasurement::recordGPU(work, worker, std::move(clock), std::move(graph));
+        timing.prepare(memory);
+        require(GPUGraphMemoryContract::acceptsFamilyObservation(device, timing.residentMemoryBytes(), graph_bytes),
             "native graph exceeded physical admission");
-        auto *backend = getBackendFor(device);
-        require(backend != nullptr, "prepared GPU backend is missing");
-        return {request, graph->nodeCount(), PlanningExecutionMeasurement::gpu(work, *backend, device, *graph)};
+        return {request, timing.graphNodeCount(), timing.observe()};
     }
 }

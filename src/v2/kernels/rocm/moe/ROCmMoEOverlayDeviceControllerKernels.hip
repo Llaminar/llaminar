@@ -5,10 +5,13 @@
  * Every action is submitted to the caller's exact non-default stream. The
  * shared implementation performs only system-scope mapped-memory operations;
  * it does not synchronize, allocate, copy through the host, or infer topology.
+ * Constant-frequency service timing borrows the startup-admitted wall clock;
+ * launch recording never rediscovers hardware or substitutes a core clock.
  */
 
 #include "ROCmMoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayDeviceControllerDispatch.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 
 #include <hip/hip_runtime.h>
 
@@ -103,17 +106,13 @@ extern "C" bool hipMoEOverlayFinishServiceTelemetry(
     int device_ordinal,
     void *stream)
 {
-    int wall_clock_rate_khz = 0;
     if (!runtime_layer || !layer_telemetry || !sample || num_experts == 0u ||
-        !selectLaunchContext(device_ordinal, stream) ||
-        hipDeviceGetAttribute(
-            &wall_clock_rate_khz,
-            hipDeviceAttributeWallClockRate,
-            device_ordinal) != hipSuccess ||
-        wall_clock_rate_khz <= 0)
+        !selectLaunchContext(device_ordinal, stream))
     {
         return false;
     }
+    const auto wall_clock_rate_khz = llaminar2::rocmServiceWallClockRateKHz(
+        llaminar2::rocmHardwareMetadata().at(device_ordinal));
     hipLaunchKernelGGL(
         llaminar2::moe_overlay_service_device::finishServiceTelemetryKernel,
         dim3(1u),

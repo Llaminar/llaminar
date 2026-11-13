@@ -70,6 +70,23 @@ namespace llaminar2
             throw std::invalid_argument("Unknown GPU graph executable memory class");
         }
 
+        /**
+         * Inclusive conservative host backing per declared General slot.
+         * RetainedParticipantGraphExecutable::generalBOM and its original
+         * factory consume this through the same PMA as the existing device
+         * unit, with ProcessRuntime retention. It is substantial headroom,
+         * not exact SDK attribution or source-hash eligibility. Other graph
+         * owners are unchanged until they explicitly declare this host policy.
+         */
+        static constexpr std::size_t kGeneralHostReservationBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+
+        /** @brief Host allowance for a supported original General slot, independent of source hashes or observed allocator deltas. */
+        [[nodiscard]] static std::size_t generalHostReservationBytesPerExecutable(DeviceId device)
+        {
+            (void)reservationBytesPerExecutable(device, GPUGraphExecutableClass::General);
+            return kGeneralHostReservationBytes;
+        }
+
         /** CUDA driver-pool reservation unit for one retained graph slot. */
         static constexpr std::size_t kCUDAExecutableReservationBytes =
             22ULL * 1024ULL * 1024ULL;

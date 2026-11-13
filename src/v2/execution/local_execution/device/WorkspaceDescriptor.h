@@ -11,9 +11,16 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * A complete transient CPU grouped-MoE declaration is carried beside named
+ * slab regions. Its owned roots share this allocator lifetime and sole PMA
+ * issuer; the serial-family envelope freezes before any consumer is bound.
  */
 
 #pragma once
+#include <memory>
+#include <limits>
+#include <stdexcept>
+
 
 #include <string>
 #include <vector>
@@ -22,6 +29,9 @@
 
 namespace llaminar2
 {
+    struct CPUGroupedMoEStorageLayout;
+    struct CPURouterQ8StorageLayout;
+
 
     /**
      * @brief Execution regime in which a workspace buffer may be live.
@@ -158,6 +168,12 @@ namespace llaminar2
     struct WorkspaceRequirements
     {
         std::vector<WorkspaceDescriptor> buffers;
+        std::shared_ptr<const CPUGroupedMoEStorageLayout> cpu_grouped_moe_storage; ///< Optional complete transient CPU root declaration.
+
+        std::shared_ptr<const CPURouterQ8StorageLayout> cpu_router_q8_storage; ///< Optional independent router declaration; coalesces only with this manager's grouped root.
+
+        /** @return Whether no named or typed storage is declared. */
+        bool empty() const noexcept { return buffers.empty() && !cpu_grouped_moe_storage && !cpu_router_q8_storage; }
 
         /**
          * @brief Calculate total bytes needed for all buffers
@@ -167,11 +183,13 @@ namespace llaminar2
          *
          * @return Sum of all buffer size_bytes
          */
-        size_t total_bytes() const
+        size_t named_bytes() const
         {
             size_t total = 0;
             for (const auto &buf : buffers)
             {
+                if (buf.size_bytes > std::numeric_limits<size_t>::max() - total)
+                    throw std::overflow_error("Named workspace byte sum overflows");
                 total += buf.size_bytes;
             }
             return total;
@@ -184,16 +202,41 @@ namespace llaminar2
          *
          * @return Upper bound on memory needed including alignment
          */
-        size_t total_bytes_with_alignment() const
+        size_t named_bytes_with_alignment() const
         {
             size_t total = 0;
             for (const auto &buf : buffers)
             {
-                // Round up to alignment boundary
-                size_t aligned_size = (buf.size_bytes + buf.alignment - 1) & ~(buf.alignment - 1);
+                if (buf.alignment == 0 || (buf.alignment & (buf.alignment - 1)) != 0)
+                    throw std::invalid_argument("Named workspace alignment must be a positive power of two");
+                const size_t padding = buf.alignment - 1;
+                if (buf.size_bytes > std::numeric_limits<size_t>::max() - padding)
+                    throw std::overflow_error("Aligned workspace extent overflows");
+                const size_t aligned_size = (buf.size_bytes + padding) & ~padding;
+                if (aligned_size > std::numeric_limits<size_t>::max() - total)
+                    throw std::overflow_error("Aligned workspace byte sum overflows");
                 total += aligned_size;
             }
             return total;
+        }
+
+        /** @return Complete CPU root contribution, coalescing a compatible grouped router once. */
+        size_t cpu_grouped_bytes() const;
+        /** @return Named logical bytes plus independently allocated typed roots. */
+        size_t total_bytes() const {return addCPUGrouped(named_bytes());}
+        /** @return Aligned named bytes plus exact independently rounded typed roots. */
+        size_t total_bytes_with_alignment() const {return addCPUGrouped(named_bytes_with_alignment());}
+        /**
+         * @brief Add independently allocated typed roots to a named-region extent.
+         * @param named Already checked named-region byte contribution.
+         * @return Complete byte contribution, without creating a live claim.
+         * @throws std::overflow_error If the complete contribution cannot be represented.
+         */
+        size_t addCPUGrouped(size_t named) const
+        {
+            const auto extra=cpu_grouped_bytes();
+            if(extra>std::numeric_limits<size_t>::max()-named)throw std::overflow_error("Workspace root byte sum overflows");
+            return named+extra;
         }
 
         /**
@@ -201,6 +244,7 @@ namespace llaminar2
          */
         bool has_required_buffers() const
         {
+            if(cpu_grouped_moe_storage || cpu_router_q8_storage)return true;
             for (const auto &buf : buffers)
             {
                 if (buf.required)
@@ -316,53 +360,7 @@ namespace llaminar2
          *
          * @param other Requirements to merge
          */
-        void merge(const WorkspaceRequirements &other)
-        {
-            for (const auto &buf : other.buffers)
-            {
-                bool found = false;
-                for (auto &existing : buffers)
-                {
-                    if (existing.name == buf.name)
-                    {
-                        // Keep larger size
-                        if (buf.size_bytes > existing.size_bytes)
-                        {
-                            existing.size_bytes = buf.size_bytes;
-                        }
-                        // Keep stricter alignment
-                        if (buf.alignment > existing.alignment)
-                        {
-                            existing.alignment = buf.alignment;
-                        }
-                        // Keep required if either is required
-                        existing.required = existing.required || buf.required;
-                        // A name used in more than one regime is a common
-                        // participant buffer and must retain one stable address.
-                        if (existing.regime != buf.regime)
-                        {
-                            existing.regime =
-                                WorkspaceExecutionRegime::Any;
-                        }
-                        // Persistent content is the stronger contract. One
-                        // initialize-once user makes the shared name live for
-                        // the complete serial graph family.
-                        if (buf.content_lifetime ==
-                            WorkspaceContentLifetime::SerialGraphFamily)
-                        {
-                            existing.content_lifetime =
-                                WorkspaceContentLifetime::SerialGraphFamily;
-                        }
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                {
-                    buffers.push_back(buf);
-                }
-            }
-        }
+        void merge(const WorkspaceRequirements &other);
     };
 
 } // namespace llaminar2

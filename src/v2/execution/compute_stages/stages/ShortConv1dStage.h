@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "GDNPreparedQKBinding.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -50,6 +51,7 @@ namespace llaminar2
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
+            GDNQKInputContract qk_contract=GDNRawQKInput{}; ///< Immutable raw or paired prepared program.
 
             ITensor *input = nullptr;        ///< Input [seq_len, channels] (modified in-place for decode)
             ITensor *output = nullptr;       ///< Output [seq_len, channels]
@@ -107,6 +109,9 @@ namespace llaminar2
         ~ShortConv1dStage() override = default;
 
         bool execute(IDeviceContext *ctx) override;
+        /** @return Added immutable activation/program identity; raw retains its original zero. */
+        uint64_t graphCaptureVariantSignature() const override
+        { return gdnQKCaptureIdentity(params_.qk_contract); }
         ComputeStageType type() const override { return ComputeStageType::SHORT_CONV1D; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -203,8 +208,11 @@ namespace llaminar2
          * recurrent layer only after the complete transaction validates.
          */
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
+        /** @brief Validate every CPU request and expose exact native snapshot-copy plans before mutation. */
+        bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
-            const int *device_row_index,
+            std::span<const int> device_row_index_view,
             void *stream) override;
         /**
          * @brief Restore one captured short-conv state row per request.
@@ -215,7 +223,7 @@ namespace llaminar2
          * banks are implemented; it must not be replaced by a scalar loop.
          */
         bool restoreVerifierStateCaptureRowsFromDeviceIndices(
-            const int *device_row_indices,
+            std::span<const int> device_row_indices_view,
             int request_count,
             int row_index_stride,
             void *stream) override;

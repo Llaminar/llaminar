@@ -1,3 +1,4 @@
+#include "backends/GPUDeviceContextPool.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 
@@ -14,12 +15,12 @@
 #include "../../../mocks/MockComputeStage.h"
 #include "../../../utils/BenchmarkGeometrySelection.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
-#include "../../../utils/NativeVNNITrainerEvidence.h"
+#include "../../../utils/NativeQuantisedTrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
-#include "../native_vnni_dispatch/NativeVNNIMoEPrefillManifest.h"
-#include "../native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
-#include "../native_vnni_dispatch/NativeVNNIProfilerControl.h"
+#include "../native_quantised_dispatch/NativeQuantisedMoEPrefillManifest.h"
+#include "../native_quantised_dispatch/NativeQuantisedMoERoutingProfiles.h"
+#include "../native_quantised_dispatch/NativeQuantisedProfilerControl.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDAGraphCapture.h"
@@ -27,7 +28,7 @@
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
-#include "../native_vnni_dispatch/GPUTrainerVerification.h"
+#include "../native_quantised_dispatch/GPUTrainerVerification.h"
 
 #include <cuda_runtime.h>
 #include <dlfcn.h>
@@ -838,9 +839,9 @@ namespace
     {
         std::vector<std::unique_ptr<llaminar2::TensorBase>> weights;
         std::vector<llaminar2::test::GpuPreparedGemm> prepared;
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
         int gateup_table_id = -1;
         int down_table_id = -1;
     };
@@ -886,8 +887,8 @@ namespace
                 "perf.moe_verifier." + backend_name + "." + role + "." + std::to_string(seed),
                 llaminar2::ModelContextId{model_context_base + static_cast<uint64_t>(seed)}));
 
-            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-            EXPECT_TRUE(tables.prepared.back().kernel->exportNativeVNNIMatrixDesc(desc))
+            llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+            EXPECT_TRUE(tables.prepared.back().kernel->exportNativeQuantisedMatrixDesc(desc))
                 << "failed to export native descriptor role=" << role;
             EXPECT_EQ(desc.n, rows);
             EXPECT_EQ(desc.k, cols);
@@ -1561,9 +1562,9 @@ namespace
     /** Emit one authenticated aggregate row for a CUDA production candidate. */
     void writeCudaMoEProductionEvidence(
         std::FILE *csv,
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
-        const llaminar2::test::native_vnni_dispatch::MoERoutingProfileStats &route_stats,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile,
+        const llaminar2::test::native_quantised_dispatch::MoERoutingProfileStats &route_stats,
         int rows,
         const CudaMoEProductionEvidence &evidence)
     {
@@ -1582,7 +1583,7 @@ namespace
         row << std::setprecision(17)
             << "cuda,moe_production_prefill,"
             << routed_case.evidenceId() << ','
-            << llaminar2::test::native_vnni_dispatch::moeRoutingProfileName(
+            << llaminar2::test::native_quantised_dispatch::moeRoutingProfileName(
                    route_profile) << ','
             << routed_case.routed.gate << ','
             << routed_case.routed.up << ','
@@ -1636,8 +1637,8 @@ namespace
     /** Retain every native CUDA event sample for later corpus authentication. */
     void writeCudaMoEProductionTimingEvidence(
         std::FILE *timing_csv,
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile,
         int rows,
         const CudaMoEProductionEvidence &evidence)
     {
@@ -1655,7 +1656,7 @@ namespace
                     "cuda,moe_production_prefill,%s,%s,%d,%s,%s,%zu,%d,%.9f,%a\n",
                     routed_case.evidenceId().c_str(),
                     std::string(
-                        llaminar2::test::native_vnni_dispatch::
+                        llaminar2::test::native_quantised_dispatch::
                             moeRoutingProfileName(route_profile)).c_str(),
                     rows,
                     evidence.candidate.id().c_str(),
@@ -1807,9 +1808,9 @@ namespace
      * @param timing_csv Optional raw native-event sidecar destination.
      */
     void runCudaProductionMoERoutedCase(
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
         int rows,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile,
         int device_ordinal,
         const CudaMoEProductionSweepSettings &settings,
         std::FILE *csv,
@@ -1902,13 +1903,13 @@ namespace
         const std::vector<float> hidden_values =
             makeHiddenValues(rows, routed_case.hidden_size);
         const std::vector<float> routing_indices =
-            llaminar2::test::native_vnni_dispatch::makeMoERoutingIndices(
+            llaminar2::test::native_quantised_dispatch::makeMoERoutingIndices(
             route_profile,
             rows,
             routed_case.experts_per_token,
             routed_case.expert_count);
         const auto route_stats =
-            llaminar2::test::native_vnni_dispatch::summarizeMoERoutingProfile(
+            llaminar2::test::native_quantised_dispatch::summarizeMoERoutingProfile(
                 routing_indices,
                 routed_case.expert_count);
         const std::vector<float> routing_weights = makeRoutingWeights(
@@ -1984,7 +1985,8 @@ namespace
             reference_candidate.schedule);
         llaminar2::PerfStatsCollector::reset();
         {
-            llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
+            auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
             llaminar2::ScopedBackendGraphCapture capture(
                 graph,
                 "CUDA production MoE reference capture");
@@ -2084,7 +2086,8 @@ namespace
                 candidate.down_columns,
                 candidate.schedule);
             llaminar2::PerfStatsCollector::reset();
-            llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
+            auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
             llaminar2::ScopedBackendGraphCapture capture(
                 graph,
                 "CUDA production MoE candidate capture");
@@ -2165,7 +2168,7 @@ namespace
                 }
                 std::fprintf(
                     stderr,
-                    "[NativeVNNIProfiler][CUDA-MoE-Prefill] request=%s "
+                    "[NativeQuantisedProfiler][CUDA-MoE-Prefill] request=%s "
                     "candidate=%s M=%d stream_id=%llu launches=1\n",
                     settings.profiler_request_id.c_str(),
                     candidate.id().c_str(),
@@ -2303,11 +2306,11 @@ namespace
      * to the exhaustive certificate.
      */
     void proveCudaProductionCandidateInvariance(
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
         int rows,
         int device_ordinal,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile =
-            llaminar2::test::native_vnni_dispatch::MoERoutingProfile::Uniform,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile =
+            llaminar2::test::native_quantised_dispatch::MoERoutingProfile::Uniform,
         std::optional<CudaMoEProductionCandidate> proof_candidate = std::nullopt)
     {
         CudaMoEProductionSweepSettings settings{};
@@ -2476,7 +2479,8 @@ namespace
          * a benchmark launch throws, preventing one failed cell from leaving
          * the CUDA stream in capture mode and poisoning every later cell.
          */
-        llaminar2::CUDAGraphCapture graph(stream, /*device_ordinal=*/0);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         {
             llaminar2::ScopedBackendGraphCapture capture_transaction(
                 graph,
@@ -2642,12 +2646,12 @@ namespace
         if (moe_workspace)
             moe_workspace->bindWorkspace(workspace.get());
 
-        llaminar2::DeviceNativeVNNIMatrixDesc gate_desc{};
-        llaminar2::DeviceNativeVNNIMatrixDesc up_desc{};
-        llaminar2::DeviceNativeVNNIMatrixDesc down_desc{};
-        EXPECT_TRUE(prepared.gate_kernel->exportNativeVNNIMatrixDesc(gate_desc));
-        EXPECT_TRUE(prepared.up_kernel->exportNativeVNNIMatrixDesc(up_desc));
-        EXPECT_TRUE(prepared.down_kernel->exportNativeVNNIMatrixDesc(down_desc));
+        llaminar2::DeviceNativeQuantisedMatrixDesc gate_desc{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc up_desc{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc down_desc{};
+        EXPECT_TRUE(prepared.gate_kernel->exportNativeQuantisedMatrixDesc(gate_desc));
+        EXPECT_TRUE(prepared.up_kernel->exportNativeQuantisedMatrixDesc(up_desc));
+        EXPECT_TRUE(prepared.down_kernel->exportNativeQuantisedMatrixDesc(down_desc));
         const int gateup_table =
             moe ? moe->uploadGroupedExpertGateUpDescriptorTables(
                       &gate_desc, &up_desc, /*num_experts=*/1, d_model, intermediate)
@@ -2732,7 +2736,8 @@ namespace
         const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        llaminar2::CUDAGraphCapture graph(stream, /*device_ordinal=*/0);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         {
             llaminar2::ScopedBackendGraphCapture capture_transaction(
                 graph,
@@ -3003,13 +3008,13 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
             "CUDA production MoE sweep requires one explicit route profile");
     }
     const auto route_profile =
-        llaminar2::test::native_vnni_dispatch::parseMoERoutingProfile(
+        llaminar2::test::native_quantised_dispatch::parseMoERoutingProfile(
             route_profile_environment);
 
     settings.profiler_request_id =
-        llaminar2::test::native_vnni_dispatch::profilerRequestId();
+        llaminar2::test::native_quantised_dispatch::profilerRequestId();
     const std::string profiler_candidate_id =
-        llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+        llaminar2::test::native_quantised_dispatch::profilerEnvironment(
             "LLAMINAR_CUDA_MOE_PRODUCTION_PROFILE_CANDIDATE");
     if (settings.profiling() != !profiler_candidate_id.empty())
     {
@@ -3028,7 +3033,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
                 profiler_candidate_id);
         }
         const std::string selected_cases =
-            llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+            llaminar2::test::native_quantised_dispatch::profilerEnvironment(
                 "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_CASES");
         if (selected_cases.empty() ||
             selected_cases.find(',') != std::string::npos ||
@@ -3092,7 +3097,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
 
     int executed_cells = 0;
     for (const auto &routed_case :
-         llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases())
+         llaminar2::test::native_quantised_dispatch::nativeQuantisedMoERoutedPrefillCases())
     {
         if (!envCsvContainsOrUnset(
                 "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_CASES",
@@ -3113,7 +3118,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
             SCOPED_TRACE(
                 routed_case.evidenceId() + "/route=" +
                 std::string(
-                    llaminar2::test::native_vnni_dispatch::
+                    llaminar2::test::native_quantised_dispatch::
                         moeRoutingProfileName(route_profile)) +
                 "/M" + std::to_string(rows));
             std::fprintf(
@@ -3122,7 +3127,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
                 "down=%s hidden=%d expert_width=%d experts=%d top_k=%d\n",
                 routed_case.evidenceId().c_str(),
                 std::string(
-                    llaminar2::test::native_vnni_dispatch::
+                    llaminar2::test::native_quantised_dispatch::
                         moeRoutingProfileName(route_profile)).c_str(),
                 rows,
                 routed_case.routed.gate.c_str(),
@@ -3168,7 +3173,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_PairedGateUpRegisterLifetimeAllFormats)
     ScopedEnvOverride perfstats("LLAMINAR_PERF_STATS_JSON", "1");
     for (const auto &format : llaminar2::test::quantizedVerifierFormats())
     {
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase fixture{
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase fixture{
             .hidden_size = 512,
             .routed_expert_width = 256,
             .expert_count = 5,
@@ -3188,7 +3193,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_PairedGateUpRegisterLifetimeAllFormats)
             };
             proveCudaProductionCandidateInvariance(
                 fixture, 39, 0,
-                llaminar2::test::native_vnni_dispatch::MoERoutingProfile::PowerLaw,
+                llaminar2::test::native_quantised_dispatch::MoERoutingProfile::PowerLaw,
                 candidate);
         }
     }
@@ -3235,7 +3240,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionCandidatesAreSerialRowByteInvarian
     const int device_ordinal = envInt(
         "LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_DEVICE", 0);
     const auto &cases =
-        llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases();
+        llaminar2::test::native_quantised_dispatch::nativeQuantisedMoERoutedPrefillCases();
 
     ScopedEnvOverride rowwise_iterations(
         "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
@@ -3296,7 +3301,7 @@ TEST(
         findCudaMoEProductionCandidate("imma_paired_g32__d32");
     ASSERT_TRUE(candidate.has_value());
     const auto &cases =
-        llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases();
+        llaminar2::test::native_quantised_dispatch::nativeQuantisedMoERoutedPrefillCases();
     const auto selected = std::find_if(
         cases.begin(),
         cases.end(),
@@ -3319,7 +3324,7 @@ TEST(
         *selected,
         /*rows=*/512,
         /*device_ordinal=*/0,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile::PowerLaw,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile::PowerLaw,
         *candidate);
 #endif
 }

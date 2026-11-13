@@ -7,16 +7,28 @@
  * - CUDA runtime context initialization
  * - cuBLAS handle creation and management
  * - Stream and event creation/destruction
+ * Physical ordinal/name validation borrows the immutable admitted inventory;
+ * the worker alone owns mutable streams, library handles and resource teardown.
  *
  * @author David Sanftenberg
  * @date February 2026
  */
 
 #include "NvidiaDeviceContext.h"
+#include "backends/NativeContextPreparation.h"
+#include "backends/GPUCaptureDependencyRoster.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "CUDAHardwareMetadata.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "backends/GPUWorkerInitialization.h"
+#include "backends/NativeContextOpaqueContract.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "CUDAGraphCapture.h"
+#include "CUDADriverApi.h"
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
+#include <exception>
 
 namespace llaminar2
 {
@@ -65,27 +77,19 @@ namespace llaminar2
     // ============================================================================
 
     NvidiaDeviceContext::NvidiaDeviceContext(int device_ordinal)
-        : device_ordinal_(device_ordinal)
+        : NvidiaDeviceContext(device_ordinal,{}) {}
+
+    NvidiaDeviceContext::NvidiaDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> prepared_stack)
+        : process_lifetime_lease_(GPUDeviceProcessLifetime::acquireNativeContext()),
+          source_native_program_stack_bytes_(prepared_stack ? CUDANativeProgramStack::capacityBytes : 0u),
+          device_ordinal_(device_ordinal)
     {
         LOG_DEBUG("[NvidiaDeviceContext] Creating context for CUDA device " << device_ordinal);
 
-        // Validate device ordinal before starting worker
-        int device_count = 0;
-        cudaError_t err = cudaGetDeviceCount(&device_count);
-        if (err != cudaSuccess)
-        {
-            std::ostringstream oss;
-            oss << "cudaGetDeviceCount failed: " << cudaGetErrorString(err);
-            throw std::runtime_error(oss.str());
-        }
-
-        if (device_ordinal < 0 || device_ordinal >= device_count)
-        {
-            std::ostringstream oss;
-            oss << "Invalid CUDA device ordinal " << device_ordinal
-                << " (available: 0-" << (device_count - 1) << ")";
-            throw std::runtime_error(oss.str());
-        }
+        // This is explicit resource startup, before the worker can select a
+        // context or allocate. Physical facts never become worker-owned state.
+        initializeCUDAHardwareMetadata();
+        (void)cudaHardwareMetadata().at(device_ordinal_);
 
         // Start worker thread
         shutdown_requested_.store(false);
@@ -93,7 +97,16 @@ namespace llaminar2
 
         try
         {
-            worker_thread_ = std::thread(&NvidiaDeviceContext::workerLoop, this);
+            {
+                // The dedicated GPU-control child needs the admitted rank
+                // partition, not its creator's first OpenMP place. Restore
+                // the creator before waiting or executing any caller work.
+                const ScopedOpenMPPartitionAffinity control_affinity;
+                if(prepared_stack)
+                    worker_thread_.start(std::move(prepared_stack),[](void* self){
+                        static_cast<NvidiaDeviceContext*>(self)->workerLoop();},this);
+                else worker_thread_ = std::thread(&NvidiaDeviceContext::workerLoop, this);
+            }
 
             // Wait for worker to signal it's ready (or failed)
             std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -154,19 +167,34 @@ namespace llaminar2
         worker_thread_id_ = std::this_thread::get_id();
         LOG_TRACE("[NvidiaDeviceContext] Worker thread starting for device " << device_ordinal_);
 
-        // Initialize CUDA context on this thread
-        if (!initializeOnWorker())
+        // One owner-thread guard covers every unpublished handle and every
+        // false/throw exit. Initialization never performs a second local cleanup.
+        bool ready = false;
+        try
+        {
+            ready = runGPUWorkerInitialization(
+                [this] { return initializeOnWorker(); },
+                [this] { cleanupOnWorker(); });
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] Worker initialization exception after rollback: " << error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] Unknown worker initialization exception after rollback");
+        }
+        if (!ready)
         {
             LOG_ERROR("[NvidiaDeviceContext] Failed to initialize CUDA context on worker thread");
-            shutdown_requested_.store(true);
-            queue_cv_.notify_all();
+            publishGPUWorkerReadiness(queue_mutex_, queue_cv_, initialized_, running_,
+                shutdown_requested_, GPUWorkerReadiness::Failed);
             return;
         }
 
-        // Signal that initialization is complete
-        initialized_.store(true);
-        running_.store(true);
-        queue_cv_.notify_all();
+        // Publish every ready flag under the constructor's predicate mutex.
+        publishGPUWorkerReadiness(queue_mutex_, queue_cv_, initialized_, running_,
+            shutdown_requested_, GPUWorkerReadiness::Ready);
 
         LOG_TRACE("[NvidiaDeviceContext] Worker loop started for device " << device_ordinal_);
 
@@ -229,6 +257,19 @@ namespace llaminar2
         // Step 1: Set CUDA device via runtime API
         CUDA_CHECK(cudaSetDevice(device_ordinal_));
 
+        // Source beginNative already retains the SAME conservative opaque
+        // commitment. Materialize program stack now, before creator publication
+        // and final admission, so library first use cannot introduce late growth.
+        // This sets driver context storage only; it launches no warmup work.
+        if(source_native_program_stack_bytes_) {
+            std::size_t actual=0;
+            CUDA_CHECK(cudaDeviceGetLimit(&actual,cudaLimitStackSize));
+            if(actual<source_native_program_stack_bytes_)
+                CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize,source_native_program_stack_bytes_));
+            CUDA_CHECK(cudaDeviceGetLimit(&actual,cudaLimitStackSize));
+            CUDANativeProgramStack::requirePrepared(0u,actual);
+        }
+
         // Step 2: Create default stream (non-blocking for better concurrency)
         CUDA_CHECK(cudaStreamCreateWithFlags(&default_stream_, cudaStreamNonBlocking));
 
@@ -258,10 +299,8 @@ namespace llaminar2
             return false;
         }
 
-        // Step 4: Query device name
-        cudaDeviceProp props;
-        CUDA_CHECK(cudaGetDeviceProperties(&props, device_ordinal_));
-        device_name_ = props.name;
+        // Step 4: Borrow the already admitted physical name, even after reset.
+        device_name_ = cudaHardwareMetadata().at(device_ordinal_).name;
 
         LOG_DEBUG("[NvidiaDeviceContext] CUDA context initialized for device " << device_ordinal_
                                                                                << " (" << device_name_ << ")");
@@ -292,7 +331,6 @@ namespace llaminar2
                 LOG_ERROR("[NvidiaDeviceContext] Failed to create persistent stream "
                           "dependency event: "
                           << cudaGetErrorString(event_status));
-                cleanupOnWorker();
                 return false;
             }
         }
@@ -305,6 +343,9 @@ namespace llaminar2
     void NvidiaDeviceContext::cleanupOnWorker()
     {
         LOG_TRACE("[NvidiaDeviceContext] Cleaning up CUDA resources for device " << device_ordinal_);
+        // Fixed projection handles outlive every graph and retire only with this
+        // exact context. Reject recording before destroying any context resource.
+        projection_resources_.retire(*this);
 
         // Destroy cuBLASLt handle
         if (cublas_lt_handle_ != nullptr)
@@ -312,7 +353,8 @@ namespace llaminar2
             cublasStatus_t status = cublasLtDestroy(cublas_lt_handle_);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                LOG_WARN("[NvidiaDeviceContext] cublasLtDestroy failed: " << status);
+                LOG_ERROR("[NvidiaDeviceContext] cublasLtDestroy failed: " << status);
+                std::terminate();
             }
             cublas_lt_handle_ = nullptr;
         }
@@ -323,7 +365,8 @@ namespace llaminar2
             cublasStatus_t status = cublasDestroy(cublas_handle_);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                LOG_WARN("[NvidiaDeviceContext] cublasDestroy failed: " << status);
+                LOG_ERROR("[NvidiaDeviceContext] cublasDestroy failed: " << status);
+                std::terminate();
             }
             cublas_handle_ = nullptr;
         }
@@ -341,23 +384,25 @@ namespace llaminar2
                 continue;
 
             cudaError_t err = cudaEventDestroy(event);
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+            if (err != cudaSuccess)
             {
                 LOG_ERROR("[NvidiaDeviceContext] cudaEventDestroy(stream dependency) "
                           "failed: "
                           << cudaGetErrorString(err));
+                std::terminate();
             }
             event = nullptr;
         }
 
-        // Destroy default stream (ignore cudaErrorCudartUnloading during shutdown)
+        // Destroy the exact default stream before the vendor runtime may unload.
         if (default_stream_ != nullptr)
         {
             cudaError_t err = cudaStreamDestroy(default_stream_);
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+            if (err != cudaSuccess)
             {
                 LOG_ERROR("[NvidiaDeviceContext] cudaStreamDestroy(default_stream_) failed: "
                           << cudaGetErrorString(err));
+                std::terminate();
             }
             default_stream_ = nullptr;
         }
@@ -489,8 +534,10 @@ namespace llaminar2
 
         std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
         auto it = auxiliary_streams_.find(name);
-        if (it != auxiliary_streams_.end() && it->second)
+        if (it != auxiliary_streams_.end() && it->second.stream)
         {
+            if(it->second.ownership)
+                throw std::logic_error("Raw auxiliary stream lookup cannot borrow an original-admitted stream without its permit");
             const auto class_it =
                 auxiliary_stream_scheduling_classes_.find(name);
             if (class_it == auxiliary_stream_scheduling_classes_.end() ||
@@ -500,7 +547,7 @@ namespace llaminar2
                           << name);
                 return nullptr;
             }
-            return static_cast<void *>(it->second);
+            return static_cast<void *>(it->second.stream);
         }
 
         cudaStream_t stream = nullptr;
@@ -540,45 +587,250 @@ namespace llaminar2
         }
         if (!stream)
             return nullptr;
-        auxiliary_streams_[name] = stream;
+        auxiliary_streams_[name] = AuxiliaryStreamRecord{stream,{}};
         auxiliary_stream_scheduling_classes_[name] = scheduling_class;
         if (created)
             *created = true;
         return static_cast<void *>(stream);
     }
 
+    void NvidiaDeviceContext::prepareProjectionResources()
+    {
+        if (!isInitialized()) throw std::logic_error("CUDA projection preparation requires a live context");
+        if (isDeviceGraphCaptureActive()) throw std::logic_error("CUDA projection resources must be prepared before capture");
+        const auto status = cudaSetDevice(device_ordinal_);
+        if (status != cudaSuccess) throw std::runtime_error("Cannot select exact CUDA projection resource owner");
+        // These replace the former fixed global pool at the same prewarm boundary.
+        // Native queue/event storage stays in the existing PMA opaque context scope.
+        projection_resources_.prepare(*this);
+    }
+    GPUProjectionSubmission NvidiaDeviceContext::acquireProjectionSubmission(
+        void *root, GPUProjectionSubmissionKind kind, bool native_capturing)
+    {
+        if (!isInitialized()) throw std::logic_error("CUDA projection submission requires a live context");
+        const auto stream = static_cast<cudaStream_t>(root);
+        CUcontext current_context = nullptr, stream_context = nullptr;
+        if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+            cudaSetDevice(device_ordinal_) != cudaSuccess ||
+            CUDADriverApi::instance().ctxGetCurrent(&current_context) != CUDA_SUCCESS || !current_context ||
+            CUDADriverApi::instance().streamGetCtx(stream, &stream_context) != CUDA_SUCCESS ||
+            current_context != stream_context)
+            throw std::logic_error("CUDA projection requires an exact stream on its owning native context");
+        if (kind == GPUProjectionSubmissionKind::Eager && !native_capturing)
+        {
+            // Direct eager callers retain the original cold preparation boundary;
+            // complete readiness is reused, never grown during native capture.
+            if (cudaSetDevice(device_ordinal_) != cudaSuccess)
+                throw std::runtime_error("Cannot activate CUDA projection owner");
+            projection_resources_.prepare(*this);
+        }
+        auto submission = projection_resources_.acquire(root, kind, native_capturing);
+        retainProjectionSubmission(submission);
+        return submission;
+    }
+    void NvidiaDeviceContext::assertProjectionResourcesRetirable()
+    { projection_resources_.assertRetirable(); }
+    void NvidiaDeviceContext::beginProjectionResourcesRetirement()
+    { projection_resources_.beginRetirement(); }
+    /** @copydoc GPUProjectionResourceOperations::createProjectionStream */
+    void *NvidiaDeviceContext::createProjectionStream()
+    {
+        cudaStream_t stream = nullptr;
+        const auto status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (status != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] createProjectionStream/cudaStreamCreateWithFlags"
+                      << " device=" << device_ordinal_ << " handle=" << static_cast<void *>(stream)
+                      << " status=" << static_cast<int>(status) << " error=" << cudaGetErrorString(status));
+            return nullptr;
+        }
+        return static_cast<void *>(stream);
+    }
+    /** @copydoc GPUProjectionResourceOperations::createProjectionEvent */
+    void *NvidiaDeviceContext::createProjectionEvent()
+    {
+        cudaEvent_t event = nullptr;
+        const auto status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (status != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] createProjectionEvent/cudaEventCreateWithFlags"
+                      << " device=" << device_ordinal_ << " handle=" << static_cast<void *>(event)
+                      << " status=" << static_cast<int>(status) << " error=" << cudaGetErrorString(status));
+            return nullptr;
+        }
+        return static_cast<void *>(event);
+    }
+    /** @copydoc GPUProjectionResourceOperations::destroyProjectionStream */
+    bool NvidiaDeviceContext::destroyProjectionStream(void *stream) noexcept
+    {
+        const auto selected = cudaSetDevice(device_ordinal_);
+        if (selected != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] destroyProjectionStream/cudaSetDevice"
+                      << " device=" << device_ordinal_ << " handle=" << stream
+                      << " status=" << static_cast<int>(selected) << " error=" << cudaGetErrorString(selected));
+            return false;
+        }
+        const auto destroyed = cudaStreamDestroy(static_cast<cudaStream_t>(stream));
+        if (destroyed != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] destroyProjectionStream/cudaStreamDestroy"
+                      << " device=" << device_ordinal_ << " handle=" << stream
+                      << " status=" << static_cast<int>(destroyed) << " error=" << cudaGetErrorString(destroyed));
+            return false;
+        }
+        return true;
+    }
+    /** @copydoc GPUProjectionResourceOperations::destroyProjectionEvent */
+    bool NvidiaDeviceContext::destroyProjectionEvent(void *event) noexcept
+    {
+        const auto selected = cudaSetDevice(device_ordinal_);
+        if (selected != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] destroyProjectionEvent/cudaSetDevice"
+                      << " device=" << device_ordinal_ << " handle=" << event
+                      << " status=" << static_cast<int>(selected) << " error=" << cudaGetErrorString(selected));
+            return false;
+        }
+        const auto destroyed = cudaEventDestroy(static_cast<cudaEvent_t>(event));
+        if (destroyed != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] destroyProjectionEvent/cudaEventDestroy"
+                      << " device=" << device_ordinal_ << " handle=" << event
+                      << " status=" << static_cast<int>(destroyed) << " error=" << cudaGetErrorString(destroyed));
+            return false;
+        }
+        return true;
+    }
+
+    /** @copydoc IWorkerGPUContext::prepareBatchCaptureDependencies */
+    std::shared_ptr<GPUCaptureDependencyRoster> NvidiaDeviceContext::prepareBatchCaptureDependencies(
+        std::size_t lanes,std::size_t groups,const PreparedGPUContextUsePermit& original)
+    {
+        if(original.worker().get()!=this)throw std::logic_error("Batch dependency roster substituted original worker");
+        std::shared_ptr<GPUCaptureDependencyRoster> result;
+        projection_resources_.withIdleOperation([&]{
+            std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+            if(!batch_capture_dependencies_)batch_capture_dependencies_=GPUCaptureDependencyRoster::create(original,lanes,groups);
+            else batch_capture_dependencies_->grow(original,lanes,groups);
+            result=batch_capture_dependencies_;
+        });
+        return result;
+    }
+
+    /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+    void *NvidiaDeviceContext::getOrCreateAdmittedAuxiliaryStream(
+        const std::string &name,const PreparedGPUContextUsePermit &original,bool *created)
+    {
+        return getOrCreateAdmittedAuxiliaryStream(name,GPUAuxiliaryStreamSchedulingClass::Normal,original,created);
+    }
+
+    /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+    void *NvidiaDeviceContext::getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+        GPUAuxiliaryStreamSchedulingClass scheduling_class,const PreparedGPUContextUsePermit &original,bool *created)
+    {
+        if(created)*created=false;
+        if(name.empty() || original.worker().get()!=this || isGraphCaptureActive())
+            throw std::invalid_argument("Admitted auxiliary stream requires its exact original cold worker/name");
+        if(scheduling_class!=GPUAuxiliaryStreamSchedulingClass::Normal &&
+           scheduling_class!=GPUAuxiliaryStreamSchedulingClass::LatencyCritical &&
+           scheduling_class!=GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance)
+            throw std::invalid_argument("Admitted auxiliary stream has unknown scheduling class");
+        void* result=nullptr;
+        projection_resources_.withIdleOperation([&]{
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        if(auto it=auxiliary_streams_.find(name);it!=auxiliary_streams_.end()){
+            if(!it->second.stream || !it->second.ownership)
+                throw std::logic_error("Admitted auxiliary stream cannot adopt an unadmitted existing handle");
+            const auto priority=auxiliary_stream_scheduling_classes_.find(name);
+            if(priority==auxiliary_stream_scheduling_classes_.end() || priority->second!=scheduling_class)
+                throw std::logic_error("Admitted auxiliary stream scheduling class changed");
+            it->second.ownership->requireOriginal(original,this,name,scheduling_class);
+            result=static_cast<void*>(it->second.stream);return;
+        }
+        auto ownership=NativeAuxiliaryStreamOwnership::claim(original,name,scheduling_class);
+        auto [entry,inserted]=auxiliary_streams_.try_emplace(name);
+        if(!inserted)throw std::logic_error("Auxiliary stream owner record already exists");
+        cudaStream_t stream=nullptr;
+        try{
+            auxiliary_stream_scheduling_classes_.emplace(name,scheduling_class);
+            ownership->beginNativeAttempt();
+            if(scheduling_class==GPUAuxiliaryStreamSchedulingClass::Normal)
+                stream=static_cast<cudaStream_t>(createStream());
+            else {
+                auto error=cudaSetDevice(device_ordinal_);int least=0,greatest=0;
+                if(error==cudaSuccess)error=cudaDeviceGetStreamPriorityRange(&least,&greatest);
+                if(error==cudaSuccess)error=cudaStreamCreateWithPriority(&stream,cudaStreamNonBlocking,
+                    scheduling_class==GPUAuxiliaryStreamSchedulingClass::LatencyCritical?greatest:least);
+                if(error!=cudaSuccess)throw std::runtime_error("Original prioritized auxiliary stream creation failed");
+            }
+            if(!stream)throw std::runtime_error("Original auxiliary stream creator returned null");
+            entry->second.stream=stream;
+            entry->second.ownership=std::move(ownership);
+            entry->second.ownership->delegateToContext();
+        }catch(...){
+            if(stream){
+                // Native destruction precedes commitment completion, including
+                // partial creation; never replace the creator's first failure.
+                if(cudaSetDevice(device_ordinal_)!=cudaSuccess || cudaStreamDestroy(stream)!=cudaSuccess)
+                    std::terminate();
+            }
+            if(ownership)ownership->completeNativeHandles();
+            auxiliary_streams_.erase(entry);
+            auxiliary_stream_scheduling_classes_.erase(name);
+            throw;
+        }
+        if(created)*created=true;
+        result=static_cast<void*>(stream);
+        });
+        return result;
+    }
+
     void NvidiaDeviceContext::resetAuxiliaryStreams()
     {
-        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
-        cudaError_t set_err = cudaSetDevice(device_ordinal_);
-        if (set_err != cudaSuccess)
-        {
-            if (set_err == cudaErrorCudartUnloading)
-            {
-                auxiliary_streams_.clear();
-                auxiliary_stream_scheduling_classes_.clear();
-                return;
+        // Public named-stream reset preserves the fixed context-lifetime set.
+        projection_resources_.withIdleOperation([&] {
+            std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+            for(const auto& [name,record]:auxiliary_streams_) {
+                (void)name;
+                if(record.ownership)record.ownership->requireRetirement(shutdown_requested_.load()
+                    ?NativeAuxiliaryStreamOwnership::RetirementScope::OriginalContextShutdown
+                    :NativeAuxiliaryStreamOwnership::RetirementScope::PublicReset);
             }
-            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
-                                                             << ") failed in resetAuxiliaryStreams: "
-                                                             << cudaGetErrorString(set_err));
-            return;
-        }
-        for (auto &[name, stream] : auxiliary_streams_)
-        {
-            (void)name;
-            if (stream && stream != default_stream_)
+            if(batch_capture_dependencies_ && batch_capture_dependencies_.use_count()!=1)
+                throw std::logic_error("Cannot destroy Batch capture events while original graph owners retain them");
+            batch_capture_dependencies_.reset();
+            if (auxiliary_streams_.empty()) return;
+            cudaError_t set_err = cudaSetDevice(device_ordinal_);
+            if (set_err != cudaSuccess)
             {
-                cudaError_t err = cudaStreamDestroy(stream);
-                if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+                LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                                 << ") failed in resetAuxiliaryStreams: "
+                                                                 << cudaGetErrorString(set_err));
+                std::terminate();
+            }
+            for (auto &[name, record] : auxiliary_streams_)
+            {
+                const auto stream=record.stream;
+                (void)name;
+                if (stream && stream != default_stream_)
                 {
-                    LOG_ERROR("[NvidiaDeviceContext] cudaStreamDestroy(auxiliary) failed: "
-                              << cudaGetErrorString(err));
+                    cudaError_t err = cudaStreamDestroy(stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[NvidiaDeviceContext] cudaStreamDestroy(auxiliary) failed: "
+                                  << cudaGetErrorString(err));
+                        std::terminate();
+                    }
+                }
+                if(record.ownership) {
+                    record.ownership->completeNativeHandles();
+                    record.ownership.reset();
                 }
             }
-        }
-        auxiliary_streams_.clear();
-        auxiliary_stream_scheduling_classes_.clear();
+            auxiliary_streams_.clear();
+            auxiliary_stream_scheduling_classes_.clear();
+        });
     }
 
     // ============================================================================
@@ -608,23 +860,25 @@ namespace llaminar2
         return static_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void NvidiaDeviceContext::destroyEvent(void *event)
     {
-        if (event == nullptr)
+        if (!event) return;
+        if (const auto error = cudaSetDevice(device_ordinal_); error != cudaSuccess)
         {
-            return;
+            LOG_ERROR("[NvidiaDeviceContext::destroyEvent] Original event device selection failed, status=" << error);
+            std::terminate();
         }
-
-        cudaError_t set_err = cudaSetDevice(device_ordinal_);
-        if (set_err != cudaSuccess)
+        const auto cuda_event = reinterpret_cast<cudaEvent_t>(event);
+        if (const auto error = cudaEventDestroy(cuda_event); error != cudaSuccess)
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
-                                                             << ") failed in destroyEvent: " << cudaGetErrorString(set_err));
-            return;
+            LOG_ERROR("[NvidiaDeviceContext::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
         }
-
-        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
-        CUDA_CHECK_VOID(cudaEventDestroy(cuda_event));
     }
 
     void NvidiaDeviceContext::recordEvent(void *event, void *stream)
@@ -1022,14 +1276,14 @@ namespace llaminar2
     {
         return std::make_unique<CUDAGraphCapture>(
             static_cast<cudaStream_t>(defaultStream()),
-            device_ordinal_);
+            device_ordinal_, *this);
     }
 
     std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture(void *stream)
     {
         return std::make_unique<CUDAGraphCapture>(
             static_cast<cudaStream_t>(stream),
-            device_ordinal_);
+            device_ordinal_, *this);
     }
 
     PointerValidationResult NvidiaDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)

@@ -115,6 +115,8 @@ namespace
         {
             std::vector<Storage> native(width, Storage::DeviceTransferDirectory);
             std::vector<Storage> disabled(width, Storage::Disabled);
+            std::vector<Storage> no_peer(width, Storage::NoPeer);
+            EXPECT_EQ(modelContextPhysicalSealBoundary(authority, no_peer), Boundary::RetiredImmutableSources);
             EXPECT_EQ(modelContextPhysicalSealBoundary(authority, native), Boundary::RetiredImmutableSources);
             EXPECT_EQ(modelContextPhysicalSealBoundary(authority, disabled), Boundary::RetiredImmutableSources);
             EXPECT_EQ(modelContextPhysicalSealBoundary(nullptr, native), Boundary::Unretained);

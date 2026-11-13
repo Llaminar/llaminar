@@ -1,12 +1,34 @@
 /**
  * @file ModelContext.cpp
- * @brief Model context implementation
+ * @brief Model-owned immutable sources and exactly-once participant preparation.
+ *
+ * A native table, fixed shard or GPU/subordinate adaptive domain is prepared
+ * only through its admitted placement and original PMA. Setup joins occur
+ * before inference; no model mutex spans file I/O or native metadata submission.
+ * Graph families retain the original source/boundary and alias-owned roots,
+ * preserving actual leases after the context releases its own references.
  * @author David Sanftenberg
  */
+#include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
 #include "ModelContext.h"
+#include "ImmutableLookupSetupObservation.h"
+#include "models/GraphTypes.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
+#include "backends/IWorkerGPUContext.h"
+#include "transfer/TransferEngine.h"
+#include "AdaptiveImmutableLookupGeometry.h"
+#include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
+#include "kernels/qwen4exp/PooledImmutableNativeKernels.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotKernels.h"
+#include <array>
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../utils/Logger.h"
 #include <exception>
+#include <algorithm>
 #include <iostream>
 #include <limits>
 
@@ -25,7 +47,33 @@ namespace llaminar2
     public:
         explicit ModelLoaderInterfaceWrapper(ModelLoader &loader) : loader_(loader) {}
 
+        /** @copydoc IModelLoader::nativeWeightSourcePlacement */
+        CPUStoragePlacement nativeWeightSourcePlacement() const override
+        {
+            return loader_.nativeWeightSourcePlacement();
+        }
+
+        /** @copydoc IModelLoader::nativeWeightSourceGeometry */
+        NativeWeightSourceGeometry nativeWeightSourceGeometry(const std::string &name) override
+        {
+            return loader_.nativeWeightSourceGeometry(name);
+        }
+
+        /** @copydoc IModelLoader::readNativeWeightSourceWindow */
+        void readNativeWeightSourceWindow(
+            const std::string &name, const NativeWeightSourceWindow &window,
+            std::span<std::byte> destination) override
+        {
+            loader_.readNativeWeightSourceWindow(name, window, destination);
+        }
+
         bool isLoaded() const override { return loader_.isLoaded(); }
+        /** @brief Expose the immutable directory owned by the enclosing model context. */
+        const GGUFModel *ggufDirectory() const noexcept override { return &loader_.getModel(); }
+        /** @brief Keep predictor metadata and policy separate from the unchanged target directory. */
+        const GGUFModel *ggufPredictorDirectory() const noexcept override { return loader_.ggufPredictorDirectory(); }
+        /** @brief Borrow the loader-owned immutable source manifest. */
+        const Qwen4ExpSidecarManifest *predictorManifest() const noexcept override { return loader_.predictorManifest(); }
 
         std::shared_ptr<TensorBase> loadTensor(
             const std::string &name,
@@ -74,6 +122,10 @@ namespace llaminar2
 
         bool hasTensor(const std::string &name) const override { return loader_.hasTensor(name); }
         std::vector<std::string> tensorNames() const override { return loader_.tensorNames(); }
+        /** @brief Project the same consumed source inventory into WeightManager preload. */
+        std::vector<std::string> materializationNames() const override { return loader_.materializationNames(); }
+        /** @brief Forward immutable source sealing to the context-owned loader. */
+        void sealTensorSources() override { loader_.sealTensorSources(); }
         std::string architecture() const override { return loader_.architecture(); }
         size_t tensorCount() const override { return loader_.tensorCount(); }
         size_t totalBytes() const override { return loader_.totalBytes(); }
@@ -115,12 +167,1069 @@ namespace llaminar2
         ModelLoader &loader_;
     };
 
+    std::shared_ptr<HostImmutableRowProvider> ModelContext::hostImmutableRowProvider() const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if (immutable_row_table_preparation_failure_)
+            std::rethrow_exception(immutable_row_table_preparation_failure_);
+        return host_row_provider_;
+    }
+
+    std::shared_ptr<const ResolvedImmutableRowTablePlacement> ModelContext::resolvedImmutableRowTablePlacement() const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        return immutable_row_table_placement_;
+    }
+
+    std::shared_ptr<const ResidentImmutableRowTable> ModelContext::residentImmutableRowTable(DeviceId device) const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if (immutable_row_table_preparation_failure_)
+            std::rethrow_exception(immutable_row_table_preparation_failure_);
+        const auto found = resident_row_tables_.find(device);
+        return found == resident_row_tables_.end() ? nullptr : found->second;
+    }
+
+    std::shared_ptr<const ImmutableLookupSetupObservation> ModelContext::immutableLookupSetupObservation()const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        return immutable_lookup_setup_observation_;
+    }
+
+    std::size_t ModelContext::residentImmutableRowTableBytes(DeviceId device) const
+    {
+        const auto table = residentImmutableRowTable(device);
+        return table ? table->nativeBytes() : 0;
+    }
+
+    ImmutableRowTableSource ModelContext::immutableRowTableSource() const
+    {
+        const auto &directory = loader_.getModel();
+        const auto *table = directory.findTensor("per_layer_token_embd.weight");
+        if (!table || table->dimensions.size() != 2)
+            throw std::invalid_argument("native table requires its original canonical [rows,columns] tensor");
+        const auto split = static_cast<std::size_t>(table->split_idx);
+        const auto paths = artifactPaths();
+        if (split >= paths.size())
+            throw std::invalid_argument("native table source shard is absent from immutable artifact identity");
+        const auto data_offset = directory.split_count > 1
+            ? directory.split_data_offsets.at(split) : directory.data_offset;
+        if (table->offset > std::numeric_limits<std::uint64_t>::max() - data_offset)
+            throw std::overflow_error("native table source file offset overflow");
+        ImmutableRowTableSource source{.path=paths.at(split),.tensor_name=table->name,
+            .file_offset=data_offset+table->offset,.rows=table->dimensions[0],
+            .row_elements=table->dimensions[1],.format=table->type};
+        if (source.tensorBytes() != table->size_bytes)
+            throw std::invalid_argument("native table extent differs from its original tensor directory");
+        return source;
+    }
+
+    std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> ModelContext::adaptiveImmutableLookupBoundary(DeviceId device) const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+        const auto found=adaptive_lookup_consumers_.find(device);
+        if(found==adaptive_lookup_consumers_.end())
+        {
+            if(!adaptive_lookup_consumers_.empty())
+                throw std::invalid_argument("Adaptive lookup boundary queried by a foreign GPU participant");
+            return {};
+        }
+        return found->second.boundary;
+    }
+
+    std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>
+    ModelContext::adaptiveImmutableLookupLocalHot(DeviceId device) const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+        const auto found=adaptive_lookup_consumers_.find(device);
+        if(found==adaptive_lookup_consumers_.end()) {
+            if(!adaptive_lookup_consumers_.empty())
+                throw std::invalid_argument("Local hot cache queried by a foreign compute participant");
+            return {};
+        }
+        return found->second.local_hot;
+    }
+
+    std::vector<ImmutableLookupNativeOwnerObservation>
+    ModelContext::retainedAdaptiveImmutableLookupOwners(PhysicalMemoryAllocatorIdentity allocator)const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+        if(!immutable_row_table_placement_ || !immutable_row_table_placement_->isGPUAdaptive())return {};
+        if(!immutable_row_table_authority_ || allocator.world_rank!=immutable_row_table_authority_->worldRank() ||
+           !allocator.device.is_gpu())
+            throw std::invalid_argument("Adaptive retained roots require the original rank and GPU allocator");
+        const auto& placement=*immutable_row_table_placement_;
+        const auto& layout=placement.gpuAdaptiveLayout();
+        const bool consumer=std::find(placement.consumers().begin(),placement.consumers().end(),allocator)!=placement.consumers().end();
+        const bool storage_owner=std::any_of(layout.owners().begin(),layout.owners().end(),[&](const auto& owner){
+            return owner.key.tier==ImmutableRowStorage::VRAM && owner.key.allocator==allocator;
+        });
+        // A prepared expert follower may have no ngram role at all.
+        if(!consumer && !storage_owner)return {};
+        const bool source_owner=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+            ? consumer : AdaptiveImmutableLookupGeometry::sourceLayout(layout,placement.gpuAdaptiveRequest()).consumers().front()==allocator;
+        std::optional<ImmutableLookupNativeOwnerObservation> result;
+        std::vector<const qwen4exp::PooledImmutableSourcePreparedStorage*> seen;
+        for(const auto& [device,entry]:adaptive_lookup_consumers_)
+        {
+            // Query-only execution entries may already have retired. Only real
+            // source boundaries retain the model's original physical roots.
+            if(!entry.boundary)continue;
+            const auto source=entry.boundary->pooledStorage();
+            if(!source)throw std::logic_error("Adaptive retained source lost its original pooled roots");
+            if(std::find(seen.begin(),seen.end(),source.get())!=seen.end())continue;
+            seen.push_back(source.get());
+            const auto observed=source->geometry().projectRetainedOwnerObservation(allocator,
+                [&]{return source->retainedOwnerObservation();},
+                [&](std::size_t index){return source->originalOwners()[index]->retainedOwnerObservation();});
+            if(!observed)continue;
+            if((source->geometry().allocator()==allocator)!=source_owner || (!source_owner && !storage_owner))
+                throw std::logic_error("Adaptive retained observation changed its declared source/storage role");
+            const auto& authority=observed->authority();
+            if(authority.get()!=immutable_row_table_authority_.get() ||
+               authority.owner_before(immutable_row_table_authority_) || immutable_row_table_authority_.owner_before(authority) ||
+               observed->allocator()!=allocator)
+                throw std::logic_error("Adaptive retained root observation changed its original allocator/PMA");
+            if(result)throw std::logic_error("Adaptive retained roots contain overlapping source/owner observations");
+            result=observed;
+        }
+        if(!result && (source_owner || storage_owner))
+            throw std::logic_error("Adaptive retained allocator lost its original live source/storage roots");
+        std::vector<ImmutableLookupNativeOwnerObservation> observations;
+        if(result)observations.push_back(*result);
+        const auto& locals=placement.gpuAdaptiveLocalHotCaches();
+        const auto declared=std::find_if(locals.begin(),locals.end(),[&](const auto& local){return local.allocator()==allocator;});
+        if(declared!=locals.end()) {
+            const auto entry=adaptive_lookup_consumers_.find(allocator.device);
+            if(!consumer || entry==adaptive_lookup_consumers_.end() || !entry->second.local_hot)
+                throw std::logic_error("Adaptive retained consumer lost its original local hot roots");
+            const auto& local=entry->second.local_hot;
+            local->requireFor(*declared,local->originalSource(),immutable_row_table_authority_);
+            if(std::find(seen.begin(),seen.end(),local->originalSource().get())==seen.end())
+                throw std::logic_error("Local retained cache lost its original model-owned shared source");
+            observations.push_back(local->retainedOwnerObservation());
+        }
+        return observations;
+    }
+
+    std::vector<ImmutableLookupNativeOwnerObservation>
+    ModelContext::retainedAdaptiveImmutableLookupLocalReadyOwners() const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+        if(!immutable_row_table_placement_ || !immutable_row_table_placement_->isGPUAdaptive())return {};
+        const auto& placement=*immutable_row_table_placement_;
+        std::vector<ImmutableLookupNativeOwnerObservation> result;
+        for(const auto& declared:placement.gpuAdaptiveLocalHotCaches()) {
+            const auto entry=adaptive_lookup_consumers_.find(declared.allocator().device);
+            if(entry==adaptive_lookup_consumers_.end() || !entry->second.local_hot)
+                throw std::logic_error("Retained local readiness page lost its actual consumer root");
+            const auto& local=entry->second.local_hot;
+            local->requireFor(declared,local->originalSource(),immutable_row_table_authority_);
+            const auto owner=local->retainedReadyObservation();
+            if(owner.authority().get()!=immutable_row_table_authority_.get() ||
+               owner.authority().owner_before(immutable_row_table_authority_) || immutable_row_table_authority_.owner_before(owner.authority()) ||
+               owner.allocator()!=PhysicalMemoryAllocatorIdentity{immutable_row_table_authority_->worldRank(),DeviceId::cpu()} ||
+               owner.tableStorageBytes() || !owner.lookupStagingBytes())
+                throw std::logic_error("Retained local readiness page changed its actual CPU/PMA claim");
+            result.push_back(owner);
+        }
+        return result;
+    }
+
+    void ModelContext::prepareAdaptiveImmutableLookupParticipants(const GraphConfig& graph)
+    {
+        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
+        {
+            std::unique_lock lock(immutable_row_table_mutex_);
+            const auto found=adaptive_lookup_consumers_.find(graph.default_device);
+            if(found==adaptive_lookup_consumers_.end())
+                throw std::logic_error("Remote participant preparation has no original ready source entry");
+            if(!found->second.boundary)
+            {
+                auto retained=found->second.participants;
+                if(!retained)throw std::logic_error("Query-only reader has no original retained source participants");
+                lock.unlock();
+                retained->requireForPolicy(graph);
+                return;
+            }
+            auto& consumer=found->second;
+            while(consumer.participant_preparation &&
+                  consumer.participant_preparation->state==ImmutableRowPreparationState::Preparing)
+            {
+                if(consumer.participant_preparation->preparing_thread==std::this_thread::get_id())
+                    throw std::logic_error("Recursive original participant preparation");
+                immutable_row_table_ready_.wait(lock);
+            }
+            if(consumer.participant_failure)std::rethrow_exception(consumer.participant_failure);
+            boundary=consumer.boundary;
+            if(!boundary->isPooled() || boundary->device()!=graph.default_device)
+                throw std::logic_error("Remote participant preparation changed its original source boundary");
+            const auto storage=boundary->pooledStorage();
+            if(!consumer.local_hot &&
+               !qwen4exp::PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(storage->geometry()))return;
+            if(consumer.participants){
+                auto retained=consumer.participants;lock.unlock();retained->requireForPolicy(graph);return;
+            }
+            consumer.participant_preparation=ImmutableRowPreparation{
+                ImmutableRowPreparationState::Preparing,std::this_thread::get_id()};
+        }
+        try{
+            // Existing remote topology guards remain authoritative. A local
+            // consumer set never substitutes replicas for a shared-owner request.
+            const auto& placement=*graph.ngram_table_placement;
+            const auto geometry=placement.gpuAdaptiveLayout().adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+                ? AdaptiveImmutableLookupGeometry::forRequester(placement.gpuAdaptiveLayout(),*immutable_row_table_source_,
+                    placement.gpuAdaptiveRequest(),{immutable_row_table_authority_->worldRank(),graph.default_device})
+                : AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(placement.gpuAdaptiveLayout(),
+                    *immutable_row_table_source_,placement.gpuAdaptiveRequest(),placement.gpuAdaptiveLocalHotCaches());
+            std::vector<std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>> localParticipants;
+            {
+                std::lock_guard lock(immutable_row_table_mutex_);
+                for(const auto& local:placement.gpuAdaptiveLocalHotCaches()) {
+                    const auto found=adaptive_lookup_consumers_.find(local.allocator().device);
+                    if(found==adaptive_lookup_consumers_.end() || !found->second.local_hot)
+                        throw std::logic_error("Combined participant preparation omitted an actual local cache");
+                    found->second.local_hot->requireFor(local,boundary->pooledStorage(),immutable_row_table_authority_);
+                    localParticipants.push_back(found->second.local_hot);
+                }
+            }
+            auto prepared=qwen4exp::PooledImmutableRetainedParticipants::create(boundary,graph,
+                immutable_source_mpi_ ? immutable_source_mpi_->clusterInventory() : nullptr,geometry.readerGeometry(),
+                geometry.localHotTransport(),localParticipants);
+            {std::lock_guard lock(immutable_row_table_mutex_);
+             auto& consumer=adaptive_lookup_consumers_.at(graph.default_device);
+             consumer.participants=std::move(prepared);
+             consumer.participant_preparation->state=ImmutableRowPreparationState::Ready;}
+            immutable_row_table_ready_.notify_all();
+        }catch(...){
+            {std::lock_guard lock(immutable_row_table_mutex_);
+             auto& consumer=adaptive_lookup_consumers_.at(graph.default_device);
+             consumer.participant_failure=std::current_exception();
+             consumer.participant_preparation->state=ImmutableRowPreparationState::Failed;}
+            immutable_row_table_ready_.notify_all();throw;
+        }
+    }
+    std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> ModelContext::adaptiveImmutableLookupParticipants(DeviceId device)const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        const auto found=adaptive_lookup_consumers_.find(device);
+        if(found==adaptive_lookup_consumers_.end())
+        {
+            if(!adaptive_lookup_consumers_.empty())
+                throw std::invalid_argument("Remote participants queried by a foreign source consumer");
+            return {};
+        }
+        if(found->second.participant_failure)std::rethrow_exception(found->second.participant_failure);
+        return found->second.participants;
+    }
+
+    void ModelContext::retireAdaptiveImmutableLookupParticipants(
+        const std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants>& original)
+    {
+        if (!original) throw std::invalid_argument("Runtime retirement requires original participants");
+        {
+            std::lock_guard lock(immutable_row_table_mutex_);
+            bool matched = false;
+            for (const auto& [device, consumer] : adaptive_lookup_consumers_) {
+                if (consumer.participants != original) continue;
+                matched = true;
+                if (consumer.participant_preparation &&
+                    consumer.participant_preparation->state == ImmutableRowPreparationState::Preparing)
+                    throw std::logic_error("Original participant preparation is still running");
+            }
+            if (!matched) throw std::logic_error("Runtime retirement replaced its original model participants");
+        }
+        // Backend graph destruction must not hold the model's preparation mutex.
+        // The runner still owns every arena and collective context at this edge.
+        original->retireOriginalRuntimeBeforeArenaRelease();
+        std::lock_guard lock(immutable_row_table_mutex_);
+        for (auto it = adaptive_lookup_consumers_.begin(); it != adaptive_lookup_consumers_.end();) {
+            auto& consumer = it->second;
+            if (consumer.participants != original) { ++it; continue; }
+            if (!consumer.boundary && !consumer.local_hot && !consumer.participant_failure) {
+                // Query-only entries own no physical source roots. Recreate them
+                // from the next runner's authenticated original reader cohort.
+                it = adaptive_lookup_consumers_.erase(it);
+                continue;
+            }
+            consumer.participants.reset();
+            // Detach graph borrowers, never erase an original poisoned-source
+            // diagnostic. Cold failure and the service's absorbing Failed state
+            // retain their existing refusal paths; only orderly reuse proceeds.
+            if (!consumer.participant_failure)
+                consumer.participant_preparation.reset();
+            ++it;
+        }
+    }
+
+    void ModelContext::bindNativeContextPreparation(std::shared_ptr<NativeContextPreparation> source)
+    {
+        if(!source)throw std::invalid_argument("Model source preparation cannot be null");
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(native_context_preparation_ && native_context_preparation_!=source)
+            throw std::logic_error("Model cannot replace its original native source preparation");
+        if(immutable_row_table_placement_ || !immutable_row_table_preparations_.empty())
+            throw std::logic_error("Model source preparation must precede table materialization");
+        native_context_preparation_=std::move(source);
+    }
+    std::shared_ptr<NativeContextPreparation> ModelContext::nativeContextPreparation() const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);return native_context_preparation_;
+    }
+
+    std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> ModelContext::borrowPreparedFollowerCaptureTerminals(
+        PreparedFollowerCaptureTerminalKey key,void* stream,const MoEOverlayInferenceOriginalSlotGeometry& geometry,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory){
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(!native_context_preparation_ || !memory || native_context_preparation_->memory().get()!=memory.get() ||
+            native_context_preparation_->memory().owner_before(memory) || memory.owner_before(native_context_preparation_->memory()))
+            throw std::logic_error("Prepared follower terminals changed the original model source/PMA");
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(key.device,memory);
+        if(!follower_capture_terminals_)follower_capture_terminals_=PreparedFollowerCaptureTerminalOwner::create(memory,geometry);
+        return follower_capture_terminals_->acquire(key,original,stream);
+    }
+    void ModelContext::sealPreparedFollowerCaptureTerminals(){
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(follower_capture_terminals_)follower_capture_terminals_->seal();
+    }
+
+    void ModelContext::bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations> declarations,
+        std::shared_ptr<PhysicalMemoryAuthority> memory,std::span<const RetainedHostServiceInstance> selected)
+    {
+        if(!declarations || !memory || declarations->worldRank()!=memory->worldRank())throw std::logic_error("Model CPU service binding lost original rank/PMA declarations");
+        std::lock_guard lock(host_service_mutex_);
+        if(host_service_binding_){
+            if(host_service_declarations_!=declarations || host_service_memory_.get()!=memory.get() ||
+               host_service_memory_.owner_before(memory)||memory.owner_before(host_service_memory_) ||
+               host_service_selected_!=std::vector<RetainedHostServiceInstance>(selected.begin(),selected.end()))
+                throw std::logic_error("Model CPU service binding cannot reprice/rebind original instances");
+            return;
+        }
+        auto binding=declarations->bind(memory,selected);
+        host_service_selected_.assign(selected.begin(),selected.end());
+        host_service_declarations_=std::move(declarations);host_service_memory_=std::move(memory);host_service_binding_=std::move(binding);
+    }
+    RetainedHostServiceBorrow ModelContext::borrowRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,
+        RetainedHostServiceRole role,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+    {
+        const auto binding=[&]{
+            std::lock_guard lock(host_service_mutex_);
+            if(!host_service_binding_||host_service_memory_.get()!=memory.get()||host_service_memory_.owner_before(memory)||memory.owner_before(host_service_memory_))
+                throw std::logic_error("Model CPU service consumer lost original admitted binding/PMA control block");
+            return host_service_binding_;
+        }();
+        return binding->borrow({consumer.world_rank,consumer.device,role});
+    }
+
+    void ModelContext::prepareGPUAdaptiveImmutableLookup(const ResolvedImmutableRowTablePlacement &placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority,const ImmutableRowTableSource &source,DeviceId consumer,
+        const std::optional<AdaptiveImmutableLookupDevicePreparation> &setup)
+    {
+        const auto &layout=placement.gpuAdaptiveLayout();
+        const PhysicalMemoryAllocatorIdentity requester{authority->worldRank(),consumer};
+        const bool independent=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
+        const bool shared=!independent && layout.consumers().size()>1;
+        if(std::find(layout.consumers().begin(),layout.consumers().end(),requester)==layout.consumers().end() ||
+            placement.gpuAdaptiveRowElements()!=source.row_elements || !consumer.is_gpu() ||
+            (setup && (setup->device!=consumer || !setup->stream || reinterpret_cast<std::uintptr_t>(setup->stream)<=2)))
+            throw std::invalid_argument("Adaptive setup requires the exact sealed native source and original GPU worker stream");
+        const auto host=layout.sourceServices().front().allocator;
+        const auto nativeSource=nativeContextPreparation();
+        if(shared)
+        {
+            const auto sourceLayout=AdaptiveImmutableLookupGeometry::sourceLayout(layout,placement.gpuAdaptiveRequest());
+            const auto coordinator=sourceLayout.consumers().front();
+            if(requester!=coordinator)
+            {
+                // The actual factory prepares the genuine coordinator policy
+                // first. A foreign graph receives no substitute source owner.
+                if(!nativeSource)
+                    throw std::logic_error("Shared PLE reader requires its original prepared worker source");
+                const auto permit=nativeSource->acquire(consumer);
+                if(permit.worker()->ownsCurrentThread() || !setup ||
+                    setup->stream!=permit.worker()->defaultStream())
+                    throw std::logic_error("Shared PLE reader requires cold preparation on its exact original stream");
+                std::lock_guard lock(immutable_row_table_mutex_);
+                if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+                const auto original=adaptive_lookup_consumers_.find(coordinator.device);
+                if(!nativeSource || nativeSource->memory().get()!=authority.get() ||
+                    nativeSource->memory().owner_before(authority) || authority.owner_before(nativeSource->memory()) ||
+                    !immutable_row_table_placement_ || *immutable_row_table_placement_!=placement ||
+                    immutable_row_table_authority_.get()!=authority.get() ||
+                    immutable_row_table_authority_.owner_before(authority) || authority.owner_before(immutable_row_table_authority_) ||
+                    !immutable_row_table_source_ || *immutable_row_table_source_!=source ||
+                    original==adaptive_lookup_consumers_.end() || !original->second.boundary ||
+                    !original->second.participants)
+                    throw std::logic_error("Shared PLE reader requires its genuine coordinator source prepared first");
+                const auto retained=original->second.participants;
+                retained->requireCurrent();
+                const auto transport=retained->transport();
+                if(!transport->readerGeometry() || transport->readerGeometry()->coordinator()!=coordinator ||
+                    std::none_of(transport->readers().begin(),transport->readers().end(),[&](const auto& reader){
+                        return reader->originalReader().device()==consumer;
+                    }))
+                    throw std::logic_error("Shared PLE reader changed its original source transport membership");
+                const auto [entry,inserted]=adaptive_lookup_consumers_.try_emplace(consumer);
+                if(!inserted && (entry->second.boundary ||
+                    (entry->second.participants && entry->second.participants!=retained)))
+                    throw std::logic_error("Shared PLE reader cannot replace its original source authority");
+                entry->second.participants=retained;
+                immutable_row_table_preparations_.insert_or_assign(consumer,
+                    ImmutableRowPreparation{ImmutableRowPreparationState::Ready,std::this_thread::get_id()});
+                return;
+            }
+        }
+        std::vector<PhysicalMemoryAllocatorIdentity> orderedOwners;
+        const auto& requestedOwners=placement.gpuAdaptiveRequest().placement;
+        if(requestedOwners.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+        {
+            requestedOwners.validate();
+            for (const auto& owner : requestedOwners.owners) {
+                if (owner.participant == *requestedOwners.coordinator ||
+                    owner.participant.backend != requestedOwners.coordinator->backend) continue;
+                const PhysicalMemoryAllocatorIdentity allocator{owner.participant.world_rank, owner.participant.device()};
+                if (layout.consumers().size() < 2 ||
+                    std::find(layout.consumers().begin(), layout.consumers().end(), allocator) == layout.consumers().end())
+                    throw std::invalid_argument("Homogeneous pooled storage requires its original inline continuation/native collective role");
+            }
+            // Layout metadata canonicalizes allocator keys. The executable
+            // physical coordinate order remains the authored owner request,
+            // including C0 participants, and fromLayout authenticates both.
+            for(const auto& owner:requestedOwners.owners)
+                orderedOwners.push_back({owner.participant.world_rank,owner.participant.device()});
+        }
+        else if(independent)
+            orderedOwners.push_back(requester);
+        else
+            for(const auto& owner:layout.owners())if(owner.key.tier==ImmutableRowStorage::VRAM)
+                orderedOwners.push_back(owner.key.allocator);
+        if(nativeSource && (nativeSource->memory().get()!=authority.get() ||
+            nativeSource->memory().owner_before(authority) || authority.owner_before(nativeSource->memory())))
+            throw std::logic_error("Model loader received a foreign source-preparation PMA");
+        if(!nativeSource && (layout.consumers().size()!=1 || orderedOwners.size()!=1 || orderedOwners.front()!=requester))
+            throw std::invalid_argument("Distributed adaptive source requires its original prepared participant authority");
+        std::vector<PreparedGPUContextUsePermit> participantPermits;
+        std::optional<PreparedGPUContextUsePermit> coordinatorPermit;
+        if(nativeSource){
+            coordinatorPermit.emplace(nativeSource->acquire(consumer));
+            for(const auto& owner:orderedOwners){
+                if(owner.world_rank!=authority->worldRank())
+                    throw std::invalid_argument("Cross-rank source requires its admitted native rank factory");
+                // Native homogeneous transport is authenticated later against
+                // the actual Rank cohort before any capture. Here the original
+                // resolved role and source permit authenticate physical roots.
+                // Cross-vendor movement keeps its original endpoint contract.
+                if (owner != requester && owner.device.type != requester.device.type)
+                    ImmutableRowTableDirectedTransportPolicy::require(requester,owner,layout.peerAccess());
+                participantPermits.push_back(nativeSource->acquire(owner.device));
+            }
+            if(coordinatorPermit->worker()->ownsCurrentThread() ||
+               std::any_of(participantPermits.begin(),participantPermits.end(),[](const auto& permit){return permit.worker()->ownsCurrentThread();}))
+                throw std::logic_error("Multi-participant source preparation must run cold outside every original worker");
+            if(!setup || setup->stream!=coordinatorPermit->worker()->defaultStream())
+                throw std::invalid_argument("Prepared source setup requires the exact original coordinator primary stream");
+        }
+        const auto geometry=independent
+            ? AdaptiveImmutableLookupGeometry::forRequester(layout,source,placement.gpuAdaptiveRequest(),requester)
+            : AdaptiveImmutableLookupGeometry::fromLayout(layout,source,placement.gpuAdaptiveRequest(),orderedOwners,
+                placement.gpuAdaptiveLocalHotCaches());
+        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> ready;
+        bool prepare_host=false;
+        {
+            std::unique_lock lock(immutable_row_table_mutex_);
+            if(immutable_row_table_placement_ && (*immutable_row_table_placement_!=placement ||
+                immutable_row_table_authority_.get()!=authority.get() ||
+                immutable_row_table_authority_.owner_before(authority) || authority.owner_before(immutable_row_table_authority_) ||
+                !immutable_row_table_source_ ||
+                *immutable_row_table_source_!=source))
+                throw std::logic_error("Adaptive model cannot replace its source, sole layout or canonical PMA");
+            if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+            for(;;)
+            {
+                const auto found=immutable_row_table_preparations_.find(consumer);
+                if(found==immutable_row_table_preparations_.end())break;
+                if(found->second.state==ImmutableRowPreparationState::Ready){ready=adaptive_lookup_consumers_.at(consumer).boundary;break;}
+                if(found->second.state==ImmutableRowPreparationState::Failed)
+                    throw std::logic_error("Adaptive source preparation previously failed");
+                if(found->second.preparing_thread==std::this_thread::get_id())
+                    throw std::logic_error("Adaptive source setup cannot join its own preparing thread");
+                immutable_row_table_ready_.wait(lock,[&] {
+                    return immutable_row_table_preparation_failure_ ||
+                        immutable_row_table_preparations_.at(consumer).state!=ImmutableRowPreparationState::Preparing;
+                });
+                if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+            }
+            if(!ready)
+            {
+                if(!setup)throw std::invalid_argument("Fresh adaptive source needs its exact ordinary metadata setup stream");
+                if(!resident_row_tables_.empty() || (host_row_provider_ && !adaptive_lookup_service_))
+                    throw std::logic_error("Adaptive source cannot alias an already materialized independent storage owner");
+                if(!immutable_row_table_placement_)
+                {
+                    immutable_row_table_placement_=std::make_shared<const ResolvedImmutableRowTablePlacement>(placement);
+                    immutable_row_table_authority_=authority;immutable_row_table_source_=source;
+                }
+                immutable_row_table_preparations_.emplace(consumer,
+                    ImmutableRowPreparation{ImmutableRowPreparationState::Preparing,std::this_thread::get_id()});
+                adaptive_lookup_consumers_.try_emplace(consumer);
+                if(!immutable_row_table_preparations_.contains(host.device))
+                {
+                    immutable_row_table_preparations_.emplace(host.device,
+                        ImmutableRowPreparation{ImmutableRowPreparationState::Preparing,std::this_thread::get_id()});
+                    prepare_host=true;
+                }
+                for(const auto& owner:orderedOwners)if(owner.device!=consumer)
+                    immutable_row_table_preparations_.emplace(owner.device,
+                        ImmutableRowPreparation{ImmutableRowPreparationState::Preparing,std::this_thread::get_id()});
+            }
+        }
+        if(ready)
+        {
+            // Source authentication is an owner readiness operation, never an
+            // empty gather or a CPU readback of warmed GPU cache state.
+            ready->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),source,geometry.computeReaderCount(),authority);
+            const auto observed=ready->retainedSourceOwnerObservation();
+            if(observed.authority().get()!=authority.get() || observed.allocator()!=host ||
+                observed.hostPlacement()!=placement.hostPlacement())
+                throw std::logic_error("Ready adaptive source lost its actual source/PMA/locality authority");
+            return;
+        }
+        try
+        {
+            // No model mutex is held through file authentication, physical
+            // materialization or native metadata initialization. Failure is
+            // sticky; an in-flight partial source is never replaced or retried.
+            if(prepare_host)
+            {
+                const auto host_geometry=independent
+                    ? AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,placement.gpuAdaptiveRequest())
+                    : geometry.host();
+                auto provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(
+                    CpuAdaptiveImmutableRowCache::create(source,host_geometry,authority));
+                std::vector<DeviceId> consumers;
+                if(shared)consumers.push_back(consumer);
+                else for(const auto& original:layout.consumers())consumers.push_back(original.device);
+                auto service=qwen4exp::ImmutableLookupService::create(provider,geometry.channelLayout(),
+                    consumers,authority,host.device,
+                    borrowRetainedHostService({authority->worldRank(),placement.lookupIOConsumer(consumer)},
+                        RetainedHostServiceRole::ImmutableLookupIO,authority));
+                const auto actual=provider->identity();
+                {
+                    std::lock_guard lock(immutable_row_table_mutex_);
+                    if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+                    if(immutable_row_table_file_identity_ && *immutable_row_table_file_identity_!=actual)
+                        throw std::logic_error("Adaptive source generation conflicts with the retained original model identity");
+                    immutable_row_table_file_identity_=actual;
+                    host_row_provider_=std::move(provider);
+                    adaptive_lookup_service_=std::move(service);
+                    immutable_row_table_preparations_.at(host.device).state=ImmutableRowPreparationState::Ready;
+                }
+                immutable_row_table_ready_.notify_all();
+            }
+            std::shared_ptr<HostImmutableRowProvider> provider;
+            std::shared_ptr<qwen4exp::ImmutableLookupService> service;
+            {
+                std::unique_lock lock(immutable_row_table_mutex_);
+                const auto host_ready=[&]{return immutable_row_table_preparation_failure_ ||
+                    immutable_row_table_preparations_.at(host.device).state!=ImmutableRowPreparationState::Preparing;};
+                if(!host_ready() && immutable_row_table_preparations_.at(host.device).preparing_thread==std::this_thread::get_id())
+                    throw std::logic_error("Adaptive shared source cannot join its own preparing thread");
+                immutable_row_table_ready_.wait(lock,host_ready);
+                if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+                provider=host_row_provider_;service=adaptive_lookup_service_;
+                if(!provider || !service)throw std::logic_error("Adaptive source has no original shared provider/service");
+            }
+            const auto binding=service->bindSubordinate(consumer);
+            const auto table=binding.deviceView().base.table,generation=binding.storageGeneration();
+            const auto policyPlan=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(
+                geometry.physical(),geometry.coordinator(),table,generation);
+            std::vector<qwen4exp::PooledImmutableOwnerNativePlan> ownerPlans;
+            std::vector<std::shared_ptr<qwen4exp::PooledImmutableOwnerPreparedStorage>> owners;
+            for(std::size_t coordinate=0;coordinate<orderedOwners.size();++coordinate){
+                ownerPlans.push_back(qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(
+                    geometry.physical(),geometry.coordinator(),coordinate,table,generation));
+                const auto initialize=[&]{
+                    void* stream=nativeSource?participantPermits[coordinate].worker()->defaultStream():setup->stream;
+                    auto owner=qwen4exp::PooledImmutableOwnerPreparedStorage::create(ownerPlans.back(),authority,stream);
+                    std::unique_ptr<qwen4exp::IPooledImmutableNativeKernels> code;
+#ifdef HAVE_CUDA
+                    if(orderedOwners[coordinate].device.is_cuda())code=qwen4exp::createCUDAPooledImmutableNativeKernels();
+#endif
+#ifdef HAVE_ROCM
+                    if(orderedOwners[coordinate].device.is_rocm())code=qwen4exp::createROCmPooledImmutableNativeKernels();
+#endif
+                    if(!code)throw std::invalid_argument("Adaptive owner requires its compiled original native backend");
+                    code->initialize(*owner,stream);owners.push_back(std::move(owner));
+                };
+                if(nativeSource)participantPermits[coordinate].worker()->submitAndWait(initialize);else initialize();
+            }
+            std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
+            const auto initializeCoordinator=[&]{
+                auto coordinator=qwen4exp::PooledImmutableCoordinatorPreparedStorage::create(policyPlan,authority,setup->stream);
+                std::unique_ptr<qwen4exp::IPooledImmutableNativeKernels> code;
+#ifdef HAVE_CUDA
+                if(consumer.is_cuda())code=qwen4exp::createCUDAPooledImmutableNativeKernels();
+#endif
+#ifdef HAVE_ROCM
+                if(consumer.is_rocm())code=qwen4exp::createROCmPooledImmutableNativeKernels();
+#endif
+                if(!code)throw std::invalid_argument("Adaptive coordinator requires its compiled original native backend");
+                code->initialize(*coordinator,setup->stream);
+                const auto packets=qwen4exp::PooledImmutableSourceGeometry::fromPlans(ownerPlans,policyPlan,source,geometry.computeReaderCount());
+                boundary=qwen4exp::ImmutableLookupExecutionBoundary::createPooled(
+                    service,packets,std::move(owners),std::move(coordinator),authority,setup->stream);
+                if(nativeSource)boundary->pooledStorage()->bindPreparedSourceWorkers(nativeSource,*coordinatorPermit,participantPermits);
+            };
+            if(nativeSource)coordinatorPermit->worker()->submitAndWait(initializeCoordinator);else initializeCoordinator();
+            // Each actual PLE consumer owns a separate bounded native replica
+            // cache. It borrows this same source lifetime, not a second CPU
+            // provider, service or source admission. Publish the complete set
+            // together, before retained transport binds their original roots.
+            std::vector<std::pair<DeviceId,std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>>> localCaches;
+            for(const auto& localGeometry:placement.gpuAdaptiveLocalHotCaches()) {
+                const auto endpoint=localGeometry.allocator();
+                if(independent || endpoint.world_rank!=authority->worldRank() ||
+                   std::find(layout.consumers().begin(),layout.consumers().end(),endpoint)==layout.consumers().end())
+                    throw std::logic_error("Local hot cache must name an admitted shared-pool compute consumer");
+                std::optional<PreparedGPUContextUsePermit> permit;
+                if(nativeSource)permit.emplace(nativeSource->acquire(endpoint.device));
+                else if(endpoint!=requester)
+                    throw std::logic_error("Remote local cache lost its original prepared worker");
+                if(permit && permit->worker()->ownsCurrentThread())
+                    throw std::logic_error("Local hot cache materialization must remain cold outside original workers");
+                const auto initializeLocal=[&] {
+                    const auto stream=permit?permit->worker()->defaultStream():setup->stream;
+                    auto local=qwen4exp::PooledImmutableLocalHotPreparedStorage::create(
+                        localGeometry,boundary->pooledStorage(),authority,stream);
+                    std::unique_ptr<qwen4exp::IPooledImmutableLocalHotKernels> code;
+#ifdef HAVE_CUDA
+                    if(endpoint.device.is_cuda())code=qwen4exp::createCUDAPooledImmutableLocalHotKernels();
+#endif
+#ifdef HAVE_ROCM
+                    if(endpoint.device.is_rocm())code=qwen4exp::createROCmPooledImmutableLocalHotKernels();
+#endif
+                    if(!code)throw std::invalid_argument("Local hot cache requires its compiled native backend");
+                    code->initialize(*local,stream);
+                    localCaches.emplace_back(endpoint.device,std::move(local));
+                };
+                if(permit)permit->worker()->submitAndWait(initializeLocal);else initializeLocal();
+            }
+            const auto actual=provider->identity();
+            {
+                std::lock_guard lock(immutable_row_table_mutex_);
+                if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+                if(immutable_row_table_file_identity_ && *immutable_row_table_file_identity_!=actual)
+                    throw std::logic_error("Adaptive source generation conflicts with the already retained model identity");
+                if(host_row_provider_!=provider || adaptive_lookup_service_!=service)
+                    throw std::logic_error("Adaptive consumer replaced its shared original source/worker");
+                for(auto& [localDevice,local]:localCaches) {
+                    auto& entry=adaptive_lookup_consumers_[localDevice];
+                    if(entry.local_hot)throw std::logic_error("Local hot cache cannot replace original model roots");
+                    entry.local_hot=std::move(local);
+                }
+                adaptive_lookup_consumers_.at(consumer).boundary=std::move(boundary);
+                immutable_row_table_preparations_.at(consumer).state=ImmutableRowPreparationState::Ready;
+                immutable_row_table_preparations_.at(host.device).state=ImmutableRowPreparationState::Ready;
+                for(const auto& owner:orderedOwners)immutable_row_table_preparations_.at(owner.device).state=ImmutableRowPreparationState::Ready;
+            }
+            immutable_row_table_ready_.notify_all();
+        }
+        catch(...)
+        {
+            {
+                std::lock_guard lock(immutable_row_table_mutex_);
+                if(!immutable_row_table_preparation_failure_)immutable_row_table_preparation_failure_=std::current_exception();
+                immutable_row_table_preparations_.at(consumer).state=ImmutableRowPreparationState::Failed;
+                if(prepare_host && immutable_row_table_preparations_.at(host.device).state==ImmutableRowPreparationState::Preparing)
+                    immutable_row_table_preparations_.at(host.device).state=ImmutableRowPreparationState::Failed;
+                for(const auto& owner:orderedOwners)immutable_row_table_preparations_.at(owner.device).state=ImmutableRowPreparationState::Failed;
+            }
+            immutable_row_table_ready_.notify_all();throw;
+        }
+    }
+
+    void ModelContext::prepareImmutableRowTableForConsumer(const ResolvedImmutableRowTablePlacement &placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+        const std::optional<ImmutableRowTableDevicePreparation> &upload, const TransferEngine &transfers,
+        const std::optional<AdaptiveImmutableLookupDevicePreparation> &adaptive_setup)
+    {
+        if (!authority || authority->worldRank() != placement.worldRank())
+            throw std::invalid_argument("Immutable row consumer requires its original rank authority");
+        const auto execution = placement.lookupForConsumer({authority->worldRank(), consumer});
+        prepareImmutableRowTableOriginal(placement, std::move(authority), consumer, execution,
+            upload, transfers, adaptive_setup);
+    }
+
+    void ModelContext::prepareImmutableRowTableForFixedPipelineOwner(
+        const ResolvedImmutableRowTablePlacement& placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId owner,
+        const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers)
+    {
+        if (!authority || !placement.fixedHeadPipeline() ||
+            authority->worldRank() != placement.worldRank() ||
+            !placement.containsAllocator({authority->worldRank(), owner}))
+            throw std::invalid_argument("Fixed PLE storage upload requires its original pipeline owner");
+        prepareImmutableRowTableOriginal(placement, std::move(authority), owner,
+            ImmutableRowLookupExecution::FixedHeadShardGPU, upload, transfers, std::nullopt);
+    }
+
+    void ModelContext::prepareImmutableRowTableOriginal(const ResolvedImmutableRowTablePlacement& placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+        ImmutableRowLookupExecution execution,
+        const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers,
+        const std::optional<AdaptiveImmutableLookupDevicePreparation>& adaptive_setup)
+    {
+        if (isGraphCaptureActive())
+            throw std::logic_error("native table materialization is forbidden during graph capture");
+        const auto source = immutableRowTableSource();
+        if (!authority || placement.worldRank() != authority->worldRank() ||
+            placement.extent() != ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()))
+            throw std::invalid_argument("native table requires its exact sealed source/PMA rank");
+        if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
+        {
+            if(upload)throw std::invalid_argument("Adaptive lookup cannot borrow a whole-table upload authority");
+            prepareGPUAdaptiveImmutableLookup(placement,std::move(authority),source,consumer,adaptive_setup);
+            return;
+        }
+        if(adaptive_setup)throw std::invalid_argument("Other immutable table modes cannot receive adaptive setup");
+        const bool resident = immutableRowLookupUsesNativeDeviceStorage(execution);
+        if ((!resident && upload) || (upload && (upload->device != consumer || !upload->stream)))
+            throw std::invalid_argument("native table participant upload does not match its exact storage/consumer");
+        const DeviceId owner = resident ? consumer : placement.allocators().front().device;
+        std::shared_ptr<HostImmutableRowProvider> ready_host;
+        std::shared_ptr<const ResidentImmutableRowTable> ready_resident;
+        {
+            std::unique_lock lock(immutable_row_table_mutex_);
+            if (immutable_row_table_placement_ && (*immutable_row_table_placement_ != placement ||
+                immutable_row_table_authority_.get() != authority.get() ||
+                !immutable_row_table_source_ || *immutable_row_table_source_ != source))
+                throw std::logic_error("native table cannot replace its declared source/placement/PMA authority");
+            if (immutable_row_table_preparation_failure_)
+                std::rethrow_exception(immutable_row_table_preparation_failure_);
+            for (;;)
+            {
+                const auto found = immutable_row_table_preparations_.find(owner);
+                if (found == immutable_row_table_preparations_.end()) break;
+                if (found->second.state == ImmutableRowPreparationState::Ready)
+                {
+                    if (resident) ready_resident = resident_row_tables_.at(owner);
+                    else ready_host = host_row_provider_;
+                    break;
+                }
+                if (found->second.state == ImmutableRowPreparationState::Failed)
+                    throw std::logic_error("native table participant setup previously failed");
+                if (found->second.preparing_thread == std::this_thread::get_id())
+                    throw std::logic_error("native table participant setup cannot recursively join its own writer");
+                // This is a setup-owner join, not a GPU execution-state wait.
+                immutable_row_table_ready_.wait(lock,[&] {
+                    return immutable_row_table_preparation_failure_ ||
+                        immutable_row_table_preparations_.at(owner).state != ImmutableRowPreparationState::Preparing;
+                });
+                if (immutable_row_table_preparation_failure_)
+                    std::rethrow_exception(immutable_row_table_preparation_failure_);
+            }
+            if (!ready_host && !ready_resident)
+            {
+                if (resident && !upload)
+                    throw std::invalid_argument("fresh resident table participant requires its drained-loader upload authority");
+                if (resident) upload->staging.requireFor(authority,consumer,source.rowBytes());
+                if (!immutable_row_table_placement_)
+                {
+                    immutable_row_table_placement_=std::make_shared<const ResolvedImmutableRowTablePlacement>(placement);
+                    immutable_row_table_authority_=authority;
+                    immutable_row_table_source_=source;
+                }
+                immutable_row_table_preparations_.emplace(owner,
+                    ImmutableRowPreparation{ImmutableRowPreparationState::Preparing,std::this_thread::get_id()});
+            }
+        }
+        if (ready_host || ready_resident)
+        {
+            // Reuse authenticates source outside the global model mutex and
+            // needs neither the old staging receipt nor an upload stream.
+            if (ready_host) ready_host->authenticateSource();
+            else
+            {
+                const auto expected = placement.isFixedHeadShards()
+                    ? placement.fixedHeadSourceRangeFor({authority->worldRank(),consumer})
+                    : ImmutableRowTableSourceRange::whole(placement.extent());
+                if (ready_resident->device()!=consumer || ready_resident->source()!=source ||
+                    ready_resident->sourceRange()!=expected || ready_resident->nativeBytes()!=expected.nativeBytes())
+                    throw std::logic_error("Ready native table differs from its exact original source/owner/range");
+                ready_resident->authenticateSource();
+            }
+            std::lock_guard lock(immutable_row_table_mutex_);
+            if (immutable_row_table_preparation_failure_)
+                std::rethrow_exception(immutable_row_table_preparation_failure_);
+            return;
+        }
+        try
+        {
+            // Ordinary participant preparation has already drained its exact
+            // staging lease. No model mutex is held during file I/O or H2D.
+            std::shared_ptr<HostImmutableRowProvider> host;
+            if(!resident)
+            {
+                if(placement.isHostAdaptive())
+                {
+                    const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::fromLayout(placement.hostAdaptiveLayout(),
+                        {authority->worldRank(),owner},placement.hostAdaptiveMaximumLiveRows(),placement.hostAdaptivePolicy());
+                    host=HostImmutableRowProvider::fromAdaptiveCache(CpuAdaptiveImmutableRowCache::create(source,geometry,authority));
+                }
+                else host=HostImmutableRowProvider::fromWholeTable(std::make_unique<ImmutableRowTable>(
+                    source,placement.storagePolicy(),owner,authority,placement.hostPlacement()));
+            }
+            std::shared_ptr<const ResidentImmutableRowTable> gpu;
+            if (resident)
+                gpu = execution == ImmutableRowLookupExecution::FixedHeadShardGPU
+                    ? ResidentImmutableRowTable::prepareRange(source,placement,authority,
+                        consumer,upload->staging,upload->stream,transfers)
+                    : ResidentImmutableRowTable::prepare(source,placement,authority,
+                        consumer,upload->staging,upload->stream,transfers);
+            if (host) host->authenticateSource();
+            const auto identity = host ? host->identity() : gpu->identity();
+            {
+                std::lock_guard lock(immutable_row_table_mutex_);
+                if (immutable_row_table_preparation_failure_)
+                    std::rethrow_exception(immutable_row_table_preparation_failure_);
+                if (immutable_row_table_file_identity_ && *immutable_row_table_file_identity_ != identity)
+                    throw std::runtime_error("native table consumers do not share one immutable source generation");
+                immutable_row_table_file_identity_=identity;
+                if (resident) resident_row_tables_.emplace(owner,std::move(gpu));
+                else host_row_provider_=std::move(host);
+                immutable_row_table_preparations_.at(owner).state=ImmutableRowPreparationState::Ready;
+            }
+            immutable_row_table_ready_.notify_all();
+        }
+        catch (...)
+        {
+            {
+                std::lock_guard lock(immutable_row_table_mutex_);
+                if (!immutable_row_table_preparation_failure_)
+                    immutable_row_table_preparation_failure_=std::current_exception();
+                immutable_row_table_preparations_.at(owner).state=ImmutableRowPreparationState::Failed;
+            }
+            immutable_row_table_ready_.notify_all();
+            throw;
+        }
+    }
+
+    void ModelContext::requireImmutableRowTablePlacementComplete(const ResolvedImmutableRowTablePlacement &placement,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
+        std::unique_lock lock(immutable_row_table_mutex_);
+        if (immutable_row_table_preparation_failure_)
+            std::rethrow_exception(immutable_row_table_preparation_failure_);
+        if (!authority || !immutable_row_table_placement_ || *immutable_row_table_placement_ != placement ||
+            immutable_row_table_authority_.get() != authority.get() || !immutable_row_table_file_identity_)
+            throw std::logic_error("native table placement is not completely materialized by its exact PMA");
+        for (const auto &allocator : placement.allocators())
+        {
+            const auto found=immutable_row_table_preparations_.find(allocator.device);
+            if (found == immutable_row_table_preparations_.end() ||
+                found->second.state != ImmutableRowPreparationState::Ready)
+                throw std::logic_error("native table placement still has an unprepared participant");
+        }
+        if(placement.isGPUAdaptive())
+        {
+            const auto source=immutable_row_table_source_;
+            const auto provider=host_row_provider_;
+            const auto service=adaptive_lookup_service_;
+            if(!source || !provider || !service || !resident_row_tables_.empty() ||
+                adaptive_lookup_consumers_.size()!=placement.consumers().size())
+                throw std::logic_error("Ready adaptive model lost its exact consumer/source population");
+            const auto& fullLayout=placement.gpuAdaptiveLayout();
+            std::vector<std::shared_ptr<const qwen4exp::PooledImmutableLocalHotPreparedStorage>> localCaches;
+            const auto& localDeclarations=placement.gpuAdaptiveLocalHotCaches();
+            for(const auto& [device,entry]:adaptive_lookup_consumers_) {
+                const auto declared=std::find_if(localDeclarations.begin(),localDeclarations.end(),[&](const auto& local){
+                    return local.allocator()==PhysicalMemoryAllocatorIdentity{authority->worldRank(),device};
+                });
+                if((declared!=localDeclarations.end())!=bool(entry.local_hot))
+                    throw std::logic_error("Ready model lost its exact optional local-cache population");
+                if(entry.local_hot)localCaches.push_back(entry.local_hot);
+            }
+            if(localCaches.size()!=localDeclarations.size())
+                throw std::logic_error("Ready model omitted an admitted local hot cache");
+            const bool shared=fullLayout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator &&
+                placement.consumers().size()>1;
+            const auto sourceLayout=shared
+                ? AdaptiveImmutableLookupGeometry::sourceLayout(fullLayout,placement.gpuAdaptiveRequest()) : fullLayout;
+            const auto expectedRequesters=sourceLayout.consumers();
+            const auto requesters=provider->subordinateRequesters();
+            if(requesters.size()!=expectedRequesters.size() ||
+                !std::equal(requesters.begin(),requesters.end(),expectedRequesters.begin()))
+                throw std::logic_error("Ready adaptive source has a different declared requester set");
+            std::vector<std::pair<DeviceId,std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary>>> boundaries;
+            for(const auto& consumer:placement.consumers())
+            {
+                const auto found=adaptive_lookup_consumers_.find(consumer.device);
+                if(found==adaptive_lookup_consumers_.end())
+                    throw std::logic_error("Ready adaptive model omitted an original consumer entry");
+                if(shared && consumer!=expectedRequesters.front())
+                {
+                    const auto original=adaptive_lookup_consumers_.find(expectedRequesters.front().device);
+                    if(found->second.boundary || original==adaptive_lookup_consumers_.end() ||
+                        !found->second.participants || found->second.participants!=original->second.participants)
+                        throw std::logic_error("Ready query-only reader replaced its original shared source");
+                    continue;
+                }
+                if(!found->second.boundary)
+                    throw std::logic_error("Ready adaptive source omitted its original boundary");
+                boundaries.emplace_back(consumer.device,found->second.boundary);
+            }
+            lock.unlock();
+            const auto& layout=placement.gpuAdaptiveLayout();
+            for(const auto& [device,boundary]:boundaries)
+            {
+                const auto geometry=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+                    ? AdaptiveImmutableLookupGeometry::forRequester(layout,*source,placement.gpuAdaptiveRequest(),
+                        {authority->worldRank(),device})
+                    : AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(layout,*source,placement.gpuAdaptiveRequest(),
+                        placement.gpuAdaptiveLocalHotCaches());
+                boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),*source,geometry.computeReaderCount(),authority);
+                const auto host=boundary->retainedSourceOwnerObservation();
+                // This is the SAME shared physical/source observation on each
+                // channel, not a per-consumer credit or another reservation.
+                if(host.authority().get()!=authority.get() ||
+                    host.authority().owner_before(authority) || authority.owner_before(host.authority()) ||
+                    host.allocator()!=layout.sourceServices().front().allocator || host.hostPlacement()!=placement.hostPlacement())
+                    throw std::logic_error("Ready mixed source/channel claims differ from the original placement/PMA");
+            }
+            std::vector<std::shared_ptr<const qwen4exp::PooledImmutableSourcePreparedStorage>> originalSources;
+            for(const auto& [device,boundary]:boundaries)originalSources.push_back(boundary->pooledStorage());
+            for(const auto& local:localCaches) {
+                const auto declared=std::find_if(localDeclarations.begin(),localDeclarations.end(),[&](const auto& geometry){
+                    return geometry.allocator()==local->geometry().allocator();
+                });
+                if(declared==localDeclarations.end() ||
+                   std::none_of(originalSources.begin(),originalSources.end(),[&](const auto& original){
+                       return original.get()==local->originalSource().get() &&
+                           !original.owner_before(local->originalSource()) && !local->originalSource().owner_before(original);
+                   }))
+                    throw std::logic_error("Local hot cache replaced its original shared source");
+                local->requireFor(*declared,local->originalSource(),authority);
+            }
+            const auto& request=placement.gpuAdaptiveRequest();
+            const auto hostGeometry=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+                ? AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,request)
+                : AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(layout,*source,request,
+                    placement.gpuAdaptiveLocalHotCaches()).host();
+            auto admitted=std::make_shared<const ImmutableLookupSetupObservation>(ImmutableLookupSetupObservation::captureAdaptive(
+                layout,hostGeometry,service,originalSources,localCaches));
+            lock.lock();
+            if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+            if(host_row_provider_!=provider || adaptive_lookup_service_!=service)
+                throw std::logic_error("Adaptive shared source changed during readiness validation");
+            for(const auto& [device,boundary]:boundaries)
+                if(adaptive_lookup_consumers_.at(device).boundary!=boundary)
+                    throw std::logic_error("Adaptive consumer boundary changed during readiness validation");
+            for(const auto& local:localCaches)
+                if(adaptive_lookup_consumers_.at(local->geometry().allocator().device).local_hot!=local)
+                    throw std::logic_error("Local hot cache changed during readiness validation");
+            if(immutable_lookup_setup_observation_ && !immutable_lookup_setup_observation_->sameCapacity(*admitted))
+                throw std::logic_error("Ready lookup setup replaced its original admitted capacity evidence");
+            if(!immutable_lookup_setup_observation_) {
+                immutable_lookup_setup_observation_=std::move(admitted);
+                immutable_lookup_setup_observation_->publish();
+            }
+            return;
+        }
+        if (placement.isFixedHeadShards() || (!placement.isHostAdaptive() && !placement.isGPUAdaptive() && placement.storage()==ImmutableRowStorage::VRAM))
+        {
+            if (host_row_provider_)
+                throw std::logic_error("Native GPU ngrams cannot retain a hidden complete host provider");
+            for (const auto &allocator : placement.allocators())
+            {
+                const auto table=resident_row_tables_.find(allocator.device);
+                const auto expected=placement.isFixedHeadShards() ? placement.fixedHeadSourceRangeFor(allocator)
+                    : ImmutableRowTableSourceRange::whole(placement.extent());
+                if (table==resident_row_tables_.end() || !table->second || !immutable_row_table_source_ ||
+                    table->second->device()!=allocator.device || table->second->source()!=*immutable_row_table_source_ ||
+                    table->second->sourceRange()!=expected || table->second->nativeBytes()!=expected.nativeBytes() ||
+                    table->second->identity()!=*immutable_row_table_file_identity_)
+                    throw std::logic_error("Ready native ngrams do not match every exact source/range/PMA owner");
+            }
+        }
+        else
+        {
+            if(!host_row_provider_)throw std::logic_error("Ready host ngrams have no materialized provider");
+            const auto observed=host_row_provider_->retainedOwnerObservation();
+            if(observed.authority().get()!=authority.get() || !placement.containsAllocator(observed.allocator()) ||
+                observed.hostPlacement()!=placement.hostPlacement() ||
+                (placement.isHostAdaptive() ? host_row_provider_->mode()!=HostImmutableRowMode::AdaptiveRAMSSD :
+                    host_row_provider_->wholeStorage()!=placement.storage()))
+                throw std::logic_error("Ready host ngrams do not match their exact sealed mode/source/PMA owner");
+        }
+    }
+
+    void ModelContext::prepareImmutableRowTable(const ResolvedImmutableRowTablePlacement &placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority,
+        std::span<const ImmutableRowTableDevicePreparation> uploads,const TransferEngine &transfers)
+    {
+        // Existing Ready storage needs no new staging/stream. This wrapper is
+        // a setup convenience; production participant factories use the same
+        // primitive immediately after each exact ordinary loader drains.
+        bool complete=false;
+        {
+            std::lock_guard lock(immutable_row_table_mutex_);
+            if (immutable_row_table_placement_ && (*immutable_row_table_placement_ != placement ||
+                immutable_row_table_authority_.get() != authority.get()))
+                throw std::logic_error("native table batch cannot replace its declared placement/PMA authority");
+            if (immutable_row_table_preparation_failure_)
+                std::rethrow_exception(immutable_row_table_preparation_failure_);
+            complete=immutable_row_table_placement_ && *immutable_row_table_placement_ == placement &&
+                immutable_row_table_authority_.get() == authority.get() &&
+                std::all_of(placement.allocators().begin(),placement.allocators().end(),[&](const auto &a) {
+                    const auto found=immutable_row_table_preparations_.find(a.device);
+                    return found != immutable_row_table_preparations_.end() &&
+                        found->second.state == ImmutableRowPreparationState::Ready;
+                });
+        }
+        std::map<DeviceId,const ImmutableRowTableDevicePreparation *> unique;
+        const bool resident=placement.isFixedHeadShards() ||
+            (!placement.isHostAdaptive() && !placement.isGPUAdaptive() && placement.storage()==ImmutableRowStorage::VRAM);
+        if (!resident && !uploads.empty())
+            throw std::invalid_argument("host native table cannot receive GPU upload authorities");
+        if (resident && (!uploads.empty() || !complete))
+        {
+            if (!authority || uploads.size() != placement.allocators().size())
+                throw std::invalid_argument("native table batch setup must cover every planned GPU exactly once");
+            for (const auto &upload : uploads)
+            {
+                if (!upload.stream || !placement.containsAllocator({authority->worldRank(),upload.device}) ||
+                    !unique.emplace(upload.device,&upload).second)
+                    throw std::invalid_argument("native table batch setup has duplicate/foreign GPU upload ownership");
+                upload.staging.requireFor(authority,upload.device,placement.extent().rowBytes());
+            }
+        }
+        const auto uploadFor = [&](DeviceId device) {
+            const auto found = unique.find(device);
+            return found == unique.end() ? std::optional<ImmutableRowTableDevicePreparation>{} :
+                std::optional<ImmutableRowTableDevicePreparation>{*found->second};
+        };
+        if (placement.fixedHeadPipeline()) {
+            for (const auto& owner : placement.allocators())
+                prepareImmutableRowTableForFixedPipelineOwner(placement, authority, owner.device,
+                    uploadFor(owner.device), transfers);
+        } else {
+            for (const auto& consumer : placement.consumers())
+                prepareImmutableRowTableForConsumer(placement, authority, consumer.device,
+                    uploadFor(consumer.device), transfers);
+        }
+        requireImmutableRowTablePlacementComplete(placement,authority);
+    }
+
     ModelContext::ModelContext(const std::string &model_path,
                                std::shared_ptr<IMPIContext> mpi_ctx,
                                std::shared_ptr<WeightPlacementMap> placement_map,
                                TensorFactory *factory,
                                WeightDistributionStrategy strategy)
-        : model_path_(model_path), loader_(factory)
+        : model_path_(model_path), immutable_source_mpi_(mpi_ctx), loader_(factory)
     {
         // WeightManager will be created after model is loaded (see create())
         // placement_map is passed through to WeightManager
@@ -224,6 +1333,7 @@ namespace llaminar2
         try
         {
             ctx->loader_.loadModel(model_path);
+            if (config.shared_predictor) ctx->loader_.bindSharedPredictor(*config.shared_predictor, config.predictor_materialization);
         }
         catch (const std::exception &e)
         {

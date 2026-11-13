@@ -6,17 +6,23 @@
  * single-device gather path, copyFromStage delegation, and host pinning cleanup.
  * Bounded-output regressions reject oversized reads before touching storage and
  * prove that lazy terminal PP output has only one vocabulary row of capacity.
+ * Captured-pipeline domain tests invoke the real rank completion to prove that
+ * retained prefill bytes cannot masquerade as a newly completed decode row.
  */
 
 #include <gtest/gtest.h>
 
 #include "execution/local_execution/orchestrators/LogitsGatherer.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "mocks/MockBackend.h"
+#include "mocks/MockModelContext.h"
 #include "tensors/Tensors.h"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <memory>
+#include <tuple>
 #include <vector>
 
 using namespace llaminar2;
@@ -109,8 +115,8 @@ namespace
     class OrderedD2HBackend : public test::MockBackend
     {
     public:
-        OrderedD2HBackend()
-            : test::MockBackend(DeviceType::CUDA)
+        explicit OrderedD2HBackend(DeviceType device_type = DeviceType::CUDA)
+            : test::MockBackend(device_type)
         {
         }
 
@@ -118,10 +124,11 @@ namespace
             void *dst,
             const void *src,
             size_t bytes,
-            int,
+            int device_id,
             void *stream) override
         {
             streams_.push_back(stream);
+            devices_.push_back(device_id);
             ++copy_count_;
             if (fail_copies_)
                 return false;
@@ -145,20 +152,23 @@ namespace
         size_t copyCount() const { return copy_count_; }
         size_t fastCopyCount() const { return fast_copy_count_; }
         const std::vector<void *> &streams() const { return streams_; }
+        /// @return Original shard device ordinals supplied with each exact-stream copy.
+        const std::vector<int> &devices() const { return devices_; }
 
     private:
         bool fail_copies_ = false;
         size_t copy_count_ = 0;
         size_t fast_copy_count_ = 0;
         std::vector<void *> streams_;
+        std::vector<int> devices_;
     };
 
     OrderedD2HBackend *g_ordered_d2h_backend = nullptr;
 
-    /// @brief Resolve the test-owned CUDA backend without global registration.
+    /// @brief Resolve the test-owned GPU backend without any native runtime registration.
     IBackend *resolveOrderedD2HBackend(DeviceId device)
     {
-        return device.is_cuda() ? g_ordered_d2h_backend : nullptr;
+        return device.is_gpu() ? g_ordered_d2h_backend : nullptr;
     }
 
     /**
@@ -641,11 +651,13 @@ public:
     OrderedGPUColumnParallelMockRunner(
         int local_vocab,
         std::vector<float> device_data,
-        void *host_bridge_stream)
+        void *host_bridge_stream,
+        DeviceId device = DeviceId::cuda(0))
         : LogitsGathererMockRunner(local_vocab),
           local_vocab_(local_vocab),
           device_data_(std::move(device_data)),
           host_bridge_stream_(host_bridge_stream),
+          device_(device),
           tensor_(std::make_shared<FP32Tensor>(
               std::vector<size_t>{1, static_cast<size_t>(local_vocab)},
               DeviceId::cpu()))
@@ -658,11 +670,31 @@ public:
 
     bool hasLogitsLocal() const override { return true; }
 
+    /** @return Authored placement metadata; no physical device is initialized. */
+    DeviceId primaryDeviceId() const override { return device_; }
+
+    /** @brief Count unexpected model dispatch; completion must never replay a child. */
+    bool forward(const int *tokens, int rows) override
+    {
+        ++model_forwards_;
+        return LogitsGathererMockRunner::forward(tokens, rows);
+    }
+
+    /** @return The single-child diagnostic view after its consuming publication boundary. */
+    const float *logits() const override
+    {
+        const auto info = const_cast<OrderedGPUColumnParallelMockRunner *>(this)
+                              ->consumeLogitsLocalInfoForHostGather();
+        if (!info.stream)
+            throw std::logic_error("Authored child host view has no producer-ordered stream");
+        return device_data_.data();
+    }
+
     LogitsLocalInfo getLogitsLocalInfo() const override
     {
         return LogitsLocalInfo{
             device_data_.data(),
-            DeviceId::cuda(0),
+            device_,
             static_cast<size_t>(local_vocab_),
             0,
             tensor_.get(),
@@ -679,12 +711,26 @@ public:
 
     size_t hostGatherConsumes() const { return host_gather_consumes_; }
 
+    /** @brief Replace a completed authored row and its exact next producer bridge. */
+    void publishCompletedRow(const std::vector<float> &row, void *stream)
+    {
+        if (row.size() != device_data_.size())
+            throw std::invalid_argument("Authored logits row changed retained geometry");
+        std::copy(row.begin(), row.end(), device_data_.begin());
+        host_bridge_stream_ = stream;
+    }
+
+    /** @return Number of model forwards; host publication must leave this zero. */
+    size_t modelForwards() const { return model_forwards_; }
+
 private:
     int local_vocab_;
     std::vector<float> device_data_;
     void *host_bridge_stream_ = nullptr;
+    DeviceId device_;
     std::shared_ptr<FP32Tensor> tensor_;
     size_t host_gather_consumes_ = 0;
+    size_t model_forwards_ = 0;
 };
 
 TEST_F(Test__LogitsGatherer, GatherColumnParallel_TwoDevices_Decode)
@@ -1008,4 +1054,229 @@ TEST_F(Test__LogitsGatherer, GatherColumnParallel_UnequalVocabSlices)
     const float *out = g->data();
     for (int i = 0; i < FULL_V; ++i)
         EXPECT_FLOAT_EQ(out[i], static_cast<float>(i));
+}
+
+namespace llaminar2::test
+{
+    /**
+     * @brief Seed authored retained host state and invoke the actual private rank completion.
+     *
+     * Only the consuming logits boundary is under test. The fixture does not
+     * emulate a pipeline, run model forwards, or initialize a GPU runtime.
+     */
+    struct RankPipelineHostPublicationTestAccess
+    {
+        /** @brief Bind the existing deterministic backend resolver to the real gatherer. */
+        static void installObservationOwner(RankOrchestrator &rank)
+        {
+            rank.logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                rank.vocab_size(), 1, resolveOrderedD2HBackend);
+            rank.applyLogitsGatherSkipFlags();
+        }
+
+        /** @brief Retain a prefill row through the real child-consuming gather API. */
+        static bool primePrefill(RankOrchestrator &rank)
+        {
+            rank.current_position_ = 9;
+            rank.current_sequence_lengths_ = {9};
+            rank.current_padded_seq_len_ = 9;
+            rank.last_logits_forward_phase_ = LogitsForwardPhase::Prefill;
+            return rank.logits_gatherer_->gather(rank.device_runners_, 1, rank.vocab_size());
+        }
+
+        /** @brief Invoke the same completion called by PipelineDeviceGeneration after its real output events. */
+        static void complete(RankOrchestrator &rank) { rank.retirePipelineForwardOnlyDomain(); }
+
+        /** @return Actual rank metadata that a failed host publication must leave unchanged. */
+        static auto metadata(const RankOrchestrator &rank)
+        {
+            return std::tuple{rank.current_position_, rank.current_sequence_lengths_,
+                rank.current_padded_seq_len_, rank.last_logits_forward_phase_,
+                rank.rank_resident_logical_state_epoch_};
+        }
+
+        /** @return Host data only while the real gatherer certifies a current row. */
+        static const float *hostData(const RankOrchestrator &rank)
+        {
+            return rank.logits_gatherer_ ? rank.logits_gatherer_->data() : nullptr;
+        }
+    };
+}
+
+namespace
+{
+    using PipelinePublicationAccess = test::RankPipelineHostPublicationTestAccess;
+
+    /** @brief Test-owned completed shards and their real RankOrchestrator host publication boundary. */
+    struct CompletedPipelineDomain
+    {
+        std::vector<OrderedGPUColumnParallelMockRunner *> children;
+        std::unique_ptr<RankOrchestrator> rank;
+        static constexpr int local_vocab = 4;
+
+        /** @return Distinct authored exact-stream identities, not physical GPU observations. */
+        static void *stream(size_t participant, int generation)
+        {
+            return reinterpret_cast<void *>(uintptr_t(0x1000 + 0x100 * generation + 0x10 * participant));
+        }
+
+        /** @brief Create any positive participant width without querying an accelerator. */
+        CompletedPipelineDomain(size_t width, DeviceType backend, bool owns_head = true)
+        {
+            std::vector<std::unique_ptr<IInferenceRunner>> runners;
+            for (size_t index = 0; index < width; ++index)
+            {
+                const auto device = backend == DeviceType::CUDA
+                    ? DeviceId::cuda(static_cast<int>(index)) : DeviceId::rocm(static_cast<int>(index));
+                auto child = std::make_unique<OrderedGPUColumnParallelMockRunner>(
+                    local_vocab, std::vector<float>(local_vocab, -1.0f), stream(index, 0), device);
+                children.push_back(child.get());
+                runners.push_back(std::move(child));
+            }
+            auto model = test::MockModelContext::createMinimal();
+            model->setVocabSize(width * local_vocab);
+            RankOrchestrator::Config config;
+            config.nested_pp_stage_config = FactoryPPStageConfig{
+                .first_layer = 0, .last_layer = 1, .has_embedding = false, .has_lm_head = owns_head};
+            rank = RankOrchestrator::createForTest(std::move(model), std::move(runners), nullptr, config);
+            if (owns_head) PipelinePublicationAccess::installObservationOwner(*rank);
+        }
+
+        /** @brief Publish one changed completed row per original shard without executing inference. */
+        void publish(float base, int generation, bool missing_first_stream = false)
+        {
+            for (size_t participant = 0; participant < children.size(); ++participant)
+            {
+                std::vector<float> row(local_vocab);
+                for (int column = 0; column < local_vocab; ++column)
+                    row[column] = base + static_cast<float>(participant * local_vocab + column);
+                children[participant]->publishCompletedRow(row,
+                    missing_first_stream && participant == 0 ? nullptr : stream(participant, generation));
+            }
+        }
+
+        /** @brief Check complete byte freshness and that observation never submitted another model row. */
+        void expectPublished(float base) const
+        {
+            std::vector<float> expected(children.size() * local_vocab);
+            for (size_t column = 0; column < expected.size(); ++column)
+                expected[column] = base + static_cast<float>(column);
+            const float *published = PipelinePublicationAccess::hostData(*rank);
+            ASSERT_NE(published, nullptr);
+            EXPECT_EQ(std::memcmp(published, expected.data(), expected.size() * sizeof(float)), 0);
+            const float *actual = rank->logits();
+            ASSERT_NE(actual, nullptr);
+            EXPECT_EQ(std::memcmp(actual, expected.data(), expected.size() * sizeof(float)), 0);
+            for (const auto *child : children) EXPECT_EQ(child->modelForwards(), 0u);
+        }
+    };
+}
+
+/** @test Actual domain completion refreshes original shards across reset, replay and arbitrary widths. */
+TEST_F(Test__LogitsGatherer, PipelineForwardOnlyRefreshesCurrentHostRows)
+{
+    for (const auto backend_type : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        OrderedD2HBackend backend(backend_type);
+        OrderedD2HResolverScope resolver(backend);
+        for (const size_t width : {1u, 2u, 3u, 8u})
+        {
+            SCOPED_TRACE(::testing::Message() << "backend=" << static_cast<int>(backend_type) << " width=" << width);
+            CompletedPipelineDomain domain(width, backend_type);
+            for (int request = 0; request < 3; ++request)
+            {
+                if (request) domain.rank->clear_cache();
+                const float initial = static_cast<float>(100 * request);
+                domain.publish(initial, 0);
+                ASSERT_TRUE(PipelinePublicationAccess::primePrefill(*domain.rank));
+                domain.expectPublished(initial);
+                for (int step = 0; step < 3; ++step)
+                {
+                    const float next = initial + static_cast<float>(10 * (step + 1));
+                    std::vector<size_t> consumed;
+                    for (const auto *child : domain.children) consumed.push_back(child->hostGatherConsumes());
+                    const auto before_copies = backend.copyCount();
+                    domain.publish(next, step + 1);
+                    PipelinePublicationAccess::complete(*domain.rank);
+                    // Public get_position() delegates to the actual child KV
+                    // owner. This unit boundary authors completed child rows,
+                    // so inspect only the rank metadata this method publishes.
+                    const auto metadata = PipelinePublicationAccess::metadata(*domain.rank);
+                    EXPECT_EQ(std::get<0>(metadata), 10 + step);
+                    EXPECT_EQ(std::get<1>(metadata), std::vector<int>({10 + step}));
+                    EXPECT_EQ(std::get<2>(metadata), 1);
+                    EXPECT_EQ(std::get<3>(metadata), std::optional{LogitsForwardPhase::Decode});
+                    EXPECT_EQ(backend.copyCount() - before_copies, width == 1 ? 0u : width);
+                    if (width > 1)
+                        ASSERT_EQ(backend.streams().size(), before_copies + width);
+                    for (size_t participant = 0; participant < width; ++participant)
+                    {
+                        EXPECT_EQ(domain.children[participant]->hostGatherConsumes(), consumed[participant] + 1);
+                        if (width > 1)
+                        {
+                            EXPECT_EQ(backend.streams()[before_copies + participant],
+                                CompletedPipelineDomain::stream(participant, step + 1));
+                            EXPECT_EQ(backend.devices()[before_copies + participant], static_cast<int>(participant));
+                        }
+                    }
+                    domain.expectPublished(next);
+                }
+            }
+        }
+    }
+}
+
+/** @test Device-only and hidden-stage completion cannot retain or gather a host logits row. */
+TEST_F(Test__LogitsGatherer, PipelineForwardOnlyDisabledAndHiddenDomainsDoNotGather)
+{
+    for (const auto backend_type : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        OrderedD2HBackend backend(backend_type);
+        OrderedD2HResolverScope resolver(backend);
+        CompletedPipelineDomain domain(3, backend_type);
+        domain.publish(0.0f, 0);
+        ASSERT_TRUE(PipelinePublicationAccess::primePrefill(*domain.rank));
+        domain.rank->setSkipLogitsGatherDecode(true);
+        domain.publish(100.0f, 1);
+        const auto before = backend.copyCount();
+        PipelinePublicationAccess::complete(*domain.rank);
+        EXPECT_EQ(PipelinePublicationAccess::hostData(*domain.rank), nullptr);
+        EXPECT_EQ(backend.copyCount(), before);
+        for (const auto *child : domain.children) EXPECT_EQ(child->hostGatherConsumes(), 1u);
+        EXPECT_THROW(domain.rank->logits(), std::logic_error);
+        domain.rank->setSkipLogitsGatherDecode(false);
+        PipelinePublicationAccess::complete(*domain.rank);
+        domain.expectPublished(100.0f);
+
+        CompletedPipelineDomain hidden(3, backend_type, false);
+        hidden.publish(200.0f, 2);
+        const auto before_hidden = backend.copyCount();
+        PipelinePublicationAccess::complete(*hidden.rank);
+        EXPECT_EQ(backend.copyCount(), before_hidden);
+        for (const auto *child : hidden.children) EXPECT_EQ(child->hostGatherConsumes(), 0u);
+        EXPECT_THROW(hidden.rank->logits(), std::logic_error);
+    }
+}
+
+/** @test Rejected exact-stream or D2H publication invalidates data before any rank metadata advances. */
+TEST_F(Test__LogitsGatherer, PipelineForwardOnlyFailedGatherCannotPublishMetadata)
+{
+    for (const auto backend_type : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        for (const bool missing_stream : {false, true})
+        {
+            OrderedD2HBackend backend(backend_type);
+            OrderedD2HResolverScope resolver(backend);
+            CompletedPipelineDomain domain(3, backend_type);
+            domain.publish(0.0f, 0);
+            ASSERT_TRUE(PipelinePublicationAccess::primePrefill(*domain.rank));
+            const auto before = PipelinePublicationAccess::metadata(*domain.rank);
+            domain.publish(100.0f, 1, missing_stream);
+            backend.setFailCopies(!missing_stream);
+            EXPECT_THROW(PipelinePublicationAccess::complete(*domain.rank), std::runtime_error);
+            EXPECT_EQ(PipelinePublicationAccess::hostData(*domain.rank), nullptr);
+            EXPECT_EQ(PipelinePublicationAccess::metadata(*domain.rank), before);
+            for (const auto *child : domain.children) EXPECT_EQ(child->modelForwards(), 0u);
+        }
+    }
 }

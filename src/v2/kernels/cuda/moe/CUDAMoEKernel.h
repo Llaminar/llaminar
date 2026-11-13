@@ -21,6 +21,7 @@
  */
 
 #include "../../IMoEKernel.h"
+#include "../../../config/MoERouterArithmeticPolicy.h"
 #include "CUDARouterQ8Prefill.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../CUDAKernelBase.h"
@@ -59,6 +60,15 @@ namespace llaminar2
         void resetDynamicState() override;
 
         /** @copydoc IMoEKernel::packMoEOverlayActivationDispatch */
+        /** @copydoc IMoEKernel::beginOriginalMoEOverlayInvocation */
+        bool beginOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,const MoEOverlayOriginalNativeBeginLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocation */
+        bool retireOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,const MoEOverlayOriginalNativeRetireLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocationBatch */
+        bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,const MoEOverlayActivationSingleRowReturnBatchLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocationBatch */
+        bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,const MoEOverlayActivationMultiRowReturnBatchLaunch&) override;
+
         bool packMoEOverlayActivationDispatch(
             const MoEKernelLaunchContext &launch,
             const MoEOverlayActivationDispatchPackLaunch &packet) override;
@@ -189,6 +199,11 @@ namespace llaminar2
             override;
 
         /** @copydoc IMoEKernel::acquireMoEOverlayEpoch */
+        /** @brief Execute the original arena's captured finite parent Arm/Close action. */
+        bool runMoEOverlayEpochParentAction(const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control, DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochParentAction action) override;
+
         bool acquireMoEOverlayEpoch(
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,
@@ -516,7 +531,7 @@ namespace llaminar2
 
         /// @brief Upload persistent down-projection descriptors for grouped CUDA prefill.
         int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -525,8 +540,8 @@ namespace llaminar2
 
         /// @brief Upload persistent gate/up descriptor tables for grouped CUDA prefill.
         int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -552,15 +567,15 @@ namespace llaminar2
 
         bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate) override;
 
         bool updateGroupedExpertGateUpDescriptorTables(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate) override;
@@ -1253,7 +1268,7 @@ namespace llaminar2
             const char *buffer_name,
             std::size_t slot,
             int num_experts,
-            DeviceNativeVNNIMatrixDesc **device_descs,
+            DeviceNativeQuantisedMatrixDesc **device_descs,
             const char *context);
 
         bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
@@ -1281,17 +1296,38 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
+         * @brief Bind required original-Q8 scratch before capture, rejecting geometry drift.
+         * @param rows Immutable physical rows. @param width Original hidden width.
+         * @param top_k Admitted route width used by the existing CUDA scratch owner.
+         * @return Whether the explicit grouped-consumer contract is satisfied.
+         */
+        bool prepareRequiredRouterQ8Hidden(int rows, int width, int top_k);
+
+        /**
+         * @brief Record original-FP32 quantization only for a declared consumer.
+         * @param source Original FP32 hidden. @param rows Physical row capacity.
+         * @param width Hidden width. @param top_k Admitted route width.
+         * @param live_rows Device-owned live prefix, never downloaded.
+         * @return Whether preparation and publication succeeded.
+         */
+        bool publishRequiredRouterQ8Hidden(const float *source, int rows,
+            int width, int top_k, const int *live_rows);
+
+
+        /**
          * @brief Publish contiguous Q8 rows produced by the current router.
          *
          * @param source FP32 device row base quantized by the router.
          * @param rows Number of valid rows in decode hidden scratch.
          * @param recorded_during_capture True when the producer was recorded,
          *        but not yet executed, by the active CUDA graph capture.
+         * @param router_basis Actual router transformation; Original for hidden-only publication.
          */
         void publishRouterQ8Hidden(
             const float *source,
             int rows,
-            bool recorded_during_capture) noexcept;
+            bool recorded_during_capture,
+            RouterQ8Basis router_basis) noexcept;
 
         /**
          * @brief Return whether the following expert stage may consume the publication.
@@ -1334,11 +1370,11 @@ namespace llaminar2
 
         struct GroupedDownDescriptorTable
         {
-            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_descs;
             std::size_t workspace_slot = 0;
             int num_experts = 0;
@@ -1349,13 +1385,13 @@ namespace llaminar2
             uint32_t policy_codebook_mask = 0;
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
-            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             bool valid = false;
 
             /** @return Whether the selected descriptor family has device storage. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
-                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                return weight_format == DeviceMoEWeightFormat::NativeQuantised
                            ? device_descs != nullptr
                            : deviceMoEWeightFormatIsFloating(weight_format) &&
                                  device_floating_descs != nullptr;
@@ -1364,14 +1400,14 @@ namespace llaminar2
 
         struct GroupedGateUpDescriptorTable
         {
-            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_up_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_gate_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_up_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_gate_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_up_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_gate_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_up_descs;
             std::size_t workspace_slot = 0;
@@ -1383,13 +1419,13 @@ namespace llaminar2
             uint32_t policy_codebook_mask = 0;
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
-            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             bool valid = false;
 
             /** @return Whether both selected descriptor tables are resident. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
-                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                return weight_format == DeviceMoEWeightFormat::NativeQuantised
                            ? device_gate_descs != nullptr && device_up_descs != nullptr
                            : deviceMoEWeightFormatIsFloating(weight_format) &&
                                  device_floating_gate_descs != nullptr &&
@@ -1467,6 +1503,8 @@ namespace llaminar2
         uint8_t *d_group_expert_mask_ = nullptr;
         std::shared_ptr<PersistentWorkspaceSlotLease> group_expert_mask_workspace_lease_;
         int group_active_expert_slots_ = 0;
+        MoEPrefillGroupingProvenance grouped_prefill_grouping_;
+            ///< Instance-owned static producer origin; no host copy of live route counts.
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
         bool group_buffers_workspace_bound_ = false;

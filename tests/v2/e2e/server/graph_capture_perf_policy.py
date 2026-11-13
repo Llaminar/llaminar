@@ -730,6 +730,55 @@ def _segmented_executable_contexts(
     return contexts, tuple(errors)
 
 
+def _materialized_decode_capture(records: Sequence[Mapping[str, Any]], *, require_replay: bool) -> bool:
+    """Join setup-only physical decode instantiation to its original submission.
+
+    Materialization deliberately emits no executed ``decode_graph_phase/capture``.
+    A replay requirement must additionally name that same rank/device/context/
+    executable family in the physical launch records and publish a completed
+    decode replay. A neighboring setup family cannot discharge this obligation.
+    Retained parents publish their setup and original/repeated submissions
+    through their own lifecycle ABI, without ``decode_graph_phase/capture``.
+    Join those records by rank/device/context as the parent lifecycle validator
+    does. Existing physical-boundary and per-context checks remain mandatory.
+    """
+    materialized, submitted, replayed = set(), set(), set()
+    parents: dict[tuple[str, str], set[str]] = {}
+    for record in records:
+        if record.get("domain") != "forward_graph":
+            continue
+        tags = record.get("tags") or {}
+        context = str(tags.get("context", ""))
+        if context not in {"main_decode", "main_verifier"}:
+            continue
+        owner = (_device_owner(record), context)
+        if (record.get("name") in _RETAINED_PARENT_METRICS
+                and math.isfinite(_record_value(record)) and _record_value(record) > 0
+                and _numeric(tags.get("child_units")) > 0):
+            parents.setdefault(owner, set()).add(_RETAINED_PARENT_METRICS[record["name"]])
+        if (record.get("name") == "decode_graph_phase" and tags.get("phase") == "replay"
+                and _record_value(record) > 0):
+            replayed.add(owner)
+        family = str(tags.get("executable_family", ""))
+        if not family.isdecimal() or int(family) <= 0:
+            continue
+        key = (*owner, family)
+        if (_is_nonempty_full_graph_executable(record)
+                and tags.get("type") == "materialized_unlaunched_executable"):
+            materialized.add(key)
+        elif (record.get("name") == "full_graph_replay_calls"
+              and tags.get("type") == "capturable" and tags.get("decode") == "true"
+              and _record_value(record) > 0):
+            submitted.add(key)
+    parent_required = {"nodes", "materialized", "initial"}
+    if require_replay:
+        parent_required.add("replay")
+    has_parent = any(parent_required <= observed for observed in parents.values())
+    if not require_replay:
+        return bool(materialized) or has_parent
+    return has_parent or any(key in submitted and key[:2] in replayed for key in materialized)
+
+
 def validate_graph_capture_policy(
     records: Sequence[Mapping[str, Any]],
     device_kinds: frozenset[str],
@@ -790,6 +839,11 @@ def validate_graph_capture_policy(
         and (r.get("tags") or {}).get("phase") == "capture"
         and _record_value(r) > 0 for r in records
     )
+
+    # Setup-only instantiation is a real capture, not an executed capture
+    # counter. REPLAY still requires its exact original physical family launch.
+    has_decode_capture |= _materialized_decode_capture(
+        records, require_replay=decode_requirement is DecodeGraphRequirement.REPLAY)
 
     error: str | None = None
     if has_segmented_execution and not heterogeneous_device_mix:

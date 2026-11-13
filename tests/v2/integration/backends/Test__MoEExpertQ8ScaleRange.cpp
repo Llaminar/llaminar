@@ -132,13 +132,13 @@ void proveExpertScaleRange(DeviceId device)
         consumer->bindWorkspace(&workspace);
         std::vector<std::unique_ptr<TensorBase>> sources;
         std::vector<GpuPreparedGemm> prepared;
-        std::array<DeviceNativeVNNIMatrixDesc, 3> descriptors{};
+        std::array<DeviceNativeQuantisedMatrixDesc, 3> descriptors{};
         for (int role = 0; role < 3; ++role)
         {
             sources.push_back(TestTensorFactory::createIQ4_NLRandom({width, width}, 7310 + role));
             prepared.push_back(makeGpuPreparedGemm(sources.back().get(), device,
                 "test.expert.q8.scale." + std::to_string(role)));
-            ASSERT_TRUE(prepared.back().kernel->exportNativeVNNIMatrixDesc(descriptors[role]));
+            ASSERT_TRUE(prepared.back().kernel->exportNativeQuantisedMatrixDesc(descriptors[role]));
         }
         const int gateup = kernel->uploadGroupedExpertGateUpDescriptorTables(
             &descriptors[0], &descriptors[1], 1, width, width);

@@ -6,6 +6,8 @@
  * production sampler must load that triplet, use normal expert preparation and
  * complete the existing grouped FFN at all three phases. These are lifecycle
  * witnesses, not real-model throughput certificates or performance thresholds.
+ * Source-backed startup experts cover exactly decode and prefill; live grouped
+ * verifier service is certified separately through prepared runtime endpoints.
  */
 #include "planning/PlanningCPUExpertMeasurement.h"
 #include "backends/BackendManager.h"
@@ -86,7 +88,7 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertSamples)
             const auto engine = KernelFactory::prepareExpertGemmLocal(tensor.get(), DeviceId::cpu());
             ASSERT_NE(engine, nullptr);
             EXPECT_EQ(engine->packedWeightBytes(),
-                CPUWeightPreparationMemory::sourceNative("Q8_1", 65, 256).persistent_bytes);
+                CPUWeightPreparationMemory::sourceNative("Q8_1", 65, 256).persistent_payload_bytes);
             continue;
         }
         SCOPED_TRACE(format.label);
@@ -112,7 +114,9 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertSamples)
             EXPECT_EQ(observed.source.gate.tensor_name, sample.gate.tensor_name);
             EXPECT_EQ(std::get<PlanningExpertMatrix>(observed.source.gate.selection).index, 7u);
             EXPECT_GT(observed.prepared_bytes, 0u);
-            ASSERT_EQ(observed.phases.size(), 3u);
+            ASSERT_EQ(observed.phases.size(), 2u);
+            EXPECT_EQ(observed.phases[0].phase,ExpertHistogramSource::DecodeToken);
+            EXPECT_EQ(observed.phases[1].phase,ExpertHistogramSource::PrefillChunk);
             for (const auto &phase : observed.phases)
             {
                 EXPECT_EQ(phase.rows, MoEOverlayCPUServiceMeasurement::rowsForPhase(phase.phase));
@@ -202,5 +206,77 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_FloatingPreparedAccounting)
         ContiguousFloatingPointWeightDescriptor retained;
         EXPECT_TRUE(view->exportContiguousFloatingPointWeights(retained));
         EXPECT_EQ(retained.bytes, tensor->size_bytes());
+    }
+}
+
+
+/**
+ * @test Exact physical preparation retains one root through independent views.
+ *
+ * Every native codebook includes a padded N tail. Odd floating K additionally
+ * distinguishes logical engine bytes from allocator rounding. The native packer
+ * alone owns bounded setup scratch and retires it before returning the final
+ * execution owner; full/one-byte-short quotas cannot hide a second claim.
+ */
+TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertPhysicalStorageAndRetirement)
+{
+    using llaminar::v2::kernels::KernelFactory;
+    FixedWorkers workers(1);
+    auto formats=quantizedVerifierFormats();
+    formats.push_back({"FP32",TensorType::FP32,0,false,0,
+        [](const auto &shape,uint32_t seed){return TestTensorFactory::createFP32Random(shape,-1.0f,1.0f,seed);}});
+    formats.push_back({"FP16",TensorType::FP16,0,false,0,
+        [](const auto &shape,uint32_t seed){return TestTensorFactory::createFP16Random(shape,-1.0f,1.0f,seed);}});
+    formats.push_back({"BF16",TensorType::BF16,0,false,0,
+        [](const auto &shape,uint32_t seed){return TestTensorFactory::createBF16Random(shape,-1.0f,1.0f,seed);}});
+    const DeviceId device{DeviceType::CPU,1};
+    for(const auto &format:formats)
+    {
+        SCOPED_TRACE(format.label);
+        const bool floating=format.tensor_type==TensorType::FP32 ||
+            format.tensor_type==TensorType::FP16 || format.tensor_type==TensorType::BF16;
+        const size_t k=floating?259:256;
+        const auto tensor=std::shared_ptr<TensorBase>(format.create({65,k},731));
+        const std::string_view source=format.tensor_type==TensorType::FP32?"F32":
+            format.tensor_type==TensorType::FP16?"F16":format.label;
+        const auto declaration=CPUWeightPreparationMemory::sourceNative(source,65,k);
+        const auto admit=[&](size_t retained)
+        {
+            PhysicalMemoryPlanBuilder plan;
+            const PhysicalMemoryResource resource{0,device,declaration.persistent_bytes+declaration.temporary_bytes,
+                declaration.persistent_bytes+declaration.temporary_bytes};
+            plan.add(resource,PhysicalMemoryOwner::RoutedExpertWeights,retained);
+            plan.add(resource,PhysicalMemoryOwner::WeightLoadStaging,declaration.temporary_bytes);
+            return std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+        };
+        auto memory=admit(declaration.persistent_bytes);
+        const auto live=[&](PhysicalMemoryOwner owner)
+        {return memory->claimedBytes(device,owner,PhysicalMemoryMaterializationKind::NewAllocation);};
+        // Full admitted scratch is available to its actual packer owner;
+        // no manual lease may occupy the same physical bytes outside it.
+        auto engine=KernelFactory::prepareExpertGemmLocal(std::shared_ptr<const TensorBase>(tensor),device,
+            KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
+                memory,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local()));
+        ASSERT_NE(engine,nullptr);
+        EXPECT_EQ(engine->packedWeightBytes(),declaration.persistent_payload_bytes);
+        EXPECT_EQ(live(PhysicalMemoryOwner::RoutedExpertWeights),declaration.persistent_bytes);
+        EXPECT_EQ(live(PhysicalMemoryOwner::WeightLoadStaging),0u);
+        auto view=KernelFactory::createExpertServiceExecutionView(engine,device);
+        ASSERT_NE(view,nullptr);
+        engine.reset();
+        EXPECT_EQ(live(PhysicalMemoryOwner::RoutedExpertWeights),declaration.persistent_bytes);
+        view.reset();
+        EXPECT_EQ(live(PhysicalMemoryOwner::RoutedExpertWeights),0u);
+        auto insufficient=admit(declaration.persistent_bytes-1);
+        // Only the persistent root is one byte short. The real packer may
+        // claim scratch first, but must retire it when final admission fails.
+        EXPECT_THROW((void)KernelFactory::prepareExpertGemmLocal(std::shared_ptr<const TensorBase>(tensor),device,
+            KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
+                insufficient,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local())),std::logic_error);
+        EXPECT_EQ(insufficient->claimedBytes(device,PhysicalMemoryOwner::RoutedExpertWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        EXPECT_EQ(insufficient->claimedBytes(device,PhysicalMemoryOwner::WeightLoadStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
     }
 }

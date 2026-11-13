@@ -13,6 +13,7 @@
 #pragma once
 
 #include "MoEOverlayCapacityAdmission.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 #include "MoEOverlayNodeLocalActivationLayout.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
@@ -46,6 +47,8 @@ namespace llaminar2
         DeviceId source_device = DeviceId::invalid();
         std::vector<MoEOverlayActivationLocalLaneBinding> source_lanes;
         std::vector<MoEOverlayActivationLocalLaneBinding> target_lanes;
+        /** Combined exact endpoint grants when both ends belong to one rank. */
+        std::vector<MoEOverlayActivationLocalLaneBinding> rank_local_lanes;
         /** Exact shared mapping consumed unchanged by both endpoint ranks. */
         MoEOverlayNodeLocalActivationLayout mapping_layout;
 
@@ -74,8 +77,10 @@ namespace llaminar2
         int top_k = 0;
         std::size_t graph_family_count = 0;
         std::size_t payload_matrix_bytes = 0;
-        /** Endpoint-private epoch-grant bytes retained by one logical lane. */
+        /** GPU allocator-rounded grant workspace for one actual lane's retained families. */
         std::size_t device_grant_bytes_per_lane = 0;
+        /** Exact CPU root for one actual lane's retained families, including GPU upload backing. */
+        std::size_t host_grant_bytes_per_lane = 0;
         /** One max-shape FP32 original-route bank per mapped GPU follower. */
         std::size_t canonical_route_matrix_bytes = 0;
         std::vector<MoEOverlayNodeLocalActivationChannelPlan> channels;
@@ -101,6 +106,8 @@ namespace llaminar2
         int d_model = 0;
         int top_k = 0;
         std::size_t graph_family_count = 0;
+        /** Same cold original protocol roster; absent for host-ordered transports. */
+        std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slots;
     };
 
     /**
@@ -117,17 +124,44 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Report whether any non-root participant lives on another rank.
+         * @brief Resolve native slot eligibility from the original bound placement.
+         * @param placement Original device/host authority and participant declarations.
+         * @param inventory Complete original world topology.
+         * @param family Original retained graph family, including its draft ceiling.
+         * @return Native geometry only for a world-one device-owned mapped follower group.
+         * @throws std::invalid_argument For an incomplete family or bound topology.
+         * This is a cold BOM declaration; it grants no execution or source authority.
+         */
+        [[nodiscard]] static std::optional<MoEOverlayInferenceOriginalSlotGeometry>
+        originalNativeSlotGeometry(const MoERoutedExpertPlacementPlan& placement,
+            const ClusterInventory& inventory,
+            const MoEOverlayInferenceGraphFamilyIdentity& family);
+
+        /**
+         * @brief Count the actual main and learned follower cache row manifests.
+         * @param maximum_rows Original admitted main activation-row ceiling.
+         * @param family Original decode/request bounds and actual learned source-layer list.
+         * @param prefill_rows Exact schedule-owned ordered retained prefill identities.
+         * @return Cache count per original mapped follower endpoint, independent of K.
+         * @throws std::invalid_argument For incomplete row/family declarations.
+         * @throws std::overflow_error If the immutable cache roster overflows.
+         */
+        [[nodiscard]] static std::size_t followerCaptureCacheCount(int maximum_rows,
+            const MoEOverlayInferenceGraphFamilyIdentity& family, std::span<const int> prefill_rows);
+
+        /**
+         * @brief Report whether any participant requires a distinct retained endpoint channel.
          * @param placement Frozen, hardware-bound routed placement.
          * @return True when capacity planning needs the gathered rank topology.
          * @throws std::invalid_argument when the continuation participant is
          *         absent or its rank identity is incomplete.
          *
          * This is the shared admission predicate for capacity and transport
-         * preflight. A participant's tier never changes whether activations
-         * must cross a rank boundary.
+         * preflight. Continuation shards and same-rank CPU work retain their original local
+         * graph storage. Foreign GPU domains require their own endpoint lanes
+         * even when their true world rank equals the continuation rank.
          */
-        [[nodiscard]] static bool hasRemoteRankParticipants(
+        [[nodiscard]] static bool requiresActivationChannels(
             const MoERoutedExpertPlacementPlan &placement);
 
         /**

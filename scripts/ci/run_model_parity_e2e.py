@@ -21,7 +21,7 @@ import time
 import run_production_parity_campaigns as parity
 from production_artifacts import CPUISA, digest, image_cpu_isa, image_identity
 from docker_paths import validate_attached_execution
-from model_parity_inventory import InventoryScope, discover as discover_inventory, export_manifest, source_revision
+from model_parity_inventory import InventoryScope, discover as discover_inventory, export_manifest, source_revision, map_predictor_source
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
@@ -284,7 +284,8 @@ def main(argv: list[str] | None = None) -> int:
                 artifact_dir = run_root / str(index)
                 artifact_dir.mkdir()
                 config_file = artifact_dir / "server-args.json"
-                config_file.write_text(json.dumps(record["e2e"]["server_args"]))
+                staged_record = map_predictor_source(record, lambda path: staged_paths[Path(path).resolve()])
+                config_file.write_text(json.dumps(staged_record["e2e"]["server_args"]))
                 model = staged_paths[Path(record["model"]).resolve()]
                 if any(ch in str(model) + record["id"] for ch in "|\r\n"):
                     raise ValueError("model/cell identity cannot contain harness delimiters")

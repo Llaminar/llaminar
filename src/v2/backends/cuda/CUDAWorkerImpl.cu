@@ -4,12 +4,15 @@
  *
  * These functions are called by GPUDeviceWorker to initialize and cleanup
  * CUDA contexts on worker threads used by NCCLBackend for collective operations.
+ * Physical identity is admitted before stream creation and remains owned by
+ * the immutable inventory, separately from this worker's resource lifetime.
  *
  * @author David Sanftenberg
  * @date February 2026
  */
 
 #include <cuda_runtime.h>
+#include "CUDAHardwareMetadata.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
@@ -27,9 +30,16 @@ namespace llaminar2
          * @param out_stream Output: created CUDA stream (as void*)
          * @param out_context Output: unused, kept for the generic worker ABI
          * @return true on success, false on failure
+         * @throws std::invalid_argument For absent output owners or invalid physical metadata.
+         * @throws std::out_of_range For an ordinal absent from admitted CUDA visibility.
+         * @throws std::runtime_error For failed physical discovery before worker resources exist.
          */
         bool initializeContext(int ordinal, void **out_stream, void **out_context)
         {
+            if (!out_stream || !out_context)
+                throw std::invalid_argument("CUDA worker initialization requires explicit output owners");
+            initializeCUDAHardwareMetadata();
+            (void)cudaHardwareMetadata().at(ordinal);
             // Set the device
             cudaError_t err = cudaSetDevice(ordinal);
             if (err != cudaSuccess)

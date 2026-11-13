@@ -13,10 +13,11 @@
 #include "DeviceMoERebalanceABI.h"
 #include "DeviceMoERebalancePublication.h"
 #include "DeviceMoERebalanceMovementJournal.h"
+#include "DeviceMoERebalanceCompletedDecision.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "DeviceMoELLEPPlannerScratch.h"
 #include "MoERuntimeTable.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -35,7 +36,7 @@ namespace llaminar2
         kDeviceMoELLEPPlannerMaxParticipants ==
         kDeviceMoEMaxParticipants);
 
-    inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
+    inline constexpr uint32_t kDeviceMoERebalanceMagic = moe_rebalance_abi::kMagic; // "MOER"
     inline constexpr uint32_t kDeviceMoERebalanceVersion =
         moe_rebalance_abi::kVersion;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentStaticOwner = 0;
@@ -49,6 +50,8 @@ namespace llaminar2
         PlanMissingArrivals = 1u << 2,
         DeferRuntimeApply = 1u << 3,
         CollectLoadStats = 1u << 4,
+        /** Authored Dynamic durable maintenance; never current-batch/cache assignment. */
+        CompletedDynamicDecisions = 1u << 5,
     };
 
     enum class DeviceMoERebalancePlanOp : uint32_t
@@ -291,6 +294,8 @@ namespace llaminar2
          * but its native conditional graph never copies this record to the host.
          */
         DeviceMoERebalanceDispatchTicket dispatch_ticket;
+        /** Successful native policy completions; reset with the request after archival. */
+        DeviceMoERebalanceCompletedDecision completed_decision;
     };
 
     /**
@@ -332,6 +337,8 @@ namespace llaminar2
         uint32_t destination_previous_layer = kDeviceMoEInvalidSlot;
         uint32_t destination_previous_expert = kDeviceMoEInvalidSlot;
         uint32_t destination_generation = 0;
+        /** Must publish zero: explicit authority for the former four-byte ABI gap. */
+        uint32_t reserved = 0;
         /** Demand sealed by the planner before histogram scratch is reused. */
         uint64_t activation_count = 0;
     };
@@ -455,8 +462,8 @@ namespace llaminar2
 
     enum class DeviceMoERebalanceStatusCode : uint32_t
     {
-        Ok = 0,
-        WindowNotReady = 1,
+        Ok = moe_rebalance_abi::kStatusOk,
+        WindowNotReady = moe_rebalance_abi::kStatusWindowNotReady,
         InvalidConfig = 2,
         InvalidRuntime = 3,
         MissingHistogram = 4,
@@ -815,7 +822,15 @@ namespace llaminar2
     static_assert(sizeof(DeviceMoERebalanceWaveProgress) == moe_rebalance_abi::kWaveProgressBytes);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceGraphControllerState>);
     static_assert(sizeof(DeviceMoERebalanceGraphControllerState) == moe_rebalance_abi::kGraphControllerBytes);
+    static_assert(offsetof(DeviceMoERebalanceGraphControllerState, completed_decision) == moe_rebalance_abi::kCompletedDecisionOffset);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
+    static_assert(std::is_standard_layout_v<DeviceMoERebalancePlanEntry>);
+    static_assert(std::has_unique_object_representations_v<DeviceMoERebalancePlanEntry>,
+                  "every command byte must have one typed field authority");
+    static_assert(offsetof(DeviceMoERebalancePlanEntry, reserved) ==
+                  moe_rebalance_abi::kPlanEntryReservedOffset);
+    static_assert(offsetof(DeviceMoERebalancePlanEntry, activation_count) ==
+                  moe_rebalance_abi::kPlanEntryActivationCountOffset);
     static_assert(
         sizeof(DeviceMoERebalancePlanEntry) ==
             moe_rebalance_abi::kPlanEntryBytes,
@@ -1494,7 +1509,7 @@ namespace llaminar2
      * @param has_emins Receives extended-minimum-plane presence.
      * @return Whether this physical format has a complete storage contract.
      */
-    inline bool deviceMoENativeVnniFormatForCodebook(
+    inline bool deviceMoENativeQuantisedFormatForCodebook(
         uint8_t codebook_id,
         uint8_t &payload_bytes_per_block,
         uint8_t &is_asymmetric,
@@ -1509,7 +1524,7 @@ namespace llaminar2
         case 4:
             payload_bytes_per_block = 16;
             return true;
-        case kNativeVnniIQ4XSSourceScaleCodebook:
+        case kNativeQuantisedIQ4XSSourceScaleCodebook:
             // Physical secondary presence: raw source coefficient, not a minimum.
             payload_bytes_per_block = 16;
             is_asymmetric = 1;
@@ -1568,12 +1583,12 @@ namespace llaminar2
     }
 
     inline bool deviceMoEProjectionFormat(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         uint8_t &payload_bytes_per_block,
         uint8_t &is_asymmetric,
         uint8_t &has_emins) noexcept
     {
-        return deviceMoENativeVnniFormatForCodebook(
+        return deviceMoENativeQuantisedFormatForCodebook(
             desc.codebook_id,
             payload_bytes_per_block,
             is_asymmetric,
@@ -1581,7 +1596,7 @@ namespace llaminar2
     }
 
     /**
-     * @brief Resolve immutable allocation capacity for a NativeVNNI descriptor.
+     * @brief Resolve immutable allocation capacity for a NativeQuantised descriptor.
      *
      * Model weights have an exact-format allocation and therefore leave the
      * explicit capacity fields at zero. Transfer slots carry non-zero capacity
@@ -1589,7 +1604,7 @@ namespace llaminar2
      * changing any graph-captured pointer.
      */
     inline bool deviceMoEProjectionAllocationCapacity(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         uint8_t &payload_bytes_per_block,
         uint8_t &has_mins,
         uint8_t &has_emins) noexcept
@@ -1619,8 +1634,8 @@ namespace llaminar2
      * @brief Test whether one formatted matrix fits a stable transfer allocation.
      */
     inline bool deviceMoEMatrixFitsTransferCapacity(
-        const DeviceNativeVNNIMatrixDesc &src,
-        const DeviceNativeVNNIMatrixDesc &dst) noexcept
+        const DeviceNativeQuantisedMatrixDesc &src,
+        const DeviceNativeQuantisedMatrixDesc &dst) noexcept
     {
         if (src.n != dst.n ||
             src.k != dst.k ||
@@ -1658,8 +1673,8 @@ namespace llaminar2
      * kernels are updated.
      */
     inline void deviceMoERetargetTransferMatrixFormat(
-        DeviceNativeVNNIMatrixDesc &dst,
-        const DeviceNativeVNNIMatrixDesc &src) noexcept
+        DeviceNativeQuantisedMatrixDesc &dst,
+        const DeviceNativeQuantisedMatrixDesc &src) noexcept
     {
         dst.n = src.n;
         dst.k = src.k;
@@ -1670,13 +1685,13 @@ namespace llaminar2
         dst.source_identity_present = src.source_identity_present;
     }
 
-    inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeVNNIMatrixDesc &desc) noexcept
+    inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeQuantisedMatrixDesc &desc) noexcept
     {
         return static_cast<uint64_t>(desc.blocks_per_row) * static_cast<uint64_t>(desc.n);
     }
 
     inline uint64_t deviceMoEMatrixPayloadBytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1694,13 +1709,13 @@ namespace llaminar2
         return deviceMoEMatrixBlockCount(desc) * static_cast<uint64_t>(payload_bytes_per_block);
     }
 
-    inline uint64_t deviceMoEMatrixScalesBytes(const DeviceNativeVNNIMatrixDesc &desc) noexcept
+    inline uint64_t deviceMoEMatrixScalesBytes(const DeviceNativeQuantisedMatrixDesc &desc) noexcept
     {
         return deviceMoEMatrixBlockCount(desc) * sizeof(uint16_t);
     }
 
     inline uint64_t deviceMoEMatrixMinsBytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1719,7 +1734,7 @@ namespace llaminar2
     }
 
     inline uint64_t deviceMoEMatrixEminsBytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1740,7 +1755,7 @@ namespace llaminar2
     }
 
     inline bool deviceMoEMatrixCopyReady(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1768,7 +1783,7 @@ namespace llaminar2
             return false;
         if (deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
             return deviceMoEFloatingExpertCopyReady(entry.descriptor);
-        return entry.descriptor.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+        return entry.descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
                deviceMoEMatrixCopyReady(entry.descriptor.gate, entry) &&
                deviceMoEMatrixCopyReady(entry.descriptor.up, entry) &&
                (entry.descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
@@ -1833,7 +1848,7 @@ namespace llaminar2
             return false;
         if (deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
             return deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
-        if (src.descriptor.weight_format != DeviceMoEWeightFormat::NativeVNNI)
+        if (src.descriptor.weight_format != DeviceMoEWeightFormat::NativeQuantised)
             return false;
         return deviceMoEMatrixFitsTransferCapacity(
                    src.descriptor.gate,
@@ -1949,6 +1964,8 @@ namespace llaminar2
             return false;
         }
         plan_entries[*plan_count] = entry;
+        // Reserved transport bytes are canonical, never inherited allocator contents.
+        plan_entries[*plan_count].reserved = 0u;
         ++(*plan_count);
         if (status)
             ++status->planned_arrivals;

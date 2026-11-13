@@ -13,6 +13,7 @@
  *
  * - **Packed column-parallel**: Each participant row packs several semantic
  *   groups, and each group is independently partitioned or replicated.
+ *   Explicit subset replicas retain original order and verify every real owner.
  *   Example: GDN `[Q_local | K_local | V_local]` projections.
  *
  * - **Row-parallel**: Input split on input dimension, combined via AllReduce
@@ -57,6 +58,29 @@ namespace llaminar2
     // =========================================================================
 
     /**
+     * @brief Locate the stage within a retained, numbered prefill-chunk scope.
+     * @param key Snapshot key with the exact `PREFILL_CHUNK_<digits>_<stage>` grammar.
+     * @return Semantic stage offset, or `npos` when the scope is absent or malformed.
+     *
+     * Chunk identity describes when a value was produced, not its TP layout.
+     * Keep the grammar strict so operational names and unknown schema entries
+     * cannot silently acquire a known stage's assembly rule.
+     */
+    inline size_t prefillChunkSnapshotSemanticStageOffset(std::string_view key)
+    {
+        constexpr std::string_view prefix = "PREFILL_CHUNK_";
+        if (!key.starts_with(prefix))
+            return std::string_view::npos;
+        size_t cursor = prefix.size();
+        const size_t first_digit = cursor;
+        while (cursor < key.size() && key[cursor] >= '0' && key[cursor] <= '9')
+            ++cursor;
+        return cursor > first_digit && cursor + 1 < key.size() && key[cursor] == '_'
+                   ? cursor + 1
+                   : std::string_view::npos;
+    }
+
+    /**
      * @brief Locate the semantic stage following the last MTP depth qualifier.
      * @param key Snapshot key that may contain `MTP<depth>_<stage>`.
      * @return Offset of the semantic stage, or `npos` for an operational/non-MTP key.
@@ -99,7 +123,9 @@ namespace llaminar2
     /**
      * @brief Extract stage type suffix from a snapshot key
      *
-     * Strips a case-insensitive `layerN_` prefix if present.  SnapshotCapture
+     * Strips a numbered prefill-chunk scope, then a case-insensitive `layerN_`
+     * prefix if present. Retained chunks keep the producing stage's schema.
+     * SnapshotCapture
      * uses lower-case prefixes for ordinary graph stages, while several
      * graph-native collective diagnostics deliberately publish upper-case
      * `LAYERN_` names.  Both spellings describe the same model layer and must
@@ -111,21 +137,24 @@ namespace llaminar2
     inline std::string extractStageType(const std::string &stage_key)
     {
         std::string stage_type = stage_key;
+        const size_t chunk_stage = prefillChunkSnapshotSemanticStageOffset(stage_type);
+        if (chunk_stage != std::string_view::npos)
+            stage_type = stage_type.substr(chunk_stage);
         const bool has_layer_word =
-            stage_key.starts_with("layer") || stage_key.starts_with("LAYER");
+            stage_type.starts_with("layer") || stage_type.starts_with("LAYER");
         if (has_layer_word)
         {
             size_t cursor = 5;
             const size_t first_digit = cursor;
-            while (cursor < stage_key.size() &&
-                   stage_key[cursor] >= '0' && stage_key[cursor] <= '9')
+            while (cursor < stage_type.size() &&
+                   stage_type[cursor] >= '0' && stage_type[cursor] <= '9')
             {
                 ++cursor;
             }
-            if (cursor > first_digit && cursor < stage_key.size() &&
-                stage_key[cursor] == '_' && cursor + 1 < stage_key.size())
+            if (cursor > first_digit && cursor < stage_type.size() &&
+                stage_type[cursor] == '_' && cursor + 1 < stage_type.size())
             {
-                stage_type = stage_key.substr(cursor + 1);
+                stage_type = stage_type.substr(cursor + 1);
             }
         }
 
@@ -353,7 +382,8 @@ namespace llaminar2
     enum class SnapshotColumnGroupMode
     {
         PARTITIONED, ///< Participant slices concatenate in TP-index order.
-        REPLICATED   ///< Every participant publishes the complete group.
+        REPLICATED,  ///< Every participant publishes the complete group.
+        SUBSET_REPLICATED ///< Explicit nonempty participant subset publishes identical complete groups.
     };
 
     /**
@@ -362,7 +392,9 @@ namespace llaminar2
      * `participant_cols[rank]` is the width of this group inside participant
      * `rank`'s local packed row.  A partitioned group must sum to
      * `global_cols`; a replicated group must publish `global_cols` on every
-     * participant.  Keeping the widths explicit supports proportional TP and
+     * participant. A subset replica has either zero (nonowner) or global_cols
+     * on each participant and at least one owner; every actual replica is checked.
+     * Keeping the widths explicit supports proportional TP and
      * prevents the diagnostic path from inventing an equal split that differs
      * from the production weight assignment.
      */
@@ -626,6 +658,7 @@ namespace llaminar2
                     if (device.device_index < 0 ||
                         device.device_index >= tp_degree ||
                         participants[static_cast<size_t>(device.device_index)] != nullptr ||
+                        (device.rows > 0 && device.cols > std::numeric_limits<size_t>::max() / device.rows) ||
                         device.data.size() != device.rows * device.cols)
                     {
                         return fail();
@@ -654,7 +687,10 @@ namespace llaminar2
                     static_cast<size_t>(tp_degree), 0);
                 for (const auto &group : column_groups)
                 {
-                    if (group.global_cols == 0 ||
+                    if ((group.mode != SnapshotColumnGroupMode::PARTITIONED &&
+                         group.mode != SnapshotColumnGroupMode::REPLICATED &&
+                         group.mode != SnapshotColumnGroupMode::SUBSET_REPLICATED) ||
+                        group.global_cols == 0 ||
                         group.participant_cols.size() !=
                             static_cast<size_t>(tp_degree) ||
                         group.global_cols >
@@ -664,6 +700,7 @@ namespace llaminar2
                     }
 
                     size_t partitioned_cols = 0;
+                    bool subset_owner = false;
                     for (size_t participant = 0;
                          participant < group.participant_cols.size();
                          ++participant)
@@ -686,6 +723,11 @@ namespace llaminar2
                             }
                             partitioned_cols += local_cols;
                         }
+                        else if (group.mode == SnapshotColumnGroupMode::SUBSET_REPLICATED)
+                        {
+                            if (local_cols != 0 && local_cols != group.global_cols) return fail();
+                            subset_owner |= local_cols != 0;
+                        }
                         else if (local_cols != group.global_cols)
                         {
                             return fail();
@@ -696,6 +738,8 @@ namespace llaminar2
                     {
                         return fail();
                     }
+                    if (group.mode == SnapshotColumnGroupMode::SUBSET_REPLICATED && !subset_owner)
+                        return fail();
                     combined_cols += group.global_cols;
                 }
 
@@ -738,6 +782,7 @@ namespace llaminar2
                             {
                                 const size_t local_cols =
                                     group.participant_cols[participant];
+                                if (local_cols == 0) continue;
                                 const auto *device = participants[participant];
                                 const float *source = device->data.data() +
                                                       row * device->cols +
@@ -748,6 +793,36 @@ namespace llaminar2
                                     local_cols * sizeof(float));
                                 group_output_offset += local_cols;
                                 local_offsets[participant] += local_cols;
+                            }
+                        }
+                        else if (group.mode == SnapshotColumnGroupMode::SUBSET_REPLICATED)
+                        {
+                            // Membership is explicit, not a numerical/nonzero test.
+                            // Copy one original head; authenticate every declared
+                            // replica, including a nonzero original-head origin.
+                            const float *original = nullptr;
+                            for (size_t participant = 0; participant < participants.size(); ++participant)
+                            {
+                                if (group.participant_cols[participant] == 0) continue;
+                                const auto *device = participants[participant];
+                                const float *source = device->data.data() + row * device->cols + local_offsets[participant];
+                                for (size_t column = 0; column < group.global_cols; ++column)
+                                {
+                                    if (!std::isfinite(source[column])) return fail();
+                                    if (original)
+                                    {
+                                        const float difference = std::fabs(original[column] - source[column]);
+                                        const float scale = std::max(std::fabs(original[column]), std::fabs(source[column]));
+                                        if (difference > kReplicatedAbsTolerance &&
+                                            difference > scale * kReplicatedRelTolerance) return fail();
+                                    }
+                                }
+                                if (!original)
+                                {
+                                    original = source;
+                                    std::memcpy(destination, source, group.global_cols * sizeof(float));
+                                }
+                                local_offsets[participant] += group.global_cols;
                             }
                         }
                         else

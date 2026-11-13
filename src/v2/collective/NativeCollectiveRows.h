@@ -68,13 +68,18 @@ namespace llaminar2
         { return static_cast<std::size_t>(rows_.capacity()) * elements_per_row_; }
 
         /**
-         * @brief Bind an optional persistent device-only useful-byte receipt.
+         * @brief Bind an optional persistent device-only outgoing primitive-send byte receipt.
          * @param counter Aligned device UINT64 retained through graph retirement.
          * @return A new immutable declaration; arithmetic and row authority are unchanged.
          * @throws std::invalid_argument For a null/misaligned counter or fixed rows.
          *
-         * This opt-in diagnostic observes native payload, never schedules work
-         * or creates a host count authority. Production declarations omit it.
+         * Native primitive sends accumulate by atomicAdd; this API does not
+         * reset or overwrite the counter. AllGather ring receipts include P-1
+         * outgoing sends per source byte. Callers initialize storage explicitly.
+         * Typed production callers retain their canonical controller and project
+         * logical contributions only after authenticating the exact terminal
+         * ring relation. Diagnostics retain their admitted device owners. This
+         * passive observation never schedules work or creates a host count authority.
          */
         [[nodiscard]] NativeCollectiveRows withPayloadReceipt(unsigned long long *counter) const
         {
@@ -110,6 +115,6 @@ namespace llaminar2
     private:
         DeviceRowRange rows_; ///< Borrowed device authority, or exact fixed rows.
         std::size_t elements_per_row_; ///< Immutable native scalar geometry.
-        unsigned long long *payload_receipt_ = nullptr; ///< Optional borrowed diagnostic storage, not execution state.
+        unsigned long long *payload_receipt_ = nullptr; ///< Optional borrowed native-send observation storage, not execution state.
     };
 }

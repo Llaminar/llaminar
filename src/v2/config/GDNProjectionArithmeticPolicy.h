@@ -11,7 +11,9 @@
  * uses the admitted half operand bank and the backend's floating GEMM.
  * FP16AlphaBeta applies that half arithmetic only to original floating alpha
  * and beta weights; all wide GDN projections retain their native codebooks.
- * FP16MoEAlphaBeta limits that selection to qwen35moe; dense models stay native.
+ * FP16MoEAlphaBeta selects original floating alpha/beta for qwen35moe and
+ * qwen4exp; dense models stay native. Full FP16 remains an explicit independent
+ * setup selection, not a change to the default.
  */
 #pragma once
 #include <stdexcept>

@@ -195,6 +195,20 @@ namespace
             logits_[3] = 10.0f; // Token 3 is always argmax
         }
 
+        /**
+         * @brief Admit response policy in this model-free protocol/sampling witness.
+         * @param request Existing immutable admission, including any target-count proof.
+         * @return True only for a valid closed program; no QSA/indexer graph exists here.
+         */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+        {
+            if (!request.valid()) return false;
+            (void)resolveSparseQueryExecutionProgram(request);
+            return true;
+        }
+        /** @brief No query graph policy is retained by this explicit no-consumer witness. */
+        void endSparseQueryExecutionProgram() noexcept override {}
+
         bool forward(const int *tokens, int seq_len) override
         {
             forward_call_count_++;
@@ -951,6 +965,65 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 1u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN));
+    }
+
+    /** @test Fatal authority cleanup uses the existing terminal command once,
+     * including a nonzero original coordinated root. This scripted context
+     * grants no model/native execution readiness.
+     */
+    TEST_F(Test__MPICoordinatedMode, AbortAuthorityPublishesOriginalShutdownExactlyOnce)
+    {
+        for (const int root : {0, 1})
+        {
+            auto [runner, mock, mpi] = createRunner(root, 2, 0, promptRecipientOverlay(root));
+            ASSERT_EQ(runner->coordinatedRootRank(), root);
+            runner->setMPICoordinatedMode(true);
+            IOrchestrationRunner &original = *runner;
+            EXPECT_NO_THROW(original.abortMPIWorkers("original authority observation failure"));
+            EXPECT_NO_THROW(original.abortMPIWorkers("repeated terminal observation"));
+            runner->shutdownMPIWorkers();
+            ASSERT_EQ(mpi->broadcastCount(), 1u);
+            EXPECT_EQ(mpi->broadcasts()[0].root, root);
+            EXPECT_THAT(mpi->broadcasts()[0].int_data,
+                        ElementsAre(static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)));
+            EXPECT_EQ(mpi->barrierCount(), 0u);
+            EXPECT_EQ(mock->forwardCallCount(), 0);
+        }
+    }
+
+    /** @test A follower preserves its original failure and abort authority;
+     * it must never enter root-only SHUTDOWN publication or an unrelated wait.
+     * MPI_COMM_NULL is the fixture's existing device-free fatal-throw boundary.
+     */
+    TEST_F(Test__MPICoordinatedMode, AbortFollowerPreservesFailureWithoutRootPublication)
+    {
+        for (const int root : {0, 1})
+        {
+            const int follower = 1 - root;
+            auto [runner, mock, mpi] = createRunner(follower, 2, 0, promptRecipientOverlay(root));
+            ASSERT_EQ(runner->coordinatedRootRank(), root);
+            ASSERT_EQ(mpi->communicator(), MPI_COMM_NULL);
+            runner->setMPICoordinatedMode(true);
+            IOrchestrationRunner &original = *runner;
+            const std::string reason = "original rank-" + std::to_string(follower) + " observer failure";
+            try
+            {
+                original.abortMPIWorkers(reason);
+                FAIL() << "A failed follower must not return to coordinated work";
+            }
+            catch (const std::runtime_error &error)
+            {
+                const std::string diagnostic = error.what();
+                EXPECT_THAT(diagnostic, HasSubstr(reason));
+                EXPECT_THAT(diagnostic, HasSubstr("rank " + std::to_string(follower)));
+                EXPECT_THAT(diagnostic, HasSubstr("coordinated cancellation"));
+                EXPECT_THAT(diagnostic, HasSubstr("further collective order is indeterminate"));
+                EXPECT_THAT(diagnostic, Not(HasSubstr("Only the coordinated root")));
+            }
+            EXPECT_EQ(mpi->broadcastCount(), 0u);
+            EXPECT_EQ(mpi->barrierCount(), 0u);
+            EXPECT_EQ(mock->forwardCallCount(), 0);
+        }
     }
 
     TEST_F(Test__MPICoordinatedMode,

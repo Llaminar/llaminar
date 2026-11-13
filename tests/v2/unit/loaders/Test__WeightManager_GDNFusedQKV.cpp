@@ -35,6 +35,9 @@
 #include "tensors/TensorSlice.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "loaders/PreparedWeightStore.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 
 namespace llaminar2::test
 {
@@ -60,6 +63,42 @@ namespace llaminar2::test
             static_cast<std::size_t>(kGDNValueHeads * kGDNState);
         constexpr std::size_t kFusedElements =
             2 * kKeyElements + kValueElements;
+
+        /** @brief Admit the original linked head rectangles with one final CPU root per consumer. */
+        void admitLinkedSources(WeightManager& manager,IModelLoader& loader,int rank,int degree,
+            const GDNHeadAssignment& assignment,int state)
+        {
+            InferenceStrategy original;original.model_id={98503};original.tp_degree=degree;original.devices={DeviceId::cpu()};
+            WeightPlan plan(original);
+            for(const auto& name:loader.materializationNames()) {
+                const auto source=loader.nativeWeightSourceGeometry(name);
+                const bool vector=source.original_shape.size()==1;
+                const size_t n=vector?1:source.original_shape[1],k=source.original_shape[0];
+                const bool columns=vector || name.ends_with("ssm_out.weight");
+                std::vector<GDNHeadSpan> spans;
+                if(name.ends_with("attn_qkv.weight") || name.ends_with("ssm_conv1d.weight")) {
+                    const auto key=assignment.keyElementSpan(state);const int key_rows=kGDNKeyHeads*state;
+                    spans={key,{key_rows+key.start,key.count}};
+                    for(const auto value:assignment.valueElementSpans(state))spans.push_back({2*key_rows+value.start,value.count});
+                } else spans=assignment.valueElementSpans(name.ends_with("attn_gate.weight") || columns&&!vector ? state:1);
+                NativeWeightSourceAssembly assembly{.axis=columns?NativeWeightSourceAssembly::Axis::Columns:
+                    NativeWeightSourceAssembly::Axis::Rows,.final_rows=columns?n:0,.final_columns=columns?0:k};
+                for(const auto span:spans) {
+                    const size_t width=columns?size_t(span.count):k;
+                    assembly.segments.push_back({0,0,columns?0:size_t(span.start),columns?n:size_t(span.count),
+                        columns?size_t(span.start):0,width,width/source.native_group_elements*source.native_group_bytes});
+                    if(columns)assembly.final_columns+=span.count;else assembly.final_rows+=span.count;
+                }
+                WeightRequirement request;request.canonical_name=name;request.role=inferWeightRole(name);
+                request.layer=inferWeightLayer(name);request.target_device=DeviceId::cpu();
+                request.tp_domain=0;request.tp_rank_or_device_index=rank;
+                request.derivation=WeightDerivationKind::FusedSubblockConcat;request.native_source_assembly=std::move(assembly);
+                plan.add(std::move(request));
+            }
+            if(!manager.preparedWeightStore()->bindModelIdIfUnset(original.model_id))
+                throw std::logic_error("Linked source fixture replaced original model authority");
+            admitCPUWeightPlansForTest(manager,loader,{&plan});
+        }
 
         /** @brief Build a matrix whose complete rows are byte-distinguishable. */
         std::shared_ptr<FP32Tensor> makeTaggedMatrix(
@@ -376,6 +415,10 @@ namespace llaminar2::test
                 kGDNKeyHeads, kGDNValueHeads, kGDNState);
             if (tp_config)
                 manager->setTensorParallelConfig(tp_config);
+            const auto assignment=tp_config ? GDNHeadAssignment::fromPartition(kGDNKeyHeads,kGDNValueHeads,
+                tp_config->forRank(rank).head_start,tp_config->forRank(rank).head_count,tp_config->totalHeads()) :
+                GDNHeadAssignment::forEqualRank(kGDNKeyHeads,kGDNValueHeads,rank,world_size);
+            admitLinkedSources(*manager,*loader_,rank,world_size,assignment,kGDNState);
             return manager;
         }
 
@@ -753,18 +796,10 @@ namespace llaminar2::test
     {
         constexpr int world_size = 16;
         auto config = makeTPConfig(world_size);
-        auto manager = makeManager(0, world_size, config);
+        EXPECT_THROW(makeManager(0,world_size,config),std::invalid_argument);
+        EXPECT_THROW(makeManager(0,world_size,nullptr),std::invalid_argument);
+        EXPECT_EQ(loader_->nativeSourceReadCallCount(),0u);
 
-        EXPECT_THROW(
-            loadAssigned(
-                *manager, *config, 0, "blk.0.attn_qkv.weight"),
-            std::invalid_argument);
-
-        auto mpi_manager = makeManager(0, world_size, nullptr);
-        EXPECT_THROW(
-            mpi_manager->getWeightForDevice(
-                "blk.0.attn_qkv.weight", DeviceId::cpu()),
-            std::invalid_argument);
     }
 
     /**
@@ -833,6 +868,7 @@ namespace llaminar2::test
                 participant.head_start,
                 participant.head_count,
                 config->totalHeads());
+        admitLinkedSources(*manager,*loader,rank,world_size,assignment,state);
         auto qkv = manager->getShardedWeightForAssignment(
             "blk.0.attn_qkv.weight", DeviceId::cpu(), participant, 0);
         auto output = manager->getShardedWeightForAssignment(
@@ -865,8 +901,38 @@ namespace llaminar2::test
             qkv_source->size_bytes() / qkv_source->shape()[0];
         const auto *source_qkv_bytes =
             static_cast<const std::uint8_t *>(qkv_source->raw_data());
-        const auto *actual_qkv_bytes =
-            static_cast<const std::uint8_t *>(qkv->raw_data());
+        const auto read_final_native=[&](const std::shared_ptr<TensorBase>& tensor,const std::string& name) {
+            const auto metadata=manager->weightMetadataRegistry()->metadata(tensor.get());
+            if(!metadata)throw std::logic_error("Native linked source lost committed binding metadata");
+            const PreparedWeightRef ref{manager->preparedWeightStore()->modelId(),metadata->identity.instance_id,
+                PreparedWeightKind::CpuPackedGemm,DeviceId::cpu()};
+            const auto binding=manager->preparedWeightStore()->binding(ref);
+            const auto engine=manager->preparedWeightStore()->gemmKernelLifetime(ref);
+            if(!binding || !binding->native_source || !engine || !engine->exportCPUNativeQuantisedPackedWeights())
+                throw std::logic_error("Native linked source lost actual committed engine/source projection");
+            const auto& projection=*binding->native_source;
+            const size_t bytes_per_row=tensor->shape()[1]/32*34;
+            std::vector<uint8_t> bytes(tensor->shape()[0]*bytes_per_row);
+            forEachNativeWeightSourceStripe(projection.original,projection.range,projection.assembly,
+                [&](const auto& stripe,size_t destination_row,size_t destination_column) {
+                    for(size_t row=0;row<stripe.rows;++row) {
+                        auto window=stripe;window.first_row+=row;window.rows=1;
+                        auto output=std::span<std::byte>(reinterpret_cast<std::byte*>(bytes.data())+
+                            (destination_row+row)*bytes_per_row+destination_column/32*34,window.nativeBytes());
+                        loader->readNativeWeightSourceWindow(name,window,output);
+                    }
+                });
+            auto expected=std::make_shared<Q8_0Tensor>(tensor->shape(),bytes);
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+            if(!cpu::native_quantised::packWeightsCPUNativeQuantised(expected.get(),packed))
+                throw std::logic_error("Native independent original-byte oracle failed packing");
+            const auto* actual=engine->exportCPUNativeQuantisedPackedWeights();
+            EXPECT_EQ(actual->native_interleaved.size(),packed.native_interleaved.size());
+            EXPECT_EQ(std::memcmp(actual->native_interleaved.data(),packed.native_interleaved.data(),packed.native_interleaved.size()),0);
+            return bytes;
+        };
+        const auto qkv_native=read_final_native(qkv,"blk.0.attn_qkv.weight");
+        const auto *actual_qkv_bytes=qkv_native.data();
         for (std::size_t local_row = 0; local_row < fused_rows.size(); ++local_row)
         {
             EXPECT_EQ(
@@ -881,13 +947,12 @@ namespace llaminar2::test
             assignment.valueElementSpans(state));
         const std::size_t source_output_row_bytes =
             output_source->size_bytes() / output_source->shape()[0];
-        const std::size_t actual_output_row_bytes =
-            output->size_bytes() / output->shape()[0];
+        const std::size_t actual_output_row_bytes = output->shape()[1]/32*34;
         const std::size_t bytes_per_block = 34;
         const auto *source_output_bytes =
             static_cast<const std::uint8_t *>(output_source->raw_data());
-        const auto *actual_output_bytes =
-            static_cast<const std::uint8_t *>(output->raw_data());
+        const auto output_native=read_final_native(output,"blk.0.ssm_out.weight");
+        const auto *actual_output_bytes=output_native.data();
         ASSERT_EQ(value_columns.size() % 32, 0u);
         for (std::size_t row = 0; row < output_source->shape()[0]; ++row)
         {

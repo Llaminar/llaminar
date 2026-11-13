@@ -1,0 +1,17 @@
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -865,6 +865,14 @@
+ 		max_segment = dma_max_mapping_size(dev->dev);
+ 	if (max_segment == 0)
+ 		max_segment = UINT_MAX;
++	/*
++	 * dma-iommu may append segment-boundary padding to the preceding
++	 * scatterlist entry. Keep both page-aligned input entries below half
++	 * the unsigned length range so that their combined padding still fits
++	 * in sg->length. This partitions a large buffer; it does not limit the
++	 * page array or its total DMA mapping size.
++	 */
++	max_segment = min_t(size_t, max_segment, UINT_MAX / 2);
+ 	err = sg_alloc_table_from_pages_segment(sg, pages, nr_pages, 0,
+ 						(unsigned long)nr_pages << PAGE_SHIFT,
+ 						max_segment, GFP_KERNEL);

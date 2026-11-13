@@ -9,9 +9,16 @@
  * CPU/GPU identities or allocating an execution communicator in the parser.
  * Compact routed stage plans preserve their global layer origin through the
  * same codec, including terminal MTP rows and nonzero pipeline offsets.
+ * Additive local-hot-cache and pipeline-width hints may be absent; omission
+ * must reproduce their exact null-intent document. All original fields remain
+ * mandatory, including the surrounding placement and automatic-search policy.
  */
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
+#include "config/ConfigValidator.h"
+#include "config/OrchestrationStartupPolicy.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include <algorithm>
 #include "utils/DebugEnv.h"
 
 #include <gtest/gtest.h>
@@ -307,11 +314,13 @@ TEST(OrchestrationConfigDocument, WorkloadRoundTripRejectsPartialObjectsAndNumer
     }
 }
 
-TEST(OrchestrationConfigDocument, EveryMissingOrExtraObjectFieldIsRejected)
+TEST(OrchestrationConfigDocument, EveryRequiredOrExtraObjectFieldIsRejected)
 {
     const Json document = Json::parse(serializeOrchestrationConfig(example(DeviceType::CUDA)));
     // Sweep the entire nested document, including every field in MTP, prefix,
-    // domains and movement. No read-side default may conceal an omitted field.
+    // domains and movement. Only the explicitly additive local-cache and
+    // pipeline-width hints may be absent and normalize to null; all other
+    // fields retain their strict required-field contract.
     const auto visit = [&](const auto &self, const Json &node, const Json::json_pointer &path) -> void
     {
         if (node.is_object())
@@ -323,7 +332,19 @@ TEST(OrchestrationConfigDocument, EveryMissingOrExtraObjectFieldIsRejected)
             {
                 auto missing = document;
                 missing[path].erase(key);
-                EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument) << path << "/" << key;
+                const auto field = (path / key).to_string();
+                if (field == "/configuration/ngram_table_policy/gpu_adaptive/local_hot_cache" ||
+                    field == "/configuration/automatic_planning/pipeline_stage_widths")
+                {
+                    ASSERT_TRUE(value.is_null());
+                    const auto decoded = deserializeOrchestrationConfig(missing.dump());
+                    EXPECT_FALSE(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache);
+                    EXPECT_FALSE(decoded.automatic_planning.pipeline_stage_widths);
+                    EXPECT_EQ(Json::parse(serializeOrchestrationConfig(decoded)), document);
+                }
+                else
+                    EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument)
+                        << path << "/" << key;
                 self(self, value, path / key);
             }
         }
@@ -337,7 +358,7 @@ TEST(OrchestrationConfigDocument, BadTypesEnumsOverflowAndDuplicateKeysFailAtInp
 {
     const Json base = Json::parse(serializeOrchestrationConfig(example(DeviceType::ROCm)));
     for (const auto &[path, value] : std::vector<std::pair<std::string, Json>>{
-             {"/schema_version", 1}, {"/schema_version", 2}, {"/schema_version", 3}, {"/schema_version", 4}, {"/schema_version", 6}, {"/schema_version", 5.0}, {"/kind", "memory-report"},
+             {"/schema_version", 1}, {"/schema_version", 2}, {"/schema_version", 3}, {"/schema_version", 4}, {"/schema_version", 5}, {"/schema_version", 6}, {"/schema_version", 7}, {"/schema_version", 8}, {"/schema_version", 9}, {"/schema_version", kOrchestrationConfigDocumentSchemaVersion+1}, {"/schema_version", static_cast<double>(kOrchestrationConfigDocumentSchemaVersion)}, {"/kind", "memory-report"},
              {"/configuration/mpi_procs", "3"}, {"/configuration/mpi_procs", 1ull << 32},
              {"/configuration/mtp/enabled", 1}, {"/configuration/mtp/draft_tokens", 1.5},
              {"/configuration/mtp/verify_mode", "invented"}, {"/configuration/mtp/verify_mode", 0},
@@ -462,4 +483,297 @@ TEST(OrchestrationConfigDocument, InvalidPrefillDocumentCannotPublishKernelPolic
         EXPECT_FALSE(debugEnv().gemm.deterministic);
         EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
     }
+}
+
+/** @test Native storage intent and exact large window counts round-trip without defaults. */
+TEST(OrchestrationConfigDocument, NgramStorageIsLosslessAndRequired)
+{
+    for (const auto mode : {ImmutableRowStoragePreference::Automatic, ImmutableRowStoragePreference::VRAM,
+                            ImmutableRowStoragePreference::RAM, ImmutableRowStoragePreference::MemoryMapped})
+    {
+        auto config = example(DeviceType::CPU);
+        config.ngram_table_policy = {mode, 131072, (1ull << 33) + 3};
+        const auto document = serializeOrchestrationConfig(config);
+        const auto decoded = deserializeOrchestrationConfig(document);
+        EXPECT_EQ(decoded.ngram_table_policy, config.ngram_table_policy);
+        auto missing = Json::parse(document);
+        missing["configuration"].erase("ngram_table_policy");
+        EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument);
+        auto invalid = Json::parse(document);
+        invalid["configuration"]["ngram_table_policy"]["window_count"] = 0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(invalid.dump()), std::invalid_argument);
+        config.ngram_table_policy.storage = static_cast<ImmutableRowStoragePreference>(255);
+        EXPECT_THROW((void)serializeOrchestrationConfig(config), std::invalid_argument);
+    }
+}
+
+/** @test Documents preserve requested adaptive ceilings even when the final solve admits zero slots. */
+TEST(OrchestrationConfigDocument, NgramHostAdaptiveRamSsdExactDocumentAndMixedArmRejection)
+{
+    for(const std::uint64_t rows:{0u,37u})
+    {
+        auto c=example(DeviceType::CPU);c.ngram_table_policy={ImmutableRowStoragePreference::HostAdaptiveRAMSSD,131072,7};
+        c.ngram_table_policy.host_adaptive={rows,0,{.aging_accesses=97,.protected_numerator=2,.protected_denominator=5}};
+        const auto document=serializeOrchestrationConfig(c);const auto decoded=deserializeOrchestrationConfig(document);
+        EXPECT_EQ(decoded.ngram_table_policy,c.ngram_table_policy);
+        auto bad=Json::parse(document);bad["configuration"]["ngram_table_policy"].erase("host_adaptive");
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(document);bad["configuration"]["ngram_table_policy"]["host_adaptive"]["policy"]["aging_accesses"]=0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(document);bad["configuration"]["ngram_table_policy"]["storage"]="RAM";
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    }
+}
+
+/** @test Explicit distribution is lossless, mandatory in schema9 and never inferred from VRAM. */
+TEST(Test__OrchestrationConfigDocument, FixedHeadDistributionRoundTripAndStrictArm)
+{
+    auto c=example(DeviceType::CUDA);c.ngram_table_policy={ImmutableRowStoragePreference::VRAM};
+    EXPECT_EQ(c.ngram_table_policy.distribution,ImmutableRowTableDistribution::Replicated);
+    c.ngram_table_policy.distribution=ImmutableRowTableDistribution::FixedHeadSharded;
+    const auto document=serializeOrchestrationConfig(c);
+    EXPECT_EQ(deserializeOrchestrationConfig(document).ngram_table_policy,c.ngram_table_policy);
+    auto bad=Json::parse(document);bad["configuration"]["ngram_table_policy"].erase("distribution");
+    EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    bad=Json::parse(document);bad["configuration"]["ngram_table_policy"]["distribution"]="unknown";
+    EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    bad=Json::parse(document);bad["schema_version"]=8;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    for(const auto mode:{ImmutableRowStoragePreference::Automatic,ImmutableRowStoragePreference::RAM,
+        ImmutableRowStoragePreference::MemoryMapped,ImmutableRowStoragePreference::HostAdaptiveRAMSSD})
+    {
+        c.ngram_table_policy.storage=mode;
+        EXPECT_THROW((void)serializeOrchestrationConfig(c),std::invalid_argument);
+    }
+}
+
+/** @test The explicit mixed request survives lossless documents with every independent original ceiling/policy. */
+TEST(OrchestrationConfigDocument, GPUAdaptiveRequestIsLosslessWithoutEnteringAutomaticOrWholeTierModes)
+{
+    for(const std::uint64_t rows:{0u,64u})
+    {
+        auto c=example(DeviceType::CUDA);auto &p=c.ngram_table_policy;
+        p.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+        p.window_bytes=131072;p.window_count=7;
+        p.gpu_adaptive={rows,1u<<20,{.aging_accesses=97,.protected_numerator=2,.protected_denominator=5},
+            {rows,2u<<20,{.aging_accesses=113,.protected_numerator=1,.protected_denominator=3}}};
+        const auto text=serializeOrchestrationConfig(c);
+        EXPECT_EQ(deserializeOrchestrationConfig(text).ngram_table_policy,p);
+        auto bad=Json::parse(text);bad["configuration"]["ngram_table_policy"].erase("gpu_adaptive");
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["storage"]="MemoryMapped";
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["gpu_adaptive"]["gpu_policy"]["aging_accesses"]=0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["gpu_adaptive"]["host"]["policy"]["protected_denominator"]=0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["distribution"]="FixedHeadSharded";
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    }
+}
+
+namespace
+{
+    /** @return Complete synthetic internal metadata, never an authored startup policy. */
+    MTPDepthPolicyScope documentScope()
+    {
+        return {MTPVerifierPhysicalWidthPolicy::ExactLogicalRows,
+                4, 1, 15, 512, 7, 16, 2, 1, 0};
+    }
+}
+
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtCurrentSchema)
+{
+    static_assert(kOrchestrationConfigDocumentSchemaVersion == 13);
+    for (const auto width : {MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket,
+                             MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope,
+                             MTPVerifierPhysicalWidthPolicy::ExactLogicalRows})
+    {
+        OrchestrationConfig internal;
+        internal.mtp.depth_policy.backend = MTPDepthPolicyBackend::ROCm;
+        internal.mtp.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+        internal.mtp.depth_policy.scope = documentScope();
+        internal.mtp.depth_policy.scope.verifier_width_policy = width;
+        const auto document = serializeOrchestrationConfig(internal);
+        const auto decoded = deserializeOrchestrationConfig(document);
+        EXPECT_EQ(decoded.mtp.depth_policy.scope, internal.mtp.depth_policy.scope);
+        EXPECT_EQ(serializeOrchestrationConfig(decoded), document);
+        const auto json = Json::parse(document);
+        EXPECT_EQ(json.at("schema_version"), 13);
+        const auto &scope = json.at("configuration").at("mtp").at("depth_policy").at("scope");
+        EXPECT_EQ(scope.size(), 10);
+        EXPECT_TRUE(scope.at("verifier_width_policy").is_string());
+    }
+    const auto generic = serializeOrchestrationConfig(OrchestrationConfig{});
+    EXPECT_EQ(deserializeOrchestrationConfig(generic).mtp.depth_policy.scope, MTPDepthPolicyScope{});
+}
+
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRejectsMalformedFieldsAndOldSchema)
+{
+    OrchestrationConfig internal;
+    internal.mtp.depth_policy.scope = documentScope();
+    const auto valid = Json::parse(serializeOrchestrationConfig(internal));
+    const Json::json_pointer location("/configuration/mtp/depth_policy/scope");
+    for (const auto *field : {"verifier_width_policy", "tp_width", "pp_stages", "retained_depth",
+                             "hidden_dim", "main_layers", "expert_count", "experts_per_token",
+                             "compute_capability_major", "compute_capability_minor"})
+    {
+        auto missing = valid;
+        missing[location].erase(field);
+        EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument) << field;
+    }
+    auto extra = valid;
+    extra[location]["invented_scope"] = 1;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(extra.dump()), std::invalid_argument);
+    for (const auto &[field, replacement] : std::vector<std::pair<std::string, Json>>{
+            {"verifier_width_policy", "exact_logical_rows"}, {"verifier_width_policy", 2},
+            {"tp_width", 4.0}, {"tp_width", "4"}, {"tp_width", false},
+            {"tp_width", std::numeric_limits<std::uint64_t>::max()},
+            {"tp_width", 0}, {"hidden_dim", 0}, {"retained_depth", 16},
+            {"experts_per_token", 17}, {"compute_capability_major", 0},
+            {"compute_capability_minor", -1}})
+    {
+        auto malformed = valid;
+        malformed[location][field] = replacement;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()), std::invalid_argument) << field;
+    }
+    for (const Json version : {Json(kOrchestrationConfigDocumentSchemaVersion - 1),
+                               Json(kOrchestrationConfigDocumentSchemaVersion + 1),
+                               Json(static_cast<double>(kOrchestrationConfigDocumentSchemaVersion))})
+    {
+        auto old = valid;
+        old["schema_version"] = version;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(old.dump()), std::invalid_argument);
+    }
+    internal.mtp.depth_policy.scope.tp_width = 0;
+    EXPECT_NE(internal.mtp.depth_policy.scope, MTPDepthPolicyScope{});
+    EXPECT_FALSE(internal.mtp.depth_policy.scope.valid());
+    EXPECT_THROW((void)serializeOrchestrationConfig(internal), std::invalid_argument);
+}
+
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeCannotAuthorStartupOrRequest)
+{
+    StartupEnvironment restore;
+    ASSERT_EQ(setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256", 1), 0);
+    ASSERT_EQ(setenv("LLAMINAR_DETERMINISTIC", "0", 1), 0);
+    mutableDebugEnv().reload();
+    OrchestrationConfig authored;
+    authored.prefill_max_bucket_size = 1024;
+    authored.deterministic = true;
+    authored.mtp.depth_policy.scope = documentScope();
+    const auto document = serializeOrchestrationConfig(authored); // Metadata codec is intentionally lossless.
+    EXPECT_EQ(deserializeOrchestrationConfig(document).mtp.depth_policy.scope, documentScope());
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseYamlString(document), std::invalid_argument);
+    EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
+    EXPECT_STREQ(std::getenv("LLAMINAR_DETERMINISTIC"), "0");
+    for (const bool partial : {false, true})
+    {
+        auto candidate = authored;
+        if (partial) candidate.mtp.depth_policy.scope.tp_width = 0;
+        const auto errors = ConfigValidator::createStandard().validate(candidate);
+        EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &error) {
+            return error.rule_id == "mtp-learned-scope-authority";
+        }));
+        EXPECT_THROW(publishOrchestrationStartupPolicy(candidate), std::invalid_argument);
+        EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
+        EXPECT_STREQ(std::getenv("LLAMINAR_DETERMINISTIC"), "0");
+        // Public direct runner APIs reject before MPI, plan or model work.
+        OrchestrationRunner inference(candidate, RankExecutionPlan{});
+        EXPECT_FALSE(inference.initialize());
+        EXPECT_NE(inference.lastError().find("runtime-derived"), std::string::npos);
+        OrchestrationRunner admission(candidate, RankExecutionPlan{});
+        EXPECT_FALSE(admission.initializeForDryRun());
+        EXPECT_NE(admission.lastError().find("runtime-derived"), std::string::npos);
+        auto request = makeMTPRequestPolicy(candidate.mtp);
+        EXPECT_EQ(request.depth_policy.scope, MTPDepthPolicyScope{});
+        request.depth_policy.scope = candidate.mtp.depth_policy.scope;
+        EXPECT_TRUE(validateMTPRequestPolicy(request, candidate.mtp).has_value());
+    }
+}
+
+/** @test A new explicit backing field never obtains a default from an older or incomplete lossless document. */
+TEST(OrchestrationConfigDocument, AdaptiveFullRAMBackingRejectsOldSchemaAndMissingField){
+    OrchestrationConfig config;config.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    config.ngram_table_policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
+    const auto valid=nlohmann::json::parse(serializeOrchestrationConfig(config));EXPECT_EQ(valid.at("schema_version"),13);
+    EXPECT_EQ(deserializeOrchestrationConfig(valid.dump()).ngram_table_policy,config.ngram_table_policy);
+    auto old=valid;old["schema_version"]=11;EXPECT_THROW(deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
+    auto missing=valid;missing["configuration"]["ngram_table_policy"]["gpu_adaptive"].erase("source_backing");
+    EXPECT_THROW(deserializeOrchestrationConfig(missing.dump()),std::invalid_argument);
+    auto foreign=valid;foreign["configuration"]["ngram_table_policy"]["gpu_adaptive"]["source_backing"]="Foreign";
+    EXPECT_THROW(deserializeOrchestrationConfig(foreign.dump()),std::invalid_argument);
+}
+
+/** @test Optional absent/null differs from explicit C0 and overrides preserve exact readers. */
+TEST(OrchestrationConfigDocument, NgramLocalHotCacheAbsentNullC0AndOverrides)
+{
+    OrchestrationConfig c;
+    c.ngram_table_policy.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    c.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement("0:rocm:0/128/1048576@0:cuda:0");
+    auto shared = nlohmann::json::parse(serializeOrchestrationConfig(c));
+    EXPECT_TRUE(shared["configuration"]["ngram_table_policy"]["gpu_adaptive"]["local_hot_cache"].is_null());
+    auto old_shared = shared;
+    old_shared["configuration"]["ngram_table_policy"]["gpu_adaptive"].erase("local_hot_cache");
+    EXPECT_EQ(deserializeOrchestrationConfig(old_shared.dump()).ngram_table_policy, c.ngram_table_policy);
+    c.ngram_table_policy.gpu_adaptive.local_hot_cache.emplace();
+    c.ngram_table_policy.gpu_adaptive.local_hot_cache->consumer_overrides = {
+        {{0, DeviceType::CUDA, 1}, 17, 4096}};
+    const auto decoded = deserializeOrchestrationConfig(serializeOrchestrationConfig(c));
+    EXPECT_EQ(decoded.ngram_table_policy, c.ngram_table_policy);
+    ASSERT_TRUE(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache);
+    EXPECT_EQ(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache->maximum_cache_rows, 0u);
+    const std::array readers{AdaptiveGPUCacheParticipant{0,DeviceType::CUDA,0}, AdaptiveGPUCacheParticipant{0,DeviceType::CUDA,1}};
+    auto local = *decoded.ngram_table_policy.gpu_adaptive.local_hot_cache;
+    EXPECT_NO_THROW(local.requireConsumers(readers));
+    EXPECT_EQ(local.ceilingsFor(readers[1]).maximum_cache_rows, 17u);
+    EXPECT_EQ(local.ceilingsFor(readers[0]).maximum_cache_rows, 0u);
+    local.consumer_overrides.push_back(local.consumer_overrides.front());
+    EXPECT_THROW(local.validate(), std::invalid_argument);
+    local.consumer_overrides = {{{0,DeviceType::CUDA,2},17,4096}};
+    EXPECT_THROW(local.requireConsumers(readers), std::invalid_argument);
+    local.policy.protected_denominator = 0;
+    EXPECT_THROW(local.validate(), std::invalid_argument);
+}
+
+/** @test Resolved hardware bindings stay lossless values without becoming trusted runtime authority. */
+TEST(OrchestrationConfigDocument, ObservedRouteBindingRoundTripsLosslesslyAtCurrentSchema) {
+    auto config=example(DeviceType::ROCm);
+    const auto unbound=serializeOrchestrationConfig(config);
+    EXPECT_FALSE(deserializeOrchestrationConfig(unbound).moe_routed_expert_plan->observed_route_transport);
+    EXPECT_FALSE(deserializeOrchestrationConfig(unbound).moe_routed_expert_plan->observed_route_diagnostic);
+    auto& plan=*config.moe_routed_expert_plan;
+    plan.observed_route_transport=MoEOverlayNodeLocalRouteTransportPolicy{
+        .ordinary_prefill=MoEOverlayNodeLocalRouteTransport::MappedSparse,
+        .decode=MoEOverlayNodeLocalRouteTransport::NativeCollective};
+    plan.observed_route_diagnostic=MoEOverlayNodeLocalRouteTransport::MappedSparse;
+    const auto text=serializeOrchestrationConfig(config);const auto restored=deserializeOrchestrationConfig(text);
+    ASSERT_TRUE(restored.moe_routed_expert_plan);
+    EXPECT_EQ(restored.moe_routed_expert_plan->observed_route_transport,plan.observed_route_transport);
+    EXPECT_EQ(restored.moe_routed_expert_plan->observed_route_diagnostic,plan.observed_route_diagnostic);
+    EXPECT_EQ(serializeOrchestrationConfig(restored),text);EXPECT_NE(text,unbound);
+    const auto json=Json::parse(text);EXPECT_EQ(json.at("schema_version"),13);
+    EXPECT_EQ(json.at("configuration").at("moe_routed_expert_plan").at("observed_route_transport").at("decode"),"NativeCollective");
+}
+/** @test New required binding fields have strict types/enums and cannot enter through an old schema. */
+TEST(OrchestrationConfigDocument, ObservedRouteBindingRejectsMissingMalformedAndOldSchema) {
+    auto config=example(DeviceType::CUDA);
+    config.moe_routed_expert_plan->observed_route_transport=MoEOverlayNodeLocalRouteTransportPolicy{
+        .ordinary_prefill=MoEOverlayNodeLocalRouteTransport::MappedSparse,
+        .decode=MoEOverlayNodeLocalRouteTransport::NativeCollective};
+    config.moe_routed_expert_plan->observed_route_diagnostic=MoEOverlayNodeLocalRouteTransport::MappedSparse;
+    const auto valid=Json::parse(serializeOrchestrationConfig(config));
+    const Json::json_pointer plan("/configuration/moe_routed_expert_plan");
+    for(const auto* field:{"observed_route_transport","observed_route_diagnostic"}) {
+        auto missing=valid;missing[plan].erase(field);
+        EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()),std::invalid_argument)<<field;
+    }
+    for(const auto& [field,value]:std::vector<std::pair<std::string,Json>>{
+        {"observed_route_transport",true},{"observed_route_transport",Json{{"ordinary_prefill","MappedSparse"}}},
+        {"observed_route_transport",Json{{"ordinary_prefill","MappedSparse"},{"decode","Foreign"}}},
+        {"observed_route_diagnostic",3},{"observed_route_diagnostic","mapped_sparse"}}) {
+        auto malformed=valid;malformed[plan][field]=value;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()),std::invalid_argument)<<field;
+    }
+    auto old=valid;old["schema_version"]=12;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
 }

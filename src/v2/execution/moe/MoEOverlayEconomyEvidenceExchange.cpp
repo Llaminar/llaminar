@@ -29,6 +29,20 @@ namespace llaminar2
                    left.layer == right.layer && left.expert == right.expert;
         }
 
+        /**
+         * @brief Match complete target identity without naming a cohort representative.
+         * @param row Original described forward edge.
+         * @param coordinate Complete target/layer calibration identity.
+         * @return Whether both alternatives match the same original whole or CPU-cohort geometry.
+         */
+        bool matchesTargetCoordinate(const MoEOverlayCompletedMigrationMeasurement &row,
+            const MoEOverlayMigrationTargetCoordinate &coordinate) noexcept
+        {
+            return row.geometry && row.layer == coordinate.layer &&
+                   MoEOverlayTargetLayerMigrationMeasurement::geometryMatches(
+                       coordinate, *row.geometry);
+        }
+
         /** @return Non-negative interference without unsigned underflow. */
         std::uint64_t interference(
             const MoEOverlayCalibrationAttemptEvidence &attempt) noexcept
@@ -44,23 +58,18 @@ namespace llaminar2
     bool MoEOverlayMigrationProfileEvidence::valid() const noexcept
     {
         if (profile_sequence == 0 || !coordinate.valid() ||
-            coordinate.source_participant >=
-                coordinate.destination_participant ||
-            local_measurements.size() != 2)
+            coordinate.source_target.word() >=
+                coordinate.destination_target.word() ||
+            local_measurements.size() != 2 || !context || context->purpose()!=MoEOverlayResidencyTransactionPurpose::EconomyCalibration || !context->matches(local_measurements))
         {
             return false;
         }
         const auto &forward = local_measurements[0];
         const auto &reverse = local_measurements[1];
-        return forward.valid() && reverse.valid() &&
-               forward.source_participant ==
-                   coordinate.source_participant &&
-               forward.destination_participant ==
-                   coordinate.destination_participant &&
-               reverse.source_participant ==
-                   coordinate.destination_participant &&
-               reverse.destination_participant ==
-                   coordinate.source_participant &&
+        return forward.valid() && reverse.valid() && matchesTargetCoordinate(forward,coordinate) &&
+               forward.geometry && reverse.geometry &&
+               forward.geometry->targets().first==reverse.geometry->targets().second &&
+               forward.geometry->targets().second==reverse.geometry->targets().first &&
                forward.layer == coordinate.layer &&
                reverse.layer == coordinate.layer;
     }
@@ -70,10 +79,12 @@ namespace llaminar2
         if (measurements.size() != 2)
             return false;
         return measurements[0].valid() && measurements[1].valid() &&
-               measurements[0].source_participant ==
-                   measurements[1].destination_participant &&
-               measurements[0].destination_participant ==
-                   measurements[1].source_participant &&
+               ((measurements[0].geometry && measurements[1].geometry &&
+                 measurements[0].geometry->targets().first==measurements[1].geometry->targets().second &&
+                 measurements[0].geometry->targets().second==measurements[1].geometry->targets().first) ||
+                (!measurements[0].geometry && !measurements[1].geometry &&
+                 measurements[0].source_participant==measurements[1].destination_participant &&
+                 measurements[0].destination_participant==measurements[1].source_participant)) &&
                measurements[0].layer == measurements[1].layer;
     }
 
@@ -127,27 +138,22 @@ namespace llaminar2
     bool MoEOverlayCalibrationAttemptEvidence::valid() const noexcept
     {
         if (calibration_sequence == 0 || !coordinate.valid() ||
-            coordinate.source_participant >=
-                coordinate.destination_participant ||
+            coordinate.source_target.word() >=
+                coordinate.destination_target.word() ||
             static_cast<std::size_t>(source) >=
                 kExpertHistogramProductionSourceCount ||
             !workload.valid() || workload.source != source ||
-            baseline_nanoseconds == 0 || local_measurements.size() != 2 ||
+            baseline_nanoseconds == 0 || local_measurements.size() != 2 || !context || context->purpose()!=MoEOverlayResidencyTransactionPurpose::EconomyCalibration || !context->matches(local_measurements) ||
             (exact_overlap && concurrent_nanoseconds == 0))
         {
             return false;
         }
         const auto &forward = local_measurements[0];
         const auto &reverse = local_measurements[1];
-        return forward.valid() && reverse.valid() &&
-               forward.source_participant ==
-                   coordinate.source_participant &&
-               forward.destination_participant ==
-                   coordinate.destination_participant &&
-               reverse.source_participant ==
-                   coordinate.destination_participant &&
-               reverse.destination_participant ==
-                   coordinate.source_participant &&
+        return forward.valid() && reverse.valid() && matchesTargetCoordinate(forward,coordinate) &&
+               forward.geometry && reverse.geometry &&
+               forward.geometry->targets().first==reverse.geometry->targets().second &&
+               forward.geometry->targets().second==reverse.geometry->targets().first &&
                forward.layer == coordinate.layer &&
                reverse.layer == coordinate.layer;
     }
@@ -166,6 +172,10 @@ namespace llaminar2
                    measurements.end(),
                    [](const auto &measurement)
                    {
+                       if (measurement.geometry)
+                           return measurement.valid() && std::all_of(
+                               measurement.piece_observations.begin(), measurement.piece_observations.end(),
+                               [](const auto &slot) {return slot.valid() && slot.observation.has_value();});
                        return measurement.valid() &&
                               std::all_of(
                                   measurement.projections.begin(),

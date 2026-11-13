@@ -7,6 +7,8 @@
  * CPU preparation establishes NUMA placement in exclusive final storage before
  * decoding or copying. Publication only borrows complete owned engines; it must
  * never migrate, replace, or discard already filled execution storage.
+ * Registry-only consumers drop references on departure without releasing shared
+ * weights or mutating the canonical registry and prepared-store ownership.
  */
 
 #include "MoEExpertWeightService.h"
@@ -20,7 +22,7 @@
 #include "../../kernels/KernelFactory.h"
 #include "../../kernels/PackedWeightsSerialization.h"
 #include "../../kernels/cpu/gemm/CPUPackedWeights.h"
-#include "../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "../../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
 #include "../../loaders/ExpertGemmRegistry.h"
 #include "../../loaders/GPUVramPreflight.h"
@@ -203,7 +205,7 @@ namespace llaminar2
                                             int expert_id,
                                             const char *role)
         {
-            auto *vnni_kernel = dynamic_cast<cpu::native_vnni::CPUNativeVNNIGemmKernel *>(kernel);
+            auto *vnni_kernel = dynamic_cast<cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(kernel);
             std::ostringstream interleaved_label;
             interleaved_label << "layer " << layer_idx << " expert " << expert_id
                               << " " << role << " native_interleaved";
@@ -253,7 +255,7 @@ namespace llaminar2
                 if (e < 0 || e >= static_cast<int>(gate_gemms.size()) || !gate_gemms[e])
                     continue;
 
-                auto *vnni_kernel = dynamic_cast<const cpu::native_vnni::CPUNativeVNNIGemmKernel *>(gate_gemms[e]);
+                auto *vnni_kernel = dynamic_cast<const cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(gate_gemms[e]);
                 if (!vnni_kernel)
                     continue;
 
@@ -375,17 +377,17 @@ namespace llaminar2
          * packed-weight record. Codebook id alone is ambiguous for K-family
          * superblocks, so the serialized superblock bit is part of the lookup.
          */
-        static const NativeVnniFormatInfo *nativeVnniFormatForPacked(
+        static const NativeQuantisedFormatInfo *nativeQuantisedFormatForPacked(
             uint8_t codebook_id,
             bool is_superblock)
         {
-            return native_vnni_formats::forSourceIdentity(
+            return native_quantised_formats::forSourceIdentity(
                 codebook_id, is_superblock);
         }
 
         /** Build the exact source provenance carried by a prepared engine. */
-        static NativeVnniSourceIdentity sourceIdentityFor(
-            const NativeVnniFormatInfo &format)
+        static NativeQuantisedSourceIdentity sourceIdentityFor(
+            const NativeQuantisedFormatInfo &format)
         {
             return {
                 .codebook_id = format.codebook_id,
@@ -469,18 +471,18 @@ namespace llaminar2
             return nullptr;
         }
 
-        static DeviceNativeVNNIMatrixDesc nativeVnniDescFromSlot(
+        static DeviceNativeQuantisedMatrixDesc nativeQuantisedDescFromSlot(
             const WeightVRAMPool::WeightSlot &slot,
             int N,
             int K,
             uint32_t blocks_per_row,
             uint8_t codebook_id)
         {
-            DeviceNativeVNNIMatrixDesc desc{};
-            desc.payload = slot.d_native_vnni_payload;
-            desc.scales = slot.d_native_vnni_scales;
-            desc.mins = slot.d_native_vnni_mins;
-            desc.emins = slot.d_native_vnni_emins;
+            DeviceNativeQuantisedMatrixDesc desc{};
+            desc.payload = slot.d_native_quantised_payload;
+            desc.scales = slot.d_native_quantised_scales;
+            desc.mins = slot.d_native_quantised_mins;
+            desc.emins = slot.d_native_quantised_emins;
             desc.n = N;
             desc.k = K;
             desc.blocks_per_row = blocks_per_row;
@@ -499,7 +501,7 @@ namespace llaminar2
             bool has_emins)
         {
             return makeGpuExpertPackedDescriptor(
-                nativeVnniDescFromSlot(slot, N, K, blocks_per_row, codebook_id),
+                nativeQuantisedDescFromSlot(slot, N, K, blocks_per_row, codebook_id),
                 payload_bytes_per_block,
                 is_asymmetric,
                 has_emins);
@@ -513,7 +515,7 @@ namespace llaminar2
             int K,
             uint32_t blocks_per_row,
             uint8_t codebook_id,
-            NativeVnniSourceIdentity source_identity,
+            NativeQuantisedSourceIdentity source_identity,
             const std::shared_ptr<void> &lifetime_owner)
         {
 #ifdef HAVE_CUDA
@@ -521,10 +523,10 @@ namespace llaminar2
             {
                 return std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
                     N, K, device_ordinal,
-                    slot.d_native_vnni_payload,
-                    static_cast<uint16_t *>(slot.d_native_vnni_scales),
-                    static_cast<uint16_t *>(slot.d_native_vnni_mins),
-                    static_cast<uint32_t *>(slot.d_native_vnni_emins),
+                    slot.d_native_quantised_payload,
+                    static_cast<uint16_t *>(slot.d_native_quantised_scales),
+                    static_cast<uint16_t *>(slot.d_native_quantised_mins),
+                    static_cast<uint32_t *>(slot.d_native_quantised_emins),
                     codebook_id, blocks_per_row,
                     lifetime_owner,
                     source_identity);
@@ -535,10 +537,10 @@ namespace llaminar2
             {
                 return std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
                     N, K, device_ordinal,
-                    slot.d_native_vnni_payload,
-                    slot.d_native_vnni_scales,
-                    slot.d_native_vnni_mins,
-                    slot.d_native_vnni_emins,
+                    slot.d_native_quantised_payload,
+                    slot.d_native_quantised_scales,
+                    slot.d_native_quantised_mins,
+                    slot.d_native_quantised_emins,
                     codebook_id, blocks_per_row,
                     lifetime_owner,
                     source_identity);
@@ -997,9 +999,15 @@ namespace llaminar2
         }
         std::atomic<bool> error_flag{false};
 
-        const auto placement = enforce_numa_placement
+        // Original NUMA intent chooses physical placement; the actual Store
+        // supplies the sole admission authority for every new packed root.
+        auto placement = enforce_numa_placement
             ? CPUWeightStoragePlacement::onNode(target_numa_node)
             : CPUWeightStoragePlacement::local();
+        if (ctx.prepared_store)
+            placement = CPUWeightStoragePlacement::accounted(
+                ctx.prepared_store->physicalMemoryAuthority(),
+                ctx.device_id, ctx.persistent_weight_owner, placement);
 
         // Per-expert engine storage for parallel assignment (avoids push_back race)
         std::vector<std::shared_ptr<ITensorGemm>> local_gate_engines(prep_count);
@@ -1326,10 +1334,16 @@ namespace llaminar2
                 "Cannot clone an incomplete prepared CPU expert");
         }
 
+        if (!ctx.prepared_store)
+            throw std::logic_error("CPU expert clone requires physical-memory admission");
+        const auto staging = CPUWeightStoragePlacement::accounted(
+            ctx.prepared_store->physicalMemoryAuthority(), ctx.device_id,
+            PhysicalMemoryOwner::ExpertMigrationStaging,
+            CPUWeightStoragePlacement::local());
         ExpertPackedWeights weights;
-        weights.gate = engines[0]->cloneWeights();
-        weights.up = engines[1]->cloneWeights();
-        weights.down = engines[2]->cloneWeights();
+        weights.gate = engines[0]->cloneWeightsTo(staging);
+        weights.up = engines[1]->cloneWeightsTo(staging);
+        weights.down = engines[2]->cloneWeightsTo(staging);
         if (!weights.complete())
         {
             throw std::runtime_error(
@@ -1340,7 +1354,7 @@ namespace llaminar2
 
     ExpertWeightBlobs MoEExpertWeightService::serializeExpert(const MoEWeightContext &ctx, int expert_id)
     {
-        using namespace cpu::native_vnni;
+        using namespace cpu::native_quantised;
 
         ExpertWeightBlobs blobs;
 
@@ -1354,17 +1368,23 @@ namespace llaminar2
                 return {};
             }
 
-            auto packed = engine->cloneWeights();
+            const auto *packed = engine->exportCPUNativeQuantisedPackedWeights();
             if (!packed)
             {
                 LOG_ERROR("[MoEWeightService] Cannot serialize packed expert weight: layer "
                           << ctx.layer_idx << " expert " << expert_id << " " << proj_name
-                          << " engine cannot clone packed weights");
+                          << " engine cannot export packed weights");
                 return {};
             }
 
+            if (!ctx.prepared_store)
+                throw std::logic_error("CPU expert serialization requires physical-memory admission");
+            const auto staging = CPUWeightStoragePlacement::accounted(
+                ctx.prepared_store->physicalMemoryAuthority(), ctx.device_id,
+                PhysicalMemoryOwner::ExpertMigrationStaging,
+                CPUWeightStoragePlacement::local());
             ExpertTransferBuffer buffer;
-            if (!packed_weights_serialization::serializeInto(*packed, buffer))
+            if (!packed_weights_serialization::serializeInto(*packed, buffer, staging))
                 return {};
             return buffer;
         };
@@ -1389,6 +1409,10 @@ namespace llaminar2
                 "MoEExpertWeightService::releaseDepartedExperts received a mask smaller than num_experts");
         }
 
+        // A registry-only graph is a consumer, never the canonical residency
+        // publisher. Dropping one graph's reference must leave sibling graphs
+        // and in-flight RCU readers' packed allocations and aliases untouched.
+        const bool owns_weights = ctx.ownsPreparedEngineWeights();
         std::vector<const TensorBase *> evict_tensors;
         std::vector<int> departed_ids;
         std::vector<ITensorGemm *> departed_engines;
@@ -1430,7 +1454,7 @@ namespace llaminar2
         }
 
         // Mirror departures to ExpertGemmRegistry (keeps registry in sync with stage state)
-        if (ctx.expert_registry && !departed_ids.empty())
+        if (owns_weights && ctx.expert_registry && !departed_ids.empty())
         {
             for (int e : departed_ids)
             {
@@ -1443,7 +1467,7 @@ namespace llaminar2
         }
 
         // Phase C: Notify PreparedWeightStore of departed experts
-        if (ctx.prepared_store && !departed_ids.empty())
+        if (owns_weights && ctx.prepared_store && !departed_ids.empty())
         {
             if (ctx.gate_slab_ref.has_value())
                 ctx.prepared_store->releaseDepartedExperts(*ctx.gate_slab_ref, departed_ids);
@@ -1468,7 +1492,8 @@ namespace llaminar2
                     continue;
                 if (std::find(released_owned_engines.begin(), released_owned_engines.end(), raw) != released_owned_engines.end())
                     continue;
-                owned->releaseWeights();
+                if (owns_weights)
+                    owned->releaseWeights();
                 released_owned_engines.push_back(raw);
             }
 
@@ -1531,9 +1556,14 @@ namespace llaminar2
 
         // CPU path: adopt final directly-received engines, resolve an existing
         // canonical store owner, or consume the portable archive wire record.
-        // The wire record contains eager CPU NativeVNNI data as well as the
+        // The wire record contains eager CPU NativeQuantised data as well as the
         // original native blocks needed by accelerator destinations. CPU uses
         // the eager representation without another quantization pass.
+        // Terminal residency publication owns registry/store aliases for shared
+        // consumers. A graph may acquire its final prepared arrivals, but must
+        // neither borrow a coarse sibling alias nor create a retained alias that
+        // its non-destructive departure would intentionally leave untouched.
+        const bool owns_weights = ctx.ownsPreparedEngineWeights();
         auto t_start = std::chrono::high_resolution_clock::now();
         int transferred_count = 0;
         std::atomic<bool> error_flag{false};
@@ -1554,13 +1584,13 @@ namespace llaminar2
                       << ctx.layer_idx);
         }
 
-        const auto placement = enforce_numa_placement
+        const auto native_placement = enforce_numa_placement
             ? CPUWeightStoragePlacement::onNode(target_numa_node)
             : CPUWeightStoragePlacement::local();
 
         auto cached_engine_for = [&](const std::optional<ExpertSlabRef> &slab_ref, int expert_id) -> ITensorGemm *
         {
-            if (!ctx.prepared_store || !slab_ref.has_value())
+            if (!owns_weights || !ctx.prepared_store || !slab_ref.has_value())
                 return nullptr;
             return ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id);
         };
@@ -1622,12 +1652,18 @@ namespace llaminar2
                         portable = &*provider_payload;
                 }
 
-                const auto build_projection = [placement](
+                const auto build_projection = [&ctx, native_placement](
                                                   const ExpertTransferBuffer &blob)
                     -> std::shared_ptr<ITensorGemm>
                 {
                     if (blob.empty())
                         return nullptr;
+                    // Borrowed prepared arrivals already retain their exact
+                    // physical owner. Only archive materialization creates new
+                    // durable bytes and consumes this destination's admission.
+                    const auto placement = CPUWeightStoragePlacement::accounted(
+                        requirePhysicalMemoryAuthority(ctx, "CPU expert archive arrival"),
+                        ctx.device_id, ctx.persistent_weight_owner, native_placement);
                     return KernelFactory::createExpertGemmFromTransferBlob(
                         blob.data(), blob.size(), placement);
                 };
@@ -1679,7 +1715,7 @@ namespace llaminar2
             return false;
 
         // Mark experts as prepared in the payload provider
-        if (ctx.payload_provider)
+        if (owns_weights && ctx.payload_provider)
         {
             for (int e : new_experts)
                 ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
@@ -1699,7 +1735,7 @@ namespace llaminar2
         }
 
         // Phase C: Register new arrivals in PreparedWeightStore using cached slab refs
-        if (ctx.prepared_store && !new_experts.empty())
+        if (owns_weights && ctx.prepared_store && !new_experts.empty())
         {
             auto register_rebalance_arrivals = [&](const std::optional<ExpertSlabRef> &slab_ref,
                                                    const std::vector<ITensorGemm *> &engines,
@@ -1761,13 +1797,6 @@ namespace llaminar2
         const int gpu_ordinal = ctx.device_id.is_cuda()
                                     ? ctx.device_id.cuda_ordinal()
                                     : ctx.device_id.rocm_ordinal();
-        IBackend *backend = getBackendFor(ctx.device_id);
-        if (!backend)
-        {
-            LOG_ERROR("[MoEWeightService::GPU-rebalance] No backend for "
-                      << ctx.device_id.to_string());
-            return false;
-        }
 
         // Weight groups: gate, up, down
         struct WeightGroup
@@ -1782,13 +1811,6 @@ namespace llaminar2
         };
         resolveExpertSlabRefs(ctx, /*create_if_missing=*/false);
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(
-            backend,
-            requirePhysicalMemoryAuthority(
-                ctx,
-                "GPU expert rebalance preparation"),
-            PhysicalMemoryOwner::RoutedExpertWeights);
-        orchestrator->addDevice(gpu_ordinal);
 
         size_t max_raw_bytes = 0;
         size_t total_planned = 0;
@@ -1796,8 +1818,8 @@ namespace llaminar2
         struct TransferSource
         {
             std::unique_ptr<IPackedWeights> packed;
-            const cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *native = nullptr;
-            const NativeVnniFormatInfo *format_info = nullptr;
+            const cpu::native_quantised::CPUPackedWeightsWithNativeBlocks *native = nullptr;
+            const NativeQuantisedFormatInfo *format_info = nullptr;
             RepackFormat format = RepackFormat::Q4_0;
         };
         std::vector<TransferSource> transfer_sources;
@@ -1859,7 +1881,11 @@ namespace llaminar2
         {
             if (blob.empty())
                 return std::nullopt;
-            auto packed = packed_weights_serialization::deserialize(blob.data(), blob.size());
+            const auto staging = CPUWeightStoragePlacement::accounted(
+                requirePhysicalMemoryAuthority(ctx, "GPU expert archive decode"), DeviceId::cpu(),
+                PhysicalMemoryOwner::ExpertMigrationStaging,
+                CPUWeightStoragePlacement::local());
+            auto packed = packed_weights_serialization::deserialize(blob.data(), blob.size(), staging);
             if (!packed)
             {
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to deserialize transferred packed weights for expert "
@@ -1867,7 +1893,7 @@ namespace llaminar2
                 return std::nullopt;
             }
 
-            auto *native = dynamic_cast<cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *>(packed.get());
+            auto *native = dynamic_cast<cpu::native_quantised::CPUPackedWeightsWithNativeBlocks *>(packed.get());
             if (!native)
             {
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Transferred expert " << expert_id << " " << label
@@ -1877,7 +1903,7 @@ namespace llaminar2
 
             const auto &cpu_packed = native->packed();
             auto repack_fmt = codebookIdToRepackFormat(cpu_packed.codebook_id, cpu_packed.is_superblock);
-            const auto *format_info = nativeVnniFormatForPacked(
+            const auto *format_info = nativeQuantisedFormatForPacked(
                 cpu_packed.codebook_id,
                 cpu_packed.is_superblock);
             if (!repack_fmt || !format_info || cpu_packed.N <= 0 ||
@@ -1951,6 +1977,24 @@ namespace llaminar2
                                                                << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
             return true;
         }
+
+        // Original cached triplets need no new loader/backend resources. Only
+        // authenticated missing payloads enter the original native pipeline.
+        IBackend *backend = getBackendFor(ctx.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[MoEWeightService::GPU-rebalance] No backend for "
+                      << ctx.device_id.to_string());
+            return false;
+        }
+
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend,
+            requirePhysicalMemoryAuthority(
+                ctx,
+                "GPU expert rebalance preparation"),
+            PhysicalMemoryOwner::RoutedExpertWeights);
+        orchestrator->addDevice(gpu_ordinal);
 
         // Phase 1: Plan weights for new experts
         for (auto &grp : groups)
@@ -2092,10 +2136,10 @@ namespace llaminar2
                 {
                     kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
                         N, K, gpu_ordinal,
-                        slot->d_native_vnni_payload,
-                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                        slot->d_native_quantised_payload,
+                        static_cast<uint16_t *>(slot->d_native_quantised_scales),
+                        static_cast<uint16_t *>(slot->d_native_quantised_mins),
+                        static_cast<uint32_t *>(slot->d_native_quantised_emins),
                         canonicalDeviceVnniCodebookId(format), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(format));
@@ -2106,10 +2150,10 @@ namespace llaminar2
                 {
                     kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
                         N, K, gpu_ordinal,
-                        slot->d_native_vnni_payload,
-                        slot->d_native_vnni_scales,
-                        slot->d_native_vnni_mins,
-                        slot->d_native_vnni_emins,
+                        slot->d_native_quantised_payload,
+                        slot->d_native_quantised_scales,
+                        slot->d_native_quantised_mins,
+                        slot->d_native_quantised_emins,
                         canonicalDeviceVnniCodebookId(format), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(format));
@@ -2314,7 +2358,7 @@ namespace llaminar2
                 }
 
                 auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+                const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
                 if (!vnni)
                 {
                     LOG_ERROR("[MoEWeightService::GPU] Expert " << e << " " << grp.label
@@ -2380,7 +2424,7 @@ namespace llaminar2
                 const auto &view = grp.views[e];
 
                 auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable->vnniFormatInfo();
+                const NativeQuantisedFormatInfo *vnni = unpackable->vnniFormatInfo();
 
                 auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
                 if (!repack_fmt)
@@ -2441,7 +2485,7 @@ namespace llaminar2
                 }
 
                 auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable->vnniFormatInfo();
+                const NativeQuantisedFormatInfo *vnni = unpackable->vnniFormatInfo();
                 const int N = static_cast<int>(view->rows());
                 const int K = static_cast<int>(view->cols());
                 const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
@@ -2453,10 +2497,10 @@ namespace llaminar2
                 {
                     kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
                         N, K, gpu_ordinal,
-                        slot->d_native_vnni_payload,
-                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                        slot->d_native_quantised_payload,
+                        static_cast<uint16_t *>(slot->d_native_quantised_scales),
+                        static_cast<uint16_t *>(slot->d_native_quantised_mins),
+                        static_cast<uint32_t *>(slot->d_native_quantised_emins),
                         canonicalDeviceVnniCodebookId(*vnni), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
@@ -2467,10 +2511,10 @@ namespace llaminar2
                 {
                     kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
                         N, K, gpu_ordinal,
-                        slot->d_native_vnni_payload,
-                        slot->d_native_vnni_scales,
-                        slot->d_native_vnni_mins,
-                        slot->d_native_vnni_emins,
+                        slot->d_native_quantised_payload,
+                        slot->d_native_quantised_scales,
+                        slot->d_native_quantised_mins,
+                        slot->d_native_quantised_emins,
                         canonicalDeviceVnniCodebookId(*vnni), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
@@ -2617,7 +2661,7 @@ namespace llaminar2
                staged.has_emins == has_emins &&
                staged.codebook_id == codebook_id &&
                source_identity.present &&
-               native_vnni_formats::forSourceIdentity(
+               native_quantised_formats::forSourceIdentity(
                    source_identity.codebook_id,
                    source_identity.is_superblock) != nullptr &&
                canonicalDeviceVnniCodebookId(source_identity) ==
@@ -3353,8 +3397,8 @@ namespace llaminar2
 
         auto source_descriptor_for = [&](const WeightGroup &grp,
                                          int expert_id,
-                                         DeviceNativeVNNIMatrixDesc &out,
-                                         NativeVnniSourceIdentity &source_identity) -> bool
+                                         DeviceNativeQuantisedMatrixDesc &out,
+                                         NativeQuantisedSourceIdentity &source_identity) -> bool
         {
             ITensorGemm *source_engine = source_engine_for(grp, expert_id);
             if (!source_engine)
@@ -3364,15 +3408,15 @@ namespace llaminar2
                           << " layer " << layer_idx);
                 return false;
             }
-            if (!source_engine->exportNativeVNNIMatrixDesc(out) || !out.valid())
+            if (!source_engine->exportNativeQuantisedMatrixDesc(out) || !out.valid())
             {
                 LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
                           << grp.label << " engine for expert " << expert_id
                           << " layer " << layer_idx
-                          << " cannot export NativeVNNI descriptor");
+                          << " cannot export NativeQuantised descriptor");
                 return false;
             }
-            if (!source_engine->exportNativeVNNISourceIdentity(source_identity) ||
+            if (!source_engine->exportNativeQuantisedSourceIdentity(source_identity) ||
                 !source_identity.present ||
                 canonicalDeviceVnniCodebookId(source_identity) !=
                     out.codebook_id)
@@ -3380,14 +3424,14 @@ namespace llaminar2
                 LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
                           << grp.label << " engine for expert " << expert_id
                           << " layer " << layer_idx
-                          << " cannot export compatible NativeVNNI source identity");
+                          << " cannot export compatible NativeQuantised source identity");
                 return false;
             }
             return true;
         };
 
         auto vnni_info_for = [&](const WeightGroup &grp,
-                                 int expert_id) -> const NativeVnniFormatInfo *
+                                 int expert_id) -> const NativeQuantisedFormatInfo *
         {
             if (expert_id < 0 || expert_id >= static_cast<int>(grp.dst_views.size()) ||
                 !grp.dst_views[expert_id])
@@ -3401,8 +3445,8 @@ namespace llaminar2
         auto validate_optional_destination_view =
             [&](const WeightGroup &grp,
                 int expert_id,
-                const DeviceNativeVNNIMatrixDesc &src_desc,
-                const NativeVnniSourceIdentity &source_identity,
+                const DeviceNativeQuantisedMatrixDesc &src_desc,
+                const NativeQuantisedSourceIdentity &source_identity,
                 uint8_t payload_bytes_per_block,
                 uint8_t is_asymmetric,
                 uint8_t has_emins) -> bool
@@ -3427,7 +3471,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
+            if (const NativeQuantisedFormatInfo *vnni = vnni_info_for(grp, expert_id);
                 vnni &&
                 (src_desc.codebook_id != canonicalDeviceVnniCodebookId(*vnni) ||
                  source_identity.codebook_id != vnni->codebook_id ||
@@ -3451,8 +3495,8 @@ namespace llaminar2
             bool can_copy = true;
             for (const auto &grp : groups)
             {
-                DeviceNativeVNNIMatrixDesc src_desc{};
-                NativeVnniSourceIdentity source_identity{};
+                DeviceNativeQuantisedMatrixDesc src_desc{};
+                NativeQuantisedSourceIdentity source_identity{};
                 if (!source_descriptor_for(
                         grp, expert_id, src_desc, source_identity))
                 {
@@ -3472,7 +3516,7 @@ namespace llaminar2
                     LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
                               << grp.label << " descriptor for expert " << expert_id
                               << " layer " << layer_idx
-                              << " has unsupported NativeVNNI codebook");
+                              << " has unsupported NativeQuantised codebook");
                     can_copy = false;
                     break;
                 }
@@ -3510,8 +3554,8 @@ namespace llaminar2
                 if (sample_expert < 0 || sample_expert >= dst_ctx.num_experts)
                     return std::nullopt;
 
-                DeviceNativeVNNIMatrixDesc src_desc{};
-                NativeVnniSourceIdentity source_identity{};
+                DeviceNativeQuantisedMatrixDesc src_desc{};
+                NativeQuantisedSourceIdentity source_identity{};
                 if (!source_descriptor_for(
                         grp, sample_expert, src_desc, source_identity))
                     return std::nullopt;
@@ -3920,8 +3964,8 @@ namespace llaminar2
                     return false;
                 }
 
-                DeviceNativeVNNIMatrixDesc src_matrix{};
-                NativeVnniSourceIdentity source_identity{};
+                DeviceNativeQuantisedMatrixDesc src_matrix{};
+                NativeQuantisedSourceIdentity source_identity{};
                 if (!source_descriptor_for(
                         grp, expert_id, src_matrix, source_identity))
                 {
@@ -4289,7 +4333,7 @@ namespace llaminar2
 
         auto sourceDescriptorFor = [&](const WeightGroup &grp,
                                        int expert_id,
-                                       DeviceNativeVNNIMatrixDesc &out) -> bool
+                                       DeviceNativeQuantisedMatrixDesc &out) -> bool
         {
             ITensorGemm *source_engine = source_engine_for(grp, expert_id);
             if (!source_engine)
@@ -4299,19 +4343,19 @@ namespace llaminar2
                           << " layer " << layer_idx);
                 return false;
             }
-            if (!source_engine->exportNativeVNNIMatrixDesc(out) || !out.valid())
+            if (!source_engine->exportNativeQuantisedMatrixDesc(out) || !out.valid())
             {
                 LOG_DEBUG("[MoEWeightService] GPU-direct transfer: source "
                           << grp.label << " engine for expert " << expert_id
                           << " layer " << layer_idx
-                          << " cannot export NativeVNNI descriptor");
+                          << " cannot export NativeQuantised descriptor");
                 return false;
             }
             return true;
         };
 
         auto vnniInfoFor = [&](const WeightGroup &grp,
-                               int expert_id) -> const NativeVnniFormatInfo *
+                               int expert_id) -> const NativeQuantisedFormatInfo *
         {
             if (expert_id < 0 || expert_id >= static_cast<int>(grp.dst_views.size()) ||
                 !grp.dst_views[expert_id])
@@ -4329,20 +4373,20 @@ namespace llaminar2
             bool can_copy = true;
             for (const auto &grp : groups)
             {
-                DeviceNativeVNNIMatrixDesc src_desc{};
+                DeviceNativeQuantisedMatrixDesc src_desc{};
                 if (!sourceDescriptorFor(grp, e, src_desc))
                 {
                     can_copy = false;
                     break;
                 }
 
-                const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, e);
+                const NativeQuantisedFormatInfo *vnni = vnniInfoFor(grp, e);
                 if (!vnni)
                 {
                     LOG_DEBUG("[MoEWeightService] GPU-direct transfer: destination "
                               << grp.label << " view for expert " << e
                               << " layer " << layer_idx
-                              << " has no NativeVNNI format info");
+                              << " has no NativeQuantised format info");
                     can_copy = false;
                     break;
                 }
@@ -4387,7 +4431,7 @@ namespace llaminar2
             specs.reserve(group_count);
             for (const auto &grp : groups)
             {
-                const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, sample_expert);
+                const NativeQuantisedFormatInfo *vnni = vnniInfoFor(grp, sample_expert);
                 if (!vnni)
                     return std::nullopt;
                 const int N = static_cast<int>(grp.dst_views[sample_expert]->rows());
@@ -4452,7 +4496,7 @@ namespace llaminar2
         };
 
         auto create_kernel_from_slot = [&](const WeightVRAMPool::WeightSlot &slot,
-                                           const NativeVnniFormatInfo &vnni,
+                                           const NativeQuantisedFormatInfo &vnni,
                                            int N,
                                            int K,
                                            uint32_t blocks_per_row,
@@ -4464,10 +4508,10 @@ namespace llaminar2
             {
                 return std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
                     N, K, dst_gpu_ordinal,
-                    slot.d_native_vnni_payload,
-                    static_cast<uint16_t *>(slot.d_native_vnni_scales),
-                    static_cast<uint16_t *>(slot.d_native_vnni_mins),
-                    static_cast<uint32_t *>(slot.d_native_vnni_emins),
+                    slot.d_native_quantised_payload,
+                    static_cast<uint16_t *>(slot.d_native_quantised_scales),
+                    static_cast<uint16_t *>(slot.d_native_quantised_mins),
+                    static_cast<uint32_t *>(slot.d_native_quantised_emins),
                     canonicalDeviceVnniCodebookId(vnni), blocks_per_row,
                     lifetime_owner,
                     sourceIdentityFor(vnni));
@@ -4478,10 +4522,10 @@ namespace llaminar2
             {
                 return std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
                     N, K, dst_gpu_ordinal,
-                    slot.d_native_vnni_payload,
-                    slot.d_native_vnni_scales,
-                    slot.d_native_vnni_mins,
-                    slot.d_native_vnni_emins,
+                    slot.d_native_quantised_payload,
+                    slot.d_native_quantised_scales,
+                    slot.d_native_quantised_mins,
+                    slot.d_native_quantised_emins,
                     canonicalDeviceVnniCodebookId(vnni), blocks_per_row,
                     lifetime_owner,
                     sourceIdentityFor(vnni));
@@ -4701,7 +4745,7 @@ namespace llaminar2
 
                 for (const auto &grp : groups)
                 {
-                    const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, e);
+                    const NativeQuantisedFormatInfo *vnni = vnniInfoFor(grp, e);
                     if (!vnni)
                     {
                         publish_satisfied();
@@ -4742,14 +4786,14 @@ namespace llaminar2
             for (size_t group_index = 0; group_index < group_count; ++group_index)
             {
                 auto &grp = groups[group_index];
-                DeviceNativeVNNIMatrixDesc src_matrix{};
+                DeviceNativeQuantisedMatrixDesc src_matrix{};
                 if (!sourceDescriptorFor(grp, e, src_matrix))
                 {
                     publish_satisfied();
                     return false;
                 }
 
-                const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, e);
+                const NativeQuantisedFormatInfo *vnni = vnniInfoFor(grp, e);
                 if (!vnni)
                 {
                     publish_satisfied();
@@ -4799,11 +4843,11 @@ namespace llaminar2
                     lifetime_owner = expert_orchestrator;
                 }
 
-                DeviceNativeVNNIMatrixDesc dst_matrix{};
-                dst_matrix.payload = copy_dst_slot.d_native_vnni_payload;
-                dst_matrix.scales = copy_dst_slot.d_native_vnni_scales;
-                dst_matrix.mins = copy_dst_slot.d_native_vnni_mins;
-                dst_matrix.emins = copy_dst_slot.d_native_vnni_emins;
+                DeviceNativeQuantisedMatrixDesc dst_matrix{};
+                dst_matrix.payload = copy_dst_slot.d_native_quantised_payload;
+                dst_matrix.scales = copy_dst_slot.d_native_quantised_scales;
+                dst_matrix.mins = copy_dst_slot.d_native_quantised_mins;
+                dst_matrix.emins = copy_dst_slot.d_native_quantised_emins;
                 dst_matrix.n = N;
                 dst_matrix.k = K;
                 dst_matrix.blocks_per_row = blocks_per_row;
@@ -4844,11 +4888,11 @@ namespace llaminar2
 
                 if (copy_via_transfer_slot)
                 {
-                    DeviceNativeVNNIMatrixDesc active_matrix{};
-                    active_matrix.payload = active_slot.d_native_vnni_payload;
-                    active_matrix.scales = active_slot.d_native_vnni_scales;
-                    active_matrix.mins = active_slot.d_native_vnni_mins;
-                    active_matrix.emins = active_slot.d_native_vnni_emins;
+                    DeviceNativeQuantisedMatrixDesc active_matrix{};
+                    active_matrix.payload = active_slot.d_native_quantised_payload;
+                    active_matrix.scales = active_slot.d_native_quantised_scales;
+                    active_matrix.mins = active_slot.d_native_quantised_mins;
+                    active_matrix.emins = active_slot.d_native_quantised_emins;
                     active_matrix.n = N;
                     active_matrix.k = K;
                     active_matrix.blocks_per_row = blocks_per_row;

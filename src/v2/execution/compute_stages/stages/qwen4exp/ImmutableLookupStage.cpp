@@ -1,0 +1,304 @@
+/**
+ * @file ImmutableLookupStage.cpp
+ * @brief Execute exact native row I/O and decoding through explicit CPU/GPU ownership.
+ *
+ * CPU calls use one live span and GPU calls consume the same device-owned row
+ * count used by the hash producer. Resident lookup reads the original native
+ * table directly after acquiring its setup event; it needs no host channel or
+ * gathered-row scratch. Hosted responses are acknowledged only after their
+ * native bytes reach private scratch, preventing reuse during GPU decoding.
+ */
+#include "ImmutableLookupStage.h"
+#include "../../../../kernels/qwen4exp/ImmutableLookupDecode.h"
+#include "../../../../tensors/Tensors.h"
+#include "../../../../transfer/TransferEngine.h"
+#include "../../../local_execution/graph/RetainedStoragePerfStats.h"
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+namespace llaminar2
+{
+namespace
+{
+/** @brief Reject incomplete setup before capture begins. */
+void require(bool condition,const char *message)
+{
+    if(!condition) throw std::invalid_argument(message);
+}
+/** @brief Prove one typed byte range without materializing it. */
+template<TensorType Type>
+void check(Qwen4ExpArenaBinding<Type> binding,std::size_t bytes,std::size_t alignment=4)
+{
+    require(binding.tensor && binding.tensor->native_type()==Type && binding.buffer<BufferId::_COUNT &&
+        binding.byteOffset%alignment==0 && binding.byteOffset<=binding.tensor->size_bytes() &&
+        bytes<=binding.tensor->size_bytes()-binding.byteOffset,
+        "Immutable lookup stage requires aligned native arena views with sufficient admitted capacity");
+}
+}
+ImmutableLookupStage::ImmutableLookupStage(Params params)
+    :ImmutableLookupStage(std::move(params),Operation::Complete) {}
+
+ImmutableLookupStage::ImmutableLookupStage(Params params,Operation operation)
+    :IComputeStage(params.device_id),operation_(operation),params_(std::move(params))
+{
+    require(device().is_valid() && params_.rows.capacity>0,"Immutable lookup stage requires an explicit device and positive row capacity");
+    qwen4exp::lookup_detail::validateGeometry(params_.format,params_.rowElements,params_.rowBytes);
+    const auto count=static_cast<std::size_t>(params_.rows.capacity)*qwen4exp::kNgramHeads;
+    require(count<=std::numeric_limits<std::size_t>::max()/params_.rowBytes &&
+        count<=std::numeric_limits<std::size_t>::max()/params_.rowElements/sizeof(float),
+        "Immutable lookup stage row geometry overflows physical bytes");
+    check(params_.ids,count*sizeof(std::int64_t),alignof(std::int64_t));
+    check(params_.output,count*params_.rowElements*sizeof(float));
+    require(params_.ids.tensor!=params_.output.tensor && params_.ids.buffer!=params_.output.buffer,
+        "Immutable lookup IDs and decoded output must have independent storage");
+    require(operation_==Operation::Complete || std::holds_alternative<GPUStorage>(params_.storage),
+        "Split immutable lookup requires the original hosted GPU boundary");
+    std::vector<TensorBase *> roots;
+    if(operation_!=Operation::Consume)roots.push_back(params_.ids.tensor);
+    if(operation_!=Operation::Publish)roots.push_back(params_.output.tensor);
+    if (const auto scratch = nativeRows())
+    {
+        check(*scratch, count*params_.rowBytes);
+        require(scratch->tensor!=params_.ids.tensor && scratch->buffer!=params_.ids.buffer &&
+            scratch->tensor!=params_.output.tensor && scratch->buffer!=params_.output.buffer,
+            "Hosted immutable lookup native scratch must have independent storage");
+        if(operation_!=Operation::Publish)roots.push_back(scratch->tensor);
+    }
+    if(params_.rows.liveRows)
+    {
+        const auto &value=params_.rows.liveRows->value;
+        if(auto *arena=std::get_if<Qwen4ExpIntBinding>(&value)) {
+            check(*arena,sizeof(std::int32_t)); if(operation_!=Operation::Consume)roots.push_back(arena->tensor);
+        }
+        else {
+            const auto &native=std::get<Qwen4ExpNativeIntInput>(value);
+            require(native.owner==device() && native.data && native.capacity>=1 &&
+                reinterpret_cast<std::uintptr_t>(native.data)%alignof(std::int32_t)==0,
+                "Immutable lookup live rows require the exact execution owner");
+        }
+    }
+    if(auto *cpu=std::get_if<CPUStorage>(&params_.storage))
+    {
+        require(device().is_cpu() && cpu->table,"Direct immutable table I/O requires CPU execution and the model-owned table");
+        if(const auto bound=cpu->table->maximumLiveRows();bound && count>*bound)
+            throw std::invalid_argument("CPU lookup stage exceeds the provider's admitted original ID envelope");
+        const auto &source=cpu->table->source();
+        require(ggufToTensorType(source.format)==params_.format && source.row_elements==static_cast<std::size_t>(params_.rowElements) &&
+            source.rowBytes()==params_.rowBytes,"Immutable lookup decode geometry disagrees with its exact native table");
+    }
+    else if (auto *binding=std::get_if<GPUStorage>(&params_.storage))
+    {
+        const auto &gpu=*binding;
+        require(device().is_gpu() && gpu.boundary && gpu.boundary->device()==device(),
+            "GPU immutable lookup requires its exact retained participant storage boundary");
+        require(gpu.boundary->channel().maximumIds>=count && gpu.boundary->channel().rowBytes==params_.rowBytes,
+            "GPU immutable lookup channel is smaller than its admitted transaction or uses another native row width");
+        check(gpu.state,sizeof(qwen4exp::ImmutableLookupDeviceState),alignof(qwen4exp::ImmutableLookupDeviceState));
+        require(gpu.state.tensor!=params_.ids.tensor && gpu.state.tensor!=gpu.nativeRows.tensor &&
+            gpu.state.tensor!=params_.output.tensor,"GPU lookup protocol state must retain independent ownership");
+        roots.push_back(gpu.state.tensor);
+    }
+    else if (const auto *binding = std::get_if<ResidentGPUStorage>(&params_.storage))
+    {
+        const auto &resident = *binding;
+        require(device().is_gpu() && resident.table && resident.table->device() == device(),
+                "Resident lookup requires the exact admitted GPU table owner");
+        const auto view = resident.table->view();
+        require(view.format() == params_.format && view.rowElements() == params_.rowElements &&
+                    view.rowBytes() == params_.rowBytes,
+                "Resident lookup geometry differs from its original model source");
+        resident.control.requireFor(device());
+#ifdef HAVE_CUDA
+        if(device().is_cuda()) resident_kernels_=qwen4exp::createCUDAImmutableResidentLookupKernels(view);
+#endif
+#ifdef HAVE_ROCM
+        if(device().is_rocm()) resident_kernels_=qwen4exp::createROCmImmutableResidentLookupKernels(view);
+#endif
+        require(bool(resident_kernels_) && resident_kernels_->table()==view,
+            "Resident lookup backend did not bind the exact immutable source");
+    }
+    prepared_.emplace(device(),roots);
+}
+
+std::optional<Qwen4ExpIntBinding> ImmutableLookupStage::nativeRows() const
+{
+    if (const auto *cpu=std::get_if<CPUStorage>(&params_.storage)) return cpu->nativeRows;
+    if (const auto *gpu=std::get_if<GPUStorage>(&params_.storage)) return gpu->nativeRows;
+    return {};
+}
+
+bool ImmutableLookupStage::prepareGraphLaunch(IDeviceContext *context,void *stream)
+{
+    require(context && context->deviceId()==device() && (!device().is_gpu() || stream),
+        "Immutable lookup preparation requires its exact device and explicit GPU stream");
+    if (stream) setGPUStream(stream);
+    prepared_->seal();
+    if (auto *resident=std::get_if<ResidentGPUStorage>(&params_.storage))
+    {
+        resident->control.requireFor(device());
+        require(resident_kernels_->table()==resident->table->view(),"Resident lookup table changed before capture");
+        auto &transfers=TransferEngine::instance();
+        if (!resident_read_) resident_read_.emplace(resident->table->acquire(stream,transfers));
+        transfers.requireImmutableNativeDeviceInput(*resident_read_,device(),stream);
+    }
+    return true;
+}
+template<typename T,TensorType Type>
+T *ImmutableLookupStage::pointer(Qwen4ExpArenaBinding<Type> binding) const
+{
+    void *base=device().is_gpu()?binding.tensor->gpu_data_ptr():binding.tensor->raw_mutable_data();
+    require(base!=nullptr,"Immutable lookup operand storage was not prepared");
+    auto *result=static_cast<std::byte *>(base)+binding.byteOffset;
+    require(reinterpret_cast<std::uintptr_t>(result)%alignof(T)==0,"Immutable lookup native pointer is misaligned");
+    return reinterpret_cast<T *>(result);
+}
+const std::int32_t *ImmutableLookupStage::liveCount() const
+{
+    if(!params_.rows.liveRows) return nullptr;
+    const auto &value=params_.rows.liveRows->value;
+    if(auto *arena=std::get_if<Qwen4ExpIntBinding>(&value)) return pointer<const std::int32_t>(*arena);
+    return std::get<Qwen4ExpNativeIntInput>(value).data;
+}
+bool ImmutableLookupStage::execute(IDeviceContext *context)
+{
+    require(context && context->deviceId()==device(),"Immutable lookup requires the exact participant execution context");
+    if (device().is_cpu()) prepared_->seal();
+    prepared_->validate();
+    if(auto *cpu=std::get_if<CPUStorage>(&params_.storage))
+    {
+        const int rows=liveCount()?*liveCount():params_.rows.capacity;
+        require(rows>=0 && rows<=params_.rows.capacity,"Immutable lookup live rows exceed admitted capacity");
+        const auto count=static_cast<std::size_t>(rows)*qwen4exp::kNgramHeads;
+        auto *native=pointer<std::byte>(cpu->nativeRows);
+        std::optional<HostImmutableRowGatherObservation> observation;
+        try
+        {
+            observation=cpu->table->gather({pointer<const std::int64_t>(params_.ids),count},{native,count*params_.rowBytes});
+            qwen4exp::decodeCPUImmutableLookupRows(params_.format,params_.rowElements,params_.rowBytes,
+                native,count,pointer<float>(params_.output));
+        }
+        catch(...)
+        {
+            recordCPUImmutableLookup(cpu->table->mode(),device(),0,0,RetainedStorageCPUOutcome::Failed);
+            throw;
+        }
+        recordCPUImmutableLookup(cpu->table->mode(),device(),count,count*params_.rowBytes,
+            RetainedStorageCPUOutcome::Completed,observation);
+        return true;
+    }
+    const auto execution=gpuExecution();
+    if(operation_!=Operation::Consume)execution.requirePreparedInput(params_.ids.tensor);
+    if(operation_!=Operation::Publish)execution.requirePreparedOutput(params_.output.tensor);
+    if(operation_!=Operation::Consume && params_.rows.liveRows)
+        if(auto *arena=std::get_if<Qwen4ExpIntBinding>(&params_.rows.liveRows->value))
+            execution.requirePreparedInput(arena->tensor);
+    if (auto *resident=std::get_if<ResidentGPUStorage>(&params_.storage))
+    {
+        resident->control.requireFor(device());
+        require(resident_read_.has_value(),"Resident lookup has no capture-stream upload acquire");
+        TransferEngine::instance().requireImmutableNativeDeviceInput(*resident_read_,device(),gpuStream());
+        const auto count=static_cast<std::size_t>(params_.rows.capacity)*qwen4exp::kNgramHeads;
+        resident_kernels_->gather({{params_.rows.capacity,liveCount()},pointer<const std::int64_t>(params_.ids),count,
+            pointer<float>(params_.output),count*params_.rowElements,resident->control.healthy(),resident->control.error()},gpuStream());
+        return true;
+    }
+    const auto &gpu=std::get<GPUStorage>(params_.storage);
+    execution.requirePreparedInput(gpu.state.tensor);
+    if(operation_!=Operation::Publish)execution.requirePreparedOutput(gpu.nativeRows.tensor);
+    require(pointer<qwen4exp::ImmutableLookupDeviceState>(gpu.state)==gpu.boundary->state(),
+        "Immutable lookup protocol arena disagrees with the retained boundary");
+    const auto control=gpu.boundary->generationControl();
+    if(operation_!=Operation::Consume)gpu.boundary->kernels().publish({{params_.rows.capacity,liveCount()},pointer<const std::int64_t>(params_.ids),
+        gpu.boundary->generation(),gpu.boundary->state(),gpu.boundary->channel()},gpuStream());
+    if(operation_!=Operation::Publish)gpu.boundary->kernels().consume({gpu.boundary->state(),gpu.boundary->channel(),pointer<std::byte>(gpu.nativeRows),
+        pointer<float>(params_.output),control.healthy,control.error},gpuStream());
+    return true;
+}
+std::size_t ImmutableLookupStage::estimatedFlops() const
+{
+    return operation_==Operation::Publish?0:static_cast<std::size_t>(params_.rows.capacity)*qwen4exp::kNgramHeads*params_.rowElements*2;
+}
+std::size_t ImmutableLookupStage::estimatedMemoryBytes() const
+{
+    const auto count=static_cast<std::size_t>(params_.rows.capacity)*qwen4exp::kNgramHeads;
+    if(operation_==Operation::Publish)return count*sizeof(std::int64_t)+sizeof(qwen4exp::ImmutableLookupDeviceState);
+    if(operation_==Operation::Consume)return count*(params_.rowBytes+params_.rowElements*sizeof(float));
+    return count*(sizeof(std::int64_t)+params_.rowBytes+params_.rowElements*sizeof(float));
+}
+bool ImmutableLookupStage::supportsBackend(ComputeBackendType backend) const
+{
+    return (device().is_cpu() && backend==ComputeBackendType::CPU) ||
+        (device().is_cuda() && backend==ComputeBackendType::GPU_CUDA) ||
+        (device().is_rocm() && backend==ComputeBackendType::GPU_ROCM);
+}
+StageBufferContract ImmutableLookupStage::bufferContract() const
+{
+    auto contract=StageBufferContract::build();
+    if(operation_!=Operation::Consume)contract.addInput(params_.ids.buffer,"INT32");
+    if(operation_!=Operation::Publish){contract.addOutput(params_.output.buffer,"FP32");
+        if(const auto scratch=nativeRows())contract.addOutput(scratch->buffer,"INT32");}
+    if(operation_!=Operation::Consume && params_.rows.liveRows)
+        if(auto *arena=std::get_if<Qwen4ExpIntBinding>(&params_.rows.liveRows->value))
+            contract.addInput(arena->buffer,"INT32");
+    if(auto *gpu=std::get_if<GPUStorage>(&params_.storage)) contract.addInOut(gpu->state.buffer,"INT32");
+    return contract;
+}
+StageDumpInfo ImmutableLookupStage::buildDumpInfoImpl() const
+{
+    StageDumpInfo dump;
+    if(operation_==Operation::Publish){dump.addScalarInt("publish_only",1);return dump;}
+    const auto *base=static_cast<const std::byte *>(params_.output.tensor->raw_data());
+    const auto cols=static_cast<std::size_t>(qwen4exp::kNgramHeads)*params_.rowElements;
+    dump.outputs.push_back({"gathered_rows",base?base+params_.output.byteOffset:nullptr,
+        static_cast<std::size_t>(params_.rows.capacity),cols,"FP32",sizeof(float),
+        params_.rows.capacity*cols*sizeof(float),params_.output.tensor,{},params_.output.byteOffset});
+    dump.addScalarInt("native_row_bytes",params_.rowBytes);
+    return dump;
+}
+
+std::uint64_t ImmutableLookupStage::graphCaptureVariantSignature() const
+{
+    prepared_->validateIfSealed();
+    std::uint64_t value=1469598103934665603ULL;
+    const auto mix=[&](std::uint64_t word) { value^=word; value*=1099511628211ULL; };
+    const auto binding=[&](const auto &view) {
+        mix(reinterpret_cast<std::uintptr_t>(view.tensor)); mix(static_cast<std::uint64_t>(view.buffer));
+        mix(view.byteOffset);
+    };
+    mix(static_cast<std::uint64_t>(operation_)); mix(params_.storage.index()); mix(static_cast<std::uint64_t>(device().type)); mix(device().ordinal);
+    mix(static_cast<std::uint64_t>(params_.format)); mix(params_.rowElements); mix(params_.rowBytes); mix(params_.rows.capacity);
+    binding(params_.ids); binding(params_.output);
+    if (const auto scratch=nativeRows()) binding(*scratch);
+    if (params_.rows.liveRows)
+    {
+        if (auto *arena=std::get_if<Qwen4ExpIntBinding>(&params_.rows.liveRows->value)) binding(*arena);
+        else {
+            const auto &native=std::get<Qwen4ExpNativeIntInput>(params_.rows.liveRows->value);
+            mix(reinterpret_cast<std::uintptr_t>(native.data)); mix(native.capacity);
+        }
+    }
+    if (auto *cpu=std::get_if<CPUStorage>(&params_.storage)) {
+        mix(reinterpret_cast<std::uintptr_t>(cpu->table.get()));mix(static_cast<std::uint64_t>(cpu->table->mode()));
+    }
+    else if (auto *gpu=std::get_if<GPUStorage>(&params_.storage)) {
+        mix(gpu->boundary->captureIdentity()); binding(gpu->state);
+    }
+    else if (const auto *binding = std::get_if<ResidentGPUStorage>(&params_.storage))
+    {
+        const auto &resident = *binding;
+        resident.control.requireFor(device());
+        const auto view = resident.table->view();
+        require(view == resident_kernels_->table(), "Resident lookup source identity changed after binding");
+        mix(reinterpret_cast<std::uintptr_t>(resident.table.get()));
+        mix(reinterpret_cast<std::uintptr_t>(view.nativeData()));
+        mix(view.rowCount());
+        mix(view.nativeBytes());
+        mix(view.storageGeneration());
+        mix(resident.control.captureIdentity());
+    }
+    return value ? value : 1;
+}
+} // namespace llaminar2

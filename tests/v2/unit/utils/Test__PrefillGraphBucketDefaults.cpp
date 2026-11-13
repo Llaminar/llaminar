@@ -1,6 +1,6 @@
 /**
  * @file Test__PrefillGraphBucketDefaults.cpp
- * @brief Host-only regressions for NativeVNNI row and MoE route planning.
+ * @brief Host-only regressions for NativeQuantised row and MoE route planning.
  *
  * These tests intentionally perform no GPU work. They pin the shared planning
  * contract used before CUDA or ROCm workspace allocation so every positive M
@@ -11,8 +11,8 @@
  */
 
 #include "utils/PrefillGraphBucketDefaults.h"
-#include "../../performance/kernels/native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
-#include "../../utils/NativeVNNIEquivalenceInventory.h"
+#include "../../performance/kernels/native_quantised_dispatch/NativeQuantisedMoERoutingProfiles.h"
+#include "../../utils/NativeQuantisedEquivalenceInventory.h"
 
 #include <gtest/gtest.h>
 
@@ -31,7 +31,7 @@ namespace llaminar2
                       (std::vector<int>{64, 128, 256, 384, 448, 512}));
             EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 512);
             EXPECT_EQ(supportedPrefillGraphBucketSizes().back(), 4096);
-            EXPECT_EQ(defaultNativeVNNIDispatchTrainingRows().back(), 4096);
+            EXPECT_EQ(defaultNativeQuantisedDispatchTrainingRows().back(), 4096);
         }
 
         /** @test Explicit caps preserve larger, smaller and non-grid shapes. */
@@ -60,9 +60,9 @@ namespace llaminar2
 
         TEST(Test__PrefillGraphBucketDefaults, RejectsInvalidGeometry)
         {
-            EXPECT_EQ(nativeVNNIBatchInvariantTileRows(0, 4096, 4096), 0);
-            EXPECT_EQ(nativeVNNIBatchInvariantTileRows(1, 0, 4096), 0);
-            EXPECT_EQ(nativeVNNIBatchInvariantTileRows(1, 4096, -1), 0);
+            EXPECT_EQ(nativeQuantisedBatchInvariantTileRows(0, 4096, 4096), 0);
+            EXPECT_EQ(nativeQuantisedBatchInvariantTileRows(1, 0, 4096), 0);
+            EXPECT_EQ(nativeQuantisedBatchInvariantTileRows(1, 4096, -1), 0);
         }
 
         TEST(Test__PrefillGraphBucketDefaults, CoversDecodeAndEveryGroupedM)
@@ -70,13 +70,13 @@ namespace llaminar2
             constexpr int n = 4096;
             constexpr int k = 4096;
 
-            EXPECT_EQ(nativeVNNIBatchInvariantTileRows(1, n, k), 1);
+            EXPECT_EQ(nativeQuantisedBatchInvariantTileRows(1, n, k), 1);
             for (int m = 2; m <= 16384; ++m)
             {
-                const int rows = nativeVNNIBatchInvariantTileRows(m, n, k);
+                const int rows = nativeQuantisedBatchInvariantTileRows(m, n, k);
                 EXPECT_GE(rows, 2) << "M=" << m;
                 EXPECT_LE(rows, m) << "M=" << m;
-                EXPECT_LE(rows, kDefaultNativeVNNIBatchInvariantTileRows)
+                EXPECT_LE(rows, kDefaultNativeQuantisedBatchInvariantTileRows)
                     << "M=" << m;
             }
         }
@@ -86,9 +86,9 @@ namespace llaminar2
             constexpr int m = 64;
             constexpr int n = 4096;
             constexpr int k = 4096;
-            const int rows = nativeVNNIBatchInvariantTileRows(m, n, k);
+            const int rows = nativeQuantisedBatchInvariantTileRows(m, n, k);
 
-            EXPECT_GT(rows, kDefaultNativeVNNIVerifierRowCapacity);
+            EXPECT_GT(rows, kDefaultNativeQuantisedVerifierRowCapacity);
             EXPECT_EQ(rows, m);
         }
 
@@ -99,11 +99,11 @@ namespace llaminar2
             constexpr int k = 5120;
 
             const int verifier_rows =
-                nativeVNNIPersistentVerifierWorkspaceRows(595, n, k);
+                nativeQuantisedPersistentVerifierWorkspaceRows(595, n, k);
             const int direct_prompt_rows =
-                nativeVNNIBatchInvariantTileRows(595, n, k);
+                nativeQuantisedBatchInvariantTileRows(595, n, k);
 
-            EXPECT_EQ(verifier_rows, kDefaultNativeVNNIVerifierRowCapacity);
+            EXPECT_EQ(verifier_rows, kDefaultNativeQuantisedVerifierRowCapacity);
             EXPECT_GT(direct_prompt_rows, verifier_rows);
         }
 
@@ -114,10 +114,10 @@ namespace llaminar2
             constexpr int k = 5120;
 
             const int rows =
-                nativeVNNIPersistentVerifierWorkspaceRows(4096, n, k);
+                nativeQuantisedPersistentVerifierWorkspaceRows(4096, n, k);
 
             EXPECT_GE(rows, 2);
-            EXPECT_LE(rows, kDefaultNativeVNNIVerifierRowCapacity);
+            EXPECT_LE(rows, kDefaultNativeQuantisedVerifierRowCapacity);
         }
 
         TEST(Test__PrefillGraphBucketDefaults, BoundsWideProjectionScratch)
@@ -125,7 +125,7 @@ namespace llaminar2
             constexpr int m = 4096;
             constexpr int n = 151936;
             constexpr int k = 8192;
-            const int rows = nativeVNNIBatchInvariantTileRows(m, n, k);
+            const int rows = nativeQuantisedBatchInvariantTileRows(m, n, k);
 
             // The wide vocabulary projection cannot consume the ordinary
             // 128-row tile, but M>1 must still enter a grouped launch.
@@ -135,27 +135,27 @@ namespace llaminar2
         TEST(Test__PrefillGraphBucketDefaults,
              ScratchlessGroupedRowsDoNotInheritKparBudget)
         {
-            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(0), 0);
-            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(1), 1);
-            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(4), 4);
+            EXPECT_EQ(nativeQuantisedScratchlessBatchInvariantTileRows(0), 0);
+            EXPECT_EQ(nativeQuantisedScratchlessBatchInvariantTileRows(1), 1);
+            EXPECT_EQ(nativeQuantisedScratchlessBatchInvariantTileRows(4), 4);
             EXPECT_EQ(
-                nativeVNNIScratchlessBatchInvariantTileRows(
-                    kDefaultNativeVNNIBatchInvariantTileRows + 1),
-                kDefaultNativeVNNIBatchInvariantTileRows);
+                nativeQuantisedScratchlessBatchInvariantTileRows(
+                    kDefaultNativeQuantisedBatchInvariantTileRows + 1),
+                kDefaultNativeQuantisedBatchInvariantTileRows);
 
             // This vocabulary geometry cannot retain all four rows when KPAR
             // scratch is required. A direct grouped verifier has no such arena.
             constexpr int n = 248320;
             constexpr int k = 5120;
-            EXPECT_LT(nativeVNNIBatchInvariantTileRows(4, n, k), 4);
-            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(4), 4);
+            EXPECT_LT(nativeQuantisedBatchInvariantTileRows(4, n, k), 4);
+            EXPECT_EQ(nativeQuantisedScratchlessBatchInvariantTileRows(4), 4);
         }
 
         TEST(Test__PrefillGraphBucketDefaults, IsTotalAtPositiveIntExtremes)
         {
             constexpr int maximum = std::numeric_limits<int>::max();
             const int rows =
-                nativeVNNIBatchInvariantTileRows(maximum, maximum, maximum);
+                nativeQuantisedBatchInvariantTileRows(maximum, maximum, maximum);
 
             EXPECT_EQ(rows, 2);
         }
@@ -188,14 +188,14 @@ namespace llaminar2
                     for (int k : geometry_values)
                     {
                         const int rows =
-                            nativeVNNIBatchInvariantTileRows(m, n, k);
+                            nativeQuantisedBatchInvariantTileRows(m, n, k);
                         EXPECT_GE(rows, 1)
                             << "M=" << m << " N=" << n << " K=" << k;
                         EXPECT_LE(rows, m)
                             << "M=" << m << " N=" << n << " K=" << k;
                         EXPECT_LE(
                             rows,
-                            kDefaultNativeVNNIBatchInvariantTileRows)
+                            kDefaultNativeQuantisedBatchInvariantTileRows)
                             << "M=" << m << " N=" << n << " K=" << k;
                         if (m > 1)
                         {
@@ -216,7 +216,7 @@ namespace llaminar2
              EquivalenceInventoryExhaustsTileRowsAndBucketBoundaries)
         {
             const auto cases =
-                test::nativeVNNIPrefillBucketEquivalenceCases();
+                test::nativeQuantisedPrefillBucketEquivalenceCases();
             ASSERT_FALSE(cases.empty());
 
             int previous_active_rows = 0;
@@ -232,7 +232,7 @@ namespace llaminar2
             }
 
             for (int m =
-                     kDefaultNativeVNNIVerifierRowCapacity + 1;
+                     kDefaultNativeQuantisedVerifierRowCapacity + 1;
                  m <= 256;
                  ++m)
             {
@@ -275,7 +275,7 @@ namespace llaminar2
 
         TEST(Test__PrefillGraphBucketDefaults, TrainingRowsAreOrderedAndDisjoint)
         {
-            const auto rows = defaultNativeVNNIDispatchTrainingRows();
+            const auto rows = defaultNativeQuantisedDispatchTrainingRows();
             ASSERT_FALSE(rows.empty());
             EXPECT_TRUE(std::is_sorted(rows.begin(), rows.end()));
             EXPECT_EQ(std::adjacent_find(rows.begin(), rows.end()), rows.end());
@@ -286,9 +286,9 @@ namespace llaminar2
         TEST(Test__PrefillGraphBucketDefaults,
              MoERoutingProfilesRemainUniqueAndDistributionDistinct)
         {
-            using test::native_vnni_dispatch::MoERoutingProfile;
-            using test::native_vnni_dispatch::makeMoERoutingIndices;
-            using test::native_vnni_dispatch::summarizeMoERoutingProfile;
+            using test::native_quantised_dispatch::MoERoutingProfile;
+            using test::native_quantised_dispatch::makeMoERoutingIndices;
+            using test::native_quantised_dispatch::summarizeMoERoutingProfile;
 
             constexpr int rows = 512;
             constexpr int top_k = 8;
@@ -337,9 +337,9 @@ namespace llaminar2
         TEST(Test__PrefillGraphBucketDefaults,
              MoERoutingProfileNamesRejectUnknownCorpusIdentity)
         {
-            using test::native_vnni_dispatch::MoERoutingProfile;
-            using test::native_vnni_dispatch::moeRoutingProfileName;
-            using test::native_vnni_dispatch::parseMoERoutingProfile;
+            using test::native_quantised_dispatch::MoERoutingProfile;
+            using test::native_quantised_dispatch::moeRoutingProfileName;
+            using test::native_quantised_dispatch::parseMoERoutingProfile;
 
             EXPECT_EQ(
                 parseMoERoutingProfile("uniform"),

@@ -76,6 +76,118 @@ namespace
     };
 }
 
+/** @brief State format names are exact and do not introduce implicit mode aliases. */
+TEST(Test__DeterministicMode, GDNStateLayoutNamesAreClosed)
+{
+    for (const auto layout : {GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+                              GDNRecurrenceStateLayout::ValueMajorKeyContiguous})
+        EXPECT_EQ(parseGDNRecurrenceStateLayout(gdnRecurrenceStateLayoutName(layout)), layout);
+    for (const auto invalid : {"", "auto", "native", "key_major", "value_major",
+                              "value_major_key_contiguous ", "KEY_MAJOR_VALUE_CONTIGUOUS"})
+        EXPECT_THROW((void)parseGDNRecurrenceStateLayout(invalid), std::invalid_argument);
+}
+
+/** @brief Every device ordinal consumes only its own backend's immutable policy. */
+TEST(Test__DeterministicMode, GDNStateLayoutBackendPoliciesAreIndependent)
+{
+    using Layout = GDNRecurrenceStateLayout;
+    for (const auto cuda_layout : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+        for (const auto rocm_layout : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+            for (int ordinal = 0; ordinal != 8; ++ordinal)
+            {
+                EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId::cuda(ordinal), cuda_layout, rocm_layout), cuda_layout);
+                EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId::rocm(ordinal), cuda_layout, rocm_layout), rocm_layout);
+                EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId(DeviceType::CPU, ordinal), cuda_layout, rocm_layout),
+                          Layout::KeyMajorValueContiguous);
+            }
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId::invalid(),
+        Layout::KeyMajorValueContiguous, Layout::KeyMajorValueContiguous), std::invalid_argument);
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId(static_cast<DeviceType>(255), 0),
+        Layout::KeyMajorValueContiguous, Layout::KeyMajorValueContiguous), std::invalid_argument);
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId::cpu(),
+        static_cast<Layout>(255), Layout::KeyMajorValueContiguous), std::invalid_argument);
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId::rocm(0),
+        Layout::KeyMajorValueContiguous, static_cast<Layout>(255)), std::invalid_argument);
+}
+
+/** @brief Reload restores defaults and cannot mutate a previously copied bank policy. */
+TEST(Test__DeterministicMode, GDNStateLayoutReloadRetainsOnlyExplicitOverrides)
+{
+    using Layout = GDNRecurrenceStateLayout;
+    ScopedEnv defaults({{"LLAMINAR_CUDA_GDN_STATE_LAYOUT", nullptr},
+                        {"LLAMINAR_ROCM_GDN_STATE_LAYOUT", nullptr}});
+    ExecutionConfig policy;
+    EXPECT_EQ(kDefaultCUDAGDNStateLayout, Layout::KeyMajorValueContiguous);
+    EXPECT_EQ(kDefaultROCmGDNStateLayout, Layout::ValueMajorKeyContiguous);
+    EXPECT_EQ(policy.cuda_gdn_state_layout, kDefaultCUDAGDNStateLayout);
+    EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+    const auto original = gdnRecurrenceStateLayoutForDevice(DeviceId::rocm(3),
+        policy.cuda_gdn_state_layout, policy.rocm_gdn_state_layout);
+    for (const auto selected : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+    {
+        // KeyMajor now differs from ROCm's default. Both explicit programs must
+        // remain selectable, and neither may change the copied bank policy.
+        ScopedEnv rocm({{"LLAMINAR_ROCM_GDN_STATE_LAYOUT", gdnRecurrenceStateLayoutName(selected).data()}});
+        policy.reload();
+        EXPECT_EQ(policy.cuda_gdn_state_layout, kDefaultCUDAGDNStateLayout);
+        EXPECT_EQ(policy.rocm_gdn_state_layout, selected);
+        EXPECT_EQ(original, Layout::ValueMajorKeyContiguous);
+    }
+    policy.reload();
+    EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+    for (const auto selected : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+    {
+        ScopedEnv cuda({{"LLAMINAR_CUDA_GDN_STATE_LAYOUT", gdnRecurrenceStateLayoutName(selected).data()}});
+        policy.reload();
+        EXPECT_EQ(policy.cuda_gdn_state_layout, selected);
+        EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+        EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId::cpu(),
+            policy.cuda_gdn_state_layout, policy.rocm_gdn_state_layout), Layout::KeyMajorValueContiguous);
+    }
+    policy.reload();
+    EXPECT_EQ(policy.cuda_gdn_state_layout, kDefaultCUDAGDNStateLayout);
+    EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+}
+
+/** @brief An explicit malformed environment setting fails cold admission. */
+TEST(Test__DeterministicMode, GDNStateLayoutMalformedEnvironmentIsRejected)
+{
+    ScopedEnv defaults({{"LLAMINAR_CUDA_GDN_STATE_LAYOUT", nullptr},
+                        {"LLAMINAR_ROCM_GDN_STATE_LAYOUT", nullptr}});
+    for (const auto name : {"LLAMINAR_CUDA_GDN_STATE_LAYOUT", "LLAMINAR_ROCM_GDN_STATE_LAYOUT"})
+    {
+        ASSERT_EQ(setenv(name, "auto", 1), 0);
+        EXPECT_THROW((void)ExecutionConfig{}, std::invalid_argument);
+        EXPECT_EQ(unsetenv(name), 0);
+    }
+}
+
+/** @brief HC-up correction is explicit, strict, and independent of other arithmetic. */
+TEST(Test__DeterministicMode, FlashNextHCUpActivationPolicyIsExplicit)
+{
+    ScopedEnv defaults({{"LLAMINAR_QFN_HC_UP_ACTIVATION", nullptr}});
+    EXPECT_EQ(GemmConfig{}.qfn_hc_up_activation, kDefaultQwen4ExpHCUpActivation);
+    EXPECT_EQ(GemmConfig{}.qfn_hc_up_activation, parseQuantizedActivationOperandPrecision("two_term_q8"));
+    const auto gdn = debugEnv().gemm.gdn_projection_arithmetic;
+    const auto router = debugEnv().gemm.moe_router_arithmetic;
+    for (const auto policy : {QuantizedActivationOperandPrecision::SingleQ8,
+                              QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        const auto name = quantizedActivationOperandPrecisionName(policy);
+        EXPECT_EQ(parseQuantizedActivationOperandPrecision(name), policy);
+        ScopedEnv selected({{"LLAMINAR_QFN_HC_UP_ACTIVATION", name.data()}});
+        EXPECT_EQ(GemmConfig{}.qfn_hc_up_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, gdn);
+        EXPECT_EQ(debugEnv().gemm.moe_router_arithmetic, router);
+    }
+    EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, kDefaultQwen4ExpHCUpActivation);
+    for (const auto invalid : {"", "auto", "native", "fp16", "q8", "two_q8", "TWO_TERM_Q8", "two_term_q8 "})
+        EXPECT_THROW(parseQuantizedActivationOperandPrecision(invalid), std::invalid_argument);
+    EXPECT_THROW(quantizedActivationOperandPrecisionName(
+        static_cast<QuantizedActivationOperandPrecision>(255)), std::invalid_argument);
+}
+
 /** @brief The qualified alpha/beta default preserves independent router and wide-projection policy. */
 TEST(Test__DeterministicMode, ProjectionArithmeticDefaultsAndExplicitOverrides)
 {
@@ -86,13 +198,13 @@ TEST(Test__DeterministicMode, ProjectionArithmeticDefaultsAndExplicitOverrides)
     EXPECT_EQ(kDefaultGDNProjectionArithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
     EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
     EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
-    EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::Native);
+    EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::ModelDefault);
     EXPECT_EQ(GemmConfig{}.cuda_moe_router_prefill, CUDARouterPrefillArithmetic::FP32);
     EXPECT_TRUE(GemmConfig{}.cuda_moe_router_q8);
     {
         ScopedEnv alpha_beta({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "fp16_alpha_beta"}});
         EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16AlphaBeta);
-        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::Native);
+        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::ModelDefault);
     }
     {
         ScopedEnv moe_alpha_beta({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "fp16_moe_alpha_beta"}});
@@ -103,7 +215,7 @@ TEST(Test__DeterministicMode, ProjectionArithmeticDefaultsAndExplicitOverrides)
         ScopedEnv native({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "native"}});
         EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::Native);
         EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::Native);
-        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::Native);
+        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::ModelDefault);
     }
     EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
     constexpr cuda::RouterQ8PrefillHardware device{0,82,16};
@@ -307,7 +419,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
     };
     constexpr std::array<ExactRegime, 5> exact_regimes{{
         {13, 4, 768, false},
-        {13, llaminar2::kNativeVnniIQ4XSSourceScaleCodebook, 768, false},
+        {13, llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook, 768, false},
         {13, 8, 600, false},
         {11, 8, 0, true},
         {13, 11, 768, false},
@@ -319,6 +431,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
         for (const int rows : exact_rows)
         {
             const auto policy = selectGroupedImmaLaunchPolicy(
+                llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
                 regime.gate_up_codebook,
                 regime.down_codebook,
                 rows,
@@ -346,6 +459,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
     for (const int rows : {1, 17, 769, 4096, 1 << 20})
     {
         const auto generic = selectGroupedImmaLaunchPolicy(
+            llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
             /*gateup_codebook=*/-1,
             /*down_codebook=*/-1,
             rows,
@@ -449,4 +563,136 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
     EXPECT_TRUE(debugEnv().rocm.concurrent_prefill);
     EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
     EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);
+}
+
+/** @test GDN-output correction is explicit and does not change other projection policies. */
+TEST(Test__DeterministicMode, FlashNextGDNOutputActivationPolicyIsExplicit)
+{
+    ScopedEnv defaults({{"LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION", nullptr},
+                        {"LLAMINAR_QFN_HC_UP_ACTIVATION", "single_q8"}});
+    const auto gdn = debugEnv().gemm.gdn_projection_arithmetic;
+    const auto router = debugEnv().gemm.moe_router_arithmetic;
+    EXPECT_EQ(GemmConfig{}.qfn_gdn_output_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    for (const auto policy : {QuantizedActivationOperandPrecision::SingleQ8,
+                              QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        const auto name = quantizedActivationOperandPrecisionName(policy);
+        ScopedEnv selected({{"LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION", name.data()}});
+        EXPECT_EQ(GemmConfig{}.qfn_gdn_output_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_gdn_output_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+        EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, gdn);
+        EXPECT_EQ(debugEnv().gemm.moe_router_arithmetic, router);
+    }
+    for (const auto invalid : {"", "auto", "native", "fp16", "q8", "two_q8", "TWO_TERM_Q8"})
+    {
+        // Avoid a partially reloaded singleton on failure: instantiate the same
+        // strict parsed setup record independently, then restore the environment.
+        const char *previous = std::getenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION");
+        const std::string saved = previous ? previous : "";
+        const bool had_previous = previous != nullptr;
+        setenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION", invalid, 1);
+        EXPECT_THROW(GemmConfig{}, std::invalid_argument);
+        if (had_previous) setenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION", saved.c_str(), 1);
+        else unsetenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION");
+    }
+}
+
+/** @test FA-output correction is explicit and does not change other projection policies. */
+TEST(Test__DeterministicMode, FlashNextFAOutputActivationPolicyIsExplicit)
+{
+    ScopedEnv defaults({{"LLAMINAR_QFN_FA_OUTPUT_ACTIVATION", nullptr},
+                        {"LLAMINAR_QFN_HC_UP_ACTIVATION", "single_q8"}});
+    const auto gdn = debugEnv().gemm.gdn_projection_arithmetic;
+    const auto router = debugEnv().gemm.moe_router_arithmetic;
+    EXPECT_EQ(GemmConfig{}.qfn_fa_output_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    for (const auto policy : {QuantizedActivationOperandPrecision::SingleQ8,
+                              QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        const auto name = quantizedActivationOperandPrecisionName(policy);
+        ScopedEnv selected({{"LLAMINAR_QFN_FA_OUTPUT_ACTIVATION", name.data()}});
+        EXPECT_EQ(GemmConfig{}.qfn_fa_output_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_fa_output_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+        EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, gdn);
+        EXPECT_EQ(debugEnv().gemm.moe_router_arithmetic, router);
+    }
+    for (const auto invalid : {"", "auto", "native", "fp16", "q8", "two_q8", "TWO_TERM_Q8"})
+    {
+        // Avoid a partially reloaded singleton on failure: instantiate the same
+        // strict parsed setup record independently, then restore the environment.
+        const char *previous = std::getenv("LLAMINAR_QFN_FA_OUTPUT_ACTIVATION");
+        const std::string saved = previous ? previous : "";
+        const bool had_previous = previous != nullptr;
+        setenv("LLAMINAR_QFN_FA_OUTPUT_ACTIVATION", invalid, 1);
+        EXPECT_THROW(GemmConfig{}, std::invalid_argument);
+        if (had_previous) setenv("LLAMINAR_QFN_FA_OUTPUT_ACTIVATION", saved.c_str(), 1);
+        else unsetenv("LLAMINAR_QFN_FA_OUTPUT_ACTIVATION");
+    }
+}
+
+
+/** @test Original-main GDN QKV is an independent strict setup policy, with unchanged default/other arithmetic. */
+TEST(Test__DeterministicMode, FlashNextGDNQKVActivationPolicyIsExplicit)
+{
+    ScopedEnv defaults({{"LLAMINAR_QFN_GDN_QKV_ACTIVATION", nullptr},
+                        {"LLAMINAR_QFN_HC_UP_ACTIVATION", "single_q8"}});
+    const auto gdn = debugEnv().gemm.gdn_projection_arithmetic;
+    const auto router = debugEnv().gemm.moe_router_arithmetic;
+    const auto output = debugEnv().gemm.qfn_gdn_output_activation;
+    const auto fa = debugEnv().gemm.qfn_fa_output_activation;
+    EXPECT_EQ(GemmConfig{}.qfn_gdn_qkv_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    for (const auto policy : {QuantizedActivationOperandPrecision::SingleQ8,
+                              QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        const auto name = quantizedActivationOperandPrecisionName(policy);
+        ScopedEnv selected({{"LLAMINAR_QFN_GDN_QKV_ACTIVATION", name.data()}});
+        EXPECT_EQ(GemmConfig{}.qfn_gdn_qkv_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_gdn_qkv_activation, policy);
+        EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+        EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, gdn);
+        EXPECT_EQ(debugEnv().gemm.moe_router_arithmetic, router);
+        EXPECT_EQ(debugEnv().gemm.qfn_gdn_output_activation, output);
+        EXPECT_EQ(debugEnv().gemm.qfn_fa_output_activation, fa);
+    }
+    for (const auto invalid : {"", "auto", "native", "fp16", "q8", "two_q8", "TWO_TERM_Q8"})
+    {
+        // Avoid a partially reloaded singleton on failure: instantiate the same
+        // strict parsed setup record independently, then restore the environment.
+        const char *previous = std::getenv("LLAMINAR_QFN_GDN_QKV_ACTIVATION");
+        const std::string saved = previous ? previous : "";
+        const bool had_previous = previous != nullptr;
+        setenv("LLAMINAR_QFN_GDN_QKV_ACTIVATION", invalid, 1);
+        EXPECT_THROW(GemmConfig{}, std::invalid_argument);
+        if (had_previous) setenv("LLAMINAR_QFN_GDN_QKV_ACTIVATION", saved.c_str(), 1);
+        else unsetenv("LLAMINAR_QFN_GDN_QKV_ACTIVATION");
+    }
+}
+
+/** @brief Omitted QFN routing resolves once to half; explicit diagnostics and other schemas retain their policies. */
+TEST(Test__DeterministicMode, QFNRouterDefaultAndExplicitOverrides)
+{
+    ScopedEnv defaults({{"LLAMINAR_MOE_ROUTER_ARITHMETIC", nullptr}});
+    const auto omitted = GemmConfig{}.moe_router_arithmetic;
+    ASSERT_EQ(omitted, MoERouterArithmetic::ModelDefault);
+    EXPECT_EQ(routerQ8Basis(omitted), RouterQ8Basis::Original);
+    EXPECT_EQ(routerQ8Basis(MoERouterArithmetic::Native), RouterQ8Basis::Original);
+    EXPECT_EQ(routerQ8Basis(MoERouterArithmetic::FP16), RouterQ8Basis::Original);
+    EXPECT_EQ(resolveMoERouterArithmetic(omitted, "qwen4exp"), MoERouterArithmetic::FP16);
+    for (const auto architecture : {"qwen35", "qwen35moe", "llama", "qwen4", "Qwen4Exp", ""})
+    {
+        EXPECT_EQ(resolveMoERouterArithmetic(omitted, architecture), MoERouterArithmetic::Native);
+    }
+    for (const auto value : {"native", "fp16", "native_hadamard32"})
+    {
+        ScopedEnv explicit_choice({{"LLAMINAR_MOE_ROUTER_ARITHMETIC", value}});
+        const auto requested = parseMoERouterArithmetic(value);
+        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, requested);
+        EXPECT_EQ(resolveMoERouterArithmetic(requested, "qwen4exp"), requested);
+        EXPECT_EQ(resolveMoERouterArithmetic(requested, "qwen35moe"), requested);
+    }
+    EXPECT_THROW(moeRouterArithmeticName(omitted), std::invalid_argument);
+    EXPECT_THROW(resolveMoERouterArithmetic(static_cast<MoERouterArithmetic>(255), "qwen4exp"),
+                 std::invalid_argument);
+    EXPECT_EQ(kDefaultGDNProjectionArithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
 }

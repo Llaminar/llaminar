@@ -10,6 +10,9 @@
  */
 
 #include "DomainCommunicatorRegistry.h"
+#include "execution/runner/RankInitializationLifecycle.h"
+#include <optional>
+#include <variant>
 #include "../../collective/GlobalTPContext.h"
 #include "../../utils/Logger.h"
 
@@ -23,9 +26,12 @@ namespace llaminar2
     void DomainCommunicatorRegistry::initialize(
         const GlobalPPTopology &topology,
         MPI_Comm world_comm,
-        int world_rank)
+        int world_rank,std::span<const OriginalCPUPipelineProgram> cpu_expert_programs,
+        std::shared_ptr<PhysicalMemoryAuthority> original_memory)
     {
+        if(cpu_owners_) throw std::logic_error("Original CPU pipeline domain registry is setup-only");
         contexts_.clear();
+        if(!cpu_expert_programs.empty()) cpu_owners_=std::make_shared<OriginalCPUPipelineDomainOwners>();
 
         // Collect global TP stages sorted by ascending stage_id so every rank
         // calls MPI_Comm_split in the same order (required for correctness).
@@ -61,18 +67,42 @@ namespace llaminar2
                 }
             }
 
-            // GlobalTPContext::createWithSplit calls MPI_Comm_split internally.
-            // For non-participants (color==MPI_UNDEFINED) it returns nullptr after
-            // the split completes, so the collective is still satisfied.
-            auto ctx = GlobalTPContext::createWithSplit(
-                world_comm,
-                stage->stage_id, // domain_id = stage_id for unambiguous keying
-                color,
-                key,
-                color == MPI_UNDEFINED ? std::nullopt : std::optional<GlobalDeviceAddress>(
-                    stage->per_rank_devices.empty() ? stage->per_rank_device
-                                                   : stage->per_rank_devices.at(key)),
-                "", stage->backend);
+            std::shared_ptr<GlobalTPContext> ctx;
+            const auto cpu=std::find_if(cpu_expert_programs.begin(),cpu_expert_programs.end(),
+                [&](const auto& program){return program.stageId()==stage->stage_id;});
+            if(cpu!=cpu_expert_programs.end()) {
+                const auto& program=cpu->nativeProgram();
+                if(program.participants().size()!=stage->participating_ranks.size() ||
+                    cpu->scope().first_layer!=stage->first_layer || cpu->scope().last_layer!=stage->last_layer+1)
+                    throw std::invalid_argument("CPU pipeline context changed its original stage program geometry");
+                for(std::size_t member=0;member<program.participants().size();++member)
+                    if(program.participants()[member].world_rank!=stage->participating_ranks[member] ||
+                        stage->per_rank_devices.size()!=program.participants().size() ||
+                        program.participants()[member].address!=stage->per_rank_devices[member])
+                        throw std::invalid_argument("CPU pipeline context changed its original rank/NUMA program");
+                std::optional<std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse>> use;
+                const auto ready=RankInitializationLifecycle::execute({0,"cpu_pipeline_original_domain_commitment"},[&]{
+                    if(!original_memory || original_memory->worldRank()!=world_rank)
+                        throw std::invalid_argument("CPU pipeline split requires its original rank PMA");
+                    if(color==MPI_UNDEFINED) use.emplace(std::in_place_type<NativeCPUCollectiveProgram::ProcessUse>,
+                        program.admitExcludedParent(original_memory,world_rank));
+                    else use.emplace(std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,
+                        program.admit(original_memory,world_rank));
+                    return true;
+                },[&](auto identity,auto outcome){return MPIRankInitializationConsensus::reach(world_comm,identity,outcome);});
+                if(!ready.succeeded()) throw std::invalid_argument(ready.diagnostic("CPU pipeline original domain"));
+                auto original=GlobalTPContext::createAdmittedCPUExpertDomain(world_comm,program,std::move(*use));
+                if(original) {cpu_owners_->retain(original);ctx=std::move(original);}
+            }
+            else {
+                // The ordinary global stage path remains unchanged. Every
+                // excluded original process still enters this SAME parent split.
+                ctx = GlobalTPContext::createWithSplit(
+                    world_comm,stage->stage_id,color,key,
+                    color == MPI_UNDEFINED ? std::nullopt : std::optional<GlobalDeviceAddress>(
+                        stage->per_rank_devices.empty() ? stage->per_rank_device : stage->per_rank_devices.at(key)),
+                    "",stage->backend);
+            }
 
             if (color != MPI_UNDEFINED)
             {

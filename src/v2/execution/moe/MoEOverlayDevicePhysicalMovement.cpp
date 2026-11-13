@@ -8,6 +8,7 @@
  */
 
 #include "MoEOverlayDevicePhysicalMovement.h"
+#include "MoEOverlayDeviceControllerKernels.h"
 
 #include <algorithm>
 #include <array>
@@ -220,7 +221,7 @@ namespace llaminar2
         MoEOptimizationMovementAxis movementAxis(
             std::uint32_t encoded_axis)
         {
-            switch (static_cast<MoEOverlayDeviceMovementAxis>(encoded_axis))
+            switch (moeOverlayMovementAxis(encoded_axis))
             {
             case MoEOverlayDeviceMovementAxis::TierResidency:
                 return MoEOptimizationMovementAxis::TierResidency;
@@ -256,127 +257,6 @@ namespace llaminar2
                     .destination_participant = participant,
                     .slot_count = count,
                 });
-            }
-            return result;
-        }
-
-        /**
-         * Decompose a balanced directed participant graph into deterministic
-         * Euler circuits.  The command order is destination-canonical, so each
-         * adjacency list deliberately retains ascending command ordinal.
-         */
-        std::vector<MoEOverlayTierMigrationCycle> durableCycles(
-            const std::vector<MoEOverlayTierMigration> &migrations,
-            std::uint32_t participant_count,
-            std::uint32_t num_layers,
-            int first_model_layer)
-        {
-            std::vector<MoEOverlayTierMigrationCycle> result;
-            std::vector<bool> used(migrations.size(), false);
-
-            for (std::uint32_t row = 0u; row < num_layers; ++row)
-            {
-                const int layer = first_model_layer + static_cast<int>(row);
-                std::vector<std::vector<std::size_t>> outgoing(
-                    participant_count);
-                std::vector<std::size_t> incoming_count(participant_count, 0u);
-                for (std::size_t index = 0u; index < migrations.size(); ++index)
-                {
-                    const auto &migration = migrations[index];
-                    if (migration.layer_idx != static_cast<int>(layer))
-                        continue;
-                    const auto source = static_cast<std::size_t>(
-                        migration.source.owner_participant);
-                    const auto destination = static_cast<std::size_t>(
-                        migration.destination.owner_participant);
-                    if (source >= participant_count ||
-                        destination >= participant_count)
-                    {
-                        throw std::invalid_argument(
-                            "device Dynamic movement contains an out-of-range cycle endpoint");
-                    }
-                    outgoing[source].push_back(index);
-                    ++incoming_count[destination];
-                }
-                for (std::size_t participant = 0u;
-                     participant < participant_count;
-                     ++participant)
-                {
-                    if (outgoing[participant].size() !=
-                        incoming_count[participant])
-                    {
-                        throw std::invalid_argument(
-                            "device Dynamic movement is not capacity-preserving within a layer");
-                    }
-                }
-
-                std::vector<std::size_t> cursor(participant_count, 0u);
-                for (std::size_t first = 0u; first < migrations.size(); ++first)
-                {
-                    if (used[first] ||
-                        migrations[first].layer_idx !=
-                            static_cast<int>(layer))
-                    {
-                        continue;
-                    }
-
-                    const int start =
-                        migrations[first].source.owner_participant;
-                    std::vector<int> vertex_stack{start};
-                    std::vector<std::size_t> edge_stack;
-                    std::vector<std::size_t> reverse_circuit;
-                    while (!vertex_stack.empty())
-                    {
-                        const int vertex = vertex_stack.back();
-                        if (vertex < 0 ||
-                            static_cast<std::size_t>(vertex) >=
-                                outgoing.size())
-                        {
-                            throw std::invalid_argument(
-                                "device Dynamic movement cycle lost a participant");
-                        }
-                        auto &next = cursor[static_cast<std::size_t>(vertex)];
-                        auto &edges = outgoing[static_cast<std::size_t>(vertex)];
-                        while (next < edges.size() && used[edges[next]])
-                            ++next;
-                        if (next < edges.size())
-                        {
-                            const std::size_t edge = edges[next++];
-                            used[edge] = true;
-                            edge_stack.push_back(edge);
-                            vertex_stack.push_back(
-                                migrations[edge]
-                                    .destination.owner_participant);
-                            continue;
-                        }
-
-                        vertex_stack.pop_back();
-                        if (!edge_stack.empty())
-                        {
-                            reverse_circuit.push_back(edge_stack.back());
-                            edge_stack.pop_back();
-                        }
-                    }
-                    std::reverse(
-                        reverse_circuit.begin(), reverse_circuit.end());
-                    MoEOverlayTierMigrationCycle cycle{
-                        .layer_idx = static_cast<int>(layer),
-                        .migration_indices = std::move(reverse_circuit),
-                    };
-                    if (!cycle.valid(migrations))
-                    {
-                        throw std::invalid_argument(
-                            "device Dynamic movement could not be decomposed into closed physical cycles");
-                    }
-                    result.push_back(std::move(cycle));
-                }
-            }
-
-            if (std::any_of(used.begin(), used.end(), [](bool value)
-                            { return !value; }))
-            {
-                throw std::invalid_argument(
-                    "device Dynamic movement cycle decomposition did not cover every command");
             }
             return result;
         }
@@ -631,11 +511,50 @@ namespace llaminar2
         if (durablePlacementKind(result.kind) &&
             !result.migrations.empty())
         {
-            result.migration_cycles = durableCycles(
-                result.migrations,
-                result.participant_count,
-                result.num_layers,
-                result.first_model_layer);
+            // Transport authenticated the original IDs; prove each group closes
+            // exactly once below before admitting its physical simple cycle.
+            // Destination sorting may interleave groups but cannot reauthor
+            // them: doing so can increase lane demand beyond admitted bounds.
+            for (std::uint32_t id = 1u; id <= command.header.accepted_cycles; ++id)
+            {
+                std::vector<std::size_t> members;
+                for (std::size_t index = 0u; index < command.entries.size(); ++index)
+                    if (moeOverlayMovementCycle(command.entries[index].flags) == id)
+                        members.push_back(index);
+                if (members.size() < 2u)
+                    throw std::invalid_argument("device authored cycle is missing or incomplete");
+                const auto seed = members.front();
+                MoEOverlayTierMigrationCycle cycle{
+                    .layer_idx = result.migrations[seed].layer_idx,
+                    .migration_indices = {seed}};
+                auto current = seed;
+                for (std::size_t step = 0u; step < members.size(); ++step)
+                {
+                    auto next = command.entries.size();
+                    for (const auto index : members)
+                    {
+                        if (command.entries[index].layer != command.entries[seed].layer)
+                            throw std::invalid_argument("device authored cycle spans source layers");
+                        if (command.entries[index].source_participant ==
+                            command.entries[current].destination_participant)
+                        {
+                            if (next != command.entries.size())
+                                throw std::invalid_argument("device authored cycle repeats a placement target");
+                            next = index;
+                        }
+                    }
+                    if (next == command.entries.size() ||
+                        (next == seed) != (step + 1u == members.size()))
+                        throw std::invalid_argument("device authored cycle does not close exactly once");
+                    if (next != seed)
+                        cycle.migration_indices.push_back(next);
+                    current = next;
+                }
+                if (!cycle.valid(result.migrations))
+                    throw std::invalid_argument(
+                        "device authored cycle differs from its physical placement targets");
+                result.migration_cycles.push_back(std::move(cycle));
+            }
         }
 
         if (!result.valid())

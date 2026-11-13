@@ -37,7 +37,10 @@ namespace llaminar2::testing
     class MockGPUGraphCapture final : public IGPUGraphCapture
     {
     public:
-        explicit MockGPUGraphCapture(void *stream) : stream_(stream) {}
+        /** @brief Optional cold destruction observation proves surrounding owner-field ordering in device-free fixtures. */
+        explicit MockGPUGraphCapture(void *stream,std::function<void()> destroyed={}) : stream_(stream),destroyed_(std::move(destroyed)) {}
+        /** @brief Observe before native-handle-double members or original context/root owners can retire. */
+        ~MockGPUGraphCapture() override {if(destroyed_)destroyed_();}
 
         /** @brief Preserve graph-only fragment construction in controller unit tests. */
         std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment() override
@@ -107,6 +110,7 @@ namespace llaminar2::testing
         int launchCount() const { return launch_count_; }
 
     private:
+        std::function<void()> destroyed_;
         void *stream_ = nullptr;
         bool capturing_ = false;
         bool captured_ = false;
@@ -124,7 +128,7 @@ namespace llaminar2::testing
      * that GPU operations require explicit streams while guaranteeing that a
      * unit test cannot accidentally create a physical device context.
      */
-    class MockWorkerGPUContext final : public IWorkerGPUContext
+    class MockWorkerGPUContext : public IWorkerGPUContext
     {
     public:
         explicit MockWorkerGPUContext(int device_ordinal = 0)
@@ -136,11 +140,19 @@ namespace llaminar2::testing
         std::string deviceName() const override { return "HardwareFreeMockGPU"; }
         bool isInitialized() const override { return true; }
 
-        void submitAndWait(std::function<void()> work) override { work(); }
+        /** @brief Only an active synchronous mock submission owns this test worker. */
+        bool ownsCurrentThread() const noexcept override { return active_worker_==this; }
+        /** @brief Preserve nested worker identity and restore it on success or exception. */
+        void submitAndWait(std::function<void()> work) override {
+            if(before_submit)before_submit();
+            std::lock_guard<std::recursive_mutex> owned(submission_mutex_);
+            struct Scope { const MockWorkerGPUContext* previous; ~Scope(){active_worker_=previous;} } scope{active_worker_};
+            active_worker_=this;work();
+        }
 
         std::future<void> submitAsync(std::function<void()> work) override
         {
-            work();
+            submitAndWait(std::move(work));
             std::promise<void> completed;
             completed.set_value();
             return completed.get_future();
@@ -216,13 +228,15 @@ namespace llaminar2::testing
             return std::make_unique<MockGPUGraphCapture>(defaultStream());
         }
 
+        /** @brief Original worker creates each cold capture; hooks observe only fixture ownership. */
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override
         {
-            if (!stream)
-                return nullptr;
+            if(!stream)return nullptr;
             ++graph_capture_create_count_;
-            return std::make_unique<MockGPUGraphCapture>(stream);
+            if(capture_created)capture_created();
+            return std::make_unique<MockGPUGraphCapture>(stream,capture_destroyed);
         }
+        std::function<void()> capture_created,capture_destroyed,before_submit;
 
         void setGraphCaptureActive(bool active) override
         {
@@ -237,6 +251,8 @@ namespace llaminar2::testing
         int graphCaptureCreateCount() const { return graph_capture_create_count_; }
 
     private:
+        std::recursive_mutex submission_mutex_;
+        inline static thread_local const MockWorkerGPUContext* active_worker_=nullptr;
         int device_ordinal_ = 0;
         int default_stream_token_ = 1;
         int next_stream_token_ = 1;

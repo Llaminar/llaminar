@@ -21,6 +21,8 @@
 #pragma once
 
 #include "../global_pp/GlobalPPTopology.h"
+#include "OriginalCPUPipelineProgram.h"
+#include "OriginalCPUPipelineDomainOwners.h"
 #include "../../collective/IGlobalTPContext.h"
 
 #include <map>
@@ -67,7 +69,12 @@ namespace llaminar2
          */
         void initialize(const GlobalPPTopology &topology,
                         MPI_Comm world_comm,
-                        int world_rank);
+                        int world_rank,
+                        std::span<const OriginalCPUPipelineProgram> cpu_expert_programs = {},
+                        std::shared_ptr<PhysicalMemoryAuthority> original_memory = {});
+
+        /** @return Original admitted CPU owners, retained through graph construction and terminal shutdown. */
+        const std::shared_ptr<OriginalCPUPipelineDomainOwners>& originalCPUOwners() const noexcept {return cpu_owners_;}
 
         // =========================================================================
         // Query
@@ -100,6 +107,7 @@ namespace llaminar2
 
     private:
         std::map<int, std::shared_ptr<IGlobalTPContext>> contexts_;
+        std::shared_ptr<OriginalCPUPipelineDomainOwners> cpu_owners_;
     };
 
 } // namespace llaminar2

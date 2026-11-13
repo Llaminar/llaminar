@@ -12,6 +12,8 @@
  * must not be mistaken for additional expert computation in that comparison.
  * Benchmark geometry admission is shared with CUDA and rejects malformed
  * explicit selectors instead of silently substituting or dropping shapes.
+ * Explicit promoted-source diagnostics share the established transfer helper
+ * and real prepared-engine publication, retaining compact sources as oracle.
  */
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
@@ -29,12 +31,18 @@
 #include "../../../mocks/MockComputeStage.h"
 #include "../../../utils/BenchmarkGeometrySelection.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
-#include "../../../utils/NativeVNNITrainerEvidence.h"
+#include "../../../utils/NativeQuantisedTrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#ifdef HAVE_ROCM
+#include "../../../integration/kernels/moe/NativeQuantisedExpertTransferParityTest.h"
+#include "execution/moe/MoEOverlayParticipantMigration.h"
+#endif
 #include "../../../utils/TestTensorFactory.h"
-#include "../native_vnni_dispatch/NativeVNNIMoEPrefillManifest.h"
-#include "../native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
-#include "../native_vnni_dispatch/NativeVNNIProfilerControl.h"
+#include "../native_quantised_dispatch/NativeQuantisedMoEPrefillManifest.h"
+#include "../native_quantised_dispatch/NativeQuantisedMoERoutingProfiles.h"
+#include "../native_quantised_dispatch/NativeQuantisedProfilerControl.h"
+#include "../native_quantised_dispatch/NativeQuantisedMoEProjectionDiagnostic.h"
+#include "../native_quantised_dispatch/NativeQuantisedGeometryTimingOrder.h"
 
 #ifdef HAVE_ROCM
 #include "backends/rocm/HIPGraphCapture.h"
@@ -42,7 +50,15 @@
 #include <hip/hip_runtime.h>
 #include <rocprofiler-sdk-roctx/roctx.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
-#include "../native_vnni_dispatch/GPUTrainerVerification.h"
+#include "../native_quantised_dispatch/GPUTrainerVerification.h"
+#include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
+#include "execution/moe/MoEProjectionRuntimeBinding.h"
+#include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
+#include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
+#include "loaders/ExpertGemmRegistry.h"
+#include "backends/HardwareInventory.h"
+#include "utils/MPIContext.h"
+#include <omp.h>
 
 extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
     uint8_t codebook_id,
@@ -87,6 +103,8 @@ extern "C" bool rocmMoE_grouped_prefill_query_kernel_resources(
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <cstring>
+#include <exception>
 
 /**
  * @file Perf__ROCmMoEVerifierPrefill.cpp
@@ -871,15 +889,15 @@ namespace
     {
         std::vector<std::unique_ptr<llaminar2::TensorBase>> weights;
         std::vector<llaminar2::test::GpuPreparedGemm> prepared;
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
         int gateup_table_id = -1;
         int down_table_id = -1;
     };
 
     /**
-     * @brief Prepare production-style native-VNNI expert descriptors.
+     * @brief Prepare production-style native-quantised expert descriptors.
      *
      * The returned owner must stay alive because every descriptor points into
      * VRAM owned by the corresponding prepared GEMM handle.
@@ -924,8 +942,8 @@ namespace
                     role + "." + std::to_string(seed),
                 llaminar2::ModelContextId{280000 + static_cast<uint64_t>(seed)}));
 
-            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-            EXPECT_TRUE(tables.prepared.back().kernel->exportNativeVNNIMatrixDesc(desc));
+            llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+            EXPECT_TRUE(tables.prepared.back().kernel->exportNativeQuantisedMatrixDesc(desc));
             EXPECT_EQ(desc.n, rows);
             EXPECT_EQ(desc.k, cols);
             EXPECT_EQ(desc.codebook_id, format.device_execution_codebook_id);
@@ -1031,10 +1049,10 @@ namespace
             : graph_(stream, device_ordinal),
               transaction_(graph_, std::move(operation))
         {
-            if (!stream || !transaction_.begin())
+            if (!stream || graph_.hasExecutable() || graph_.nodeCount() != 0 || !transaction_.begin())
             {
                 throw std::runtime_error(
-                    "ScopedHipPerfGraph failed to begin HIP graph capture");
+                    "ScopedHipPerfGraph requires a fresh empty HIP capture owner");
             }
         }
 
@@ -1052,6 +1070,12 @@ namespace
         bool launch()
         {
             return graph_.launch();
+        }
+
+        /** @brief Inspect the real retained native nodes after capture, outside timing. */
+        bool inspectKernelNodes(std::vector<llaminar2::GPUGraphKernelNodeInfo> &nodes, std::string *error) const
+        {
+            return graph_.inspectKernelNodes(nodes, error);
         }
 
     private:
@@ -1837,12 +1861,12 @@ namespace
             router_weights.get()));
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        llaminar2::DeviceNativeVNNIMatrixDesc gate_desc{};
-        llaminar2::DeviceNativeVNNIMatrixDesc up_desc{};
-        llaminar2::DeviceNativeVNNIMatrixDesc down_desc{};
-        EXPECT_TRUE(prepared.gate_kernel->exportNativeVNNIMatrixDesc(gate_desc));
-        EXPECT_TRUE(prepared.up_kernel->exportNativeVNNIMatrixDesc(up_desc));
-        EXPECT_TRUE(prepared.down_kernel->exportNativeVNNIMatrixDesc(down_desc));
+        llaminar2::DeviceNativeQuantisedMatrixDesc gate_desc{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc up_desc{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc down_desc{};
+        EXPECT_TRUE(prepared.gate_kernel->exportNativeQuantisedMatrixDesc(gate_desc));
+        EXPECT_TRUE(prepared.up_kernel->exportNativeQuantisedMatrixDesc(up_desc));
+        EXPECT_TRUE(prepared.down_kernel->exportNativeQuantisedMatrixDesc(down_desc));
         const int gateup_table =
             moe ? moe->uploadGroupedExpertGateUpDescriptorTables(
                       &gate_desc, &up_desc, /*num_experts=*/1, d_model, intermediate)
@@ -2919,9 +2943,9 @@ namespace
      */
     void writeMoEProductionPairEvidence(
         std::FILE *csv,
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
-        const llaminar2::test::native_vnni_dispatch::MoERoutingProfileStats &route_stats,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile,
+        const llaminar2::test::native_quantised_dispatch::MoERoutingProfileStats &route_stats,
         int rows,
         const MoEProductionPairEvidence &evidence)
     {
@@ -2944,7 +2968,7 @@ namespace
         row << std::setprecision(17)
             << "rocm,moe_production_prefill,"
             << routed_case.evidenceId() << ','
-            << llaminar2::test::native_vnni_dispatch::moeRoutingProfileName(
+            << llaminar2::test::native_quantised_dispatch::moeRoutingProfileName(
                    route_profile) << ','
             << routed_case.routed.gate << ','
             << routed_case.routed.up << ','
@@ -3005,8 +3029,8 @@ namespace
      */
     void writeMoEProductionPairTimingEvidence(
         std::FILE *timing_csv,
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile,
         int rows,
         const MoEProductionPairEvidence &evidence)
     {
@@ -3024,7 +3048,7 @@ namespace
                     "rocm,moe_production_prefill,%s,%s,%d,%s,%s,%zu,%d,%.9f,%a\n",
                     routed_case.evidenceId().c_str(),
                     std::string(
-                        llaminar2::test::native_vnni_dispatch::
+                        llaminar2::test::native_quantised_dispatch::
                             moeRoutingProfileName(route_profile)).c_str(),
                     rows,
                     evidence.candidate.id().c_str(),
@@ -3133,6 +3157,8 @@ namespace
         llaminar2::IWorkspaceConsumer *consumer_ = nullptr;
     };
 
+    #include "NativeQuantisedROCmMoEProjectionDiagnostic.inc"
+
     /**
      * @brief Train one real routed-MoE source tuple at one prefill bucket.
      *
@@ -3152,9 +3178,9 @@ namespace
      * @param timing_csv Optional raw event-sample sidecar.
      */
     void runROCmProductionMoERoutedCase(
-        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        const llaminar2::test::native_quantised_dispatch::MoERoutedPrefillCase &routed_case,
         int rows,
-        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        llaminar2::test::native_quantised_dispatch::MoERoutingProfile route_profile,
         int device_ordinal,
         const MoEProductionSweepSettings &settings,
         std::FILE *csv,
@@ -3269,13 +3295,13 @@ namespace
         const std::vector<float> hidden_values =
             makeHiddenValues(rows, routed_case.hidden_size);
         const std::vector<float> routing_indices =
-            llaminar2::test::native_vnni_dispatch::makeMoERoutingIndices(
+            llaminar2::test::native_quantised_dispatch::makeMoERoutingIndices(
             route_profile,
             rows,
             routed_case.experts_per_token,
             routed_case.expert_count);
         const auto route_stats =
-            llaminar2::test::native_vnni_dispatch::summarizeMoERoutingProfile(
+            llaminar2::test::native_quantised_dispatch::summarizeMoERoutingProfile(
                 routing_indices,
                 routed_case.expert_count);
         const std::vector<float> routing_weights = makeRoutingWeights(
@@ -3548,7 +3574,7 @@ namespace
                         "failed to settle ROCm preconditioning before profiling");
                 }
                 const std::string profiler_range =
-                    "NativeVNNIProfile::" + settings.profiler_request_id;
+                    "NativeQuantisedProfile::" + settings.profiler_request_id;
                 if (roctxRangePushA(profiler_range.c_str()) < 0)
                 {
                     throw std::runtime_error(
@@ -3572,7 +3598,7 @@ namespace
                 }
                 std::fprintf(
                     stderr,
-                    "[NativeVNNIProfiler][ROCm-MoE-Prefill] request=%s "
+                    "[NativeQuantisedProfiler][ROCm-MoE-Prefill] request=%s "
                     "candidate=%s M=%d launches=1\n",
                     settings.profiler_request_id.c_str(),
                     candidate.id().c_str(),
@@ -4127,7 +4153,7 @@ namespace
                      * Grouped MoE publication contains one hidden vector per
                      * routed row. The former d_model count inspected only the
                      * first vector; use the complete downloaded tensor for both
-                     * diagnostics and the hard NativeVNNI byte certificate.
+                     * diagnostics and the hard NativeQuantised byte certificate.
                      */
                     const CloseMetrics metrics = compareVectors(
                         actual,
@@ -4333,15 +4359,15 @@ TEST(Perf__MoEVerifierPrefill, ROCm_DeviceByteCertificateIsExact)
 
 TEST(Perf__MoEVerifierPrefill, ROCm_ProductionMoEMixtureManifestIsCanonical)
 {
-    using llaminar2::test::native_vnni_dispatch::
-        nativeVnniMoEPrefillMixtureManifest;
-    using llaminar2::test::native_vnni_dispatch::
-        nativeVnniMoERoutedPrefillCases;
+    using llaminar2::test::native_quantised_dispatch::
+        nativeQuantisedMoEPrefillMixtureManifest;
+    using llaminar2::test::native_quantised_dispatch::
+        nativeQuantisedMoERoutedPrefillCases;
 
-    const auto &mixtures = nativeVnniMoEPrefillMixtureManifest();
+    const auto &mixtures = nativeQuantisedMoEPrefillMixtureManifest();
     ASSERT_FALSE(mixtures.empty());
     std::set<std::string> identities;
-    size_t native_vnni_count = 0;
+    size_t native_quantised_count = 0;
     const auto &format_cases = llaminar2::test::quantizedVerifierFormats();
     const auto has_format = [&format_cases](const std::string &label)
     {
@@ -4365,19 +4391,19 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionMoEMixtureManifestIsCanonical)
         ASSERT_GT(mixture.experts_per_token, 0);
         ASSERT_LE(mixture.experts_per_token, mixture.expert_count);
         ASSERT_FALSE(mixture.uses.empty());
-        if (!mixture.native_vnni_sweepable)
+        if (!mixture.native_quantised_sweepable)
             continue;
-        ++native_vnni_count;
+        ++native_quantised_count;
         for (const auto &format : mixture.routed.ordered())
             EXPECT_TRUE(has_format(format)) << mixture.evidenceId() << ' ' << format;
         for (const auto &format : mixture.shared.ordered())
             EXPECT_TRUE(has_format(format)) << mixture.evidenceId() << ' ' << format;
     }
-    EXPECT_GT(native_vnni_count, 0u);
-    EXPECT_LT(native_vnni_count, mixtures.size())
+    EXPECT_GT(native_quantised_count, 0u);
+    EXPECT_LT(native_quantised_count, mixtures.size())
         << "all-format inventory unexpectedly lost floating/MXFP4 cases";
 
-    const auto &routed_cases = nativeVnniMoERoutedPrefillCases();
+    const auto &routed_cases = nativeQuantisedMoERoutedPrefillCases();
     EXPECT_EQ(routed_cases.size(), 49u)
         << "the pinned GGUF manifest's routed source-key inventory changed";
     for (const auto &routed_case : routed_cases)
@@ -4398,9 +4424,9 @@ TEST(Perf__MoEVerifierPrefill, ROCm_Qwen36_35B_IQ3SProductionMixtureM64)
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
 
-    using llaminar2::test::native_vnni_dispatch::
-        nativeVnniMoEPrefillMixtureManifest;
-    const auto &manifest = nativeVnniMoEPrefillMixtureManifest();
+    using llaminar2::test::native_quantised_dispatch::
+        nativeQuantisedMoEPrefillMixtureManifest;
+    const auto &manifest = nativeQuantisedMoEPrefillMixtureManifest();
     const auto mixture = std::find_if(
         manifest.begin(),
         manifest.end(),
@@ -4423,7 +4449,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_Qwen36_35B_IQ3SProductionMixtureM64)
                 });
         });
     ASSERT_NE(mixture, manifest.end());
-    ASSERT_TRUE(mixture->native_vnni_sweepable);
+    ASSERT_TRUE(mixture->native_quantised_sweepable);
     ASSERT_EQ(mixture->expert_count, 256);
     ASSERT_EQ(mixture->experts_per_token, 8);
 
@@ -4463,6 +4489,13 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
 #ifndef HAVE_ROCM
     GTEST_SKIP() << "ROCm support not compiled";
 #else
+    if (const char *request = std::getenv("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_OPERATION_REQUEST"); request && *request)
+    {
+        if (envInt("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP", 0) != 1)
+            throw std::invalid_argument("explicit MoE operation diagnostics require the canonical sweep enable");
+        route87::run(llaminar2::test::native_quantised_dispatch::loadMoEProjectionDiagnostic(request));
+        return;
+    }
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
     if (envInt("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP", 0) == 0)
@@ -4507,13 +4540,13 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
             "ROCm production MoE sweep requires one explicit route profile");
     }
     const auto route_profile =
-        llaminar2::test::native_vnni_dispatch::parseMoERoutingProfile(
+        llaminar2::test::native_quantised_dispatch::parseMoERoutingProfile(
             route_profile_environment);
 
     settings.profiler_request_id =
-        llaminar2::test::native_vnni_dispatch::profilerRequestId();
+        llaminar2::test::native_quantised_dispatch::profilerRequestId();
     const std::string profiler_candidate_id =
-        llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+        llaminar2::test::native_quantised_dispatch::profilerEnvironment(
             "LLAMINAR_ROCM_MOE_PRODUCTION_PROFILE_CANDIDATE");
     if (settings.profiling() != !profiler_candidate_id.empty())
     {
@@ -4532,7 +4565,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
                 profiler_candidate_id);
         }
         const std::string selected_cases =
-            llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+            llaminar2::test::native_quantised_dispatch::profilerEnvironment(
                 "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_CASES");
         if (selected_cases.empty() ||
             selected_cases.find(',') != std::string::npos ||
@@ -4596,7 +4629,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
 
     int executed_cells = 0;
     for (const auto &routed_case :
-         llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases())
+         llaminar2::test::native_quantised_dispatch::nativeQuantisedMoERoutedPrefillCases())
     {
         if (!envCsvContainsOrUnset(
                 "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_CASES",
@@ -4617,7 +4650,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
             SCOPED_TRACE(
                 routed_case.evidenceId() + "/route=" +
                 std::string(
-                    llaminar2::test::native_vnni_dispatch::
+                    llaminar2::test::native_quantised_dispatch::
                         moeRoutingProfileName(route_profile)) +
                 "/M" + std::to_string(rows));
             std::fprintf(
@@ -4626,7 +4659,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
                 "down=%s hidden=%d expert_width=%d experts=%d top_k=%d\n",
                 routed_case.evidenceId().c_str(),
                 std::string(
-                    llaminar2::test::native_vnni_dispatch::
+                    llaminar2::test::native_quantised_dispatch::
                         moeRoutingProfileName(route_profile)).c_str(),
                 rows,
                 routed_case.routed.gate.c_str(),

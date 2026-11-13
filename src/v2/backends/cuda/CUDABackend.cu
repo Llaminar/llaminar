@@ -7,12 +7,17 @@
  * CPU-only cluster ranks need no NVIDIA driver to load this full-backend binary.
  * Pinned materialization counters expose accidental inference-time allocation;
  * they are observations, never a second admission or live-memory ledger.
+ * Immutable physical facts are admitted once; context reset changes native
+ * resource generations without querying or republishing that inventory.
  *
  * @author David Sanftenberg
  */
 
 #include "CUDABackend.h"
+#include "backends/NativeContextOpaqueContract.h"
+#include "../GPUDeviceContextPool.h"
 #include "CUDADriverApi.h"
+#include "CUDAHardwareMetadata.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -22,13 +27,18 @@
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
+#include "../../transfer/PipelineActivationFanoutProtocol.h"
 #include "../../transfer/CapturedTransferKernelPlan.h"
+#include "../../transfer/CapturedTransferChannelBatch.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
 #include <cuda/atomic>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "../../collective/NativeCountedAllGatherFrame.h"
+#include "../../collective/NativePipelineByteFrame.h"
+#include "../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include <algorithm>
 #include <memory>
 #include <limits>
@@ -61,6 +71,7 @@ namespace llaminar2
         {
             size_t bytes = 0u; ///< Exact cudaMalloc byte count.
             int device_id = -1; ///< Owning CUDA ordinal.
+            std::shared_ptr<const NativeAllocationCaptureIdentity> capture_identity; ///< Original record token.
         };
 
         /** CUDA host allocation or registration whose aliases die on reset. */
@@ -90,6 +101,14 @@ namespace llaminar2
             static auto *allocations =
                 new std::unordered_map<void *, CUDADeviceAllocationRecord>();
             return *allocations;
+        }
+
+        /** @brief Validate native retirement while the CUDA lifecycle lock is held. */
+        void requireCUDANativeRelease(const void* pointer, int device_id) {
+            const auto record = cudaTrackedDeviceAllocations().find(const_cast<void*>(pointer));
+            if (record == cudaTrackedDeviceAllocations().end() || record->second.device_id != device_id)
+                throw std::invalid_argument("CUDA native free requires its exact live allocation base/device");
+            NativeAllocationCaptureLease::requireUnborrowed(record->second.capture_identity);
         }
 
         /** @return Exact live CUDA host allocations and registrations. */
@@ -483,12 +502,8 @@ namespace llaminar2
     CUDABackend::CUDABackend()
         : device_count_(0)
     {
-        cudaError_t err = cudaGetDeviceCount(&device_count_);
-        if (err != cudaSuccess)
-        {
-            device_count_ = 0;
-            // Log warning but don't throw - allow CPU-only execution
-        }
+        initializeCUDAHardwareMetadata();
+        device_count_ = static_cast<int>(cudaHardwareMetadata().size());
         if (device_count_ > 0)
             (void)CUDADriverApi::instance(); // Resolve once, before any capture/reset.
         penalty_buffers_.resize(
@@ -528,6 +543,53 @@ namespace llaminar2
     // ====================================================================
     // Memory Transfer Operations
     // ====================================================================
+
+    bool CUDABackend::validateNativeCountedAllGatherFrame(void *memory,std::size_t degree,
+        ncclLlaminarCompletionAuthority original,int device_id,void *stream)
+    {
+        const auto native=requireExplicitStream(stream,"validateNativeCountedAllGatherFrame");
+        if(!memory || !degree || !original.abortFlag || !original.deviceCommunicator || !setDevice(device_id))return false;
+        ::llaminar2::validateNativeCountedAllGatherFrame<<<1u,1u,0u,native>>>(memory,degree,original);
+        return cudaGetLastError()==cudaSuccess;
+    }
+
+    bool CUDABackend::enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+        std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing)
+    {
+        const auto native=requireExplicitStream(stream,"enqueueNativeCountedAllGatherFrame");
+        if(!memory || !degree || !table || !admission ||
+           (outgoing && reinterpret_cast<std::uintptr_t>(outgoing) % alignof(unsigned long long)) || !setDevice(device_id))return false;
+        if(preparation==NativeCountedAllGatherPreparation::Initialize) {
+            if(isGraphCaptureActive() || outgoing)return false;
+            cudaFuncAttributes attributes{};
+            if(cudaFuncGetAttributes(&attributes,::llaminar2::prepareNativeCountedAllGatherFrame)!=cudaSuccess ||
+               cudaFuncGetAttributes(&attributes,::llaminar2::validateNativeCountedAllGatherFrame)!=cudaSuccess)return false;
+            return cudaMemsetAsync(memory,0,NativeCountedAllGatherLayout(degree).bytes(),native)==cudaSuccess;
+        }
+        if(preparation!=NativeCountedAllGatherPreparation::Advance)return false;
+        ::llaminar2::prepareNativeCountedAllGatherFrame<<<1u,1u,0u,native>>>(memory,degree,table,admission,outgoing);
+        return cudaGetLastError()==cudaSuccess;
+    }
+
+    bool CUDABackend::enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+        NativePipelineByteOperation operation, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "enqueueNativePipelineByteFrame");
+        if (!invocation.valid() || !setDevice(device_id)) return false;
+        if (operation == NativePipelineByteOperation::Initialize) {
+            if (isGraphCaptureActive()) return false;
+            cudaFuncAttributes attributes{};
+            if (cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(::llaminar2::prepareNativePipelineByteFrame)) != cudaSuccess ||
+                cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(::llaminar2::validateNativePipelineByteFrame)) != cudaSuccess) return false;
+            return cudaMemsetAsync(invocation.memory, 0, NativeCountedAllGatherLayout(1).bytes(), native) == cudaSuccess;
+        }
+        if (operation == NativePipelineByteOperation::Prepare)
+            ::llaminar2::prepareNativePipelineByteFrame<<<1u, 1u, 0u, native>>>(invocation);
+        else if (operation == NativePipelineByteOperation::Validate)
+            ::llaminar2::validateNativePipelineByteFrame<<<1u, 1u, 0u, native>>>(invocation);
+        else return false;
+        return cudaGetLastError() == cudaSuccess;
+    }
 
     bool CUDABackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
@@ -669,16 +731,31 @@ namespace llaminar2
         return reinterpret_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @param device_id Exact original event device ordinal.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void CUDABackend::destroyEvent(void *event, int device_id)
     {
-        if (!event || device_id >= device_count_ || device_id < 0)
+        if (!event) return;
+        if (device_id < 0 || device_id >= device_count_)
         {
-            return;
+            LOG_ERROR("[CUDABackend::destroyEvent] Non-null event has an invalid original device");
+            std::terminate();
         }
-
-        CUDA_WARN_IF_FAIL(cudaSetDevice(device_id)); // cleanup path
-        cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
-        CUDA_WARN_IF_FAIL(cudaEventDestroy(cuda_event));
+        if (const auto error = cudaSetDevice(device_id); error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::destroyEvent] Original event device selection failed, status=" << error);
+            std::terminate();
+        }
+        const auto cuda_event = reinterpret_cast<cudaEvent_t>(event);
+        if (const auto error = cudaEventDestroy(cuda_event); error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
+        }
     }
 
     bool CUDABackend::recordEvent(void *event, int device_id, void *stream)
@@ -852,6 +929,10 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Mint only host identity before creating native bytes; allocation
+        // failure cannot leave a newly added identity operation owning VRAM.
+        auto capture_identity = std::make_shared<const NativeAllocationCaptureIdentity>();
+
         // Set device before allocation
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
@@ -898,6 +979,7 @@ namespace llaminar2
             CUDADeviceAllocationRecord{
                 .bytes = bytes,
                 .device_id = device_id,
+                .capture_identity = std::move(capture_identity),
             });
         if (vramBomEnabled())
         {
@@ -915,6 +997,23 @@ namespace llaminar2
         return ptr;
     }
 
+    NativeAllocationCaptureLease CUDABackend::retainNativeAllocation(
+        const void* pointer, size_t bytes, int device_id)
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            throw std::invalid_argument("CUDA captured allocation needs an exact existing device");
+        std::lock_guard<std::mutex> lock(cudaRuntimeResourceLifecycleMutex());
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        for (const auto& [base, record] : cudaTrackedDeviceAllocations()) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(base);
+            if (address >= begin && address - begin < record.bytes)
+                return NativeAllocationCaptureLease::acquire(record.capture_identity,
+                    base, record.bytes, DeviceId::cuda(record.device_id),
+                    pointer, bytes, DeviceId::cuda(device_id));
+        }
+        throw std::invalid_argument("CUDA captured span is not a live native allocation");
+    }
+
     void CUDABackend::free(void *ptr, int device_id)
     {
         std::lock_guard<std::mutex> lifecycle_lock(
@@ -926,18 +1025,20 @@ namespace llaminar2
 
         if (device_id >= device_count_ || device_id < 0)
         {
-            LOG_ERROR("[CUDABackend] Invalid device ID " << device_id << " for cudaFree");
-            return;
+            throw std::invalid_argument("CUDA native free requires an existing allocator device");
         }
+
+        // Exact base membership is the native allocator's release authority.
+        // Mapped aliases and foreign pointers are not native allocation bases.
+        requireCUDANativeRelease(ptr, device_id);
 
         // Set device before freeing
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
         {
-            // Benign during process exit — driver is already shutting down
-            LOG_DEBUG("[CUDABackend] Failed to set device " << device_id << " before cudaFree: "
-                                                            << cudaGetErrorString(err));
-            return;
+            // Leave the original record and caller's tensor pointer intact.
+            throw std::runtime_error(std::string("CUDA native free could not select its owner: ") +
+                cudaGetErrorString(err));
         }
 
         const std::string bom_ptr =
@@ -945,8 +1046,10 @@ namespace llaminar2
         err = cudaFree(ptr);
         if (err != cudaSuccess)
         {
-            LOG_DEBUG("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
-                                                               << " on device " << device_id << ": " << cudaGetErrorString(err));
+            // Failure is not retirement: retain record/claim and stop the caller
+            // before it can clear its logical storage metadata.
+            throw std::runtime_error(std::string("CUDA native free failed; allocation remains owned: ") +
+                cudaGetErrorString(err));
         }
         else
         {
@@ -1010,6 +1113,7 @@ namespace llaminar2
         int request_row_capacity,
         int bucket_seq_len,
         int pad_token_id,
+        bool require_exact_rows,
         int device_id,
         void *stream,
         void *out_token_ids_device,
@@ -1037,6 +1141,7 @@ namespace llaminar2
             request_row_capacity,
             bucket_seq_len,
             static_cast<int32_t>(pad_token_id),
+            require_exact_rows,
             static_cast<int32_t *>(out_token_ids_device),
             static_cast<int32_t *>(out_position_ids_device),
             static_cast<int32_t *>(out_real_rows_device),
@@ -1215,14 +1320,7 @@ namespace llaminar2
             return "Invalid Device";
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return "Unknown Device";
-        }
-
-        return std::string(prop.name);
+        return cudaHardwareMetadata().at(device_id).name;
     }
 
     size_t CUDABackend::deviceMemoryTotal(int device_id) const
@@ -1232,14 +1330,7 @@ namespace llaminar2
             return 0;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return 0;
-        }
-
-        return prop.totalGlobalMem;
+        return cudaHardwareMetadata().at(device_id).total_memory;
     }
 
     size_t CUDABackend::deviceMemoryFree(int device_id) const
@@ -1290,7 +1381,16 @@ namespace llaminar2
         if (capture_status != cudaStreamCaptureStatusNone)
             throw std::logic_error("CUDA context storage must be prepared after sealing capture, never inside recording");
         CUDAStackFootprintProbe profile;
+        if (GPUDeviceContextPool::instance().hasPreparedNativeProgramStack(DeviceId::cuda(device_id),memory)) {
+            // Source birth already owns this capacity inside its original opaque
+            // commitment. Inspection cannot grow it or mint a second PMA claim.
+            CUDANativeProgramStack::requirePrepared(required_local_bytes,profile.original());
+            return;
+        }
         if (required_local_bytes <= profile.original()) return;
+        // Existing original stack capacity needs no new obligation. Growth in a
+        // prepared source must never enter the legacy late-observation ledger.
+        GPUDeviceContextPool::instance().requireOrdinaryContextStackGrowth(DeviceId::cuda(device_id),memory);
 
         std::size_t before_free = 0u, before_total = 0u;
         requireContextMemoryOperation(cudaMemGetInfo(&before_free, &before_total), "observe original footprint");
@@ -1762,15 +1862,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return false;
-        }
-
         // BF16 support requires compute capability >= 8.0 (Ampere and later)
-        int compute_capability = prop.major * 10 + prop.minor;
+        const auto &hardware = cudaHardwareMetadata().at(device_id);
+        const int compute_capability = hardware.sm_major * 10 + hardware.sm_minor;
         return compute_capability >= 80;
     }
 
@@ -1781,15 +1875,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return false;
-        }
-
         // FP16 support requires compute capability >= 5.3 (Maxwell and later)
-        int compute_capability = prop.major * 10 + prop.minor;
+        const auto &hardware = cudaHardwareMetadata().at(device_id);
+        const int compute_capability = hardware.sm_major * 10 + hardware.sm_minor;
         return compute_capability >= 53;
     }
 
@@ -1800,15 +1888,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return false;
-        }
-
         // INT8 support requires compute capability >= 6.1 (Pascal and later)
-        int compute_capability = prop.major * 10 + prop.minor;
+        const auto &hardware = cudaHardwareMetadata().at(device_id);
+        const int compute_capability = hardware.sm_major * 10 + hardware.sm_minor;
         return compute_capability >= 61;
     }
 
@@ -2093,6 +2175,7 @@ namespace llaminar2
         const int *token,
         int vocab_size,
         int *generated_token_counts,
+        MTPGreedyPenaltyPolicy *direct_output_policy,
         int device_idx,
         void *stream);
 
@@ -2119,6 +2202,14 @@ namespace llaminar2
         int *out_token_ids, int out_stride, float *out_probs,
         float *scratch_values, int *scratch_indices, int scratch_capacity,
         const int *active_rows,
+        int device_idx, void *stream);
+    extern "C" bool cudaOps_topk_topp_distributions_f32_with_history(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        int *out_token_ids, int out_stride, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        const int *active_rows,
+        const int *counts, const MTPGreedyPenaltyPolicy *policy, const int *tokens,
         int device_idx, void *stream);
     extern "C" bool cudaOps_topk_topp_processed_logits_f32(
         const float *data, int row_count, int n, int row_stride, int k,
@@ -2560,6 +2651,7 @@ namespace llaminar2
         int verifier_input_token_stride,
         sampling_math::MTPCommittedVerifierIdentityRecord *
             out_committed_verifier_identity,
+        sampling_math::MTPDepthTransactionTrace *depth_transaction_trace,
         int device_idx,
         void *stream);
     extern "C" bool cudaOps_derive_speculative_publication_metadata(
@@ -2592,7 +2684,7 @@ namespace llaminar2
         int *out_accepted_state_counts,
         int *out_ok,
         int device_idx,
-        void *stream);
+        void *stream, llaminar2::MTPShiftedCacheOrigin origin);
     extern "C" bool cudaOps_prepare_speculative_shifted_kv_tokens(
         const int *meta,
         int meta_stride,
@@ -2978,6 +3070,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || rows <= 0 || cols <= 0 ||
             !history.admitsRows(rows) ||
+            (history.branchTokens() && !history.activeRows()) ||
             !stream || !out_values_device || !out_indices_device ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
             output_stride <= 0)
@@ -3142,6 +3235,32 @@ namespace llaminar2
             static_cast<const int *>(token_device),
             vocab_size,
             static_cast<int *>(generated_token_counts_device),
+            nullptr, // Ordinary publication does not own an MTP frontier transition.
+            device_id,
+            stream);
+    }
+
+    /** @brief One native scalar launch owns the direct history/frontier transition. */
+    bool CUDABackend::enqueueCommitMTPDirectTokenHistoryDevice(
+        const void *token_device,
+        int vocab_size,
+        void *generated_token_counts_device,
+        void *penalty_policy_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !token_device || vocab_size <= 0 ||
+            !generated_token_counts_device || !penalty_policy_device || !stream)
+        {
+            return false;
+        }
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_commit_generation_token_history(
+            static_cast<const int *>(token_device),
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            static_cast<MTPGreedyPenaltyPolicy *>(penalty_policy_device),
             device_id,
             stream);
     }
@@ -3395,6 +3514,56 @@ namespace llaminar2
             static_cast<int *>(scratch_indices_device),
             scratch_capacity,
             static_cast<const int *>(active_rows_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        int out_stride,
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity,
+        const GenerationPenaltyHistory &history)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !history.admitsRows(row_count) ||
+            !data_device || row_count <= 0 || n <= 0 || row_stride < n ||
+            top_k <= 0 || top_k > 256 || top_k > n || out_stride <= 0 || out_stride < top_k ||
+            !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_topk_topp_distributions_f32_with_history(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            out_stride,
+            static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            static_cast<const int *>(history.activeRows()),
+            static_cast<const int *>(history.counts()),
+            static_cast<const MTPGreedyPenaltyPolicy *>(history.policy()),
+            static_cast<const int *>(history.branchTokens()),
             device_id,
             stream);
     }
@@ -4855,7 +5024,8 @@ namespace llaminar2
         void *out_next_verifier_condition_tokens_device,
         const void *verifier_input_tokens_device,
         int verifier_input_token_stride,
-        void *out_committed_verifier_identity_device)
+        void *out_committed_verifier_identity_device,
+        sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device)
     {
         const bool has_verifier_identity_binding =
             verifier_input_tokens_device != nullptr ||
@@ -4869,7 +5039,7 @@ namespace llaminar2
             !output_tokens_device || output_token_stride <= 0 ||
             !meta_device || !base_cached_tokens_device ||
             meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
-            request_count <= 0 || padded_state_rows_per_request <= 0 ||
+            request_count <= 0 || (depth_transaction_trace_device && request_count != 1) || padded_state_rows_per_request <= 0 ||
             !response_tokens_device ||
             response_token_stride <= 0 || !control_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
@@ -4916,6 +5086,7 @@ namespace llaminar2
             static_cast<
                 sampling_math::MTPCommittedVerifierIdentityRecord *>(
                 out_committed_verifier_identity_device),
+            depth_transaction_trace_device,
             device_id,
             stream);
     }
@@ -4994,14 +5165,14 @@ namespace llaminar2
         void *stream,
         void *out_target_cached_tokens_device,
         void *out_accepted_state_counts_device,
-        void *out_ok_device)
+        void *out_ok_device, MTPShiftedCacheOrigin origin)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !base_cached_tokens_device ||
             !main_target_cached_tokens_device ||
             !main_publication_ok_device ||
             request_count <= 0 ||
-            mtp_depth < 0 ||
+            mtpShiftedPrefixOffset(origin,mtp_depth)<0 ||
             !stream ||
             !out_target_cached_tokens_device ||
             !out_accepted_state_counts_device ||
@@ -5021,7 +5192,7 @@ namespace llaminar2
             static_cast<int *>(out_accepted_state_counts_device),
             static_cast<int *>(out_ok_device),
             device_id,
-            stream);
+            stream,origin);
     }
 
     bool CUDABackend::enqueuePrepareSpeculativeShiftedKVTokens(
@@ -5901,16 +6072,29 @@ namespace llaminar2
             return false;
         *timeout_ticks = 0;
         cudaFuncAttributes attributes{};
-        if (cudaFuncGetAttributes(&attributes, capturedTransferAcquireKernel) != cudaSuccess ||
+        if (cudaFuncGetAttributes(&attributes, pipelineActivationFanoutValidationKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferAcquireKernel) != cudaSuccess ||
             cudaFuncGetAttributes(&attributes, capturedTransferCopyPublishKernel<true>) != cudaSuccess ||
             cudaFuncGetAttributes(&attributes, capturedTransferCopyPublishKernel<false>) != cudaSuccess ||
             cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<true>) != cudaSuccess ||
-            cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<false>) != cudaSuccess)
+            cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<false>) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferBatchFusedKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferBatchAcquireKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferBatchCopyPublishKernel) != cudaSuccess)
             return false;
         // The graph wait uses %globaltimer nanoseconds, not a DVFS-dependent
         // SM cycle count or a queried maximum shader frequency.
         *timeout_ticks = 1'000'000ULL * static_cast<std::uint64_t>(timeout_ms);
         return prepareMappedHostCopyKernels(device_id);
+    }
+
+    bool CUDABackend::enqueuePipelineActivationFanoutValidation(
+        const PipelineActivationFanoutValidation &binding, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "CUDABackend::enqueuePipelineActivationFanoutValidation");
+        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        pipelineActivationFanoutValidationKernel<<<1, 1, 0, native>>>(binding);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     bool CUDABackend::enqueueCapturedTransferChannel(
@@ -5920,7 +6104,8 @@ namespace llaminar2
         const auto native = requireExplicitStream(stream, "CUDABackend::enqueueCapturedTransferChannel");
         if (!binding.valid() || !destination || !source || device_id < 0 || device_id >= device_count_ ||
             !setDevice(device_id)) return false;
-        const bool aligned = reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
+        // A live slice may be unaligned even when its immutable base is aligned.
+        const bool aligned = !binding.source_slice && reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
             reinterpret_cast<std::uintptr_t>(source) % alignof(uint4) == 0;
         // One block is economical for small admitted messages. This selection
         // never samples the live count or changes when ownership/skew changes.
@@ -5943,6 +6128,38 @@ namespace llaminar2
         else
             capturedTransferCopyPublishKernel<false><<<mappedHostCopyBlocks(binding.message.bytes),
                 kMappedHostCopyThreads, 0, native>>>(binding, destination, source);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    bool CUDABackend::enqueueCapturedTransferChannelBatch(
+        const CapturedTransferChannelBatch &original, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "CUDABackend::enqueueCapturedTransferChannelBatch");
+        if (!original.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        auto batch = original;
+        unsigned maximum_blocks = 1;
+        bool single = true;
+        for (unsigned i = 0; i < batch.count; ++i)
+        {
+            auto &entry = batch.entries[i];
+            entry.vector_aligned = !entry.binding.source_slice &&
+                reinterpret_cast<std::uintptr_t>(entry.destination) % alignof(uint4) == 0 &&
+                reinterpret_cast<std::uintptr_t>(entry.source) % alignof(uint4) == 0;
+            const auto bytes = entry.binding.message.bytes;
+            entry.copy_blocks = entry.vector_aligned
+                ? mappedHostCopyBlocks(bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0))
+                : mappedHostCopyBlocks(bytes);
+            if (entry.copy_blocks > maximum_blocks) maximum_blocks = entry.copy_blocks;
+            single = single && capturedTransferBatchKernelPlan(bytes) == CapturedTransferKernelPlan::SingleBlock;
+        }
+        if (single)
+            capturedTransferBatchFusedKernel<<<dim3(1, batch.count), kMappedHostCopyThreads, 0, native>>>(batch);
+        else
+        {
+            capturedTransferBatchAcquireKernel<<<dim3(1, batch.count), 32, 0, native>>>(batch);
+            if (cudaGetLastError() != cudaSuccess) return false;
+            capturedTransferBatchCopyPublishKernel<<<dim3(maximum_blocks, batch.count), kMappedHostCopyThreads, 0, native>>>(batch);
+        }
         return cudaGetLastError() == cudaSuccess;
     }
 

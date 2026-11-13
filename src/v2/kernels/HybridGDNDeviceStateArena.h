@@ -85,6 +85,9 @@ namespace llaminar2
                 throw std::runtime_error(
                     "HybridGDNDeviceStateArena cannot be initialized twice");
 
+            if (!validGDNRecurrenceStateLayout(geometry.recurrence_layout))
+                throw std::invalid_argument(
+                    "Hybrid GDN arena received an unknown recurrence layout");
             validateStates(geometry, states);
 
             WorkspaceRequirements requirements;
@@ -148,12 +151,13 @@ namespace llaminar2
                     states[layer].local_conv_state_size,
                     states[layer].full_conv_state_size,
                     request_capacity);
-                states[layer].recurrence_device_state = resolveBinding(
-                    layer,
-                    "recurrence",
-                    states[layer].local_recurrence_state_size,
-                    states[layer].full_recurrence_state_size,
-                    request_capacity);
+                states[layer].recurrence_device_state =
+                    resolveBinding(layer,
+                                   "recurrence",
+                                   states[layer].local_recurrence_state_size,
+                                   states[layer].full_recurrence_state_size,
+                                   request_capacity,
+                                   geometry.recurrence_layout);
             }
         }
 
@@ -182,16 +186,12 @@ namespace llaminar2
             {
                 if (state.n_k_heads != geometry.local_key_heads ||
                     state.n_v_heads != geometry.local_value_heads ||
-                    state.d_k != geometry.d_k ||
-                    state.d_v != geometry.d_v ||
-                    state.local_conv_state_size !=
-                        geometry.local_conv_state_floats ||
-                    state.full_conv_state_size !=
-                        geometry.full_conv_state_floats ||
-                    state.local_recurrence_state_size !=
-                        geometry.local_recurrence_state_floats ||
-                    state.full_recurrence_state_size !=
-                        geometry.full_recurrence_state_floats)
+                    state.recurrence_layout != geometry.recurrence_layout ||
+                    state.d_k != geometry.d_k || state.d_v != geometry.d_v ||
+                    state.local_conv_state_size != geometry.local_conv_state_floats ||
+                    state.full_conv_state_size != geometry.full_conv_state_floats ||
+                    state.local_recurrence_state_size != geometry.local_recurrence_state_floats ||
+                    state.full_recurrence_state_size != geometry.full_recurrence_state_floats)
                 {
                     throw std::logic_error(
                         "Hybrid GDN runtime state does not match canonical geometry");
@@ -245,17 +245,20 @@ namespace llaminar2
                 true});
         }
 
-        GDNDeviceStateBinding resolveBinding(
-            size_t layer,
-            const char *kernel,
-            int local_state_floats,
-            int full_state_floats,
-            int request_capacity) const
+        GDNDeviceStateBinding
+        resolveBinding(size_t layer,
+                       const char *kernel,
+                       int local_state_floats,
+                       int full_state_floats,
+                       int request_capacity,
+                       GDNRecurrenceStateLayout recurrence_layout =
+                           GDNRecurrenceStateLayout::KeyMajorValueContiguous) const
         {
             if (local_state_floats <= 0)
                 return {};
 
             GDNDeviceStateBinding binding;
+            binding.recurrence_layout = recurrence_layout;
             binding.primary_state_floats = local_state_floats;
 
             const int effective_full_state_floats =

@@ -4,7 +4,8 @@
  *
  * CPU global TP gathers complete vocabulary rows in its graph. GPU local TP
  * mirrors terminal heads and publishes a device-resident accepted outcome.
- * ExpertOverlay followers consume transactions, not vocabulary distributions.
+ * ExpertOverlay and original pipeline stage followers consume transactions,
+ * not vocabulary distributions.
  * None of these contracts is implied merely by a process count or backend name.
  */
 #include "MTPStochasticVerificationOwner.h"
@@ -23,12 +24,14 @@ namespace llaminar2
         // happens to implement the same reduction kernels as the continuation.
         if (participation == MTPRankParticipation::ExpertTransactionFollower)
             return "An ExpertOverlay transaction follower cannot own MTP verification";
+        if (participation == MTPRankParticipation::OriginalPipelineFollower)
+            return "An original pipeline stage follower cannot own MTP verification";
 
         // Only full-model peers need a vocabulary collective. The installed
         // overlay coordinator already orders expert-only followers through
         // retained tickets; those followers never own a vocabulary shard.
         const bool distributed_model = plan.usesGlobalTP() ||
-            participation == MTPRankParticipation::ModelCollectivePeer;
+            mtpRankRequiresModelCollectives(participation);
         const bool gathered_cpu = plan.usesGlobalTP() &&
             runner.primaryDeviceId().is_cpu() && runner.supportsMTPTokenCoordination();
         if (distributed_model && !gathered_cpu)
@@ -42,6 +45,15 @@ namespace llaminar2
             (!runner.supportsDeviceStochasticMTPVerification() ||
              !runner.supportsDeviceResidentMTPSpecStatePublication()))
             return "MTP ExpertOverlay continuation requires resident stochastic verification and state publication";
+
+        // An original pipeline tail owns the complete vocabulary and outcome.
+        // Earlier ranks own layer work only, so they receive neither token/depth
+        // collectives nor authority to relax the real tail's resident contract.
+        if (participation == MTPRankParticipation::OriginalPipelineContinuation &&
+            (!runner.primaryDeviceId().is_gpu() || !runner.publishesFullVocabularyMTPLogits() ||
+             !runner.supportsDeviceStochasticMTPVerification() ||
+             !runner.supportsDeviceResidentMTPSpecStatePublication()))
+            return "MTP original pipeline continuation requires full vocabulary, resident stochastic verification and state publication";
 
         // Each local GPU participant must own both its full distribution and
         // the accepted-state publisher; a full head alone is not sufficient.

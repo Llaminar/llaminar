@@ -4,11 +4,11 @@ Date: 2026-05-19
 Workspace: `/workspaces/llaminar`
 Primary model: `/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`
 Primary failing path: single-device ROCm Qwen3.5 35B MoE prefill parity
-Previous handover: `docs/v2/projects/2026-06/HANDOVER_ROCM_MOE_NATIVE_VNNI_FORMAT_SUPPORT_2026-05-19.md`
+Previous handover: `docs/v2/projects/2026-06/HANDOVER_ROCM_MOE_NATIVE_QUANTISED_FORMAT_SUPPORT_2026-05-19.md`
 
 ## Executive Summary
 
-This document continues the investigation after the native-VNNI format-support handover. The earlier handover fixed MoE native-VNNI format admission and mixed `Q4_K` gate/up plus `Q5_K` down dispatch, but the real Qwen35 ROCm prefill parity failure remains.
+This document continues the investigation after the native-quantised format-support handover. The earlier handover fixed MoE native-quantised format admission and mixed `Q4_K` gate/up plus `Q5_K` down dispatch, but the real Qwen35 ROCm prefill parity failure remains.
 
 The new stage-dump evidence sharply narrows the failure:
 
@@ -39,7 +39,7 @@ Relevant dirty files observed in this area include:
 - `src/v2/kernels/rocm/moe/ROCmMoEKernel.h`
 - `src/v2/kernels/rocm/moe/ROCmMoEKernels.hip`
 - `src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip`
-- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip`
 - `src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp`
 - `tests/v2/integration/kernels/rocm/Test__ROCmMoEKernel.cpp`
 
@@ -282,28 +282,28 @@ Routing slots differ slightly across CPU/ROCm/PyTorch, but:
 
 Routing may still affect final numbers, but it is not the main cliff.
 
-### Generic Native-VNNI Q4_K/Q5_K GEMV/GEMM Math
+### Generic NativeQuantised Q4_K/Q5_K GEMV/GEMM Math
 
-Broad ROCm native-VNNI tests passed against CPU references:
+Broad ROCm native-quantised tests passed against CPU references:
 
 ```bash
 ctest --test-dir build_v2_integration \
-  -R '^V2_Integration_ROCm_NativeVNNI_GEMV$' \
+  -R '^V2_Integration_ROCm_NativeQuantised_GEMV$' \
   --output-on-failure --parallel
 
 ctest --test-dir build_v2_integration \
-  -R '^V2_Integration_ROCm_NativeVNNI_GEMM$' \
+  -R '^V2_Integration_ROCm_NativeQuantised_GEMM$' \
   --output-on-failure --parallel
 ```
 
 Results:
 
 ```text
-V2_Integration_ROCm_NativeVNNI_GEMV passed
-V2_Integration_ROCm_NativeVNNI_GEMM passed
+V2_Integration_ROCm_NativeQuantised_GEMV passed
+V2_Integration_ROCm_NativeQuantised_GEMM passed
 ```
 
-This does not rule out real MoE packed-weight preparation, descriptor wiring, or grouped-pipeline bugs, but it makes a generic Q4_K/Q5_K native-VNNI math bug less likely.
+This does not rule out real MoE packed-weight preparation, descriptor wiring, or grouped-pipeline bugs, but it makes a generic Q4_K/Q5_K native-quantised math bug less likely.
 
 ## Existing Synthetic Coverage And Its Gap
 
@@ -397,7 +397,7 @@ Pipeline:
 4. down GEMM,
 5. weighted scatter.
 
-Prior inspection found no obvious linear-indexing mismatch. The GEMM indexing uses `linear = b * N + n`, matching the non-grouped native-VNNI GEMM layout.
+Prior inspection found no obvious linear-indexing mismatch. The GEMM indexing uses `linear = b * N + n`, matching the non-grouped native-quantised GEMM layout.
 
 ### Expert Weight Service
 
@@ -489,7 +489,7 @@ Prioritize real-model weight and GEMM diagnostics:
 
 1. Build a layer-0 expert replay that loads the actual GGUF expert tensors and routes from the dump.
 2. Compare CPU reference, ROCm sequential expert GEMM path, and grouped prefill path.
-3. Byte-compare CPU-packed vs GPU-packed native-VNNI payload/scales/mins for selected real layer-0 experts.
+3. Byte-compare CPU-packed vs GPU-packed native-quantised payload/scales/mins for selected real layer-0 experts.
 4. Start with experts from token 0 and token 6 because they include both common and divergent route slots:
 
 ```text

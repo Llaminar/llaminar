@@ -5,6 +5,10 @@
  * Source coalescing is deliberately a planning operation: immutable parent
  * identities group adjacent expert views, while their tensor views retain the
  * mapped GGUF lifetime until all staging work has completed.
+ * Independent staging lanes inherit the admitted OpenMP partition only while
+ * their threads are constructed; the loader retains its exact caller placement.
+ * Partial construction retires every created lane before its storage unwinds.
+ * Worker entry holds a stable lane pointer while the owner grows its lane vector.
  */
 
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
@@ -16,6 +20,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/WeightLoadingProfiler.h"
 #include "utils/DebugEnv.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -57,8 +62,8 @@ namespace llaminar2
             jobs.begin(), jobs.end(),
             [](const WeightJob &lhs, const WeightJob &rhs)
             {
-                // Invalid jobs remain at the end so processJobs() emits its
-                // existing precise null-source diagnostic before touching them.
+                // Bounded sources retain their declared order after pointer
+                // jobs. Invalid sources receive their diagnostic before staging.
                 const auto lhs_address = lhs.host_raw_data
                                              ? reinterpret_cast<uintptr_t>(lhs.host_raw_data)
                                              : std::numeric_limits<uintptr_t>::max();
@@ -97,7 +102,7 @@ namespace llaminar2
                     "coalesceContiguousWeightJobs requires a non-null immutable source identity for '" +
                     job.name + "'");
             }
-            if (!job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
+            if (job.bounded_source || !job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
                 job.raw_bytes % static_cast<size_t>(job.N) != 0)
             {
                 throw std::invalid_argument(
@@ -274,6 +279,10 @@ namespace llaminar2
                 for (size_t job_index = 0; job_index < jobs.size(); ++job_index)
                 {
                     const auto &job = jobs[job_index];
+                    // A converted source owns its own native input descriptor.
+                    // It writes directly into this same pinned ring below.
+                    if (job.bounded_source)
+                        continue;
                     // MmapRegion owns the process-wide registry of live model
                     // mappings. Resolve the concrete pointer range instead of
                     // trusting a tensor-class hint: expert views and other
@@ -391,6 +400,7 @@ namespace llaminar2
         {
             const void *payload = nullptr;
             size_t file_bytes = 0;
+            size_t bounded_source_bytes = 0;
             double read_ms = 0.0;
             double h2d_wait_ms = 0.0;
             std::string error;
@@ -427,31 +437,34 @@ namespace llaminar2
                   h2d_done_events_(h2d_done_events)
             {
                 lanes_.reserve(static_cast<size_t>(lane_count));
-                for (int lane = 0; lane < lane_count; ++lane)
+                try
                 {
-                    lanes_.push_back(std::make_unique<Lane>());
-                    lanes_.back()->worker = std::thread(
-                        [this, lane]
-                        { workerLoop(lane); });
+                    for (int lane = 0; lane < lane_count; ++lane)
+                    {
+                        lanes_.push_back(std::make_unique<Lane>());
+                        {
+                            // These independent I/O lanes must not all inherit a
+                            // bound loader master's one place. Preserve metadata
+                            // allocation and all later loader work on the creator.
+                            const ScopedOpenMPPartitionAffinity control_affinity;
+                            lanes_.back()->worker = std::thread(
+                                [this, lane, state = lanes_.back().get()]
+                                { workerLoop(*state, lane); });
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    // Construction never publishes a partial pool. Retire all
+                    // successfully started workers before their lanes unwind,
+                    // then preserve the original allocation/thread exception.
+                    stopAndJoinWorkers();
+                    throw;
                 }
             }
 
-            ~StagingLanePool()
-            {
-                for (auto &lane : lanes_)
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(lane->mutex);
-                        lane->stop = true;
-                    }
-                    lane->condition.notify_all();
-                }
-                for (auto &lane : lanes_)
-                {
-                    if (lane->worker.joinable())
-                        lane->worker.join();
-                }
-            }
+            /** @brief Join every original worker before lane storage can be released. */
+            ~StagingLanePool() { stopAndJoinWorkers(); }
 
             StagingLanePool(const StagingLanePool &) = delete;
             StagingLanePool &operator=(const StagingLanePool &) = delete;
@@ -503,9 +516,36 @@ namespace llaminar2
                 StagedSource result;
             };
 
-            void workerLoop(int lane_index)
+            /**
+             * @brief Signal every created lane, then join each worker before releasing storage.
+             * Constructor rollback has no submitted jobs; ordinary destruction
+             * retains the existing pending-job drain. A failed join is fatal
+             * before any joinable thread or referenced lane can be destroyed.
+             */
+            void stopAndJoinWorkers() noexcept
             {
-                auto &lane = *lanes_[static_cast<size_t>(lane_index)];
+                for (auto &lane : lanes_)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(lane->mutex);
+                        lane->stop = true;
+                    }
+                    lane->condition.notify_all();
+                }
+                for (auto &lane : lanes_)
+                {
+                    if (lane->worker.joinable())
+                        lane->worker.join();
+                }
+            }
+
+            /**
+             * @brief Execute the original task loop using a pointer-stable lane.
+             * @param lane Heap-owned lane retained through successful join.
+             * @param lane_index Original pinned/event slot for this worker.
+             */
+            void workerLoop(Lane &lane, int lane_index)
+            {
                 while (true)
                 {
                     size_t job_index = 0;
@@ -553,7 +593,25 @@ namespace llaminar2
                             const auto &job = jobs_[job_index];
                             const auto &plan =
                                 file_read_plans_[job_index];
-                            if (plan.fd >= 0)
+                            if (job.bounded_source)
+                            {
+                                try
+                                {
+                                    job.bounded_source->read(job.source_offset_bytes,
+                                        {static_cast<std::byte *>(destination), job.raw_bytes});
+                                    result.payload = destination;
+                                    result.bounded_source_bytes = job.raw_bytes;
+                                }
+                                catch (const std::exception &error)
+                                {
+                                    result.error = error.what();
+                                }
+                                catch (...)
+                                {
+                                    result.error = "bounded weight source threw a nonstandard exception";
+                                }
+                            }
+                            else if (plan.fd >= 0)
                             {
                                 file_reader_.read(
                                     plan,
@@ -760,6 +818,7 @@ namespace llaminar2
         const bool trace_weights = env.weight_lifecycle_trace;
         const bool sync_after_repack_job = env.rocm.sync_after_kernel;
         size_t buffered_file_read_bytes = 0;
+        size_t bounded_source_bytes = 0;
 
         MmapFileReader file_reader;
         std::vector<FileReadPlan> file_read_plans;
@@ -792,10 +851,14 @@ namespace llaminar2
         {
             const int full_n = job.full_N > 0 ? job.full_N : job.N;
             const int full_k = job.full_K > 0 ? job.full_K : job.K;
-            if (job.raw_bytes == 0 || !job.host_raw_data)
+            try
+            {
+                job.validateSource();
+            }
+            catch (const std::exception &error)
             {
                 LOG_ERROR("DeviceLoadPipeline: invalid host source for '" << job.name
-                                                                          << "' raw_bytes=" << job.raw_bytes);
+                          << "': " << error.what());
                 return false;
             }
             if (job.N <= 0 || full_n <= 0 || job.row_offset < 0 ||
@@ -883,6 +946,7 @@ namespace llaminar2
             lane_read_ms[static_cast<size_t>(stream_index)] += staged.read_ms;
             event_wait_ms += staged.h2d_wait_ms;
             buffered_file_read_bytes += staged.file_bytes;
+            bounded_source_bytes += staged.bounded_source_bytes;
 
             if (trace_weights)
             {
@@ -895,7 +959,7 @@ namespace llaminar2
                                                         << " K=" << job.K
                                                         << " source=" << job.host_raw_data
                                                         << " source_mode="
-                                                        << (file_read_plans[job_index].fd >= 0
+                                                        << (job.bounded_source ? "bounded_source" : file_read_plans[job_index].fd >= 0
                                                                 ? "buffered_file"
                                                                 : "memory")
                                                         << " stream_slot=" << stream_index);
@@ -927,6 +991,9 @@ namespace llaminar2
                 return false;
             }
 
+            // An enqueue can report failure after accepting work. Conservatively
+            // retain the ring until its exact streams retire on every exit.
+            work_lifetime_ = WorkLifetime::Pending;
             if (!backend_.hostToDeviceOnStream(
                     staging_ptr,
                     staged.payload,
@@ -975,7 +1042,7 @@ namespace llaminar2
                 }
                 const size_t payload_bytes_per_row =
                     slot->payload_bytes / static_cast<size_t>(full_n);
-                auto *chunk_payload = slot->d_native_vnni_payload +
+                auto *chunk_payload = slot->d_native_quantised_payload +
                                       static_cast<size_t>(job.row_offset) * payload_bytes_per_row;
                 if (!backend_.deviceCopyAsync(
                         chunk_payload, staging_ptr, job.raw_bytes,
@@ -1026,10 +1093,10 @@ namespace llaminar2
                 const bool repack_ok = kernels_.vnniRepack(
                     job.format,
                     staging_ptr,
-                    slot->d_native_vnni_payload,
-                    static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                    static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                    static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                    slot->d_native_quantised_payload,
+                    static_cast<uint16_t *>(slot->d_native_quantised_scales),
+                    static_cast<uint16_t *>(slot->d_native_quantised_mins),
+                    static_cast<uint32_t *>(slot->d_native_quantised_emins),
                     job.N, job.K,
                     full_n, job.row_offset,
                     job.packed_group_rows,
@@ -1101,6 +1168,7 @@ namespace llaminar2
                 return false;
             }
         }
+        work_lifetime_ = WorkLifetime::Retired;
         const double drain_ms = std::chrono::duration<double, std::milli>(
                                     Clock::now() - drain_start)
                                     .count();
@@ -1149,6 +1217,9 @@ namespace llaminar2
                 static_cast<double>(buffered_file_read_bytes),
                 "load",
                 device);
+            PerfStatsCollector::addCounter(
+                "weight_loading", "gpu_pipeline_bounded_source_bytes",
+                static_cast<double>(bounded_source_bytes), "load", device);
         }
         LOG_DEBUG("DeviceLoadPipeline: device " << device_id_ << " loaded "
                                                 << num_processed_ << " weights, " << std::fixed << std::setprecision(1)
@@ -1163,6 +1234,25 @@ namespace llaminar2
             return;
 
         backend_.setDevice(device_id_);
+
+        if (work_lifetime_ == WorkLifetime::Pending)
+        {
+            // Startup failure is a terminal boundary, never an inference hot
+            // path. Stream destruction alone does not certify completion of
+            // asynchronous users of the pinned/device slots or their events.
+            for (void *stream : h2d_streams_)
+                if (stream && !backend_.synchronizeStream(stream, device_id_))
+                {
+                    LOG_ERROR("DeviceLoadPipeline: cannot retire accepted H2D work on device " << device_id_);
+                    std::terminate();
+                }
+            if (repack_stream_ && !backend_.synchronizeStream(repack_stream_, device_id_))
+            {
+                LOG_ERROR("DeviceLoadPipeline: cannot retire accepted repack work on device " << device_id_);
+                std::terminate();
+            }
+            work_lifetime_ = WorkLifetime::Retired;
+        }
 
         // Destroy events first
         for (auto &ev : repack_done_events_)

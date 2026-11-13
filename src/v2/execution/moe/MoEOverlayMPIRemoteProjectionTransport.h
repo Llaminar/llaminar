@@ -37,7 +37,9 @@ namespace llaminar2
     /**
      * @brief Source-side producer of authenticated host-visible network chunks.
      *
-     * A CPU implementation returns spans into immutable final execution bytes.
+     * A CPU implementation retains original immutable final execution bytes;
+     * native rectangles gather only live encoded columns into existing MPI send
+     * staging, while floating rectangles expose exact original row segments.
      * A GPU implementation first enqueues conversion or D2H on its exact
      * auxiliary stream, returns Pending while its event is incomplete, and then
      * returns a span into model-lifetime pinned staging storage.
@@ -55,12 +57,13 @@ namespace llaminar2
          * @brief Produce the next event-ready chunk without waiting.
          * @param chunk Receives a header and stable payload span on Ready.
          * @param error Receives an exact conversion/event failure.
+         * @param staging Original exclusive admitted MPI send lane; reused only after exact ACK.
          * @return Pending while device preparation runs, Ready for one chunk,
          *         or Failed. Ready never means end-of-stream without a chunk.
          */
         virtual MoEOverlayResidencyWaveProgress pollNextChunk(
             MoEOverlayRemoteProjectionChunkView *chunk,
-            std::string *error = nullptr) noexcept = 0;
+            std::string *error = nullptr, std::span<std::uint8_t> staging = {}) noexcept = 0;
 
         /**
          * @brief Acknowledge that MPI no longer reads the last returned payload.
@@ -135,14 +138,15 @@ namespace llaminar2
         [[nodiscard]] virtual bool complete() const noexcept = 0;
 
         /**
-         * @brief Publish the prepared execution object after final-byte readiness.
+         * @brief Finalize the prepared execution object after final-byte readiness.
          * @param error Optional exact publication diagnostic.
-         * @return True only when the destination may participate in bank commit.
+         * @return True only when original final storage is complete and may finish its transport operation.
          *
          * The MPI operation calls this once after @ref complete becomes true and
          * before releasing its lane. Device-free storage oracles may implement
-         * an explicit no-op; production endpoints use it to publish the exact
-         * prepared engine into their candidate expert arrival authority.
+         * an explicit no-op. Production endpoints finalize their reserved engine;
+         * candidate arrival publication is a separate outer-operation edge and
+         * requires every checked destination intersection to report Ready.
          */
         virtual bool publishFinal(std::string *error = nullptr) noexcept = 0;
 
@@ -192,7 +196,7 @@ namespace llaminar2
         /** @brief Return the next allocation-free cursor chunk immediately. */
         MoEOverlayResidencyWaveProgress pollNextChunk(
             MoEOverlayRemoteProjectionChunkView *chunk,
-            std::string *error = nullptr) noexcept override;
+            std::string *error = nullptr, std::span<std::uint8_t> staging = {}) noexcept override;
 
         /** @brief Release the cursor span after MPI completes its payload send. */
         bool acknowledgeChunkSent(
@@ -249,6 +253,7 @@ namespace llaminar2
          * @param match_policy Whether the live sender GPU representation must
          *        equal the expected physical fields or may be an equivalent
          *        valid representation producing the same final CPU storage.
+         * @param encoded_write_mutex SAME final-role word writer for multi-piece native arrivals; absent denotes an exclusive writer.
          * @throws std::invalid_argument For invalid identity or ownership.
          */
         MoEOverlayHostRemoteProjectionDestination(
@@ -260,7 +265,8 @@ namespace llaminar2
             std::optional<MoEOverlayRemoteProjectionManifest>
                 expected_manifest = std::nullopt,
             MoEOverlayRemoteProjectionManifestMatchPolicy match_policy =
-                MoEOverlayRemoteProjectionManifestMatchPolicy::Exact);
+                MoEOverlayRemoteProjectionManifestMatchPolicy::Exact,
+            std::shared_ptr<std::mutex> encoded_write_mutex = {});
 
         /** @brief Authenticate format, identity, and all final-region sizes. */
         bool beginManifest(
@@ -296,9 +302,15 @@ namespace llaminar2
             std::span<std::uint8_t>,
             kMoEOverlayRemoteProjectionRegionCount> regions_;
         std::shared_ptr<void> lifetime_;
+        /** Same destination-role Q6 word writer used by concurrent local/remote pieces. */
+        std::shared_ptr<std::mutex> encoded_write_mutex_;
         std::optional<MoEOverlayRemoteProjectionManifest> expected_manifest_;
         MoEOverlayRemoteProjectionManifestMatchPolicy match_policy_ =
             MoEOverlayRemoteProjectionManifestMatchPolicy::Exact;
+        /** Original native CPU destination geometry, retained after manifest authentication. */
+        std::optional<ExpertTierWeightCPUStorageLayout> cpu_layout_;
+        /** Original floating root geometry; protocol bytes remain a compact virtual rectangle. */
+        std::optional<MoEOverlayRemoteProjectionManifest> floating_layout_;
         std::optional<MoEOverlayRemoteProjectionChunkValidator> validator_;
         bool aborted_ = false;
     };
@@ -366,17 +378,17 @@ namespace llaminar2
     /**
      * @brief Exact persistent MPI lane budget for bounded migration cycles.
      *
-     * A capacity-preserving cycle never visits one physical participant more
-     * than once, so `maximum_participants_per_cycle` also bounds the number of
-     * expert migrations in one cycle. Multiplying by the public concurrent
-     * cycle policy and the expert projection count yields the complete
-     * setup-time lane count. Keeping the factors typed prevents a caller from
-     * materializing a one-cycle pool while the residency authority admits a
-     * wider wave.
+     * A canonical cycle visits each complete target once. Each role can have
+     * several nonempty source/destination intersections when a target is a
+     * cohort. `maximum_pieces_per_projection_wave` is the shared configured
+     * piece-demand bound, not a count of participants or allocated columns.
+     * The wave bound is the checked sum of feasible layer-cycle slots, so it
+     * need not factor into one layer maximum times the global cycle cap.
+     * The concurrent-cycle policy remains explicit metadata. PMA owns bytes.
      */
     struct MoEOverlayRemoteProjectionLaneBudget
     {
-        std::size_t maximum_participants_per_cycle = 0;
+        std::size_t maximum_pieces_per_projection_wave = 0;
         std::size_t maximum_concurrent_cycles = 0;
         std::size_t projections_per_expert = 0;
 
@@ -387,23 +399,38 @@ namespace llaminar2
         [[nodiscard]] constexpr std::optional<std::size_t>
         projectionOperationCount() const noexcept
         {
-            if (maximum_participants_per_cycle == 0 ||
+            if (maximum_pieces_per_projection_wave == 0 ||
                 maximum_concurrent_cycles == 0 ||
-                projections_per_expert == 0 ||
-                maximum_participants_per_cycle >
-                    std::numeric_limits<std::size_t>::max() /
-                        maximum_concurrent_cycles)
+                projections_per_expert == 0)
             {
                 return std::nullopt;
             }
-            const std::size_t migrations =
-                maximum_participants_per_cycle * maximum_concurrent_cycles;
-            if (migrations > std::numeric_limits<std::size_t>::max() /
+            const std::size_t pieces =
+                maximum_pieces_per_projection_wave;
+            if (pieces > std::numeric_limits<std::size_t>::max() /
                                  projections_per_expert)
             {
                 return std::nullopt;
             }
-            return migrations * projections_per_expert;
+            return pieces * projections_per_expert;
+        }
+
+        /**
+         * @brief Declare a uniform per-cycle fixture/record bound explicitly.
+         * @param pieces_per_cycle Maximum original pieces per role in each cycle.
+         * @param cycles Declared concurrent-cycle policy.
+         * @param roles Required original role count.
+         * @return Checked wave budget, or an invalid empty value on zero/overflow.
+         * @note Production sharded staging uses its actual feasible wave plan;
+         *       this builder preserves explicit uniform lower-level contracts.
+         */
+        [[nodiscard]] static constexpr MoEOverlayRemoteProjectionLaneBudget fromUniformCycles(
+            std::size_t pieces_per_cycle,std::size_t cycles,std::size_t roles) noexcept
+        {
+            if(!pieces_per_cycle || !cycles || !roles ||
+               pieces_per_cycle>std::numeric_limits<std::size_t>::max()/cycles)return {};
+            return {.maximum_pieces_per_projection_wave=pieces_per_cycle*cycles,
+                .maximum_concurrent_cycles=cycles,.projections_per_expert=roles};
         }
 
         /** @brief Compare all setup-time capacity factors. */

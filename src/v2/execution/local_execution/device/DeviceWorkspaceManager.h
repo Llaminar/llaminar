@@ -17,6 +17,9 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * A complete transient CPU grouped-MoE declaration is carried beside named
+ * slab regions. Its owned roots share this allocator lifetime and sole PMA
+ * issuer; the serial-family envelope freezes before any consumer is bound.
  */
 
 #pragma once
@@ -36,6 +39,10 @@
 
 namespace llaminar2
 {
+    class CPUGroupedMoEStorageBacking;
+    struct Q8_1Block;
+    template <typename T> class AlignedVector;
+
     /**
      * @brief One stable named-buffer placement in a serial graph family.
      *
@@ -62,6 +69,10 @@ namespace llaminar2
         std::vector<SerialWorkspaceBufferPlacement> placements;
         size_t total_bytes = 0;
         std::string error;
+        std::shared_ptr<const CPUGroupedMoEStorageLayout> cpu_grouped_moe_storage; ///< SerialGraphLocal bundle, separate from named slab.
+        std::shared_ptr<const CPURouterQ8StorageLayout> cpu_router_q8_storage; ///< Optional publication, coalesced within this family only.
+        /** @return Complete named-slab and independent CPU root footprint. */
+        [[nodiscard]] size_t totalPhysicalBytes() const;
 
         /**
          * @brief Whether planning completed with a valid layout.
@@ -481,6 +492,27 @@ namespace llaminar2
         // Buffer Access
         // =========================================================================
 
+        /** @return The frozen backing owned by this manager's actual allocation domain. */
+        [[nodiscard]] std::shared_ptr<CPUGroupedMoEStorageBacking> cpuGroupedMoEStorage() const noexcept
+        {return cpu_grouped_moe_storage_;}
+        /** @brief Reject introduction, growth, retired backing or incompatible late typed requests.
+         * @param requested Absent or complete transient CPU root declaration.
+         * @throws std::invalid_argument For a malformed complete declaration.
+         * @throws std::logic_error For missing, retired, incompatible or undersized backing.
+         */
+        void requireCPUGroupedMoEStorage(const std::shared_ptr<const CPUGroupedMoEStorageLayout> &requested) const;
+        /** @return Actual router backing, shared with grouped scratch when this manager owns it. */
+        [[nodiscard]] std::shared_ptr<AlignedVector<Q8_1Block>> cpuRouterQ8Storage() const noexcept;
+        /**
+         * @brief Authenticate a router request before binding its actual backing.
+         * @param requested Complete optional router declaration.
+         * @throws std::invalid_argument For a noncanonical or incompatible source identity.
+         * @throws std::logic_error For missing, undersized or retired backing.
+         */
+        void requireCPURouterQ8Storage(const std::shared_ptr<const CPURouterQ8StorageLayout> &requested) const;
+        /** @return Exact retained primary and typed backing bytes for model reuse. */
+        size_t retainedBackingBytes() const;
+
         /**
          * @brief Get pointer to a named buffer
          * @param name Buffer name
@@ -653,15 +685,18 @@ namespace llaminar2
         /**
          * @brief Get the number of bytes used (including alignment padding)
          */
-        size_t used() const { return used_bytes_; }
+        size_t used() const;
+
+        /** @return Physical backings owned by this manager, including sealed capacity and typed roots. */
+        size_t allocatedPhysicalBytes() const;
 
         /**
          * @brief Get the remaining budget in bytes
          */
         size_t remaining() const
         {
-            return used_bytes_ < budget_bytes_
-                       ? budget_bytes_ - used_bytes_
+            return used() < budget_bytes_
+                       ? budget_bytes_ - used()
                        : 0;
         }
 
@@ -685,6 +720,11 @@ namespace llaminar2
         DeviceId device_;
         uint64_t id_;
         size_t budget_bytes_;
+        std::shared_ptr<CPUGroupedMoEStorageBacking> cpu_grouped_moe_storage_; ///< Concrete owned roots; no independent accounting ledger.
+        std::shared_ptr<const CPURouterQ8StorageLayout> cpu_router_q8_layout_; ///< Frozen standalone source identity; absent for grouped ownership.
+        std::shared_ptr<AlignedVector<Q8_1Block>> cpu_router_q8_storage_; ///< Actual standalone root; never allocated beside a grouped router.
+        /** @return Actual independent typed backings retained by this manager. */
+        size_t typedCPUPhysicalBytes() const;
         size_t used_bytes_ = 0;
         bool allocated_ = false;
 

@@ -34,7 +34,7 @@
 
 #include "Tensors.h"
 #include "../backends/DeviceId.h"
-#include "../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../utils/Logger.h"
 #include <memory>
 #include <cstring>
@@ -454,7 +454,7 @@ namespace llaminar2
         /**
          * @brief Create a GEMM kernel for this slice
          *
-         * For row-parallel slices with full inner data, creates a CPUNativeVNNIGemmKernel
+         * For row-parallel slices with full inner data, creates a CPUNativeQuantisedGemmKernel
          * that only packs the slice rows. Otherwise delegates to inner tensor.
          *
          * IMPORTANT: When inner tensor's raw data has been released (after first
@@ -477,7 +477,7 @@ namespace llaminar2
                 LOG_DEBUG("TensorSlice: Creating row-sliced kernel ["
                           << metadata_.slice_start << ", " << metadata_.slice_end
                           << ") from full inner tensor");
-                return std::make_unique<cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                return std::make_unique<cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
                     inner(),
                     static_cast<int>(metadata_.slice_start),
                     static_cast<int>(metadata_.slice_end));
@@ -512,7 +512,7 @@ namespace llaminar2
         }
 
         /** @return Inner native packing metadata, or null for non-native storage. */
-        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        const NativeQuantisedFormatInfo *vnniFormatInfo() const override
         {
             const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
@@ -542,7 +542,7 @@ namespace llaminar2
                 unpackable->packVnniBlock(ctx, source_n, destination_n, b);
             }
             else
-                throw std::logic_error("Cannot pack floating-point TensorSlice as NativeVNNI");
+                throw std::logic_error("Cannot pack floating-point TensorSlice as NativeQuantised");
         }
 
         /**

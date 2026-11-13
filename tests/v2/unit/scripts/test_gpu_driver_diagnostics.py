@@ -4,8 +4,13 @@
 Exercise ring rotation, missing records, late teardown warnings, process
 retirement, journal corruption and the actual CLI/shell closure protocol.
 Kernel reads are simulated; no model, GPU or elevated privilege is used.
+Real informational KFD clock/memory-map hung-task frames reproduce diagnostics
+that the original severity-and-fault-word classifier incorrectly marked clean.
+Busy-batch and idle-poll contracts preserve every original journal byte without
+requiring fragile elapsed-time assertions.
 """
 from dataclasses import asdict
+import io
 import json
 from pathlib import Path
 import shlex
@@ -56,12 +61,70 @@ def clean_evidence(directory: Path):
             'findings': [], 'finding_count': 0, 'error': None}
 
 
+# Exact frame spellings/offsets retained from the q90 Linux blocked-task report.
+# The heading/fence frames alone deliberately carry no GPU attribution.
+Q90_GPU_WAIT_STACK = (
+    "INFO: task llaminar_model_:1606685 blocked for more than 122 seconds.",
+    "Call Trace:",
+    "  dma_fence_default_wait+0xed/0x250",
+    "  kfd_ioctl_get_clock_counters+0x20/0x80 [amdgpu]",
+    "  amdgpu_amdkfd_gpuvm_sync_memory+0x6e/0xb0 [amdgpu]",
+    "  kfd_ioctl_map_memory_to_gpu+0x238/0x400 [amdgpu]",
+)
+
 class GPUDriverDiagnosticsTests(unittest.TestCase):
     """Existing warning, scope and public-harness obligations stay mandatory."""
     def setUp(self):
         """Never inherit a real CI observer while testing simulated kernels."""
         self.enterContext(patch.dict(driver.os.environ))
         driver.os.environ.pop(driver.READER_CONTAINER_ENV, None)
+
+    def test_direct_record_serialization_preserves_original_jsonl_bytes(self):
+        """Immutable-field serialization retains the original asdict encoding."""
+        records = (
+            record(),
+            record('unicode \u03bb \U0001f680, quote " and slash \\, newline\nNUL\0', timestamp=0.0),
+            record('same stamp, distinct record', 'debug', timestamp=0.0, facility='user'),
+            record('negative zero remains exact', timestamp=-0.0),
+        )
+        stream = io.BytesIO()
+        expected = bytearray()
+        for ordinal, row in enumerate(records, 1):
+            original = {'kind': 'record', 'ordinal': ordinal, **asdict(row)}
+            driver.journal_line(stream, {'kind': 'record', 'ordinal': ordinal, **row.to_dict()})
+            expected.extend((json.dumps(original, ensure_ascii=True, separators=(',', ':')) + '\n').encode())
+            self.assertEqual(list(row.to_dict()), list(asdict(row)))
+        self.assertEqual(stream.getvalue(), bytes(expected))
+
+    def test_exact_cursor_prefilter_preserves_full_order_and_ambiguity(self):
+        """A timestamp excludes only impossible anchors, never log records."""
+        rows = tuple(record('large ring ' + str(index), timestamp=index)
+                     for index in range(8192))
+        cursor = rows[4096:4104]
+        comparisons = []
+        original_equal = driver.KernelRecord.__eq__
+
+        def compare(left, right):
+            """Count full record comparisons independently of elapsed time."""
+            comparisons.append((left.time, right.time))
+            return original_equal(left, right)
+
+        with patch.object(driver.KernelRecord, '__eq__', compare):
+            selected = driver.new_records(checkpoint(*cursor), snapshot(*rows))
+        self.assertEqual(selected, rows[4104:])
+        self.assertEqual(comparisons, [(row.time, row.time) for row in cursor])
+
+        # False anchors share a timestamp, and publication order reverses time.
+        # All fields of all cursor records must still match in their old order.
+        exact = (record('anchor', timestamp=9), record('earlier', timestamp=8))
+        false_anchor = (record('different message', timestamp=9), exact[1])
+        tail = record('new equal-time record', timestamp=9)
+        current = snapshot(*false_anchor, *exact, tail)
+        self.assertEqual(driver.new_records(checkpoint(*exact), current), (tail,))
+        for invalid in (snapshot(*exact, tail, *exact), snapshot(*reversed(exact)),
+                        snapshot(*false_anchor, tail)):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'cursor lost or ambiguous'):
+                driver.new_records(checkpoint(*exact), invalid)
 
     def test_amd_and_nvidia_severity_and_misleveled_faults(self):
         """In particular, reproduce MI50 IH overflow and informational Xid."""
@@ -100,6 +163,29 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertFalse(driver.driver_diagnostic(record(message, priority)))
         self.assertFalse(driver.driver_diagnostic(record("amdgpu error mentioned by userspace", "err", facility="user")))
+
+    def test_informational_kfd_hung_task_frames_reject_original_false_clean_rule(self):
+        """Restore q90's actual wait frames and authenticate the original rule's miss."""
+        for message in Q90_GPU_WAIT_STACK[-3:]:
+            with self.subTest(message=message):
+                row = record(message, "info")
+                legacy = bool(driver._DRIVER.search(row.msg) and
+                    (row.pri in driver._BAD_PRIORITIES or driver._PROBLEM.search(row.msg)))
+                self.assertFalse(legacy, "Negative control must reproduce the original missed finding")
+                self.assertTrue(driver.driver_diagnostic(row))
+                self.assertTrue(driver.driver_diagnostic(record(" ? __pfx_" + message.strip(), "info")))
+                self.assertFalse(driver.driver_diagnostic(record(message, "info", facility="user")))
+        self.assertTrue(driver.driver_diagnostic(record("\n".join(Q90_GPU_WAIT_STACK), "info")))
+        for message in (
+            *Q90_GPU_WAIT_STACK[:3],
+            "amdgpu: kfd initialized clock counters and GPU memory mappings",
+            "amdgpu: registered kfd_ioctl_map_memory_to_gpu",
+            "amdgpu: kfd_ioctl_map_memory_to_gpu+0x238/0x400 [amdgpu] initialized",
+            " kfd_ioctl_map_memory_to_gpu+0x238/0x400 [unrelated]",
+            "Modules linked in: amdgpu kfd_ioctl_map_memory_to_gpu",
+        ):
+            with self.subTest(benign=message):
+                self.assertFalse(driver.driver_diagnostic(record(message, "info")))
 
     def test_old_warnings_are_excluded_but_new_equal_time_records_are_checked(self):
         """Ordering, not time-of-day or a coarse seconds filter, defines a cell."""
@@ -197,7 +283,7 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
 class GPUDriverWindowTests(unittest.TestCase):
     """Long lifetimes rotate the ring without losing collected diagnostics."""
 
-    def run_collector(self, root, before, after, *, controls=None, owners=None):
+    def run_collector(self, root, before, after, *, controls=None, owners=None, poll_timeouts=None):
         """Drive the real collector and journal through a deterministic ring."""
         state = root / 'cell.driver-checkpoint.json'
         window = 'b' * 32
@@ -213,9 +299,58 @@ class GPUDriverWindowTests(unittest.TestCase):
             alive.return_value = True
             control.return_value.__enter__.return_value.recv.side_effect = controls
             passed = driver.collect(state)
+            if poll_timeouts is not None:
+                poll_timeouts.extend(call.args[0] for call in
+                    control.return_value.__enter__.return_value.settimeout.call_args_list)
         terminal = json.loads(state.read_text())
         self.assertEqual(terminal['state'], 'retired')
         return state, terminal['outcome'], passed
+
+    def test_busy_batches_poll_buffered_close_and_preserve_all_original_bytes(self):
+        """Large consecutive batches never idle; buffered close adds a final read."""
+        rows = tuple(record('busy kernel row ' + str(index), timestamp=index % 17)
+                     for index in range(8 + 3 * 2048 + 3))
+        before = snapshot(*rows[:8])
+        ends = (2056, 4104, 6152)
+        after = [snapshot(*rows[end - 2056:end]) for end in ends]
+        # A record published after the close request must remain in the journal.
+        after.append(snapshot(*rows[ends[-1] - 8:]))
+        close = json.dumps({'action': 'close', 'window_id': 'b' * 32}).encode()
+        polls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, after,
+                controls=[BlockingIOError(), BlockingIOError(), close], poll_timeouts=polls)
+            self.assertTrue(passed)
+            self.assertEqual(polls, [0.0, 0.0, 0.0])
+            self.assertEqual(evidence['snapshot_count'], 4)
+            self.assertEqual(evidence['new_record_count'], len(rows) - 8)
+            lines = (root / evidence['journal']).read_bytes().splitlines(keepends=True)
+            original_bytes = [
+                (json.dumps({'kind': 'record', 'ordinal': ordinal, **asdict(row)},
+                            ensure_ascii=True, separators=(',', ':')) + '\n').encode()
+                for ordinal, row in enumerate(rows[8:], 1)]
+            self.assertEqual(lines[1:-1], original_bytes)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
+
+    def test_empty_batches_restore_idle_wait_and_close_requires_final_read(self):
+        """Idle polling resumes after a busy batch without losing late records."""
+        before = snapshot(record('initial'))
+        busy = snapshot(*before.records, record('busy publication', timestamp=9))
+        final = snapshot(*busy.records, record('after close', timestamp=8))
+        close = json.dumps({'action': 'close', 'window_id': 'b' * 32}).encode()
+        polls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, [before, busy, busy, final],
+                controls=[socket.timeout(), BlockingIOError(), close], poll_timeouts=polls)
+            self.assertTrue(passed)
+            self.assertEqual(polls, [driver._POLL_SECONDS, 0.0, driver._POLL_SECONDS])
+            self.assertEqual(evidence['snapshot_count'], 4)
+            self.assertEqual(evidence['new_record_count'], 2)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
 
     def test_continuous_collection_survives_repeated_ring_rotation(self):
         """Reproduce the five-hour bookend defect with 128 immediate rotations."""
@@ -233,6 +368,23 @@ class GPUDriverWindowTests(unittest.TestCase):
             driver.publish(root / 'cell.driver-diagnostics.json', evidence)
             driver.validate_evidence(root)
 
+    def test_informational_kfd_hung_task_journal_cannot_close_clean(self):
+        """The actual collector and posthoc reader both reject q90's old zero-finding summary."""
+        original=record("amdgpu: normal startup", timestamp=10)
+        stack=tuple(record(message, "info", timestamp=11+index) for index,message in enumerate(Q90_GPU_WAIT_STACK))
+        before=snapshot(original)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            _,evidence,passed=self.run_collector(root,before,[before,snapshot(original,*stack)])
+            self.assertFalse(passed);self.assertTrue(evidence['complete'])
+            self.assertFalse(evidence['passed']);self.assertEqual(evidence['finding_count'],3)
+            self.assertEqual([row['msg'] for row in evidence['findings']],list(Q90_GPU_WAIT_STACK[-3:]))
+            # A retained old summary can never certify the same journal after
+            # the corrected parser discovers these actual driver stack frames.
+            old={**evidence,'passed':True,'findings':[],'finding_count':0}
+            with self.assertRaises(ValueError):driver.inspect_journal(root,old)
+            with self.assertRaises(ValueError):driver.inspect_journal(root,evidence)
+
     def test_loss_between_observations_and_reboots_still_fail(self):
         """A short polling interval never excuses missing kernel history."""
         before = snapshot(record())
@@ -246,6 +398,70 @@ class GPUDriverWindowTests(unittest.TestCase):
                 self.assertIsNotNone(evidence['error'])
                 driver.publish(root/'cell.driver-diagnostics.json',evidence)
                 with self.assertRaises(ValueError):driver.validate_evidence(root)
+
+    def test_publication_order_survives_nonmonotonic_kernel_timestamps(self):
+        """Concurrent printk records can arrive with an earlier timestamp.
+
+        Reproduce the one-microsecond reversal from native preflight, including
+        a reversal across reads. The exact retained cursor owns log ordering;
+        neither sorting records nor treating timestamps as sequence IDs is valid.
+        """
+        old = record('previous published record', timestamp=372277.717543)
+        first = record('concurrent earlier stamp', timestamp=372277.717542)
+        equal = record('distinct equal stamp', timestamp=372277.717542)
+        last = record('next-read earlier stamp', timestamp=372277.717541)
+        before = snapshot(old)
+        after = [snapshot(old, first, equal), snapshot(old, first, equal, last)]
+        self.assertEqual(driver.new_records(checkpoint(old), after[0]), (first, equal))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, after)
+            self.assertTrue(passed)
+            self.assertTrue(evidence['complete'])
+            self.assertEqual(evidence['new_record_count'], 3)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
+            rows = [json.loads(line) for line in (root / evidence['journal']).read_text().splitlines()]
+            self.assertEqual([row['msg'] for row in rows if row['kind'] == 'record'],
+                             [first.msg, equal.msg, last.msg])
+
+    def test_earlier_timestamp_driver_fault_is_still_reported(self):
+        """No timestamp filter may discard a newly published driver warning."""
+        before = snapshot(record(timestamp=20.000003))
+        fault = record('amdgpu: ring gfx timeout', 'warn', timestamp=20.000002)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(
+                root, before, [before, snapshot(*before.records, fault)])
+            self.assertFalse(passed)
+            self.assertTrue(evidence['complete'])
+            self.assertEqual(evidence['finding_count'], 1)
+            self.assertEqual(evidence['findings'], [asdict(fault)])
+            # Replaying the journal must diagnose the fault even if an outer
+            # report incorrectly claims success; a timestamp reversal is not it.
+            with self.assertRaisesRegex(ValueError, 'GPU driver diagnostic'):
+                driver.inspect_journal(root, evidence)
+
+    def test_nonmonotonic_timestamps_do_not_admit_reordered_journal(self):
+        """Ordinals and the final exact cursor reject reorder independently."""
+        before = snapshot(record(timestamp=20.000003))
+        first = record('first publication', timestamp=20.000002)
+        second = record('second publication', timestamp=20.000001)
+        for renumber in (False, True):
+            with self.subTest(renumber=renumber), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, evidence, passed = self.run_collector(root, before,
+                    [before, snapshot(*before.records, first, second)])
+                self.assertTrue(passed)
+                path = root / evidence['journal']
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                rows[1], rows[2] = rows[2], rows[1]
+                if renumber:
+                    rows[1]['ordinal'], rows[2]['ordinal'] = 1, 2
+                path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                expected = 'mismatched driver journal closure' if renumber else 'reordered driver journal'
+                with self.assertRaisesRegex(ValueError, expected):
+                    driver.inspect_journal(root, evidence)
 
     def test_final_read_captures_teardown_fault_and_preserves_bounded_preview(self):
         """Keep every warning in the journal while retaining only 32 in memory."""
@@ -306,7 +522,7 @@ class GPUDriverWindowTests(unittest.TestCase):
             with self.assertRaises(ValueError):driver.finish(state,report)
 
     def test_real_cli_and_shell_count_teardown_warnings(self):
-        """Run real owned background processes with only dmesg substituted."""
+        """Run real closure with earlier-stamped records and only dmesg replaced."""
         shell=(ROOT/'tests/v2/e2e/server/test_server_e2e.sh').read_text()
         functions='\n'.join(name+'() {'+shell.split(name+'() {',1)[1].split('\n}\n',1)[0]+'\n}'
                              for name in ('pass','fail','finish_driver_diagnostics'))
@@ -314,8 +530,9 @@ class GPUDriverWindowTests(unittest.TestCase):
             with self.subTest(warning=warning),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);state=root/'cell.driver-checkpoint.json';report=root/'cell.driver-diagnostics.json'
                 current=root/'current.json';current.write_text(json.dumps({'dmesg':[asdict(record())]}))
-                ending=root/'ending.json';ending.write_text(json.dumps({'dmesg':[asdict(record())]+(
-                    [asdict(record(warning,timestamp=20))] if warning else [])}))
+                ending=root/'ending.json';ending.write_text(json.dumps({'dmesg':[asdict(record()),
+                    asdict(record('concurrent earlier stamp',timestamp=9.999999))]+(
+                    [asdict(record(warning,timestamp=9.999998))] if warning else [])}))
                 fake=root/'dmesg';fake.write_text('#!/bin/sh\nexec cat '+shlex.quote(str(current))+'\n');fake.chmod(0o755)
                 env={**driver.os.environ,'PATH':str(root)+':'+driver.os.environ['PATH']}
                 env.pop(driver.READER_CONTAINER_ENV,None)
@@ -325,12 +542,13 @@ class GPUDriverWindowTests(unittest.TestCase):
                     'pass "HTTP passed"\ncp "$4" "$5"\n'
                     'finish_driver_diagnostics cell "$2" "$3"\n'
                     '[ "$FAILED_TESTS" -eq 0 ]\n')
-                result=subprocess.run(['bash','-c',command,'guard-regression',str(ROOT/'tests/v2/e2e/server'),
+                result=subprocess.run(['bash','-c',command,'guard-regression',str(Path(driver.__file__).parent),
                     str(state),str(report),str(ending),str(current)],env=env,capture_output=True,text=True,timeout=10)
                 self.assertEqual(result.returncode,1 if warning else 0,result.stdout+result.stderr)
                 evidence=json.loads(report.read_text())
                 self.assertEqual(evidence['passed'],warning is None)
                 self.assertTrue(evidence['complete'])
+                self.assertEqual(evidence['new_record_count'], 1 if warning is None else 2)
                 self.assertFalse(driver.process_is_live(evidence['collector']))
                 self.assertEqual(json.loads(state.read_text())['state'],'closed')
                 if warning is None:driver.validate_evidence(root)

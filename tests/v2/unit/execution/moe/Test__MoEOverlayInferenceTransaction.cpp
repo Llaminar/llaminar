@@ -9,14 +9,24 @@
  */
 
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
+#include "execution/moe/MoEOverlayInferenceOriginalSlot.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/moe/MoEOverlayHostServiceContract.h"
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
+#include <cstdio>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -26,6 +36,54 @@
 
 namespace llaminar2::test
 {
+    /** Closed access to the actual native-proof aggregation body; no owner construction. */
+    struct MoEOverlayParticipantNativeRetirementReplayAccess
+    {
+        /** @brief Observe the actual private callable publisher protocol, never construct a native-ready runner. */
+        using PublicationState = MoEOverlayParticipantGraphRunner::RankLocalPublicationState;
+        /** @brief Exercise actual original source cancellation publication; no native/source owner is constructed. */
+        static void cancelSource(const std::function<void()> &cancel, std::mutex &mutex, std::exception_ptr &failure)
+        {
+            MoEOverlayParticipantGraphRunner::cancelOriginalPooledSource(cancel, mutex, failure);
+        }
+        /** @brief Observe the actual sticky source/native drain boundary with recorded native-terminal state. */
+        template <class Drain>
+        static bool drainCancellation(bool native_joined, std::mutex &mutex, const std::exception_ptr &failure,
+            Drain drain, std::string *error)
+        {
+            return MoEOverlayParticipantGraphRunner::drainOriginalSubmissionCancellation(
+                native_joined, mutex, failure, std::move(drain), error);
+        }
+
+        template <class Enqueues, class Boundaries>
+        static void requireRetired(const Enqueues &enqueues, const Boundaries &boundaries, bool native_proven)
+        {
+            MoEOverlayParticipantGraphRunner::requireOriginalSubmissionRetired(enqueues, boundaries, native_proven);
+        }
+        /** @brief Exercise original worker failure cancellation before its async result is published. */
+        template<class Work,class Cancel> static bool enqueue(Work work,Cancel cancel){
+            return MoEOverlayParticipantGraphRunner::runOriginalEndpointEnqueue(std::move(work),std::move(cancel));
+        }
+        /** @brief Mutable original future handles must all be consumed despite one failure. */
+        template<class T,class Wait,class Abort> static bool joinMutable(T& terminals,Wait wait,Abort abort,std::string* error){
+            return MoEOverlayParticipantGraphRunner::joinAllOriginalNativeTerminals(terminals,std::move(wait),std::move(abort),error);
+        }
+
+        template <typename Owners, typename Registry>
+        static void requireRegistry(const Owners &owners, const Registry &registry,
+                                    int rank, std::uint64_t epoch)
+        {
+            MoEOverlayParticipantGraphRunner::requireOriginalRankRegistry(
+                owners, registry, rank, epoch);
+        }
+        template <typename Terminals, typename Wait, typename Abort>
+        static bool join(const Terminals &terminals, Wait wait, Abort abort, std::string *error)
+        {
+            return MoEOverlayParticipantGraphRunner::joinAllOriginalNativeTerminals(
+                terminals, std::move(wait), std::move(abort), error);
+        }
+    };
+
     namespace
     {
         MoEOverlayInferenceTopologyIdentity topology(int target_rank = 1)
@@ -63,9 +121,9 @@ namespace llaminar2::test
                 segments.push_back({
                     .role = MoEOverlayInferenceCoordinatorSegmentRole::
                         ExpertFollower,
-                    .materialization =
-                        MoEOverlayInferenceSegmentMaterializationKind::
-                            EagerHostGraph,
+                    .materialization = follower_rank == 0
+                        ? MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable
+                        : MoEOverlayInferenceSegmentMaterializationKind::EagerHostGraph,
                     .world_rank = follower_rank,
                     .local_participant_count = 1u,
                 });
@@ -114,9 +172,10 @@ namespace llaminar2::test
             : public IMoEOverlayInferenceTransactionPublisher
         {
         public:
-            explicit RecordingPublisher(int target_rank)
+            explicit RecordingPublisher(int target_rank, int source_rank = 0)
                 : topology_(topology(target_rank))
             {
+                topology_.source_world_rank = source_rank;
             }
 
             bool beginCommand(
@@ -138,6 +197,12 @@ namespace llaminar2::test
                 override
             {
                 MoEOverlayPublishedInferenceTransaction result;
+                if (reject_next_publish_)
+                {
+                    reject_next_publish_ = false;
+                    result.error = "injected original publisher rejection";
+                    return result;
+                }
                 if (!active_)
                 {
                     result.error = "recording publisher is inactive";
@@ -217,6 +282,8 @@ namespace llaminar2::test
                 return topology_;
             }
 
+            /** @brief Reject the next original publisher call to exercise coordinator first-error ownership. */
+            void rejectNextPublish() noexcept { reject_next_publish_ = true; }
             std::size_t publishCount() const noexcept { return publish_count_; }
             std::size_t retireCount() const noexcept { return retire_count_; }
             std::size_t completeCount() const noexcept { return complete_count_; }
@@ -236,6 +303,7 @@ namespace llaminar2::test
             MoEOverlayInferenceTopologyIdentity topology_;
             MoEOverlayInferenceCommandIdentity command_{};
             bool active_ = false;
+            bool reject_next_publish_ = false;
             std::uint64_t next_ordinal_ = 1;
             std::size_t publish_count_ = 0;
             std::size_t retire_count_ = 0;
@@ -362,6 +430,24 @@ namespace llaminar2::test
             return plan;
         }
 
+        /** @brief Exact one-rank CUDA2 continuation and ROCm4 expert domain. */
+        MoERoutedExpertPlacementPlan rankLocalHeterogeneousPlan()
+        {
+            auto placement = heterogeneousPlan();
+            auto &continuation = placement.domains[0];
+            continuation.scope = ExecutionDomainScope::RANK_LOCAL;
+            continuation.participants.push_back(GlobalDeviceAddress::cuda(1, 0, "node"));
+            continuation.world_ranks.clear();
+            auto &followers = placement.domains[1];
+            followers.scope = ExecutionDomainScope::RANK_LOCAL;
+            followers.owner_rank = 0;
+            followers.participants.clear();
+            for (int i = 0; i < 4; ++i)
+                followers.participants.push_back(GlobalDeviceAddress::rocm(i, 0, "node"));
+            followers.world_ranks.clear();
+            return placement;
+        }
+
         MoEExpertOwnerMap heterogeneousOwnerMap()
         {
             return MoEExpertOwnerMap::build(heterogeneousPlan());
@@ -467,6 +553,233 @@ namespace llaminar2::test
             (void)makeMoEOverlayInferenceTopologyIdentity(
                 owner_map, graph_family, 0, 2),
             std::invalid_argument);
+    }
+
+    /** Same-rank endpoints retain the original graph/ticket protocol and real IDs. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalEndpointIdentityRetainsGraphFamiliesAndRejectsForeignMembership)
+    {
+        auto placement = rankLocalHeterogeneousPlan();
+        const auto owners = MoEExpertOwnerMap::build(placement);
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 7, .main_layer_count = 2,
+            .mtp_source_layers = {2}, .max_graph_rows = 16,
+            .max_decode_rows = 4, .max_request_count = 1,
+            .max_mtp_draft_depth = 3,
+        };
+        const std::array targets{2, 3, 4, 5};
+        const auto local = makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            owners, family, 0, targets);
+        ASSERT_TRUE(local.valid());
+        EXPECT_EQ(local.source_world_rank, 0);
+        EXPECT_EQ(local.target_world_rank, 0);
+        EXPECT_EQ(local, makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            owners, family, 0, targets));
+        EXPECT_THROW((void)makeMoEOverlayInferenceTopologyIdentity(
+            owners, family, 0, 0), std::invalid_argument)
+            << "The original distributed constructor still requires distinct ranks";
+        const std::array continuation_peer{1};
+        const std::array duplicate{2, 2};
+        const std::array missing{99};
+        for (const auto invalid : {std::span<const int>(continuation_peer),
+                                  std::span<const int>(duplicate),
+                                  std::span<const int>(missing), std::span<const int>()})
+            EXPECT_THROW((void)makeMoEOverlayRankLocalInferenceTopologyIdentity(
+                owners, family, 0, invalid), std::invalid_argument);
+        EXPECT_THROW((void)makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            heterogeneousOwnerMap(), family, 0, std::array{1}), std::invalid_argument);
+        auto changed = family;
+        changed.max_decode_rows = 3;
+        EXPECT_NE(local, makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            owners, changed, 0, targets));
+        MoEOverlayInferenceTransactionProtocol owner({
+            .topology = local, .slot_count = 4,
+            .max_request_count = 1, .max_rows_per_request = 16,
+            .max_mtp_draft_depth = 3,
+        });
+        for (std::uint64_t generation = 1; generation <= 2; ++generation)
+        {
+            const auto current = command(generation, generation, 41);
+            ASSERT_TRUE(owner.beginCommand(current));
+            const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+                local, current, 1, 0, 41,
+                MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+                1, 4, 4, 3);
+            completeSlot(owner, owner.accept(ticket), ticket);
+            EXPECT_FALSE(owner.accept(ticket).accepted()) << "Retired identities remain stale";
+            const auto terminal = makeMoEOverlayInferenceTerminalTicket(
+                local, current, 2, 41, MoEOverlayInferenceTransactionAction::Complete);
+            EXPECT_EQ(owner.accept(terminal).status, MoEOverlayInferenceAdmissionStatus::Complete);
+        }
+    }
+
+    /** Admitted expert participation does not erase the original physical role inventory. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalGPUExpertParticipationUsesFrozenAdmittedTiersAndOriginalRoles)
+    {
+        auto placement = rankLocalHeterogeneousPlan();
+        RoutedExpertDomain cpu;
+        cpu.name = "cpu-backing";
+        cpu.scope = ExecutionDomainScope::SINGLE;
+        cpu.backend = CollectiveBackendType::HOST;
+        cpu.participants = {GlobalDeviceAddress::cpu(0, "node")};
+        cpu.owner_rank = 0;
+        placement.domains.push_back(cpu);
+        placement.routed_tiers[1].fallback = false;
+        placement.routed_tiers.push_back(RoutedExpertTier{
+            .name = "cpu-backing", .domain = cpu.name, .priority = 2,
+            .fallback = true, .resolved_live_experts_per_layer = {0, 0, 0},
+        });
+        placement.routed_tiers[0].resolved_live_experts_per_layer = {2, 2, 2};
+        placement.routed_tiers[1].resolved_live_experts_per_layer = {2, 2, 2};
+        ClusterInventory inventory;
+        inventory.world_size = 1;
+        inventory.ranks.resize(1);
+        inventory.ranks[0].rank = 0;
+        inventory.ranks[0].node_id = 0;
+        inventory.ranks[0].hostname = "node";
+        const auto owners = MoEExpertOwnerMap::build(placement);
+        const auto planned = MoEOverlayHostServiceContract::resolve(
+            placement, owners.participants(), inventory);
+        EXPECT_TRUE(planned.hasHostBoundary()) << "Pre-quota CPU admission stays conservative";
+        const auto admitted = MoEOverlayHostServiceContract::resolveAdmitted(
+            placement, owners, inventory);
+        EXPECT_FALSE(admitted.hasHostBoundary());
+        EXPECT_TRUE(admitted.mappedActivationTopology());
+        EXPECT_TRUE(admitted.localParticipants().empty());
+        ASSERT_EQ(admitted.externalParticipants().size(), 4u);
+        for (const int id : admitted.externalParticipants())
+        {
+            const auto *participant = owners.participantForId(id);
+            ASSERT_NE(participant, nullptr);
+            EXPECT_EQ(participant->world_rank, 0);
+            EXPECT_EQ(participant->domain_name, "follower");
+            EXPECT_TRUE(participant->device.is_gpu());
+        }
+        EXPECT_FALSE(admitted.hasHostBoundary())
+            << "GPU-only heterogeneous publication does not invent a CPU service";
+        EXPECT_TRUE(admitted.requiresRankLocalInferencePublisher());
+        for (const bool authority : {false, true}) {
+            const auto envelope = admitted.captureEnvelope(authority);
+            EXPECT_EQ(envelope, GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
+            DeviceGraphExecutor::DecodeCapturePolicy policy;
+            policy.allow_cached_graph_replay = true;
+            policy.heterogeneous_segmented_enabled = true;
+            policy.graph_replay_plan_policy = DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation;
+            ASSERT_TRUE(DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(envelope, policy));
+            EXPECT_EQ(policy.graph_replay_plan_policy, DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+            EXPECT_TRUE(policy.defer_final_sync);
+        }
+
+        auto cpu_positive = placement;
+        cpu_positive.placements[1].routed_expert_tier = {0, 0, 1, 2};
+        cpu_positive.routed_tiers[1].resolved_live_experts_per_layer[1] = 1;
+        cpu_positive.routed_tiers[2].resolved_live_experts_per_layer[1] = 1;
+        const auto positive_owners = MoEExpertOwnerMap::buildTransition(cpu_positive, owners);
+        const auto positive = MoEOverlayHostServiceContract::resolveAdmitted(
+            cpu_positive, positive_owners, inventory);
+        EXPECT_TRUE(positive.hasHostBoundary());
+        EXPECT_EQ(positive.localParticipants().size(), 1u);
+        EXPECT_EQ(positive.externalParticipants().size(), 4u)
+            << "Positive tiers keep every declared GPU, including initially empty lanes";
+        EXPECT_EQ(positive.captureEnvelope(true),
+                  GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+
+        auto unresolved = placement;
+        unresolved.routed_tiers[2].resolved_live_experts_per_layer.clear();
+        EXPECT_TRUE(MoEOverlayHostServiceContract::resolveAdmitted(
+            unresolved, owners, inventory).hasHostBoundary());
+        auto contradictory = placement;
+        contradictory.routed_tiers[1].resolved_live_experts_per_layer = {0, 0, 0};
+        EXPECT_THROW((void)MoEOverlayHostServiceContract::resolveAdmitted(
+            contradictory, owners, inventory), std::logic_error);
+
+        auto empty = contradictory;
+        empty.routed_tiers[0].resolved_live_experts_per_layer = {4, 4, 4};
+        for (auto &layer : empty.placements)
+            layer.routed_expert_tier = {0, 0, 0, 0};
+        const auto empty_owners = MoEExpertOwnerMap::buildTransition(empty, owners);
+        const auto no_expert_packets = MoEOverlayHostServiceContract::resolveAdmitted(
+            empty, empty_owners, inventory);
+        EXPECT_TRUE(no_expert_packets.externalParticipants().empty());
+        EXPECT_FALSE(no_expert_packets.hasHostBoundary());
+        EXPECT_FALSE(no_expert_packets.requiresRankLocalInferencePublisher());
+        EXPECT_EQ(no_expert_packets.captureEnvelope(true),
+                  GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
+        EXPECT_EQ(empty.domains[1].participants.size(), 4u);
+        EXPECT_EQ(empty_owners.participants().size(), owners.participants().size())
+            << "Expert packet omission never erases physical storage/context membership";
+    }
+
+    /** Missing native proof never permits later peers or physical receipt publication to be skipped. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         LocalEndpointRetirementAttemptsEveryPeerAndPreservesFirstNativeFailure)
+    {
+        for (const std::array<int, 3> order : {std::array{0, 1, 2}, std::array{2, 1, 0}})
+        {
+            std::array<MoEOverlayInferenceBoundaryReceipt, 3> receipts;
+            for (auto &receipt : receipts)
+                ASSERT_EQ(receipt.beginSubmission(), 1u);
+            std::vector<int> visited;
+            int aborts = 0;
+            std::string error;
+            const bool proved = MoEOverlayParticipantNativeRetirementReplayAccess::join(
+                order,
+                [&](int endpoint)
+                {
+                    visited.push_back(endpoint);
+                    if (endpoint != 1)
+                        throw std::logic_error("missing-native-" + std::to_string(endpoint));
+                }, [&]() noexcept { ++aborts; }, &error);
+            EXPECT_FALSE(proved);
+            EXPECT_EQ(visited, (std::vector<int>(order.begin(), order.end())));
+            EXPECT_EQ(error, "missing-native-" + std::to_string(order.front()));
+            EXPECT_EQ(aborts, 2);
+            for (const auto &receipt : receipts)
+                EXPECT_EQ(receipt.completedGeneration(), 0u);
+        }
+        std::array<MoEOverlayInferenceBoundaryReceipt, 3> receipts;
+        for (auto &receipt : receipts)
+            ASSERT_EQ(receipt.beginSubmission(), 1u);
+        ASSERT_TRUE(receipts[2].cancelUnsubmitted(1u));
+        const std::array submitted{0, 1};
+        int observed = 0;
+        std::string error;
+        ASSERT_TRUE(MoEOverlayParticipantNativeRetirementReplayAccess::join(
+            submitted, [&](int) { ++observed; }, []() noexcept {}, &error));
+        for (const int endpoint : submitted)
+            ASSERT_TRUE(receipts[endpoint].completeSubmission(1u));
+        EXPECT_EQ(observed, 2);
+        EXPECT_EQ(receipts[2].submittedGeneration(), 0u);
+        EXPECT_EQ(receipts[2].completedGeneration(), 0u);
+    }
+
+    /** A subordinate role borrows the full rank's same original prepared-bank owner. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalExpertSubsetRequiresOriginalFullRankRegistryAndEpoch)
+    {
+        const auto owners = MoEExpertOwnerMap::build(rankLocalHeterogeneousPlan());
+        const auto make_registry = [&](std::vector<int> ids, std::uint64_t epoch)
+        {
+            return std::make_unique<MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = owners, .local_participant_ids = std::move(ids),
+                    .num_layers = 3, .num_experts = 4, .initial_epoch = epoch,
+                });
+        };
+        const auto original = make_registry({0, 1, 2, 3, 4, 5}, 41u);
+        EXPECT_NO_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, 0, 41u));
+        const auto subset = make_registry({2, 3, 4, 5}, 41u);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *subset, 0, 41u), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, 0, 42u), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, 1, 41u), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, -1, 41u), std::invalid_argument);
+        EXPECT_EQ(original->localParticipantIds(), (std::vector<int>{0, 1, 2, 3, 4, 5}));
     }
 
     /** Stage slicing retains only terminal NextN banks at every admitted depth. */
@@ -634,6 +947,54 @@ namespace llaminar2::test
             << "Two segment roles may never alias one MPI rank";
     }
 
+    /** @test Actual root admission supports local endpoints and nonzero distributed roots without MPI fiction. */
+    TEST(Test__MoEOverlayInferenceTransaction, RootCommandAdmissionUsesOriginalPlanAndGeneration)
+    {
+        for (const int root : {0, 3}) {
+            const int follower = root == 0 ? 0 : 4;
+            auto publisher = std::make_shared<RecordingPublisher>(follower, root);
+            auto plan = MoEOverlayInferenceCoordinatorGraphPlan::sealAfterSynchronizedMaterialization(71, {
+                {.role=MoEOverlayInferenceCoordinatorSegmentRole::Continuation,
+                 .materialization=MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable,
+                 .world_rank=root,.local_participant_count=1},
+                {.role=MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower,
+                 .materialization=MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable,
+                 .world_rank=follower,.local_participant_count=1}});
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers={publisher},.graph_plan=std::move(plan),
+                .continuation_participant_count=1,.ticket_authority_participant_index=0,
+                .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command=2,.max_mtp_draft_depth=0});
+            std::string error;
+            EXPECT_FALSE(coordinator.beginRootCommand(root+1,command(),&error));
+            EXPECT_EQ(coordinator.state(),MoEOverlayInferenceProtocolState::Idle);
+            EXPECT_FALSE(coordinator.beginRootCommand(root,command(0,1,41),&error));
+            EXPECT_FALSE(coordinator.beginRootCommand(root,command(9,0,41),&error));
+            EXPECT_FALSE(coordinator.beginRootCommand(root,command(9,1,0),&error));
+            std::uint64_t id=1;
+            // Prefill, ordinary decode and teacher-forced decode all use the
+            // same original command boundary, followed by actual graph retirement.
+            for (const auto role : {MoEOverlayInferenceGraphRole::MainPrefill,
+                                    MoEOverlayInferenceGraphRole::MainDecode,
+                                    MoEOverlayInferenceGraphRole::MainDecode}) {
+                ASSERT_TRUE(coordinator.beginRootCommand(root,command(9,id,41),&error)) << error;
+                ASSERT_TRUE(coordinator.beginGraphSequence(0,&error)) << error;
+                const auto binding=coordinator.beginParticipantGraph({.graph_role=role,
+                    .placement_epoch=41,.request_count=1,.logical_rows_per_request=1,
+                    .physical_rows_per_request=1},0);
+                ASSERT_TRUE(binding.ok) << binding.error;
+                ASSERT_TRUE(coordinator.armParticipantGraph(binding,&error)) << error;
+                ASSERT_TRUE(coordinator.finishParticipantGraph(binding,true,&error)) << error;
+                ASSERT_TRUE(coordinator.completeCommand(41,&error)) << error;
+                EXPECT_FALSE(coordinator.beginRootCommand(root,command(9,id,41),&error));
+                EXPECT_FALSE(coordinator.beginRootCommand(root,command(8,id+1,41),&error));
+                ++id;
+            }
+            ASSERT_TRUE(coordinator.beginRootCommand(root,command(10,1,41),&error)) << error;
+            ASSERT_TRUE(coordinator.completeCommand(41,&error)) << error;
+        }
+    }
+
     TEST(Test__MoEOverlayInferenceTransaction,
          CoordinatorGraphPlanMirrorsSetupAndExactSparseReturnRetirement)
     {
@@ -787,6 +1148,109 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalExpertsShareOriginalCoordinatorWithoutAliasingDenseSegments)
+    {
+        const auto graph_plan = coordinatorGraphPlan(2, {0, 2});
+        EXPECT_EQ(graph_plan.segmentForWorldRank(0), nullptr)
+            << "Rank-only lookup must reject real mixed role ambiguity";
+        ASSERT_NE(graph_plan.segmentForWorldRank(0,
+            MoEOverlayInferenceCoordinatorSegmentRole::Continuation), nullptr);
+        ASSERT_NE(graph_plan.segmentForWorldRank(0,
+            MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower), nullptr);
+        EXPECT_EQ(graph_plan.nativeParticipantCount(), 3u)
+            << "This device-free controller fixture seals two dense and one local endpoint";
+        auto first_target = std::make_shared<RecordingPublisher>(0);
+        auto second_target = std::make_shared<RecordingPublisher>(2);
+        auto coordinator =
+            std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {first_target, second_target},
+                    .graph_plan = coordinatorGraphPlan(2, {0, 2}),
+                    .continuation_participant_count = 2,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                    },
+                    .max_transactions_per_command = 4,
+                    .max_mtp_draft_depth = 3,
+                });
+        ASSERT_TRUE(coordinator->beginRootCommand(0, command()));
+        ASSERT_TRUE(coordinator->beginGraphSequence(2));
+
+        const MoEOverlayInferenceExecutionDescriptor sidecar{
+            .graph_role = MoEOverlayInferenceGraphRole::MTPDraft,
+            .placement_epoch = 41,
+            .request_count = 1,
+            .logical_rows_per_request = 1,
+            .physical_rows_per_request = 1,
+        };
+        auto first = coordinator->beginParticipantGraph(sidecar, 0);
+        ASSERT_TRUE(first.ok) << first.error;
+        ASSERT_TRUE(first.active);
+        EXPECT_EQ(first.descriptor.draft_depth, 2);
+        EXPECT_EQ(first.descriptor.sidecar_depth, 0);
+        EXPECT_EQ(first_target->publishCount(), 0u)
+            << "Graph entry reserves identity but must not wake a follower during cold capture";
+        EXPECT_EQ(second_target->publishCount(), 0u);
+
+        auto second = coordinator->beginParticipantGraph(sidecar, 1);
+        ASSERT_TRUE(second.ok) << second.error;
+        EXPECT_EQ(second.group_id, first.group_id);
+        EXPECT_EQ(second.descriptor, first.descriptor);
+        ASSERT_TRUE(coordinator->armParticipantGraph(first));
+        EXPECT_EQ(first_target->publishCount(), 1u)
+            << "The first executable launch edge publishes one target ticket";
+        EXPECT_EQ(second_target->publishCount(), 1u);
+        EXPECT_EQ(first_target->publishCount(), 1u)
+            << "A LocalTP sibling must not own another ticket edge";
+        ASSERT_TRUE(coordinator->finishParticipantGraph(first, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(second, true));
+
+        auto third = coordinator->beginParticipantGraph(sidecar, 0);
+        auto fourth = coordinator->beginParticipantGraph(sidecar, 1);
+        ASSERT_TRUE(third.ok) << third.error;
+        ASSERT_TRUE(fourth.ok) << fourth.error;
+        EXPECT_EQ(third.descriptor.sidecar_depth, 1);
+        ASSERT_TRUE(coordinator->armParticipantGraph(third));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(third, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(fourth, true));
+
+        const MoEOverlayInferenceExecutionDescriptor verifier{
+            .graph_role =
+                MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+            .placement_epoch = 41,
+            .request_count = 1,
+            .logical_rows_per_request = 3,
+            .physical_rows_per_request = 4,
+            .draft_depth = 2,
+        };
+        auto verifier_first =
+            coordinator->beginParticipantGraph(verifier, 0);
+        auto verifier_second =
+            coordinator->beginParticipantGraph(verifier, 1);
+        ASSERT_TRUE(verifier_first.ok) << verifier_first.error;
+        ASSERT_TRUE(verifier_second.ok) << verifier_second.error;
+        ASSERT_TRUE(coordinator->armParticipantGraph(verifier_first));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(
+            verifier_first, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(
+            verifier_second, true));
+
+        EXPECT_EQ(first_target->retireCount(), 0u)
+            << "Asynchronous graph slots remain live until terminal output";
+        ASSERT_TRUE(coordinator->completeCommand(41));
+        EXPECT_EQ(first_target->publishCount(), 3u);
+        EXPECT_EQ(second_target->publishCount(), 3u);
+        EXPECT_EQ(first_target->retireCount(), 3u);
+        EXPECT_EQ(second_target->retireCount(), 3u);
+        EXPECT_EQ(first_target->completeCount(), 1u);
+        EXPECT_EQ(second_target->completeCount(), 1u);
+    }
+
+    TEST(Test__MoEOverlayInferenceTransaction,
          RankCoordinatorPublishesOnceAcrossSymmetricParticipantsAndTargets)
     {
         auto first_target = std::make_shared<RecordingPublisher>(1);
@@ -878,6 +1342,162 @@ namespace llaminar2::test
         EXPECT_EQ(second_target->retireCount(), 3u);
         EXPECT_EQ(first_target->completeCount(), 1u);
         EXPECT_EQ(second_target->completeCount(), 1u);
+    }
+
+    /** @test A finite parent spans actual command generations while the original publisher waits. */
+    TEST(Test__MoEOverlayInferenceTransaction, FinitePlacementScopeDescendsAcrossRequestGenerations)
+    {
+        // This is an original authority/transport lifecycle proof, not a native
+        // GPU or synthetic physical-bank admission. Existing metadata fixtures
+        // preserve their authored endpoint coordinates.
+        class PublicationTransport final : public IMoEOverlayResidencyTransport {
+        public:
+            class Wave final : public IMoEOverlayResidencyWave {
+            public:
+                explicit Wave(PublicationTransport &owner): owner_(owner) {}
+                MoEOverlayResidencyWaveProgress pollStage(std::string*) noexcept override {return MoEOverlayResidencyWaveProgress::Ready;}
+                bool beginPrepare(std::string*) noexcept override {return true;}
+                MoEOverlayResidencyWaveProgress pollPrepare(std::string*) noexcept override {return MoEOverlayResidencyWaveProgress::Ready;}
+                bool beginPublication(std::string*) noexcept override {++owner_.publications;return true;}
+                MoEOverlayResidencyWaveProgress pollPublication(std::string*) noexcept override {return MoEOverlayResidencyWaveProgress::Ready;}
+                void abortStaged() noexcept override {}
+                void retirePrevious() noexcept override {++owner_.retirements;}
+            private: PublicationTransport &owner_;
+            };
+            MoEOverlayResidencyStageStart beginStage(const MoEOverlayResidencyTransaction&) override {
+                return {.status=MoEOverlayResidencyStageStartStatus::Started,.wave=std::make_unique<Wave>(*this)};
+            }
+            int publications=0,retirements=0;
+        };
+        for(int replay=0;replay<20;++replay) {
+            auto plan=heterogeneousPlan();
+            plan.residency_policy=RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.routed_tiers[0].max_experts_per_layer=2;
+            DecodeExpertHistogramConfig histogram_config;
+            histogram_config.num_layers=3;histogram_config.num_experts=4;
+            histogram_config.top_k=1;histogram_config.window_size=1;
+            histogram_config.sockets={DeviceId::cuda(0),DeviceId::rocm(0)};
+            histogram_config.ownership=MoELayeredExpertOwnership::uniform(3,2,{0,0,1,1});
+            DecodeExpertHistogram histogram(histogram_config);
+            const std::array<std::uint64_t,4> counts{1,1,100,90};
+            for(int layer=0;layer<3;++layer)histogram.mergeLayerCounts(layer,counts.data(),4,false);
+            auto authority=std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+                .initial_plan=plan,.model_metadata=heterogeneousMetadata(),
+                .maintenance_mode=MoERebalanceRuntimeMode::Dynamic,.histogram=&histogram});
+            auto publisher=std::make_shared<RecordingPublisher>(1);
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers={publisher},.graph_plan=coordinatorGraphPlan(1),
+                .continuation_participant_count=1,.ticket_authority_participant_index=0,
+                .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command=2,.max_mtp_draft_depth=0,.residency_authority=authority});
+            auto old_reader=authority->tryAcquireTicketSnapshot();ASSERT_TRUE(old_reader);
+            PublicationTransport transport;
+            const auto execute=[&](std::uint64_t generation,std::uint64_t id) {
+                ASSERT_TRUE(coordinator.beginCommand(command(generation,id,1)));
+                ASSERT_TRUE(coordinator.beginGraphSequence(0));
+                EXPECT_EQ(authority->activeTicketCount(),3u); // original reader, parent, child
+                const auto binding=coordinator.beginParticipantGraph({
+                    .graph_role=MoEOverlayInferenceGraphRole::MainDecode,.placement_epoch=1,
+                    .request_count=1,.logical_rows_per_request=1,.physical_rows_per_request=1},0);
+                ASSERT_TRUE(binding.ok)<<binding.error;
+                ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+                ASSERT_TRUE(coordinator.finishParticipantGraph(binding,true));
+                ASSERT_TRUE(coordinator.completeCommand(1));
+                EXPECT_EQ(authority->activeTicketCount(),2u);
+            };
+            const auto scope=coordinator.withMoEOverlayInferencePlacementScope([&] {
+                execute(9,3);
+                auto transaction=authority->proposeFromHistogram();
+                ASSERT_FALSE(transaction.empty());
+                ASSERT_EQ(authority->beginApply(transaction,transport).status,MoEOverlayResidencyApplyStatus::Started);
+                ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Preparing);
+                ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary);
+                EXPECT_EQ(transport.publications,0);
+                // New request generation, original parent; ordinary current
+                // admission here would deadlock against its own reserved wave.
+                execute(10,4);
+                EXPECT_EQ(transport.publications,0);
+                EXPECT_THROW(coordinator.withMoEOverlayInferencePlacementScope([]{}),std::logic_error);
+            });
+            EXPECT_EQ(scope.placement_epoch,1u);EXPECT_EQ(scope.first_sequence_id,1u);EXPECT_EQ(scope.next_sequence_id,3u);
+            EXPECT_EQ(authority->activeTicketCount(),1u);
+            ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Publishing);
+            ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Published);
+            EXPECT_EQ(transport.publications,1);EXPECT_EQ(authority->pendingRetirementCount(),1u);
+            EXPECT_EQ(transport.retirements,0);
+            old_reader.reset();
+            EXPECT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Idle);
+            EXPECT_EQ(authority->pendingRetirementCount(),0u);EXPECT_EQ(transport.retirements,1);
+        }
+    }
+
+    /** @test No successful scope can be invented from an empty callback or failed native command. */
+    TEST(Test__MoEOverlayInferenceTransaction, FinitePlacementScopeRejectsEmptyAndPreservesTerminalException)
+    {
+        auto authority=std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+            .initial_plan=heterogeneousPlan(),.model_metadata=heterogeneousMetadata()});
+        auto publisher=std::make_shared<RecordingPublisher>(1);
+        MoEOverlayInferenceTransactionCoordinator coordinator({
+            .publishers={publisher},.graph_plan=coordinatorGraphPlan(1),
+            .continuation_participant_count=1,.ticket_authority_participant_index=0,
+            .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+            .max_transactions_per_command=2,.max_mtp_draft_depth=0,.residency_authority=authority});
+        EXPECT_THROW(coordinator.withMoEOverlayInferencePlacementScope([]{}),std::logic_error);
+        EXPECT_EQ(authority->activeTicketCount(),0u);
+        bool reached=false;
+        try {coordinator.withMoEOverlayInferencePlacementScope([&] {
+            reached=true;throw std::runtime_error("original request reset failure before command");
+        });FAIL()<<"original exception was swallowed";}
+        catch(const std::runtime_error &error) {EXPECT_TRUE(reached);EXPECT_STREQ(error.what(),"original request reset failure before command");}
+        EXPECT_EQ(authority->activeTicketCount(),0u);
+        bool terminal_throw_entered=false;
+        try {coordinator.withMoEOverlayInferencePlacementScope([&] {
+            ASSERT_TRUE(coordinator.beginCommand(command(9,2,1)));
+            ASSERT_TRUE(coordinator.beginGraphSequence(0));
+            const auto binding=coordinator.beginParticipantGraph({
+                .graph_role=MoEOverlayInferenceGraphRole::MainDecode,.placement_epoch=1,
+                .request_count=1,.logical_rows_per_request=1,.physical_rows_per_request=1},0);
+            ASSERT_TRUE(binding.ok)<<binding.error;
+            ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+            ASSERT_TRUE(coordinator.finishParticipantGraph(binding,true));
+            ASSERT_TRUE(coordinator.completeCommand(1));
+            terminal_throw_entered=true;
+            throw std::runtime_error("original exception after complete request");
+        });FAIL()<<"terminal callback exception was swallowed";}
+        catch(const std::runtime_error &error) {
+            EXPECT_TRUE(terminal_throw_entered);
+            EXPECT_STREQ(error.what(),"original exception after complete request");
+        }
+        EXPECT_EQ(authority->activeTicketCount(),0u);
+        EXPECT_TRUE(coordinator.beginCommand(command(10,3,1)));
+        EXPECT_THROW(coordinator.withMoEOverlayInferencePlacementScope([]{}),std::logic_error);
+        EXPECT_TRUE(coordinator.abortCommand(1,1));
+    }
+
+    /** @test Missing original native receipts retain the parent until the fatal process boundary. */
+    TEST(Test__MoEOverlayInferenceTransaction, FinitePlacementScopeIncompleteChildIsFatalWithOriginalOwner)
+    {
+        EXPECT_EXIT({
+            auto authority=std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+                .initial_plan=heterogeneousPlan(),.model_metadata=heterogeneousMetadata()});
+            auto publisher=std::make_shared<RecordingPublisher>(1);
+            static MoEOverlayResidencyAuthority *fatal_authority=nullptr;
+            static RecordingPublisher *fatal_publisher=nullptr;
+            fatal_authority=authority.get();fatal_publisher=publisher.get();
+            std::set_terminate([] {
+                std::_Exit(fatal_authority->activeTicketCount()==1u && fatal_publisher->abortCount()==1u ? 91:92);
+            });
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers={publisher},.graph_plan=coordinatorGraphPlan(1),
+                .continuation_participant_count=1,.ticket_authority_participant_index=0,
+                .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command=2,.max_mtp_draft_depth=0,.residency_authority=authority});
+            coordinator.withMoEOverlayInferencePlacementScope([&] {
+                if(!coordinator.beginCommand(command(9,3,1)) || !coordinator.beginGraphSequence(0))std::_Exit(93);
+                throw std::runtime_error("original missing native child receipt");
+            });
+            std::_Exit(94);
+        },::testing::ExitedWithCode(91),"unproven descendant retirement: original missing native child receipt");
     }
 
     /**
@@ -1041,6 +1661,219 @@ namespace llaminar2::test
         ASSERT_TRUE(coordinator->completeCommand(41));
         EXPECT_EQ(publisher->retireCount(), 1u);
         EXPECT_EQ(publisher->completeCount(), 1u);
+    }
+
+    /**
+     * @test A restored-prefix tail can follow zero, one or two prefill chunks.
+     * Completed sparse returns must retire before the one-row decode publishes;
+     * neither a new request nor dynamic MTP may inherit the old control slot.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RestoredPrefixDecodeRetiresOnlyCompletedPrefillAcrossRepeatedCommands)
+    {
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        std::uint64_t progress = 0;
+        MoEOverlayInferenceTransactionCoordinator coordinator({
+            .publishers = {publisher},
+            .graph_plan = coordinatorGraphPlan(2),
+            .continuation_participant_count = 2,
+            .ticket_authority_participant_index = 0,
+            .participant_completion_boundaries = {
+                MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous,
+                MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+            .max_transactions_per_command = 4,
+            .max_mtp_draft_depth = 3,
+            .retired_prefill_progress_sink =
+                [&progress](std::uint64_t tokens, std::string *) {
+                    progress += tokens;
+                    return true;
+                }});
+        std::size_t expected_graphs = 0;
+        std::uint64_t expected_progress = 0;
+        std::uint64_t last_sequence = 0;
+        for (std::uint64_t repetition = 0; repetition < 20; ++repetition)
+        {
+            for (std::size_t chunks = 0; chunks <= 2; ++chunks)
+            {
+                SCOPED_TRACE(::testing::Message() << "repeat=" << repetition
+                                                  << " chunks=" << chunks);
+                const auto command_id = repetition * 3 + chunks + 1;
+                ASSERT_TRUE(coordinator.beginCommand(command(9, command_id, 41)));
+                if (chunks != 0)
+                    ASSERT_TRUE(coordinator.declarePrefillInterferenceSchedule(
+                        makeMoEOverlayInferenceWorkloadIdentity(
+                            ExpertHistogramSource::PrefillChunk,
+                            static_cast<int>(chunks * 8), static_cast<int>(chunks * 8),
+                            static_cast<int>(chunks), 0, command_id)));
+                const auto submit = [&](MoEOverlayInferenceGraphRole role, int rows)
+                {
+                    const MoEOverlayInferenceExecutionDescriptor descriptor{
+                        .graph_role = role, .placement_epoch = 41,
+                        .request_count = 1, .logical_rows_per_request = rows,
+                        .physical_rows_per_request = rows};
+                    auto first = coordinator.beginParticipantGraph(descriptor, 0);
+                    ASSERT_TRUE(first.ok) << first.error;
+                    auto second = coordinator.beginParticipantGraph(descriptor, 1);
+                    ASSERT_TRUE(second.ok) << second.error;
+                    EXPECT_EQ(first.sequence_id, second.sequence_id);
+                    EXPECT_GT(first.sequence_id, last_sequence);
+                    last_sequence = first.sequence_id;
+                    // A completed prior graph must already have retired before
+                    // the next graph's sole authority publishes its ticket.
+                    EXPECT_EQ(publisher->retireCount(), expected_graphs);
+                    ASSERT_TRUE(coordinator.armParticipantGraph(first));
+                    ++expected_graphs;
+                    EXPECT_EQ(publisher->publishCount(), expected_graphs);
+                    ASSERT_TRUE(coordinator.finishParticipantGraph(first, true));
+                    ASSERT_TRUE(coordinator.finishParticipantGraph(second, true));
+                    EXPECT_EQ(publisher->retireCount(), expected_graphs - 1);
+                };
+                for (std::size_t chunk = 0; chunk < chunks; ++chunk)
+                {
+                    ASSERT_TRUE(coordinator.admitSerialPrefillGraph(0));
+                    ASSERT_TRUE(coordinator.admitSerialPrefillGraph(1));
+                    submit(MoEOverlayInferenceGraphRole::MainPrefill, 8);
+                }
+                ASSERT_TRUE(coordinator.beginRestoredPrefixDecodeSequence());
+                expected_progress += chunks * 8;
+                EXPECT_EQ(progress, expected_progress);
+                EXPECT_EQ(publisher->retireCount(), expected_graphs);
+                submit(MoEOverlayInferenceGraphRole::MainDecode, 1);
+                ASSERT_TRUE(coordinator.completeCommand(41));
+                EXPECT_EQ(publisher->retireCount(), expected_graphs);
+                EXPECT_EQ(publisher->completeCount(), command_id);
+                EXPECT_EQ(progress, expected_progress);
+                EXPECT_EQ(publisher->abortCount(), 0u);
+            }
+        }
+        EXPECT_EQ(publisher->publishCount(), 120u);
+        EXPECT_EQ(publisher->retireCount(), 120u);
+        EXPECT_EQ(progress, 480u);
+    }
+
+    /** @test The original strict admission reproduces the observed completed-prefill failure. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RestoredPrefixDecodeOriginalAdmissionRejectsCompletedPrefill)
+    {
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        MoEOverlayInferenceTransactionCoordinator coordinator({
+            .publishers = {publisher}, .graph_plan = coordinatorGraphPlan(1),
+            .continuation_participant_count = 1,
+            .ticket_authority_participant_index = 0,
+            .participant_completion_boundaries = {
+                MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+            .max_transactions_per_command = 4, .max_mtp_draft_depth = 3});
+        ASSERT_TRUE(coordinator.beginCommand(command()));
+        ASSERT_TRUE(coordinator.admitSerialPrefillGraph(0));
+        auto binding = coordinator.beginParticipantGraph({
+            .graph_role = MoEOverlayInferenceGraphRole::MainPrefill,
+            .placement_epoch = 41, .request_count = 1,
+            .logical_rows_per_request = 8, .physical_rows_per_request = 8}, 0);
+        ASSERT_TRUE(binding.ok) << binding.error;
+        ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+        ASSERT_TRUE(coordinator.finishParticipantGraph(binding, true));
+        EXPECT_EQ(publisher->publishCount(), 1u);
+        EXPECT_EQ(publisher->retireCount(), 0u);
+        std::string error;
+        EXPECT_FALSE(coordinator.beginGraphSequence(0, &error));
+        EXPECT_EQ(error, "ExpertOverlay graph sequence cannot overlap live graph slots");
+        EXPECT_EQ(publisher->retireCount(), 0u);
+    }
+
+    /** @test The restored-prefix boundary never repairs an incompatible live sequence. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RestoredPrefixDecodeRejectsIncompleteAndNonPrefillSequences)
+    {
+        // Each rejection is terminal, so retain a fresh original coordinator
+        // per fault rather than attempting to recover a failed protocol owner.
+        for (int fault = 0; fault < 5; ++fault)
+        {
+            SCOPED_TRACE(fault);
+            auto publisher = std::make_shared<RecordingPublisher>(1);
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers = {publisher}, .graph_plan = coordinatorGraphPlan(2),
+                .continuation_participant_count = 2,
+                .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {
+                    MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous,
+                    MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command = 4, .max_mtp_draft_depth = 3});
+            if (fault == 0)
+            {
+                EXPECT_FALSE(coordinator.beginRestoredPrefixDecodeSequence());
+                EXPECT_EQ(publisher->publishCount(), 0u);
+                continue;
+            }
+            ASSERT_TRUE(coordinator.beginCommand(command()));
+            ASSERT_TRUE(coordinator.beginGraphSequence(fault == 4 ? 1 : 0));
+            if (fault != 4)
+            {
+                const MoEOverlayInferenceExecutionDescriptor descriptor{
+                    .graph_role = fault == 3
+                        ? MoEOverlayInferenceGraphRole::MainDecode
+                        : MoEOverlayInferenceGraphRole::MainPrefill,
+                    .placement_epoch = 41, .request_count = 1,
+                    .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+                auto first = coordinator.beginParticipantGraph(descriptor, 0);
+                ASSERT_TRUE(first.ok) << first.error;
+                if (fault != 1)
+                {
+                    auto second = coordinator.beginParticipantGraph(descriptor, 1);
+                    ASSERT_TRUE(second.ok) << second.error;
+                    ASSERT_TRUE(coordinator.armParticipantGraph(first));
+                    ASSERT_TRUE(coordinator.finishParticipantGraph(first, true));
+                    if (fault == 3)
+                        ASSERT_TRUE(coordinator.finishParticipantGraph(second, true));
+                }
+            }
+            const auto published = publisher->publishCount();
+            const auto retired = publisher->retireCount();
+            std::string error;
+            EXPECT_FALSE(coordinator.beginRestoredPrefixDecodeSequence(&error));
+            EXPECT_FALSE(error.empty());
+            EXPECT_EQ(publisher->publishCount(), published);
+            EXPECT_EQ(publisher->retireCount(), retired);
+            EXPECT_EQ(publisher->completeCount(), 0u);
+        }
+    }
+
+    /** @test Declared finite intervals cannot close before or after their exact cardinality. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RestoredPrefixDecodeRejectsDeclaredScheduleUnderAndOvershoot)
+    {
+        for (const int submitted : {1, 3})
+        {
+            SCOPED_TRACE(submitted);
+            auto publisher = std::make_shared<RecordingPublisher>(1);
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers = {publisher}, .graph_plan = coordinatorGraphPlan(1),
+                .continuation_participant_count = 1,
+                .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {
+                    MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command = 4, .max_mtp_draft_depth = 3});
+            ASSERT_TRUE(coordinator.beginCommand(command()));
+            ASSERT_TRUE(coordinator.declarePrefillInterferenceSchedule(
+                makeMoEOverlayInferenceWorkloadIdentity(
+                    ExpertHistogramSource::PrefillChunk, 16, 16, 2, 0, 91)));
+            for (int chunk = 0; chunk < submitted; ++chunk)
+            {
+                ASSERT_TRUE(coordinator.admitSerialPrefillGraph(0));
+                auto binding = coordinator.beginParticipantGraph({
+                    .graph_role = MoEOverlayInferenceGraphRole::MainPrefill,
+                    .placement_epoch = 41, .request_count = 1,
+                    .logical_rows_per_request = 8, .physical_rows_per_request = 8}, 0);
+                ASSERT_TRUE(binding.ok) << binding.error;
+                ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+                ASSERT_TRUE(coordinator.finishParticipantGraph(binding, true));
+            }
+            const auto published = publisher->publishCount();
+            std::string error;
+            EXPECT_FALSE(coordinator.beginRestoredPrefixDecodeSequence(&error));
+            EXPECT_FALSE(error.empty());
+            EXPECT_EQ(publisher->publishCount(), published);
+            EXPECT_EQ(publisher->completeCount(), 0u);
+        }
     }
 
     TEST(Test__MoEOverlayInferenceTransaction,
@@ -1234,6 +2067,7 @@ namespace llaminar2::test
         ASSERT_TRUE(coordinator->completeCommand(41));
         EXPECT_TRUE(probe->idle());
     }
+
 
     TEST(Test__MoEOverlayInferenceTransaction,
          GpuCoordinatorWaitsForEveryExactDeviceTerminalBeforeCompletingProbe)
@@ -1543,6 +2377,152 @@ namespace llaminar2::test
         ASSERT_TRUE(probe->consume(&sample));
         EXPECT_EQ(sample.workload, workload);
         ASSERT_TRUE(coordinator->completeCommand(41));
+    }
+
+    /** @test Original device-event terminals close only their finite prefill interval. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RestoredPrefixDecodeClosesExactProbeIntervalBeforeSuffix)
+    {
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        auto coordinator =
+            std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
+                    .continuation_participant_count = 2,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::DeviceEvent,
+                        MoEOverlayInferenceCompletionBoundaryKind::DeviceEvent,
+                    },
+                    .max_transactions_per_command = 2,
+                    .max_mtp_draft_depth = 0,
+                });
+        auto probe =
+            std::make_shared<MoEOverlayInferenceInterferenceProbe>();
+        ASSERT_TRUE(coordinator->bindPrefillInterferenceProbe(probe));
+
+        const auto workload = makeMoEOverlayInferenceWorkloadIdentity(
+            ExpertHistogramSource::PrefillChunk,
+            /*real_rows=*/7,
+            /*execution_rows=*/16,
+            /*transaction_count=*/2,
+            /*speculative_depth=*/0,
+            /*schedule_fingerprint=*/0x123456789abcdef0ULL);
+        const MoEOverlayInterferenceProbeRequest request{
+            .coordinate = {
+                .source_participant = 0,
+                .destination_participant = 1,
+                .layer = 0,
+            },
+            .source = ExpertHistogramSource::PrefillChunk,
+            .require_exact_workload = true,
+            .required_workload = workload,
+            .mode = MoEOverlayInterferenceProbeMode::ConcurrentMovement,
+            .calibration_sequence = 29,
+        };
+        ASSERT_TRUE(probe->arm(request));
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+        ASSERT_TRUE(
+            coordinator->declarePrefillInterferenceSchedule(workload));
+        EXPECT_EQ(
+            probe->progress(request),
+            MoEOverlayInterferenceProbeProgress::Running);
+
+        auto submit = [&](int real_rows,
+                          std::shared_ptr<RecordingCompletionFence> first_event,
+                          std::shared_ptr<RecordingCompletionFence> second_event)
+        {
+            const MoEOverlayInferenceExecutionDescriptor chunk{
+                .graph_role = MoEOverlayInferenceGraphRole::MainPrefill,
+                .placement_epoch = 41,
+                .request_count = 1,
+                .logical_rows_per_request = real_rows,
+                .physical_rows_per_request = 8,
+            };
+            ASSERT_TRUE(coordinator->admitSerialPrefillGraph(0));
+            const auto first =
+                coordinator->beginParticipantGraph(chunk, 0);
+            ASSERT_TRUE(first.ok) << first.error;
+            ASSERT_TRUE(coordinator->admitSerialPrefillGraph(1));
+            const auto second =
+                coordinator->beginParticipantGraph(chunk, 1);
+            ASSERT_TRUE(second.ok) << second.error;
+            EXPECT_EQ(first.descriptor.prefill_schedule_workload, workload);
+            EXPECT_EQ(second.descriptor.prefill_schedule_workload, workload);
+            ASSERT_TRUE(coordinator->armParticipantGraph(first));
+
+            std::string error;
+            ASSERT_TRUE(
+                coordinator->deferPrefillInterferenceCompletionAtDeviceTerminal(
+                    first.descriptor.logical_step_id,
+                    first.participant_index,
+                    std::move(first_event),
+                    reinterpret_cast<void *>(0x11),
+                    &error)) << error;
+            ASSERT_TRUE(
+                coordinator->deferPrefillInterferenceCompletionAtDeviceTerminal(
+                    second.descriptor.logical_step_id,
+                    second.participant_index,
+                    std::move(second_event),
+                    reinterpret_cast<void *>(0x12),
+                    &error)) << error;
+            ASSERT_TRUE(coordinator->finishParticipantGraph(first, true));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(second, true));
+        };
+
+        auto unused_first = std::make_shared<RecordingCompletionFence>();
+        auto unused_second = std::make_shared<RecordingCompletionFence>();
+        submit(4, unused_first, unused_second);
+        EXPECT_EQ(
+            probe->progress(request),
+            MoEOverlayInterferenceProbeProgress::Running)
+            << "A non-final segment must not publish or query device events";
+
+        auto final_first = std::make_shared<RecordingCompletionFence>();
+        auto final_second = std::make_shared<RecordingCompletionFence>();
+        submit(3, final_first, final_second);
+        ASSERT_EQ(publisher->tickets().size(), 2u);
+        for (const auto &ticket : publisher->tickets())
+            EXPECT_EQ(ticket.prefillScheduleWorkload(), workload);
+        EXPECT_EQ(
+            probe->progress(request),
+            MoEOverlayInterferenceProbeProgress::Running);
+
+        final_first->signal();
+        EXPECT_EQ(
+            probe->progress(request),
+            MoEOverlayInterferenceProbeProgress::Running);
+        final_second->signal();
+        EXPECT_EQ(
+            probe->progress(request),
+            MoEOverlayInterferenceProbeProgress::Completed);
+
+        MoEOverlayInterferenceProbeSample sample;
+        ASSERT_TRUE(probe->consume(&sample));
+        EXPECT_EQ(sample.workload, workload);
+        // The finite calibration interval ends before this mathematically
+        // serial suffix, even though both belong to one outer PREFILL command.
+        ASSERT_TRUE(coordinator->beginRestoredPrefixDecodeSequence());
+        const MoEOverlayInferenceExecutionDescriptor suffix{
+            .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+            .placement_epoch = 41, .request_count = 1,
+            .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+        auto first_suffix = coordinator->beginParticipantGraph(suffix, 0);
+        auto second_suffix = coordinator->beginParticipantGraph(suffix, 1);
+        ASSERT_TRUE(first_suffix.ok) << first_suffix.error;
+        ASSERT_TRUE(second_suffix.ok) << second_suffix.error;
+        EXPECT_FALSE(first_suffix.descriptor.prefill_schedule_workload.valid());
+        EXPECT_FALSE(second_suffix.descriptor.prefill_schedule_workload.valid());
+        ASSERT_TRUE(coordinator->armParticipantGraph(first_suffix));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(first_suffix, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(second_suffix, true));
+        ASSERT_TRUE(coordinator->completeCommand(41));
+        EXPECT_EQ(publisher->publishCount(), 3u);
+        EXPECT_EQ(publisher->retireCount(), 3u);
+        EXPECT_EQ(publisher->completeCount(), 1u);
+        EXPECT_FALSE(probe->consume(&sample));
+
     }
 
     TEST(Test__MoEOverlayInferenceTransaction,
@@ -2599,6 +3579,244 @@ namespace llaminar2::test
                   MoEOverlayInferenceAdmissionStatus::Rejected);
     }
 
+    /** Original condition policies select distinct bodies despite identical scalar geometry. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageConditionTicketRolesAreExact)
+    {
+        for (const auto purpose : kMTPConditionForwardPurposes)
+        {
+            const auto role = moeOverlayPipelineConditionGraphRole(purpose);
+            EXPECT_NE(role, MoEOverlayInferenceGraphRole::MainDecode);
+            EXPECT_EQ(moeOverlayPipelineConditionForwardPurpose(role), purpose);
+            auto owner = protocol();
+            const auto active = command();
+            ASSERT_TRUE(owner.beginCommand(active));
+            const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+                topology(), active, 1, 50, active.initial_placement_epoch, role, 1, 1, 1);
+            ASSERT_TRUE(ticket.valid());
+            const auto accepted = owner.accept(ticket);
+            ASSERT_TRUE(accepted.accepted()) << accepted.error;
+            completeSlot(owner, accepted, ticket);
+            for (const auto invalid : {MoEOverlayInferenceGraphRole::MainDecode,
+                    MoEOverlayInferenceGraphRole::MTPGroupedVerifier, MoEOverlayInferenceGraphRole::MTPDraft,
+                    MoEOverlayInferenceGraphRole::None})
+                EXPECT_THROW((void)moeOverlayPipelineConditionForwardPurpose(invalid), std::invalid_argument);
+        }
+        EXPECT_NE(moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose::SpeculativeContinuation),
+            moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose::CommittedSerialToken));
+        EXPECT_THROW((void)moeOverlayPipelineConditionGraphRole(static_cast<MTPConditionForwardPurpose>(255)), std::invalid_argument);
+    }
+
+    /** @test Recorded command roles retain placement authority across FORCE, MTP and reset. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStagePlacementAuthorityCommandReplay)
+    {
+        using Kind = MoEOverlayInferencePlacementIdentityKind;
+        using Role = MoEOverlayInferenceGraphRole;
+        struct Step
+        {
+            Role role; ///< Authored captured transaction role.
+            int depth; ///< Original verifier depth; negative for scalar work.
+        };
+        // These records preserve the original scheduler ordering and exact
+        // physical verifier width. Dynamic MTP changes depth, never authority.
+        const std::array<std::vector<Step>, 4> traces{{
+            {{Role::GenerationAdmission, -1}, {Role::MainDecode, -1}, {Role::MainDecode, -1}},
+            {{Role::GenerationAdmission, -1}, {Role::OrdinaryForwardOnly, -1}},
+            {{Role::MTPConditionSpeculativeContinuation, -1}, {Role::GenerationAdmission, -1},
+             {Role::MTPGroupedVerifier, 3}, {Role::MTPGroupedVerifier, 3}},
+            {{Role::MTPConditionCommittedSerialToken, -1}, {Role::GenerationAdmission, -1},
+             {Role::MTPGroupedVerifier, 1}, {Role::MTPGroupedVerifier, 15},
+             {Role::MTPGroupedVerifier, 2}, {Role::MTPGroupedVerifier, 3}},
+        }};
+        for (const auto kind : {Kind::RetainedGraph, Kind::ResidencyEpoch, Kind::ControllerPlacementEpoch})
+        {
+            const MoEOverlayInferenceTransactionProtocol::Config configuration{
+                .topology = topology(), .slot_count = moeOverlayInferenceTransactionSlotCount(15),
+                .max_request_count = 1, .max_rows_per_request = 16, .max_mtp_draft_depth = 15};
+            MoEOverlayInferenceTransactionProtocol source(configuration), follower(configuration);
+            for (const uint64_t request : {9u, 10u})
+            {
+                for (size_t lane = 0; lane < traces.size(); ++lane)
+                {
+                    const MoEOverlayInferenceCommandIdentity active{
+                        .request_generation = request, .command_id = lane + 1,
+                        .initial_placement_epoch = kind == Kind::ResidencyEpoch ? 41u : 0u,
+                        .placement_identity_kind = kind};
+                    ASSERT_TRUE(active.valid());
+                    ASSERT_TRUE(source.beginCommand(active));
+                    // Production binds original outer provenance before receiving
+                    // its first ticket, including a scalar MTP condition.
+                    ASSERT_TRUE(follower.beginCommand(active));
+                    uint64_t ordinal = 1;
+                    uint64_t epoch = active.initial_placement_epoch;
+                    for (const auto step : traces[lane])
+                    {
+                        if (kind != Kind::RetainedGraph && ordinal > 1) ++epoch;
+                        const int rows = step.depth < 0 ? 1 : step.depth + 1;
+                        const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+                            configuration.topology, active, ordinal++, 0, epoch,
+                            step.role, 1, rows, rows, step.depth);
+                        ASSERT_TRUE(ticket.valid());
+                        EXPECT_EQ(ticket.commandIdentity().placement_identity_kind, kind);
+                        EXPECT_EQ(ticket.placement_epoch, epoch);
+                        completeSlot(source, source.accept(ticket), ticket);
+                        completeSlot(follower, follower.accept(ticket), ticket);
+                        EXPECT_EQ(source.currentPlacementEpoch(), epoch);
+                        EXPECT_EQ(follower.currentPlacementEpoch(), epoch);
+                    }
+                    const auto terminal = makeMoEOverlayInferenceTerminalTicket(
+                        configuration.topology, active, ordinal, epoch,
+                        MoEOverlayInferenceTransactionAction::Complete);
+                    EXPECT_EQ(source.accept(terminal).status, MoEOverlayInferenceAdmissionStatus::Complete);
+                    EXPECT_EQ(follower.accept(terminal).status, MoEOverlayInferenceAdmissionStatus::Complete);
+                    EXPECT_FALSE(source.beginCommand(active)) << "Completed command identities remain stale";
+                    EXPECT_FALSE(follower.beginCommand(active));
+                }
+            }
+        }
+    }
+
+    /** @test Initial zero needs explicit graph/controller authority; absent ownership cannot select it. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStagePlacementAuthorityRejectsMissingOrSwitchedIdentity)
+    {
+        using Kind = MoEOverlayInferencePlacementIdentityKind;
+        auto missing = command(9, 1, 0);
+        EXPECT_FALSE(missing.valid());
+        EXPECT_THROW((void)makeMoEOverlayInferenceExecutionTicket(topology(), missing, 1, 0, 0,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1), std::invalid_argument);
+        auto retained = missing;
+        retained.placement_identity_kind = Kind::RetainedGraph;
+        ASSERT_TRUE(retained.valid());
+        auto invented_epoch = retained;
+        invented_epoch.initial_placement_epoch = 1;
+        EXPECT_FALSE(invented_epoch.valid());
+        auto initial_controller = missing;
+        initial_controller.placement_identity_kind = Kind::ControllerPlacementEpoch;
+        ASSERT_TRUE(initial_controller.valid()) << "A real controller begins at its canonical zero version";
+        const auto initial_controller_ticket = makeMoEOverlayInferenceExecutionTicket(topology(), initial_controller,
+            1, 0, 0, MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        EXPECT_TRUE(initial_controller_ticket.valid());
+        auto unknown = retained;
+        unknown.placement_identity_kind = static_cast<Kind>(99);
+        EXPECT_FALSE(unknown.valid());
+        for (const auto admitted : {retained, command(9, 1, 41), initial_controller})
+        {
+            auto follower = protocol();
+            ASSERT_TRUE(follower.beginCommand(admitted));
+            const auto other = admitted.placement_identity_kind == Kind::RetainedGraph ? command(9, 1, 41) : retained;
+            const auto switched = makeMoEOverlayInferenceExecutionTicket(topology(), other, 1, 0,
+                other.initial_placement_epoch, MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+            ASSERT_TRUE(switched.valid());
+            const auto rejected = follower.accept(switched);
+            EXPECT_FALSE(rejected.accepted());
+            EXPECT_NE(rejected.error.find("placement authority"), std::string::npos);
+        }
+        auto old_wire = makeMoEOverlayInferenceExecutionTicket(topology(), retained, 1, 0, 0,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        old_wire.abi_version = 6;
+        EXPECT_FALSE(old_wire.valid());
+        auto residency = protocol();
+        ASSERT_TRUE(residency.beginCommand(command(9, 1, 41)));
+        const auto advanced = makeMoEOverlayInferenceExecutionTicket(topology(), command(9, 1, 41), 1, 0, 42,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        completeSlot(residency, residency.accept(advanced), advanced);
+        const auto regressed = makeMoEOverlayInferenceExecutionTicket(topology(), command(9, 1, 41), 2, 0, 41,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        EXPECT_FALSE(residency.accept(regressed).accepted());
+    }
+
+    /** Replay the actual protocol across no-controller conditions, explicit admission and sampler-free commits. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageOriginalRankAdmissionAndForwardOnlyReplay)
+    {
+        const auto active = command();
+        for (const auto final_role : {MoEOverlayInferenceGraphRole::MainDecode,
+                 MoEOverlayInferenceGraphRole::OrdinaryForwardOnly})
+        {
+            // Reset and repeat the same recorded transaction order under a new
+            // command identity. A condition never aliases a response-loop body.
+            auto owner = protocol();
+            for (unsigned replay = 0; replay != 3; ++replay)
+            {
+                auto request = active;
+                request.command_id += replay;
+                ASSERT_TRUE(owner.beginCommand(request));
+                uint64_t ordinal = 0;
+                for (const auto role : {MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken,
+                         MoEOverlayInferenceGraphRole::GenerationAdmission, final_role})
+                {
+                    const auto ticket = makeMoEOverlayInferenceExecutionTicket(topology(), request,
+                        ++ordinal, 50, request.initial_placement_epoch, role, 1, 1, 1);
+                    ASSERT_TRUE(ticket.valid());
+                    const auto accepted = owner.accept(ticket);
+                    ASSERT_TRUE(accepted.accepted()) << accepted.error;
+                    completeSlot(owner, accepted, ticket);
+                    EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+                    EXPECT_THROW((void)moeOverlayPipelineConditionForwardPurpose(
+                        role == MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken ?
+                            MoEOverlayInferenceGraphRole::OrdinaryForwardOnly : role), std::invalid_argument);
+                }
+                const auto terminal = makeMoEOverlayInferenceTerminalTicket(topology(), request,
+                    ordinal + 1, request.initial_placement_epoch, MoEOverlayInferenceTransactionAction::Complete);
+                const auto completed = owner.accept(terminal);
+                ASSERT_EQ(completed.status, MoEOverlayInferenceAdmissionStatus::Complete) << completed.error;
+                EXPECT_EQ(owner.state(), MoEOverlayInferenceProtocolState::Complete);
+                EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+            }
+        }
+    }
+
+    /** Unsupported old ABIs and padded/no-sampling policies fail before any native enqueue. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageOriginalRankMetadataRejectsAmbiguousReplay)
+    {
+        for (const auto role : {MoEOverlayInferenceGraphRole::GenerationAdmission,
+                 MoEOverlayInferenceGraphRole::OrdinaryForwardOnly})
+        {
+            const auto recorded = makeMoEOverlayInferenceExecutionTicket(topology(), command(),
+                1, 50, command().initial_placement_epoch, role, 1, 1, 1);
+            ASSERT_TRUE(recorded.valid());
+            for (int mutation = 0; mutation != 5; ++mutation)
+            {
+                auto invalid = recorded;
+                if (mutation == 0) invalid.abi_version = 5;
+                if (mutation == 1) invalid.physical_rows_per_request = 2;
+                if (mutation == 2) invalid.logical_rows_per_request = 2;
+                if (mutation == 3) invalid.draft_depth = 1;
+                if (mutation == 4) invalid.sidecar_depth = 0;
+                EXPECT_FALSE(invalid.valid());
+                auto owner = protocol();
+                ASSERT_TRUE(owner.beginCommand(command()));
+                EXPECT_EQ(owner.accept(invalid).status, MoEOverlayInferenceAdmissionStatus::Rejected);
+                EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+            }
+        }
+    }
+
+    /** Legacy/contradictory tickets fail before slot publication; old role values remain unchanged. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageConditionTicketsRejectAmbiguousGeometryAndABI)
+    {
+        EXPECT_EQ(static_cast<unsigned>(MoEOverlayInferenceGraphRole::MainDecode), 2u);
+        EXPECT_EQ(static_cast<unsigned>(MoEOverlayInferenceGraphRole::MTPGroupedVerifier), 4u);
+        const auto active = command();
+        for (const auto purpose : kMTPConditionForwardPurposes)
+        {
+            const auto role = moeOverlayPipelineConditionGraphRole(purpose);
+            const auto ticket = makeMoEOverlayInferenceExecutionTicket(topology(), active, 1, 50, 41, role, 1, 1, 1);
+            for (int mutation = 0; mutation != 5; ++mutation)
+            {
+                auto invalid = ticket;
+                if (mutation == 0) invalid.abi_version = 4u;
+                if (mutation == 1) invalid.logical_rows_per_request = 2;
+                if (mutation == 2) invalid.physical_rows_per_request = 2;
+                if (mutation == 3) invalid.draft_depth = 1;
+                if (mutation == 4) invalid.sidecar_depth = 0;
+                EXPECT_FALSE(invalid.valid());
+                auto owner = protocol();
+                ASSERT_TRUE(owner.beginCommand(active));
+                EXPECT_EQ(owner.accept(invalid).status, MoEOverlayInferenceAdmissionStatus::Rejected);
+                EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+            }
+        }
+    }
+
     TEST(Test__MoEOverlayInferenceTransaction,
          GeometryBuildersRejectInvalidRoleAndDepthCombinations)
     {
@@ -2665,4 +3883,315 @@ namespace llaminar2::test
         EXPECT_TRUE(owner.beginCommand(command(10, 1, 50)));
     }
 
+    /** @brief Native admission zero opens exactly one real sparse sequence without fake progress. */
+    TEST(Test__MoEOverlayInferenceTransaction, HostedContinuationAdmissionStartsOnceWithoutPredecessorRetirement)
+    {
+        using Transition = MoEOverlayInferenceTransactionCoordinator::HostedGraphSequenceTransition;
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        std::uint64_t progress = 0;
+        auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+            MoEOverlayInferenceTransactionCoordinator::Config{
+                .publishers = {publisher}, .graph_plan = coordinatorGraphPlan(2),
+                .continuation_participant_count = 2, .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous,
+                    MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command = 8, .max_mtp_draft_depth = 15,
+                .retired_decode_progress_sink = [&progress](std::uint64_t tokens, std::string *) {
+                    progress += tokens; return true;
+                }});
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+        auto first = std::async(std::launch::async, [&] {
+            return coordinator->beginHostedContinuationGraphSequence(Transition::speculativeMTP(6)); });
+        auto sibling = std::async(std::launch::async, [&] {
+            return coordinator->beginHostedContinuationGraphSequence(Transition::speculativeMTP(6)); });
+        ASSERT_TRUE(first.get());
+        ASSERT_TRUE(sibling.get());
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), 6);
+        EXPECT_EQ(publisher->publishCount(), 0u);
+        EXPECT_EQ(publisher->retireCount(), 0u);
+        EXPECT_EQ(progress, 0u);
+        const MoEOverlayInferenceExecutionDescriptor sidecar{
+            .graph_role = MoEOverlayInferenceGraphRole::MTPDraft, .placement_epoch = 41,
+            .request_count = 1, .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+        for (int depth = 0; depth < 6; ++depth)
+        {
+            auto a = coordinator->beginParticipantGraph(sidecar, 0);
+            auto b = coordinator->beginParticipantGraph(sidecar, 1);
+            ASSERT_TRUE(a.ok) << a.error;
+            ASSERT_TRUE(b.ok) << b.error;
+            ASSERT_TRUE(coordinator->armParticipantGraph(a));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(a, true));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(b, true));
+        }
+        const MoEOverlayInferenceExecutionDescriptor verifier{
+            .graph_role = MoEOverlayInferenceGraphRole::MTPGroupedVerifier, .placement_epoch = 41,
+            .request_count = 1, .logical_rows_per_request = 7, .physical_rows_per_request = 7, .draft_depth = 6};
+        auto a = coordinator->beginParticipantGraph(verifier, 0);
+        auto b = coordinator->beginParticipantGraph(verifier, 1);
+        ASSERT_TRUE(a.ok) << a.error;
+        ASSERT_TRUE(b.ok) << b.error;
+        ASSERT_TRUE(coordinator->armParticipantGraph(a));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(a, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(b, true));
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(1, Transition::terminal(), 7));
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(1, Transition::terminal(), 7));
+        EXPECT_EQ(progress, 7u);
+        EXPECT_EQ(publisher->publishCount(), 7u);
+        EXPECT_EQ(publisher->retireCount(), 7u);
+        ASSERT_TRUE(coordinator->completeCommand(41));
+    }
+
+    /** @brief Wrong role/depth, overlapping sequences and changed symmetric choices fail closed. */
+    TEST(Test__MoEOverlayInferenceTransaction, HostedContinuationAdmissionRejectsDivergentOrExistingSequence)
+    {
+        using Transition = MoEOverlayInferenceTransactionCoordinator::HostedGraphSequenceTransition;
+        for (int fault = 0; fault < 6; ++fault)
+        {
+            SCOPED_TRACE(fault);
+            auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {std::make_shared<RecordingPublisher>(1)}, .graph_plan = coordinatorGraphPlan(1),
+                    .continuation_participant_count = 1, .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                    .max_transactions_per_command = 8, .max_mtp_draft_depth = 15});
+            if (fault != 0) ASSERT_TRUE(coordinator->beginCommand(command()));
+            auto transition = Transition::speculativeMTP(6);
+            if (fault == 1) transition = Transition::ordinaryDecode();
+            if (fault == 2) transition = Transition::terminal();
+            if (fault == 3) transition = Transition::speculativeMTP(16);
+            if (fault == 4) ASSERT_TRUE(coordinator->beginGraphSequence(1));
+            if (fault == 5) ASSERT_TRUE(coordinator->beginHostedContinuationGraphSequence(Transition::speculativeMTP(7)));
+            std::string error;
+            EXPECT_FALSE(coordinator->beginHostedContinuationGraphSequence(transition, &error));
+            EXPECT_FALSE(error.empty());
+        }
+    }
+
+    /** @test Failed terminal publication is fatal before a worker can return without native closure. */
+    TEST(Test__MoEOverlayInferenceTransaction, MissingOriginalGraphFailureTerminalIsProcessFatal)
+    {
+        EXPECT_DEATH(([] {
+            // Only this re-executed death child changes core policy. Its parent
+            // and production native processes retain their original limits.
+            const rlimit no_core{0, 0};
+            if (setrlimit(RLIMIT_CORE, &no_core) != 0) {
+                std::fprintf(stderr, "Death-test child could not disable core dumps\n");
+                std::_Exit(94);
+            }
+            auto publisher = std::make_shared<RecordingPublisher>(1);
+            auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
+                    .continuation_participant_count = 1,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                    .max_transactions_per_command = 2,
+                    .max_mtp_draft_depth = 3});
+            if (!coordinator->beginCommand(command()) || !coordinator->beginGraphSequence(0))
+                std::_Exit(91);
+            const MoEOverlayInferenceExecutionDescriptor decode{
+                .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                .placement_epoch = 41, .request_count = 1,
+                .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+            {
+                MoEOverlayInferenceParticipantGraphScope scope(coordinator, decode, 0);
+                if (!scope.ready() || !scope.active()) std::_Exit(92);
+                publisher->rejectNextPublish();
+                std::string error;
+                if (scope.armForHostExecution(&error) ||
+                    error != "injected original publisher rejection") std::_Exit(93);
+                // The actual coordinator has preserved its first error and
+                // cannot authenticate this scope's terminal after that failure.
+                // Only the actual scope destructor supplies the fatal boundary.
+            }
+            // Old log-only scope destruction reaches success immediately. No
+            // later coordinator/fixture destructor can satisfy this death test.
+            std::_Exit(0);
+        }()), "participant graph scope could not publish its failed terminal: injected original publisher rejection");
+    }
+
+    /** @test Proven original failed terminals retain ordinary cancellation both before and after arm. */
+    TEST(Test__MoEOverlayInferenceTransaction, OriginalGraphFailureTerminalRemainsRecoverable)
+    {
+        for (int repeat = 0; repeat < 20; ++repeat)
+            for (const bool arm : {false, true}) {
+                auto publisher = std::make_shared<RecordingPublisher>(1);
+                auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                    MoEOverlayInferenceTransactionCoordinator::Config{
+                        .publishers = {publisher},
+                        .graph_plan = coordinatorGraphPlan(1),
+                        .continuation_participant_count = 1,
+                        .ticket_authority_participant_index = 0,
+                        .participant_completion_boundaries = {
+                            MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                        .max_transactions_per_command = 1,
+                        .max_mtp_draft_depth = 3});
+                ASSERT_TRUE(coordinator->beginCommand(command()));
+                ASSERT_TRUE(coordinator->beginGraphSequence(0));
+                const MoEOverlayInferenceExecutionDescriptor decode{
+                    .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                    .placement_epoch = 41, .request_count = 1,
+                    .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+                {
+                    MoEOverlayInferenceParticipantGraphScope scope(coordinator, decode, 0);
+                    ASSERT_TRUE(scope.ready());
+                    ASSERT_TRUE(scope.active());
+                    if (arm) ASSERT_TRUE(scope.armForHostExecution());
+                    // Intentionally abandon the actual scope. Its original
+                    // failed terminal is accepted, so no process exit occurs.
+                }
+                EXPECT_EQ(publisher->publishCount(), arm ? 1u : 0u);
+                ASSERT_TRUE(coordinator->abortCommand(41, 17));
+                EXPECT_EQ(publisher->abortCount(), 1u);
+            }
+    }
+
 } // namespace llaminar2::test
+
+#include "RankLocalPublisherStateReplay.inc"
+
+#include "RankLocalSubmissionResetReplay.inc"
+
+namespace llaminar2::test
+{
+/** @test Native resource tokens consume actual original accepted/submitted slot ownership. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsRequireExactSubmittedPublication)
+{
+    static_assert(!std::is_default_constructible_v<MoEOverlayInferenceOriginalSlot>);
+    static_assert(!std::is_copy_constructible_v<MoEOverlayInferenceTransactionProtocol>);
+    static_assert(!std::is_move_constructible_v<MoEOverlayInferenceTransactionProtocol>);
+    auto owner=protocol(moeOverlayInferenceTransactionSlotCount(3));
+    const auto domain=owner.originalSlotDomain();
+    EXPECT_EQ(domain->slotCount(),owner.slotCount());
+    ASSERT_TRUE(owner.beginCommand(command()));
+    const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology(),command(),1,73,41,
+        MoEOverlayInferenceGraphRole::MainDecode,1,1,1);
+    EXPECT_THROW((void)owner.originalSubmittedSlot(ticket),std::invalid_argument);
+    const auto accepted=owner.accept(ticket);
+    ASSERT_TRUE(accepted.accepted());
+    EXPECT_THROW((void)owner.originalSubmittedSlot(ticket),std::invalid_argument);
+    ASSERT_TRUE(owner.markSubmitted(accepted.slot_index,ticket));
+    const auto token=owner.originalSubmittedSlot(ticket);
+    EXPECT_EQ(token.index(),accepted.slot_index);
+    EXPECT_EQ(token.ticket(),ticket);
+    EXPECT_EQ(token.domain(),domain);
+    EXPECT_NO_THROW(domain->requireCurrent(token));
+    EXPECT_NO_THROW(domain->requireActiveAdmission(token));
+    auto foreign=protocol(domain->slotCount());
+    EXPECT_THROW(foreign.originalSlotDomain()->requireCurrent(token),std::logic_error);
+    ASSERT_TRUE(owner.markReturnReady(accepted.slot_index,ticket));
+    EXPECT_NO_THROW(domain->requireCurrent(token));
+    EXPECT_THROW(domain->requireActiveAdmission(token),std::logic_error);
+    ASSERT_TRUE(owner.retire(accepted.slot_index,ticket));
+    EXPECT_THROW(domain->requireCurrent(token),std::logic_error);
+}
+
+/** @test Slot reuse/reset never authenticates a retained prior native publication. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsRejectPriorWrappedAndResetTicketsReplay)
+{
+    for(const int depth:{1,3})
+    {
+        const auto count=moeOverlayInferenceTransactionSlotCount(depth);
+        MoEOverlayInferenceTransactionProtocol owner({.topology=topology(),.slot_count=count,
+            .max_request_count=4,.max_rows_per_request=16,.max_mtp_draft_depth=depth});
+        const auto domain=owner.originalSlotDomain();
+        for(std::uint64_t request=1;request<=3;++request)
+        {
+            const auto active=command(request,request,41);
+            ASSERT_TRUE(owner.beginCommand(active));
+            std::optional<MoEOverlayInferenceOriginalSlot> first;
+            for(std::uint64_t ordinal=1;ordinal<=count*2u+1u;++ordinal)
+            {
+                const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology(),active,ordinal,ordinal,41,
+                    MoEOverlayInferenceGraphRole::MainDecode,1,1,1);
+                const auto accepted=owner.accept(ticket);ASSERT_TRUE(accepted.accepted());
+                ASSERT_TRUE(owner.markSubmitted(accepted.slot_index,ticket));
+                const auto token=owner.originalSubmittedSlot(ticket);
+                EXPECT_NO_THROW(domain->requireCurrent(token));
+                if(first) { EXPECT_THROW(domain->requireCurrent(*first),std::logic_error); }
+                else { first=token; }
+                ASSERT_TRUE(owner.markReturnReady(accepted.slot_index,ticket));
+                ASSERT_TRUE(owner.retire(accepted.slot_index,ticket));
+                EXPECT_THROW(domain->requireCurrent(token),std::logic_error);
+            }
+            const auto done=makeMoEOverlayInferenceTerminalTicket(topology(),active,count*2u+2u,41,
+                MoEOverlayInferenceTransactionAction::Complete);
+            EXPECT_TRUE(owner.accept(done).completed());
+            EXPECT_THROW(domain->requireCurrent(*first),std::logic_error);
+        }
+    }
+}
+
+/** @test Aborted work retains native teardown ownership; owner withdrawal invalidates every borrow. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsRetainAbortDrainAndWithdrawOwner)
+{
+    std::optional<MoEOverlayInferenceOriginalSlot> retained;
+    std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain;
+    {
+        auto owner=protocol(moeOverlayInferenceTransactionSlotCount(3));
+        domain=owner.originalSlotDomain();
+        const auto active=command();ASSERT_TRUE(owner.beginCommand(active));
+        const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology(),active,1,73,41,
+            MoEOverlayInferenceGraphRole::MainDecode,1,1,1);
+        const auto accepted=owner.accept(ticket);ASSERT_TRUE(accepted.accepted());
+        ASSERT_TRUE(owner.markSubmitted(accepted.slot_index,ticket));
+        retained=owner.originalSubmittedSlot(ticket);
+        const auto abort=makeMoEOverlayInferenceTerminalTicket(topology(),active,2,41,
+            MoEOverlayInferenceTransactionAction::Abort,17);
+        EXPECT_EQ(owner.accept(abort).status,MoEOverlayInferenceAdmissionStatus::Aborted);
+        EXPECT_NO_THROW(domain->requireCurrent(*retained));
+        EXPECT_THROW(domain->requireActiveAdmission(*retained),std::logic_error);
+        EXPECT_THROW((void)owner.originalSubmittedSlot(ticket),std::invalid_argument);
+    }
+    EXPECT_THROW(domain->requireCurrent(*retained),std::logic_error);
+}
+}
+
+namespace llaminar2::test
+{
+/** @test Immutable publication and absorbing Abort share the original metadata lock. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsSerializePublicationWithAbortReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        auto owner = protocol(moeOverlayInferenceTransactionSlotCount(3));
+        const auto active = command();
+        ASSERT_TRUE(owner.beginCommand(active));
+        const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+            topology(), active, 1, 73, 41, MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        const auto accepted = owner.accept(ticket);
+        ASSERT_TRUE(accepted.accepted());
+        ASSERT_TRUE(owner.markSubmitted(accepted.slot_index, ticket));
+        const auto token = owner.originalSubmittedSlot(ticket);
+        std::atomic<bool> publication_started{false};
+        std::atomic<bool> abort_attempted{false};
+        std::atomic<bool> published{false};
+        bool abort_observed_publication = false;
+        const auto abort = makeMoEOverlayInferenceTerminalTicket(
+            topology(), active, 2, 41, MoEOverlayInferenceTransactionAction::Abort, 17);
+        std::thread cancellation([&] {
+            while (!publication_started.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            abort_attempted.store(true, std::memory_order_release);
+            (void)owner.accept(abort);
+            abort_observed_publication = published.load(std::memory_order_acquire);
+        });
+        token.domain()->withActiveAdmission(token, [&] {
+            publication_started.store(true, std::memory_order_release);
+            while (!abort_attempted.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            published.store(true, std::memory_order_release);
+        });
+        cancellation.join();
+        EXPECT_TRUE(abort_observed_publication);
+        bool late_publication = false;
+        EXPECT_THROW(token.domain()->withActiveAdmission(token, [&] {
+            late_publication = true;
+        }), std::logic_error);
+        EXPECT_FALSE(late_publication);
+        EXPECT_NO_THROW(token.domain()->requireCurrent(token));
+    }
+}
+}

@@ -28,7 +28,7 @@ namespace llaminar2
         plan.description_ = PlanningExpertSampleDescription::resolve(source, request);
         const auto projections = request.projections();
         for (size_t i = 0; i < projections.size(); ++i)
-            plan.gguf_types_[i] = static_cast<uint32_t>(source.loader().getModel().findTensor(projections[i]->tensor_name)->type);
+            plan.gguf_types_[i] = static_cast<uint32_t>(source.loader().tensorInfo(projections[i]->tensor_name)->type);
         // The local path and the wire path use precisely the same validator.
         return deserialize(plan.serialize());
     }

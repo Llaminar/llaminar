@@ -13,8 +13,17 @@
  *
  * @author David Sanftenberg
  * @date December 2025
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <sys/resource.h>
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <vector>
@@ -524,12 +533,54 @@ TEST_F(Test__MPITopologyIntegration, ComputeWorldSizeMatchesParticipants)
     }
 }
 
+namespace
+{
+    /** @brief Reject MPI finalization before the actual entry closes native admission. */
+    int requireRetiredNativeEntry(MPI_Comm, int, void *, void *) noexcept
+    {
+        try { llaminar2::GPUDeviceProcessLifetime::requireActive(); }
+        catch (const std::logic_error &) { return MPI_SUCCESS; }
+        catch (...) { std::fputs("[ERROR] Cannot authenticate native retirement at MPI finalization\n", stderr); std::abort(); }
+        std::fputs("[ERROR] MPI finalized before the custom entry retired native admission\n", stderr);
+        std::abort();
+    }
+}
+
+/** @test The real custom main admits discovery and retires before MPI finalization. */
+TEST(MPITopologyProcessLifetime, MainOwnsNativeAdmissionBeforeDiscovery)
+{
+    const rlimit no_core{0, 0};
+    ASSERT_EQ(setrlimit(RLIMIT_CORE, &no_core), 0);
+    int initialized = 0, finalized = 0;
+    ASSERT_EQ(MPI_Initialized(&initialized), MPI_SUCCESS);
+    ASSERT_EQ(MPI_Finalized(&finalized), MPI_SUCCESS);
+    ASSERT_EQ(initialized, 1);
+    ASSERT_EQ(finalized, 0);
+    // Do not create another process owner here: the test must fail if its real
+    // custom entry has no lexical authority. This lease performs no GPU query.
+    ASSERT_NO_THROW(llaminar2::GPUDeviceProcessLifetime::requireActive());
+    { auto native_admission = llaminar2::GPUDeviceProcessLifetime::acquireNativeContext(); }
+    int key = MPI_KEYVAL_INVALID;
+    ASSERT_EQ(MPI_Comm_create_keyval(MPI_COMM_NULL_COPY_FN,
+        requireRetiredNativeEntry, &key, nullptr), MPI_SUCCESS);
+    static int retirement_marker = 1;
+    ASSERT_EQ(MPI_Comm_set_attr(MPI_COMM_SELF, key, &retirement_marker), MPI_SUCCESS);
+    // MPI retains the attribute's callback until COMM_SELF retirement during
+    // MPI_Finalize, independently of this test body and key ownership.
+    ASSERT_EQ(MPI_Comm_free_keyval(&key), MPI_SUCCESS);
+}
+
 // MPI-aware main function
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

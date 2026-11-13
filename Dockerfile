@@ -55,7 +55,7 @@ ARG LLAMINAR_BUILD_MODEL_PARITY_MATRICES=ON
 ARG LLAMINAR_TEST_RUNNER_INVENTORY=full-matrix
 ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON
 ARG RCCL_GIT_REF=rocm-7.2.4
-ARG RCCL_GPU_TARGETS=gfx906
+ARG RCCL_GPU_TARGETS=
 ARG ROCM_RUNTIME_GPU_TARGETS=
 ARG LLAMINAR_SOURCE_TREE=
 
@@ -96,24 +96,60 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-cuda.sh \
      scripts/docker/install-nccl.sh \
      scripts/docker/install-rocm.sh \
+     scripts/docker/install-rocm-lto-linker.sh \
      scripts/docker/rocm-release.env \
      scripts/docker/configure-rocm-repository.sh \
      scripts/docker/install-hip-graph-runtime.sh \
-     scripts/docker/install-rocblas-gfx906.sh \
+     scripts/docker/install-rocr-helper-numa.sh \
+     scripts/docker/install-rocm-smi-compat.sh \
+     scripts/docker/install-rocblas.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
+# The compiler repair is builder-only; both installer layouts retain the
+# canonical spill parser as the sibling scripts/build source of truth.
+COPY scripts/build/gpu_spill_guard.py /tmp/build/gpu_spill_guard.py
+COPY scripts/docker/llvm-lto-linker/ /tmp/install-scripts/llvm-lto-linker/
+COPY scripts/docker/patches/llvm-parallel-lto-remarks.patch \
+     /tmp/install-scripts/patches/llvm-parallel-lto-remarks.patch
+COPY scripts/docker/patches/llvm-gvn-filtered-remarks.patch \
+     /tmp/install-scripts/patches/llvm-gvn-filtered-remarks.patch
 # CUDA's NCCL installer consumes this patch during early toolchain setup.
 COPY scripts/docker/patches/nccl-capture-reentry.patch \
      /tmp/install-scripts/patches/nccl-capture-reentry.patch
 COPY scripts/docker/patches/nccl-device-live-rows.patch \
      /tmp/install-scripts/patches/nccl-device-live-rows.patch
+COPY scripts/docker/patches/nccl-gin-auto-selection.patch \
+     /tmp/install-scripts/patches/nccl-gin-auto-selection.patch
+COPY scripts/docker/nccl-gin-selection/ /tmp/install-scripts/nccl-gin-selection/
+COPY scripts/docker/patches/nccl-created-thread-ownership.patch \
+     /tmp/install-scripts/patches/nccl-created-thread-ownership.patch
+COPY scripts/docker/nccl-thread-lifetime/ /tmp/install-scripts/nccl-thread-lifetime/
+COPY scripts/docker/native-completed-broadcast/ /tmp/install-scripts/native-completed-broadcast/
+COPY scripts/docker/patches/nccl-device-completed-broadcast.patch \
+     /tmp/install-scripts/patches/nccl-device-completed-broadcast.patch
+COPY scripts/docker/shared-file-lifecycle/ /tmp/install-scripts/shared-file-lifecycle/
+COPY scripts/docker/patches/nccl-partial-file-cleanup.patch \
+     /tmp/install-scripts/patches/nccl-partial-file-cleanup.patch
 COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
-     scripts/docker/patches/rocm-hip-host-queue-native-stack.patch \
-     scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch \
      scripts/docker/patches/rocm-hip-sdma-event-publication.patch \
      scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch \
      scripts/docker/patches/rocm-hip-event-producer-lifetime.patch \
+     scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch \
+     scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch \
+     scripts/docker/patches/rocm-hip-timed-sdma-marker.patch \
+     scripts/docker/patches/rocm-hip-capture-retirement-membership.patch \
      /tmp/install-scripts/patches/
+COPY scripts/docker/patches/rocm-rocr-helper-numa.patch /tmp/install-scripts/patches/rocm-rocr-helper-numa.patch
+COPY scripts/docker/rocr-helper-numa/ /tmp/install-scripts/rocr-helper-numa/
+COPY scripts/docker/patches/rocm-rocr-deferred-sdma-profiling.patch \
+     /tmp/install-scripts/patches/rocm-rocr-deferred-sdma-profiling.patch
+COPY scripts/docker/rocr-deferred-sdma/ /tmp/install-scripts/rocr-deferred-sdma/
+COPY scripts/docker/hip-preferred-queue/proof.py \
+     scripts/docker/hip-preferred-queue/selector-contract.cpp.in \
+     /tmp/install-scripts/hip-preferred-queue/
+COPY scripts/docker/hip-end-capture/proof.py \
+     scripts/docker/hip-end-capture/end-capture-contract.cpp.in \
+     /tmp/install-scripts/hip-end-capture/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
@@ -132,7 +168,8 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
     else \
         echo "==> [cutlass] skipped because CUDA is disabled"; \
     fi
-RUN rm -rf /tmp/install-scripts
+# RCCL final-link certification below still consumes the staged linker helper.
+# Retire the shared installer tree only after that certificate is complete.
 
 # Cloud CI exports this completed SDK checkpoint before starting RCCL. A
 # later dependency proof or source compilation failure cannot discard it.
@@ -142,8 +179,8 @@ WORKDIR /src
 
 # RCCL — build in a dedicated layer so the ROCm collective library is visible,
 # cacheable, and not hidden inside Llaminar's CMake configure step. The source
-# build is enabled by default for release images because packaged RCCL has no
-# usable gfx906 binaries on MI50/MI60 systems. RCCL_GIT_REF pins our collective
+# build is enabled by default for release images to cover every declared native
+# ROCm target, including MI50/MI60. RCCL_GIT_REF pins our collective
 # source ABI independently of the SDK; rebuild it with the active HIP compiler.
 # MSCCL generated kernels are optional for standard collectives and make source
 # builds dramatically slower, so release images default them off.
@@ -153,24 +190,40 @@ ARG RCCL_ENABLE_MSCCL_KERNEL=OFF
 # an explicit empty override remains the full upstream RCCL developer build.
 ARG RCCL_ONLY_FUNCS=default
 COPY scripts/docker/rccl-functions.txt /src/rccl-functions.txt
+COPY scripts/docker/rocm-release.env /src/scripts/docker/rocm-release.env
 # The capture patch is consumed only by the RCCL source build. Stage it before
 # the ISA boundary below, so its immutable collective layer is shared by both
 # shipping CPU variants.
 COPY scripts/docker/apply-rccl-capture-patch.sh /tmp/install-scripts/
+COPY scripts/docker/apply-rccl-patch-chain.py /tmp/install-scripts/
 COPY scripts/docker/patches/rccl-hip-capture-event-wait.patch \
      /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch
 COPY scripts/docker/patches/rccl-device-live-rows.patch \
      /tmp/install-scripts/patches/rccl-device-live-rows.patch
 COPY scripts/docker/patches/rccl-native-host-storage.patch \
      /tmp/install-scripts/patches/rccl-native-host-storage.patch
+COPY scripts/docker/patches/rccl-partial-file-cleanup.patch \
+     /tmp/install-scripts/patches/rccl-partial-file-cleanup.patch
+COPY scripts/docker/patches/rccl-created-thread-lifetime.patch \
+     /tmp/install-scripts/patches/rccl-created-thread-lifetime.patch
 COPY scripts/docker/patches/rccl-communicator-protocol-defaults.patch \
      /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch
+COPY scripts/docker/patches/rccl-collective-selector-taxonomy.patch \
+     /tmp/install-scripts/patches/rccl-collective-selector-taxonomy.patch
+COPY scripts/docker/patches/rccl-small-allgather-ll-policy.patch \
+     /tmp/install-scripts/patches/rccl-small-allgather-ll-policy.patch
+COPY scripts/docker/patches/rccl-sdk-legacy-smi.patch /tmp/install-scripts/patches/rccl-sdk-legacy-smi.patch
+COPY scripts/docker/patches/rccl-user-p2p-override.patch /tmp/install-scripts/patches/rccl-user-p2p-override.patch
+COPY scripts/docker/patches/rccl-device-completed-broadcast.patch \
+     /tmp/install-scripts/patches/rccl-device-completed-broadcast.patch
 # ccache hashes the compiler and full command line, so one 50 GB shared cache
 # is correct across both ISA lanes. It lives in the persistent named BuildKit
 # worker hosted by the one host Docker daemon; locked sharing keeps independent
 # builds coherent without exposing Docker's graph store to another daemon.
 RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     set -e; \
+    . /src/scripts/docker/rocm-release.env; \
+    RCCL_GPU_TARGETS="${RCCL_GPU_TARGETS:-${LLAMINAR_ROCM_GPU_TARGETS}}"; \
     rccl_started_epoch="$(date +%s)"; \
     rccl_build_funcs="${RCCL_ONLY_FUNCS}"; \
     if [ "${rccl_build_funcs}" = "default" ]; then rccl_build_funcs="$(cat /src/rccl-functions.txt)"; fi; \
@@ -195,10 +248,17 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         rm -f /tmp/rccl.tar.gz; \
         printf '%s\n' "${RCCL_GIT_REF}" > /src/external/rccl/.llaminar-rccl-source-ref; \
         bash /tmp/install-scripts/apply-rccl-capture-patch.sh /src/external/rccl; \
+        python3 /tmp/install-scripts/llvm-lto-linker/artifact.py configure \
+            --sdk "${ROCM_PATH}" --pins /src/scripts/docker/rocm-release.env \
+            --spill-guard /tmp/build/gpu_spill_guard.py \
+            --library /src/external/rccl/build/librccl.so.1.0 \
+            --architectures "${RCCL_GPU_TARGETS}" \
+            --write-cache /src/external/rccl/build/llaminar-final-link.cmake; \
         echo "==> [rccl] configure for GPU_TARGETS=${RCCL_GPU_TARGETS}"; \
         if [ -n "${rccl_build_funcs}" ]; then \
             echo "==> [rccl] ONLY_FUNCS=${rccl_build_funcs}"; \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
+                -C /src/external/rccl/build/llaminar-final-link.cmake \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
                 -DCMAKE_C_COMPILER="${ROCM_PATH}/bin/amdclang" \
@@ -206,11 +266,13 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
                 -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
                 -DROCM_PATH="${ROCM_PATH}" \
                 -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
+                -DGPU_BUILD_TARGETS="${RCCL_GPU_TARGETS}" \
                 -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
                 -DONLY_FUNCS="${rccl_build_funcs}" \
                 -DBUILD_TESTS=OFF; \
         else \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
+                -C /src/external/rccl/build/llaminar-final-link.cmake \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
                 -DCMAKE_C_COMPILER="${ROCM_PATH}/bin/amdclang" \
@@ -218,6 +280,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
                 -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
                 -DROCM_PATH="${ROCM_PATH}" \
                 -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
+                -DGPU_BUILD_TARGETS="${RCCL_GPU_TARGETS}" \
                 -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
                 -DBUILD_TESTS=OFF; \
         fi; \
@@ -233,9 +296,26 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         rccl_capture_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch | cut -d ' ' -f 1)"; \
         rccl_rows_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-device-live-rows.patch | cut -d ' ' -f 1)"; \
         rccl_storage_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-native-host-storage.patch | cut -d ' ' -f 1)"; \
+        rccl_shm_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-partial-file-cleanup.patch | cut -d ' ' -f 1)"; \
+        rccl_thread_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-created-thread-lifetime.patch | cut -d ' ' -f 1)"; \
         rccl_protocol_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch | cut -d ' ' -f 1)"; \
-        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-protocol-${rccl_protocol_patch_sha}" \
-            > /src/external/rccl/build/.llaminar-rccl-commit; \
+        rccl_selector_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-collective-selector-taxonomy.patch | cut -d ' ' -f 1)"; \
+        rccl_small_allgather_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-small-allgather-ll-policy.patch | cut -d ' ' -f 1)"; \
+        rccl_smi_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-sdk-legacy-smi.patch | cut -d ' ' -f 1)"; \
+        rccl_user_p2p_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-user-p2p-override.patch | cut -d ' ' -f 1)"; \
+        rccl_completed_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-device-completed-broadcast.patch | cut -d ' ' -f 1)"; \
+        rccl_target_hash="$(printf '%s' "${RCCL_GPU_TARGETS}" | sha256sum | cut -d ' ' -f 1)"; \
+        rccl_lto_receipt_sha="$(sha256sum "${LLAMINAR_ROCM_LTO_LINKER_PREFIX}/share/llaminar-llvm-lto/receipt.json" | cut -d ' ' -f 1)"; \
+        rccl_lto_producer_sha="$(sha256sum /tmp/install-scripts/llvm-lto-linker/artifact.py | cut -d ' ' -f 1)"; \
+        printf '%s\n' "p2p-${rccl_user_p2p_patch_sha}-targets-${rccl_target_hash}-llvm-lto-${rccl_lto_receipt_sha}-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-smi-${rccl_smi_patch_sha}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}" \
+            > /src/external/rccl/build/.llaminar-rccl-commit.pending; \
+        python3 /tmp/install-scripts/llvm-lto-linker/artifact.py compile \
+            --sdk "${ROCM_PATH}" \
+            --spec /src/external/rccl/build/llaminar-final-allocation/configuration.json \
+            --report /src/external/rccl/build/llaminar-final-allocation.json \
+            --receipt /src/external/rccl/build/.llaminar-rccl-commit.pending; \
+        mv /src/external/rccl/build/.llaminar-rccl-commit.pending \
+            /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; elapsed_seconds=$(( $(date +%s) - rccl_started_epoch )); library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
     elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         echo "==> [rccl] source build disabled; runtime image will stage packaged RCCL"; \
@@ -245,12 +325,22 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
 
 # Install the selected collective dependency before compiling either binary.
 # The runtime stage copies these same bytes; tests must not accidentally load
-# the packaged gfx906 library merely because their checkout lives under /src.
+# a different packaged library merely because their checkout lives under /src.
 RUN set -e; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         install -m 0755 /src/external/rccl/build/librccl.so.1.0 /usr/local/lib/librccl.so.1.0; \
         ln -sf librccl.so.1.0 /usr/local/lib/librccl.so.1; \
         ln -sf librccl.so.1 /usr/local/lib/librccl.so; \
+        mkdir -p /usr/local/share/llaminar-rccl; \
+        cp /src/external/rccl/build/llaminar-final-allocation.json \
+            /usr/local/share/llaminar-rccl/final-allocation.json; \
+        cp /src/external/rccl/build/.llaminar-rccl-commit \
+            /usr/local/share/llaminar-rccl/build.txt; \
+        mkdir -p /src/rccl-allocation-evidence; \
+        cp /src/external/rccl/build/llaminar-final-allocation.json \
+            /src/rccl-allocation-evidence/final-allocation.json; \
+        cp /src/external/rccl/build/.llaminar-rccl-commit \
+            /src/rccl-allocation-evidence/build.txt; \
         ldconfig; \
     fi
 
@@ -409,7 +499,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         integration_started_epoch="$(date +%s)"; \
         RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
         if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
-            RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"; \
+            RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1 -DRCCL_FINAL_ALLOCATION_REPORT=/src/rccl-allocation-evidence/final-allocation.json -DRCCL_FINAL_ALLOCATION_RECEIPT=/src/rccl-allocation-evidence/build.txt"; \
         fi; \
         echo "==> [integration] cmake configure" \
      && cmake -B build_v2_integration -S src/v2 -G Ninja \
@@ -466,7 +556,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     release_started_epoch="$(date +%s)"; \
     RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
-        RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"; \
+        RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1 -DRCCL_FINAL_ALLOCATION_REPORT=/src/rccl-allocation-evidence/final-allocation.json -DRCCL_FINAL_ALLOCATION_RECEIPT=/src/rccl-allocation-evidence/build.txt"; \
     fi; \
     echo "==> [release] cmake configure" \
  && cmake -B build_v2_release -S src/v2 -G Ninja \
@@ -497,8 +587,10 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas \
+ && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas /src/runtime-hip /src/runtime-rocr /src/runtime-rocm-smi \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
+ && cp build_v2_release/llaminar_mpi_session /src/runtime-bin/ \
+ && cp -r build_v2_release/llaminar_mpi_components /src/runtime-bin/ \
  && cp build_v2_release/llaminar_native_tool_evidence_decoder /src/runtime-bin/ \
  && cp build_v2_release/llaminar_model_kld_canary /src/runtime-bin/ \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
@@ -509,8 +601,9 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
-        cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/libamdhip64.so.7; \
-        cp -r "${ROCM_PATH}/share/licenses/llaminar-hip" /src/runtime-licenses/; \
+        HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh; \
+        ROCR_RUNTIME_STAGE_PREFIX=/src/runtime-rocr bash scripts/docker/install-rocr-helper-numa.sh; \
+        ROCM_SMI_STAGE_PREFIX=/src/runtime-rocm-smi bash scripts/docker/install-rocm-smi-compat.sh; \
         mkdir -p /src/runtime-rocblas/lib/rocblas /src/runtime-rocblas/share/llaminar; \
         cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5; \
         ln -s librocblas.so.5 /src/runtime-rocblas/lib/librocblas.so; \
@@ -615,8 +708,14 @@ ENV LLAMINAR_CPU_ISA=${LLAMINAR_CPU_ISA}
 # installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
 COPY --from=builder /src/runtime-bin/ /usr/local/bin/
 COPY --from=builder /src/runtime-libs/ /usr/local/lib/
+# Replace the SDK package's HIP file/aliases with its authenticated builder
+# component. RUNPATH, dependent $ORIGIN paths and ldconfig now name one owner;
+# LD_LIBRARY_PATH is not required to bypass a stock SDK copy.
+COPY --from=builder /src/runtime-hip/ /opt/rocm-sdk/
+COPY --from=builder /src/runtime-rocr/ /opt/rocm-sdk/
+COPY --from=builder /src/runtime-rocm-smi/ /opt/rocm-sdk/
 COPY --from=builder /src/runtime-licenses/ /usr/local/share/licenses/
-# Keep the rocBLAS DSO and its gfx906 Tensile tree at their SDK-relative paths.
+# Keep the rocBLAS DSO and its shipping-target Tensile tree at their SDK-relative paths.
 # The DSO resolves code objects relative to itself, not from a foreign package.
 # This directory is empty for a CPU/CUDA-only image and has no compiler closure.
 COPY --from=builder /src/runtime-rocblas/ /opt/rocm-sdk/

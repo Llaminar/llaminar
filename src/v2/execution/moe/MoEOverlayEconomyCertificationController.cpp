@@ -6,6 +6,8 @@
  * ordered readiness exchange, immutable profile installation, and routing
  * evidence rebase. A cold-format price remains missing until a real
  * participant-local measurement supplies it.
+ * Stage service coordinates stay model-global; only compact vector offsets
+ * subtract the authenticated first model layer.
  */
 
 #include "MoEOverlayEconomyCertificationController.h"
@@ -130,6 +132,19 @@ namespace llaminar2
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay";
 
+        if(config_.prepared_target_service_plan) {
+            const auto& plan=config_.prepared_target_service_plan;
+            const auto snapshot=config_.authority->snapshot();
+            if(!plan->authenticates(plan) || plan->snapshot().get()!=snapshot.get() ||
+                plan->snapshot().owner_before(snapshot) || snapshot.owner_before(plan->snapshot()) ||
+                plan->catalog().get()!=config_.layer_catalog.get() || plan->catalog().owner_before(config_.layer_catalog) ||
+                config_.layer_catalog.owner_before(plan->catalog()) || plan->topology()!=config_.production_topology ||
+                !config_.prepared_service_measurements.empty() || config_.prepared_service_world_rank<0 ||
+                (config_.evidence_exchange && config_.prepared_service_world_rank!=config_.evidence_exchange->worldRank()))
+                throw std::invalid_argument("Prepared target certification has foreign source/provenance or mixed live input");
+            plan->requireLocalSamples(config_.prepared_target_service_measurements,config_.prepared_service_world_rank);
+        }else if(!config_.prepared_target_service_measurements.empty())
+            throw std::invalid_argument("Prepared target observations omitted original declarations");
         if (!config_.prepared_service_measurements.empty())
         {
             (void)config_.layer_catalog->serviceEvidenceGaps(
@@ -140,10 +155,13 @@ namespace llaminar2
 
         const auto snapshot = config_.authority->snapshot();
         if (!snapshot || !snapshot->valid() ||
+            config_.model_metadata.first_model_layer != snapshot->firstModelLayer() ||
+            config_.production_topology.firstModelLayer() != config_.model_metadata.first_model_layer ||
+            config_.layer_catalog->firstModelLayer() != config_.model_metadata.first_model_layer ||
             config_.model_metadata.num_layers !=
-                snapshot->layered_ownership.layerCount() ||
+                snapshot->layerCount() ||
             config_.model_metadata.num_experts !=
-                snapshot->layered_ownership.expertCount() ||
+                snapshot->expertCount() ||
             config_.production_topology.layerCount() !=
                 static_cast<std::size_t>(
                     config_.model_metadata.num_layers) ||
@@ -155,8 +173,8 @@ namespace llaminar2
         }
 
         std::vector<int> global_participants;
-        global_participants.reserve(snapshot->owner_map.participants().size());
-        for (const auto &participant : snapshot->owner_map.participants())
+        global_participants.reserve(snapshot->placementOwnerMap().participants().size());
+        for (const auto &participant : snapshot->placementOwnerMap().participants())
             global_participants.push_back(participant.participant_id);
         std::sort(global_participants.begin(), global_participants.end());
         if (!config_.evidence_exchange &&
@@ -176,7 +194,7 @@ namespace llaminar2
                     "Distributed ExpertOverlay certification requires valid evidence-exchange membership");
             }
             for (const auto &participant :
-                 snapshot->owner_map.participants())
+                 snapshot->placementOwnerMap().participants())
             {
                 if (!participant.world_rank_known ||
                     participant.world_rank < 0 ||
@@ -204,7 +222,7 @@ namespace llaminar2
         }
         if (local_readiness ==
                 MoEOverlayServiceEvidenceReadiness::Ready &&
-            !ready_local_service_evidence_)
+            !ready_local_service_evidence_ && !config_.prepared_target_service_plan)
         {
             throw std::logic_error(
                 "ExpertOverlay ready service round requires a retained local snapshot");
@@ -349,8 +367,10 @@ namespace llaminar2
                     throw std::logic_error(
                         "Completed ExpertOverlay calibration omitted its sealed evidence");
                 }
-                expanded_migration_measurements_ =
-                    config_.layer_catalog->expand(*representatives);
+                expanded_migration_measurements_ = config_.prepared_target_service_plan
+                    ? config_.layer_catalog->expand(*representatives,
+                        config_.prepared_target_service_plan->snapshot())
+                    : config_.layer_catalog->expand(*representatives);
                 next_service_readiness_attempt_ = {};
                 state_.store(
                     MoEOverlayEconomyCertificationState::
@@ -406,13 +426,16 @@ namespace llaminar2
                 }
                 if (global_readiness !=
                     MoEOverlayServiceEvidenceReadiness::Ready ||
-                    !ready_local_service_evidence_)
+                    (!ready_local_service_evidence_ && !config_.prepared_target_service_plan))
                 {
                     throw std::logic_error(
                         "ExpertOverlay ready service round omitted its retained local snapshot");
                 }
-                if (!config_.evidence_exchange->beginService(
-                        *ready_local_service_evidence_, &error))
+                const bool began=config_.prepared_target_service_plan
+                    ?config_.evidence_exchange->beginPreparedService(config_.prepared_target_service_plan,
+                        config_.prepared_target_service_measurements,&error)
+                    :config_.evidence_exchange->beginService(*ready_local_service_evidence_,&error);
+                if (!began)
                 {
                     throw std::runtime_error(
                         error.empty()
@@ -430,6 +453,14 @@ namespace llaminar2
                 MoEOverlayEconomyCertificationState::
                     ExchangingServiceEvidence)
             {
+                if(config_.prepared_target_service_plan) {
+                    std::vector<MoEOverlayPreparedTargetServiceTotals> complete;
+                    std::string error;const auto progress=config_.evidence_exchange->pollPreparedService(&complete,&error);
+                    if(progress==MoEOverlayResidencyWaveProgress::Pending)return;
+                    if(progress!=MoEOverlayResidencyWaveProgress::Ready)
+                        throw std::runtime_error(error.empty()?"Prepared target service exchange failed":error);
+                    composePreparedTargetEvidence(std::move(complete));return;
+                }
                 std::vector<MoEOverlayParticipantLayerServiceTotals>
                     complete_service;
                 std::string error;
@@ -453,9 +484,9 @@ namespace llaminar2
                 }
                 std::vector<int> global_participant_ids;
                 global_participant_ids.reserve(
-                    snapshot->owner_map.participants().size());
+                    snapshot->placementOwnerMap().participants().size());
                 for (const auto &participant :
-                     snapshot->owner_map.participants())
+                     snapshot->placementOwnerMap().participants())
                 {
                     global_participant_ids.push_back(
                         participant.participant_id);
@@ -503,6 +534,15 @@ namespace llaminar2
                         MoEOverlayEconomyCertificationState::Stopped,
                         std::memory_order_release);
                 }
+                return;
+            }
+
+            if(config_.prepared_target_service_plan) {
+                // One immutable setup corpus; never snapshot or fill with live
+                // packet totals whose ingress/return boundary is different.
+                if(config_.evidence_exchange)
+                    beginServiceReadinessRound(MoEOverlayServiceEvidenceReadiness::Ready);
+                else composePreparedTargetEvidence(config_.prepared_target_service_measurements);
                 return;
             }
 
@@ -710,9 +750,12 @@ namespace llaminar2
                     std::move(raw_service),
                     config_.production_topology,
                     *config_.layer_catalog);
+        // Service certification still requires complete whole-participant costs.
+        // Typed cohort rows cannot be priced as one representative member.
         measurements.directed_migration =
-            MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(
-                expanded_migration_measurements_->rows);
+            MoEOverlayEconomyProfileComposer::checkedWholeMigrationCosts(
+                MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(
+                    expanded_migration_measurements_->rows));
 
         const auto snapshot = config_.authority->snapshot();
         if (!snapshot || !snapshot->valid() || !snapshot->placement_plan)
@@ -726,6 +769,25 @@ namespace llaminar2
             snapshot->owner_map,
             std::move(measurements),
             config_.economy_policy);
+        completeProfiles(std::move(profiles));
+    }
+
+    void MoEOverlayEconomyCertificationController::composePreparedTargetEvidence(
+        std::vector<MoEOverlayPreparedTargetServiceTotals> rows)
+    {
+        if(!config_.prepared_target_service_plan || !expanded_migration_measurements_ || !expanded_migration_measurements_->valid())
+            throw std::logic_error("Prepared target composition lost complete original movement/service declarations");
+        auto service=MoEOverlayEconomyProfileComposer::composePreparedService(config_.prepared_target_service_plan,rows);
+        auto movement=std::make_shared<MoEOverlayMigrationCostProfile>();
+        movement->identity=expanded_migration_measurements_->identity;
+        movement->costs=MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(expanded_migration_measurements_->rows);
+        completeProfiles({std::move(service),std::move(movement),config_.economy_policy});
+    }
+
+    void MoEOverlayEconomyCertificationController::completeProfiles(MoEOverlayCertifiedEconomyProfiles profiles)
+    {
+        const auto snapshot=config_.authority->snapshot();
+        if(!snapshot || !snapshot->valid())throw std::logic_error("Economy profile completion lost original snapshot");
         if (!profiles.valid())
         {
             throw std::logic_error(
@@ -783,7 +845,7 @@ namespace llaminar2
             config_.perf_device,
             {{"blocking_inference", "false"},
              {"layer_equivalence", config_.layer_catalog->identity()},
-             {"service_source", "live_prepared_experts"},
+             {"service_source", config_.prepared_target_service_plan?"prepared_input_to_canonical_output":"live_prepared_experts"},
              {"movement_source", "real_non_publishable_waves"},
              {"distributed",
               config_.evidence_exchange ? "true" : "false"},
@@ -809,22 +871,20 @@ namespace llaminar2
         }
 
         const std::size_t participant_count =
-            profile.participant_costs.empty()
+            profile.target_costs.empty()
                 ? 0u
-                : profile.participant_costs.size() / layer_count;
+                : profile.target_costs.size() / layer_count;
         if (participant_count == 0u ||
-            profile.participant_costs.size() !=
+            profile.target_costs.size() !=
                 participant_count * layer_count)
         {
             throw std::invalid_argument(
                 "ExpertOverlay service diagnostics received incomplete participant geometry");
         }
-        for (const auto &row : profile.participant_costs)
+        for (const auto &row : profile.target_costs)
         {
-            if (row.participant_id < 0 || row.layer < 0 ||
-                static_cast<std::size_t>(row.participant_id) >=
-                    participant_count ||
-                static_cast<std::size_t>(row.layer) >= layer_count)
+            if (row.target.isAbsent() || row.layer < config_.model_metadata.first_model_layer ||
+                static_cast<std::size_t>(row.layer - config_.model_metadata.first_model_layer) >= layer_count)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay service diagnostics received an invalid participant coordinate");
@@ -845,12 +905,12 @@ namespace llaminar2
                 }
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
-                    "certified_participant_service_ns_per_activation",
+                    row.target.isCPUCohort()?"certified_target_service_ns_per_activation":"certified_participant_service_ns_per_activation",
                     static_cast<double>(cost),
                     "maintenance",
                     config_.perf_device,
-                    {{"participant",
-                      std::to_string(row.participant_id)},
+                    {{row.target.isCPUCohort()?"target":"participant",
+                      std::to_string(row.target.word())},
                      {"layer", std::to_string(row.layer)},
                      {"source", serviceSourceName(phase)},
                      {"service_profile", profile.identity}});
@@ -861,16 +921,16 @@ namespace llaminar2
             profile.costs.size(), nullptr);
         for (const auto &row : profile.costs)
         {
-            if (row.tier_index < 0 || row.layer < 0 ||
+            if (row.tier_index < 0 || row.layer < config_.model_metadata.first_model_layer ||
                 static_cast<std::size_t>(row.tier_index) >= tier_count ||
-                static_cast<std::size_t>(row.layer) >= layer_count)
+                static_cast<std::size_t>(row.layer - config_.model_metadata.first_model_layer) >= layer_count)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay crossover diagnostics received an invalid service coordinate");
             }
             const std::size_t offset =
                 static_cast<std::size_t>(row.tier_index) * layer_count +
-                static_cast<std::size_t>(row.layer);
+                static_cast<std::size_t>(row.layer - config_.model_metadata.first_model_layer);
             if (rows[offset] != nullptr)
             {
                 throw std::invalid_argument(
@@ -900,7 +960,7 @@ namespace llaminar2
                  ++phase)
             {
                 if (!profile.production_topology.requiresServiceEvidence(
-                        static_cast<int>(layer), phase))
+                        config_.model_metadata.first_model_layer + static_cast<int>(layer), phase))
                     continue;
                 for (std::size_t rank = 1;
                      rank < priority_order.size();
@@ -927,7 +987,7 @@ namespace llaminar2
                         1.0,
                         "maintenance",
                         config_.perf_device,
-                        {{"layer", std::to_string(layer)},
+                        {{"layer", std::to_string(config_.model_metadata.first_model_layer + static_cast<int>(layer))},
                          {"source", serviceSourceName(phase)},
                          {"preferred_tier", std::to_string(preferred)},
                          {"preferred_priority",
@@ -1018,8 +1078,8 @@ namespace llaminar2
     {
         std::uint64_t hash = kFNV1a64OffsetBasis;
         hashString(hash, config_.layer_catalog->identity());
-        for (int layer = 0;
-             layer < config_.model_metadata.num_layers;
+        for (int layer = config_.model_metadata.first_model_layer;
+             layer < config_.model_metadata.first_model_layer + config_.model_metadata.num_layers;
              ++layer)
         {
             for (const bool reachable :

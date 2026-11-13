@@ -9,6 +9,7 @@
 
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "../../../fixtures/moe/MoEOverlayParticipantMigrationTestAccess.h"
 #include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -226,6 +227,18 @@ namespace
         bool aborted_ = false;
     };
 
+    /** @brief Checked singleton geometry for identity-only component transfer fixtures. */
+    std::shared_ptr<MoEOverlayPreparedProjectionCompletion> identityCompletion(
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
+        ExpertTierWeightProjection projection, std::shared_ptr<ITensorGemm> engine)
+    {
+        const MoEExpertProjectionOwnership::Projection whole{
+            MoEProjectionResidence::ExpertOwner, 1, 1, 0, 1, 0, 1};
+        return std::make_shared<MoEOverlayPreparedProjectionCompletion>(
+            std::vector{ExpertTierWeightProjectionIntersection::between(whole, whole)},
+            std::move(arrival), projection, [engine = std::move(engine)] { return engine; });
+    }
+
     /** @brief Scripted physical provider that publishes complete or partial arrivals. */
     class IdentityTransferProvider final
         : public IMoEOverlayParticipantTransferProvider
@@ -250,37 +263,40 @@ namespace
             {
                 auto &entry = prepared.migrations[index];
                 const auto &migration = transaction.migrations[index];
+                entry.operations.resize(3);
+                for(size_t role=0;role<3;++role)
+                    entry.operations[role] = {
+                        .projection=static_cast<ExpertTierWeightProjection>(role),
+                        .destination_participant=migration.destination.owner_participant,
+                        .source_participant=migration.source.owner_participant};
+                std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival;
                 if (!std::binary_search(
                         local_destination_participants.begin(),
                         local_destination_participants.end(),
                         migration.destination.owner_participant))
                 {
-                    for (auto &projection : entry.projections)
+                    for (auto &piece : entry.operations)
                     {
-                        projection =
+                        piece.operation =
                             std::make_unique<ReadyProjectionTransfer>();
                     }
                     continue;
                 }
 
-                entry.destination_arrival =
-                    std::make_shared<MoEOverlayPreparedExpertArrival>();
+                arrival = std::make_shared<MoEOverlayPreparedExpertArrival>();
+                entry.destination_arrivals.push_back({migration.destination.owner_participant,arrival});
                 const auto engines = payload(
                     2000 + migration.destination.owner_participant * 100 +
                     migration.expert_id * 10);
-                entry.projections[0] =
+                entry.operations[0].operation =
                     std::make_unique<MoEOverlayPreparedProjectionOperation>(
                         std::make_unique<ReadyProjectionTransfer>(),
-                        entry.destination_arrival,
-                        ExpertTierWeightProjection::Gate,
-                        engines.gate());
-                entry.projections[1] =
+                        identityCompletion(arrival, ExpertTierWeightProjection::Gate, engines.gate()), 0);
+                entry.operations[1].operation =
                     std::make_unique<MoEOverlayPreparedProjectionOperation>(
                         std::make_unique<ReadyProjectionTransfer>(),
-                        entry.destination_arrival,
-                        ExpertTierWeightProjection::Up,
-                        engines.up());
-                entry.projections[2] = omit_down_
+                        identityCompletion(arrival, ExpertTierWeightProjection::Up, engines.up()), 0);
+                entry.operations[2].operation = omit_down_
                                            ? std::unique_ptr<
                                                  IMoEOverlayTierTransferOperation>(
                                                  std::make_unique<
@@ -291,9 +307,7 @@ namespace
                                                      MoEOverlayPreparedProjectionOperation>(
                                                      std::make_unique<
                                                          ReadyProjectionTransfer>(),
-                                                     entry.destination_arrival,
-                                                     ExpertTierWeightProjection::Down,
-                                                     engines.down()));
+                                                     identityCompletion(arrival, ExpertTierWeightProjection::Down, engines.down()), 0));
             }
             return prepared;
         }
@@ -954,7 +968,7 @@ TEST(MoEOverlayPreparedPayload, FixedDownRequiresCompleteExactIdentity)
 TEST(MoEOverlayPreparedPayload, RuntimeResetAndPrefixRestoreRetainFixedDownBindings)
 {
     for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(3)})
-    for (const auto format : {DeviceMoEWeightFormat::NativeVNNI, DeviceMoEWeightFormat::FP16,
+    for (const auto format : {DeviceMoEWeightFormat::NativeQuantised, DeviceMoEWeightFormat::FP16,
                              DeviceMoEWeightFormat::BF16, DeviceMoEWeightFormat::FP32})
     {
         // These are metadata-only device tables. No GPU driver or engine is invoked.
@@ -999,7 +1013,7 @@ TEST(MoEOverlayPreparedPayload, RuntimeResetAndPrefixRestoreRetainFixedDownBindi
         local.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
             DeviceMoEExpertFlags::Resident | DeviceMoEExpertFlags::LocalCompute);
         local.weight_format = format;
-        if (format == DeviceMoEWeightFormat::NativeVNNI)
+        if (format == DeviceMoEWeightFormat::NativeQuantised)
         {
             local.gate.payload = reinterpret_cast<const uint8_t *>(0x1000u);
             local.gate.scales = reinterpret_cast<const void *>(0x2000u);
@@ -1754,6 +1768,132 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         << error;
 }
 
+/**
+ * @brief Prepared continuation banks need no graph-declaration side effects.
+ *
+ * A retained auxiliary constructor can finish before the continuation graphs
+ * are declared. Its same-process registry still includes both domains and a
+ * retained MTP layer. Finalization must authenticate every original source,
+ * reject an absent sidecar engine, and preserve already-published followers.
+ * GPU identifiers below are metadata only; no runtime or native memory is used.
+ */
+TEST(Test__MoEOverlayParticipantResidencyRegistry,
+     FinalizesDeferredContinuationAndRetainedSidecarBeforeAuxiliaryReadiness)
+{
+    for (const auto [continuations, followers] :
+         {std::pair{1, 1}, std::pair{2, 4}, std::pair{4, 4}})
+    for (const int first : {0, 32})
+    {
+        SCOPED_TRACE(continuations);
+        SCOPED_TRACE(followers);
+        SCOPED_TRACE(first);
+        constexpr int layers = 3; // Two main layers and the retained sidecar.
+        const int total = continuations + followers;
+        RoutedExpertDomain hot, cold;
+        hot.name = "continuation";
+        hot.scope = ExecutionDomainScope::RANK_LOCAL;
+        hot.backend = CollectiveBackendType::NCCL;
+        hot.owner_rank = 0;
+        cold.name = "followers";
+        cold.scope = ExecutionDomainScope::RANK_LOCAL;
+        cold.backend = CollectiveBackendType::RCCL;
+        cold.owner_rank = 0;
+        for (int i = 0; i < continuations; ++i)
+            hot.participants.push_back(GlobalDeviceAddress::cuda(i));
+        for (int i = 0; i < followers; ++i)
+            cold.participants.push_back(GlobalDeviceAddress::rocm(i));
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = plan.shared_expert_domain = hot.name;
+        plan.domains = {hot, cold};
+        plan.routed_tiers = {
+            {.name = "hot", .domain = hot.name, .priority = 0,
+             .max_experts_per_layer = continuations},
+            {.name = "capacity", .domain = cold.name, .priority = 1, .fallback = true}};
+        plan.first_model_layer = first;
+        std::vector<int> tier_ids(total, 1);
+        std::fill_n(tier_ids.begin(), continuations, 0);
+        for (int row = 0; row < layers; ++row)
+            plan.placements.push_back({.layer = first + row, .routed_expert_tier = tier_ids});
+        const auto owners = MoEExpertOwnerMap::build(plan);
+        std::vector<int> ids;
+        for (int id = 0; id < total; ++id) ids.push_back(id);
+        MoEOverlayParticipantResidencyRegistry residency({
+            .owner_map = owners, .local_participant_ids = ids,
+            .num_layers = layers, .num_experts = total, .initial_epoch = 1,
+            .first_model_layer = first});
+        ExpertGemmRegistry prepared;
+        std::shared_ptr<ITensorGemm> missing_down;
+        const auto register_role = [&](int id, int layer, int expert,
+                                       ExpertGemmRegistry::WeightRole role,
+                                       const std::shared_ptr<ITensorGemm> &engine)
+        {
+            const auto *participant = owners.participantForId(id);
+            ASSERT_NE(participant, nullptr);
+            prepared.registerEngineForParticipant(participant->domain_name, participant->device,
+                participant->world_rank_known ? participant->world_rank : -1,
+                participant->domain_participant_index, layer, expert, role, engine.get(), engine);
+        };
+        int missing_expert = -1;
+        for (const int id : ids)
+        for (int row = 0; row < layers; ++row)
+        {
+            const int layer = first + row;
+            const auto mask = owners.expertMaskForParticipant(layer, id, total);
+            std::vector<MoEOverlayPreparedExpertPayload> table(total);
+            for (int expert = 0; expert < total; ++expert)
+            {
+                if (!mask[expert]) continue;
+                table[expert] = payload(10000 + id * 100 + row * 10);
+                register_role(id, layer, expert, ExpertGemmRegistry::WeightRole::GATE, table[expert].gate());
+                register_role(id, layer, expert, ExpertGemmRegistry::WeightRole::UP, table[expert].up());
+                if (id == continuations - 1 && row == layers - 1)
+                {
+                    missing_down = table[expert].down();
+                    missing_expert = expert;
+                }
+                else
+                    register_role(id, layer, expert, ExpertGemmRegistry::WeightRole::DOWN, table[expert].down());
+            }
+            // Follower graph construction has already registered its layers;
+            // the continuation builder has not been allowed to run yet.
+            if (id >= continuations)
+            {
+                std::string error;
+                ASSERT_TRUE(residency.registerInitialLayer(id, layer, mask, table, &error)) << error;
+            }
+        }
+        const auto deficits = residency.incompleteInitialBanks();
+        ASSERT_EQ(deficits.size(), static_cast<std::size_t>(continuations));
+        for (const auto &deficit : deficits)
+            EXPECT_EQ(deficit.missing_layers, (std::vector<int>{first, first + 1, first + 2}));
+        const auto original_follower = residency.endpoint(continuations)->acquire(1);
+        ASSERT_TRUE(original_follower);
+        EXPECT_FALSE(residency.allInitialBanksReady());
+        std::string error;
+        EXPECT_FALSE(residency.finalizeInitialBanksFromPreparedRegistry(prepared, &error));
+        EXPECT_NE(error.find("participant " + std::to_string(continuations - 1) +
+                             " layer " + std::to_string(first + layers - 1)), std::string::npos) << error;
+        ASSERT_TRUE(missing_down);
+        ASSERT_GE(missing_expert, 0);
+        register_role(continuations - 1, first + layers - 1, missing_expert,
+                      ExpertGemmRegistry::WeightRole::DOWN, missing_down);
+        ASSERT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(prepared, &error)) << error;
+        EXPECT_TRUE(residency.allInitialBanksReady());
+        EXPECT_TRUE(residency.incompleteInitialBanks().empty());
+        EXPECT_EQ(residency.verifyImmutablePreparedSources(prepared), static_cast<std::size_t>(total * layers));
+        const auto original_continuation = residency.endpoint(0)->acquire(1);
+        ASSERT_TRUE(original_continuation);
+        ASSERT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(prepared, &error)) << error;
+        EXPECT_EQ(residency.endpoint(0)->acquire(1).get(), original_continuation.get());
+        EXPECT_EQ(residency.endpoint(continuations)->acquire(1).get(), original_follower.get());
+        ExpertGemmRegistry foreign;
+        EXPECT_FALSE(residency.finalizeInitialBanksFromPreparedRegistry(foreign, &error));
+        EXPECT_EQ(residency.endpoint(0)->acquire(1).get(), original_continuation.get());
+    }
+}
+
 TEST(Test__MoEOverlayPreparedExpertArrival,
      PublishesOneExactCompletePayloadAndRejectsIdentityDrift)
 {
@@ -1796,7 +1936,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     ASSERT_EQ((*old_ticket)->epoch, 1u);
 
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -1877,7 +2017,7 @@ TEST(Test__MoEOverlayParticipantMigration,
 {
     auto fixture = participantMigrationFixture(/*cuda_continuation=*/true);
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cuda/cpu",
@@ -1914,7 +2054,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto provider = std::make_shared<IdentityTransferProvider>();
     auto script = std::make_shared<ScriptedDeviceBankPublication>();
     auto publisher = std::make_shared<ScriptedDeviceBankPublisher>(script);
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .device_bank_publisher = publisher,
@@ -2009,7 +2149,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto provider = std::make_shared<IdentityTransferProvider>();
     auto script = std::make_shared<ScriptedDeviceBankPublication>();
     auto publisher = std::make_shared<ScriptedDeviceBankPublisher>(script);
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .device_bank_publisher = publisher,
@@ -2068,7 +2208,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto fixture = participantMigrationFixture();
     auto provider = std::make_shared<IdentityTransferProvider>(
         /*omit_down=*/true);
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -2111,7 +2251,7 @@ TEST(Test__MoEOverlayParticipantMigration,
         << error;
 
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -2130,7 +2270,7 @@ TEST(Test__MoEOverlayParticipantMigration,
 {
     auto fixture = participantMigrationFixture();
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -2190,7 +2330,7 @@ TEST(Test__MoEOverlayParticipantMigration,
                 .initial_epoch = 1,
             });
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = relay_registry,
         .transfer_provider = provider,
         .perf_device = "relay",
@@ -2778,7 +2918,7 @@ TEST(Test__MoEOverlayParticipantMigration, PipelineStageWavePublishesExactGlobal
         auto fixture = stageMigrationFixture(first);
         const auto old = fixture.registry->endpoint(0)->acquire(1);
         auto provider = std::make_shared<IdentityTransferProvider>();
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = fixture.registry, .transfer_provider = provider,
         });
         auto wave = factory.prepare(fixture.transaction);
@@ -2815,7 +2955,7 @@ TEST(Test__MoEOverlayParticipantMigration, PipelineStageForeignSnapshotFailsBefo
     auto local = stageMigrationFixture(32);
     auto foreign = stageMigrationFixture(40);
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = local.registry, .transfer_provider = provider,
     });
     auto wave = factory.prepare(foreign.transaction);
@@ -2873,3 +3013,9 @@ TEST(Test__MoEOverlayParticipantResidency, PipelineStageRuntimeRetainsFixedDownB
             EXPECT_THROW((MoERuntimeTable(config)), std::invalid_argument);
         }
 }
+
+#include "PreparedSourceNonemptyBankContract.inc"
+
+#include "PreparedProjectionIntersectionContract.inc"
+
+#include "PhysicalPieceFlatteningContract.inc"

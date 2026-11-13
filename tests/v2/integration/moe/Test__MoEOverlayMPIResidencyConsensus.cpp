@@ -11,8 +11,12 @@
  * collective operations must stay inside the admitted execution membership.
  * A queued next proposal must not steal the maintenance worker from a pending
  * all-rank retirement fence; current-epoch inference remains admitted meanwhile.
+ * Completed remote telemetry must retain exact ordered changing coordinates
+ * without retaining a separate string-keyed metric for each lifetime epoch.
  */
 
+#include "../../utils/RecordedMigrationEvidence.h"
+#include "execution/moe/MoEOverlayEconomyEvidenceCodec.h"
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
 #include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
 #include "execution/moe/MoEOverlayMPIResidencyProposalPublisher.h"
@@ -21,13 +25,17 @@
 #include "execution/moe/MoEOverlayEconomyCalibrationController.h"
 #include "execution/moe/MoEOverlayEconomyCertificationController.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "../../fixtures/moe/MoEOverlayParticipantMigrationTestAccess.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "execution/moe/CpuExpertSlotPool.h"
 #include "utils/MPIContext.h"
+#include "utils/PerfStatsCollector.h"
+#include "execution/moe/ExpertTierTransferMeasurement.h"
 #include "../../utils/ObservedExpertDemandFixture.h"
+#include "../../utils/ActiveProgressContinuationReplayFixture.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -38,12 +46,62 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+/**
+ * @brief Child-only PMPI controls for a deterministic unmatched native payload.
+ *
+ * Disabled by default. A synchronous payload send models permitted rendezvous
+ * behavior without relying on eager limits. Rejecting the already-received
+ * header leaves that payload unmatched. No request/completion is retained or
+ * reordered, and every unrelated MPI call delegates unchanged.
+ */
+namespace physical_stage_failure_child
+{
+    thread_local bool active = false;
+    thread_local int rank = -1;
+    thread_local int sends = 0;
+    thread_local int counts = 0;
+}
+
+/** @brief Observe only the child's third original send (manifest/header/payload). */
+extern "C" int MPI_Isend(const void *buffer, int count, MPI_Datatype datatype,
+                         int destination, int tag, MPI_Comm communicator,
+                         MPI_Request *request)
+{
+    using namespace physical_stage_failure_child;
+    if (active && rank == 1 && ++sends == 3)
+    {
+        const int result = PMPI_Issend(buffer, count, datatype, destination, tag,
+                                      communicator, request);
+        std::fprintf(stderr, "physical-stage-child payload-posted bytes=%d status=%d\n", count, result);
+        std::fflush(stderr);
+        return result;
+    }
+    return PMPI_Isend(buffer, count, datatype, destination, tag, communicator, request);
+}
+
+/** @brief Reject only the child's real second received packet, its chunk header. */
+extern "C" int MPI_Get_count(const MPI_Status *status, MPI_Datatype datatype, int *count)
+{
+    const int result = PMPI_Get_count(status, datatype, count);
+    using namespace physical_stage_failure_child;
+    if (active && rank == 0 && ++counts == 2 && result == MPI_SUCCESS)
+    {
+        *count = 0;
+        std::fprintf(stderr, "physical-stage-child reject-original-header\n");
+        std::fflush(stderr);
+    }
+    return result;
+}
 
 namespace llaminar2::test
 {
@@ -432,14 +490,14 @@ namespace llaminar2::test
                              * isolating distributed transaction lifecycle, not
                              * manufacturing an independent skew objective.
                              */
-                            profile->participant_costs = {
+                            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                                 {.participant_id = 0,
                                  .layer = 0,
                                  .nanoseconds_per_activation = {10, 20, 30}},
                                 {.participant_id = 1,
                                  .layer = 0,
                                  .nanoseconds_per_activation = {100, 200, 300}},
-                            };
+                            });
                             return profile;
                         }(),
                         .migration_cost_profile = []
@@ -448,7 +506,7 @@ namespace llaminar2::test
                                 MoEOverlayMigrationCostProfile>();
                             profile->identity =
                                 "mpi-maintenance-migration-profile-v1";
-                            profile->costs = {
+                            profile->setWholeCosts(std::vector<MoEOverlayParticipantLayerMigrationCost>{
                                 {.source_participant = 0,
                                  .destination_participant = 1,
                                  .layer = 0,
@@ -457,7 +515,7 @@ namespace llaminar2::test
                                  .destination_participant = 0,
                                  .layer = 0,
                                  .transfer_and_repack_ns = 1},
-                            };
+                            });
                             return profile;
                         }(),
                         .migration_economy_policy =
@@ -577,8 +635,8 @@ namespace llaminar2::test
                     });
                 for (int participant = 0; participant < 3; ++participant)
                 {
-                    service_profile->participant_costs.push_back({
-                        .participant_id = participant,
+                    service_profile->target_costs.push_back({
+                        .target = MoEOverlayRouteTarget::whole(participant),
                         .layer = layer,
                         .nanoseconds_per_activation =
                             participant == 0
@@ -606,10 +664,7 @@ namespace llaminar2::test
                     {
                         if (source == destination)
                             continue;
-                        migration_profile->costs.push_back({
-                            .source_participant = source,
-                            .destination_participant = destination,
-                            .layer = layer,
+                        migration_profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                             .transfer_and_repack_ns = 1,
                             .inference_interference_ns = 1,
                         });
@@ -694,8 +749,15 @@ namespace llaminar2::test
 
                 /** @brief Local physical staging is already complete. */
                 MoEOverlayResidencyWaveProgress pollStage(
-                    std::string *) noexcept override
+                    std::string *error) noexcept override
                 {
+                    if (owner_->stage_operation)
+                    {
+                        const auto progress = owner_->stage_operation->poll(error);
+                        if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                            owner_->stage_operation->abort();
+                        return progress;
+                    }
                     return MoEOverlayResidencyWaveProgress::Ready;
                 }
 
@@ -761,6 +823,8 @@ namespace llaminar2::test
                 };
             }
 
+            /** Optional original physical operation; only the negative child supplies it. */
+            std::unique_ptr<IMoEOverlayTierTransferOperation> stage_operation;
             bool defer_start = false;
             bool prepare_begin_ok = true;
             int begin_calls = 0;
@@ -996,18 +1060,18 @@ namespace llaminar2::test
         }
 
         /** @brief Build deterministic final CPU projection bytes for MPI traffic. */
-        cpu::native_vnni::CPUNativeVNNIPackedWeights remoteCpuProjection(
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights remoteCpuProjection(
             std::uint8_t seed)
         {
-            using namespace cpu::native_vnni;
-            CPUNativeVNNIPackedWeights packed;
+            using namespace cpu::native_quantised;
+            CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
-            packed.codebook_id = native_vnni_formats::Q4_0.codebook_id;
+            packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
             packed.payload_bytes = 16;
-            packed.encoding = CPUNativeVNNIEncoding::NibbleLUT;
+            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
@@ -1028,6 +1092,73 @@ namespace llaminar2::test
                         seed + static_cast<std::uint8_t>(index * 29u));
             }
             return packed;
+        }
+
+        /**
+         * @brief Resolve canonical live CPU planes without inventing GPU metadata.
+         * @param packed Actual original native root whose format/strides are retained.
+         * @return Whole logical projection layout; resident N padding is excluded from wire bytes.
+         */
+        ExpertTierWeightCPUStorageLayout cpuLiveWireLayout(const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed)
+        {
+            ExpertTierWeightCPUStorageLayout layout{
+                .N=packed.N,.K=packed.K,.blocks_per_row=packed.blocks_per_row,
+                .cpu_N=packed.N,.cpu_K=packed.K,
+                .cpu_codebook_id=packed.codebook_id,.cpu_is_asymmetric=uint8_t(packed.is_asymmetric),
+                .cpu_is_superblock=uint8_t(packed.is_superblock),.cpu_encoding=packed.encoding,
+                .cpu_data_stride=uint32_t(packed.data_stride),.cpu_block_stride=uint32_t(packed.interleaved_block_stride),
+                .unit_count=uint32_t((packed.N+63)/64*packed.blocks_per_row),
+                .maximum_units_per_chunk=uint32_t((packed.N+63)/64*packed.blocks_per_row)};
+            if(!layout.valid())throw std::logic_error("MPI CPU fixture has invalid original native geometry");
+            return layout;
+        }
+
+        /**
+         * @brief Inspect all live source bytes through the existing canonical wire encoder.
+         * @param packed Actual original native root.
+         * @return Exact encoded payload/metadata planes, independent of storage padding.
+         */
+        std::vector<uint8_t> cpuLiveWireOracle(const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed)
+        {
+            const auto layout=cpuLiveWireLayout(packed);
+            std::vector<uint8_t> result(layout.chunkBytes(layout.unit_count));
+            if(!gatherExpertTierCPUWeightChunk(layout,
+                std::span<const uint8_t>(packed.native_interleaved.data(),packed.native_interleaved.size()),0,layout.unit_count,result))
+                throw std::logic_error("MPI CPU fixture cannot encode original live planes");
+            return result;
+        }
+
+        /**
+         * @brief Independently copy this fixture's Q4_0 live columns into a dirty recipient image.
+         * @param packed Original source including deliberately populated inactive storage.
+         * @param initial Recipient's actual pre-transfer sentinel image.
+         * @return Every final recipient byte, preserving all inactive payload/metadata columns.
+         *
+         * This scalar oracle does not call the production scatter. Every four-byte
+         * payload group and16-bit scale/coefficient plane has its own64-column
+         * resident stride; comparing a compact prefix of the raw root is incorrect.
+         */
+        std::vector<uint8_t> expectedCpuRecipientImage(
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed,std::span<const uint8_t> initial)
+        {
+            if(packed.codebook_id!=native_quantised_formats::Q4_0.codebook_id || packed.is_superblock ||
+               packed.encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT || initial.size()!=packed.native_interleaved.size())
+                throw std::logic_error("Independent MPI recipient oracle requires its declared Q4_0 fixture");
+            std::vector<uint8_t> expected(initial.begin(),initial.end());
+            for(int n=0;n<packed.N;++n)for(int kb=0;kb<packed.blocks_per_row;++kb) {
+                const size_t unit=(size_t(n/64)*packed.blocks_per_row+kb)*packed.interleaved_block_stride,column=n%64;
+                for(size_t group=0;group<size_t(packed.data_stride)/256;++group)
+                    for(size_t byte=0;byte<4;++byte) {
+                        const auto offset=unit+group*256+column*4+byte;
+                        expected[offset]=packed.native_interleaved[offset];
+                    }
+                for(size_t plane=0;plane<size_t(packed.interleaved_block_stride-packed.data_stride)/128;++plane)
+                    for(size_t byte=0;byte<2;++byte) {
+                        const auto offset=unit+packed.data_stride+plane*128+column*2+byte;
+                        expected[offset]=packed.native_interleaved[offset];
+                    }
+            }
+            return expected;
         }
 
         /** @brief Name one direction of a bidirectional two-rank data wave. */
@@ -1059,7 +1190,7 @@ namespace llaminar2::test
 
         /** @brief Present one CPU packed allocation as a four-region source. */
         std::array<std::span<const std::uint8_t>, 4> cpuSourceRegions(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &packed)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &packed)
         {
             return {
                 std::span<const std::uint8_t>(
@@ -1090,7 +1221,7 @@ namespace llaminar2::test
             std::size_t lane_index,
             const MoEOverlayRemoteProjectionIdentity &identity,
             const MoEOverlayRemoteProjectionManifest &manifest,
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
             std::vector<std::uint8_t> &destination,
             const std::shared_ptr<void> &source_lifetime,
             const std::shared_ptr<void> &destination_lifetime)
@@ -1158,10 +1289,10 @@ namespace llaminar2::test
         std::vector<CpuExpertSlotPool::ProjectionSpec>
         distributedCpuProjectionSpecs()
         {
-            const NativeVnniSourceIdentity source_identity{
-                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            const NativeQuantisedSourceIdentity source_identity{
+                .codebook_id = native_quantised_formats::Q4_0.codebook_id,
                 .is_superblock =
-                    native_vnni_formats::Q4_0.is_superblock,
+                    native_quantised_formats::Q4_0.is_superblock,
                 .present = true,
             };
             return {
@@ -1170,21 +1301,21 @@ namespace llaminar2::test
                     .N = 32,
                     .K = 64,
                     .format =
-                        ExpertWeightFormat::nativeVnni(source_identity),
+                        ExpertWeightFormat::nativeQuantised(source_identity),
                 },
                 {
                     .projection = ExpertTierWeightProjection::Up,
                     .N = 32,
                     .K = 64,
                     .format =
-                        ExpertWeightFormat::nativeVnni(source_identity),
+                        ExpertWeightFormat::nativeQuantised(source_identity),
                 },
                 {
                     .projection = ExpertTierWeightProjection::Down,
                     .N = 64,
                     .K = 32,
                     .format =
-                        ExpertWeightFormat::nativeVnni(source_identity),
+                        ExpertWeightFormat::nativeQuantised(source_identity),
                 },
             };
         }
@@ -1279,10 +1410,10 @@ namespace llaminar2::test
         std::vector<MoEOverlayLayerWeightManifest>
         distributedCpuLayerManifest()
         {
-            const NativeVnniSourceIdentity source_identity{
-                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            const NativeQuantisedSourceIdentity source_identity{
+                .codebook_id = native_quantised_formats::Q4_0.codebook_id,
                 .is_superblock =
-                    native_vnni_formats::Q4_0.is_superblock,
+                    native_quantised_formats::Q4_0.is_superblock,
                 .present = true,
             };
             return {{
@@ -1293,21 +1424,21 @@ namespace llaminar2::test
                         .N = 32,
                         .K = 64,
                         .format =
-                            ExpertWeightFormat::nativeVnni(source_identity),
+                            ExpertWeightFormat::nativeQuantised(source_identity),
                     },
                     {
                         .projection = ExpertTierWeightProjection::Up,
                         .N = 32,
                         .K = 64,
                         .format =
-                            ExpertWeightFormat::nativeVnni(source_identity),
+                            ExpertWeightFormat::nativeQuantised(source_identity),
                     },
                     {
                         .projection = ExpertTierWeightProjection::Down,
                         .N = 64,
                         .K = 32,
                         .format =
-                            ExpertWeightFormat::nativeVnni(source_identity),
+                            ExpertWeightFormat::nativeQuantised(source_identity),
                     },
                 }},
             }};
@@ -1358,33 +1489,32 @@ namespace llaminar2::test
                 std::move(admission), world_rank);
         }
 
-        /** @brief Verify every final byte against the source's fill function. */
-        bool distributedCpuBytesMatchSeed(
-            const MoEOverlayPreparedExpertPayload &payload,
-            std::uint8_t seed)
+        /**
+         * @brief Verify every live payload and metadata byte against the original fill function.
+         * @param payload Actual published CPU engines, not a reconstructed owner.
+         * @param seed Original source's deterministic byte seed.
+         * @return Whether all semantic native planes match the independent source pattern.
+         *
+         * Fabric slot storage is explicitly Uninitialized; inactive N columns
+         * have no zero/sentinel contract. Direct endpoint tests independently
+         * prove every dirty recipient padding byte remains untouched.
+         */
+        bool distributedCpuBytesMatchSeed(const MoEOverlayPreparedExpertPayload& payload,uint8_t seed)
         {
-            const std::array<std::shared_ptr<ITensorGemm>, 3> engines{
-                payload.gate(),
-                payload.up(),
-                payload.down(),
-            };
-            for (const auto &engine : engines)
-            {
-                const auto *packed = engine
-                                         ? engine
-                                               ->exportCPUNativeVNNIPackedWeights()
-                                         : nullptr;
-                if (!packed)
-                    return false;
-                for (std::size_t byte = 0;
-                     byte < packed->native_interleaved.size();
-                     ++byte)
-                {
-                    const auto expected = static_cast<std::uint8_t>(
-                        seed + static_cast<std::uint8_t>(byte * 13u));
-                    if (packed->native_interleaved[byte] != expected)
-                        return false;
-                }
+            const std::array<std::shared_ptr<ITensorGemm>,3> engines{payload.gate(),payload.up(),payload.down()};
+            const auto original_specs=distributedCpuProjectionSpecs();
+            for(size_t role=0;role<engines.size();++role) {
+                const auto& engine=engines[role];
+                const auto* packed=engine?engine->exportCPUNativeQuantisedPackedWeights():nullptr;
+                if(!packed || packed->N!=original_specs[role].N || packed->K!=original_specs[role].K ||
+                   packed->codebook_id!=native_quantised_formats::Q4_0.codebook_id || packed->is_superblock ||
+                   packed->encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)return false;
+                std::vector<uint8_t> original(packed->native_interleaved.size());
+                for(size_t byte=0;byte<original.size();++byte)original[byte]=uint8_t(seed+uint8_t(byte*13u));
+                const auto layout=cpuLiveWireLayout(*packed);
+                std::vector<uint8_t> expected(layout.chunkBytes(layout.unit_count));
+                if(!gatherExpertTierCPUWeightChunk(layout,original,0,layout.unit_count,expected) ||
+                   cpuLiveWireOracle(*packed)!=expected)return false;
             }
             return true;
         }
@@ -1406,8 +1536,8 @@ namespace llaminar2::test
                 .wave_wall_nanoseconds = static_cast<std::uint64_t>(
                     900 + world_rank),
             };
-            const std::size_t first = world_rank == 0 ? 0u : 1u;
-            const std::size_t count = world_rank == 0 ? 1u : 2u;
+            const std::size_t first = 0u;
+            const std::size_t count = 3u;
             for (std::size_t offset = 0; offset < count; ++offset)
             {
                 const std::size_t projection = first + offset;
@@ -1430,15 +1560,12 @@ namespace llaminar2::test
         /** @brief One exact production workload and local migration pair. */
         MoEOverlayCalibrationAttemptEvidence economyAttempt(
             int world_rank,
-            bool exact_overlap)
+            bool exact_overlap,
+            const MoEExpertOwnerMap &inventory)
         {
-            return {
+            MoEOverlayCalibrationAttemptEvidence result{
                 .calibration_sequence = 41,
-                .coordinate = {
-                    .source_participant = 0,
-                    .destination_participant = 1,
-                    .layer = 0,
-                },
+                .coordinate = recordedWholeMigrationCoordinate(0,1,0),
                 .source = ExpertHistogramSource::GroupedVerifier,
                 .workload = {
                     .source = ExpertHistogramSource::GroupedVerifier,
@@ -1460,6 +1587,8 @@ namespace llaminar2::test
                     economyMigration(1, 0, 1, world_rank),
                 },
             };
+            result.context=attachRecordedMigrationContext(result.local_measurements,&inventory);
+            return result;
         }
 
         /** @brief One valid pre-staging identity, optionally rank-divergent. */
@@ -1553,7 +1682,7 @@ namespace llaminar2::test
         EXPECT_TRUE(exchange.idle());
 
         ASSERT_TRUE(exchange.beginAttempt(
-            economyAttempt(context->rank(), true), &error))
+            economyAttempt(context->rank(), true, owner_map), &error))
             << error;
         const auto accepted = finishEconomyAttempt(exchange);
         ASSERT_TRUE(accepted.valid());
@@ -1561,8 +1690,9 @@ namespace llaminar2::test
         ASSERT_EQ(accepted.measurements.size(), 2u);
         EXPECT_EQ(accepted.baseline_nanoseconds, 200u);
         EXPECT_EQ(accepted.concurrent_nanoseconds, 260u);
-        for (const auto &migration : accepted.measurements)
+        for (const auto &described : accepted.measurements)
         {
+            const auto migration=scalarMoEOverlayMigrationMeasurement(described);
             EXPECT_EQ(migration.wave_wall_nanoseconds, 901u);
             EXPECT_TRUE(std::all_of(
                 migration.projections.begin(),
@@ -1575,7 +1705,7 @@ namespace llaminar2::test
         ASSERT_TRUE(exchange.beginAttempt(
             economyAttempt(
                 context->rank(),
-                context->rank() != 1),
+                context->rank() != 1, owner_map),
             &error))
             << error;
         const auto rejected = finishEconomyAttempt(exchange);
@@ -1670,11 +1800,7 @@ namespace llaminar2::test
         constexpr std::size_t staging_bytes = 97;
         MoEOverlayMPIRemoteProjectionTransport transport({
             .mpi_context = context,
-            .lane_budget = {
-                .maximum_participants_per_cycle = 2,
-                .maximum_concurrent_cycles = 1,
-                .projections_per_expert = 3,
-            },
+            .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, 3),
             .staging_capacity_bytes = staging_bytes,
             .perf_device = "mpi_remote_projection_cpu_test",
         });
@@ -1697,6 +1823,11 @@ namespace llaminar2::test
                 ? rank_one_source.native_interleaved.size()
                 : rank_zero_source.native_interleaved.size(),
             0xa5u);
+        const auto initial_recipient=received_from_peer;
+        const auto zero_wire=cpuLiveWireOracle(rank_zero_source),one_wire=cpuLiveWireOracle(rank_one_source);
+        ASSERT_EQ(zero_wire.size(),1280u);ASSERT_EQ(one_wire.size(),1280u);
+        ASSERT_EQ(rank_zero_source.native_interleaved.size(),2560u);
+        EXPECT_EQ(zero_manifest.total_bytes,zero_wire.size());EXPECT_EQ(one_manifest.total_bytes,one_wire.size());
         const auto source_lifetime = std::make_shared<int>(41);
         const auto destination_lifetime = std::make_shared<int>(73);
 
@@ -1882,10 +2013,10 @@ namespace llaminar2::test
         EXPECT_TRUE(second_measurement->valid());
         EXPECT_EQ(
             first_measurement->bytes,
-            rank_zero_source.native_interleaved.size());
+            zero_wire.size());
         EXPECT_EQ(
             second_measurement->bytes,
-            rank_one_source.native_interleaved.size());
+            one_wire.size());
         EXPECT_GT(first_measurement->transport_nanoseconds, 0u);
         EXPECT_GT(second_measurement->transport_nanoseconds, 0u);
         EXPECT_EQ(first_measurement->device_nanoseconds, 0u);
@@ -1911,14 +2042,12 @@ namespace llaminar2::test
             second_measurement->transport_nanoseconds,
             second_measurement->wall_nanoseconds);
 
-        const auto &expected = context->rank() == 0
-                                   ? rank_one_source.native_interleaved
-                                   : rank_zero_source.native_interleaved;
-        EXPECT_TRUE(std::equal(
-            received_from_peer.begin(),
-            received_from_peer.end(),
-            expected.begin(),
-            expected.end()));
+        const auto& expected_source=context->rank()==0?rank_one_source:rank_zero_source;
+        EXPECT_EQ(received_from_peer,expectedCpuRecipientImage(expected_source,initial_recipient));
+        EXPECT_EQ(cpuLiveWireOracle(rank_zero_source),zero_wire);
+        EXPECT_EQ(cpuLiveWireOracle(rank_one_source),one_wire);
+        const auto& sent_wire=context->rank()==0?zero_wire:one_wire;
+        const auto& received_wire=context->rank()==0?one_wire:zero_wire;
 
         const auto stats = transport.stats();
         EXPECT_EQ(stats.lanes_materialized, 6u);
@@ -1935,14 +2064,68 @@ namespace llaminar2::test
             context->rank() == 0 ? 1u : 2u);
         EXPECT_EQ(stats.operations_completed, 2u);
         EXPECT_EQ(stats.operations_aborted, 1u);
-        EXPECT_GT(stats.chunks_sent, 1u);
-        EXPECT_GT(stats.chunks_received, 1u);
-        EXPECT_EQ(stats.bytes_sent, expected.size());
-        EXPECT_EQ(stats.bytes_received, received_from_peer.size());
+        //97-byte lane fits one4-column Q4_0 unit (80 bytes);16 units
+        // must each finish the existing send/ACK before the staging slice is reused.
+        EXPECT_EQ(stats.chunks_sent,16u);
+        EXPECT_EQ(stats.chunks_received,16u);
+        EXPECT_EQ(stats.bytes_sent,sent_wire.size());
+        EXPECT_EQ(stats.bytes_received,received_wire.size());
         EXPECT_EQ(stats.mpi_failures, 0u);
         EXPECT_EQ(stats.protocol_failures, 0u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
         EXPECT_EQ(stats.blocking_synchronizations, 0u);
+    }
+
+    /** @test Original distributed wrapper must abort before an unmatched payload can strand its vote. */
+    TEST(Test__MoEOverlayMPIResidencyConsensus,
+         DISABLED_PhysicalHeaderRejectionDuringPayloadIsImmediatelyFatal)
+    {
+        auto context = worldContext();
+        ASSERT_TRUE(requireTwoRanks(*context));
+        auto fixture = realTransaction();
+        auto lane = std::make_shared<MoEOverlayMPIResidencyConsensus>(
+            MoEOverlayMPIResidencyConsensus::Config{.mpi_context=context,
+                                                  .perf_device="physical-stage-fatal-child"});
+        MoEOverlayMPIRemoteProjectionTransport physical({
+            .mpi_context=context,
+            .lane_budget=MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1,1,3),
+            .staging_capacity_bytes=97,
+            .perf_device="physical-stage-fatal-child"});
+        auto original = remoteCpuProjection(193);
+        const auto key = remoteProjectionIdentity(1,0,0,ExpertTierWeightProjection::Gate);
+        const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(key,original,97);
+        auto lifetime = std::make_shared<int>(73);
+        std::vector<std::uint8_t> final_bytes(original.native_interleaved.size(),0xa5);
+        std::shared_ptr<IMoEOverlayRemoteProjectionSourceEndpoint> source;
+        std::shared_ptr<IMoEOverlayRemoteProjectionDestinationEndpoint> destination;
+        if(context->rank()==1)
+            source=std::make_shared<MoEOverlayHostRemoteProjectionSource>(
+                manifest,cpuSourceRegions(original),lifetime);
+        else
+            destination=std::make_shared<MoEOverlayHostRemoteProjectionDestination>(
+                key,cpuDestinationRegions(final_bytes),lifetime);
+        auto reservation=physical.reserve(0,key,source,destination);
+        ASSERT_EQ(reservation.status,MoEOverlayResidencyStageStartStatus::Started)<<reservation.error;
+        ImmediateLocalResidencyTransport local;
+        local.stage_operation=std::move(reservation.operation);
+        MoEOverlayDistributedResidencyTransport distributed({
+            .local_transport=&local,.consensus=lane,.perf_device="physical-stage-fatal-child"});
+        auto start=distributed.beginStage(fixture.transaction);
+        ASSERT_EQ(start.status,MoEOverlayResidencyStageStartStatus::Started)<<start.error;
+        physical_stage_failure_child::rank=context->rank();
+        physical_stage_failure_child::active=true;
+        for(;;)
+        {
+            std::string error;
+            const auto progress=start.wave->pollStage(&error);
+            if(progress!=MoEOverlayResidencyWaveProgress::Pending)
+            {
+                std::fprintf(stderr,"physical-stage-child unexpectedly-returned=%d detail=%s\n",
+                             static_cast<int>(progress),error.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
     }
 
     TEST(
@@ -1972,6 +2155,186 @@ namespace llaminar2::test
         }
     }
 
+    /**
+     * @test Real remote completions retain bounded telemetry across changing epochs.
+     *
+     * Every epoch moves the original packed CPU wire and checks its recipient
+     * image. Roles, projection and lane remain bounded topology dimensions;
+     * changing layer/expert/migration identities are verified in ordered words.
+     * This is a transport lifecycle/telemetry contract, not a model trace replay.
+     */
+    TEST(Test__MoEOverlayMPIResidencyConsensus,
+         RemoteProjectionTelemetryRetainsBoundedOrderedEpochWitness)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+            GTEST_SKIP() << "Remote telemetry contract requires the original two ranks";
+
+        /** Cold fixture scope; no transport operation survives its exit. */
+        struct CollectionScope final
+        {
+            std::optional<std::string> json;
+            std::optional<std::string> filter;
+            /** Enable only the original telemetry domain before creating lanes. */
+            CollectionScope()
+            {
+                if (const char *value = std::getenv("LLAMINAR_PERF_STATS_JSON")) json = value;
+                if (const char *value = std::getenv("LLAMINAR_PERF_STATS_FILTER")) filter = value;
+                if (::setenv("LLAMINAR_PERF_STATS_JSON", "1", 1) != 0 ||
+                    ::setenv("LLAMINAR_PERF_STATS_FILTER", "moe_overlay_residency", 1) != 0)
+                    throw std::runtime_error("Cannot enable original remote telemetry owner");
+                PerfStatsCollector::reset();
+            }
+            /** Clear only this isolated test epoch, then restore exact caller policy. */
+            ~CollectionScope()
+            {
+                const int json_status = json ? ::setenv("LLAMINAR_PERF_STATS_JSON", json->c_str(), 1)
+                                             : ::unsetenv("LLAMINAR_PERF_STATS_JSON");
+                const int filter_status = filter ? ::setenv("LLAMINAR_PERF_STATS_FILTER", filter->c_str(), 1)
+                                                 : ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+                if (json_status != 0 || filter_status != 0) std::terminate();
+                PerfStatsCollector::reset();
+            }
+        } collection;
+        constexpr std::size_t epochs = 64;
+        constexpr std::size_t words_per_step = 6;
+        constexpr std::size_t staging_bytes = 97;
+        constexpr std::array<const char *, 7> names{
+            "remote_projection_operations_completed",
+            "remote_projection_payload_bytes_completed",
+            "remote_projection_wall_ns",
+            "remote_projection_admission_to_dispatch_ns",
+            "remote_projection_host_work_ns",
+            "remote_projection_mpi_request_visible_ns",
+            "remote_projection_unattributed_poll_ns"};
+        // Six actual role/projection combinations, all using the original lane0.
+        std::array<std::vector<std::uint64_t>, 6> expected_words;
+        std::array<std::array<std::uint64_t, 7>, 6> expected_values{};
+        MoEOverlayMPIRemoteProjectionTransport transport({
+            .mpi_context = context,
+            .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1, 1, 1),
+            .staging_capacity_bytes = staging_bytes,
+            .perf_device = "mpi_remote_projection_bounded_telemetry_test",
+        });
+        for (std::size_t step = 0; step < epochs; ++step)
+        {
+            const auto projection = static_cast<ExpertTierWeightProjection>(step % 3u);
+            const int source_rank = static_cast<int>(step % 2u);
+            const bool source_role = context->rank() == source_rank;
+            const std::size_t group = (source_role ? 0u : 3u) + step % 3u;
+            auto identity = remoteProjectionIdentity(source_rank, 1 - source_rank, step, projection);
+            identity.expected_epoch = 100u + step;
+            identity.candidate_epoch = identity.expected_epoch + 1u;
+            identity.layer_idx = static_cast<int>(step % 4u);
+            identity.expert_id = static_cast<int>(step * 7u + 3u);
+            auto original = remoteCpuProjection(static_cast<std::uint8_t>(17u + step));
+            const auto wire = cpuLiveWireOracle(original);
+            const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
+                identity, original, static_cast<std::uint32_t>(staging_bytes));
+            std::vector<std::uint8_t> destination(original.native_interleaved.size(), 0xa5u);
+            const auto initial = destination;
+            const auto source_lifetime = std::make_shared<int>(19);
+            const auto destination_lifetime = std::make_shared<int>(23);
+            auto binding = localHostBinding(context->rank(), 0, identity, manifest, original,
+                destination, source_lifetime, destination_lifetime);
+            auto wave = transport.reserveWave({std::move(binding)});
+            ASSERT_EQ(wave.status, MoEOverlayResidencyStageStartStatus::Started) << wave.error;
+            ASSERT_EQ(wave.operations.size(), 1u);
+            bool ready = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!ready && std::chrono::steady_clock::now() < deadline)
+            {
+                std::string error;
+                const auto progress = wave.operations.front()->poll(&error);
+                ASSERT_NE(progress, MoEOverlayResidencyWaveProgress::Failed) << error;
+                ready = progress == MoEOverlayResidencyWaveProgress::Ready;
+                std::this_thread::yield();
+            }
+            ASSERT_TRUE(ready);
+            const auto measurement = wave.operations.front()->completedMeasurement();
+            ASSERT_TRUE(measurement.has_value());
+            ASSERT_TRUE(measurement->valid());
+            ASSERT_EQ(measurement->bytes, wire.size());
+            EXPECT_EQ(destination, source_role ? initial : expectedCpuRecipientImage(original, initial));
+            auto &words = expected_words[group];
+            words.insert(words.end(), {identity.expected_epoch, identity.candidate_epoch,
+                identity.migration_index, static_cast<std::uint64_t>(identity.layer_idx),
+                static_cast<std::uint64_t>(identity.expert_id), measurement->bytes});
+            auto &values = expected_values[group];
+            ++values[0];
+            values[1] += measurement->bytes;
+            values[2] += measurement->wall_nanoseconds;
+            values[4] += measurement->host_nanoseconds;
+            values[5] += measurement->transport_nanoseconds;
+            const auto attributed = saturatingExpertTierMeasurementAdd(
+                measurement->host_nanoseconds, measurement->transport_nanoseconds);
+            values[6] += measurement->wall_nanoseconds > attributed
+                ? measurement->wall_nanoseconds - attributed : 0u;
+            // Every operation object retires before this lane is reused.
+        }
+        context->barrier();
+        const auto records = PerfStatsCollector::snapshot();
+        const auto metric_records = std::count_if(records.begin(), records.end(),
+            [&](const auto &record) { return std::find(names.begin(), names.end(), record.name) != names.end(); });
+        ASSERT_EQ(metric_records, names.size() * expected_words.size())
+            << "Epoch/expert identities must not become retained telemetry keys";
+        std::array<std::array<bool, 7>, 6> seen{};
+        std::size_t retained = 0;
+        for (const auto &record : records)
+        {
+            const auto name = std::find(names.begin(), names.end(), record.name);
+            if (name == names.end()) continue;
+            ++retained;
+            ASSERT_EQ(record.device, "mpi_remote_projection_bounded_telemetry_test");
+            EXPECT_EQ(record.kind, PerfStatRecord::Kind::Counter);
+            EXPECT_EQ(record.domain, "moe_overlay_residency");
+            EXPECT_EQ(record.phase, "maintenance");
+            EXPECT_EQ(record.tags.count("expected_epoch"), 0u);
+            EXPECT_EQ(record.tags.count("candidate_epoch"), 0u);
+            EXPECT_EQ(record.tags.count("migration_index"), 0u);
+            EXPECT_EQ(record.tags.count("layer"), 0u);
+            EXPECT_EQ(record.tags.count("expert"), 0u);
+            ASSERT_TRUE(record.tags.contains("projection"));
+            ASSERT_TRUE(record.tags.contains("role"));
+            const auto projection = static_cast<std::size_t>(std::stoul(record.tags.at("projection")));
+            ASSERT_LT(projection, 3u);
+            const bool source_role = record.tags.at("role") == "source";
+            EXPECT_TRUE(source_role || record.tags.at("role") == "destination");
+            const int source_rank = source_role ? context->rank() : 1 - context->rank();
+            EXPECT_EQ(record.tags.at("source_world_rank"), std::to_string(source_rank));
+            EXPECT_EQ(record.tags.at("destination_world_rank"), std::to_string(1 - source_rank));
+            EXPECT_EQ(record.tags.at("source_participant"), std::to_string(source_rank));
+            EXPECT_EQ(record.tags.at("destination_participant"), std::to_string(1 - source_rank));
+            EXPECT_EQ(record.tags.at("purpose"), "placement_change");
+            EXPECT_EQ(record.tags.at("background"), "true");
+            EXPECT_EQ(record.tags.at("blocking"), "false");
+            const std::size_t group = (source_role ? 0u : 3u) + projection;
+            const std::size_t metric = static_cast<std::size_t>(name - names.begin());
+            ASSERT_FALSE(seen[group][metric]);
+            seen[group][metric] = true;
+            EXPECT_EQ(record.count, expected_values[group][0]);
+            EXPECT_TRUE(PerfStatsCollector::matchesCounterSequence(
+                record, expected_words[group], words_per_step)) << record.name;
+            if (metric == 3u) EXPECT_GE(record.value, 0.0); // Admission clock is not the transfer measurement.
+            else EXPECT_DOUBLE_EQ(record.value, static_cast<double>(expected_values[group][metric]));
+            EXPECT_EQ(record.tags.at("lane"), "0");
+            EXPECT_EQ(record.tags.at("world_rank"), std::to_string(context->rank()));
+            EXPECT_EQ(record.tags.at("world_size"), "2");
+            EXPECT_EQ(record.tags.at("source_device"), "CPU");
+            EXPECT_EQ(record.tags.at("destination_device"), "CPU");
+        }
+        EXPECT_EQ(retained, names.size() * expected_words.size());
+        for (const auto &group : seen) for (const bool present : group) EXPECT_TRUE(present);
+        const auto stats = transport.stats();
+        EXPECT_EQ(stats.operations_completed, epochs);
+        EXPECT_EQ(stats.bytes_sent, epochs / 2u * 1280u);
+        EXPECT_EQ(stats.bytes_received, epochs / 2u * 1280u);
+        EXPECT_EQ(stats.protocol_failures, 0u);
+        EXPECT_EQ(stats.mpi_failures, 0u);
+        EXPECT_EQ(stats.inference_stream_waits, 0u);
+        EXPECT_EQ(stats.blocking_synchronizations, 0u);
+    }
+
     TEST(
         Test__MoEOverlayMPIResidencyConsensus,
         PreparedContextRestorationPurposeMovesExactRemoteBytes)
@@ -1983,11 +2346,7 @@ namespace llaminar2::test
         constexpr std::size_t staging_bytes = 97;
         MoEOverlayMPIRemoteProjectionTransport transport({
             .mpi_context = context,
-            .lane_budget = {
-                .maximum_participants_per_cycle = 1,
-                .maximum_concurrent_cycles = 1,
-                .projections_per_expert = 1,
-            },
+            .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1, 1, 1),
             .staging_capacity_bytes = staging_bytes,
             .perf_device = "mpi_remote_projection_restoration_test",
         });
@@ -2004,6 +2363,10 @@ namespace llaminar2::test
             static_cast<std::uint32_t>(staging_bytes));
         std::vector<std::uint8_t> destination_bytes(
             source_projection.native_interleaved.size(), 0xa5u);
+        const auto initial_recipient=destination_bytes;
+        const auto source_wire=cpuLiveWireOracle(source_projection);
+        ASSERT_EQ(source_wire.size(),1280u);
+        EXPECT_EQ(manifest.total_bytes,source_wire.size());
         const auto source_lifetime = std::make_shared<int>(19);
         const auto destination_lifetime = std::make_shared<int>(23);
 
@@ -2043,13 +2406,14 @@ namespace llaminar2::test
             ASSERT_EQ(
                 destination_bytes.size(),
                 source_projection.native_interleaved.size());
-            EXPECT_TRUE(std::equal(
-                destination_bytes.begin(),
-                destination_bytes.end(),
-                source_projection.native_interleaved.begin(),
-                source_projection.native_interleaved.end()));
+            EXPECT_EQ(destination_bytes,expectedCpuRecipientImage(source_projection,initial_recipient));
         }
+        else EXPECT_EQ(destination_bytes,initial_recipient);
         const auto stats = transport.stats();
+        EXPECT_EQ(stats.bytes_sent,context->rank()==0?source_wire.size():0u);
+        EXPECT_EQ(stats.bytes_received,context->rank()==1?source_wire.size():0u);
+        EXPECT_EQ(stats.chunks_sent,context->rank()==0?16u:0u);
+        EXPECT_EQ(stats.chunks_received,context->rank()==1?16u:0u);
         EXPECT_EQ(stats.wave_reservations_started, 1u);
         EXPECT_EQ(stats.wave_reservations_failed, 0u);
         EXPECT_EQ(stats.operations_completed, 1u);
@@ -2120,18 +2484,18 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
             };
-            service->participant_costs = {
+            service->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {1, 1, 1}},
                 {.participant_id = 1,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
-            };
+            });
             auto migration =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
             migration->identity = "root-migration-profile";
-            migration->costs = {
+            migration->setWholeCosts(std::vector<MoEOverlayParticipantLayerMigrationCost>{
                 {.source_participant = 0,
                  .destination_participant = 1,
                  .layer = 0,
@@ -2140,7 +2504,7 @@ namespace llaminar2::test
                  .destination_participant = 0,
                  .layer = 0,
                  .transfer_and_repack_ns = 1},
-            };
+            });
             authority->installEconomyCertification(
                 std::move(service),
                 std::move(migration),
@@ -2201,11 +2565,7 @@ namespace llaminar2::test
             MoEOverlayMPIRemoteProjectionTransport>(
             MoEOverlayMPIRemoteProjectionTransport::Config{
                 .mpi_context = context,
-                .lane_budget = {
-                    .maximum_participants_per_cycle = 2,
-                    .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = 3,
-                },
+                .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, 3),
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "mpi-distributed-physical-cpu",
             });
@@ -2219,7 +2579,7 @@ namespace llaminar2::test
             .staging_capacity_bytes = staging_bytes,
             .perf_device = "mpi-distributed-physical-cpu",
         });
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = registry,
             .transfer_provider = fabric,
             .perf_device = "mpi-distributed-physical-cpu",
@@ -2411,7 +2771,13 @@ namespace llaminar2::test
         EXPECT_EQ(projection_stats.source_operations, 3u);
         EXPECT_EQ(projection_stats.destination_operations, 3u);
         EXPECT_EQ(projection_stats.operations_completed, 6u);
-        EXPECT_GT(projection_stats.bytes_sent, 0u);
+        size_t live_expert_bytes=0;
+        for(const auto& engine:{arrived.gate(),arrived.up(),arrived.down()}) {
+            const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
+            live_expert_bytes+=cpuLiveWireOracle(*packed).size();
+        }
+        EXPECT_EQ(live_expert_bytes,3840u); //1280 live bytes per Gate/Up/Down projection.
+        EXPECT_EQ(projection_stats.bytes_sent,live_expert_bytes);
         EXPECT_EQ(
             projection_stats.bytes_sent,
             projection_stats.bytes_received);
@@ -2537,11 +2903,7 @@ namespace llaminar2::test
             MoEOverlayMPIRemoteProjectionTransport>(
             MoEOverlayMPIRemoteProjectionTransport::Config{
                 .mpi_context = context,
-                .lane_budget = {
-                    .maximum_participants_per_cycle = 2,
-                    .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = 3,
-                },
+                .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, 3),
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "mpi-distributed-economy-cpu",
             });
@@ -2572,7 +2934,7 @@ namespace llaminar2::test
             .collect_economy_measurements = true,
             .perf_device = "mpi-distributed-economy-cpu",
         });
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = registry,
             .transfer_provider = fabric,
             .perf_device = "mpi-distributed-economy-cpu",
@@ -2845,7 +3207,7 @@ namespace llaminar2::test
                     6,
                     MoEOverlayAuthoritativeResidencyEntry{
                         .candidate_tier_idx = 0,
-                        .candidate_owner_participant = 0,
+                        .candidate_target = MoEOverlayRouteTarget::whole(0),
                     }),
             },
             .execution_fingerprint = {
@@ -3058,7 +3420,7 @@ namespace llaminar2::test
                         6,
                         MoEOverlayAuthoritativeResidencyEntry{
                             .candidate_tier_idx = 0,
-                            .candidate_owner_participant = 0,
+                            .candidate_target = MoEOverlayRouteTarget::whole(0),
                         }),
                 },
                 .execution_fingerprint = {
@@ -3843,4 +4205,95 @@ namespace llaminar2::test
         EXPECT_TRUE(local.fingerprints.empty());
         EXPECT_EQ(local.retirements, 0);
     }
+    /** Same observed generation can publish distinct later epochs only through retired original lanes. */
+    TEST(Test__MoEOverlayMPIResidencyConsensus, ActiveProgressContinuationSameGenerationLaterEpochReplay)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context)) GTEST_SKIP() << "Continuation publisher replay requires two ranks";
+        constexpr int coordinator = 1;
+        auto histogram = continuation_replay::histogram(context->rank(), true);
+        auto authority = continuation_replay::authority(*histogram, 2, coordinator);
+        MoEOverlayMPIResidencyProposalPublisher publisher({.mpi_context = context,
+            .coordinator_world_rank = coordinator, .num_layers = 1, .num_experts = 8,
+            .perf_device = "continuation-original-publisher-replay",
+            .transaction_demand = histogram->config().transaction_demand});
+        ImmediateLocalResidencyTransport local;
+        auto consensus = std::make_shared<MoEOverlayMPIResidencyConsensus>(
+            MoEOverlayMPIResidencyConsensus::Config{.mpi_context = context,
+                .perf_device = "continuation-original-consensus-replay"});
+        MoEOverlayDistributedResidencyTransport transport({.local_transport = &local,
+            .consensus = consensus, .perf_device = "continuation-original-wave-replay"});
+        std::optional<MoEOverlayResidencyAuthority::CommittedObservation> observation;
+        uint64_t first_generation = 0;
+        for (int round = 0; round < 3; ++round)
+        {
+            MoEOverlayResidencyTransaction transaction;
+            std::string error;
+            if (publisher.isCoordinator())
+            {
+                if (round == 0) transaction = authority->proposeFromHistogram();
+                else
+                {
+                    auto next = authority->reproposeFromCommittedObservation(*observation);
+                    ASSERT_TRUE(next);
+                    transaction = std::move(*next);
+                }
+                const auto proposal = makeMoEOverlayDistributedResidencyProposal(
+                    authority->exportAuthoritativeResidencyPlan(transaction), transaction);
+                ASSERT_TRUE(publisher.beginPublish(proposal, &error)) << error;
+                EXPECT_FALSE(publisher.beginPublish(proposal, &error))
+                    << "The original packet/ack lane must finish before reuse";
+            }
+            else if (round != 0)
+                ASSERT_TRUE(publisher.armReceive(&error)) << error;
+
+            bool adopted = false;
+            for (;;)
+            {
+                std::shared_ptr<const MoEOverlayDistributedResidencyProposal> received;
+                const auto progress = publisher.poll(&received, &error);
+                ASSERT_NE(progress, MoEOverlayResidencyWaveProgress::Failed) << error;
+                if (received)
+                {
+                    ASSERT_FALSE(publisher.isCoordinator());
+                    transaction = authority->adoptAuthoritativeResidencyPlan(received->plan);
+                    ASSERT_EQ(fingerprintMoEOverlayResidencyExecutionPlan(transaction), received->execution_fingerprint);
+                    EXPECT_FALSE(publisher.armReceive(&error));
+                    ASSERT_TRUE(publisher.acceptReceivedProposal(transaction.histogram_generation, &error)) << error;
+                    EXPECT_FALSE(publisher.armReceive(&error)) << "A posted ack still owns its storage";
+                    adopted = true;
+                    continue;
+                }
+                if (progress == MoEOverlayResidencyWaveProgress::Ready) break;
+                std::this_thread::yield();
+            }
+            EXPECT_EQ(publisher.state(), MoEOverlayMPIResidencyProposalPublisherState::Idle);
+            EXPECT_TRUE(publisher.isCoordinator() || adopted);
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_FALSE(transaction.empty());
+            EXPECT_EQ(transaction.expected_epoch, uint64_t(1 + round));
+            if (round == 0) first_generation = transaction.histogram_generation;
+            EXPECT_EQ(transaction.histogram_generation, first_generation);
+            auto old_reader = authority->tryAcquireTicketSnapshot();
+            ASSERT_TRUE(old_reader);
+            ASSERT_EQ(authority->beginApply(transaction, transport).status, MoEOverlayResidencyApplyStatus::Started);
+            ASSERT_EQ(finishAuthorityWave(*authority).status, MoEOverlayResidencyApplyStatus::Published);
+            if (publisher.isCoordinator()) observation = authority->retainCommittedObservation(transaction);
+            EXPECT_EQ(authority->snapshot()->epoch, uint64_t(2 + round));
+            EXPECT_GT(authority->pendingRetirementCount(), 0u);
+            old_reader.reset();
+            ASSERT_TRUE(drainAuthorityRetirements(*authority, &error)) << error;
+            EXPECT_EQ(local.retirements, round + 1);
+            // This is a test boundary on the existing execution membership;
+            // production still uses its nonblocking reader/consensus edges.
+            context->barrier();
+        }
+        EXPECT_EQ(publisher.stats().blocking_inference_waits, 0u);
+        if (publisher.isCoordinator()) EXPECT_EQ(publisher.stats().publications_completed, 3u);
+        else EXPECT_EQ(publisher.stats().acknowledgements_completed, 3u);
+        publisher.stopAndDrain();
+    }
+
 } // namespace llaminar2::test
+
+#include "LiveEconomyEvidenceMPIContract.inc"

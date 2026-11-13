@@ -14,6 +14,7 @@
  * archival. They must not exhaust physical work queues needed by maintenance.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
@@ -125,8 +126,7 @@ namespace
             .slot_capacity = 2u,
             .execution_lane_capacity = 2u,
             .execution_streams =
-                TransferEngine::instance()
-                    .allocatePersistentTransferExecutionLanes(
+                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                         2u,
                         device,
                         "mapped_progress_repeated_generations"),
@@ -362,8 +362,7 @@ namespace
             .slot_capacity = 2u,
             .execution_lane_capacity = 2u,
             .execution_streams =
-                TransferEngine::instance()
-                    .allocatePersistentTransferExecutionLanes(
+                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                         2u,
                         device,
                         "mapped_progress_inference_no_join"),
@@ -500,8 +499,7 @@ namespace
             .slot_capacity = kTopologyCommandSlots,
             .execution_lane_capacity = kMigrationCycleSlots,
             .execution_streams =
-                TransferEngine::instance()
-                    .allocatePersistentTransferExecutionLanes(
+                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                         4u,
                         device,
                         "mapped_progress_topology_sized_directory"),
@@ -571,8 +569,7 @@ namespace
             .slot_capacity = kCommandCount,
             .execution_lane_capacity = 1u,
             .execution_streams =
-                TransferEngine::instance()
-                    .allocatePersistentTransferExecutionLanes(
+                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                         1u,
                         device,
                         "mapped_progress_bounded_lane_queue"),
@@ -714,7 +711,7 @@ namespace
             else
                 std::memset(destinations.back()->mutableHostData(), 0, bytes);
         }
-        const auto execution = transfers.allocatePersistentTransferExecutionLanes(
+        const auto execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
             slots, device, "progress_across_held_inference");
         // Every CUDA client shares the same captured service. Local and remote
         // CPU edges reserve independent read/write identities, not new queues.
@@ -741,8 +738,12 @@ namespace
         std::vector<std::shared_ptr<DeviceTransferBuffer>> cpu_device_outputs;
         if (cpu_edge != CPUWeightEdgeProof::None)
         {
+            // Only the remote edge exposes these original slices to MPI.
             cpu_staging = transfers.allocatePersistentTransferStagingSlices(
-                cpu_bytes, slots, device);
+                cpu_bytes, slots, device,
+                cpu_edge == CPUWeightEdgeProof::Remote
+                    ? HostTransferAccess::CrossProcessReadable
+                    : HostTransferAccess::ProcessLocal);
             for (std::size_t i = 0; i < slots; ++i)
             {
                 cpu_outputs.emplace_back(cpu_bytes, 0u);
@@ -1098,12 +1099,12 @@ namespace
 
         /* One physical stream intentionally serves two logical authorities. */
         const auto execution =
-            transfers.allocatePersistentTransferExecutionLanes(
+            ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                 1u,
                 device,
                 "remote_mapped_shared_worker");
         auto staging = transfers.allocatePersistentTransferStagingSlices(
-            bytes, 1u, device);
+            bytes, 1u, device, HostTransferAccess::CrossProcessReadable);
         ASSERT_EQ(staging.size(), 1u);
         auto remote = std::make_unique<MoEOverlayGpuRemoteProjectionLane>(
             MoEOverlayGpuRemoteProjectionLane::Config{
@@ -1260,7 +1261,7 @@ namespace
         std::atomic_ref<std::uint64_t>(*signal).store(0u, std::memory_order_release);
         auto epoch = MappedTransferProgressEpoch::create({
             .device = device, .slot_capacity = 2u, .execution_lane_capacity = 2u,
-            .execution_streams = transfers.allocatePersistentTransferExecutionLanes(
+            .execution_streams = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                 2u, device, "producer_dependency_service"),
             .maximum_bytes = bytes + 13u, .name = "producer_dependency_service"});
         auto dependent = epoch->reserveSlot(MappedTransferDirection::DeviceToHost, output);
@@ -1363,7 +1364,7 @@ namespace
         auto staging = engine.allocateMappedHostRegion(capacity, devices);
         auto observation = engine.allocateMappedHostRegion(capacity, devices);
         auto storage = engine.allocateDeviceTransferBuffer(capacity, device);
-        const auto lanes = engine.allocatePersistentTransferExecutionLanes(
+        const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(engine,
             1u, device, "bounded_byte_copy_sweep");
         const auto staging_slices = engine.allocatePersistentTransferStagingSlices(
             capacity, 2u, device);
@@ -1522,7 +1523,7 @@ namespace
                 MappedTransferPackedWork description{};
                 description.kind = MappedTransferWorkKind::PackedGpuToCpu;
                 description.layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                    native_vnni_formats::Q8_0, 64, 32, 1, 0, 0,
+                    native_quantised_formats::Q8_0, 64, 32, 1, 0, 0,
                     ExpertTierWeightProjection::Gate, 1).deviceLayout();
                 description.scales = reinterpret_cast<std::uintptr_t>(storage->deviceData()) + 4096u;
                 description.device_staging = description.scales + 128u;
@@ -1891,3 +1892,5 @@ namespace
 #endif
 } // namespace
 } // namespace llaminar2
+
+#include "FiniteBodySiblingNativeReplay.inc"

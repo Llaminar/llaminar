@@ -211,6 +211,12 @@ namespace llaminar2
             return 0;
         }
 
+        /** @return Exact fixed-pipeline cache capacity when sealed by serving admission. */
+        virtual std::optional<std::size_t> retainedExactPrefillCacheEntries() const
+        {
+            return std::nullopt;
+        }
+
         /**
          * @brief Called once after the first graph build completes and workspace
          *        is allocated, but before execution starts.
@@ -342,8 +348,8 @@ namespace llaminar2
          *
          * For PP non-embedding stages, the previous stage's output (external hidden)
          * must be copied to the local working buffer before graph execution. During
-         * cache MISS this happens inline in graph build; during cache HIT the engine
-         * must redo this copy using the stored PPCopyInfo.
+         * cache MISS and HIT this is resolved from the current host boundary.
+         * Live extents are never stored in retained graph state.
          */
         struct PPCopyInfo
         {
@@ -352,9 +358,10 @@ namespace llaminar2
             size_t copy_bytes = 0;
             DeviceId device;
             bool needs_copy = false;
+
         };
 
-        /** Resolve PP copy info for the given input (after a cache-miss build). */
+        /** Resolve exact PP metadata for this invocation, before any copy or graph build. */
         virtual PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const = 0;
 
         /** Check if MoE dynamic rebalancing is active for this forward domain. */
@@ -750,6 +757,14 @@ namespace llaminar2
          * resources and live tensors remain untouched.
          */
         virtual void cancelPrefillChunkSnapshotDiagnostics() noexcept {}
+        /** @brief Carry the exact optional source definition through the existing prefill cold boundary. */
+        virtual bool waitAtPrefillGraphCaptureBoundary(const ForwardInput&,DeviceId,const std::string&,void*,
+            LocalTPCaptureSourceDefinition&)
+        {throw std::logic_error("Forward host has no typed prefill source-definition handoff");}
+        /** @brief Carry the exact optional source definition through the existing decode cold boundary. */
+        virtual bool waitAtDecodeGraphCaptureBoundary(const ForwardInput&,DeviceId,const std::string&,void*,
+            LocalTPCaptureSourceDefinition&)
+        {throw std::logic_error("Forward host has no typed decode source-definition handoff");}
     };
 
     /**
@@ -772,6 +787,7 @@ namespace llaminar2
         struct Config
         {
             GraphCacheConfig cache_config;
+            std::size_t sparse_query_program_count = 1u; ///< Actual model-owned closed prefill topology roster per admitted bucket.
             std::optional<FactoryPPStageConfig> pp_stage_config;
             /** Frozen rank-owned prefill edges; cannot change after engine construction. */
             const PipelineForwardGraphEdges *pipeline_forward_edges = nullptr;
@@ -907,6 +923,8 @@ namespace llaminar2
             void *stream = nullptr;
             size_t stage_count = 0;
             size_t captured_node_count = 0;
+            std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary; ///< Retained immutable I/O declaration, independent of ticket scheduling.
+            std::shared_ptr<ReadAheadNativeResourceFamily> read_ahead_resources; ///< Original event/lane owner retained through native parent completion.
 
             explicit operator bool() const noexcept
             {
@@ -914,6 +932,17 @@ namespace llaminar2
                        stage_count > 0 && captured_node_count > 0;
             }
         };
+
+        /**
+         * @brief Borrow the actual sealed finite graph definitions for one cold setup topology.
+         * @param snapshot_identity Original executor snapshot topology selected by the Rank.
+         * @return Exact materialized cache owners, including source-free declarations.
+         * @throws std::exception If a source-bearing executable lacks its matching preparation.
+         * No ordering is inferred from this set: each finite graph declares its
+         * own optional source occurrence, and family association uses its exact signature.
+         */
+        std::vector<RetainedForwardSourceDefinition> retainedSourceGraphDefinitions(
+            uint64_t snapshot_identity) const;
 
         /**
          * @brief Immutable identity of one exact retained decode replay plan.
@@ -933,6 +962,14 @@ namespace llaminar2
             size_t source_capture_unit_count = 0; ///< Native child templates represented by the plan.
             bool segmented = false; ///< True only for host-sequenced heterogeneous replay.
             bool composed_parent = false; ///< True when one device parent owns all source units.
+            const ComputeGraph *graph_owner = nullptr; ///< Exact cache-owned graph, never a lifetime extension.
+            uint64_t topology_generation = 0; ///< Canonical graph generation at export.
+            uint64_t workspace_generation = 0; ///< Existing arena/workspace preparation generation.
+            uint64_t capture_variant_signature = 0; ///< Complete immutable stage launch-policy identity.
+            uint64_t capture_generation = 0; ///< Existing cache lifetime materialization generation.
+            std::shared_ptr<ReadAheadNativeResourceFamily> read_ahead_resources; ///< Original side-lane family retained across complete hosted/ticket request lifetime.
+            /** @return Exact immutable owner/geometry match; no count or tensor data is observed. */
+            bool operator==(const RetainedDecodeGraphView &) const = default;
 
             explicit operator bool() const noexcept
             {
@@ -1044,6 +1081,26 @@ namespace llaminar2
             const IGPUGraphCapture *source_capture,
             int64_t completed_invocations,
             std::string *error = nullptr) const;
+
+        /**
+         * @brief Publish diagnostics from one original forward already completed inside a parent.
+         *
+         * Uses only the exact child's retained snapshot manifest and the parent's
+         * original producer stream. The existing diagnostic acquisition publishes
+         * captured values; no forward, capture, arena allocation or state replay
+         * occurs. The caller must already have authenticated terminal completion.
+         *
+         * @param signature Original executed child identity, retained before request reset.
+         * @param source_capture Exact borrowed child embedded in the completed parent.
+         * @param producer_stream Exact stream on which the parent executed.
+         * @param error Optional first violated source/publication invariant.
+         * @return True after original diagnostics and last-executed view are published.
+         */
+        bool publishComposedForwardSnapshots(
+            const ForwardGraphSignature &signature,
+            const IGPUGraphCapture *source_capture,
+            void *producer_stream,
+            std::string *error = nullptr);
 
         /**
          * @brief Inspect one exact retained decode graph without requiring monolithic capture.
@@ -1263,9 +1320,12 @@ namespace llaminar2
          * graphs are not yet proven placement-stable and must not replay after
          * a mask publication under a stable MoE epoch.
          *
+         * @param before_invalidation Cold owner hook, called once before the first
+         * child recording is destroyed so enclosing retained parents retire first.
          * @return Number of valid cached graphs invalidated.
          */
-        size_t invalidateMoEPlacementSensitiveGraphsForStablePlacement();
+        size_t invalidateMoEPlacementSensitiveGraphsForStablePlacement(
+            const std::function<void()> &before_invalidation = {});
 
         /**
          * @brief Drop captured GPU replay state while keeping cached ComputeGraphs.
@@ -1428,6 +1488,7 @@ namespace llaminar2
          * @param host Participant-local execution and publication services.
          * @param signature Canonical cache identity, including verifier/condition role.
          * @param start Start of this forward's host timing interval.
+         * @param pp_submission Whether this same invocation already consumed its host PP boundary.
          * @return True after the requested materialization or execution succeeds.
          */
         bool executeCacheHit(
@@ -1436,7 +1497,8 @@ namespace llaminar2
             ForwardGraphCache &cache,
             IForwardExecutionHost &host,
             const ForwardGraphSignature &signature,
-            std::chrono::high_resolution_clock::time_point start);
+            std::chrono::high_resolution_clock::time_point start,
+            HostPipelineBoundarySubmission pp_submission = HostPipelineBoundarySubmission::Current);
 
         /**
          * @brief Capture and instantiate one cached GPU graph without execution.
@@ -1508,7 +1570,7 @@ namespace llaminar2
 
         /** @brief Enforce the engine-level cap for all reusable prefill topologies. */
         void enforcePrefillForwardCapacity(
-            const ForwardGraphSignature *active_signature = nullptr);
+            const IForwardExecutionHost &host, const ForwardGraphSignature *active_signature);
 
         /** @brief Count valid top-level exact and bucketed prefill cache entries. */
         size_t prefillForwardCacheSize() const;

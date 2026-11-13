@@ -319,8 +319,12 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         for backend in ("CUDA", "ROCm"):
             journal = ledger()
             for edge in journal["edges"]:
-                edge["source_device"] = f'{backend}:{edge["source_participant"]}'
-                edge["destination_device"] = f'{backend}:{edge["destination_participant"]}'
+                # Schema4 retains the exact typed endpoint. Native device
+                # authorities have whole endpoints; no cohort is projected
+                # onto a representative participant when changing vendors.
+                for side in ("source", "destination"):
+                    self.assertEqual(edge[side]["kind"], "whole")
+                    edge[side]["device"] = f'{backend}:{edge[side]["participant"]}'
             records, terminal = controller_transport(journal)
             with self.subTest(backend=backend):
                 self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
@@ -1003,6 +1007,42 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 self.assertIsNotNone(validate_gpu_host_transfer_policy([sample, proof], device_kinds=kinds).error)
         self.assertIsNotNone(validate_gpu_host_transfer_policy([ticket], device_kinds=mixed).error)
 
+    def test_cuda_hosted_transfer_audit_authenticates_live_window_without_setup(self) -> None:
+        """Current-window ordinary hosted tickets require actual same-owner replay and exact ABI."""
+        import copy
+        graph = self.local_ticket_boundary_records("CUDA:0", 0)
+        def row(name, value, tags):
+            return counter(name, value=value, domain="mtp", device="CUDA:0", tags=tags) | {"rank":0}
+        launch = row("device_generation_loop_graph_launches",1,
+            {"execution":"hosted_ticket_selected_captured_transactions","backend":"CUDA","requests":"1",
+             "draft_depth":"0","minimum_draft_depth":"0","maximum_draft_depth":"0",
+             "fragments":"1","conditional_fragments":"0","selector_gated_fragments":"0"})
+        ticket = row("device_generation_dispatch_ticket_d2h_submissions",4,device_generation_ticket_tags())
+        observation = row("device_generation_dispatch_tickets_observed",3,{"entry_source":"committed_transaction_ticket","complete":"false"})
+        final_observation = row("device_generation_dispatch_tickets_observed",1,{"entry_source":"committed_transaction_ticket","complete":"true"})
+        fragment = row("hosted_device_generation_fragment_submissions",3,{"fragment_index":"0"})
+        branch = row("hosted_device_generation_transaction_submissions",3,
+            {"entry_source":"committed_transaction_ticket","dynamic_depth_source":"device_controller_ticket","fragments":"1"})
+        terminal = row("hosted_device_generation_terminal_submissions",1,{})
+        rows = [*graph,launch,ticket,observation,final_observation,branch,fragment,terminal]
+        mixed = frozenset({"cuda","cpu","rocm"})
+        self.assertIsNone(validate_gpu_host_transfer_policy(rows,device_kinds=mixed).error)
+        for name,changed in (
+            ("missing_graph",[launch,ticket,observation,final_observation,branch,fragment,terminal]),
+            ("foreign_rank",[*graph,launch|{"rank":1},ticket,observation,final_observation,branch,fragment,terminal]),
+            ("foreign_device",[*graph,launch|{"device":"CUDA:1"},ticket,observation,final_observation,branch,fragment,terminal]),
+            ("unobserved_ticket",[*graph,launch,ticket,observation|{"value":2},final_observation,branch,fragment,terminal]),
+            ("missing_branch",[*graph,launch,ticket,observation,final_observation,fragment,terminal]),
+            ("wrong_bytes",[*graph,launch,ticket|{"tags":device_generation_ticket_tags()|{"bytes":"64"}},observation,final_observation,branch,fragment,terminal]),
+        ):
+            with self.subTest(case=name):
+                self.assertIsNotNone(validate_gpu_host_transfer_policy(changed,device_kinds=mixed).error)
+        for key,value in (("execution","native_conditional_parent"),("requests","2"),("conditional_fragments","1"),("maximum_draft_depth","-1")):
+            changed=copy.deepcopy(rows);changed[len(graph)]["tags"][key]=value
+            with self.subTest(geometry=key):
+                self.assertIsNotNone(validate_gpu_host_transfer_policy(changed,device_kinds=mixed).error)
+        self.assertIsNotNone(validate_gpu_host_transfer_policy(rows,device_kinds=frozenset({"cuda"})).error)
+
     def test_llep_verifier_policy_accepts_grouped_static_owner_execution(
         self,
     ) -> None:
@@ -1485,6 +1525,117 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     else:
                         self.assertIn("unauthenticated scheduler", result.error or "")
 
+    @classmethod
+    def continuation_mtp_records(cls, *, cuda: bool = False, rank: int | None = None) -> list[dict]:
+        """Append one complete native-admission witness triplet to each controller."""
+        records = cls.hybrid_hosted_mtp_records(rank=rank) if cuda else cls.hosted_mtp_records()
+        if not cuda and rank is not None:
+            for row in records:
+                row["rank"] = rank
+        devices = {row.get("device") for row in records if row["name"] == "device_generation_loop_graph_materializations"}
+        for device in devices:
+            existing = next(row for row in records if row.get("device") == device and
+                            row["name"] == "device_generation_dispatch_ticket_d2h_submissions")
+            existing["value"] += 1
+            scope = {"kind": "counter", "count": 1, "phase": "decode", "sequence_word_count": 3,
+                     "sequence_minimum_words": [0, 17, 41], "sequence_maximum_words": [0, 17, 41],
+                     "sequence_digest_lo": 1234, "sequence_digest_hi": 5678}
+            if rank is not None:
+                scope["rank"] = rank
+            common = {"family": "exact_rows", "physical_rows": "4",
+                      "entry_source": "native_continue_response_admission"}
+            for name, tags in (
+                ("device_generation_continuation_admission_tickets", {**common, "depth": "3"}),
+                ("device_generation_dispatch_tickets_observed", {**common, "next_depth": "3", "complete": "false", "maintenance_due": "false"}),
+                ("hosted_device_generation_transaction_submissions", {**common, "depth": "3", "fragments": "12", "dynamic_depth_source": "device_controller_ticket"}),
+            ):
+                records.append(counter(name, domain="mtp", device=device, tags=tags) | copy.deepcopy(scope))
+            admission = counter("device_generation_admissions", domain="mtp", device=device, tags={
+                "admission_boundary": "continue_response", "response_owner": "persistent_device_ledger",
+                "request_count": "1", "minimum_draft_depth": "3", "maximum_draft_depth": "3"}) | {"phase": "decode"}
+            if rank is not None:
+                admission["rank"] = rank
+            records.append(admission)
+        return records
+
+    def test_hosted_mtp_continuation_joins_bounded_native_identity_streams(self) -> None:
+        """Genuine ticket zero adds exactly one witnessed dispatch per continuation."""
+        for cuda in (False, True):
+            for multi_rank in (False, True):
+                with self.subTest(cuda=cuda, multi_rank=multi_rank):
+                    records = (self.continuation_mtp_records(cuda=cuda, rank=0) +
+                               self.continuation_mtp_records(cuda=cuda, rank=1)) if multi_rank else self.continuation_mtp_records(cuda=cuda)
+                    result = validate_host_scheduled_mtp_device_generation_policy(records,
+                        device_kinds=frozenset({"cuda", "rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+                    self.assertIsNone(result.error)
+        # Ordinary first transaction one keeps its original strict schema/law.
+        self.assertIsNone(validate_host_scheduled_mtp_device_generation_policy(self.hosted_mtp_records(),
+            device_kinds=frozenset({"rocm"}), expected_minimum_depth=3, expected_maximum_depth=3).error)
+
+    def test_hosted_mtp_continuation_rejects_missing_malformed_and_foreign_witnesses(self) -> None:
+        """No rank/device/depth or plausible total repairs an absent native identity."""
+        faults = ("missing_admission", "missing_observation", "missing_branch", "missing_all", "duplicate",
+                  "session", "workspace", "zero_session", "zero_workspace", "digest", "digest_missing", "count",
+                  "words", "ordinal", "family", "depth", "physical", "source", "committed_source", "phase",
+                  "domain", "device", "rank", "session_tag", "complete", "maintenance", "native_admissions",
+                  "word_bool", "word_fraction", "word_string", "count_bool", "count_fraction", "count_string",
+                  "word_count_bool", "word_count_fraction", "word_count_string", "epoch_overflow", "range_reverse", "digest_bool")
+        for cuda in (False, True):
+            for fault in faults:
+                with self.subTest(cuda=cuda, fault=fault):
+                    records = self.continuation_mtp_records(cuda=cuda, rank=0) + self.continuation_mtp_records(cuda=cuda, rank=1)
+                    target = next(row for row in records if row.get("rank") == 0 and
+                                  row["name"] == "device_generation_continuation_admission_tickets")
+                    device = target["device"]
+                    zero = next(row for row in records if row.get("rank") == 0 and row.get("device") == device and
+                                row["name"] == "device_generation_dispatch_tickets_observed" and
+                                row.get("tags", {}).get("entry_source") == "native_continue_response_admission")
+                    branch = next(row for row in records if row.get("rank") == 0 and row.get("device") == device and
+                                  row["name"] == "hosted_device_generation_transaction_submissions" and
+                                  row.get("tags", {}).get("entry_source") == "native_continue_response_admission")
+                    if fault.startswith("missing_"):
+                        for row in {"missing_admission": [target], "missing_observation": [zero],
+                                    "missing_branch": [branch], "missing_all": [target, zero, branch]}[fault]:
+                            records.remove(row)
+                    elif fault == "duplicate": records.append(copy.deepcopy(target))
+                    elif fault in {"session", "workspace", "zero_session", "zero_workspace"}:
+                        word = 1 if "session" in fault else 2
+                        for key in ("sequence_minimum_words", "sequence_maximum_words"):
+                            zero[key][word] = 0 if fault.startswith("zero_") else zero[key][word] + 1
+                    elif fault == "digest": zero["sequence_digest_hi"] += 1
+                    elif fault == "digest_missing": del zero["sequence_digest_lo"]
+                    elif fault == "count": zero["count"] = zero["value"] = 2
+                    elif fault == "words": zero["sequence_word_count"] = 1
+                    elif fault == "ordinal": zero["sequence_maximum_words"][0] = 1
+                    elif fault == "family": zero["tags"]["family"] = "bounded_buckets"
+                    elif fault == "depth": zero["tags"]["next_depth"] = "4"
+                    elif fault == "physical": zero["tags"]["physical_rows"] = "16"
+                    elif fault == "source": zero["tags"]["entry_source"] = "committed_transaction_ticket"
+                    elif fault == "committed_source": branch["tags"]["entry_source"] = "committed_transaction_ticket"
+                    elif fault == "phase": zero["phase"] = "setup"
+                    elif fault == "domain": zero["domain"] = "forward_graph"
+                    elif fault == "device": zero["device"] = "ROCm:99"
+                    elif fault == "rank": zero["rank"] = 2
+                    elif fault == "session_tag": zero["tags"]["session_epoch"] = "17"
+                    elif fault == "complete": zero["tags"]["complete"] = "true"
+                    elif fault == "maintenance": zero["tags"]["maintenance_due"] = "true"
+                    elif fault in {"word_bool", "word_fraction", "word_string"}:
+                        zero["sequence_minimum_words"][1] = {"word_bool": True, "word_fraction": 17.5, "word_string": "17"}[fault]
+                    elif fault in {"count_bool", "count_fraction", "count_string"}:
+                        zero["count"] = {"count_bool": True, "count_fraction": 1.5, "count_string": "1"}[fault]
+                    elif fault in {"word_count_bool", "word_count_fraction", "word_count_string"}:
+                        zero["sequence_word_count"] = {"word_count_bool": True, "word_count_fraction": 3.0, "word_count_string": "3"}[fault]
+                    elif fault == "epoch_overflow": zero["sequence_maximum_words"][1] = 1 << 64
+                    elif fault == "range_reverse": zero["sequence_minimum_words"][2] = 42
+                    elif fault == "digest_bool": zero["sequence_digest_lo"] = True
+                    elif fault == "native_admissions":
+                        row = next(row for row in records if row.get("rank") == 0 and row.get("device") == device and
+                                   row["name"] == "device_generation_admissions")
+                        row["value"] = 2
+                    result = validate_host_scheduled_mtp_device_generation_policy(records,
+                        device_kinds=frozenset({"cuda", "rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+                    self.assertIsNotNone(result.error)
+
     def test_hybrid_cuda_terminal_mtp_accepts_authenticated_boundary(self) -> None:
         """A CUDA PP tail needs captured ticket dispatch across the ROCm boundary."""
         records = self.hybrid_hosted_mtp_records()
@@ -1537,6 +1688,42 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             expected_minimum_depth=3, expected_maximum_depth=3)
         self.assertIsNone(result.error)
         self.assertEqual(len(result.devices), 4)
+
+    def test_hosted_mtp_scopes_cross_domain_sidecar_parent_join_to_original_owner(self) -> None:
+        """A neighbor's MTP sidecar must not survive removal of its forward-graph proof."""
+        records = self.hybrid_hosted_mtp_records(rank=0)
+        for index in range(2):
+            device = f"CUDA:{index}"
+            context = "mtp_decode_sidecar"
+            parents = self.retained_parent_records(device, rank=0)
+            for row in parents:
+                row["tags"]["context"] = context
+                if row["name"].startswith("retained_parent_"):
+                    row["tags"]["boundary_authority"] = "captured_device_units"
+            records += parents
+            records.append(dict(counter("sidecar_graph_capture_path", value=4, device=device,
+                tags={"context": "mtp_decode_sidecar_device_target_token_live_position",
+                      "graph_context": context, "seq_len": "1", "path": "retained_parent"}),
+                domain="mtp", rank=0))
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"cuda", "rocm"}),
+            expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIsNone(result.error)
+        for mutation in ("missing_replay", "foreign_device_replay", "foreign_rank_replay"):
+            with self.subTest(mutation=mutation):
+                broken = copy.deepcopy(records)
+                selected = next(row for row in broken if row["name"] == "retained_parent_replays"
+                                and row["device"] == "CUDA:0")
+                if mutation == "missing_replay":
+                    broken.remove(selected)
+                elif mutation == "foreign_device_replay":
+                    selected["device"] = "CUDA:2"
+                else:
+                    selected["rank"] = 1
+                result = validate_host_scheduled_mtp_device_generation_policy(
+                    broken, device_kinds=frozenset({"cuda", "rocm"}),
+                    expected_minimum_depth=3, expected_maximum_depth=3)
+                self.assertIsNotNone(result.error)
 
     def test_hybrid_hosted_mtp_rejects_borrowed_or_incomplete_evidence(self) -> None:
         """A neighboring graph, rank, vendor or controller cannot fill a hole."""
@@ -2239,6 +2426,39 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertIsNone(validate_graph_capture_policy(records, frozenset({'rocm'})).error)
         records[2]["tags"]["context"] = "main_decode"
         self.assertIn("main_verifier", validate_graph_capture_policy(records, frozenset({'rocm'})).error)
+
+    def test_materialized_decode_family_satisfies_strict_replay_without_executed_capture(self) -> None:
+        """q547 setup captures no arithmetic; exact family launch proves its reuse."""
+        for device in ("cuda:1", "rocm:1"):
+            rows = [counter("full_graph_plan_graphs", device=device, tags={"type": "capturable"}),
+                    counter("full_graph_capture_executable_nodes", value=3463, device=device, tags={
+                        "context": "main_verifier", "source": "full_graph_capture",
+                        "type": "materialized_unlaunched_executable", "executable_family": "251"}),
+                    counter("full_graph_replay_calls", device=device, tags={
+                        "context": "main_verifier", "type": "capturable", "decode": "true",
+                        "executable_family": "251"}),
+                    counter("decode_graph_phase", device=device, tags={
+                        "context": "main_verifier", "phase": "replay"})]
+            rows = [dict(row, rank=0) for row in rows]
+            kinds = frozenset({device.split(":")[0]})
+            def validate(candidate):
+                return validate_graph_capture_policy(candidate, kinds,
+                    decode_requirement=DecodeGraphRequirement.REPLAY).error
+            with self.subTest(device=device):
+                self.assertIsNone(validate(rows))
+                for missing in (1, 2, 3):
+                    with self.subTest(missing=missing):
+                        self.assertIsNotNone(validate(rows[:missing] + rows[missing+1:]))
+                for target, field, value in ((1, "value", 0), (2, "value", 0),
+                                              (1, "rank", 1), (2, "device", "rocm:99")):
+                    changed = copy.deepcopy(rows); changed[target][field] = value
+                    self.assertIsNotNone(validate(changed))
+                for target, field, value in ((1, "context", "main_decode"),
+                        (1, "executable_family", "250"), (2, "executable_family", "252"),
+                        (1, "executable_family", ""), (1, "executable_family", "0"),
+                        (1, "source", "unbound"), (1, "type", "graph_only_child")):
+                    changed = copy.deepcopy(rows); changed[target]["tags"][field] = value
+                    self.assertIsNotNone(validate(changed))
 
     def test_helper_executable_cannot_mask_legacy_verifier_warmup(self) -> None:
         """Context attribution must expose a verifier using retired eager warmup."""
@@ -3606,6 +3826,46 @@ class TestNativeRetainedParentEvidence(unittest.TestCase):
                     self.assertIsNone(result.error)
                     self.assertFalse(result.has_segmented_execution)
                     self.assertTrue(result.has_nonempty_full_graph_executable)
+
+    def test_setup_only_decode_parent_keeps_capture_and_replay_distinct(self) -> None:
+        """Retained decode setup need not invent an executed capture counter.
+
+        The CUDA/CPU smoke executes its verifier once. Native and CPU-service
+        parents must both prove their own nodes, setup and original launch;
+        the app additionally needs a repeat submission of that same context.
+        This class is explicitly registered in production preflight.
+        """
+        for device in ("cuda:0", "rocm:0"):
+            for host_service in (False, True):
+                with self.subTest(device=device, host_service=host_service):
+                    kinds = frozenset({device.split(":")[0]} | ({"cpu"} if host_service else set()))
+                    rows = (TestServerGraphCapturePerfPolicy.local_ticket_boundary_records(device, 1)
+                            if host_service else self.records(device))
+                    rows = [row for row in rows if row["name"] != "decode_graph_phase"]
+                    if not any(row["name"] == "retained_parent_materialized_without_launch" for row in rows):
+                        setup = copy.deepcopy(next(row for row in rows if row["name"] == "retained_parent_executable_nodes"))
+                        setup.update(name="retained_parent_materialized_without_launch", value=1)
+                        rows.append(setup)
+
+                    def validate(candidate, requirement=DecodeGraphRequirement.REPLAY):
+                        return validate_graph_capture_policy(candidate, kinds, decode_requirement=requirement).error
+
+                    self.assertIsNone(validate(rows))
+                    first = copy.deepcopy([row for row in rows if row["name"] != "retained_parent_replays"])
+                    next(row for row in first if row["name"] == "decode_capture_policy")["value"] = 1
+                    self.assertIsNone(validate(first, DecodeGraphRequirement.CAPTURE))
+                    self.assertIsNotNone(validate(first))
+                    for name in ("retained_parent_executable_nodes", "retained_parent_materialized_without_launch",
+                                 "retained_parent_transaction_zero_launches", "retained_parent_replays"):
+                        with self.subTest(missing=name):
+                            self.assertIsNotNone(validate([row for row in rows if row["name"] != name]))
+                        for field, value in (("rank", 2), ("device", "cuda:7"), ("context", "mtp_decode_sidecar"),
+                                             ("value", 0)):
+                            with self.subTest(record=name, field=field):
+                                changed = copy.deepcopy(rows)
+                                target = next(row for row in changed if row["name"] == name)
+                                (target["tags"] if field == "context" else target)[field] = value
+                                self.assertIsNotNone(validate(changed))
 
     def test_native_parent_rejects_missing_or_foreign_lifecycle(self) -> None:
         """All lifecycle evidence belongs to the same rank/device/context."""

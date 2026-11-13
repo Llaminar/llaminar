@@ -231,6 +231,28 @@ namespace llaminar2
         return topo;
     }
 
+    int GlobalPPTopology::embeddingPublisherRank() const
+    {
+        const GlobalPPStageSpec* embedding = nullptr;
+        for (const auto& stage : stages)
+        {
+            if (!stage.has_embedding)
+                continue;
+            if (embedding || stage.first_layer != 0)
+                throw std::logic_error("Pipeline request publication requires one original embedding stage");
+            embedding = &stage;
+        }
+        if (!embedding)
+            throw std::logic_error("Pipeline request publication has no original embedding stage");
+        const auto ranks = ranksForStage(*embedding);
+        if (ranks.empty() || ranks.front() < 0 || ranks.back() >= world_size ||
+            (embedding->is_global_tp &&
+                (ranks.size() < 2 || ranks.size() != embedding->participating_ranks.size() || embedding->owning_rank >= 0)) ||
+            (!embedding->is_global_tp && !embedding->participating_ranks.empty()))
+            throw std::logic_error("Pipeline request publication has invalid original embedding rank membership");
+        return sourceRankForStage(*embedding, ranks);
+    }
+
     const GlobalPPStageSpec *GlobalPPTopology::stageForLayer(int layer) const
     {
         for (const auto &stage : stages)

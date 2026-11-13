@@ -7,6 +7,8 @@
  * NUMA IDs, or an assumed rank-zero request authority. Attention obligations
  * follow actual stage/tensor ownership, including recurrent-only PP slices and
  * the separately owned MTP predictor, without removing compute participants.
+ * Selected GPU locality retains immutable PCI ancestry and directed peer
+ * observations; absent information never becomes an inferred switch or edge.
  */
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
@@ -81,6 +83,8 @@ TEST(ServerExecutionEvidence, OrdinaryCPUAndBothGPUsUseSelectedParticipants)
         const auto tags = serverExecutionTopologyTags(selected, plan, {.n_layers = 4});
         EXPECT_EQ(tags.at("devices"), device.toString());
         EXPECT_EQ(tags.at("attention_devices"), device.toString());
+        EXPECT_EQ(tags.at("flash_attention_devices"), device.toString());
+        EXPECT_TRUE(tags.at("sparse_attention_devices").empty());
     }
 }
 
@@ -333,6 +337,65 @@ TEST(ServerExecutionEvidence, PhysicalParticipantsAreNotVisibilityOrRankCounts)
     EXPECT_THROW(serverExecutionParticipantTags(DeviceId::cpu(), first, 0), std::invalid_argument);
 }
 
+/** @test Physical peer evidence uses original UUIDs, bridge order and complete directed observations. */
+TEST(ServerExecutionEvidence, GPUAncestryAndPeersRetainObservedIdentityForAnyDomainWidth)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int count : {1, 2, 3, 5, 8, 9})
+    {
+        RankInventory observed{.rank = 0, .node_id = 0};
+        observed.cpu.numa_node = 6;
+        for (int index = 0; index < count; ++index)
+        {
+            DeviceInfo gpu;
+            gpu.type = backend;
+            gpu.local_device_id = 7 + index * 3;
+            gpu.uuid = "original-" + std::to_string(index);
+            gpu.numa_node = 6;
+            gpu.native_isa = backend == DeviceType::CUDA ? "sm86" : "gfx906";
+            gpu.pci_bus_address = "0000:3" + std::to_string(index) + ":00.0";
+            gpu.pcie_upstream_bdfs = {"0000:80:01.0", "0000:80:00.0", "0000:00:01.0"};
+            observed.gpus.push_back(gpu);
+        }
+        auto &matrix = backend == DeviceType::CUDA ? observed.p2p_cuda : observed.p2p_rocm;
+        auto &extent = backend == DeviceType::CUDA ? observed.p2p_cuda_count : observed.p2p_rocm_count;
+        extent = count;
+        matrix.assign(count * count, true);
+        const DeviceId first{backend, 7};
+        const auto original = serverExecutionParticipantTags(first, observed, 6);
+        EXPECT_EQ(nlohmann::json::parse(original.at("pcie_upstream_bdfs")), observed.gpus[0].pcie_upstream_bdfs);
+        EXPECT_EQ(original.at("peer_access_matrix_observed"), "true");
+        EXPECT_EQ(original.at("numa_node"), "6");
+        const auto peers = nlohmann::json::parse(original.at("mutual_peer_physical_ids"));
+        ASSERT_EQ(peers.size(), static_cast<std::size_t>(count - 1));
+        EXPECT_EQ(original.at("native_isa"), observed.gpus[0].native_isa);
+        for (int index = 1; index < count; ++index)
+            EXPECT_NE(std::find(peers.begin(), peers.end(), "original-" + std::to_string(index)), peers.end());
+        std::reverse(observed.gpus.begin(), observed.gpus.end());
+        EXPECT_EQ(serverExecutionParticipantTags(first, observed, 6), original);
+        std::reverse(observed.gpus.begin(), observed.gpus.end());
+        if (count > 1)
+        {
+            matrix[1] = false;
+            const auto directed = serverExecutionParticipantTags(first, observed, 6);
+            const auto mutual = nlohmann::json::parse(directed.at("mutual_peer_physical_ids"));
+            EXPECT_EQ(mutual.size(), static_cast<std::size_t>(count - 2));
+            EXPECT_EQ(std::find(mutual.begin(), mutual.end(), "original-1"), mutual.end());
+        }
+        matrix.pop_back();
+        const auto incomplete = serverExecutionParticipantTags(first, observed, 6);
+        EXPECT_EQ(incomplete.at("peer_access_matrix_observed"), "false");
+        EXPECT_TRUE(nlohmann::json::parse(incomplete.at("mutual_peer_physical_ids")).empty());
+        observed.gpus[0].pcie_upstream_bdfs.clear();
+        EXPECT_TRUE(nlohmann::json::parse(serverExecutionParticipantTags(first, observed, 6)
+            .at("pcie_upstream_bdfs")).empty());
+        observed.gpus[0].pcie_upstream_bdfs = {"0000:80:00.0", "0000:80:00.0"};
+        EXPECT_THROW(serverExecutionParticipantTags(first, observed, 6), std::invalid_argument);
+        observed.gpus[0].pcie_upstream_bdfs = {observed.gpus[0].pci_bus_address};
+        EXPECT_THROW(serverExecutionParticipantTags(first, observed, 6), std::invalid_argument);
+    }
+}
+
 TEST(ServerExecutionEvidence, ReportsResolvedParallelismNotRequestedFlagSpelling)
 {
     RankExecutionPlan plan;
@@ -369,4 +432,84 @@ TEST(ServerExecutionEvidence, ReportsActualRoutedComputeAndRejectsUniformAssumpt
     EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "gate-up-owned-down-columns");
     overlay->domains.push_back({.name = "second", .routed_compute_policy = RoutedExpertComputePolicy::Apportioned});
     EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "mixed");
+}
+
+/** @test A dense exported predictor and QSA trunk retain independent obligations on the same owner. */
+TEST(ServerExecutionEvidence, SparseTrunkAndDensePredictorHaveIndependentAttentionOwners)
+{
+    ModelMemoryProfile model{.architecture = "qwen4exp", .n_layers = 4};
+    model.flash_next.emplace();
+    model.flash_next->sparse_decoder_layers = {1, 3};
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RankExecutionPlan plan;
+        plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(device);
+        const auto selected = serverExecutionParticipants(plan, {}, 1);
+        const auto off = serverExecutionTopologyTags(selected, plan, model);
+        EXPECT_EQ(off.at("sparse_attention_devices"), device.toString());
+        EXPECT_TRUE(off.at("flash_attention_devices").empty());
+
+        model.mtp_layer_count = 1;
+        model.flash_next_predictor = Qwen4ExpPredictorMetadata{4, Qwen4ExpPredictorAttention::Dense,
+            Qwen4ExpPredictorHiddenNorm::PerBranch, Qwen4ExpPredictorSource::SharedGGUF};
+        plan.runtime.mtp.enabled = true;
+        plan.has_lm_head = true;
+        const auto mixed = serverExecutionTopologyTags(selected, plan, model);
+        EXPECT_EQ(mixed.at("sparse_attention_devices"), device.toString());
+        EXPECT_EQ(mixed.at("flash_attention_devices"), device.toString());
+        plan.has_lm_head = false;
+        EXPECT_TRUE(serverExecutionTopologyTags(selected, plan, model).at("flash_attention_devices").empty());
+        model.mtp_layer_count = 0;
+        model.flash_next_predictor.reset();
+    }
+}
+
+namespace {
+/** @brief Original typed overlay: GPU model rank plus explicitly addressed CPU expert endpoints. */
+OrchestrationConfig observedCPUOverlay(DeviceId gpu,std::vector<GlobalDeviceAddress> cpus,int modelRank=0){
+ OrchestrationConfig config;auto overlay=std::make_shared<MoERoutedExpertPlacementPlan>();
+ overlay->enabled=true;overlay->topology=RoutedExpertPlacementTopology::TieredOverlay;
+ overlay->continuation_domain="model";overlay->shared_expert_domain="model";
+ RoutedExpertDomain model;model.name="model";model.scope=ExecutionDomainScope::SINGLE;
+ model.participants={GlobalDeviceAddress::fromLocalDeviceId(gpu)};model.world_ranks={modelRank};model.owner_rank=modelRank;
+ RoutedExpertDomain experts;experts.name="experts";experts.scope=ExecutionDomainScope::RANK_LOCAL;
+ experts.participants=std::move(cpus);experts.owner_rank=0;
+ overlay->domains={model,experts};overlay->routed_tiers={{.name="first",.domain="model",.priority=0},
+  {.name="last",.domain="experts",.priority=1,.fallback=true}};
+ config.moe_routed_expert_plan=std::move(overlay);return config;
+}
+}
+/** @test CPU expert NUMA comes from the frozen endpoint even when the primary GPU has no NUMA binding. */
+TEST(ServerExecutionEvidence, OverlayCPUObservationUsesItsOwnResolvedNUMA){
+ for(const auto gpu:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+  RankExecutionPlan plan;plan.rank=0;plan.primary_device=GlobalDeviceAddress::fromLocalDeviceId(gpu);plan.numa_node=-1;
+  RankInventory physical{.rank=0,.node_id=0};physical.cpu.numa_node=0;
+  physical.gpus={{.type=gpu.type,.local_device_id=gpu.ordinal,.uuid="original-gpu",.pci_bus_address="0000:41:00.0"}};
+  const auto config=observedCPUOverlay(gpu,{GlobalDeviceAddress::cpu(0)});
+  const auto cpu=serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,config,1);
+  ASSERT_EQ(cpu.size(),1u);EXPECT_EQ(cpu.front().at("physical_id"),"numa:0");
+  const auto observedGPU=serverExecutionParticipantRecords(gpu,physical,plan,config,1);
+  ASSERT_EQ(observedGPU.size(),1u);EXPECT_EQ(observedGPU.front(),serverExecutionParticipantTags(gpu,physical,-1));
+  // An expert-only rank retains its own endpoint; it never inherits the remote model primary.
+  const auto remote=observedCPUOverlay(gpu,{GlobalDeviceAddress::cpu(0)},1);
+  const auto expert=serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,remote,2);
+  EXPECT_EQ(expert,cpu);
+ }
+}
+/** @test Multiple original endpoints deduplicate, but missing/invalid/conflicting physical ownership stays fatal. */
+TEST(ServerExecutionEvidence, OverlayCPUObservationRejectsMissingAndConflictingNUMA){
+ RankExecutionPlan plan;plan.rank=0;plan.primary_device=GlobalDeviceAddress::cuda(0);plan.numa_node=-1;
+ RankInventory physical{.rank=0,.node_id=0};physical.cpu.numa_node=-1;
+ const auto multiple=observedCPUOverlay(DeviceId::cuda(0),{GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)});
+ const auto records=serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,multiple,1);
+ ASSERT_EQ(records.size(),2u);EXPECT_EQ(records[0].at("physical_id"),"numa:0");EXPECT_EQ(records[1].at("physical_id"),"numa:1");
+ physical.cpu.numa_node=0;
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,multiple,1),std::invalid_argument);
+ const auto unresolved=observedCPUOverlay(DeviceId::cuda(0),{GlobalDeviceAddress::cpu()});
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,unresolved,1),std::invalid_argument);
+ auto invalid=GlobalDeviceAddress::cpu();invalid.numa_node=-2;
+ const auto malformed=observedCPUOverlay(DeviceId::cuda(0),{invalid});
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,malformed,1),std::invalid_argument);
+ const auto gpuOnly=observedCPUOverlay(DeviceId::cuda(0),{GlobalDeviceAddress::rocm(0)});
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,gpuOnly,1),std::invalid_argument);
 }

@@ -32,12 +32,12 @@
 #include "../../../backends/BackendManager.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../gemm/CUDAMoEGroupedPrefillKernels.h"
-#include "../gemm/CUDAMoEProductionPrefillOverlayGenerated.inc"
+#include "../gemm/CUDAMoEProductionPrefillPolicy.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
-#include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
@@ -57,7 +57,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-extern "C" bool cudaNativeVNNIInitIQGridTables_tuned();
+extern "C" bool cudaNativeQuantisedInitIQGridTables_tuned();
 
 namespace
 {
@@ -97,7 +97,7 @@ namespace
      */
     void appendGroupedDescriptorIdentity(
         std::vector<std::uint64_t> &words,
-        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &descriptor)
     {
         words.push_back(static_cast<std::uint64_t>(
             reinterpret_cast<std::uintptr_t>(descriptor.payload)));
@@ -141,8 +141,8 @@ namespace
      */
     llaminar2::PersistentWorkspacePublicationKey
     groupedDescriptorPublicationKey(
-        const llaminar2::DeviceNativeVNNIMatrixDesc *primary,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *secondary,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *primary,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *secondary,
         int num_experts,
         int d_model,
         int intermediate)
@@ -540,7 +540,7 @@ namespace
     int singleCUDAMoECodebook(uint32_t codebook_mask) noexcept
     {
         // Family24 executes both IQ4 descriptors without changing their mask.
-        if (codebook_mask & (uint32_t{1} << llaminar2::kNativeVnniIQ4XSSourceScaleCodebook))
+        if (codebook_mask & (uint32_t{1} << llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook))
             codebook_mask &= ~(uint32_t{1} << 4);
         if (codebook_mask == 0 ||
             (codebook_mask & (codebook_mask - 1U)) != 0U)
@@ -585,6 +585,7 @@ namespace
      * it is never replaced after selection.
      */
     CUDAMoEProductionPrefillPolicy selectCUDAMoEProductionPrefillPolicy(
+        llaminar2::MoEPrefillMeasuredOperation operation,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
         int seq_len,
@@ -605,6 +606,7 @@ namespace
         {
             const auto grouped_imma =
                 llaminar2::cuda::moe::selectGroupedImmaLaunchPolicy(
+                    operation,
                     singleCUDAMoECodebook(gateup_codebook_mask),
                     singleCUDAMoECodebook(down_codebook_mask),
                     seq_len,
@@ -661,8 +663,9 @@ namespace
         {
             policy.source = "generic";
             int exact_tile_n = 0;
-            if (llaminar2::cuda::generated::
-                    selectCUDAMoEProductionPrefillOverlay(
+            if (llaminar2::cuda::
+                    selectCUDAMoEProductionPrefillOverlayForOperation(
+                        operation,
                         static_cast<uint8_t>(gateup_codebook),
                         static_cast<uint8_t>(down_codebook),
                         hidden_size,
@@ -936,7 +939,7 @@ namespace
         {
         case 0:
         case 4:
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
         case 5:
         case 6:
         case 7:
@@ -951,7 +954,7 @@ namespace
         case 16:
         case 17:
         case 19:
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -963,7 +966,7 @@ namespace
         switch (cb)
         {
         case 11: // Original IQ3_S source nibble; no additive correction.
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
         case 5:
         case 7:
         case 8:
@@ -973,7 +976,7 @@ namespace
         case 14:
         case 16:
         case 17:
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -1000,18 +1003,18 @@ namespace
      * select an exact arithmetic contract unless the producer also publishes
      * its source identity. Legacy immutable descriptors remain accepted for
      * self-describing execution formats, while any supplied provenance is
-     * checked against the central NativeVNNI catalog.
+     * checked against the central NativeQuantised catalog.
      */
     bool validateCudaGroupedSourceIdentity(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeVnniExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
+                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
         }
         const auto *source =
-            llaminar2::native_vnni_formats::forSourceIdentity(
+            llaminar2::native_quantised_formats::forSourceIdentity(
                 desc.source_codebook_id,
                 desc.source_is_superblock != 0);
         return source != nullptr &&
@@ -1021,7 +1024,7 @@ namespace
 
     /** @return Bit selecting the source arithmetic-policy codebook. */
     uint32_t cudaGroupedPrefillPolicyCodebookBit(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!validateCudaGroupedSourceIdentity(desc))
             return 0u;
@@ -1088,7 +1091,7 @@ namespace
                 << " before IQ grid table publication");
             return false;
         }
-        if (!cudaNativeVNNIInitIQGridTables_tuned())
+        if (!cudaNativeQuantisedInitIQGridTables_tuned())
         {
             LOG_ERROR(
                 "[CUDAMoEKernel] IQ grid table publication failed for CUDA:"
@@ -1102,7 +1105,7 @@ namespace
     }
 
     bool validateCudaGroupedDesc(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         int k,
         uint8_t codebook_id)
@@ -1117,7 +1120,7 @@ namespace
     }
 
     bool validateCudaGroupedDescShape(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         int k)
     {
@@ -1131,7 +1134,7 @@ namespace
                (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
     }
 
-    bool isBlankGroupedDesc(const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         return desc.payload == nullptr &&
                desc.scales == nullptr &&
@@ -1198,6 +1201,7 @@ extern "C"
         }
         const CUDAMoEProductionPrefillPolicy policy =
             selectCUDAMoEProductionPrefillPolicy(
+                llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
                 uint32_t{1} << gateup_codebook_id,
                 uint32_t{1} << down_codebook_id,
                 m,
@@ -1664,9 +1668,9 @@ extern "C"
         const float *routing_weights,
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -1694,9 +1698,9 @@ extern "C"
     bool cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -1775,9 +1779,9 @@ extern "C"
 
     bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
         const void *runtime,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int device_idx,
         void *stream);
@@ -1827,10 +1831,10 @@ extern "C"
         int expert_id, int max_tokens, int d_model,
         int device_idx, void *stream);
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+    bool cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
         const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
         const int *d_expert_ids,
         float *const *d_gate_outputs,
         float *const *d_up_outputs,
@@ -1863,7 +1867,7 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+    bool cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart(
         const float *d_hidden,
         const void *d_runtime_layer,
         const int *d_expert_ids,
@@ -1883,10 +1887,10 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+    bool cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_desc_table,
         const int *d_expert_ids,
         const float *d_weights,
         int8_t *d_swiglu_int8,
@@ -1919,7 +1923,7 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+    bool cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
         const void *d_runtime_layer,
@@ -1942,9 +1946,9 @@ extern "C"
         const float *d_hidden,
         const int8_t *d_prequantized_hidden,
         const float *d_prequantized_hidden_scales,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_down_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_down_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
         uint32_t *d_group_work_directory,
@@ -2033,6 +2037,43 @@ extern "C"
 
 namespace llaminar2
 {
+
+    bool CUDAMoEKernel::beginOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeBeginLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "beginOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeBegin(&packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeRetireLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeRetire(&packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationSingleRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeRetireSingleRowBatch(&packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationMultiRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeRetireMultiRowBatch(&packet, device_ordinal_, stream);
+    }
+
     bool CUDAMoEKernel::packMoEOverlayActivationDispatch(
         const MoEKernelLaunchContext &launch,
         const MoEOverlayActivationDispatchPackLaunch &packet)
@@ -2510,7 +2551,7 @@ namespace llaminar2
         const char *buffer_name,
         std::size_t slot,
         int num_experts,
-        DeviceNativeVNNIMatrixDesc **device_descs,
+        DeviceNativeQuantisedMatrixDesc **device_descs,
         const char *context)
     {
         if (!buffer_name || !device_descs || num_experts <= 0 ||
@@ -2524,7 +2565,7 @@ namespace llaminar2
         if (!bindWorkspaceBuffer(
                 &base,
                 buffer_name,
-                sizeof(DeviceNativeVNNIMatrixDesc),
+                sizeof(DeviceNativeQuantisedMatrixDesc),
                 context))
         {
             return false;
@@ -2536,7 +2577,7 @@ namespace llaminar2
             static_cast<std::size_t>(
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
         const std::size_t descriptor_stride =
-            slot_bytes / sizeof(DeviceNativeVNNIMatrixDesc);
+            slot_bytes / sizeof(DeviceNativeQuantisedMatrixDesc);
         if (descriptor_stride < static_cast<std::size_t>(num_experts))
         {
             LOG_ERROR("[CUDAMoEKernel] " << context
@@ -2550,7 +2591,7 @@ namespace llaminar2
 
         const std::size_t descriptor_offset = slot * descriptor_stride;
         const std::size_t descriptor_capacity =
-            available / sizeof(DeviceNativeVNNIMatrixDesc);
+            available / sizeof(DeviceNativeQuantisedMatrixDesc);
         if (descriptor_offset + static_cast<std::size_t>(num_experts) >
             descriptor_capacity)
         {
@@ -2563,12 +2604,13 @@ namespace llaminar2
         }
 
         *device_descs =
-            static_cast<DeviceNativeVNNIMatrixDesc *>(base) + descriptor_offset;
+            static_cast<DeviceNativeQuantisedMatrixDesc *>(base) + descriptor_offset;
         return true;
     }
 
     void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        grouped_prefill_grouping_.invalidate();
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
         staging_capacity_ = 0;
@@ -2695,7 +2737,7 @@ namespace llaminar2
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
-                        DeviceNativeVNNIMatrixDesc *slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *slot_base = nullptr;
                         if (!bindGroupedDescriptorTableSlot(
                                 MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES,
                                 slot,
@@ -2768,7 +2810,7 @@ namespace llaminar2
 
         const size_t desc_bytes =
             static_cast<size_t>(table.num_experts) *
-            sizeof(DeviceNativeVNNIMatrixDesc);
+            sizeof(DeviceNativeQuantisedMatrixDesc);
         const auto publication_result =
             workspace_->getOrCreatePersistentPublication(
                 kCudaGroupedDownDescriptorLeaseDomain,
@@ -2781,7 +2823,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
-                    DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+                    DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
                     if (!bindGroupedDescriptorTableSlot(
                             MoEWorkspaceBuffers::
                                 CUDA_GROUPED_DOWN_DESC_TABLES,
@@ -2876,7 +2918,7 @@ namespace llaminar2
             return false;
         }
 
-        table.device_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->primary_descs);
         table.device_floating_descs = nullptr;
         table.workspace_publication = std::move(publication);
@@ -2929,8 +2971,8 @@ namespace llaminar2
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
-                        DeviceNativeVNNIMatrixDesc *gate_slot_base = nullptr;
-                        DeviceNativeVNNIMatrixDesc *up_slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *gate_slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *up_slot_base = nullptr;
                         if (!bindGroupedDescriptorTableSlot(
                                 MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES,
                                 slot,
@@ -3023,7 +3065,7 @@ namespace llaminar2
 
         const size_t desc_bytes =
             static_cast<size_t>(table.num_experts) *
-            sizeof(DeviceNativeVNNIMatrixDesc);
+            sizeof(DeviceNativeQuantisedMatrixDesc);
         const auto publication_result =
             workspace_->getOrCreatePersistentPublication(
                 kCudaGroupedGateUpDescriptorLeaseDomain,
@@ -3036,9 +3078,9 @@ namespace llaminar2
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
-                    DeviceNativeVNNIMatrixDesc *device_gate_descs =
+                    DeviceNativeQuantisedMatrixDesc *device_gate_descs =
                         nullptr;
-                    DeviceNativeVNNIMatrixDesc *device_up_descs =
+                    DeviceNativeQuantisedMatrixDesc *device_up_descs =
                         nullptr;
                     if (!bindGroupedDescriptorTableSlot(
                             MoEWorkspaceBuffers::
@@ -3149,9 +3191,9 @@ namespace llaminar2
             return false;
         }
 
-        table.device_gate_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_gate_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->primary_descs);
-        table.device_up_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_up_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->secondary_descs);
         table.device_floating_gate_descs = nullptr;
         table.device_floating_up_descs = nullptr;
@@ -3205,6 +3247,7 @@ namespace llaminar2
 
     void CUDAMoEKernel::resetDynamicState()
     {
+        grouped_prefill_grouping_.invalidate();
         /*
          * This hook is reached only on hard kernel-dynamic reset boundaries.
          * Replay-preserving request reset deliberately avoids
@@ -3218,6 +3261,15 @@ namespace llaminar2
         clearWorkspaceScratchBindings();
         grouped_down_desc_tables_.clear();
         grouped_gateup_desc_tables_.clear();
+    }
+
+    bool CUDAMoEKernel::runMoEOverlayEpochParentAction(
+        const MoEKernelLaunchContext &launch,DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochStatus *status,DeviceMoEOverlayEpochParentAction action)
+    {
+        void *stream=explicitMoELaunchStream(launch,"runMoEOverlayEpochParentAction");
+        if(!stream || !control || !status)return false;
+        return cudaMoEOverlayEpochParentAction(control,status,action,device_ordinal_,stream);
     }
 
     bool CUDAMoEKernel::acquireMoEOverlayEpoch(
@@ -3358,6 +3410,7 @@ namespace llaminar2
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         group_active_expert_slots_ = 0;
+        grouped_prefill_grouping_.invalidate();
         group_expert_mask_cap_ = 0;
         group_expert_mask_hash_ = 0;
         group_expert_mask_num_experts_ = 0;
@@ -3679,6 +3732,35 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::prepareRequiredRouterQ8Hidden(int rows, int width, int top_k)
+    {
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (router_q8_publication_access_ != MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_->acceptsProducerRows(rows, width))
+        {
+            LOG_ERROR("[CUDAMoEKernel] required Q8 producer geometry/access mismatch");
+            return false;
+        }
+        return ensureGroupedGateUpDecodeCapacity(top_k, width, rows);
+    }
+
+    bool CUDAMoEKernel::publishRequiredRouterQ8Hidden(
+        const float *source, int rows, int width, int top_k, const int *live_rows)
+    {
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k) ||
+            !cudaMoE_publish_original_hidden_q8_rows(source, d_decode_hidden_int8_,
+                d_decode_hidden_scales_, rows, width, device_ordinal_, getStream(), live_rows))
+            return false;
+        publishRouterQ8Hidden(source, rows, isCudaMoEDecodeCaptureActive(getStream()),
+            RouterQ8Basis::Original);
+        return true;
+    }
+
     void CUDAMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
         if (router_q8_publication_access_ ==
@@ -3720,7 +3802,8 @@ namespace llaminar2
     void CUDAMoEKernel::publishRouterQ8Hidden(
         const float *source,
         int rows,
-        bool recorded_during_capture) noexcept
+        bool recorded_during_capture,
+        RouterQ8Basis router_basis) noexcept
     {
         if (router_q8_publication_access_ !=
                 MoERouterQ8PublicationAccess::ProducerAndConsumer ||
@@ -3747,7 +3830,7 @@ namespace llaminar2
         publication.blocks_per_row_capacity =
             (decode_gateup_d_model_cap_ + 31) / 32;
         publication.capture_recorded = recorded_during_capture;
-        if (routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) == RouterQ8Basis::SignedHadamard32)
+        if (router_basis == RouterQ8Basis::SignedHadamard32)
             PerfStatsCollector::addCounter("kernel", "cuda_moe_router_hadamard32_calls", 1.0,
                 "router", "cuda:" + std::to_string(device_ordinal_),
                 {{"rows", std::to_string(rows)}, {"expert_hidden_basis", "original"}, {"block", "32"}});
@@ -4066,7 +4149,8 @@ namespace llaminar2
         publishRouterQ8Hidden(
             d_hidden,
             /*rows=*/1,
-            isCudaMoEDecodeCaptureActive(stream));
+            isCudaMoEDecodeCaptureActive(stream),
+            routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         PerfStatsCollector::addCounter(
             "kernel", "cuda_moe_router_q8_decode_calls", 1.0, {}, {},
             {{"num_experts", std::to_string(num_experts)},
@@ -4691,6 +4775,12 @@ namespace llaminar2
         // cache and hidden bank; capture only consumes their retained addresses.
         const bool q8_prefill = gate_is_fp32 &&
             debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8;
+        invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        if (!q8_prefill && !publishRequiredRouterQ8Hidden(
+                hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
         if (q8_prefill)
         {
             if (!debugEnv().gemm.cuda_moe_router_q8 || d_model % 32 != 0 ||
@@ -4723,7 +4813,8 @@ namespace llaminar2
                         seq_len, num_experts, top_k, normalize_weights, device_ordinal_, stream,
                         device_effective_seq_len)) return false;
             }
-            publishRouterQ8Hidden(hidden, seq_len, isCudaMoEDecodeCaptureActive(stream));
+            publishRouterQ8Hidden(hidden, seq_len, isCudaMoEDecodeCaptureActive(stream),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
             const auto geometry = cuda::routerQ8PrefillGeometry(
                 owned ? owned->partition.capacityFor(seq_len) : seq_len, d_model, num_experts, router_q8_prefill_hardware_);
             PerfStatsCollector::addCounter("kernel", "cuda_moe_router_q8_prefill_calls", 1.0,
@@ -5043,6 +5134,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!prepareRequiredRouterQ8Hidden(plan.physical_rows, plan.d_model, plan.top_k))
+            return false;
+
         const size_t logits_count =
             static_cast<size_t>(plan.physical_rows) *
             static_cast<size_t>(plan.num_experts);
@@ -5179,6 +5273,11 @@ namespace llaminar2
             return false;
         }
         invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        if (!q8_router_requested && !publishRequiredRouterQ8Hidden(
+                d_hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
 
         /*
          * Route all verifier rows as one grouped transaction while preserving
@@ -5220,7 +5319,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 d_hidden,
                 seq_len,
-                isCudaMoEDecodeCaptureActive(stream));
+                isCudaMoEDecodeCaptureActive(stream),
+            routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
         else if (gate_is_fp32)
         {
@@ -6726,6 +6826,7 @@ namespace llaminar2
                                                   int *d_expert_offsets, int *d_expert_counts,
                                                   int *d_grouped_token_indices, float *d_grouped_weights)
     {
+        grouped_prefill_grouping_.invalidate();
         const int total_slots = seq_len * top_k;
         void *stream = requireStream("CUDAMoEKernel::groupTokensByExpertDevice");
         // One graph node resets every publication, including padded/remote
@@ -6770,6 +6871,7 @@ namespace llaminar2
         bool filter_to_local_runtime_experts,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!runtime_layer || !routing_indices || !routing_weights)
         {
             LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] null runtime or routing tensor");
@@ -6840,6 +6942,7 @@ namespace llaminar2
         int top_k,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 ||
             current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
@@ -6881,6 +6984,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer || !routing_indices || !routing_weights ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -6920,9 +7024,9 @@ namespace llaminar2
             return false;
         }
 
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -6983,6 +7087,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -7017,9 +7122,9 @@ namespace llaminar2
         if (!ensureGroupingBufferCapacity(max_slots, num_experts))
             return false;
 
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -7409,7 +7514,7 @@ namespace llaminar2
     }
 
     int CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable(
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int d_model,
         int intermediate,
@@ -7434,7 +7539,7 @@ namespace llaminar2
         {
             return -1;
         }
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7447,10 +7552,10 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            if (!addNativeVnniExecutionFormat(
+            if (!addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7470,7 +7575,7 @@ namespace llaminar2
             return -1;
         for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
         {
-            if ((codebook_mask & nativeVnniCodebookMaskBit(codebook)) != 0u &&
+            if ((codebook_mask & nativeQuantisedCodebookMaskBit(codebook)) != 0u &&
                 !cudaGroupedPrefillSupportsCodebook(codebook))
             {
                 return -1;
@@ -7499,12 +7604,12 @@ namespace llaminar2
          * attempts.
          */
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_down_desc_tables_[index];
             if (!existing.valid ||
-                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
@@ -7532,7 +7637,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
-        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
                 table,
@@ -7545,8 +7650,8 @@ namespace llaminar2
     }
 
     int CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables(
-        const DeviceNativeVNNIMatrixDesc *gate_descs,
-        const DeviceNativeVNNIMatrixDesc *up_descs,
+        const DeviceNativeQuantisedMatrixDesc *gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *up_descs,
         int num_experts,
         int d_model,
         int intermediate,
@@ -7571,7 +7676,7 @@ namespace llaminar2
         {
             return -1;
         }
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7588,7 +7693,7 @@ namespace llaminar2
             }
 
             if (!gate_desc.valid() || !up_desc.valid() ||
-                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
+                !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
                 !validateCudaGroupedDescShape(up_desc, intermediate, d_model))
             {
@@ -7597,12 +7702,12 @@ namespace llaminar2
                 return -1;
             }
             const auto add_descriptor = [&](
-                                            const DeviceNativeVNNIMatrixDesc &desc)
+                                            const DeviceNativeQuantisedMatrixDesc &desc)
             {
-                return addNativeVnniExecutionFormat(
+                return addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7624,7 +7729,7 @@ namespace llaminar2
             return -1;
         for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
         {
-            if ((codebook_mask & nativeVnniCodebookMaskBit(codebook)) != 0u &&
+            if ((codebook_mask & nativeQuantisedCodebookMaskBit(codebook)) != 0u &&
                 !cudaGroupedPrefillSupportsCodebook(codebook))
             {
                 return -1;
@@ -7652,12 +7757,12 @@ namespace llaminar2
          * replay-state resets.
          */
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
             if (!existing.valid ||
-                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_gate_descs ||
                 !existing.device_up_descs ||
                 existing.num_experts != num_experts ||
@@ -7689,7 +7794,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
-        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
                 table,
@@ -7879,7 +7984,7 @@ namespace llaminar2
 
     bool CUDAMoEKernel::updateGroupedExpertDownDescriptorTable(
         int descriptor_table_id,
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int d_model,
         int intermediate)
@@ -7901,7 +8006,7 @@ namespace llaminar2
 
         auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid ||
-            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             !table.device_descs ||
             !table.workspace_publication ||
             table.num_experts != num_experts ||
@@ -7914,7 +8019,7 @@ namespace llaminar2
         const bool runtime_mutable =
             table.descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7922,10 +8027,10 @@ namespace llaminar2
                 continue;
             if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
                 return false;
-            if (!addNativeVnniExecutionFormat(
+            if (!addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7958,7 +8063,7 @@ namespace llaminar2
         }
 
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         const cudaStream_t stream =
             static_cast<cudaStream_t>(getStream());
         if (!workspace_->rewritePersistentPublication(
@@ -8012,8 +8117,8 @@ namespace llaminar2
 
     bool CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables(
         int descriptor_table_id,
-        const DeviceNativeVNNIMatrixDesc *gate_descs,
-        const DeviceNativeVNNIMatrixDesc *up_descs,
+        const DeviceNativeQuantisedMatrixDesc *gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *up_descs,
         int num_experts,
         int d_model,
         int intermediate)
@@ -8035,7 +8140,7 @@ namespace llaminar2
 
         auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid ||
-            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             !table.device_gate_descs ||
             !table.device_up_descs || !table.workspace_publication ||
             table.num_experts != num_experts ||
@@ -8048,7 +8153,7 @@ namespace llaminar2
         const bool runtime_mutable =
             table.descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -8062,19 +8167,19 @@ namespace llaminar2
                 return false;
             }
             if (!gate_desc.valid() || !up_desc.valid() ||
-                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
+                !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
                 !validateCudaGroupedDescShape(up_desc, intermediate, d_model))
             {
                 return false;
             }
             const auto add_descriptor = [&](
-                                            const DeviceNativeVNNIMatrixDesc &desc)
+                                            const DeviceNativeQuantisedMatrixDesc &desc)
             {
-                return addNativeVnniExecutionFormat(
+                return addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -8109,7 +8214,7 @@ namespace llaminar2
         }
 
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         const cudaStream_t stream =
             static_cast<cudaStream_t>(getStream());
         if (!workspace_->rewritePersistentPublication(
@@ -8387,6 +8492,7 @@ namespace llaminar2
     bool CUDAMoEKernel::prepareExpertGroupsAsync(ITensor *routing_indices, ITensor *routing_weights,
                                                  int seq_len, int num_experts, int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginAllRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
         void *stream = requireStream("CUDAMoEKernel::prepareExpertGroupsAsync");
@@ -8438,6 +8544,7 @@ namespace llaminar2
                  {"top_k", std::to_string(top_k)},
                  {"num_experts", std::to_string(num_experts)},
                  {"total_slots", std::to_string(total_slots)}});
+            std::move(grouping_publication).publish();
             return true;
         }
 
@@ -8463,6 +8570,7 @@ namespace llaminar2
              {"top_k", std::to_string(top_k)},
              {"num_experts", std::to_string(num_experts)},
              {"total_slots", std::to_string(total_slots)}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -8473,6 +8581,7 @@ namespace llaminar2
         int num_experts,
         int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginSelectedRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
         void *stream = requireStream(
@@ -8546,6 +8655,7 @@ namespace llaminar2
              {"num_experts", std::to_string(num_experts)},
              {"mask_active_experts", std::to_string(group_expert_mask_active_experts_)},
              {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -8670,6 +8780,7 @@ namespace llaminar2
 
     bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
     {
+        grouped_prefill_grouping_.invalidate();
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -8989,6 +9100,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             active_expert_slots > 0 && !use_grouped_imma;
         CUDAMoEProductionPrefillPolicy prefill_policy =
             selectCUDAMoEProductionPrefillPolicy(
+                execution.measuredOperation(
+                    canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                  : MoEPrefillOutputLayout::TokenRows,
+                    grouped_prefill_grouping_.scope()),
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
                 seq_len,
@@ -9285,6 +9400,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
         // Mutable placement never owns immutable column slices. Binding a
@@ -9384,9 +9500,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 return false;
             }
 
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -9479,6 +9595,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             active_expert_slots > 0 && !use_grouped_imma;
         CUDAMoEProductionPrefillPolicy prefill_policy =
             selectCUDAMoEProductionPrefillPolicy(
+                execution.measuredOperation(
+                    canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                  : MoEPrefillOutputLayout::TokenRows,
+                    MoEPrefillRouteScope::SelectedRoutes),
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
                 seq_len,
@@ -9576,9 +9696,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
          * descriptor slots. The compute consumer resolves the same immutable
          * slot identities without launching a hidden materialization step.
          */
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -10034,7 +10154,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                       << " requested_intermediate=" << intermediate);
             return false;
         }
-        /* NativeVNNI quantizes in 32-element blocks; contiguous floating
+        /* NativeQuantised quantizes in 32-element blocks; contiguous floating
          * tables use the exact published K width and do not inherit that
          * packing constraint. */
         if (!floating && (d_model % 32) != 0)
@@ -10180,7 +10300,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   table.weight_format,
                   device_ordinal_,
                   stream)
-            : cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            : cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
                   d_hidden,
                   table.device_gate_descs,
                   table.device_up_descs,
@@ -10333,7 +10453,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   table.weight_format,
                   device_ordinal_,
                   stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            : cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
                   d_gate_ptrs,
                   d_up_ptrs,
                   table.device_descs,
@@ -10518,7 +10638,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
 
-        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+        const bool ok = cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
             d_hidden,
             table.device_gate_descs,
             table.device_up_descs,
@@ -10695,7 +10815,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
 
-        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+        const bool ok = cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
             d_gate_ptrs,
             d_up_ptrs,
             table.device_descs,
@@ -10943,9 +11063,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         if (descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable)
         {
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -11282,11 +11402,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
          * publishes a bank; the materializer preserves it during every graph
          * replay without host inspection, allocation, or synchronization.
          */
-        const DeviceNativeVNNIMatrixDesc *decode_gate_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_gate_descs =
             gateup_table.device_gate_descs;
-        const DeviceNativeVNNIMatrixDesc *decode_up_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_up_descs =
             gateup_table.device_up_descs;
-        const DeviceNativeVNNIMatrixDesc *decode_down_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_down_descs =
             down_table.device_descs;
         const DeviceMoEFloatingMatrixDesc *decode_floating_gate_descs =
             gateup_table.device_floating_gate_descs;
@@ -11296,9 +11416,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             down_table.device_floating_descs;
         if (use_runtime_descriptors)
         {
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -11470,7 +11590,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   gateup_table.weight_format,
                   device_ordinal_,
                   stream)
-            : cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            : cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
                   d_hidden,
                   decode_gate_descs,
                   decode_up_descs,
@@ -11509,7 +11629,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   down_table.weight_format,
                   device_ordinal_,
                   stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            : cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
                   d_down_gate_ptrs,
                   d_down_up_ptrs,
                   decode_down_descs,
@@ -11671,7 +11791,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                  {"d_model", std::to_string(d_model)}});
         }
 
-        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+        const bool ok = cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart(
             d_hidden,
             runtime_layer,
             d_expert_ids,
@@ -11795,7 +11915,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
 
-        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+        const bool ok = cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart(
             d_gate_ptrs,
             d_up_ptrs,
             runtime_layer,

@@ -13,6 +13,7 @@
  * @author David Sanftenberg
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <memory>
@@ -360,6 +361,9 @@ TEST_F(MPIStaging, TwoDimensionalTensor)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     // Initialize MPI
     MPI_Init(&argc, &argv);
 

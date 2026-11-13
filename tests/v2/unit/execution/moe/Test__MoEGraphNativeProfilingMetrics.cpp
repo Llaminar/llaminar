@@ -16,6 +16,9 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <string>
+#include <array>
+#include <stdexcept>
+#include <tuple>
 
 using namespace llaminar2;
 
@@ -597,4 +600,75 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, WhenProfilingDisabled_NoRowsRecorde
         0, 1, profileEdge(1, 0), 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     EXPECT_TRUE(MoEExpertOverlayProfiler::rows().empty());
+}
+
+
+/**
+ * @brief Replay grouped, M1, empty and reordered-overlap observations through
+ * legacy normalization and the production sorted-span entry, including reset.
+ * Both the exact expert union and every unified PerfStats key/value survive.
+ */
+TEST_F(Test__MoEGraphNativeProfilingMetrics, SortedCPUExpertSpanMatchesOwnedLifecycleAndReset)
+{
+    const std::vector<std::vector<int>> observations{{10,2,7},{2},{},{7,2},{11,2},{2,10,7}};
+    const auto replay = [&](bool sorted) {
+        MoEExpertOverlayProfiler::reset(); PerfStatsCollector::reset();
+        for (size_t i=0;i<observations.size();++i) {
+            auto ids=observations[i];
+            const auto routes=ids.size();
+            if(sorted) {
+                std::sort(ids.begin(),ids.end());
+                MoEExpertOverlayProfiler::recordGraphNativeCPUExpertSorted(
+                    5,2,3,"CPU",4,routes,routes?4:0,ids,.125);
+                // The borrowed owner may be overwritten immediately after call.
+                std::fill(ids.begin(),ids.end(),999);
+            } else MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+                5,2,3,"CPU",true,4,routes,routes?4:0,ids,.125);
+        }
+        return std::pair{MoEExpertOverlayProfiler::rows(),
+                        PerfStatsCollector::snapshot({"moe_overlay"})};
+    };
+    const auto signature=[](const MoEExpertOverlayProfileRow &r) {
+        return std::tie(r.phase,r.layer,r.tier_index,r.participant_id,r.source_participant,
+            r.target_participant,r.domain,r.domain_kind,r.backend,r.assigned_experts,
+            r.resident_experts,r.routed_entries,r.active_routes,r.selected_rows,r.transfer_bytes,
+            r.outbound_bytes,r.return_bytes,r.compute_ms,r.domain_reduce_ms,r.cross_domain_reduce_ms,
+            r.participant_count,r.observed_expert_ids,r.executed_experts,r.transport_mode,
+            r.final_reduce_mode,r.accumulation_path,r.inbound_rows,r.compact_dispatch_bytes,
+            r.compact_return_bytes,r.dense_bytes_avoided,r.cpu_fallback_rows,r.gpu_cached_rows,
+            r.scatter_ms,r.import_broadcast_ms);
+    };
+    for(int repeat=0;repeat<3;++repeat) {
+        const auto old=replay(false), candidate=replay(true);
+        ASSERT_EQ(old.first.size(),1u); ASSERT_EQ(candidate.first.size(),1u);
+        EXPECT_EQ(signature(old.first.front()),signature(candidate.first.front()));
+        EXPECT_EQ(candidate.first.front().observed_expert_ids,(std::vector<int>{2,7,10,11}));
+        EXPECT_EQ(candidate.first.front().assigned_experts,3);
+        ASSERT_FALSE(old.second.empty()); ASSERT_EQ(old.second.size(),candidate.second.size());
+        for(size_t i=0;i<old.second.size();++i) {
+            const auto &a=old.second[i],&b=candidate.second[i];
+            EXPECT_EQ(std::tie(a.kind,a.domain,a.name,a.phase,a.device,a.tags,a.count,a.value,
+                              a.total_ns,a.min_ns,a.max_ns,a.sequence_word_count,
+                              a.sequence_digest_lo,a.sequence_digest_hi),
+                      std::tie(b.kind,b.domain,b.name,b.phase,b.device,b.tags,b.count,b.value,
+                              b.total_ns,b.min_ns,b.max_ns,b.sequence_word_count,
+                              b.sequence_digest_lo,b.sequence_digest_hi));
+        }
+        MoEExpertOverlayProfiler::reset(); PerfStatsCollector::reset();
+        MoEExpertOverlayProfiler::recordGraphNativeCPUExpertSorted(5,2,3,"CPU",4,0,0,{},0.0);
+        const auto empty=MoEExpertOverlayProfiler::rows();
+        ASSERT_EQ(empty.size(),1u); EXPECT_TRUE(empty.front().observed_expert_ids.empty());
+        EXPECT_EQ(empty.front().assigned_experts,0); EXPECT_EQ(empty.front().active_routes,0u);
+    }
+}
+
+/** @brief A malformed borrowed view is rejected before either aggregate changes. */
+TEST_F(Test__MoEGraphNativeProfilingMetrics, SortedCPUExpertSpanRejectsMalformedBeforePublication)
+{
+    for(const std::vector<int> ids : {std::vector<int>{2,1}, {1,1}, {-1,2}}) {
+        EXPECT_THROW(MoEExpertOverlayProfiler::recordGraphNativeCPUExpertSorted(
+            5,2,3,"CPU",1,2,1,ids,.125),std::invalid_argument);
+        EXPECT_TRUE(MoEExpertOverlayProfiler::rows().empty());
+        EXPECT_TRUE(PerfStatsCollector::snapshot({"moe_overlay"}).empty());
+    }
 }

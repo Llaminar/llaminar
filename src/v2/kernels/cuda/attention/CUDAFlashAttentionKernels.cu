@@ -44,13 +44,11 @@
 #include <cfloat>
 #include <cstdio>
 #include <atomic>
-#include <mutex>
-#include <unordered_map>
 
-#include "../../../backends/BackendManager.h"
 #include "../../../backends/cuda/CUDAGraphCapture.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include "CUDAFlashAttentionLaunchPolicy.h"
+#include "CUDAFlashAttentionHardware.h"
 #include "../../../tensors/TensorType.h"
 #include "utils/DebugEnv.h"
 
@@ -182,45 +180,6 @@ namespace
     //   tile_kv=64, pad=8:  ld=72, 18 words/row, 18 mod 32=18 → 0 conflicts
     constexpr int FA2_SCORES_LD_PAD = 8;
     constexpr int FA2_QKV_PAD = 8;
-
-    // =========================================================================
-    // Cached Device Properties for Fast Kernel Launch
-    // =========================================================================
-
-    struct FA2DeviceConfig
-    {
-        int sm_major = 0;
-        int sm_minor = 0;
-        int sm_count = 0;
-        int max_smem_optin = 0; // Max dynamic shared memory with opt-in
-        bool initialized = false;
-    };
-
-    // Per-device cached config (thread-safe via atomics on first init)
-    static FA2DeviceConfig g_fa2_device_config[8]; // Support up to 8 GPUs
-
-    /**
-     * @brief Get cached device configuration (lazy init, thread-safe)
-     */
-    inline FA2DeviceConfig &getFA2DeviceConfig(int device)
-    {
-        if (device < 0 || device >= 8)
-            device = 0;
-        FA2DeviceConfig &cfg = g_fa2_device_config[device];
-
-        if (!cfg.initialized)
-        {
-            cudaDeviceProp prop;
-            cudaGetDeviceProperties(&prop, device);
-            cfg.sm_major = prop.major;
-            cfg.sm_minor = prop.minor;
-            cfg.sm_count = prop.multiProcessorCount;
-            cudaDeviceGetAttribute(&cfg.max_smem_optin,
-                                   cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-            cfg.initialized = true;
-        }
-        return cfg;
-    }
 
 #if CUDART_VERSION >= 12030
     /**
@@ -2370,43 +2329,10 @@ namespace
 
 namespace
 {
-    // TQ codebooks (compile-time Lloyd-Max centroids for N(0,1))
-    __constant__ float d_tq8_attn_cents[256];
-    __constant__ float d_tq4_attn_cents[16];
-    static std::mutex s_tq_attn_codebooks_mutex;
-    static std::unordered_map<int, std::uint64_t>
-        s_tq_attn_codebook_generations;
-
-    /** @return True when this device/runtime generation owns live constants. */
-    bool upload_tq_attn_codebooks()
-    {
-        int device_id = -1;
-        if (cudaGetDevice(&device_id) != cudaSuccess)
-            return false;
-        llaminar2::IBackend *const backend = llaminar2::getCUDABackend();
-        const std::uint64_t runtime_generation = backend
-                                                     ? backend->deviceRuntimeGeneration(
-                                                           device_id)
-                                                     : 0u;
-        if (runtime_generation == 0u)
-            return false;
-
-        std::lock_guard<std::mutex> lock(s_tq_attn_codebooks_mutex);
-        const auto existing =
-            s_tq_attn_codebook_generations.find(device_id);
-        if (existing != s_tq_attn_codebook_generations.end() &&
-            existing->second == runtime_generation)
-        {
-            return true;
-        }
-        // TQ4: 16-level Lloyd-Max centroids for N(0,1)
-        static constexpr float TQ4_C[16] = {
-            -2.732897f, -2.069364f, -1.618400f, -1.256565f,
-            -0.942629f, -0.656982f, -0.388189f, -0.128443f,
-            0.128443f, 0.388189f, 0.656982f, 0.942629f,
-            1.256565f, 1.618400f, 2.069364f, 2.732897f};
-        // TQ8: 256-level Lloyd-Max centroids for N(0,1)
-        static constexpr float TQ8_C[256] = {
+    // These codebooks are immutable program data. Native module loading owns
+    // their initialization on every device/context; no host readiness cache,
+    // default-stream upload, or capture-time mutation is needed.
+    __device__ __constant__ const float d_tq8_attn_cents[256] = {
             -3.78920960f, -3.30915570f, -3.01834941f, -2.80658674f, -2.63340139f, -2.48449373f, -2.35561466f, -2.24269128f,
             -2.14211559f, -2.05341673f, -1.97122753f, -1.89669085f, -1.82880616f, -1.76743543f, -1.71260118f, -1.66326785f,
             -1.61619723f, -1.57234073f, -1.53127813f, -1.49353135f, -1.45867503f, -1.42624652f, -1.39503074f, -1.36621320f,
@@ -2439,16 +2365,12 @@ namespace
             1.36415398f, 1.39277720f, 1.42348731f, 1.45656335f, 1.49078155f, 1.52804673f, 1.56803429f, 1.61146212f,
             1.65781057f, 1.70859325f, 1.76440656f, 1.82453620f, 1.89094412f, 1.96517146f, 2.04702711f, 2.13570380f,
             2.23243070f, 2.34583116f, 2.47412658f, 2.62253070f, 2.79892921f, 3.01957417f, 3.30903292f, 3.74206471f};
-        cudaMemcpyToSymbol(d_tq8_attn_cents, TQ8_C, sizeof(TQ8_C));
-        cudaMemcpyToSymbol(d_tq4_attn_cents, TQ4_C, sizeof(TQ4_C));
-        if (cudaGetLastError() == cudaSuccess)
-        {
-            s_tq_attn_codebook_generations[device_id] =
-                runtime_generation;
-            return true;
-        }
-        return false;
-    }
+    __device__ __constant__ const float d_tq4_attn_cents[16] = {
+            -2.732897f, -2.069364f, -1.618400f, -1.256565f,
+            -0.942629f, -0.656982f, -0.388189f, -0.128443f,
+            0.128443f, 0.388189f, 0.656982f, 0.942629f,
+            1.256565f, 1.618400f, 2.069364f, 2.732897f};
+
 } // anonymous namespace
 
 namespace
@@ -2881,8 +2803,10 @@ static int fa2_prefill_launch(
 {
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    cudaSetDevice(device_idx);
-    const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device_idx);
+    const auto dev_cfg = llaminar2::cuda::fa2_policy::bindCUDAFA2Hardware(
+        llaminar2::cudaHardwareMetadata().at(device_idx));
+    if (cudaSetDevice(device_idx) != cudaSuccess)
+        return -1;
 
     if (dev_cfg.sm_major < 8)
     {
@@ -3772,7 +3696,8 @@ static int fa2_context_transaction_launch(
                device_idx);
         return -1;
     }
-    const FA2DeviceConfig &device = getFA2DeviceConfig(device_idx);
+    const auto device = llaminar2::cuda::fa2_policy::bindCUDAFA2Hardware(
+        llaminar2::cudaHardwareMetadata().at(device_idx));
     if (device.sm_major < 8)
     {
         printf("[cudaFlashAttn_context_transaction] SM %d.%d is unsupported\n",
@@ -4503,7 +4428,8 @@ extern "C"
         // malformed block geometry before either captured phase is submitted.
         if (!stream || head_dim <= 0 || head_dim > 256 || head_dim % 32 != 0)
             return -1;
-        cudaSetDevice(device_idx);
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return -1;
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
@@ -4577,12 +4503,9 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-
-        // Ensure TQ codebooks are in constant memory
-        if (!upload_tq_attn_codebooks())
+        if (!stream || cudaSetDevice(device_idx) != cudaSuccess)
             return -1;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 

@@ -14,7 +14,19 @@
  * endpoint actions retain that same immutable membership projection.
  * No model or accelerator is opened.
  * This proves a real multi-process node, not a remote-network deployment.
+ * A separate unbound-runtime lifecycle check calls actual rank-worker admission without
+ * MPI or devices, proving exact caller/child masks and retained worker binding
+ * across automatic, partial and repeated teams and nested-call rejection.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "fixtures/execution/RetainedHostServiceReplayAccess.h"
+#include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
+#include "utils/ScopedCallerThreadAffinity.h"
+#include "utils/MPISessionOwner.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/modes/ServerRankMembership.h"
@@ -30,16 +42,141 @@
 #include <omp.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
+#include <memory>
+#include <atomic>
+#include <set>
+#include <map>
+#include <sched.h>
 #include <cerrno>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 using namespace llaminar2;
 
 namespace
 {
+    /** @return The calling OS thread's exact native allowed mask, or fail before admission. */
+    cpu_set_t callerMask()
+    {
+        cpu_set_t result{};
+        if (sched_getaffinity(0, sizeof(result), &result) != 0)
+            throw std::runtime_error("Cannot observe bootstrap lifecycle caller affinity");
+        return result;
+    }
+
+    /**
+     * @brief Check production rank admission with an initially unchanged partition mask.
+     * @return Zero only for restored caller/child masks and persistent worker placement.
+     * @throws std::runtime_error For missing native geometry or any failed invariant.
+     *
+     * Two distinct allowed physical cores expose the former master's singleton
+     * leak without depending on CPU IDs, NUMA labels, MPI ranks or accelerators.
+     * Only this test caller is narrowed; its original mask is restored on exit.
+     */
+    int checkBootstrapCallerAffinity()
+    {
+        const ScopedCallerThreadAffinity restore_test_caller;
+        if (omp_get_proc_bind() != omp_proc_bind_false)
+            throw std::runtime_error("Bootstrap caller lifecycle requires pre-exec OMP_PROC_BIND=false");
+        const auto original = callerMask();
+        std::map<int, int> physical;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &original))
+                physical.try_emplace(MPIBootstrapPhase::physicalRepresentativeForCpu(cpu), cpu);
+        if (physical.size() < 2 || physical.contains(-1))
+            throw std::runtime_error("Bootstrap caller lifecycle requires two admitted physical cores");
+        std::vector<int> cpus;
+        cpu_set_t admitted{};
+        for (const auto &[representative, cpu] : physical)
+        {
+            cpus.push_back(cpu);
+            CPU_SET(cpu, &admitted);
+            if (cpus.size() == 2) break;
+        }
+        if (sched_setaffinity(0, sizeof(admitted), &admitted) != 0)
+            throw std::runtime_error("Cannot admit bootstrap lifecycle caller cores");
+        {
+            const ScopedOpenMPPartitionAffinity partition;
+            const auto unchanged = callerMask();
+            if (!CPU_EQUAL(&admitted, &unchanged))
+                throw std::runtime_error("Unbound partition unexpectedly changed caller mask");
+        }
+
+        // Zero is production auto sizing. The one-worker request exercises a
+        // partial team; full/default admissions then reuse its original pool.
+        for (const int requested : {0, 2, 1, 2, 0})
+        {
+            OrchestrationConfig config;
+            config.n_threads = requested;
+            MPIBootstrapPhase::configureClusterRankThreads(config);
+            const auto restored = callerMask();
+            if (!CPU_EQUAL(&admitted, &restored))
+                throw std::runtime_error("Production bootstrap leaked its master's singleton affinity");
+            bool child_inherited = false;
+            std::thread child([&] {
+                cpu_set_t inherited{};
+                child_inherited = sched_getaffinity(0, sizeof(inherited), &inherited) == 0 &&
+                    CPU_EQUAL(&admitted, &inherited);
+            });
+            child.join();
+            if (!child_inherited)
+                throw std::runtime_error("Native child lost the restored original rank mask");
+            const int expected = requested == 0 ? 2 : requested;
+            if (omp_get_max_threads() != expected || omp_get_dynamic() != 0 ||
+                omp_get_proc_bind() != omp_proc_bind_false)
+                throw std::runtime_error("Bootstrap changed the admitted runtime worker policy");
+            std::vector<cpu_set_t> masks(static_cast<std::size_t>(expected));
+            int actual = 0, failed = 0;
+#pragma omp parallel reduction(| : failed)
+            {
+#pragma omp single
+                actual = omp_get_num_threads();
+                const int worker = omp_get_thread_num();
+                if (worker >= expected ||
+                    sched_getaffinity(0, sizeof(cpu_set_t), &masks[worker]) != 0)
+                    failed = 1;
+            }
+            if (failed || actual != expected || !CPU_EQUAL(&admitted, &masks[0]))
+                throw std::runtime_error("Observed team changed its caller or worker geometry");
+            for (int worker = 1; worker < expected; ++worker)
+                if (CPU_COUNT(&masks[worker]) != 1 || !CPU_ISSET(cpus[worker], &masks[worker]))
+                    throw std::runtime_error("Retained OpenMP worker lost its original singleton binding");
+        }
+
+        // The partition authority rejects nested callers before team binding.
+        // Actual exception unwinding must also preserve that caller's mask.
+        bool rejected = false, exception_restored = false;
+#pragma omp parallel num_threads(1)
+        {
+            // No exception may cross the OpenMP structured block, including a
+            // failed fixture observation before or after production rejection.
+            try
+            {
+                const auto before = callerMask();
+                try { MPIBootstrapPhase::configureClusterRankThreads(OrchestrationConfig{}); }
+                catch (const std::runtime_error &error)
+                {
+                    rejected = std::string(error.what()).find("outer host thread") != std::string::npos;
+                    const auto after = callerMask();
+                    exception_restored = CPU_EQUAL(&before, &after);
+                }
+            }
+            catch (...)
+            {
+                rejected = false;
+                exception_restored = false;
+            }
+        }
+        if (!rejected || !exception_restored)
+            throw std::runtime_error("Nested bootstrap rejection lost exact caller ownership");
+        std::cout << "PASS bootstrap caller restoration: auto/full/partial/repeated/exception; retained workers; native child" << std::endl;
+        return 0;
+    }
+
     /** @brief Own only the unique, small hostfile created by this test. */
     class Hostfile
     {
@@ -60,6 +197,75 @@ namespace
         ~Hostfile() { std::remove(path.c_str()); }
         std::string path;
     };
+
+    /**
+     * @brief Replay the actual retained service's first and repeated OpenMP teams.
+     * @param cpu Original gathered rank CPU observation used by its existing PMA domain.
+     * @param details Precise failed worker/partition invariant.
+     * @return True only for the creator's whole physical-core budget and one
+     *         unique admitted core place per worker; SMT siblings in a place are legal.
+     */
+    bool verifyRetainedServiceTeam(const PhysicalMemoryResource& cpu,std::string& details)
+    try
+    {
+        cpu_set_t partition;
+        CPU_ZERO(&partition);
+        {
+            const ScopedOpenMPPartitionAffinity admitted_partition;
+            if(sched_getaffinity(0,sizeof(partition),&partition)!=0)
+            {details="cannot observe admitted OpenMP partition";return false;}
+        }
+        std::set<int> physical;
+        for(int cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&partition))
+            physical.insert(MPIBootstrapPhase::physicalRepresentativeForCpu(cpu));
+        const int expected=omp_get_max_threads();
+        if(physical.empty()||physical.contains(-1)||expected!=static_cast<int>(physical.size()))
+        {details="pre-main core place collapsed the rank's physical worker budget";return false;}
+        const auto program=test::RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ExecutorParentTicket);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(program.bom(cpu)),cpu.world_rank);
+        auto owner=PreparedRetainedHostService::materialize(test::RetainedHostServiceReplayAccess::claim(memory,program));
+        for(int repeat=0;repeat<2;++repeat)
+        {
+            struct Observation {int expected,maximum=0,dynamic=-1,actual=0;std::vector<cpu_set_t> masks;std::atomic<bool> failed{false};};
+            Observation observed{expected,0,-1,0,std::vector<cpu_set_t>(static_cast<std::size_t>(expected))};
+            const auto ticket=owner->worker().dispatch([](void* opaque){
+                auto& value=*static_cast<Observation*>(opaque);
+                value.maximum=omp_get_max_threads();value.dynamic=omp_get_dynamic();
+#pragma omp parallel
+                {
+#pragma omp single
+                    value.actual=omp_get_num_threads();
+                    const int worker=omp_get_thread_num();
+                    if(worker>=value.expected || sched_getaffinity(0,sizeof(cpu_set_t),&value.masks[worker])!=0)
+                        value.failed.store(true,std::memory_order_relaxed);
+                }
+                return !value.failed.load()&&value.maximum==value.expected&&value.actual==value.expected&&value.dynamic==0;
+            },&observed);
+            if(!owner->worker().await(ticket))
+            {details="retained pthread changed the original program declaration's OpenMP budget";return false;}
+            std::set<int> assigned;
+            for(const auto& mask:observed.masks)
+            {
+                std::set<int> place;
+                for(int id=0;id<CPU_SETSIZE;++id)if(CPU_ISSET(id,&mask))
+                {
+                    if(!CPU_ISSET(id,&partition))
+                    {details="retained worker escaped its original rank partition";return false;}
+                    place.insert(MPIBootstrapPhase::physicalRepresentativeForCpu(id));
+                }
+                if(place.size()!=1||place.contains(-1)||!assigned.insert(*place.begin()).second)
+                {details="retained OpenMP workers do not own unique physical core places";return false;}
+            }
+        }
+        details="retained creator budget and unique physical core places verified";
+        return true;
+    }
+    catch(const std::exception& error)
+    {
+        details=error.what();
+        return false;
+    }
 
     /** @brief Enter production MPI bootstrap and prove each child's inventory. */
     int probe(int argc, char **argv)
@@ -93,6 +299,12 @@ namespace
             const auto topology = MPIBootstrap::detectCPUTopology();
             std::string detail;
             const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(-1, true, detail);
+            std::string retained_detail;
+            const PhysicalMemoryResource observed_cpu{context->rank(),DeviceId::cpu(),
+                local_observation.cpu.memory_bytes,local_observation.cpu.free_memory_bytes};
+            const bool retained_affinity_ok=verifyRetainedServiceTeam(observed_cpu,retained_detail);
+            passed=passed&&retained_affinity_ok;
+            if(!retained_affinity_ok)std::cerr<<"retained_team_affinity rank="<<context->rank()<<" "<<retained_detail<<std::endl;
             passed = passed && inventory.world_size == topology.numa_nodes &&
                 inventory.ranks.size() == static_cast<std::size_t>(context->world_size()) &&
                 inventory.node_count == 1 && inventory.total_gpus == 0 && affinity_ok;
@@ -268,6 +480,7 @@ namespace
                       << " workers=" << omp_get_max_threads()
                       << " affinity=" << detail << std::endl;
         }
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         MPI_Finalize();
         return passed ? 0 : 1;
     }
@@ -276,8 +489,14 @@ namespace
 /** @brief Launch through a real hostfile or execute one initialized child. */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
+        if (argc == 2 && std::string(argv[1]) == "--caller-affinity")
+            return checkBootstrapCallerAffinity();
         if (argc > 1) return probe(argc, argv);
         const Hostfile file(MPIBootstrap::detectCPUTopology().numa_nodes);
         const auto child = fork();

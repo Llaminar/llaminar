@@ -7,6 +7,18 @@
  * captured pipeline provides the serial-arithmetic oracle. Fixture-only full
  * weights permit adversarial owner-bank changes; this is not a movement-copy
  * or production-memory-footprint certificate. All comparisons are byte exact.
+ * Counted timing also checks device-published useful packet extents after each
+ * pair; these are not inferred native ring link-byte receipts. Original legacy
+ * reversed membership remains the default; A1 geometry selects ordinal members.
+ * Quantized cold preparation batches all original matrices in one existing
+ * production loader/pool/staging lifecycle per device, preserving independent
+ * source tensors, prepared stores and full-down oracle handles.
+ * The common fixture entry retains the original MPI discovery publication
+ * before CPU synthesis; native and counted transport consume one physical
+ * observation rather than relying on a counted-only initialization side effect.
+ * Setup synthesizes independent seeded original tensors on the canonical CPU
+ * physical-worker budget before GPU preparation; no coherence owner is shared
+ * between participants. Progress/elapsed records exclude every timed replay.
  * Optional timings include runtime publication, regrouping and both explicit
  * collectives. Setup, request uploads and oracle readback stay outside timing.
  * The real down stage also exposes its existing route-column buffer through
@@ -19,11 +31,19 @@
  * Decode's full-row cohort preserves the separate native shared allreduce and
  * verifies its bytes while routed down and the following native gather execute
  * in the production fork/join order. It never substitutes a column reduction.
+ * Fixed scalar rows additionally prove actual native gather output ownership,
+ * complete-row diagnostic leases and absence of the old identity-copy kernel.
+ * Counted rows retain their original two-bank declarations even at capacity one.
  */
 #include "MoEProjectionPipelineFixture.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
+#include "integration/transfer/CapturedChannelGraphProof.h"
+#include "execution/moe/MoECountedTransferPolicy.h"
 #include "execution/moe/MoEProjectionRuntimeBinding.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
+#include "backends/HardwareInventory.h"
+#include <omp.h>
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/LocalTPContext.h"
 #include "collective/DeviceCountedAllGather.h"
@@ -31,6 +51,8 @@
 #include "planning/PlanningObservedResource.h"
 #include "utils/MPIContext.h"
 #include "execution/compute_stages/stages/MoEProjectionPipeline.h"
+#include "execution/compute_stages/stages/NativeAllGatherStage.h"
+#include "kernels/common/ColumnShardAssemblyKernels.h"
 #include "execution/compute_stages/stages/TPLocalReduceOverlap.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/moe/MoEGroupedVerifierHistogramBoundarySet.h"
@@ -51,6 +73,8 @@
 #include "utils/QuantizedVerifierFormats.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <barrier>
 #include <bit>
@@ -61,6 +85,9 @@
 #include <map>
 #include <thread>
 #include <vector>
+#include <string_view>
+#include <sstream>
+#include <iomanip>
 
 namespace llaminar2::test
 {
@@ -83,18 +110,96 @@ std::vector<Format> formats()
 {
     std::vector<Format> result;
     for (const auto &format : quantizedMoEVerifierFormats())
-        result.push_back({format.label, DeviceMoEWeightFormat::NativeVNNI, format.create});
+        result.push_back({format.label, DeviceMoEWeightFormat::NativeQuantised, format.create});
     // The target model mixes gate/up and down codebooks. Equal-format sweeps
     // alone would not prove that the fixed bank retains its independent type.
-    result.push_back({"IQ2_S/IQ4_NL", DeviceMoEWeightFormat::NativeVNNI,
+    result.push_back({"IQ2_S/IQ4_NL", DeviceMoEWeightFormat::NativeQuantised,
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createIQ2_SRandom(shape, seed); },
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }});
+    // Upstream's metadata documentation for this exact UD-Q4_K_XL family
+    // identifies Q4_K gate/up and Q5_1 down as the dominant original pair.
+    // Keep the superblock gate source distinct from physical-ID-sharing Q4_1.
+    result.push_back({"Q4_K/Q5_1", DeviceMoEWeightFormat::NativeQuantised,
+        [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ5_1Random(shape, seed); }});
+    // Explicit representative original 32-column formats for measured physical
+    // dispatch IDs 5/7. IDs alone do not authenticate a model's original GGUF
+    // format: Q4_K/Q5_K share those IDs with distinct superblock metadata.
+    result.push_back({"Q4_1/Q5_1", DeviceMoEWeightFormat::NativeQuantised,
+        [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ4_1Random(shape, seed); },
+        [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ5_1Random(shape, seed); }});
     result.push_back({"FP16", DeviceMoEWeightFormat::FP16, [](const auto &shape, uint32_t seed) {
         return TestTensorFactory::createFP16Random(shape, -.125f, .125f, seed); }});
     result.push_back({"BF16", DeviceMoEWeightFormat::BF16, [](const auto &shape, uint32_t seed) {
         return TestTensorFactory::createBF16Random(shape, -.125f, .125f, seed); }});
     result.push_back({"FP32", DeviceMoEWeightFormat::FP32, [](const auto &shape, uint32_t seed) {
         return TestTensorFactory::createFP32Random(shape, -.125f, .125f, seed); }});
+    return result;
+}
+
+/** @brief Independent host-original parents for one expert on one participant. */
+struct OriginalExpertSources
+{
+    std::shared_ptr<TensorBase> gate, up, down;
+};
+
+/**
+ * @brief Synthesize exact original triplets in parallel without sharing tensor coherence.
+ * @param format Existing source factories; every task retains its own seeded RNG.
+ * @param config Original complete expert geometry, unchanged by timing mode.
+ * @param participants Number of independent original/prepared device owners.
+ * @return Per-participant originals retained until all GPU owners finish.
+ * @throws std::runtime_error For missing physical-worker authority or generation failure.
+ *
+ * Parallelism is over complete experts, never within a seeded tensor. This
+ * preserves every generated byte and the original seed-to-role mapping. No
+ * GPU operation or OpenMP task escapes into the timed/captured path. Physical
+ * inventory and the startup-selected OpenMP budget jointly bound the team.
+ */
+std::vector<std::vector<OriginalExpertSources>> synthesizeOriginalSources(
+    const Format &format, const ProjectionPipelineFixtureConfig &config, int participants)
+{
+    const auto [experts, width, intermediate, top_k] = config.geometry;
+    (void)top_k;
+    const auto *hardware = DeviceManager::instance().hardware();
+    require(hardware && hardware->total_physical_cores() > 0 && omp_get_max_threads() > 0,
+        "projection source synthesis requires original physical-worker inventory");
+    require(participants > 0 && experts > 0 && participants <= std::numeric_limits<int>::max() / experts,
+        "projection source synthesis task geometry overflow");
+    const int tasks = participants * experts;
+    const int workers = std::min({tasks, hardware->total_physical_cores(), omp_get_max_threads()});
+    std::vector<std::vector<OriginalExpertSources>> result(participants,
+        std::vector<OriginalExpertSources>(experts));
+    std::vector<std::exception_ptr> errors(tasks);
+    std::atomic<int> completed{0};
+    const auto start = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "PROJECTION_SETUP,phase=source_synthesis,start=1,source=%s,participants=%d,experts=%d,worker_limit=%d\n",
+        format.name.c_str(), participants, experts, workers);
+    std::fflush(stderr);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+    for (int task = 0; task < tasks; ++task)
+    {
+        try
+        {
+            const int participant = task / experts, expert = task % experts;
+            auto &source = result[participant][expert];
+            source.gate = format.create({std::size_t(intermediate), std::size_t(width)}, 51800 + expert);
+            source.up = format.create({std::size_t(intermediate), std::size_t(width)}, 51900 + expert);
+            source.down = (format.create_down ? format.create_down : format.create)(
+                {std::size_t(width), std::size_t(intermediate)}, 52000 + expert);
+            require(source.gate && source.up && source.down, "projection original synthesis returned null");
+        }
+        catch (...) { errors[task] = std::current_exception(); }
+        const int done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (done % 64 == 0 || done == tasks)
+        {
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "PROJECTION_SETUP,phase=source_synthesis,source=%s,completed=%d,total=%d,elapsed_seconds=%.3f\n",
+                format.name.c_str(), done, tasks, elapsed);
+            std::fflush(stderr);
+        }
+    }
+    for (const auto &error : errors) if (error) std::rethrow_exception(error);
     return result;
 }
 
@@ -204,9 +309,10 @@ std::vector<GraphCaptureDependencyLedger::StagePlan> capturePlan(
     return plans;
 }
 
-/** @brief Exercise full/empty/sparse rows and changed owners on a retained six-node transaction. */
+/** @brief Exercise full/empty/sparse rows and changed owners on the retained production transaction. */
 void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::barrier<> &rendezvous,
     const Format &format, const ProjectionPipelineFixtureConfig &config,
+    const std::vector<OriginalExpertSources> &originals,
     std::vector<double> &candidate_times, std::vector<double> &oracle_times)
 {
     const auto [experts, width, intermediate, top_k] = config.geometry;
@@ -222,14 +328,6 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
         const bool floating = deviceMoEWeightFormatIsFloating(format.family);
         std::vector<std::shared_ptr<TensorBase>> sources;
         std::vector<std::shared_ptr<GpuPreparedGemm>> engines;
-        auto prepare = [&](std::shared_ptr<TensorBase> source) {
-            sources.push_back(source);
-            auto prepared = std::make_shared<GpuPreparedGemm>(floating
-                ? makeGpuPreparedFloatingPointGemm(source.get(), device)
-                : makeGpuPreparedGemm(source.get(), device));
-            engines.push_back(prepared);
-            return std::shared_ptr<ITensorGemm>(prepared, prepared->kernel);
-        };
         const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
             {experts, width, intermediate}, participant, participants);
         MoERoutedExpertPlacementPlan initial_plan;
@@ -257,19 +355,58 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
         endpoint.world_rank = 0; endpoint.world_rank_known = true;
         ExpertGemmRegistry registry;
         std::vector<MoEOverlayPreparedExpertPayload> movable, complete;
+        require(originals.size() == static_cast<std::size_t>(experts), "projection original source population changed");
+        const auto preparation_started = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "PROJECTION_SETUP,phase=device_preparation,start=1,device=%s,source=%s,experts=%d\n",
+            device.toString().c_str(), format.name.c_str(), experts);
+        std::fflush(stderr);
+        // All original parents and local down views remain participant-owned.
+        // Only cold pool/staging admission is batched; each GEMM keeps its own
+        // production factory handle/store, and the independent full-down oracle.
+        std::vector<TensorBase *> inputs;
+        sources.reserve(static_cast<size_t>(experts) * 4);
+        inputs.reserve(static_cast<size_t>(experts) * 4);
+        for (const auto &original : originals)
+        {
+            for (auto source : {original.gate, original.up, original.down,
+                    original.down->create_view({std::size_t(local_columns), std::size_t(intermediate)},
+                        std::size_t(participant) * local_columns * intermediate)})
+            {
+                sources.push_back(std::move(source));
+                inputs.push_back(sources.back().get());
+            }
+        }
+        if (floating)
+        {
+            // Floating sources retain their explicit production RAW_FP policy.
+            for (auto *source : inputs)
+                engines.push_back(std::make_shared<GpuPreparedGemm>(makeGpuPreparedFloatingPointGemm(source, device)));
+        }
+        else
+        {
+            auto prepared = makeGpuPreparedGemmBatch(inputs, device, "projection.original");
+            for (auto &engine : prepared) engines.push_back(std::make_shared<GpuPreparedGemm>(std::move(engine)));
+        }
+        const auto prepared_at = [&](size_t index) {
+            return std::shared_ptr<ITensorGemm>(engines.at(index), engines.at(index)->kernel);
+        };
         for (int expert = 0; expert < experts; ++expert)
         {
-            auto gate = prepare(format.create({std::size_t(intermediate), std::size_t(width)}, 51800 + expert));
-            auto up = prepare(format.create({std::size_t(intermediate), std::size_t(width)}, 51900 + expert));
-            std::shared_ptr<TensorBase> down_source = (format.create_down ? format.create_down : format.create)(
-                {std::size_t(width), std::size_t(intermediate)}, 52000 + expert);
-            auto down = prepare(down_source);
-            auto slice = prepare(down_source->create_view({std::size_t(local_columns), std::size_t(intermediate)},
-                std::size_t(participant) * local_columns * intermediate));
+            const auto base = static_cast<size_t>(expert) * 4;
+            auto gate = prepared_at(base), up = prepared_at(base + 1);
+            auto down = prepared_at(base + 2), slice = prepared_at(base + 3);
             registry.registerEngineForParticipant("native", device, 0, participant, 0, expert,
                 ExpertGemmRegistry::WeightRole::DOWN, slice.get(), slice, ownership);
             movable.push_back(MoEOverlayPreparedExpertPayload::gateUp(gate, up));
             complete.emplace_back(gate, up, down);
+            if ((expert + 1) % 64 == 0 || expert + 1 == experts)
+            {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - preparation_started).count();
+                std::fprintf(stderr, "PROJECTION_SETUP,phase=device_preparation,device=%s,source=%s,completed=%d,total=%d,elapsed_seconds=%.3f\n",
+                    device.toString().c_str(), format.name.c_str(), expert + 1, experts, elapsed);
+                std::fflush(stderr);
+            }
         }
         auto fixed = MoEOverlayFixedDownProjectionBank::resolve(registry, endpoint, 0, ownership);
         DeviceMoERuntimeTable::Config runtime_config;
@@ -308,6 +445,16 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
         auto route_columns = tensor(capacity * top_k * local_columns);
         auto columns = tensor(capacity * local_columns), gathered = tensor(capacity * width), output = tensor(capacity * width);
         auto expected = tensor(capacity * width);
+        // Persistent terminal-only diagnostic destinations use the actual
+        // packet layout and never alias production capture storage.
+        const MoEGroupedIntermediateLayout diagnostic_maximum{
+            maximum_layout.encoding, maximum_layout.columns,
+            maximum_layout.route_capacity, 1};
+        auto diagnostic_candidate = tensor(diagnostic_maximum.packetBytes() / sizeof(float));
+        auto diagnostic_reference = tensor(diagnostic_maximum.packetBytes() / sizeof(float));
+        auto diagnostic_owners = TestTensorFactory::createINT32({std::size_t(capacity * top_k)});
+        require(diagnostic_owners->ensureOnDevice(device, stream), "projection diagnostic owner admission");
+
         const bool shared_columns = config.output == ProjectionOutputProof::SharedColumnCompletion;
         const bool shared_full_sum = config.output == ProjectionOutputProof::SharedFullRowsOverlap;
         const bool has_shared = shared_columns || shared_full_sum;
@@ -326,7 +473,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
         auto oracle = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
         oracle->setGPUStream(stream);
         dynamic_cast<IWorkspaceConsumer *>(oracle.get())->bindWorkspace(&workspace);
-        std::vector<DeviceNativeVNNIMatrixDesc> gates(experts), ups(experts), downs(experts);
+        std::vector<DeviceNativeQuantisedMatrixDesc> gates(experts), ups(experts), downs(experts);
         std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(experts), fp_ups(experts), fp_downs(experts);
         for (int expert = 0; expert < experts; ++expert)
         {
@@ -445,7 +592,8 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
             params.rows = rows; params.top_k = top_k; params.prefix = "layer0_projection_"; params.router_node = "fixture_router";
             params.demand = demand;
             params.service_phase = demand == MoEGroupedPlanDemand::DeferredAcceptedRows
-                ? MoEOverlayServicePhaseHint::GroupedVerifier : MoEOverlayServicePhaseHint::Prefill;
+                ? MoEOverlayServicePhaseHint::GroupedVerifier
+                : demand == MoEGroupedPlanDemand::OrdinaryPrefill ? MoEOverlayServicePhaseHint::Prefill : config.service_phase;
             ActivationBuffers arena;
             arena.normalized = dynamic_cast<TensorBase *>(hidden.get());
             arena.extensions = {
@@ -463,10 +611,58 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
             params.bindArena(arena);
             require(params.hidden.tensor == hidden.get(), "production normalized activation binding");
             const auto terminal = appendMoEProjectionPipeline(graph, params);
-            require(graph.size() == 7 && terminal == "layer0_projection_assemble", "projection graph structure");
+            const auto expected_nodes = rows == 1 ? 6u : 7u;
+            require(graph.size() == expected_nodes && terminal == "layer0_projection_assemble", "projection graph structure");
+            const auto *direct_gather = dynamic_cast<const NativeAllGatherStage *>(graph.getNode(terminal)->stage.get());
+            require((direct_gather != nullptr) == (rows == 1), "only a fixed scalar row may publish directly from allgather");
+            if (direct_gather)
+            {
+                require(!graph.getNode(params.prefix + "column_allgather") &&
+                    direct_gather->params().rank_major_output == output.get() &&
+                    direct_gather->params().output_buffer_id == params.output.id &&
+                    direct_gather->params().local_input == columns.get() &&
+                    direct_gather->params().bytes_per_participant == std::size_t(width / participants) * sizeof(float),
+                    "scalar gather changed its original banks or exact communication extent");
+                // Independently reduce the actual layout coordinates. The
+                // scalar row cancels the only rank/row transpose; wider rows
+                // remain covered by the old native assembly below.
+                for (int column = 0; column < width; ++column)
+                {
+                    const int peer = column / (width / participants);
+                    const int local = column % (width / participants);
+                    require((peer * rows + 0) * (width / participants) + local == column,
+                        "scalar rank-major/row-major addresses differ");
+                }
+            }
+            // A mutable live count is a different byte-lifetime contract even
+            // when its capacity is one. Construction must retain the original
+            // receive bank/assembly and the exact native count authority.
+            {
+                ComputeGraph counted_graph;
+                counted_graph.addNode("fixture_router", std::make_unique<FixtureRouterBoundary>(device), device);
+                auto counted_params = params;
+                counted_params.live_rows = DeviceRowRange::deviceCounted(rows,
+                    static_cast<const int *>(active_rows->gpu_data_ptr()));
+                const auto counted_terminal = appendMoEProjectionPipeline(counted_graph, counted_params);
+                const auto *counted_gather = dynamic_cast<const NativeAllGatherStage *>(
+                    counted_graph.getNode(params.prefix + "column_allgather")->stage.get());
+                require(counted_graph.size() == 7 && counted_terminal == terminal && counted_gather &&
+                    counted_gather->params().rank_major_output == gathered.get() &&
+                    counted_gather->params().live_rows &&
+                    counted_gather->params().live_rows->rows().countOwner() == active_rows->gpu_data_ptr() &&
+                    counted_graph.getNode(counted_terminal)->stage->type() == ComputeStageType::MOE_PROJECTION_PHASE,
+                    "device-counted assembly changed its empty-row bank or native count authority");
+            }
+            if (params.counted_exchange)
+            {
+                auto unresolved = params;
+                unresolved.prefix = "unresolved_phase_";
+                unresolved.service_phase = MoEOverlayServicePhaseHint::Auto;
+                EXPECT_THROW(appendMoEProjectionPipeline(graph, unresolved), std::invalid_argument);
+            }
             auto invalid = params; invalid.prefix = "invalid_"; invalid.local_packet = invalid.output;
             EXPECT_THROW(appendMoEProjectionPipeline(graph, invalid), std::invalid_argument);
-            EXPECT_EQ(graph.size(), 7u);
+            EXPECT_EQ(graph.size(), expected_nodes);
             if (has_shared)
             {
                 graph.addNode("fixture_shared", std::make_unique<FixtureRouterBoundary>(device), device);
@@ -486,7 +682,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     overlapMoEProjectionSharedAllreduce(graph, params.prefix, sum.stage_name);
                     EXPECT_THROW(overlapMoEProjectionSharedAllreduce(graph, params.prefix, sum.stage_name),
                                  std::invalid_argument);
-                    require(graph.size() == 11, "projection full-row overlap duplicated a node");
+                    require(graph.size() == expected_nodes + 4, "projection full-row overlap duplicated a node");
                     // Pin the exact native submission order, not merely final
                     // equality: a peer may otherwise capture a different order.
                     const auto order = graph.getExecutionOrder();
@@ -498,7 +694,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     require(position(params.prefix + "intermediate_allgather") < position(sum.stage_name + "_submit") &&
                             position(sum.stage_name + "_submit") < position(params.prefix + "import_down") &&
                             position(params.prefix + "import_down") < position(sum.stage_name) &&
-                            position(sum.stage_name) < position(params.prefix + "column_allgather"),
+                            position(sum.stage_name) < position(rows == 1 ? terminal : params.prefix + "column_allgather"),
                             "projection full-row sum is outside its independent down window");
                 }
                 else
@@ -509,9 +705,24 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                 require(finalizeMoEProjectionSharedColumns(graph, params.prefix, completion) == terminal,
                     "projection shared completion changed terminal identity");
                 EXPECT_THROW(finalizeMoEProjectionSharedColumns(graph, params.prefix, completion), std::invalid_argument);
-                require(graph.size() == 12, "projection shared completion duplicated a node");
+                require(graph.size() == (rows == 1 ? 11u : 12u), "projection shared completion duplicated a node");
                 }
             }
+            // Both original and scalar terminal nodes expose the same
+            // complete-value snapshot semantics, including after finalization.
+            require(graph.getNode(terminal)->stage->type() == (rows == 1
+                    ? ComputeStageType::NATIVE_ALLGATHER : ComputeStageType::MOE_PROJECTION_PHASE),
+                "projection snapshot metadata disguised the actual native stage type");
+            const auto terminal_dump = graph.getNode(terminal)->stage->getDumpInfoSnapshot();
+            const auto terminal_name = shared_columns ? "combined_output" : "output";
+            const auto final_output = std::find_if(terminal_dump.outputs.begin(), terminal_dump.outputs.end(),
+                [&](const auto &entry) { return entry.name && std::string_view(entry.name) == terminal_name; });
+            require(final_output != terminal_dump.outputs.end() && final_output->tensor == output.get() &&
+                final_output->rows == static_cast<std::size_t>(rows) && final_output->cols == static_cast<std::size_t>(width),
+                "projection final native/assembled publication lost its original snapshot owner");
+            const auto final_keys = SnapshotCapture::possibleKeysForStage(terminal, terminal_dump);
+            require(std::find(final_keys.begin(), final_keys.end(), (shared_columns ? "layer0_MOE_COMBINED_OUTPUT" : "layer0_MOE_EXPERT_OUTPUT")) != final_keys.end(),
+                "projection terminal lost the complete-row snapshot key");
             std::map<BufferId, TensorBase *> buffers;
             for (const auto binding : {params.hidden, params.routing_indices, params.routing_weights, params.local_packet,
                     params.gathered_packets, params.local_route_columns,
@@ -599,6 +810,42 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     scope.complete();
                 }
                 recording.finish();
+                // Bind the expected assembly function to one real captured
+                // production launch. Function identity authenticates removal
+                // even if a backend cannot resolve a symbolic kernel name.
+                auto assembly_probe = gpu.createGraphCapture(stream);
+                {
+                    ScopedBackendGraphCapture probe_recording(gpu, *assembly_probe, "projection_assembly_identity_oracle");
+                    require(probe_recording.begin() && assembleColumnShardsFP32(device,
+                        static_cast<const float *>(gathered->gpu_data_ptr()),
+                        static_cast<float *>(output->gpu_data_ptr()), rows, participants, width / participants, stream),
+                        "projection assembly identity oracle capture");
+                    probe_recording.finish();
+                }
+                std::vector<GPUGraphKernelNodeInfo> probe_nodes, native_nodes;
+                std::string inspection_error;
+                require(assembly_probe->inspectKernelNodes(probe_nodes, &inspection_error) && probe_nodes.size() == 1 &&
+                    probe_nodes.front().valid(), "projection assembly oracle kernel identity");
+                require(capture->inspectKernelNodes(native_nodes, &inspection_error), "projection native kernel inventory");
+                const auto copies = std::count_if(native_nodes.begin(), native_nodes.end(), [&](const auto &node) {
+                    return node.function_identity == probe_nodes.front().function_identity;
+                });
+                // Shared-column packing legitimately uses the same existing
+                // transpose kernel before reduce-scatter. Only the final scalar
+                // copy disappears; M>1 keeps its original final assembly.
+                require(copies == (rows == 1 ? 0 : 1) + (shared_columns ? 1 : 0),
+                    "captured projection did not remove exactly the scalar identity copy");
+                if (params.counted_exchange)
+                {
+                    std::size_t prepare=0,validate=0;
+                    for(const auto &node:native_nodes) {
+                        require(node.name.find("capturedTransfer")==std::string::npos,
+                            "Native projection exchange retained a custom peer transport");
+                        prepare+=node.name.find("prepareNativeCountedAllGatherFrame")!=std::string::npos;
+                        validate+=node.name.find("validateNativeCountedAllGatherFrame")!=std::string::npos;
+                    }
+                    require(prepare==1 && validate==1,"Projection must capture one complete original native counted composition");
+                }
                 require(capture->instantiate(), "projection capture instantiate");
             };
             record();
@@ -838,11 +1085,171 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                             "projection published route columns do not fold to the captured output");
                     }
                 }
+                auto observed_terminal = terminal_dump;
+                for (auto &entry : observed_terminal.outputs)
+                    if (entry.name && std::string_view(entry.name) == terminal_name)
+                        entry.data = actual.data();
+                SnapshotCapture terminal_snapshots;
+                terminal_snapshots.captureStage(terminal, observed_terminal);
+                const auto terminal_snapshot = terminal_snapshots.getShared(
+                    shared_columns ? "layer0_MOE_COMBINED_OUTPUT" : "layer0_MOE_EXPERT_OUTPUT");
+                require(terminal_snapshot && terminal_snapshot->publication == SnapshotPublication::CompleteValue &&
+                    terminal_snapshot->rows == static_cast<std::size_t>(rows) &&
+                    terminal_snapshot->cols == static_cast<std::size_t>(width) &&
+                    terminal_snapshot->data == std::vector<float>(actual.begin(), actual.begin() + std::size_t(rows) * width),
+                    "projection native/assembled terminal snapshot changed complete-row semantics");
                 for (std::size_t i = 0; i < actual.size(); ++i)
                     if (!std::isfinite(actual[i]) || std::bit_cast<uint32_t>(actual[i]) != std::bit_cast<uint32_t>(reference[i]))
-                        throw std::runtime_error(format.name + " projection byte mismatch rows=" + std::to_string(rows) +
-                            " replay=" + std::to_string(replay) + " element=" + std::to_string(i) +
-                            " actual=" + std::to_string(actual[i]) + " expected=" + std::to_string(reference[i]));
+                    {
+                        // Keep the receiver-local complete-expert oracle exact.
+                        // Column and gate/up provenance separate mixed-program
+                        // arithmetic from an incorrect transport/assembly owner.
+                        const auto actual_bits = std::bit_cast<std::uint32_t>(actual[i]);
+                        const auto expected_bits = std::bit_cast<std::uint32_t>(reference[i]);
+                        const auto ordered = [](std::uint32_t bits) -> std::uint32_t {
+                            return bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+                        };
+                        const auto a_order = ordered(actual_bits), e_order = ordered(expected_bits);
+                        const auto ulps = a_order > e_order ? std::uint64_t(a_order) - e_order
+                                                           : std::uint64_t(e_order) - a_order;
+                        const bool payload = i < std::size_t(rows) * width;
+                        const int row = payload ? int(i / width) : -1;
+                        const int column = payload ? int(i % width) : -1;
+                        const int down_owner = payload ? column / local_columns : -1;
+                        std::ostringstream detail;
+                        detail << format.name << " projection byte mismatch"
+                            << " receiver=" << device.toString() << " receiver_member=" << participant
+                            << " reference_device=" << device.toString()
+                            << " rows=" << rows << " live=" << live << " replay=" << replay
+                            << " element=" << i << " row=" << row << " column=" << column
+                            << " width=" << width << " intermediate=" << intermediate
+                            << " experts=" << experts << " top_k=" << top_k
+                            << " demand=" << int(demand) << " epoch=" << epoch
+                            << " actual=" << std::setprecision(std::numeric_limits<float>::max_digits10) << actual[i]
+                            << " expected=" << reference[i]
+                            << " actual_bits=0x" << std::hex << actual_bits
+                            << " expected_bits=0x" << expected_bits << std::dec;
+                        if (std::isfinite(actual[i]) && std::isfinite(reference[i])) detail << " ulp_distance=" << ulps;
+                        else detail << " ulp_distance=nonfinite";
+                        if (down_owner >= 0)
+                            detail << " down_owner_member=" << down_owner
+                                << " down_owner_device=" << tp.devices().at(down_owner).toString()
+                                << " down_local_column=" << column % local_columns;
+                        else detail << " region=guard_suffix";
+                        if (payload && row < live)
+                        {
+                            detail << " gate_up_routes=[";
+                            for (int slot = 0; slot < top_k; ++slot)
+                            {
+                                const auto route = row * top_k + slot;
+                                if (slot) detail << ',';
+                                detail << "slot:" << slot << "/expert_bits:0x" << std::hex
+                                    << std::bit_cast<std::uint32_t>(ids[route]) << "/weight_bits:0x"
+                                    << std::bit_cast<std::uint32_t>(probabilities[route]) << std::dec;
+                                const float expert_value = ids[route];
+                                if (!std::isfinite(expert_value) || expert_value < 0.f ||
+                                    expert_value >= experts || std::trunc(expert_value) != expert_value)
+                                {
+                                    detail << "/owner:inactive_or_invalid";
+                                    continue;
+                                }
+                                const int expert = static_cast<int>(expert_value);
+                                // This is the fixture's unchanged placement trace.
+                                const auto *initial = initial_owners.ownerFor(0, expert);
+                                if (replay == 0 && !initial)
+                                {
+                                    detail << "/owner:missing_initial_assignment";
+                                    continue;
+                                }
+                                const int owner = replay == 0 ? initial->owner_participant
+                                    : replay % 4 == 3 ? 0 : (expert + replay) % participants;
+                                detail << "/expert:" << expert << "/member:" << owner;
+                                if (owner >= 0 && std::size_t(owner) < tp.devices().size())
+                                    detail << "/device:" << tp.devices()[owner].toString();
+                                else detail << "/device:invalid_owner";
+                            }
+                            detail << ']';
+                        }
+                        // ImportDown has regrouped all original routes before
+                        // consuming the exchanged representation. Observe that
+                        // retained representation and the full oracle through
+                        // the public bit-copy exporter, with one complete local
+                        // diagnostic member. This does not rerun gate/up/down.
+                        const MoEGroupedIntermediateLayout diagnostic_layout{
+                            maximum_layout.encoding, maximum_layout.columns,
+                            static_cast<std::uint32_t>(rows * top_k), 1};
+                        std::vector<std::int32_t> complete_owners(rows * top_k, -1);
+                        bool diagnostic_routes_valid = true;
+                        for (int route = 0; route < rows * top_k; ++route)
+                        {
+                            const float expert = ids[route];
+                            const bool valid_expert = std::isfinite(expert) && expert >= 0.f &&
+                                expert < experts && std::trunc(expert) == expert;
+                            if (route < live * top_k && valid_expert) complete_owners[route] = 0;
+                            else if (expert != -1.f) diagnostic_routes_valid = false;
+                        }
+                        if (!diagnostic_routes_valid)
+                            detail << " retained_intermediate=not_observed_invalid_route_inputs";
+                        else try
+                        {
+                            require(backend->hostToDeviceOnStream(diagnostic_owners->gpu_data_ptr(), complete_owners.data(),
+                                complete_owners.size() * sizeof(std::int32_t), device.ordinal, stream),
+                                "projection terminal diagnostic grouping upload");
+                            const auto *complete_owner_device = static_cast<const std::int32_t *>(diagnostic_owners->gpu_data_ptr());
+                            require(kernel_owner->kernel && kernel_owner->kernel->exportGroupedPrefillIntermediates(
+                                    diagnostic_layout, complete_owner_device, diagnostic_candidate.get(), 0) &&
+                                oracle->exportGroupedPrefillIntermediates(
+                                    diagnostic_layout, complete_owner_device, diagnostic_reference.get(), 0),
+                                "projection terminal retained-intermediate export");
+                            std::vector<std::uint32_t> candidate_words(diagnostic_layout.packetBytes() / sizeof(std::uint32_t));
+                            std::vector<std::uint32_t> reference_words(candidate_words.size());
+                            require(backend->deviceToHostOnStream(candidate_words.data(), diagnostic_candidate->gpu_data_ptr(),
+                                    diagnostic_layout.packetBytes(), device.ordinal, stream) &&
+                                backend->deviceToHostOnStream(reference_words.data(), diagnostic_reference->gpu_data_ptr(),
+                                    diagnostic_layout.packetBytes(), device.ordinal, stream) &&
+                                gpu.synchronizeStreamChecked(stream), "projection retained-intermediate observation");
+                            const auto mismatch = std::mismatch(candidate_words.begin(), candidate_words.end(), reference_words.begin());
+                            if (mismatch.first == candidate_words.end())
+                                detail << " retained_intermediate=byte_identical stage_suspect=down_or_fold_or_assembly";
+                            else
+                            {
+                                const auto word = std::size_t(mismatch.first - candidate_words.begin());
+                                // This is the dense exporter ABI: payload only,
+                                // no compact route-ID header or packet padding.
+                                const auto route_words = diagnostic_layout.routeWords();
+                                const auto value_words = diagnostic_layout.valueWords();
+                                const auto scale_words = diagnostic_layout.scaleWords();
+                                if (route_words == 0 || route_words != value_words + scale_words ||
+                                    candidate_words.size() != std::size_t(diagnostic_layout.route_capacity) * route_words)
+                                    detail << " retained_intermediate=invalid_dense_packet_geometry";
+                                else
+                                {
+                                    const auto route = word / route_words;
+                                    const auto component = word % route_words;
+                                    if (route >= diagnostic_layout.route_capacity || route >= ids.size() ||
+                                        component >= value_words + scale_words)
+                                        detail << " retained_intermediate=invalid_dense_packet_coordinate";
+                                    else
+                                        detail << " retained_intermediate=differs stage_suspect=gate_up_q8_or_exchange_import"
+                                            << " intermediate_route=" << route
+                                            << " intermediate_expert_bits=0x" << std::hex
+                                            << std::bit_cast<std::uint32_t>(ids[route]) << std::dec
+                                            << " intermediate_component=" << (component < value_words ? "value_word" : "scale")
+                                            << " intermediate_component_index=" << (component < value_words
+                                                ? component : component - value_words)
+                                            << " intermediate_actual_bits=0x" << std::hex << *mismatch.first
+                                            << " intermediate_reference_bits=0x" << *mismatch.second << std::dec;
+                                }
+                            }
+                        }
+                        catch (const std::exception &observation_error)
+                        {
+                            // Diagnostic failure never replaces the original
+                            // exact-output mismatch and its provenance.
+                            detail << " retained_intermediate_observation_error=" << observation_error.what();
+                        }
+                        throw std::runtime_error(detail.str());
+                    }
                 if (live > 0)
                     require(std::any_of(reference.begin(), reference.begin() + live * width,
                         [](float value) { return value != 0.f; }), "projection math requires a nonzero live-row witness");
@@ -874,6 +1281,24 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     require(backend->deviceToHostOnStream(actual.data(), output->gpu_data_ptr(), output->size_bytes(), device.ordinal, stream) &&
                         backend->deviceToHostOnStream(reference.data(), expected->gpu_data_ptr(), expected->size_bytes(), device.ordinal, stream) &&
                         gpu.synchronizeStreamChecked(stream), "projection timed result observation");
+                    // This is a terminal observation outside the timed device interval.
+                    // The production fabric owns each packet's useful extent; derive the
+                    // independent expected bytes from original router IDs and owner map.
+                    // These are packet extents, not an inferred native ring link receipt.
+                    if (const auto fabric = tp.deviceCountedAllGather())
+                    {
+                        std::vector<std::uint64_t> observed(participants), useful(participants);
+                        require(backend->deviceToHostOnStream(observed.data(), fabric->extentAddress(participant, 0),
+                            observed.size() * sizeof(observed[0]), device.ordinal, stream) &&
+                            gpu.synchronizeStreamChecked(stream), "projection timed useful-extent observation");
+                        for (int slot = 0; slot < rows * top_k; ++slot)
+                        {
+                            const auto *owner = initial_owners.ownerFor(0, static_cast<int>(ids[slot]));
+                            require(owner != nullptr, "projection timed route has no original owner");
+                            useful[owner->owner_participant] += maximum_layout.compactRecordWords() * sizeof(std::uint32_t);
+                        }
+                        require(observed == useful, "projection timed exchange sent capacity or wrong owner payload");
+                    }
                     for (std::size_t i = 0; i < actual.size(); ++i)
                         require(std::isfinite(actual[i]) && std::bit_cast<uint32_t>(actual[i]) == std::bit_cast<uint32_t>(reference[i]),
                             "projection timed replay byte mismatch");
@@ -900,27 +1325,45 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
 
 } // namespace
 
-void runProjectionPipelineFixture(DeviceId first, int participants,
+/** @brief Execute the declared graph on the original rank-local physical cohort. */
+void runProjectionPipelineFixtureOnCohort(const std::vector<DeviceId> &selected,
     const ProjectionPipelineFixtureConfig &config, ProjectionPipelineTiming *timing)
 {
+    require(selected.size() >= 2 && selected.size() <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "projection fixture requires a representable original participant cohort");
+    const auto first = selected.front();
+    const int participants = static_cast<int>(selected.size());
     require(participants >= 2 && !config.rows.empty() &&
         std::all_of(config.rows.begin(), config.rows.end(), [](int rows) { return rows > 0; }) &&
         config.geometry.experts >= config.geometry.top_k && config.geometry.top_k > 0 &&
         *std::max_element(config.rows.begin(), config.rows.end()) <=
             std::numeric_limits<int>::max() / config.geometry.top_k &&
         config.geometry.width > 0 && config.geometry.width % participants == 0 &&
+        (config.participant_order == ProjectionParticipantOrder::Reversed ||
+            config.participant_order == ProjectionParticipantOrder::Ordinal) &&
         config.geometry.intermediate > 0 && config.timing_warmups >= 0 && config.timing_samples >= 0 &&
         (config.output == ProjectionOutputProof::RoutedOnly ||
             (config.timing_samples == 0 && config.history == ProjectionHistoryProof::Disabled)) &&
         ((timing != nullptr) == (config.timing_samples > 0)) &&
         (!timing || (config.rows.size() == 1 && !config.format.empty())), "projection fixture configuration");
+    // MPI GTest main owns MPI_Init, but raw backend/context acquisition does
+    // not publish physical CPU inventory. Retain the original canonical
+    // discovery once for every transport before synthesis consumes that budget.
+    // Existing startup policy owns vendor visibility; do not rediscover devices
+    // or call DeviceManager::initialize again when the observation already exists.
+    const auto mpi = MPIContextFactory::global();
+    const auto inventory = mpi->clusterInventory();
+    require(bool(inventory), "projection fixture requires original rank inventory");
+    const auto &rank = inventory->ranks.at(mpi->rank());
     auto *backend = getBackendFor(first);
     ASSERT_NE(backend, nullptr); ASSERT_GE(backend->deviceCount(), participants);
     std::vector<DeviceId> devices;
     std::vector<GlobalDeviceAddress> addresses;
-    for (int ordinal = participants - 1; ordinal >= 0; --ordinal)
+    for (int member = 0; member < participants; ++member)
     {
-        devices.push_back(first.is_cuda() ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal));
+        const int index = config.participant_order == ProjectionParticipantOrder::Ordinal
+            ? member : participants - 1 - member;
+        devices.push_back(selected.at(index));
         addresses.push_back(GlobalDeviceAddress::fromLocalDeviceId(devices.back()));
     }
     auto tp = createLocalTPContext(addresses, {},
@@ -929,23 +1372,19 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
     std::shared_ptr<PhysicalMemoryAuthority> transport_authority;
     if (config.exchange == ProjectionExchangeProof::DeviceCounted)
     {
-        const auto mpi = MPIContextFactory::global();
-        const auto inventory = mpi->clusterInventory();
-        require(bool(inventory), "projection counted transport inventory");
-        const auto &rank = inventory->ranks.at(mpi->rank());
-        const auto coverage = localTPPeerAccessCoverage(rank, devices);
-        require(coverage == PeerAccessCoverage::None, "projection counted fixture must not bypass enabled native P2P");
+        const auto topology = DeviceCountedAllGatherTopology::resolve(rank, devices);
         const MoEGroupedIntermediateLayout maximum{MoEGroupedIntermediateEncoding::FP32,
             static_cast<std::uint32_t>(config.geometry.intermediate),
             static_cast<std::uint32_t>(*std::max_element(config.rows.begin(), config.rows.end()) * config.geometry.top_k),
             static_cast<std::uint32_t>(participants)};
         const auto capacity = maximum.compactCapacityBytes();
-        const auto memory = DeviceCountedAllGather::memoryFor(participants, capacity);
         PhysicalMemoryPlanBuilder bom;
-        bom.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
-            memory.host_bytes * participants);
-        for (auto device : devices) bom.add(planningObservedResource(rank, device),
-            PhysicalMemoryOwner::ActivationTransportStaging, memory.device_bytes);
+        for (std::size_t member = 0; member < devices.size(); ++member)
+        {
+            const auto memory = topology.memoryFor(member, capacity);
+            bom.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging, memory.host_bytes);
+            bom.add(planningObservedResource(rank, devices[member]), PhysicalMemoryOwner::ActivationTransportStaging, memory.device_bytes);
+        }
         transport_authority = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bom.build()), rank.rank);
         std::vector<void *> streams(devices.size());
@@ -954,8 +1393,13 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
             auto &worker = GPUDeviceContextPool::instance().getContext(devices[i]);
             worker.submitAndWait([&] { streams[i] = worker.getOrCreateAuxiliaryStream("projection_counted_setup"); });
         }
-        tp->installDeviceCountedAllGather(DeviceCountedAllGather::create(*transport_authority,
-            DeviceId::cpu(), devices, streams, coverage, capacity));
+        const auto fabric = DeviceCountedAllGather::create(*transport_authority, *tp,
+            DeviceId::cpu(), topology, streams, capacity);
+        for (std::size_t from = 0; from < devices.size(); ++from)
+            for (std::size_t to = 0; to < devices.size(); ++to)
+                if (from != to) require(fabric->payloadStorage(from, to) == topology.payloadStorage(from, to),
+                    "Projection actual counted payload storage differs from original peer route");
+        tp->installDeviceCountedAllGather(fabric);
     }
     std::barrier rendezvous(participants);
     std::vector<std::exception_ptr> errors(participants);
@@ -965,16 +1409,29 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
     if (!config.format.empty())
         std::erase_if(selected_formats, [&](const Format &format) { return format.name != config.format; });
     require(!selected_formats.empty(), "projection fixture format is not supported");
-    for (int participant = 0; participant < participants; ++participant)
-        threads[participant] = std::thread([&, participant] {
-            try { for (const auto &format : selected_formats)
-                proveFormat(devices[participant], participant, *tp, rendezvous, format, config,
-                    candidate_times[participant], oracle_times[participant]); }
-            catch (...) { errors[participant] = std::current_exception(); tp->requestAbort(); rendezvous.arrive_and_drop(); }
-        });
-    for (auto &thread : threads) thread.join();
-    for (const auto &error : errors) if (error)
-        try { std::rethrow_exception(error); } catch (const std::exception &failure) { ADD_FAILURE() << failure.what(); }
+    for (const auto &format : selected_formats)
+    {
+        // Complete CPU synthesis before GPU workers enter collective preparation.
+        // Original tensors remain independent for each endpoint; local vectors
+        // retain them until every worker and its prepared source owner retires.
+        const auto originals = synthesizeOriginalSources(format, config, participants);
+        std::fill(errors.begin(), errors.end(), std::exception_ptr{});
+        for (int participant = 0; participant < participants; ++participant)
+            threads[participant] = std::thread([&, participant] {
+                try { proveFormat(devices[participant], participant, *tp, rendezvous, format, config,
+                    originals[participant], candidate_times[participant], oracle_times[participant]); }
+                catch (...) { errors[participant] = std::current_exception(); tp->requestAbort(); rendezvous.arrive_and_drop(); }
+            });
+        for (auto &thread : threads) thread.join();
+        bool failed = false;
+        for (const auto &error : errors) if (error)
+        {
+            failed = true;
+            try { std::rethrow_exception(error); }
+            catch (const std::exception &failure) { ADD_FAILURE() << failure.what(); }
+        }
+        if (failed) return; // An aborted communicator/barrier cannot admit another source family.
+    }
     if (timing && !::testing::Test::HasFailure())
     {
         // GPUs overlap: adding participant intervals would double count work.
@@ -993,7 +1450,17 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
         std::sort(critical.begin(), critical.end());
         std::sort(oracle_critical.begin(), oracle_critical.end());
         *timing = {critical[critical.size() / 2], critical[critical.size() / 10],
-            critical[critical.size() * 9 / 10], oracle_critical[oracle_critical.size() / 2]};
+            critical[critical.size() * 9 / 10], oracle_critical[oracle_critical.size() / 2],
+            config.exchange == ProjectionExchangeProof::DeviceCounted};
     }
+}
+/** @brief Select actual original ownership before constructing native graph participants. */
+void runProjectionPipelineFixture(DeviceId first, int participants,
+    const ProjectionPipelineFixtureConfig &config, ProjectionPipelineTiming *timing)
+{
+    require(participants >= 2, "projection fixture participant count");
+    originalRankLocalReplay(first.type, static_cast<size_t>(participants), [&](const auto &selected) {
+        runProjectionPipelineFixtureOnCohort(selected, config, timing);
+    });
 }
 } // namespace llaminar2::test

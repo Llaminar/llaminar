@@ -140,10 +140,22 @@ def audit_rocm_object(path: Path, llvm_bin: Path) -> list[KernelSpills]:
                         for obj in notes for section in obj.get("NoteSections", [])
                         for note in section["NoteSection"]["Notes"]
                         if "AMDGPU Metadata" in note]
-            if len(metadata) != 1:
-                raise SpillGuardError(f"{target}: missing unique final AMDGPU metadata")
-            for kernel in parse_metadata(metadata[0]):
-                kernels.append(kernel)
+            if not metadata:
+                raise SpillGuardError(f"{target}: missing final AMDGPU metadata")
+            # Device LTO emits one metadata note per backend partition. Every
+            # partition is final allocation evidence; selecting the first note
+            # loses kernels. Names must be unique within this target, even if
+            # repeated records happen to agree. Distinct targets may legitimately
+            # repeat a name and still require their own allocation observations.
+            names: set[str] = set()
+            for partition in metadata:
+                if not isinstance(partition, str):
+                    raise SpillGuardError(f"{target}: malformed final AMDGPU metadata partition")
+                for kernel in parse_metadata(partition):
+                    if kernel.name in names:
+                        raise SpillGuardError(f"{target}: duplicate final kernel metadata: {kernel.name}")
+                    names.add(kernel.name)
+                    kernels.append(kernel)
     return kernels
 
 
@@ -263,20 +275,29 @@ def audit_device_allocations(functions: dict[str, FunctionAllocation],
 def preserve_device_diagnostics(command: list[str]) -> list[str]:
     """Keep device-only code-generation flags intact through ccache.
 
-    ccache classifies -Xarch_* as preprocessing-only and can silently remove the
-    pair from the real compiler invocation. Its documented per-argument escape
-    preserves both the selector and diagnostic flag in compilation and cache
-    identity. Direct compiler invocations need no ccache-specific arguments.
+    ccache classifies device/linker selectors as preprocessing/link-only and can
+    remove the pair from the real compiler invocation. Final LTO remarks must
+    retain their direct stdout routing as well as frontend diagnostic flags.
+    ccache's documented per-argument escape preserves the selector and payload
+    in compilation and cache identity. Direct invocations need no cache escape.
+
+    :param command: Original compiler/cache argv, without shell interpretation.
+    :return: Equivalent argv with opaque device diagnostic arguments retained.
     """
     if not any(Path(argument).name == "ccache" for argument in command):
         return command
     result: list[str] = []
+    operand = False
     for argument in command:
-        if argument == "-Xarch_device" or argument.startswith(
+        selector = argument in ("-Xarch_device", "-Xoffload-linker")
+        if operand or selector or argument.startswith(
                 ("-fsave-optimization-record=", "-foptimization-record-",
-                 "-Rpass-analysis=stack-frame-layout", "-mllvm=")):
+                 "-Rpass-analysis=stack-frame-layout", "-mllvm=", "-plugin-opt=opt-remarks-filename=")):
             result.append("--ccache-skip")
         result.append(argument)
+        # A retained selector must retain its complete operand, even when a
+        # caller adds another legitimate device option beside our diagnostics.
+        operand = selector
     return result
 
 

@@ -18,6 +18,7 @@
 #include "config/OrchestrationConfig.h"
 #include "backends/GlobalDeviceAddress.h"
 #include <algorithm>
+#include <limits>
 
 using namespace llaminar2;
 
@@ -828,4 +829,47 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
     }
     EXPECT_TRUE(found_overlay_conflict) << "Expected exact overlay root placement conflict; first error: "
                                         << (errors.empty() ? "<none>" : errors.front());
+}
+
+/** @test Typed callers receive the same bounded ngram policy gate as CLI/document parsing. */
+TEST(Test__ConfigValidator, NgramStoragePolicyRejectsInvalidTypedValues)
+{
+    const auto validator = ConfigValidator::createStandard();
+    OrchestrationConfig config;
+    for (const auto policy : {
+        ImmutableRowTablePolicy{ImmutableRowStoragePreference::MemoryMapped, 1, 2},
+        ImmutableRowTablePolicy{ImmutableRowStoragePreference::MemoryMapped, 65536, 0},
+        ImmutableRowTablePolicy{static_cast<ImmutableRowStoragePreference>(255), 65536, 1},
+        ImmutableRowTablePolicy{ImmutableRowStoragePreference::MemoryMapped, 65536, std::numeric_limits<std::size_t>::max()},
+    })
+    {
+        config.ngram_table_policy = policy;
+        const auto errors = validator.validate(config);
+        EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &error) {
+            return error.rule_id == "ngram-storage-policy";
+        }));
+    }
+    config.ngram_table_policy = {};
+    EXPECT_TRUE(validator.validate(config).empty());
+}
+
+/** @test Explicit adaptive RAM/SSD permits zero capacity and rejects conflicting or unbounded typed policy arms. */
+TEST(Test__ConfigValidator, NgramHostAdaptiveRamSsdTypedPolicyIsBoundedAndExplicit)
+{
+    const auto validator=ConfigValidator::createStandard();OrchestrationConfig c;
+    c.ngram_table_policy.storage=ImmutableRowStoragePreference::HostAdaptiveRAMSSD;
+    EXPECT_TRUE(validator.validate(c).empty());
+    c.ngram_table_policy.host_adaptive={64,1u<<20,{}};EXPECT_TRUE(validator.validate(c).empty());
+    const auto valid=c.ngram_table_policy;
+    for(int mutation=0;mutation<5;++mutation)
+    {
+        c.ngram_table_policy=valid;
+        if(mutation==0)c.ngram_table_policy.storage=ImmutableRowStoragePreference::Automatic;
+        if(mutation==1)c.ngram_table_policy.host_adaptive.maximum_cache_rows=std::numeric_limits<std::uint32_t>::max();
+        if(mutation==2)c.ngram_table_policy.host_adaptive.policy.aging_accesses=0;
+        if(mutation==3)c.ngram_table_policy.host_adaptive.policy.protected_denominator=0;
+        if(mutation==4)c.ngram_table_policy.host_adaptive.policy.protected_numerator=5;
+        const auto errors=validator.validate(c);
+        EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto &e){return e.rule_id=="ngram-storage-policy";}))<<mutation;
+    }
 }

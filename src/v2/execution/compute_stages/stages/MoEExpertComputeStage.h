@@ -12,12 +12,16 @@
  */
 
 #pragma once
+#include "../../../loaders/ExpertGemmRegistry.h"
+#include "../../moe/MoEOverlayParticipantResidency.h"
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "MoEOverlayPinnedRouteEvidenceViews.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
+#include "../../../memory/CPUGroupedMoEStorageLayout.h"
+#include "../../../memory/CPUGroupedMoEStorageBacking.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../loaders/WeightPlan.h"
 #include "../../../loaders/ExpertSlabTypes.h"
@@ -39,6 +43,13 @@
 
 namespace llaminar2
 {
+    /** @brief Immutable diagnostic ownership of an expert stage's canonical route bank. */
+    enum class MoECanonicalRouteDiagnosticPublication : std::uint8_t
+    {
+        CompleteBank, ///< Existing canonical producer surface for ordinary/native compute.
+        ContinuationLocalBank, ///< Heterogeneous continuation routes before remote ingress/join.
+    };
+
 
     // Forward declarations
     class ITensorGemm;
@@ -69,6 +80,8 @@ namespace llaminar2
     class CPUGroupedMoESerialWorkspace final
     {
     public:
+        /** @brief Standalone root declaration shared with topology/BOM planning. */
+        using StorageLayout = CPUGroupedMoEStorageLayout;
         /** @brief Complete immutable capacity contract. */
         struct Config
         {
@@ -78,7 +91,19 @@ namespace llaminar2
             int num_experts = 0; ///< Logical expert-table width.
             int routing_top_k = 0; ///< Maximum routes admitted per row.
             std::string debug_name; ///< Stable diagnostics identity.
+            DeviceId device_id = DeviceId::invalid(); ///< Exact admitted CPU allocator.
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority; ///< Sole root issuer.
+            /** @brief Exact enclosing serial declaration, authenticated before materialization. */
+            std::shared_ptr<const StorageLayout> declared_storage;
         };
+
+        /** @brief Declare all physical roots from one exact execution configuration.
+         * @param config Complete serial geometry and exact CPU allocator.
+         * @return Allocation-free layout used by admission and materialization.
+         * @throws std::invalid_argument For incomplete geometry or allocator identity.
+         * @throws std::overflow_error For unrepresentable extents.
+         */
+        [[nodiscard]] static StorageLayout storageLayout(const Config &config);
 
         /** @brief Exclusive invocation lease for one serial participant stage. */
         class InvocationLease final
@@ -110,9 +135,9 @@ namespace llaminar2
         ~CPUGroupedMoESerialWorkspace();
 
         /**
-         * @brief Price the exact payload allocated by this workspace before construction.
+         * @brief Price all exact physical roots before construction.
          * @param config Same immutable geometry consumed by the constructor.
-         * @return FP32, Q8 and kernel-publication bytes, without allocating anything.
+         * @return Rounded FP32, Q8 and kernel-publication roots, without allocation.
          * @throws std::invalid_argument for incomplete geometry.
          * @throws std::overflow_error for unrepresentable row or byte counts.
          */
@@ -144,7 +169,7 @@ namespace llaminar2
             int num_experts,
             int layer_idx);
 
-        /** @brief Return all setup-owned payload bytes. */
+        /** @brief Return all setup-owned physical backing bytes. */
         [[nodiscard]] size_t allocationBytes() const noexcept
         {
             return allocation_bytes_;
@@ -163,13 +188,7 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         std::atomic_flag invocation_active_ = ATOMIC_FLAG_INIT;
 
-        std::shared_ptr<FP32Tensor> scratch_batch_;
-        std::shared_ptr<FP32Tensor> scratch_gate_;
-        std::shared_ptr<FP32Tensor> scratch_up_;
-        std::shared_ptr<FP32Tensor> scratch_out_;
-        std::vector<Q8_1Block> router_q8_;
-        std::vector<Q8_1Block> swiglu_q8_;
-        std::vector<float> route_outputs_;
+        std::shared_ptr<CPUGroupedMoEStorageBacking> backing_; ///< Same eight-root owner used by ordinary workspace domains.
         std::unique_ptr<IMoEKernel> moe_kernel_;
     };
 
@@ -213,7 +232,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Select the authority that publishes CPU NativeVNNI input rows.
+     * @brief Select the authority that publishes CPU NativeQuantised input rows.
      *
      * Ordinary CPU graphs require the immediately preceding CPU router to own
      * the canonical Q8_1 publication. A heterogeneous ExpertOverlay participant
@@ -225,21 +244,6 @@ namespace llaminar2
     {
         RequireRouterStage = 0,
         PublishTransportedRows = 1,
-    };
-
-    /**
-     * @brief Select the sole graph-build authority for routed-expert weights.
-     *
-     * Ordinary standalone graphs may prepare engines from their bound raw
-     * three-dimensional parent tensors. ExpertOverlay graphs instead receive
-     * participant-scoped engines from @ref ExpertGemmRegistry; consulting a
-     * generic raw-parent binding there can select another participant's packed
-     * slice when CPU and GPU tiers share a model layer.
-     */
-    enum class MoEExpertWeightResolutionPolicy : uint8_t
-    {
-        RawOrPrepared = 0,
-        PreparedRegistryOnly = 1,
     };
 
     /**
@@ -295,11 +299,11 @@ namespace llaminar2
             std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner;
 
             /**
-             * @brief Authority for the CPU NativeVNNI hidden-row publication.
+             * @brief Authority for the CPU NativeQuantised hidden-row publication.
              *
              * Graph-native heterogeneous local-expert stages set
              * PublishTransportedRows after compact ticket dispatch. Both the
-             * serial one-row and grouped-row NativeVNNI paths publish the
+             * serial one-row and grouped-row NativeQuantised paths publish the
              * transported bytes before consuming them. Every ordinary CPU
              * graph retains RequireRouterStage and fails if its router/expert
              * publication edge is missing.
@@ -331,6 +335,9 @@ namespace llaminar2
              * expert. This makes an ExpertOverlay graph unable to fall back to
              * a coincidentally bound slice owned by another tier participant.
              */
+            /** @brief Exact persistent owner from the graph's immutable weight plan. */
+            PhysicalMemoryOwner persistent_weight_owner = PhysicalMemoryOwner::Count;
+
             MoEExpertWeightResolutionPolicy expert_weight_resolution_policy =
                 MoEExpertWeightResolutionPolicy::RawOrPrepared;
 
@@ -417,6 +424,8 @@ namespace llaminar2
             // owned_kernels keeps MoE batch-constructed kernels alive,
             // packed_*_lifetime keeps the shared GPU allocation alive.
             std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
+            /** Original selected source triplets and native engines; never a whole-owner alias. */
+            std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
             std::shared_ptr<void> moe_packed_down_lifetime;
@@ -519,6 +528,10 @@ namespace llaminar2
              * own the globally ordered fold.
              */
             TensorBase *canonical_route_contributions = nullptr;
+
+            /** Frozen producer identity; never infer completeness from shape, M, or current masks. */
+            MoECanonicalRouteDiagnosticPublication canonical_route_diagnostic_publication =
+                MoECanonicalRouteDiagnosticPublication::CompleteBank;
 
             /** Arithmetic represented by each canonical route slot. */
             MoECanonicalRouteArithmeticPolicy canonical_route_arithmetic =
@@ -765,6 +778,8 @@ namespace llaminar2
             std::span<ITensorGemm *const> down_engines;     ///< Global-id-indexed down engines.
             /** Exact CPU-only hidden rows borrowed for this host packet. */
             CPUTransportedHiddenRows cpu_transported_hidden;
+            /** Exact acquired fixed-family CPU fragment epoch; copied as an RCU reader until GEMM completes. */
+            const MoEOverlayParticipantResidencyRegistry::CPUJointLayer* cpu_joint_epoch=nullptr;
         };
 
         /**
@@ -784,6 +799,23 @@ namespace llaminar2
         bool bindSparseOverlayInvocation(
             const SparseOverlayInvocation &invocation);
 
+        /**
+         * @brief Borrow the completed CPU invocation's sorted unique expert IDs.
+         * @return Empty before completion, after reset/failure/empty work, and on GPU.
+         * The existing CPU route schedule owns the storage. The view is valid only
+         * until the next bind, execute or reset; it never owns residency or kernels.
+         */
+        std::span<const int> completedCPUActiveExpertIds() const noexcept
+        {
+            return cpu_active_expert_view_published_
+                ? std::span<const int>(cpu_grouped_active_experts_) : std::span<const int>{};
+        }
+        /** @brief Revoke only the last completed observation before packet reuse. */
+        void clearCompletedCPUActiveExpertView() noexcept
+        {
+            cpu_active_expert_view_published_ = false;
+            cpu_grouped_active_experts_.clear();
+        }
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
@@ -917,6 +949,49 @@ namespace llaminar2
         {
             return params_.moe_runtime_table;
         }
+        /**
+         * @brief Read-only witness of one graph-frozen native expert source.
+         *
+         * Construction regressions compare these const engine identities with
+         * the admitted registry and retained RCU bank. This value grants no
+         * parameter mutation, ownership publication or executable capability.
+         */
+        struct NativePreparedExpertObservation
+        {
+            MoEExpertWeightResolutionPolicy resolution;
+            int participant_count;
+            const int32_t *live_rows;
+            bool has_raw_parents;
+            bool explicit_owner_metadata;
+            const ITensorGemm *gate;
+            const ITensorGemm *up;
+            const ITensorGemm *down;
+        };
+
+        /**
+         * @brief Observe immutable source/count bindings for one logical expert.
+         * @param expert Zero-based logical expert in the complete prepared table.
+         * @return Const source identities and graph-frozen native metadata.
+         * @throws std::out_of_range For an absent or incomplete prepared row.
+         */
+        [[nodiscard]] NativePreparedExpertObservation
+        nativePreparedExpertObservationForTesting(int expert) const
+        {
+            if (expert < 0 || expert >= params_.num_experts ||
+                static_cast<std::size_t>(expert) >= params_.prepared_gate_gemm.size() ||
+                static_cast<std::size_t>(expert) >= params_.prepared_up_gemm.size() ||
+                static_cast<std::size_t>(expert) >= params_.prepared_down_gemm.size())
+                throw std::out_of_range("Native prepared-expert observation has no complete row");
+            return {.resolution = params_.expert_weight_resolution_policy,
+                .participant_count = params_.participant_count,
+                .live_rows = params_.active_row_count_device,
+                .has_raw_parents = params_.gate_exps || params_.up_exps || params_.down_exps,
+                .explicit_owner_metadata = params_.runtime_decode_has_explicit_owner_metadata,
+                .gate = params_.prepared_gate_gemm[expert],
+                .up = params_.prepared_up_gemm[expert],
+                .down = params_.prepared_down_gemm[expert]};
+        }
+
         bool hasPrefillLLEPTPContextForTesting() const { return params_.prefill_llep_tp_ctx != nullptr; }
         bool usesGraphPhasedCurrentBatchLLEPForTesting() const
         {
@@ -1149,6 +1224,7 @@ namespace llaminar2
          */
         void resetSessionState() override
         {
+            clearCompletedCPUActiveExpertView();
             IComputeStage::resetSessionState();
             runtime_grouped_decode_launch_state_prepared_ = false;
         }
@@ -1166,6 +1242,7 @@ namespace llaminar2
          */
         void invalidateKernelDynamicState() override
         {
+            clearCompletedCPUActiveExpertView();
             IMoEKernel *kernel =
                 params_.routed_pipeline_kernel_owner &&
                         params_.routed_pipeline_kernel_owner->kernel
@@ -1181,14 +1258,14 @@ namespace llaminar2
             grouped_gateup_desc_table_d_model_ = 0;
             grouped_gateup_desc_table_intermediate_ = 0;
             grouped_gateup_desc_table_weight_format_ =
-                DeviceMoEWeightFormat::NativeVNNI;
+                DeviceMoEWeightFormat::NativeQuantised;
             grouped_gateup_desc_table_dirty_ = false;
             grouped_down_desc_table_id_ = -1;
             grouped_down_desc_table_num_experts_ = 0;
             grouped_down_desc_table_d_model_ = 0;
             grouped_down_desc_table_intermediate_ = 0;
             grouped_down_desc_table_weight_format_ =
-                DeviceMoEWeightFormat::NativeVNNI;
+                DeviceMoEWeightFormat::NativeQuantised;
             grouped_down_desc_table_dirty_ = false;
             combined_shared_gateup_desc_table_id_ = -1;
             combined_shared_gateup_desc_table_d_model_ = 0;
@@ -1216,6 +1293,7 @@ namespace llaminar2
          */
         void resetSessionStatePreservingCapturedReplay() override
         {
+            clearCompletedCPUActiveExpertView();
             IComputeStage::resetSessionState();
         }
         StageBufferRequirements getBufferRequirements() const override;
@@ -1436,6 +1514,12 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Clear invocation-owned engine indexes before releasing their exact RCU reader.
+         * @note Packet-published tables clear on normal return and exceptions. Explicit complete-bank
+         * construction retains its original source-bound table contract. No allocation or publication.
+         */
+        void releaseCPUJointInvocation() noexcept;
+
         /**
          * @brief Query the already-selected weight-descriptor authority.
          * @return True only for request-pinned runtime placement descriptors.
@@ -1497,6 +1581,13 @@ namespace llaminar2
 
         Params params_;
         bool raw_weights_released_ = false;                       ///< Set by releaseRawExpertWeights()
+        /**
+         * @brief Bind immutable CPU payload roots and setup-only decode views.
+         * @param backing Exact finalized serial or exclusive workspace owner.
+         * @throws std::logic_error If geometry or publication storage is absent.
+         */
+        void bindCPUGroupedStorage(std::shared_ptr<CPUGroupedMoEStorageBacking> backing);
+        std::shared_ptr<CPUGroupedMoEStorageBacking> cpu_grouped_backing_; ///< Frozen workspace owner, never allocated by execution.
         DeviceWorkspaceManager *bound_workspace_ = nullptr;       ///< Workspace for expert GEMM engines
         ExpertWeightPayloadProvider *payload_provider_ = nullptr; ///< Model-context owned
 
@@ -1505,21 +1596,8 @@ namespace llaminar2
         mutable std::vector<ITensorGemm *> cached_up_gemm_;
         mutable std::vector<ITensorGemm *> cached_down_gemm_;
 
-        /**
-         * @brief Reusable host scratch for CPU routed-expert execution.
-         *
-         * Fixed-M verifier stages bind their complete bounded capacity during
-         * construction. Heterogeneous CPU ExpertOverlay stages instead borrow
-         * @ref CPUGroupedMoESerialWorkspace across mutually exclusive layers
-         * and graph roles. Ordinary standalone large-prefill stages retain
-         * these private grow-only buffers because they have no serial overlay
-         * ownership contract to authorize cross-layer aliasing.
-         */
-        mutable std::shared_ptr<FP32Tensor> scratch_batch_;
-        mutable std::shared_ptr<FP32Tensor> scratch_gate_;
-        mutable std::shared_ptr<FP32Tensor> scratch_up_;
+        /// First output row aliases the declared output root for serial decode.
         mutable std::shared_ptr<FP32Tensor> scratch_out_;
-        mutable int scratch_capacity_ = 0;
 
         /// Batched gate+up scratch buffers for M=1 decode (one per top-k expert).
         /// Enables fusing all experts' gate+up into a single OMP region.
@@ -1530,7 +1608,7 @@ namespace llaminar2
         mutable std::vector<std::shared_ptr<FP32Tensor>> scratch_down_batch_;
 
         /// Per-expert SwiGLU scratch buffers for fused Phase 2.
-        mutable std::vector<std::vector<float>> swiglu_scratch_batch_;
+        mutable std::vector<std::span<float>> swiglu_scratch_batch_;
 
         /// Reusable projection descriptor vector (avoids per-call heap alloc)
         mutable std::vector<ITensorGemm::TensorProjectionDesc> batch_projections_;
@@ -1556,7 +1634,7 @@ namespace llaminar2
         /**
          * @brief Local logical slot to its expert-major output row.
          *
-         * NativeVNNI computes every active expert into one contiguous
+         * NativeQuantised computes every active expert into one contiguous
          * expert-major layer buffer. This inverse map lets the final
          * row-owned accumulation restore original router order without an
          * intermediate output copy.
@@ -1565,6 +1643,8 @@ namespace llaminar2
 
         /** @brief Ascending IDs of experts with at least one local route row. */
         mutable std::vector<int> cpu_grouped_active_experts_;
+        /** Completed-call observation validity; never a topology/execution decision. */
+        bool cpu_active_expert_view_published_ = false;
 
         /** @brief Gather indices reused for each complete expert batch. */
         mutable std::vector<int> cpu_grouped_token_indices_;
@@ -1577,15 +1657,6 @@ namespace llaminar2
 
         /** Compact CPU execution row to borrowed physical source-row index. */
         std::vector<int> sparse_overlay_cpu_compact_to_source_row_;
-
-        /** @brief Canonical router-Q8 rows gathered in expert-major layer order. */
-        mutable std::vector<Q8_1Block> cpu_grouped_router_q8_;
-
-        /** @brief Pre-quantized SwiGLU rows for the batched expert down phase. */
-        mutable std::vector<Q8_1Block> cpu_grouped_swiglu_q8_;
-
-        /** @brief Floating-format expert outputs indexed by local logical route slot. */
-        mutable std::vector<float> cpu_grouped_route_outputs_;
 
         /** @brief Per-expert route counts used only while PerfStats is enabled. */
         mutable std::vector<uint32_t> cpu_grouped_routed_rows_by_expert_;
@@ -1638,8 +1709,11 @@ namespace llaminar2
             MoEOverlayServicePhaseHint::Auto;
         /** Maximum compact route width certified before any host rebind. */
         int sparse_overlay_route_width_capacity_ = 0;
+        int cpu_workspace_row_capacity_ = 0; ///< Original setup envelope, independent of smaller packet publications.
         /** @brief Residency generation currently certified by the bound tables. */
         uint64_t sparse_overlay_engine_binding_generation_ = 0;
+        MoEOverlayParticipantBankLease cpu_joint_invocation_bank_; ///< One execute-scoped reader, never an idle bank cache.
+
         /**
          * @brief Whether the next sparse replay must republish placement metadata.
          *
@@ -1701,7 +1775,7 @@ namespace llaminar2
          *
          * The executor builds a flat CSR schedule without per-expert heap
          * objects, consumes the router's canonical Q8 publication for every
-         * NativeVNNI expert bundle, and invokes one runtime-M gate/up and down
+         * NativeQuantised expert bundle, and invokes one runtime-M gate/up and down
          * operation per active expert.  Expert outputs remain separate until
          * they are accumulated in original row/top-k order, so ordinary
          * prefill and MTP verification are both serial-row byte-equivalent.
@@ -1899,6 +1973,22 @@ namespace llaminar2
         const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;
         bool runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const;
         void ensureScratchBuffers(int max_batch) const;
+        /**
+         * @brief Acquire the existing graph-owned kernel object without stream binding.
+         * @return Borrowed kernel, or null if construction fails.
+         *
+         * Accepted-state preparation calls this before native capture. Object
+         * ownership is independent of the verifier compute stream; no model
+         * arithmetic, workspace rebinding or stream substitution occurs here.
+         */
+        IMoEKernel *acquireMoEKernelObject() const;
+
+        /**
+         * @brief Resolve the ordinary compute kernel and its exact stage binding.
+         * @return Graph-owned kernel bound to this stage's compute stream/workspace.
+         * Histogram publication instead uses the prepared object and its explicit
+         * table-owned MoEKernelLaunchContext, never this compute-stream boundary.
+         */
         IMoEKernel *ensureMoEKernel() const;
 
         mutable int grouped_gateup_desc_table_id_ = -1;
@@ -1906,7 +1996,7 @@ namespace llaminar2
         mutable int grouped_gateup_desc_table_d_model_ = 0;
         mutable int grouped_gateup_desc_table_intermediate_ = 0;
         mutable DeviceMoEWeightFormat grouped_gateup_desc_table_weight_format_ =
-            DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat::NativeQuantised;
         bool grouped_gateup_desc_table_dirty_ = false;
 
         mutable int grouped_down_desc_table_id_ = -1;
@@ -1914,7 +2004,7 @@ namespace llaminar2
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
         mutable DeviceMoEWeightFormat grouped_down_desc_table_weight_format_ =
-            DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat::NativeQuantised;
         bool grouped_down_desc_table_dirty_ = false;
 
         mutable int combined_shared_desc_table_d_model_ = 0;
@@ -2213,7 +2303,7 @@ namespace llaminar2
          * @brief Publish the one-entry typed gate/up table used by grouped decode.
          *
          * The prepared gate, up, and down engines are validated as one uniform
-         * NativeVNNI or FP16/BF16/FP32 family before the backend receives any
+         * NativeQuantised or FP16/BF16/FP32 family before the backend receives any
          * descriptor. The backend owns the resulting graph-stable table.
          *
          * @param kernel Exact-stream-bound backend MoE kernel.

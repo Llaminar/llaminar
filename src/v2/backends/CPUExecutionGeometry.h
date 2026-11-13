@@ -34,7 +34,7 @@ namespace llaminar2
     {
         CPUCacheGeometry cache;
         std::uint32_t maximum_native_row_tile = 0; ///< Two for AVX2, four for AVX512.
-        /** @return Whether NativeVNNI can price and execute this exact observation. */
+        /** @return Whether NativeQuantised can price and execute this exact observation. */
         constexpr bool isValid() const noexcept
         {
             return cache.isValid() && (maximum_native_row_tile == 2 || maximum_native_row_tile == 4);
@@ -46,7 +46,7 @@ namespace llaminar2
          * @return Real CPUID cache dimensions and selected ISA; unknown fields stay zero.
          *
          * Detection is cached once, before execution. Unsupported/incomplete
-         * NativeVNNI geometry is rejected by its requirement/dispatch boundary;
+         * NativeQuantised geometry is rejected by its requirement/dispatch boundary;
          * discovery must not fabricate cache sizes or exclude floating work.
          */
         static const CPUExecutionGeometry &local();

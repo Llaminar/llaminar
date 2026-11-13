@@ -4,7 +4,8 @@
  *
  * **Purpose**: Public interface for CUDA backend. Implementation lives in .cu file
  * to avoid exposing cuda_runtime.h to other compilation units.
- * Exact native-context storage is prepared through a reversible cold footprint
+ * Original source workers provision a fixed native-program stack inside their opaque
+ * commitment at birth. Ordinary native-context storage uses a reversible cold footprint
  * probe and admitted by PhysicalMemoryAuthority. Its leases have primary-context
  * lifetime, separately from model allocations and graph executables; only a
  * successful exclusive native reset publishes their retirement.
@@ -13,6 +14,7 @@
  */
 
 #pragma once
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "../IBackend.h"
 #include <cstdint>
@@ -35,6 +37,12 @@ namespace llaminar2
     class CUDABackend : public IBackend
     {
     public:
+        /** @copydoc IBackend::validateNativeCountedAllGatherFrame */
+        bool validateNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            ncclLlaminarCompletionAuthority original, int device_id, void *stream) override;
+        /** @copydoc IBackend::enqueueNativeCountedAllGatherFrame */
+        bool enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing) override;
         CUDABackend();
         ~CUDABackend() override;
 
@@ -52,6 +60,9 @@ namespace llaminar2
         void destroyEvent(void *event, int device_id) override;
         bool recordEvent(void *event, int device_id, void *stream) override;
         bool waitForEvent(void *event, int device_id) override;
+        /** @copydoc IBackend::enqueueNativePipelineByteFrame */
+        bool enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+            NativePipelineByteOperation operation, int device_id, void *stream) override;
         /** @copydoc IBackend::queryEvent */
         bool queryEvent(void *event, int device_id, bool *ready) override;
         bool eventElapsedTimeMs(
@@ -62,7 +73,12 @@ namespace llaminar2
 
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
+
         void free(void *ptr, int device_id) override;
+
+        /** @copydoc IBackend::retainNativeAllocation */
+        NativeAllocationCaptureLease retainNativeAllocation(
+            const void* pointer, size_t bytes, int device_id) override;
         bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream) override;
         bool enqueuePreparePrefillChunkView(
             const void *request_token_ids_device,
@@ -72,6 +88,7 @@ namespace llaminar2
             int request_row_capacity,
             int bucket_seq_len,
             int pad_token_id,
+            bool require_exact_rows,
             int device_id,
             void *stream,
             void *out_token_ids_device,
@@ -102,7 +119,10 @@ namespace llaminar2
          * @param stream Exact non-capturing graph stream.
          * @param memory Source family authority whose outstanding demand is protected.
          *
-         * A reversible cold footprint probe supplies the physical byte count.
+         * Source-prepared workers only verify the actual captured requirement
+         * against their fixed birth capacity and original PMA. Exceeding it is a
+         * precise program-capacity error, never a new allocation or OOM estimate.
+         * For ordinary workers a reversible cold footprint probe supplies the physical byte count.
          * Its PMA lease survives graph destruction and retires only after the
          * matching native context is reset. No inferred driver allocation
          * granule, guessed safety margin, or graph allowance is used.
@@ -255,6 +275,14 @@ namespace llaminar2
             void *generated_token_counts_device,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::enqueueCommitMTPDirectTokenHistoryDevice */
+        bool enqueueCommitMTPDirectTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            void *penalty_policy_device,
+            int device_id,
+            void *stream) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
@@ -299,6 +327,24 @@ namespace llaminar2
             void *scratch_indices_device = nullptr,
             int scratch_capacity = 0,
             const void *active_rows_device = nullptr) override;
+        /** @copydoc IBackend::enqueueBuildTopKTopPDistributionsF32WithHistoryDevice */
+        bool enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            int out_stride,
+            void *out_probs_device,
+            void *scratch_values_device,
+            void *scratch_indices_device,
+            int scratch_capacity,
+            const GenerationPenaltyHistory &history) override;
         bool enqueueBuildTopKTopPProcessedLogitsF32Device(
             const void *data_device,
             int row_count,
@@ -732,6 +778,7 @@ namespace llaminar2
             void *decode_boundary_advanced_device,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata */
         bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
             const void *output_tokens_device,
             int output_token_stride,
@@ -758,7 +805,8 @@ namespace llaminar2
             void *out_next_verifier_condition_tokens_device = nullptr,
             const void *verifier_input_tokens_device = nullptr,
             int verifier_input_token_stride = 0,
-            void *out_committed_verifier_identity_device = nullptr) override;
+            void *out_committed_verifier_identity_device = nullptr,
+            sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device = nullptr) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,
@@ -788,7 +836,8 @@ namespace llaminar2
             void *stream,
             void *out_target_cached_tokens_device,
             void *out_accepted_state_counts_device,
-            void *out_ok_device) override;
+            void *out_ok_device,
+            MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly) override;
         bool enqueuePrepareSpeculativeShiftedKVTokens(
             const void *meta_device,
             int meta_stride,
@@ -952,6 +1001,14 @@ namespace llaminar2
         bool prepareMappedHostCopyKernels(int device_id) override;
         /** @copydoc IBackend::prepareCapturedTransferChannelKernels */
         bool prepareCapturedTransferChannelKernels(int device_id, int timeout_ms, std::uint64_t *timeout_ticks) override;
+        /** @copydoc IBackend::enqueueCapturedTransferChannelBatch */
+        bool enqueueCapturedTransferChannelBatch(const CapturedTransferChannelBatch &batch,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::enqueuePipelineActivationFanoutValidation */
+        bool enqueuePipelineActivationFanoutValidation(const PipelineActivationFanoutValidation &binding,
+            int device_id, void *stream) override;
+
         /** @copydoc IBackend::enqueueCapturedTransferChannel */
         bool enqueueCapturedTransferChannel(const CapturedTransferChannelDeviceBinding &binding,
             void *destination, const void *source, int device_id, void *stream) override;

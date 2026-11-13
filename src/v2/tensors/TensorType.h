@@ -7,6 +7,9 @@
  * no platform-specific code (no SIMD intrinsics, no CUDA kernels).
  */
 
+#include <optional>
+#include <string_view>
+
 namespace llaminar2
 {
 
@@ -122,15 +125,15 @@ namespace llaminar2
     }
 
     /**
-     * @brief Check if tensor type is a native-VNNI format (≤6-bit quantization)
+     * @brief Check if tensor type is a native-quantised format (≤6-bit quantization)
      *
-     * These formats use lossless native-VNNI decode with per-block FP16 scales.
+     * These formats use lossless native-quantised decode with per-block FP16 scales.
      * Other quantized types (Q8_1, Q8_K) use INT8-VNNI instead.
      *
      * @param type The tensor type enum value
-     * @return true if the format supports native-VNNI kernels
+     * @return true if the format supports native-quantised kernels
      */
-    inline bool isNativeVnniFormat(TensorType type)
+    inline bool isNativeQuantisedFormat(TensorType type)
     {
         switch (type)
         {
@@ -178,6 +181,20 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    /**
+     * @brief Decode original GGUF/profile scalar names through the canonical tensor enum.
+     * @param name Original inventory label; F32/F16 retain their GGUF aliases.
+     * @return Exact source enum, or absence for an unknown inventory label.
+     */
+    inline std::optional<TensorType> tensorTypeFromName(std::string_view name)
+    {
+        if(name=="F32")return TensorType::FP32;
+        if(name=="F16")return TensorType::FP16;
+        for(int value=0;value<=static_cast<int>(TensorType::AQ8);++value)
+            if(name==tensorTypeName(static_cast<TensorType>(value)))return static_cast<TensorType>(value);
+        return std::nullopt;
     }
 
 } // namespace llaminar2

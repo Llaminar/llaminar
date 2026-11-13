@@ -18,7 +18,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -146,7 +146,7 @@ TEST_F(Test__Q2_KTensor, QuantizedVsFP32Parity)
     // Test dimensions: M=4, N=64, K=256
     // A: FP32 activation (random values)
     // B: Q2_K weight (random data with valid scales)
-    // Compare: CPUNativeVNNIGemmKernel vs FloatingPointGemmKernel on FP32
+    // Compare: CPUNativeQuantisedGemmKernel vs FloatingPointGemmKernel on FP32
 
     int m = 4;
     int n = 64;
@@ -208,11 +208,11 @@ TEST_F(Test__Q2_KTensor, QuantizedVsFP32Parity)
     // B is [N, K], so transpose_B=true to compute A @ B^T
     fp_kernel.multiply_tensor(A_fp32.get(), C_ref.get(), m, n, k, true);
 
-    // === Test: CPUNativeVNNIGemmKernel with Q2_K weights ===
+    // === Test: CPUNativeQuantisedGemmKernel with Q2_K weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
-    cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_q2k.get());
+    cpu::native_quantised::CPUNativeQuantisedGemmKernel quant_kernel(B_q2k.get());
     llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {&quant_kernel}));
     quant_kernel.multiply_tensor(A_fp32.get(), C_quant.get(), m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
 

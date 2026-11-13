@@ -36,15 +36,15 @@ namespace llaminar2::test
             {
             }
 
-            /** @brief Construct a NativeVNNI descriptor source. */
-            explicit DescriptorGemm(DeviceNativeVNNIMatrixDesc native) noexcept
+            /** @brief Construct a NativeQuantised descriptor source. */
+            explicit DescriptorGemm(DeviceNativeQuantisedMatrixDesc native) noexcept
                 : native_(native), source_{native.source_codebook_id,
                     native.source_is_superblock != 0, native.source_identity_present != 0}, exports_native_(true)
             {
             }
 
             /** @brief Model engines may publish source provenance independently of their raw view. */
-            DescriptorGemm(DeviceNativeVNNIMatrixDesc native, NativeVnniSourceIdentity source) noexcept
+            DescriptorGemm(DeviceNativeQuantisedMatrixDesc native, NativeQuantisedSourceIdentity source) noexcept
                 : native_(native), source_(source), exports_native_(true)
             {
             }
@@ -71,13 +71,13 @@ namespace llaminar2::test
                 return false;
             }
 
-            /** @brief Export the fixture's NativeVNNI view when configured. */
-            bool exportNativeVNNIMatrixDesc(
-                DeviceNativeVNNIMatrixDesc &output) override
+            /** @brief Export the fixture's NativeQuantised view when configured. */
+            bool exportNativeQuantisedMatrixDesc(
+                DeviceNativeQuantisedMatrixDesc &output) override
             {
                 output = exports_native_
                              ? native_
-                             : DeviceNativeVNNIMatrixDesc{};
+                             : DeviceNativeQuantisedMatrixDesc{};
                 return exports_native_;
             }
 
@@ -92,15 +92,15 @@ namespace llaminar2::test
             }
 
             /** @return The exact separately prepared source identity, when available. */
-            bool exportNativeVNNISourceIdentity(NativeVnniSourceIdentity &output) const override
+            bool exportNativeQuantisedSourceIdentity(NativeQuantisedSourceIdentity &output) const override
             {
                 output = source_;
                 return source_.present;
             }
 
         private:
-            DeviceNativeVNNIMatrixDesc native_{};
-            NativeVnniSourceIdentity source_{};
+            DeviceNativeQuantisedMatrixDesc native_{};
+            NativeQuantisedSourceIdentity source_{};
             ContiguousFloatingPointWeightDescriptor floating_{};
             bool exports_native_ = false;
             bool exports_floating_ = false;
@@ -125,8 +125,8 @@ namespace llaminar2::test
             };
         }
 
-        /** @return Minimally valid NativeVNNI fixture descriptor. */
-        DeviceNativeVNNIMatrixDesc nativeDescriptor(
+        /** @return Minimally valid NativeQuantised fixture descriptor. */
+        DeviceNativeQuantisedMatrixDesc nativeDescriptor(
             const std::uint8_t *payload,
             const std::uint16_t *scales,
             int n,
@@ -314,7 +314,7 @@ namespace llaminar2::test
             descriptor));
         EXPECT_EQ(
             descriptor.weight_format,
-            DeviceMoEWeightFormat::NativeVNNI);
+            DeviceMoEWeightFormat::NativeQuantised);
         EXPECT_TRUE(descriptor.gate.valid());
         EXPECT_TRUE(descriptor.up.valid());
         EXPECT_TRUE(descriptor.down.valid());
@@ -500,7 +500,7 @@ namespace llaminar2::test
             const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({2, 768, 256}, degree - 1, degree);
             auto native = nativeDescriptor(data.data(), scales.data(), 768 / degree, 256);
             native.codebook_id = format.device_execution_codebook_id;
-            const NativeVnniSourceIdentity source{format.source_codebook_id, format.source_is_superblock, true};
+            const NativeQuantisedSourceIdentity source{format.source_codebook_id, format.source_is_superblock, true};
             auto first = std::make_shared<DescriptorGemm>(native, source);
             auto second = std::make_shared<DescriptorGemm>(native, source);
             auto bank = fixedDownBank(device, ownership, {first, second});
@@ -521,8 +521,8 @@ namespace llaminar2::test
                 EXPECT_EQ(entry.source_identity_present, 1u);
             }
             // Enriching the exported value must not mutate the engine's view.
-            DeviceNativeVNNIMatrixDesc retained{};
-            ASSERT_TRUE(first->exportNativeVNNIMatrixDesc(retained));
+            DeviceNativeQuantisedMatrixDesc retained{};
+            ASSERT_TRUE(first->exportNativeQuantisedMatrixDesc(retained));
             EXPECT_EQ(retained.source_identity_present, 0u);
         }
     }
@@ -574,7 +574,7 @@ namespace llaminar2::test
         const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({2, 768, 256}, 1, 2);
         auto native = nativeDescriptor(data.data(), scales.data(), 384, 256);
         native.codebook_id = 19;
-        const NativeVnniSourceIdentity source{19, false, true};
+        const NativeQuantisedSourceIdentity source{19, false, true};
         auto good = std::make_shared<DescriptorGemm>(native, source);
         for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(3)})
         {

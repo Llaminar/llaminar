@@ -32,6 +32,7 @@
  * @date January 2026
  */
 
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include <gtest/gtest.h>
 
 #ifdef HAVE_CUDA
@@ -737,6 +738,7 @@ namespace
                 return;
             }
 
+            llaminar2::initializeCUDAHardwareMetadata();
             cudaDeviceProp properties{};
             if (cudaSetDevice(0) != cudaSuccess ||
                 cudaGetDeviceProperties(&properties, 0) != cudaSuccess ||
@@ -1511,6 +1513,7 @@ namespace
                 return;
             }
 
+            llaminar2::initializeCUDAHardwareMetadata();
             int device_count = 0;
             cudaDeviceProp properties{};
             if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
@@ -2136,6 +2139,7 @@ namespace
             }
 
             // Initialize device manager
+            llaminar2::initializeCUDAHardwareMetadata();
             DeviceManager::instance().initialize(-1);
             if (!DeviceManager::instance().has_gpu())
             {

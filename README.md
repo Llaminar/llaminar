@@ -28,7 +28,7 @@ The current builds target the following hardware:
 |---|---|
 | x86-64 CPUs | Separate AVX512-VNNI and AVX2 images |
 | NVIDIA GPUs | CUDA `sm86`, initially tested on RTX 3090 |
-| AMD GPUs | ROCm `gfx906`, including the Instinct MI50 |
+| AMD GPUs | ROCm `gfx906` (Instinct MI50) and `gfx1100` (Radeon RX 7900 XTX) |
 
 You can combine supported CPUs and GPUs in the same deployment, including
 NVIDIA and AMD cards together. The [recipes below](#e2e-tested-auto-recipes)
@@ -224,6 +224,132 @@ You can add these options to the command when you need them:
 | Disable MTP on a GGUF with MTP weights | Add `--no-mtp` |
 | Connect from another machine | Change to `--host 0.0.0.0` and use the server's IP address |
 
+QFN can explicitly partition its original native table by head with
+`--ngram-storage vram --ngram-distribution fixed-head-sharded`. This requires
+full-main homogeneous rank-local GPU tensor parallelism of degree2,4,or8 in
+its declared communicator order. PP, CPU, mixed backends, cross-rank TP and
+hosted/adaptive storage are rejected before preparation. Native shard lengths
+follow original head offsets and may differ; PMA admits the complete fixed
+execution plus original native ranges after higher-priority owners are frozen.
+`--ngram-distribution replicated` remains the default, including whole-VRAM
+replication; Automatic never selects head sharding. This component is not a
+qualification claim for distributed serving.
+
+Models with native ngram tables select storage with `--ngram-storage auto`
+(the default), `vram`, `ram`, or `mmap`. Automatic admission first fixes model
+weights, expert placement, KV/context, graph rows, workspace and every other
+consumer, then chooses VRAM, RAM, or bounded SSD mmap from the remaining
+canonical memory plan. VRAM keeps one original native-format table on each GPU
+that executes PLE; a real CPU PLE consumer makes VRAM ineligible. RAM and mmap
+share one rank-local host table. Explicit choices must fit and never retry a
+cheaper mode. The mmap mode reads the original GGUF through bounded read-only
+file mappings; model-file staging is a separate source-storage policy.
+`--ngram-mmap-window-bytes` sets the page-aligned mapping extent (default 65,536
+bytes), and `--ngram-mmap-window-count` sets the maximum retained mappings
+(default 1,024). The resolved mode stays fixed after admission, including on an
+allocation or SSD-read failure.
+
+`--ngram-storage host-adaptive-ram-ssd` explicitly selects one CPU-owned native
+RAM cache over that bounded SSD source. It supports CPU lookup and the existing
+hosted GPU lookup service; it does not create GPU cache pools or change Automatic
+selection. Set both `--ngram-cache-max-rows` and `--ngram-cache-bytes` to bound the
+optional cache; the latter includes its native payload and all slot/index/policy
+metadata. Both default to zero, which is a valid SSD response service without
+RAM cache slots. Mandatory SSD windows, request metadata and lookup execution
+are admitted before expert quotas; optional slots use only the final complete
+PMA plan after other owners are fixed. Admission can resolve fewer slots than
+the requested ceilings without changing mode, model placement or graph rows.
+`--ngram-cache-aging-accesses` (65,536),
+`--ngram-cache-protected-numerator` (3), and
+`--ngram-cache-protected-denominator` (4) freeze the experimental policy: aged
+frequency controls admission and probation/protected logical recency controls
+eviction. These fields are valid only for this explicit mode. Native source
+identity and row bytes are preserved, and SSD/source failure is fatal. GPU
+adaptive residency, cross-rank cache sharding and adaptive no-SSD are not
+implemented by this host mode.
+
+`--ngram-storage gpu-adaptive-vram-ram-ssd` is the explicit experimental
+GPU-coordinated native cache over a local subordinate CPU RAM/SSD source. Its
+admission scope includes one full-main CUDA or ROCm continuation and homogeneous
+ConsumerLocal TP2/4/8, request batch1. The cohort retains one CPU provider, optional RAM cache and I/O
+worker, with disjoint request frames and a local GPU cache for each participant.
+This source-backing choice does not expand admitted compute/transport topology. Auto
+and host-adaptive storage do not select it. Each newly admitted degree still requires native
+admission, execution, numerical and performance qualification; its declaration
+alone does not establish any of those results.
+
+`--ngram-gpu-cache-placement consumer-local` explicitly retains that original
+policy. A declared storage cohort uses, for example,
+`--ngram-gpu-cache-placement '0:cuda:0/64/1048576,0:rocm:0/64/1048576@0:cuda:0'`:
+ordered `rank:backend:ordinal/maximum_rows/byte_ceiling` owners precede the exact
+`@rank:backend:ordinal` coordinator. YAML uses `ngram.gpu_cache_placement` with
+the same grammar. This arm uses per-owner ceilings and requires both consumer-local
+GPU ceilings to remain zero. Storage owners do not become compute or expert domains. The
+coordinator must be the original sole PLE consumer and have an explicit owner
+entry, including at C0. Cross-rank and same-vendor remote materialization reject.
+Opposite-vendor declarations still require the original admitted directed
+transport and complete retained remote transaction implementation; declaration,
+source-owner initialization and checked geometry alone do not qualify inference.
+
+A declared shared pool can additionally request **participant-local hot caches**
+with `--ngram-local-cache-max-rows` and `--ngram-local-cache-bytes`. This is a
+separate optional arm: omission retains shared-only execution; explicitly setting
+zero keeps the combined C0 path and its mandatory miss/response storage. It is
+valid only with declared rank-local placement, and cannot be combined with the
+independent `consumer-local` placement. Local caches belong to actual PLE
+consumers, not to storage-only pool owners. Lookups follow local native VRAM,
+then the shared GPU pool, then the original RAM/SSD source. Full-RAM backing
+ends at RAM and retains no redundant bounded RAM cache.
+
+Local caps cover native payload plus local slot/directory/policy metadata,
+independently of pool and source-cache caps. All mandatory obligations, including
+the bounded local miss/response/ready roots, must fit first. Optional local slots
+are admitted before optional pool slots, followed by RAM cache slots; frozen
+model, expert and KV grants are never reopened. Opaque setup/event resources
+remain separately charged by the same physical-memory authority. A positive
+ceiling is not a guaranteed grant.
+
+`--ngram-local-cache-aging-accesses`,
+`--ngram-local-cache-protected-numerator` and
+`--ngram-local-cache-protected-denominator` retain the existing deterministic
+frequency/probation/protected policy (defaults 65,536/3/4). YAML uses
+`ngram.local_cache_max_rows`, `local_cache_bytes`, `local_cache_aging_accesses`,
+`local_cache_protected_numerator` and `local_cache_protected_denominator`.
+The lossless configuration's
+`ngram_table_policy.gpu_adaptive.local_hot_cache` record can additionally carry
+`consumer_overrides`, using the existing participant/row/byte-ceiling records;
+duplicate or non-consumer endpoints reject. An absent or null record preserves
+shared-only intent, while an explicit zero-valued record preserves combined C0.
+Speculative fetches must not receive consumed-demand policy credit. Declaration
+or metadata/BOM tests alone do not qualify native execution, MTP, read-ahead,
+numerics or performance for this combined path.
+
+Use `--ngram-gpu-cache-max-rows` / `--ngram-gpu-cache-bytes` for GPU payload plus
+metadata, and `--ngram-source-cache-max-rows` / `--ngram-source-cache-bytes` for
+the subordinate CPU cache. Both ceilings per cache default to zero, preserving
+the same explicit mode and mandatory original source response path. `--ngram-source-backing ssd`
+(the default; YAML `ngram.source_backing: ssd`) retains bounded SSD mappings with
+the optional bounded RAM cache. `--ngram-source-backing ram` materializes the
+entire original native table once in the existing host source owner, shared by
+all declared consumers; it is not an oversized cache or a separate table per
+GPU. Full-RAM backing requires both source-cache ceilings to be zero and rejects
+redundant RAM caching. GPU cache placement/ceilings and all existing source,
+PMA, graph/event and terminal-retirement requirements stay in force. Insufficient
+RAM is a hard admission failure, never a switch to SSD. Full-RAM source observations
+use `gpu_subordinate_full_ram` and must report zero mapping-window work.
+Mandatory source,
+protocol and request scratch precede expert/KV grants; optional GPU slots then
+RAM slots fit only after higher priorities freeze. Positive requested limits
+are ceilings, not guaranteed reservations. Each prefix has independent
+`-aging-accesses`, `-protected-numerator`, and `-protected-denominator` options
+with defaults 65,536/3/4. Existing `--ngram-cache-*` options belong solely to the
+host-adaptive mode and cannot be mixed into this arm, regardless of flag order.
+YAML `ngram` keys are `storage`, `gpu_cache_max_rows`, `gpu_cache_bytes`,
+`gpu_aging_accesses`, `gpu_protected_numerator`, `gpu_protected_denominator`,
+`source_cache_max_rows`, `source_cache_bytes`, `source_aging_accesses`,
+`source_protected_numerator`, and `source_protected_denominator`; the unchanged
+`mmap_window_bytes` / `mmap_window_count` bound the original SSD service.
+
 MTP is enabled automatically when the GGUF includes complete learned MTP heads.
 Dynamic depth is the default and adapts how many tokens the model proposes and
 verifies at a time. `--no-mtp` supports ordinary decoding on the same GGUF across
@@ -262,7 +388,10 @@ Head placement is automatic too: CPU tensor-parallel execution splits the
 vocabulary projection across participants. Dense Qwen3.8 27B with a Q6_K head
 and dynamic MTP also uses vocabulary shards on a local pair of RTX 3090 or
 MI50 cards with the measured two- or fifteen-draft graph envelope and a
-replicated sidecar. Other CUDA and ROCm configurations keep a mirrored head.
+replicated sidecar. Qwen Flash Next's native Q8_0 head also uses vocabulary
+shards on four local MI50s with RCCL, equal full-model tensor-parallel shares,
+batch size one, and MTP disabled with no reserved draft capacity. Other CUDA
+and ROCm configurations keep a mirrored head.
 For experiments, `--mtp-terminal-head-policy vocabulary-sharded` or
 `--mtp-terminal-head-policy mirrored-full-vocabulary` overrides that choice.
 
@@ -327,6 +456,7 @@ planner, add any of these options to `plan` or to an automatic `serve` command:
 |---|---|
 | Only ROCm compute | `--only-backends rocm` |
 | Exactly two ROCm devices, with automatic placement | `--only-backends rocm --auto-device-counts rocm=2` |
+| Two automatic PP stages with four devices each | `--only-strategies pp --auto-pipeline-stage-widths 4,4` |
 | Consider only tensor or pipeline parallelism | `--only-strategies tp,pp` |
 | Prefer AMD when two choices have similar estimated performance | `--prefer-backend rocm` |
 | Optimize for roughly 512 prompt tokens and 384 output tokens | `--plan-workload 512,384` |
@@ -334,8 +464,33 @@ planner, add any of these options to `plan` or to an automatic `serve` command:
 
 Auto may choose fewer devices if it expects them to be faster. Set
 `--auto-device-counts` when you want an exact count; otherwise leave it out.
+`--auto-pipeline-stage-widths` fixes the ordered stage participant counts and
+restricts selection to pipeline parallelism. Every width must be positive;
+repeated widths and other stage counts are supported. The planner selects physical
+devices and assigns one contiguous layer range per stage, proportional to its
+participant count. Integer remainders are assigned deterministically, with at
+least one layer per stage. Explicit applied plans retain their own layer ranges.
+Combine it with exact backend counts to constrain
+the whole pipeline, for example `--only-backends rocm --auto-device-counts rocm=8
+--auto-pipeline-stage-widths 4,4`. YAML uses `planning.pipeline_stage_widths: 4,4`.
+A width hint cannot be combined with applied placement or a strategy filter that
+excludes PP; incompatible complete device totals fail before discovery.
+Independent candidate admissions use the configured OpenMP worker budget in
+bounded batches. Capacity checks and final selection remain deterministic.
+
 For CPUs, a device count means NUMA nodes: groups of CPU cores with their own
 local memory, often one per socket. It does not mean a thread count.
+
+Automatic GPU placement samples directed physical transfers at startup using a
+small, fixed set of payload sizes and repeats. The same measurements serve every
+candidate; the planner does not benchmark every possible GPU group. Direct peer
+copies and measured host-staging legs remain distinct from native collective
+timings. Allreduce, equal allgather, and counted gathers have separate native
+measurements. Cost estimates include live payloads, required control traffic,
+and observed shared PCIe link limits; unmeasured subsets remain estimates.
+The resulting placement estimate can prefer faster measured links over
+switch locality. Equal-cost choices favor mutually accessible cards with shorter
+observed PCIe paths. Startup logs report calibration setup and sampling time.
 
 `--plan-workload` helps estimate performance for your expected request size;
 it does not send a prompt or limit the output. You can
@@ -903,10 +1058,18 @@ keeps gate/up weights movable while splitting each expert's down-output
 columns across the GPUs. It is a separate compute layout, not a movement
 setting. CPU, heterogeneous and multi-tier layouts keep whole-expert ownership.
 To compare against whole experts on the same GPU tier, use
-`--moe-routed-expert-compute apportioned` (or add `;routed_compute=apportioned`
+`--moe-routed-expert-compute apportioned` (or add `;expert_compute=apportioned`
 to that tier). Explicit layout choices always take precedence. Projection
 ownership currently requires rank-local GPUs from one backend; cross-rank and
 cross-tier projection execution are not yet supported.
+
+Domain policy keys identify the expert work explicitly: `expert_compute` chooses
+the weight layout, `expert_phase` chooses phase behavior, and
+`expert_decode_assignment` / `expert_prefill_assignment` choose row assignment.
+`apportioned` distributes complete experts; `tensor-sharded` splits every
+expert's matrices across the domain and combines its partial outputs. The tier
+limit counts logical experts in either mode. A declared policy still requires
+a supported execution path for its topology.
 
 For more tuning options, see `serve --help` and the
 [configuration guide](AGENTS.md#run-and-inspect-configuration). To inspect
@@ -951,12 +1114,63 @@ the VMs afterward.
 
 </details>
 
+### MPI runtime files
+
+MPI selects the native local-copy mechanism for the installed host and runtime
+(for example, CMA on supported Linux hosts). Llaminar preserves explicit native
+MPI settings in both self-launched and externally launched jobs; standard MCA
+environment or launcher options remain available to the operator.
+
+Llaminar enters its process owner before MPI or model startup. The same owner
+retains temporary runtime files and shared-memory backing until the application,
+MPI launcher and their local daemon children have exited. Each run uses fresh
+private directories, so a reused PID cannot reopen another run's files.
+
+If you launch MPI yourself, keep that launcher's ownership explicit:
+
+```bash
+llaminar_mpi_session --session-base /tmp -- mpirun -np 2 -- llaminar2 describe
+```
+
+The inner `--` separates native MPI options from application arguments. The
+owner sets runtime file locations; MPI `--tmpdir`, location MCA overrides and
+exports of those location variables conflict with that ownership and are
+rejected. Native `mca_base_env_list` exports are also unsupported in this owned
+launch contract; use `-x` for non-location variables. Application arguments after
+the native `--` remain untouched. A bare external `mpirun` remains responsible for its own job files;
+an application rank never deletes its parent launcher's files or live peers.
+Install the matching `llaminar_mpi_session` helper beside Llaminar on each host,
+with its `llaminar_mpi_components/mca_schizo_llaminar.so` asset. Owned launches
+require this native component built for the selected OpenMPI 4.1.6 ABI. Its
+native fork hook publishes each daemon's own temporary/shared roots to that
+daemon's ranks; ranks authenticate this publication before MPI initialization.
+OpenMPI's default component selection remains intact. An explicit SCHIZO
+selector must include `llaminar` (or avoid excluding it); replacing the owned
+component search path or disabling dynamic components is rejected.
+
+Project shared-memory creators (ShmemSpin and the two node-local MoE channels)
+use regular mmap files inside the authenticated owner directory. Participants
+validate the creator's original file identity and exact extent before mapping.
+These creators reject an unowned external MPI launch; use the wrapper above.
+Native communication-library file lifetimes remain part of their separately
+qualified SDK closure.
+
+The guardian also handles abrupt application or launcher exits. If the guardian
+itself is killed, it cannot certify retirement, so its original private roots
+remain for explicit recovery. New runs use different roots; no startup scans or
+deletes unrelated files in `/tmp` or `/dev/shm`.
+
 ## Benchmarks
 
 Want to see how your own hardware performs? The `benchmark` command loads the
 model, warms it up, and measures prompt processing and answer generation.
 It uses the same production runtime as the server. Stop other inference jobs
 on the same devices before running it.
+
+For an ordered prompt/MTP request sweep under one admitted runtime, use
+[`--benchmark-campaign`](docs/benchmark-campaigns.md). It retains one immutable
+sampling cohort, validates every input before the first request, and preserves
+completed cell JSON files if a later request fails.
 
 ### Run a benchmark and save the result
 
@@ -1029,6 +1243,9 @@ The examples use `--temperature 0 --seed 42` for greedy sampling. Avoid adding
 For sampled generation, set `--temperature`, `--top-k`, and `--top-p` explicitly;
 the same sampling settings apply with MTP on or off.
 Leave profiling and debug options off while measuring throughput.
+
+For offline diagnosis of adaptive MTP decisions, use the bounded
+[controller trace replay workflow](tests/v2/unit/mtp/README.md).
 
 For comparisons with other engines, the JSON field
 `throughput_tokens_per_sec.decode_after_prefill` excludes the first output
@@ -1126,7 +1343,7 @@ Uptime and request sequence numbers continue across resets.
 | `prefix_cache.token_reuse_rate` | Matched tokens divided by requested tokens, weighted across requests |
 | `prefix_cache.storage.tiers.ram`, `.disk` | Enabled/initialized state, payload `used_bytes`, `capacity_bytes`, and `utilization_percent`; RAM sums participant bytes, while shared disk archives count once |
 | `prefix_cache.storage.churn` | Completed RAM-to-disk demotions, disk-to-RAM hydrations, per-tier capacity evictions, actual disk payload writes and metadata-only backing reuse; each has `operations` and `bytes` |
-| `mtp.acceptance_rate` | Accepted speculative tokens divided by accepted plus rejected tokens |
+| `mtp.acceptance_rate` | Accepted speculative draft tokens divided by all attempted draft tokens; rejected transactions do not count discarded suffix tokens |
 | `last_request` | Atomically published terminal outcome, with sequence, age in seconds, usage and per-request rates; remains the previous outcome while the next request runs |
 | `http.status_codes` | Finished responses from all routes, including errors and stats calls; an SSE generation error can follow HTTP 200 headers |
 
@@ -1251,7 +1468,43 @@ operands to all GDN projections and `fp32` selects full floating operands.
 Router precision and Q8 expert GEMM stay unchanged. Planning, prepared engines
 and prefix-cache identity include the selected policy.
 
+For Qwen Flash Next, keep `fp16_moe_alpha_beta` when comparing router precision
+alone; selecting `fp16` additionally applies half operands to QKV, Z and output
+projections. Both retain FP32 accumulation and recurrent-state arithmetic.
+Full floating GDN policies cannot be combined with the QFN QKV or GDN-output
+`two_term_q8` diagnostics, which require original native quantized operands.
+
+### QFN hyperconnection activation correction
+
+`LLAMINAR_QFN_HC_UP_ACTIVATION=single_q8|two_term_q8` selects the
+activation approximation for quantized HC-up projections. The default is
+`two_term_q8`; select `single_q8` explicitly to use one activation term.
+TwoTerm quantizes
+both the primary activation and its residual, applies each to the same original
+prepared weights, and adds the two completed results. Every canonical NativeQuantised
+source format retains its original weight values, codebook, scales and minima;
+no weight requantization is introduced. CPU, CUDA and ROCm use the same policy.
+Original FP32, FP16 and BF16 HC weights retain their native floating operation
+and do not reserve Q8 correction buffers. The policy is fixed before admission,
+participates in graph and prefix-cache identity, and does not change HC-down,
+GDN, attention-output or expert arithmetic.
+
 ### Router arithmetic diagnostics
+
+Qwen Flash Next (`qwen4exp`) defaults to FP16 router weights and hidden
+operands with FP32 accumulation on CPU, CUDA and ROCm. Its GDN default remains
+native QKV, Z and output projections with FP16 alpha/beta controls. Other model
+families retain their existing native router default. Explicit
+`LLAMINAR_MOE_ROUTER_ARITHMETIC=native` restores the native router diagnostic;
+`fp16` and `native_hadamard32` remain explicit choices for every family. Planning,
+prepared weights, startup observations and prefix identity use the resolved
+policy, so omitted QFN routing and explicit `fp16` share the same identity.
+
+`LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16` selects FP16 weights and hidden operands
+with FP32 accumulation and routing reductions on CPU, CUDA and ROCm. It can
+be used independently or together with
+`LLAMINAR_GDN_PROJECTION_ARITHMETIC=fp16`. Quantized expert GEMMs still consume
+the original hidden state through their own Q8 activation preparation.
 
 For FP32 router source weights, the native CUDA policy uses FP32 routing in
 ordinary prefill and Q8 routing in decode and serial-equivalent verification.
@@ -1281,6 +1534,47 @@ choosing an arithmetic policy; lower router error alone does not guarantee
 lower final-logit divergence. `src/v2/utils/DebugEnv.h` owns these diagnostic
 settings.
 
+### Diagnostic MoE ordinary-prefill route transport
+
+`LLAMINAR_DIAGNOSTIC_MOE_PREFILL_ROUTE_TRANSPORT=mapped_sparse` or
+`native_collective` explicitly selects the existing transport for ordinary
+prefill in a rank-local multi-GPU ExpertOverlay continuation. The default is
+unchanged. Rank startup reads the key through `DebugEnv` once and copies the
+parsed enum into the existing phase-aware graph configuration; environment
+changes and request reset cannot alter retained graphs. Decode, grouped MTP
+verification, and MTP sidecars keep the actual topology's default transport.
+
+This is an opt-in diagnostic for matched capture/byte/economy experiments,
+not a calibrated production policy. It preserves driver P2P facts and the
+existing transfer owner; it adds no kernel or automatic error path. A native
+collective cannot span CUDA and ROCm. Empty/unknown values, incomplete topology,
+unsupported Rank layouts, and conflicting preselected policies fail explicitly.
+Unset the variable before starting a new process to return to normal selection.
+
+### NativeQuantised exact collection
+
+`scripts/refresh_native_quantised_dispatch_tables.sh` selects modern model
+work by default: Qwen3.5, Qwen3.6, explicit Qwen3.8 identities, QFN, and
+physical shapes shared with those families. It excludes Qwen2.5/Qwen3-only
+new jobs without removing runtime support or installed exact keys. The source
+catalog currently declares no explicit Qwen3.8 geometry; collection does not
+invent it. Modern `--surface all` covers decode/MTP and routed experts;
+ordinary dense-prefill collection is parked.
+
+`--resume` preserves the saved model scope and original evidence identities.
+Use `--model-scope all-retained` for an explicit full retained inventory, with
+a separate output directory when changing scope. CPU
+`--reuse-completed-root PATH` authenticates compatible completed owner receipts
+and collects missing jobs; it preserves their original producer and raw data.
+For CUDA/ROCm `--surface decode` (including MTP), the same flag retains
+completed shapes from an original native collection or superset when its exact
+producer, published hardware context, serial policy, phase, formats, device
+ordinals and timing floors match. Original raw artifacts and context remain
+receipt-bound; only missing shapes launch. `--resume` revalidates those original
+references. Pre-install M1 timings cannot be relabeled as clocks of a later
+rebuilt producer. Historical routed-MoE receipts omit actual hardware identity,
+so their cross-root reuse is inadmissible; resume their original corpus instead.
+
 ### Optional corpora
 
 Ordinary checkouts, builds, Docker images, and Unit/preflight tests do not
@@ -1290,10 +1584,11 @@ require downloading large corpora. Published data lives in
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora
-git -C corpora lfs pull --include 'native_vnni_dispatch/cpu/**' --exclude ''
+git -C corpora lfs pull --include '<family>/<selected-generation>/**' --exclude ''
 ```
 
-Narrow the include pattern to the desired generation. Publish corpus payloads
+Use the directory names recorded by the selected corpus generation; source
+renames do not rename already published data artifacts. Publish corpus payloads
 in that repository, then update the source gitlink; do not add them to the
 source tree or Docker build context.
 
@@ -1442,3 +1737,17 @@ Production inference currently supports FP32 model activations only.
 `--activation-precision fp32` is the default; other activation modes fail as
 unimplemented. KV-cache precision and model/expert weight formats are separate
 settings and retain their own supported formats.
+
+### QFN GDN QKV arithmetic diagnostic
+
+`LLAMINAR_QFN_GDN_QKV_ACTIVATION=single_q8|two_term_q8` selects the
+activation operand precision for original main-decoder GDN mixed-QKV
+projections. The default remains `single_q8`. This setup-only setting is
+independent of the HC-up, GDN-output and FA-output activation selectors and
+of `LLAMINAR_GDN_PROJECTION_ARITHMETIC`. The explicit `two_term_q8` arm
+requires the complete unchanged original native quantized matrix, one request's
+authenticated query rows and the existing prepared-weight/workspace owners;
+partial dense TP and converted GDN weight representations are rejected.
+It does not select FA, predictor, Z, alpha or beta arithmetic. This diagnostic
+introduces no default or model-qualification promotion; focused backend and
+canonical numerical qualification remain required.

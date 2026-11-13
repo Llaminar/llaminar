@@ -15,6 +15,8 @@
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "transfer/TransferEngine.h"
+#include "backends/NativeContextPreparation.h"
+#include "loaders/ModelContext.h"
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -36,6 +38,7 @@ namespace llaminar2
         {
             switch (kind)
             {
+            case MoEOverlayMigrationStorageKind::NoPeer:
             case MoEOverlayMigrationStorageKind::Disabled:
             case MoEOverlayMigrationStorageKind::DeviceTransferDirectory:
                 break;
@@ -147,6 +150,17 @@ namespace llaminar2
         return result;
     }
 
+    ModelContextRetirementReceipt PendingExclusiveModelRetirement::complete(
+        const std::shared_ptr<NativeContextPreparation>& original_source)
+    {
+        if(completed_)throw std::logic_error("Pending model-context retirement cannot complete twice");
+        // begin() only captured allocation facts. Worker destruction starts in
+        // complete(), so source-held calibration loans must close before it.
+        // A rejected close leaves this same pending boundary unconsumed.
+        if(original_source)original_source->retirePreparedCalibrations();
+        return complete();
+    }
+
     ModelContextRetirementReceipt
     retireExclusiveModelContextReuseContract(
         ModelContextReuseContract &contract)
@@ -197,6 +211,15 @@ namespace llaminar2
                      : retention_error));
         }
 
+        // The weight/workspace BOM need not contain storage-only GPU workers.
+        // Retain the original source through final owner destruction so its
+        // remaining births receive the same reset proof as ordinary shutdown.
+        auto final_native_source = contract.context->nativeContextPreparation();
+        if (final_native_source &&
+            (final_native_source->memory().get() != contract.physical_memory_authority.get() ||
+             final_native_source->memory().owner_before(contract.physical_memory_authority) ||
+             contract.physical_memory_authority.owner_before(final_native_source->memory())))
+            throw std::logic_error("Final model source requires its original physical-memory authority");
         PendingExclusiveModelRetirement pending =
             PendingExclusiveModelRetirement::begin(*sealed_retention);
 
@@ -220,7 +243,46 @@ namespace llaminar2
         ::malloc_trim(0);
 #endif
 
-        return pending.complete();
+        // This receipt continues to describe the sealed model-allocation BOM;
+        // residual birth reset is an additional original-source lifetime proof.
+        auto receipt = pending.complete(final_native_source);
+        if (final_native_source)
+            final_native_source->retireReleasedContexts();
+        return receipt;
+    }
+
+    InvalidModelContextDiscardReceipt discardExclusiveInvalidModelContextReuseContract(ModelContextReuseContract& contract)
+    {
+        if(!contract.context || !contract.reusable_execution_workspaces || !contract.reuse_authority || !contract.physical_memory_authority)
+            throw std::invalid_argument("Invalid model discard requires complete original final owners");
+        if(contract.reuse_authority->state()!=ModelContextReuseAuthority::State::Invalid)
+            throw std::logic_error("Invalid model discard requires the terminal Invalid lifecycle boundary");
+        const auto diagnostic=contract.reuse_authority->diagnostic();
+        if(contract.context.use_count()!=1u || contract.reusable_execution_workspaces.use_count()!=1u ||
+           contract.reuse_authority.use_count()!=1u)
+            throw std::logic_error("Invalid model discard still has borrowed model/workspace/lifecycle owners: "+diagnostic);
+        auto source=contract.context->nativeContextPreparation();
+        if(source){
+            const auto memory=source->memory();
+            if(memory.get()!=contract.physical_memory_authority.get() || memory.owner_before(contract.physical_memory_authority) ||
+               contract.physical_memory_authority.owner_before(memory))
+                throw std::logic_error("Invalid model discard requires its original source/PMA control block: "+diagnostic);
+        }else{
+            for(const auto& row:contract.physical_memory_authority->rankAttestation())
+                if(row.identity.device.is_gpu())
+                    throw std::logic_error("Invalid GPU model discard requires its original native source: "+diagnostic);
+        }
+        // Invalid means reuse failed, not that physical ownership disappeared.
+        // Keep the original source through final owner destruction and then use
+        // its existing exact central-ledger-zero native retirement transaction.
+        contract.context.reset();
+        contract.reusable_execution_workspaces.reset();
+        contract.physical_memory_authority.reset();
+        contract.reuse_authority.reset();
+        contract.prepared_routed_weight_plan.reset();
+        contract.expert_overlay_memory_admission.reset();
+        contract.routed_weight_authority_identity.clear();
+        return {source ? source->retireReleasedContexts() : 0u};
     }
 
 } // namespace llaminar2

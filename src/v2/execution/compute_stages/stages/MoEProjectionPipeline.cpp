@@ -11,6 +11,10 @@
  * full-K down dot and ordered top-k fold used by serial decode.
  * Diagnostics borrow each down stage's existing per-route column bank at its
  * producer boundary; they never add a full-route bank or another collective.
+ * Bounded Automatic owner execution reads the existing startup observation at
+ * declaration and resolves the actual mode before graph identity or admission.
+ * Fixed scalar output rows publish directly from the existing native allgather;
+ * wider and device-counted rows retain their original receive/assembly banks.
  */
 #include "MoEProjectionPipeline.h"
 #include "MoEOverlayPinnedRouteEvidenceViews.h"
@@ -20,6 +24,7 @@
 
 #include "collective/ILocalTPContext.h"
 #include "collective/DeviceCountedAllGather.h"
+#include "execution/moe/MoECountedTransferPolicy.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -28,7 +33,11 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
+#endif
 #include "kernels/KernelFactory.h"
+#include "backends/HardwareInventory.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
 #include "kernels/common/SharedExpertColumnGateKernels.h"
 #include "models/GraphTypes.h"
@@ -88,6 +97,9 @@ namespace
                 params.rows > std::numeric_limits<int>::max() / params.top_k ||
                 !validMoEGroupedPlanDemand(params.demand))
                 throw std::invalid_argument("Projection graph requires complete immutable execution bindings");
+            // Counted native transport requires an explicit immutable semantic phase.
+            // The phase belongs in capture identity; it never selects a second transport.
+            if (params.counted_exchange) requireMoENativeCountedPhase(params.service_phase);
             const auto &ownership = params.fixed_down->ownership();
             const auto geometry = ownership.geometry();
             if (params.top_k > geometry.experts ||
@@ -118,8 +130,81 @@ namespace
                 if constexpr (std::is_same_v<std::decay_t<decltype(table)>,
                               MoEOverlayFixedDownProjectionBank::FloatingDescriptorTable>)
                     return table.format;
-                else return DeviceMoEWeightFormat::NativeVNNI;
+                else return DeviceMoEWeightFormat::NativeQuantised;
             }, fixed_table);
+#ifdef HAVE_ROCM
+            if (device().is_rocm() && params.rows == 1 && family == DeviceMoEWeightFormat::NativeQuantised)
+            {
+                const auto model_policy = rocm::compiledMoERouteOwnedModelPartitionPolicy();
+                const rocm::MoERouteOwnedModelOperation operation{
+                    .shape = {.output_columns = geometry.intermediate_columns, .reduction_columns = geometry.model_columns},
+                    .rows = params.rows, .experts = geometry.experts, .top_k = params.top_k,
+                    .phase = params.service_phase, .has_live_rows = params.live_rows.has_value()};
+                // Borrow existing startup metadata only for this declaration.
+                // Never initialize/discover hardware here or retain its pointers.
+                const auto *startup = DeviceManager::instance().hardware();
+                const auto startup_devices = startup ? std::span<const ComputeDevice>{startup->rocm_devices}
+                                                     : std::span<const ComputeDevice>{};
+                const bool inspect_sources = model_policy == rocm::MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes ||
+                    (model_policy == rocm::MoERouteOwnedModelPartitionPolicy::Automatic &&
+                        rocm::moeRouteOwnedModelMeasuredDomain(operation, params.tp->devices(), params.tp->weights(),
+                            params.tp->backend(), startup_devices));
+                if (inspect_sources)
+                {
+                    NativeQuantisedExecutionFormatEnvelope envelope;
+                    std::vector<NativeQuantisedSourceIdentity> sources;
+                    for (const auto &payload : params.initial_gate_up)
+                    {
+                        if (payload.empty()) continue;
+                        DeviceNativeQuantisedMatrixDesc gate{}, up{};
+                        if (!payload.readyFor(DeviceMoEProjectionSet::GateUp) ||
+                            !payload.gate()->inspectPreparedNativeQuantisedMatrixDesc(gate) ||
+                            !payload.up()->inspectPreparedNativeQuantisedMatrixDesc(up) ||
+                            gate.n != geometry.intermediate_columns || up.n != geometry.intermediate_columns ||
+                            gate.k != geometry.model_columns || up.k != geometry.model_columns ||
+                            !areNativeQuantisedGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id))
+                            throw std::logic_error("Projection launch intent requires already-prepared original native gate/up metadata");
+                        for (const auto *desc : {&gate, &up})
+                        {
+                            const NativeQuantisedSourceIdentity source{desc->source_codebook_id, desc->source_is_superblock != 0,
+                                desc->source_identity_present != 0};
+                            if (!addNativeQuantisedExecutionFormat(envelope, desc->codebook_id, source, true))
+                                throw std::invalid_argument("Projection owner launch intent has an invalid original source envelope");
+                            sources.push_back(source);
+                        }
+                    }
+                    const auto execution = rocm::selectMoERouteOwnedModelPartitionExecution(model_policy, operation,
+                        params.tp->devices(), params.tp->weights(), params.tp->backend(), startup_devices, sources);
+                    if (execution == rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes)
+                    {
+                        owner_plan.emplace(rocm::planMoERouteOwnedGateUp(rocm::MoERouteOwnedGateUpGeometry::TN64,
+                            envelope, device().rocm_ordinal(), execution, operation.shape));
+                        if (model_policy == rocm::MoERouteOwnedModelPartitionPolicy::Automatic && owner_plan->maximumKPartitions() != 16)
+                            throw std::logic_error("Automatic owner source partitions changed beyond their qualified program");
+                        declaration_signature = owner_plan->identity();
+                        // The immutable launch mode/shape/source-policy intent exists
+                        // before the first cache hash. Descriptor payload pointers are
+                        // runtime table contents, not additional embedded graph operands.
+                        // Original prepare/export/upload and workspace leases remain their
+                        // sole authority; materialization must validate this same intent.
+                        const auto mix = [&](std::uint64_t word) { declaration_signature = (declaration_signature ^ word) * kFNV1a64Prime; };
+                        mix(params.rows); mix(params.top_k);
+                        mix(static_cast<std::uint64_t>(params.demand)); mix(static_cast<std::uint64_t>(params.service_phase));
+                        mix(reinterpret_cast<std::uintptr_t>(params.tp));
+                        mix(reinterpret_cast<std::uintptr_t>(params.counted_exchange.get()));
+                        mix(reinterpret_cast<std::uintptr_t>(params.runtime));
+                        mix(reinterpret_cast<std::uintptr_t>(params.kernel_owner.get()));
+                        mix(reinterpret_cast<std::uintptr_t>(params.fixed_down.get()));
+                        mix(fnv1a64(params.prefix.data(), params.prefix.size()));
+                        for (const auto &tensor : {params.hidden, params.routing_indices, params.routing_weights,
+                                params.local_packet, params.gathered_packets, params.local_route_columns,
+                                params.local_columns, params.gathered_columns, params.output})
+                        { mix(reinterpret_cast<std::uintptr_t>(tensor.tensor)); mix(static_cast<std::uint64_t>(tensor.id)); }
+                        if (!declaration_signature) declaration_signature = 1;
+                    }
+                }
+            }
+#endif
             layout = {deviceMoEWeightFormatIsFloating(family) ? MoEGroupedIntermediateEncoding::FP32
                         : MoEGroupedIntermediateEncoding::BlockQ8FP32Scales,
                 static_cast<std::uint32_t>(geometry.intermediate_columns),
@@ -188,6 +273,9 @@ namespace
                     throw std::logic_error("Projection graph workspace identity changed after preparation");
                 if (prepared->stream != stream)
                     throw std::logic_error("Projection graph descriptor publication belongs to another capture stream");
+                if (!params.kernel_owner->kernel)
+                    throw std::logic_error("Projection graph lost its prepared kernel owner");
+                params.kernel_owner->kernel->requireOwnerGateUpCaptureBinding(prepared->gate, params.rows, prepared->owner_intent);
                 return;
             }
             auto &kernel = params.kernel_owner->kernel;
@@ -198,7 +286,7 @@ namespace
             if (!consumer) throw std::logic_error("Projection kernel has no admitted workspace contract");
             consumer->bindWorkspace(workspace);
             const auto geometry = params.fixed_down->ownership().geometry();
-            std::vector<DeviceNativeVNNIMatrixDesc> gates(geometry.experts), ups(geometry.experts);
+            std::vector<DeviceNativeQuantisedMatrixDesc> gates(geometry.experts), ups(geometry.experts);
             std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(geometry.experts), fp_ups(geometry.experts);
             for (int expert = 0; expert < geometry.experts; ++expert)
             {
@@ -236,14 +324,24 @@ namespace
                     return retained;
                 };
                 const std::string identity = params.prefix + "/" + std::to_string(params.rows) + "/" +
-                    std::to_string(layout.columns) + "/" + std::to_string(static_cast<int>(layout.encoding));
+                    std::to_string(layout.columns) + "/" + std::to_string(static_cast<int>(layout.encoding)) +
+                    "/phase/" + std::to_string(static_cast<std::uint32_t>(params.service_phase));
                 compact = params.counted_exchange->bind(params.fixed_down->ownership().participant(),
                     {fnv1a64(identity.data(), identity.size()), layout.compactCapacityBytes()},
                     retain(params.local_packet.tensor), retain(params.gathered_packets.tensor));
             }
-            // Publication is atomic on the host setup path. Execute sees either
-            // the complete immutable metadata identity or a hard failure.
-            prepared = Prepared{workspace, workspace->id(), stream, gate_table, down_table};
+            std::uint64_t expected_intent = 0;
+#ifdef HAVE_ROCM
+            if (owner_plan) expected_intent = owner_plan->identity();
+#endif
+            const auto materialized_intent = kernel->prepareOwnerGateUpCaptureBinding(gate_table, params.rows, expected_intent);
+            if (materialized_intent != expected_intent)
+                throw std::logic_error("Projection graph materialized a different owner launch intent");
+            kernel->requireOwnerGateUpCaptureBinding(gate_table, params.rows, expected_intent);
+            // Publication is atomic on the host setup path. It does not alter
+            // declaration_signature: graph identity was complete before this
+            // exact resource materialization, including during the first hash.
+            prepared = Prepared{workspace, workspace->id(), stream, gate_table, down_table, expected_intent};
         }
 
         /**
@@ -270,6 +368,7 @@ namespace
             if (prepared->stream != stream)
                 throw std::logic_error("Projection graph execution changed its prepared metadata stream");
             auto &kernel = *params.kernel_owner->kernel;
+            kernel.requireOwnerGateUpCaptureBinding(prepared->gate, params.rows, prepared->owner_intent);
             kernel.setGPUStream(stream);
             const auto &ownership = params.fixed_down->ownership();
             const auto geometry = ownership.geometry();
@@ -353,8 +452,13 @@ namespace
             void *stream;
             int gate;
             int down;
+            std::uint64_t owner_intent;
         };
         const MoEProjectionPipelineParams params;
+#ifdef HAVE_ROCM
+        std::optional<rocm::MoERouteOwnedGateUpPlan> owner_plan; ///< Pure immutable intent, not resource/allocation authority.
+#endif
+        std::uint64_t declaration_signature = 0; ///< Frozen before any cache-identity query; zero retains default policy.
         MoEGroupedIntermediateLayout layout;
         DeviceMoEWeightFormat family;
         MoEOverlayFixedDownProjectionBank::DescriptorTable fixed_table;
@@ -399,6 +503,16 @@ namespace
         ComputeStageType type() const override { return ComputeStageType::MOE_PROJECTION_PHASE; }
         /** @return The frozen model/layer/phase identity. */
         std::string name() const override { return name_; }
+        /**
+         * @return Pure predeclared owner launch variant; native preparation only validates/materializes it.
+         * @note Arena/stream/workspace ownership retains its existing independent checks. No getter probes HIP or lazily changes identity.
+         */
+        std::uint64_t graphCaptureVariantSignature() const override
+        {
+            if (!binding_->declaration_signature) return 0;
+            const auto value = (binding_->declaration_signature ^ static_cast<std::uint64_t>(phase_)) * kFNV1a64Prime;
+            return value ? value : 1;
+        }
         /** @return Only the exact compiled GPU backend is supported. */
         bool supportsBackend(ComputeBackendType backend) const override
         {
@@ -555,6 +669,61 @@ namespace
         const std::array<MoEProjectionTensorBinding, 1> fold_inputs_{binding_->params.local_route_columns};
         const std::array<MoEProjectionTensorBinding, 1> column_inputs_{binding_->params.gathered_columns};
         DeviceWorkspaceManager *workspace_ = nullptr;
+    };
+
+    /**
+     * @brief Publish a fixed scalar row directly from the existing native gather.
+     *
+     * For M=1, [participant,row,column] and [row,participant,column] have the
+     * identical address: (participant * 1 + 0) * columns + column. The native
+     * receive therefore owns the original final output bank directly. No copy,
+     * alias, arena remap or additional publication stage is required. Counted
+     * rows retain their original assembly because an empty receive must leave
+     * its bank untouched; redirecting that bank would alter inactive bytes.
+     * The retained binding keeps original route-epoch snapshot leases alive.
+     */
+    class ProjectionColumnGatherStage final : public NativeAllGatherStage
+    {
+    public:
+        /**
+         * @brief Retain native transport and the exact row-major output owner.
+         * @param params Complete existing native gather declaration.
+         * @param binding Original prepared projection transaction and leases.
+         * @param output Original routed or explicitly combined output bank.
+         * @throws std::invalid_argument For nonidentity geometry or a foreign bank.
+         */
+        ProjectionColumnGatherStage(NativeAllGatherStage::Params params,
+            std::shared_ptr<Binding> binding, MoEProjectionTensorBinding output)
+            : NativeAllGatherStage(std::move(params)), binding_(std::move(binding)), output_(output)
+        {
+            if (!binding_ || binding_->params.rows != 1 || binding_->params.live_rows ||
+                this->params().live_rows || this->params().arena_rows ||
+                this->params().rank_major_output != output_.tensor ||
+                this->params().output_buffer_id != output_.id)
+                throw std::invalid_argument("Direct projection gather requires one fixed row and its exact output bank");
+        }
+        /** @return Original prepared transaction; no runtime state is copied. */
+        const std::shared_ptr<Binding> &binding() const noexcept { return binding_; }
+        /** @return Whether the shared-column finalizer already installed its output. */
+        bool publishesCombinedColumns() const noexcept
+        { return this->params().local_input == binding_->params.local_route_columns.tensor; }
+        /**
+         * @return Original complete-row snapshot and route-epoch evidence.
+         * @details The diagnostic name stays projection_assemble although its
+         * actual stage is the explicit native allgather that now owns the bytes.
+         */
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            StageDumpInfo info;
+            info.addScalarInt("projection_phase", static_cast<int>(Phase::Assemble));
+            info.addOutput(publishesCombinedColumns() ? "combined_output" : "output", output_.tensor,
+                1, binding_->params.fixed_down->ownership().geometry().model_columns);
+            if (binding_->route_evidence) binding_->route_evidence->appendOutputs(info);
+            return info;
+        }
+    private:
+        const std::shared_ptr<Binding> binding_; ///< Existing transaction/descriptor lease, retained through graph retirement.
+        const MoEProjectionTensorBinding output_; ///< Sole native receive and snapshot authority.
     };
 
     /** @brief Explicit counted collective; all model arithmetic remains in local phases. */
@@ -717,6 +886,7 @@ std::string appendMoEProjectionPipeline(ComputeGraph &graph, MoEProjectionPipeli
     auto binding = std::make_shared<Binding>(std::move(params));
     const auto &p = binding->params;
     const auto &ownership = p.fixed_down->ownership();
+    const bool direct_row = p.rows == 1 && !p.live_rows;
     const auto column_bytes = std::size_t(p.rows) * ownership.projection(WeightRole::MoEExpertDown).rows * sizeof(float);
     const std::array names{p.prefix + "gate_up_pack", p.prefix + "intermediate_allgather",
         p.prefix + "import_down", p.prefix + "fold_routes", p.prefix + "column_allgather", p.prefix + "assemble"};
@@ -736,22 +906,27 @@ std::string appendMoEProjectionPipeline(ComputeGraph &graph, MoEProjectionPipeli
         if (input.id == p.local_columns.id && p.live_rows)
             params.live_rows = NativeCollectiveRows(*p.live_rows,
                 ownership.projection(WeightRole::MoEExpertDown).rows * sizeof(float));
-        return std::make_unique<NativeAllGatherStage>(std::move(params));
+        return params;
     };
     // Native membership and every tensor contract must validate before adding
     // any graph node. Neither constructor performs backend work or allocates VRAM.
     std::array<std::unique_ptr<IComputeStage>, 6> stages{
         std::make_unique<ProjectionStage>(binding, Phase::GateUpPack, names[0]),
         p.counted_exchange ? std::unique_ptr<IComputeStage>(std::make_unique<CompactExchangeStage>(binding))
-            : gather(p.local_packet, p.gathered_packets, binding->layout.packetBytes(), names[1]),
+            : std::make_unique<NativeAllGatherStage>(gather(p.local_packet, p.gathered_packets, binding->layout.packetBytes(), names[1])),
         std::make_unique<ProjectionStage>(binding, Phase::ImportDown, names[2]),
         std::make_unique<ProjectionStage>(binding, Phase::FoldRoutes, names[3]),
-        gather(p.local_columns, p.gathered_columns, column_bytes, names[4]),
-        std::make_unique<ProjectionStage>(binding, Phase::Assemble, names[5])};
+        direct_row ? nullptr : std::make_unique<NativeAllGatherStage>(gather(p.local_columns, p.gathered_columns, column_bytes, names[4])),
+        direct_row ? std::unique_ptr<IComputeStage>(std::make_unique<ProjectionColumnGatherStage>(
+            gather(p.local_columns, p.output, column_bytes, names[5]), binding, p.output))
+            : std::make_unique<ProjectionStage>(binding, Phase::Assemble, names[5])};
+    auto predecessor = p.router_node;
     for (std::size_t i = 0; i < stages.size(); ++i)
     {
+        if (!stages[i]) continue;
         graph.addNode(names[i], std::move(stages[i]), binding->device());
-        graph.addDependency(names[i], i ? names[i - 1] : p.router_node);
+        graph.addDependency(names[i], predecessor);
+        predecessor = names[i];
     }
     return names.back();
 }
@@ -784,13 +959,15 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
 {
     auto *assembly_node = graph.getNode(prefix + "assemble");
     const auto *assembly = assembly_node ? dynamic_cast<const ProjectionStage *>(assembly_node->stage.get()) : nullptr;
-    auto *gather_node = graph.getNode(prefix + "column_allgather");
+    const auto *direct = assembly_node ? dynamic_cast<const ProjectionColumnGatherStage *>(assembly_node->stage.get()) : nullptr;
+    auto *gather_node = direct ? assembly_node : graph.getNode(prefix + "column_allgather");
     const auto *gather = gather_node ? dynamic_cast<const NativeAllGatherStage *>(gather_node->stage.get()) : nullptr;
     const auto *producer = graph.getNode(shared.producer);
-    if (!assembly || assembly->phase() != Phase::Assemble || assembly->publishesCombinedColumns() ||
-        !gather || !producer || !producer->stage || !shared.gate || !shared.combined_output.tensor)
+    const bool original_terminal = (assembly && assembly->phase() == Phase::Assemble && !assembly->publishesCombinedColumns()) ||
+        (direct && !direct->publishesCombinedColumns());
+    if (!original_terminal || !gather || !producer || !producer->stage || !shared.gate || !shared.combined_output.tensor)
         throw std::invalid_argument("Shared-column finalization requires an unmodified projection DAG and complete shared producer");
-    const auto binding = assembly->binding();
+    const auto binding = direct ? direct->binding() : assembly->binding();
     const auto &p = binding->params;
     const auto &owner = p.fixed_down->ownership();
     const auto &sum = shared.reduction;
@@ -805,9 +982,9 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
         shared.combined_output.tensor->native_type() != TensorType::FP32 ||
         shared.combined_output.tensor->size_bytes() < full_bytes ||
         gather->params().local_input != p.local_columns.tensor ||
-        gather->params().rank_major_output != p.gathered_columns.tensor ||
+        gather->params().rank_major_output != (direct ? p.output.tensor : p.gathered_columns.tensor) ||
         gather_node->dependencies != std::vector<std::string>{prefix + "fold_routes"} ||
-        assembly_node->dependencies != std::vector<std::string>{prefix + "column_allgather"})
+        (!direct && assembly_node->dependencies != std::vector<std::string>{prefix + "column_allgather"}))
         throw std::invalid_argument("Shared-column finalization disagrees with native policy, bank geometry or graph ownership");
     for (const auto &b : {p.hidden, p.local_columns, p.local_route_columns, p.gathered_columns,
                           p.local_packet, p.gathered_packets, p.routing_indices, p.routing_weights})
@@ -835,8 +1012,15 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
     // now the compact combined-column send bank; no third allocation is needed.
     combined_gather.local_input = p.local_route_columns.tensor;
     combined_gather.input_buffer_id = p.local_route_columns.id;
-    auto combined_gather_stage = std::make_unique<NativeAllGatherStage>(combined_gather);
-    auto combined_assembly = std::make_unique<ProjectionStage>(binding, Phase::Assemble,
+    if (direct)
+    {
+        combined_gather.rank_major_output = shared.combined_output.tensor;
+        combined_gather.output_buffer_id = shared.combined_output.id;
+    }
+    std::unique_ptr<IComputeStage> combined_gather_stage = direct
+        ? std::unique_ptr<IComputeStage>(std::make_unique<ProjectionColumnGatherStage>(combined_gather, binding, shared.combined_output))
+        : std::make_unique<NativeAllGatherStage>(combined_gather);
+    auto combined_assembly = direct ? nullptr : std::make_unique<ProjectionStage>(binding, Phase::Assemble,
         prefix + "assemble", shared.combined_output);
     auto gate_stage = std::make_unique<SharedColumnGateStage>(binding, shared);
 
@@ -852,8 +1036,8 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
     // All participants submit intermediate gather -> shared scatter -> column
     // gather. Only local down compute occupies the scatter's event window.
     gather_node->stage = std::move(combined_gather_stage);
-    graph.addDependency(prefix + "column_allgather", gate_name);
-    assembly_node->stage = std::move(combined_assembly);
+    graph.addDependency(prefix + (direct ? "assemble" : "column_allgather"), gate_name);
+    if (!direct) assembly_node->stage = std::move(combined_assembly);
     return prefix + "assemble";
 }
 } // namespace llaminar2

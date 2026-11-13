@@ -25,6 +25,7 @@
  * - Fused GEMM operands retain their reduction width even when output N differs
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 #include <atomic>
@@ -1002,6 +1003,8 @@ TEST_F(StageDumpInfoTest, AllreduceStage_GetDumpInfo_NullBuffer)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

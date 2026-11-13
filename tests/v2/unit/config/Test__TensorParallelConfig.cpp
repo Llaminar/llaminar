@@ -8,6 +8,9 @@
 
 #include <gtest/gtest.h>
 #include "config/TensorParallelConfig.h"
+#include "config/GDNHeadAssignment.h"
+#include "kernels/attention/AttentionHeadMapping.h"
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -61,6 +64,43 @@ namespace llaminar2
             // KV heads: 4 / 2 = 2 each
             EXPECT_EQ(rank0.kv_head_count, 2);
             EXPECT_EQ(rank1.kv_head_count, 2);
+        }
+
+        /** @test Original24Q/2KV ownership remains exact at TP2/4/8 and reversed communicator order. */
+        TEST_F(Test__TensorParallelConfig, ReplicatedKVQwenTP2TP4TP8PreservesIntegralGDN)
+        {
+            for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+                for (const int degree : {2, 4, 8})
+                    for (const bool reversed : {false, true})
+                    {
+                        SCOPED_TRACE(::testing::Message() << static_cast<int>(backend)
+                            << " degree=" << degree << " reversed=" << reversed);
+                        std::vector<DeviceId> devices;
+                        for (int ordinal = 0; ordinal < degree; ++ordinal)
+                            devices.emplace_back(backend, ordinal);
+                        if (reversed) std::reverse(devices.begin(), devices.end());
+                        const auto config = TensorParallelConfig::equalSplit(
+                            degree, 24, 2, 1024, 32000, devices);
+                        ASSERT_TRUE(config.validate()) << config.validationError();
+                        EXPECT_EQ(config.totalHeads(), 24);
+                        EXPECT_EQ(config.totalKVHeads(), 2);
+                        for (int participant = 0; participant < degree; ++participant)
+                        {
+                            const auto &local = config.forRank(participant);
+                            EXPECT_EQ(local.device, devices[participant]);
+                            EXPECT_EQ(local.head_start, participant * (24 / degree));
+                            EXPECT_EQ(local.head_count, 24 / degree);
+                            EXPECT_EQ(local.kv_head_count, degree == 2 ? 1 : 2);
+                            EXPECT_EQ(local.kv_head_start, degree == 2 ? participant : 0);
+                            EXPECT_TRUE(attention::isValidHeadMapping({local.head_count,
+                                local.kv_head_count, local.head_start, degree == 2 ? 0 : 12}));
+                            EXPECT_TRUE(GDNHeadAssignment::hasIntegralKeyHeadBoundaries(
+                                16, 48, local.head_start, local.head_count, 24));
+                        }
+                    }
+            // Removing the attention alignment does not permit rounded GDN heads.
+            EXPECT_FALSE(GDNHeadAssignment::hasIntegralKeyHeadBoundaries(16, 48, 0, 4, 24));
+            EXPECT_THROW(GDNHeadAssignment::fromPartition(16, 48, 0, 4, 24), std::invalid_argument);
         }
 
         TEST_F(Test__TensorParallelConfig, EqualSplit_WithRemainder)

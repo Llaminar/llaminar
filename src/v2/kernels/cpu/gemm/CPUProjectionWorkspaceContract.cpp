@@ -8,8 +8,8 @@
  * root-local CPUID, anonymous reserve or per-layer live balance exists here.
  */
 #include "CPUProjectionWorkspaceContract.h"
-#include "CPUNativeVNNITileConfig.h"
-#include "CPUNativeVNNIWeightPacker.h"
+#include "CPUNativeQuantisedTileConfig.h"
+#include "CPUNativeQuantisedWeightPacker.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include <climits>
 #include <stdexcept>
@@ -32,19 +32,19 @@ namespace llaminar2
     {
         requireGeometry(geometry);
         if (format == "F32" || format == "F16" || format == "BF16") return {};
-        const auto *native = native_vnni_formats::forQuantType(format);
+        const auto *native = native_quantised_formats::forQuantType(format);
         if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format");
-        return prepared(cpu::native_vnni::preparedFootprintForFormat(*native), native->codebook_id, geometry);
+        return prepared(cpu::native_quantised::preparedFootprintForFormat(*native), native->codebook_id, geometry);
     }
 
     WorkspaceRequirements CPUProjectionWorkspaceContract::prepared(
-        const cpu::native_vnni::NativeVNNIPreparedFootprint &footprint, std::uint8_t codebook,
+        const cpu::native_quantised::NativeQuantisedPreparedFootprint &footprint, std::uint8_t codebook,
         const CPUProjectionWorkspaceGeometry &geometry)
     {
         requireGeometry(geometry);
         if (geometry.workers <= 0 || !geometry.execution.isValid())
             throw std::invalid_argument("CPU projection workspace requires participant-owned worker/cache/ISA geometry");
-        const auto config = cpu::native_vnni::serialTileConfigForPreparedProjection(footprint,
+        const auto config = cpu::native_quantised::serialTileConfigForPreparedProjection(footprint,
             codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
             geometry.k, geometry.workers, geometry.execution.cache);
         auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);

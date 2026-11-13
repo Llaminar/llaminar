@@ -27,6 +27,7 @@
 
 #include <mpi.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -145,6 +147,16 @@ namespace llaminar2
             const MoEOverlayInferenceTransactionTicket &ticket,
             std::string *error = nullptr);
 
+        /** @brief Poll one exact remote receipt and local send release without waiting. */
+        MoEOverlayInferenceCompletionFenceProgress tryAwaitCompletion(
+            const MoEOverlayInferenceTransactionTicket &ticket, std::string *error = nullptr);
+
+        /** @brief Progress one ticket receive without waiting; empty success means pending. */
+        [[nodiscard]] MoEOverlayInferenceTransactionReceiveResult tryReceive();
+
+        /** @return Fixed bound on concurrently retained transaction identities. */
+        [[nodiscard]] std::size_t slotCapacity() const noexcept { return config_.send_slot_count; }
+
         /**
          * @brief Receive exactly one ticket required by the follower scheduler.
          *
@@ -237,6 +249,7 @@ namespace llaminar2
         Config config_;
         mutable std::vector<SendSlot> send_slots_;
         std::size_t next_send_slot_ = 0;
+        std::vector<MoEOverlayInferenceTransactionTicket> executing_tickets_; ///< Setup-bounded unretired receive identities.
         MoEOverlayInferenceTransactionTicket receive_ticket_{};
         MPI_Request receive_request_ = MPI_REQUEST_NULL;
         ReceiveLifecycle receive_lifecycle_ = ReceiveLifecycle::Idle;
@@ -249,10 +262,26 @@ namespace llaminar2
      * sparse data-plane execution. They must not sample, mutate continuation KV,
      * or manufacture token state merely because a control ticket arrived.
      */
+    /** @brief Explicit immediate terminal or retained poll-only native completion ownership. */
+    struct MoEOverlayInferenceAsyncSubmission
+    {
+        MoEOverlayInferenceCompletionFenceProgress progress = MoEOverlayInferenceCompletionFenceProgress::Failed;
+        std::shared_ptr<IMoEOverlayInferenceCompletionFence> completion;
+    };
+
     class IMoEOverlayInferenceTransactionExecutor
     {
     public:
         virtual ~IMoEOverlayInferenceTransactionExecutor() = default;
+
+        /** @brief Submit one graph; Pending must retain the actual producer's armed native fence. */
+        virtual MoEOverlayInferenceAsyncSubmission submitMoEOverlayInferenceTransaction(
+            const MoEOverlayInferenceTransactionTicket &ticket, std::string *error = nullptr)
+        {
+            return {executeMoEOverlayInferenceTransaction(ticket, error) ?
+                MoEOverlayInferenceCompletionFenceProgress::Ready :
+                MoEOverlayInferenceCompletionFenceProgress::Failed, {}};
+        }
 
         /**
          * @brief Execute exactly the graph family and geometry named by a ticket.
@@ -333,6 +362,13 @@ namespace llaminar2
         virtual bool retire(
             const MoEOverlayPublishedInferenceTransaction &transaction,
             std::string *error = nullptr) = 0;
+        /** @brief Poll retirement; unsupported publishers fail instead of blocking implicitly. */
+        virtual MoEOverlayInferenceCompletionFenceProgress tryRetire(
+            const MoEOverlayPublishedInferenceTransaction &, std::string *error = nullptr)
+        {
+            if (error) *error = "Publisher has no asynchronous retirement implementation";
+            return MoEOverlayInferenceCompletionFenceProgress::Failed;
+        }
         /** @brief Publish the successful terminal ticket. */
         virtual bool complete(
             std::uint64_t placement_epoch,
@@ -382,6 +418,10 @@ namespace llaminar2
             const MoEOverlayPublishedInferenceTransaction &transaction,
             std::string *error = nullptr) override;
 
+        /** @brief Poll exact remote completion and release its protocol slot only when ready. */
+        MoEOverlayInferenceCompletionFenceProgress tryRetire(
+            const MoEOverlayPublishedInferenceTransaction &transaction, std::string *error = nullptr) override;
+
         /** @brief Publish the successful terminal after every handle retired. */
         bool complete(
             std::uint64_t placement_epoch,
@@ -405,6 +445,12 @@ namespace llaminar2
         [[nodiscard]] MoEOverlayInferenceProtocolState state() const noexcept
         {
             return protocol_.state();
+        }
+
+        /** @return Original protocol's last authenticated epoch, including transaction advances. */
+        [[nodiscard]] std::uint64_t currentPlacementEpoch() const noexcept
+        {
+            return protocol_.currentPlacementEpoch();
         }
 
         /** @return Ordinal that the next execution or terminal must use. */
@@ -465,7 +511,7 @@ namespace llaminar2
     enum class MoEOverlayInferenceCoordinatorSegmentRole : std::uint8_t
     {
         Continuation = 0, ///< Dense continuation graph group and ticket authority.
-        ExpertFollower,  ///< Remote retained sparse-expert transaction follower.
+        ExpertFollower,  ///< Original retained sparse-expert endpoints, local or remote.
     };
 
     /**
@@ -518,10 +564,10 @@ namespace llaminar2
         /**
          * @brief Seal a complete deterministic plan after graph-family consensus.
          * @param graph_family_generation Exact generation embedded in tickets.
-         * @param segments One continuation plus every remote follower rank.
+         * @param segments One continuation plus every original local/remote expert endpoint group.
          * @return Valid immutable plan in deterministic role/rank order.
          * @throws std::invalid_argument when the plan is incomplete or aliases a
-         *         rank, continuation authority, or follower boundary.
+         *         role on a rank, continuation authority, or follower boundary.
          */
         static MoEOverlayInferenceCoordinatorGraphPlan
         sealAfterSynchronizedMaterialization(
@@ -560,10 +606,19 @@ namespace llaminar2
 
         /**
          * @brief Find the unique segment owned by @p world_rank.
-         * @return Stable plan-owned pointer, or null when the rank is absent.
+         * @return Stable plan-owned pointer, or null when the rank is absent or ambiguous.
          */
         [[nodiscard]] const Segment *segmentForWorldRank(
             int world_rank) const noexcept;
+
+        /**
+         * @brief Find an exact original endpoint role on one actual world rank.
+         * @param world_rank Original process rank; no synthetic ranks are introduced.
+         * @param role Dense continuation or retained expert endpoint ownership.
+         * @return Stable plan-owned pointer, or null for missing/ambiguous membership.
+         */
+        [[nodiscard]] const Segment *segmentForWorldRank(
+            int world_rank, MoEOverlayInferenceCoordinatorSegmentRole role) const noexcept;
 
         /** @return Deterministically ordered immutable segment inventory. */
         [[nodiscard]] const std::vector<Segment> &segments() const noexcept
@@ -735,7 +790,38 @@ namespace llaminar2
             MoEOverlayInferenceWorkloadIdentity workload,
             std::string *error = nullptr);
 
-        /** @brief Open one monotonic command on every target publisher. */
+        /**
+         * @brief Execute finite complete commands under one original host placement.
+         * @param body Original synchronous caller; executes outside the coordinator lock.
+         * @return Exact parent and fully retired original descendant sequence interval.
+         * @throws std::logic_error For unsupported, nested, active or incomplete scope.
+         *
+         * Ordinary current admission remains unchanged outside this scope. Its
+         * checked descendants may enter while publication is reserved because
+         * their live parent already owns that original inference boundary.
+         * A terminal callback exception releases the parent and is rethrown;
+         * missing native completion uses original abort and remains fatal.
+         */
+        MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
+            const std::function<void()> &body);
+
+        /**
+         * @brief Admit an outer command only from the original sealed continuation rank.
+         * @param world_rank Actual original overlay communicator rank, including world-one publishers.
+         * @param command Original request generation, monotonic command identity and admitted epoch floor.
+         * @param error Optional stable rejection diagnostic.
+         * @return True after existing publisher admission; false before publication for foreign/stale identity.
+         * @note The epoch is a scheduling floor. Device packet kernels authenticate the live bank ticket.
+         */
+        bool beginRootCommand(int world_rank, const MoEOverlayInferenceCommandIdentity &command,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Open one monotonic command on every target publisher.
+         * @param command Original request, command and admitted epoch-floor identity.
+         * @param error Optional stable publication diagnostic.
+         * @return Whether every original publisher admitted the command.
+         */
         bool beginCommand(
             const MoEOverlayInferenceCommandIdentity &command,
             std::string *error = nullptr);
@@ -758,6 +844,23 @@ namespace llaminar2
         bool beginGraphSequence(
             int draft_depth,
             std::string *error = nullptr);
+
+        /**
+         * @brief Open the one-row decode bridge at a restored-prefix boundary.
+         *
+         * A prefix harvest schedule may end with a complete prefill chunk and
+         * then one real token. Retire that chunk through the ordinary publisher
+         * completion contract before opening the depth-zero decode sequence.
+         * A direct one-row suffix has no preceding chunk and opens from idle.
+         * Any declared finite prefill interval closes at its exact terminal
+         * ordinal before the suffix starts; decode is outside that interval.
+         * Live, incomplete, speculative and non-prefill sequences are rejected;
+         * this transition never discards slots or synchronizes a device.
+         *
+         * @param error Optional stable rejection or retirement diagnostic.
+         * @return True when the restored-prefix serial decode graph may enter.
+         */
+        bool beginRestoredPrefixDecodeSequence(std::string *error = nullptr);
 
         /**
          * @brief Admit the current participant into a serial prefill sequence.
@@ -894,6 +997,16 @@ namespace llaminar2
          * @return True when this exact transition was applied or had already
          *         been applied by a symmetric participant.
          */
+        /**
+         * @brief Open the first retained sequence named by an authenticated ContinueResponse ticket zero.
+         * @param transition Exact nonterminal speculative depth from the device admission ticket.
+         * @param error Receives the first lifecycle or symmetric-decision disagreement.
+         * @return True once per command, or idempotently for matching symmetric participants.
+         * No predecessor is retired and no committed-token progress is reported.
+         */
+        bool beginHostedContinuationGraphSequence(HostedGraphSequenceTransition transition,
+            std::string *error = nullptr);
+
         bool advanceHostedGraphSequence(
             std::uint64_t transaction_id,
             HostedGraphSequenceTransition transition,
@@ -1091,6 +1204,14 @@ namespace llaminar2
         bool allParticipantsMarked(const std::vector<std::uint8_t> &marks) const;
         /** @brief Validate and retire one completed sequence while mutex_ is held. */
         bool retireCompletedGraphSequenceLocked(std::string *error);
+        /**
+         * @brief Close a declared prefill interval at its exact retired frontier.
+         * @param error Optional cardinality or terminal-publication diagnostic.
+         * @return True for no declaration or a completely retired interval.
+         * @note Called with mutex_ held after graph retirement. Published device
+         * events retain their existing owners; this never waits on a device.
+         */
+        bool closeCompletedPrefillScheduleLocked(std::string *error);
         /** @brief Open one graph sequence while mutex_ is already held. */
         bool beginGraphSequenceLocked(int draft_depth, std::string *error);
         /** @brief Publish the probe terminal once every local boundary exists. */
@@ -1104,6 +1225,13 @@ namespace llaminar2
         /** Optional model-lifetime probe; policy/calibration remain host-owned. */
         std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
             prefill_interference_probe_;
+        /**
+         * @brief Perform existing command publication while the original coordinator mutex is held.
+         * @param command Checked command identity; publishers retain their original validation.
+         * @param error Optional stable diagnostic.
+         * @return Whether every original publisher admitted the command.
+         */
+        bool beginCommandLocked(const MoEOverlayInferenceCommandIdentity &command, std::string *error);
         mutable std::mutex mutex_;
         /** Wakes an ahead prefill submitter after the last sibling seals a group. */
         std::condition_variable graph_group_completion_cv_;
@@ -1139,6 +1267,12 @@ namespace llaminar2
         bool declared_prefill_probe_released_ = false;
         bool declared_prefill_terminal_published_ = false;
         std::string failure_;
+        /**
+         * Original host parent; survives command/request reset. Declared after
+         * config_ so its lease retires before the original shared authority.
+         */
+        std::optional<MoEOverlayResidencyAuthority::TicketLease> placement_scope_parent_;
+
     };
 
     /**
@@ -1157,7 +1291,12 @@ namespace llaminar2
                 coordinator,
             MoEOverlayInferenceExecutionDescriptor descriptor,
             int participant_index);
-        /** @brief Fail an unfinished active graph without throwing. */
+        /**
+         * @brief Publish the original failed terminal for an unfinished active graph.
+         * @note Failure to publish that terminal is process-fatal before worker
+         *       collection or graph-owner release can wait on unproven work.
+         *       A successfully published failed terminal retains normal cancellation.
+         */
         ~MoEOverlayInferenceParticipantGraphScope() noexcept;
 
         MoEOverlayInferenceParticipantGraphScope(
@@ -1269,13 +1408,20 @@ namespace llaminar2
          */
         explicit MoEOverlayInferenceTransactionFollower(Config config);
 
+        /** @brief Retain every failed command's native fence until its producer is proven terminal. */
+        ~MoEOverlayInferenceTransactionFollower();
+
         /**
          * @brief Receive and execute tickets until Complete or Abort arrives.
          *
          * The method performs no token, sampler, logits, or KV coordination. It
          * is intended to run inside the remote rank's coordinated worker command.
+         * @param admitted_command Original outer command provenance when already
+         * published by the global-rank owner; tickets must retain that authority.
+         * @return Completed command or the first protocol/native failure.
          */
-        [[nodiscard]] MoEOverlayInferenceFollowerCommandResult runOneCommand();
+        [[nodiscard]] MoEOverlayInferenceFollowerCommandResult runOneCommand(
+            std::optional<MoEOverlayInferenceCommandIdentity> admitted_command = std::nullopt);
 
         /** @return Protocol state for diagnostics and adversarial tests. */
         [[nodiscard]] MoEOverlayInferenceProtocolState state() const noexcept
@@ -1287,6 +1433,40 @@ namespace llaminar2
         /** @brief Prove channel, protocol, and local follower ownership agree. */
         void validateConstruction() const;
 
+        /** @brief One cold-capacity slot owns its native producer and optional timing sample. */
+        struct PendingExecution
+        {
+            MoEOverlayInferenceTransactionTicket ticket;
+            std::size_t slot_index;
+            MoEOverlayInferenceCompletionFenceProgress submission_progress; ///< Typed immediate/native submission proof.
+            std::shared_ptr<IMoEOverlayInferenceCompletionFence> fence;
+            std::optional<MoEOverlayInferenceInterferenceScope> scope;
+            std::chrono::steady_clock::time_point execution_begin;
+
+            /** @brief Transfer a retained execution into a setup-capacity queue slot. */
+            PendingExecution(MoEOverlayInferenceTransactionTicket value, std::size_t slot,
+                MoEOverlayInferenceAsyncSubmission terminal,
+                std::optional<MoEOverlayInferenceInterferenceScope> sample,
+                std::chrono::steady_clock::time_point begin)
+                : ticket(value), slot_index(slot), submission_progress(terminal.progress),
+                  fence(std::move(terminal.completion)), scope(std::move(sample)), execution_begin(begin) {}
+            PendingExecution(PendingExecution &&) noexcept = default;
+            /** @brief Compact only after the old slot's sample and native ownership retire. */
+            PendingExecution &operator=(PendingExecution &&other) noexcept
+            {
+                if (this == &other) return *this;
+                scope.reset();
+                ticket = other.ticket;
+                slot_index = other.slot_index;
+                submission_progress = other.submission_progress;
+                fence = std::move(other.fence);
+                if (other.scope) scope.emplace(std::move(*other.scope));
+                other.scope.reset();
+                execution_begin = other.execution_begin;
+                return *this;
+            }
+        };
+        std::vector<PendingExecution> pending_; ///< Allocated once; failure never drops native ownership.
         std::shared_ptr<MoEOverlayMPIInferenceTransactionChannel> channel_;
         IMoEOverlayInferenceTransactionExecutor *executor_ = nullptr;
         MoEOverlayInferenceTransactionProtocol protocol_;

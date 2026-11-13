@@ -23,6 +23,7 @@
 
 namespace llaminar2
 {
+    class NativeContextPreparation;
     enum class MoEOverlayDeviceControllerDrainIntent : std::uint8_t;
     enum class MoEOverlayMigrationStorageKind : std::uint8_t;
 
@@ -137,6 +138,17 @@ namespace llaminar2
          * @throws std::runtime_error when exact backend retirement fails.
          */
         [[nodiscard]] ModelContextRetirementReceipt complete();
+        /**
+         * @brief Close original startup-calibration ownership before model ticket completion.
+         * @param original_source Same final model's original native source, or null for no native source.
+         * @return Existing host-only/per-device retirement evidence from complete().
+         * @throws std::exception If calibration loans/handles are still live, before this pending
+         *         boundary is consumed; completed or backend-failed boundaries remain strict.
+         * @note Actual model/workspace owners must already be dropped. This overload adds no
+         *       source ownership, runtime reset or alternate retirement authority.
+         */
+        [[nodiscard]] ModelContextRetirementReceipt complete(
+            const std::shared_ptr<NativeContextPreparation>& original_source);
 
     private:
         PendingExclusiveModelRetirement(
@@ -174,5 +186,23 @@ namespace llaminar2
     [[nodiscard]] ModelContextRetirementReceipt
     retireExclusiveModelContextReuseContract(
         ModelContextReuseContract &contract);
+
+    /** @brief Actual original native generations retired after an invalid final model was discarded. */
+    struct InvalidModelContextDiscardReceipt final {
+        std::size_t native_contexts_retired=0;
+        /** @return Actual completed original-source native reset receipts, not a reusable allocation BOM. */
+        std::size_t retiredDeviceCount()const noexcept{return native_contexts_retired;}
+    };
+    /**
+     * @brief Dispose exclusively owned terminal Invalid state without making it reusable.
+     * @param contract Original failed-seal contract after every runner has released ownership.
+     * @return Actual original-source final retirement evidence; CPU-only disposal has zero native receipts.
+     * @throws std::exception For non-Invalid lifecycle, borrowed owners, foreign source/PMA,
+     * missing GPU source or unproven central-ledger-zero native retirement.
+     * @note Lifecycle and provenance checks precede owner release; native zero-allocation validation follows model/workspace destruction.
+     * This cannot restore reuse or consume RunnerExclusive, Sealing or Reusable contracts.
+     */
+    [[nodiscard]] InvalidModelContextDiscardReceipt discardExclusiveInvalidModelContextReuseContract(
+        ModelContextReuseContract& contract);
 
 } // namespace llaminar2

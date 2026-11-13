@@ -315,8 +315,10 @@ namespace llaminar2::test
                 EXPECT_EQ(command.candidate_epoch, 8u);
                 EXPECT_NE(command.source_participant,
                           command.destination_participant);
-                const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
-                    command.flags);
+                EXPECT_GE(moeOverlayMovementCycle(command.flags), 1u);
+                EXPECT_LE(moeOverlayMovementCycle(command.flags),
+                          plan.evidence.accepted_cycles);
+                const auto axis = moeOverlayMovementAxis(command.flags);
                 EXPECT_TRUE(
                     axis == MoEOverlayDeviceMovementAxis::TierResidency ||
                     axis ==
@@ -337,6 +339,37 @@ namespace llaminar2::test
             }
         }
     } // namespace
+
+    /** @test Actual measured policy author retains every admitted original group. */
+    TEST(Test__MoEOverlayDevicePlacementPolicy, AuthoredCycleIdsSurviveTwoAndFiveCycleBudgets)
+    {
+        for (const std::uint32_t budget : {2u, 5u})
+        {
+            auto policy_input = input(
+                {0, 0, 17, 17},
+                {2, 2, 3, 3, 0, 0, 1, 1},
+                {800, 700, 600, 500, 40, 30, 20, 10}, budget);
+            const auto first = policy_input.collected_state;
+            policy_input.num_layers = 2u;
+            policy_input.collected_state.assign(4u * 2u * 8u, 0u);
+            for (std::uint32_t participant = 0u; participant < 4u; ++participant)
+                for (std::uint32_t layer = 0u; layer < 2u; ++layer)
+                    std::copy_n(first.begin() + participant * 8u, 8u,
+                        policy_input.collected_state.begin() + (participant * 2u + layer) * 8u);
+            policy_input.payload_bytes_per_layer = {4096u, 4096u};
+            policy_input.command_capacity = 16u;
+            attachMeasuredEconomy(&policy_input);
+            const auto plan = MoEOverlayDevicePlacementPolicyReference::planDynamic(policy_input);
+            ASSERT_EQ(plan.evidence.accepted_cycles, budget);
+            expectCanonicalCommands(plan);
+            for (std::uint32_t id = 1u; id <= budget; ++id)
+            {
+                const auto count = std::count_if(plan.commands.begin(), plan.commands.end(),
+                    [id](const auto &entry) { return moeOverlayMovementCycle(entry.flags) == id; });
+                EXPECT_GE(count, 2);
+            }
+        }
+    }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,
          AdversarialTwoPriorityLayoutPromotesHotExpertsAndDemotesColdExperts)
@@ -436,8 +469,7 @@ namespace llaminar2::test
         bool advances_participant = false;
         for (const auto &command : plan.commands)
         {
-            const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
-                command.flags);
+            const auto axis = moeOverlayMovementAxis(command.flags);
             advances_tier = advances_tier ||
                 axis == MoEOverlayDeviceMovementAxis::TierResidency ||
                 axis == MoEOverlayDeviceMovementAxis::Combined;
@@ -527,8 +559,7 @@ namespace llaminar2::test
         bool advances_participant = false;
         for (const auto &command : plan.commands)
         {
-            const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
-                command.flags);
+            const auto axis = moeOverlayMovementAxis(command.flags);
             advances_tier = advances_tier ||
                 axis == MoEOverlayDeviceMovementAxis::TierResidency ||
                 axis == MoEOverlayDeviceMovementAxis::Combined;
@@ -565,8 +596,7 @@ namespace llaminar2::test
             plan.commands.end(),
             [](const auto &command)
             {
-                return static_cast<MoEOverlayDeviceMovementAxis>(
-                           command.flags) ==
+                return moeOverlayMovementAxis(command.flags) ==
                        MoEOverlayDeviceMovementAxis::ParticipantPlacement;
             }));
         for (std::int32_t participant = 0; participant < 4; ++participant)
