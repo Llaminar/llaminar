@@ -5121,3 +5121,28 @@ Admission.cpp:23. Mac-coverage gap class (affected TUs Linux-only;
 (remove/qualify the forward decl; extend the TU-compile probe rule
 to MoE/planning headers; fix SHA -> sparks re-pins .80 replacing
 the b660 pin... [note: sparks holds; earlier-SHA pin rejected]).
+
+### Main: 221 needs the base delta; lane handback = Linux compile required (23:50Z)
+
+(1) .79 sealed gate @ 03480d07e ACCEPTED as the early-surface
+record; bucket-b present => chain-introduced CONFIRMED. **221 reds
+NOT accepted as "known"** — full classification needs a d5e04fdce
+CUDA-ON control on .79 (same script, same image, base SHA): the
+triage-tip gate rerun on .79 gets a failed-set DIFF vs that base
+= only the delta is ours; 39 cuda-socket + 126 exclusive cannot be
+attributed without it. BUDGETED NOW: sparks runs the d5e04fdce
+CUDA-ON base control on .79 (K14-STAGEAGATE-D5E04FDCE-CUDAON-
+BASELINE). (2) BUILD BREAK = CONFIRMED IN SOURCE (Main): global-
+scope `struct ClusterInventory;` at MoEOverlayCapacityAdmission.h:
+29 OUTSIDE namespace llaminar2, in ba2811e4c's DIFF = the lane
+introduced it. FIX: delete / include DeviceInventory.h / forward-
+declare INSIDE namespace. NEW STANDING RULES (Main): (a) every
+edited header gets a Linux g++-14 standalone include-compile
+(echo '#include "<hdr>"' | g++-14 -std=gnu++23 -fsyntax-only -x
+c++ - <includes>); (b) EVERY transitively-including TU compiled on
+Linux before handback (ninja -t query/deps OR build the owning
+test targets on .80); (c) **lane handbacks require Linux compile
+evidence of the affected targets — Mac probe NO LONGER ACCEPTABLE**
+(3 failures on record: RECORD arity, Linux-only TUs, ClusterInventory).
+Triage-tip gate rerun on .79 after the focused greens; diff vs the
+base; ONLY the delta ours.
