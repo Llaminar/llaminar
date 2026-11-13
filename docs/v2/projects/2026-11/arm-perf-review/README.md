@@ -4676,3 +4676,35 @@ SHA. A2 FINAL scope = A2-R1 + docs list (the A2-R1 already coded;
 docs items to be confirmed in the push). LESSON: tool-bash with
 0.0% CPU for >15m = probe the process tree for pager/editor waits
 (same class as the earlier pipeline masks).
+
+### T' = 03480d07e LANDED + VERIFIED; all legs re-targeted (20:40Z)
+
+Lane reported T' @ 03480d07e, pushed (ee66b1ed6..03480d07e);
+coordinator verified on origin: chain correct (T -> ee66b1ed6 ->
+74104b6b6 A2-R1 -> c848e4061 docs-T' -> 03480d07e 6ceae8219
+cherry-pick); 03480d07e patch content IDENTICAL to PR's 6ceae8219
+(only index/hunk headers differ); touches exactly
+tests/v2/CMakeLists.txt; range 91e0437c6..03480d07e = 5 files
+(design doc + ExpertTierWeightStream.cpp + CMakeLists.txt +
+V2ExpertTierRectangularWeightTests.cmake + Test__ExpertTierWeight
+Stream.cpp), progress_replay NOT in range. A2-R1 implementation =
+catch-variant (exactly std::invalid_argument -> reject(error,...),
+no allocation, pre-filled cpu byte-identical; regression
+GpuToCpuReferenceRejectsUnimplementedLayoutsWithoutThrowing,
+Q4_0+Q8_0 canonical/compact/0xFF, EXISTING preflight filter — no
+new gate; sibling noexcept audit in commit). Doc truthfulness
+verified in-tree (presence contract, no 5-findings framing, local
+arithmetic static_asserts, direct-kernel-not-capture, Unit-not-
+preflight, archive no-hash wording zero occurrences). Mac gates
+green (A2-R1 probe, 297/297, 12/12, 4/4, 5/5, RECORD + DI probes,
+.inc probes, py_compile). DISPATCHED: sparks (91e0437c6 run =
+early-surface NO seal -> 2-edit script update: full SHA
+03480d07e33b815ac8a146bcac333273d07ab73c + OUT=sa-results-03480d07e
+-> coord re-verify 2 edits -> sealed gate at 03480d07e,
+K14-STAGEAGATE-03480D07E); WSL (T' x86 incremental — run NOT
+proof-by-diff since A2-R1 = CPU code; then develop-control; then
+base retry; seal K14-STAGEAGATE-X86-03480D07E); Main (T' verified;
+lane's flag: tracker-docs commits in the range — keep, no rewrite
+unless Main wants; reviewer exact-pin pre-staged offer out; pins
+A2-fixup/A3-fixup/A4 at T' -> Gate-A d5e04fdce..03480d07e).
+HANG LESSON recorded (vi-editor probe rule).
