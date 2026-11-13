@@ -70,6 +70,10 @@ StaticJointOriginal staticJointOriginal(int rank=0,int members=2,bool serial_lay
  for(auto& domain:plan.domains)if(domain.name=="cpu_joint")
   for(size_t p=0;p<domain.participants.size();++p)
    domain.participants[p]=GlobalDeviceAddress::cpu(test::localNativeSourceTestNUMANode()+int((p+domain.participants.size()-size_t(rank))%domain.participants.size()));
+ // Device-free fixture: admission requires the inventory-bound observation;
+ // the single-ISA fixture truth is canonical.
+ plan.resolved_cpu_prepared_layout=
+  cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
  plan.residency_policy=RoutedExpertResidencyPolicy::StaticById;
  plan.authority_execution=resolveMoEOverlayAuthorityExecutionKind(plan);
  auto original=std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(plan));

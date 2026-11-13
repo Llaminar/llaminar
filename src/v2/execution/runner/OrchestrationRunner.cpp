@@ -18815,7 +18815,8 @@ namespace llaminar2
                                 metadata.num_experts,
                                 layer_weight_manifest,
                                 physical_budgets,
-                                policy);
+                                policy,
+                                &cluster_inventory_);
                         return true;
                     });
 

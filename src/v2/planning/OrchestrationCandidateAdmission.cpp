@@ -307,7 +307,8 @@ namespace llaminar2
                     budgets.insert(budgets.end(), local.back().physical_budgets.begin(), local.back().physical_budgets.end());
                 }
                 auto draft=MoEOverlayCapacityAdmission::resolveCapacityDraft(
-                    overlay_plan,profile.expert_count,manifest,budgets,capacity_policy);
+                    overlay_plan,profile.expert_count,manifest,budgets,capacity_policy,
+                    &inventory);
                 selected_draft.emplace(std::move(draft));
                 selected_local=std::move(local);
                 selected_segments=std::move(segments);

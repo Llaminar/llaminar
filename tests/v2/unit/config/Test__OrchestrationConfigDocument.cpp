@@ -338,6 +338,18 @@ TEST(OrchestrationConfigDocument, EveryRequiredOrExtraObjectFieldIsRejected)
                     EXPECT_FALSE(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache);
                     EXPECT_EQ(Json::parse(serializeOrchestrationConfig(decoded)), document);
                 }
+                else if ((path / key).to_string() ==
+                    "/configuration/moe_routed_expert_plan/resolved_cpu_prepared_layout")
+                {
+                    // Additive optional planning observation (seq 148): an
+                    // absent field is a pre-A4 document, decoded to nullopt —
+                    // never a schema error (same contract as local_hot_cache).
+                    ASSERT_TRUE(value.is_null());
+                    const auto decoded = deserializeOrchestrationConfig(missing.dump());
+                    ASSERT_TRUE(decoded.moe_routed_expert_plan);
+                    EXPECT_FALSE(decoded.moe_routed_expert_plan->resolved_cpu_prepared_layout);
+                    EXPECT_EQ(Json::parse(serializeOrchestrationConfig(decoded)), document);
+                }
                 else
                     EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument)
                         << path << "/" << key;

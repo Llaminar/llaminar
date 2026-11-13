@@ -29,7 +29,11 @@ MoERoutedExpertPlacementPlan cpuShardPlan(int experts=4){
  d.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;d.routed_phase_policy=RoutedExpertPhasePolicy::Uniform;
  d.routed_decode_assignment_policy=d.routed_prefill_assignment_policy=RoutedExpertAssignmentPolicy::StaticOwner;p.domains={d};
  p.routed_tiers={{.name="joint",.domain=d.name,.priority=0,.max_experts_per_layer=experts,.fallback=true}};
- p.placements={{.layer=3,.routed_expert_tier=std::vector<int>(experts,0)}};return p;
+ p.placements={{.layer=3,.routed_expert_tier=std::vector<int>(experts,0)}};
+ // Device-free fixture: admission requires the inventory-bound observation;
+ // the single-ISA fixture truth is canonical.
+ p.resolved_cpu_prepared_layout=cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
+ return p;
 }
 /** @return Original PMA resource views with an exact requested capacity, no anonymous reserve. */
 std::vector<MoEOverlayBoundPhysicalMemoryBudget> cpuShardBudgets(std::size_t first,std::size_t second){

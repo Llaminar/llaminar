@@ -860,14 +860,26 @@ namespace llaminar2
             std::invalid_argument);
 
         // The bound overlay's layout is the sole pricing input; compact
-        // tables are not implemented, so a compact-bound plan fails closed
-        // at the section authority rather than under-admitting.
+        // tables are not implemented. The observation itself is admitted
+        // (buildResolverInput validates presence, not executability); the
+        // section authority fails closed at PRICING rather than
+        // under-admitting foreign bytes.
         plan.resolved_cpu_prepared_layout =
             CPUNativeQuantisedLayout::InterleavedCompactA64;
-        EXPECT_THROW(
-            static_cast<void>(MoEOverlayCapacityAdmission::buildResolverInput(
-                plan, experts, model_manifest, budgets, policy)),
-            std::invalid_argument);
+        {
+            const auto compact_input =
+                MoEOverlayCapacityAdmission::buildResolverInput(
+                    plan, experts, model_manifest, budgets, policy);
+            EXPECT_EQ(compact_input.cpu_prepared_layout,
+                CPUNativeQuantisedLayout::InterleavedCompactA64);
+            EXPECT_THROW(
+                static_cast<void>(
+                    MoEOverlayCapacityResolver::preparedFootprints(
+                        compact_input.layer_weight_manifest,
+                        DeviceMoEProjectionSet::CompleteExpert,
+                        compact_input.cpu_prepared_layout)),
+                std::invalid_argument);
+        }
 
         // The canonical bound layout prices exactly the build-default bytes.
         plan.resolved_cpu_prepared_layout =
@@ -4205,12 +4217,16 @@ namespace llaminar2
     /** @brief Physical admission rejects foreign manifests before installing quotas. */
     TEST(MoEOverlayCapacityResolver, PipelineStageAdmissionAuthenticatesManifestOrigin)
     {
+        using cpu::native_quantised::CPUNativeQuantisedLayout;
         MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
         plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan.first_model_layer = 32;
         plan.continuation_domain = plan.shared_expert_domain = "stage";
         plan.domains = {boundDomain("stage", 0, GlobalDeviceAddress::cpu(0))};
+        // Device-free fixture: admission requires the inventory-bound
+        // observation; the single-ISA fixture truth is canonical.
+        plan.resolved_cpu_prepared_layout = CPUNativeQuantisedLayout::InterleavedCanonical;
         plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
         const std::vector owned{layer(32, native_quantised_formats::Q4_K), layer(33, native_quantised_formats::Q4_K)};
         const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned);

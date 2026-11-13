@@ -25,6 +25,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+
+struct ClusterInventory;
 #include <utility>
 #include <vector>
 
@@ -451,7 +453,8 @@ namespace llaminar2
             int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {});
+            const MoEOverlayCapacityAdmissionPolicy &policy = {},
+            const ClusterInventory *inventory = nullptr);
 
         /**
          * @brief Admit complete expert coverage and the largest bounded cache.
@@ -475,7 +478,8 @@ namespace llaminar2
             int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {});
+            const MoEOverlayCapacityAdmissionPolicy &policy = {},
+            const ClusterInventory *inventory = nullptr);
 
         /**
          * @brief Admit a complete pipeline and its bounded replica caches together.
@@ -493,7 +497,8 @@ namespace llaminar2
          * same admission transaction, so shared resources have one authority.
          */
         [[nodiscard]] static std::vector<MoEOverlayResolvedCapacityPlan>
-        resolvePipelineCapacity(std::span<const MoEOverlayStageCapacityRequest> stages);
+        resolvePipelineCapacity(std::span<const MoEOverlayStageCapacityRequest> stages,
+            const ClusterInventory *inventory = nullptr);
         /**
          * @brief Freeze replica/quota decisions without granting materialization.
          * @param stages Complete authored requests for the higher-priority search.
@@ -501,7 +506,8 @@ namespace llaminar2
          * @throws MoEOverlayCapacityExhausted For higher-priority capacity pressure only.
          */
         static MoEOverlayCapacityDraft resolvePipelineCapacityDraft(
-            std::span<const MoEOverlayStageCapacityRequest> stages);
+            std::span<const MoEOverlayStageCapacityRequest> stages,
+            const ClusterInventory *inventory = nullptr);
         /**
          * @brief Freeze a standalone overlay's higher-priority quotas and replica grant.
          * @param plan Exact hardware-bound overlay topology.
@@ -515,7 +521,8 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlan &plan,int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {});
+            const MoEOverlayCapacityAdmissionPolicy &policy = {},
+            const ClusterInventory *inventory = nullptr);
 
         /**
          * @brief Resolve capacity and install its exact quotas into a plan copy.
@@ -534,6 +541,7 @@ namespace llaminar2
             int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {});
+            const MoEOverlayCapacityAdmissionPolicy &policy = {},
+            const ClusterInventory *inventory = nullptr);
     };
 } // namespace llaminar2

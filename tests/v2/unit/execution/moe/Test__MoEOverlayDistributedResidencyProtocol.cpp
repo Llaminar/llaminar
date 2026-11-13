@@ -639,6 +639,13 @@ namespace llaminar2::test
         // before seal-time column arithmetic could divide by a zero stride.
         auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cpu(), DeviceId::cuda(0));
+        // The destination-wire builder names a CPU-END-to-CPU-END receiver
+        // expectation (both endpoints CPU) — not the CPU→GPU stream boundary.
+        auto cpu_identity = remoteProjectionIdentity(
+            fixture.transaction, DeviceId::cpu(), DeviceId::cpu());
+        cpu_identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCompactA64);
         identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
             cpu::native_quantised::CPUNativeQuantisedLayout::
                 InterleavedCompactA64);
@@ -681,14 +688,31 @@ namespace llaminar2::test
                       std::string::npos);
         }
 
+        const auto cpu_intersection =
+            ExpertTierWeightProjectionIntersection::between(
+                MoEExpertProjectionOwnership::Projection{
+                    .residence =
+                        MoEProjectionResidence::ExpertOwner,
+                    .source_rows = zero_root.N,
+                    .source_columns = zero_root.K,
+                    .first_row = 0,
+                    .rows = zero_root.N,
+                    .first_column = 0,
+                    .columns = zero_root.K},
+                MoEExpertProjectionOwnership::Projection{
+                    .residence =
+                        MoEProjectionResidence::ExpertOwner,
+                    .source_rows = zero_root.N,
+                    .source_columns = zero_root.K,
+                    .first_row = 0,
+                    .rows = zero_root.N,
+                    .first_column = 0,
+                    .columns = zero_root.K});
         try
         {
             [[maybe_unused]] const auto rejected =
                 makeMoEOverlayRemoteCpuDestinationProjectionManifest(
-                    identity, zero_root,
-                    ExpertTierWeightProjectionIntersection::between(
-                        stream.source_projection,
-                        stream.destination_projection),
+                    cpu_identity, zero_root, cpu_intersection,
                     /*capacity=*/4096);
             FAIL() << "compact-labelled destination wire must be refused before arithmetic";
         }

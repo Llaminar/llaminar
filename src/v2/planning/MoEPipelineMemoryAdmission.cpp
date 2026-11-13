@@ -287,7 +287,13 @@ namespace llaminar2
                     requests.push_back({*stage.topology_.config().moe_routed_expert_plan,profile.expert_count,stage.manifest_,
                         cross_rank?complete[index].budgets:fixed[index].physical_budgets,stage.storage_policy_});
                 }
-                selected=MoEOverlayCapacityAdmission::resolvePipelineCapacityDraft(requests);
+                // The stage plans are authored config plans, not overlay-bound
+                // copies: admission observes the uniform CPU layout from the
+                // SAME live inventory (with the same cross-layout refusal) the
+                // hardware binder would use, so a PP stage with a CPU expert
+                // tier is admitted instead of refused as an unbound plan.
+                selected=MoEOverlayCapacityAdmission::resolvePipelineCapacityDraft(
+                    requests, &inventory);
                 return true;
             };
             if(cross_rank && original) {

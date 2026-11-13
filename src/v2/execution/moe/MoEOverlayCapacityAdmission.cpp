@@ -13,6 +13,7 @@
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEOverlayNoPeerResidency.h"
 #include "MoEOverlayPhysicalLaneDemand.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 
 #include <algorithm>
 #include <limits>
@@ -38,6 +39,106 @@ namespace llaminar2
                 return device < other.device;
             }
         };
+
+        /** @return Observed rank inventory for one world rank, or null. */
+        [[nodiscard]] const RankInventory *rankByObservedRank(
+            const ClusterInventory &inventory, int rank)
+        {
+            for (const auto &candidate : inventory.ranks)
+                if (candidate.rank == rank)
+                    return &candidate;
+            return nullptr;
+        }
+
+        /**
+         * @brief Resolve the overlay-uniform CPU prepared layout from live inventory.
+         *
+         * This is the SAME observation and refusal the hardware binder publishes:
+         * every CPU participant's owning rank is observed and paired; mixed
+         * layouts and unobserved owner ranks are typed rejections. Absent when
+         * the overlay declares no CPU participant. A plan that carries the
+         * binder's own observation never reaches this derivation.
+         */
+        [[nodiscard]] std::optional<
+            cpu::native_quantised::CPUNativeQuantisedLayout>
+        resolveUniformCpuPreparedLayoutFromInventory(
+            const ClusterInventory &inventory,
+            const MoERoutedExpertPlacementPlan &plan)
+        {
+            std::vector<std::pair<std::string, int>> cpu_endpoint_owners;
+            for (const auto &domain : plan.domains)
+            {
+                if (!domain.world_ranks.empty() &&
+                    domain.world_ranks.size() != domain.participants.size())
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay capacity admission cannot resolve CPU "
+                        "endpoint ranks for domain '" +
+                        domain.name +
+                        "': the domain declares a different rank count than "
+                        "participants");
+                }
+                for (std::size_t index = 0;
+                     index < domain.participants.size(); ++index)
+                {
+                    if (domain.participants[index].device_type !=
+                        DeviceType::CPU)
+                        continue;
+                    const int rank = !domain.world_ranks.empty()
+                        ? domain.world_ranks[index]
+                        : domain.owner_rank;
+                    if (rank < 0)
+                    {
+                        throw std::invalid_argument(
+                            "ExpertOverlay CPU endpoint in domain '" +
+                            domain.name +
+                            "' has no bound rank to observe; declare "
+                            "world_ranks or owner_rank");
+                    }
+                    cpu_endpoint_owners.push_back({domain.name, rank});
+                }
+            }
+            if (cpu_endpoint_owners.empty())
+                return std::nullopt;
+            const RankInventory *first = rankByObservedRank(
+                inventory, cpu_endpoint_owners.front().second);
+            if (!first)
+            {
+                throw std::invalid_argument(
+                    "MoE overlay CPU endpoint references an unobserved owner rank");
+            }
+            const auto uniform = first->cpu_prepared_layout;
+            for (const auto &endpoint : cpu_endpoint_owners)
+            {
+                const RankInventory *owner =
+                    rankByObservedRank(inventory, endpoint.second);
+                if (!owner)
+                {
+                    throw std::invalid_argument(
+                        "MoE overlay CPU endpoint references an unobserved owner rank");
+                }
+                if (owner->cpu_prepared_layout != uniform)
+                {
+                    throw std::invalid_argument(
+                        "MoE overlay domain '" + endpoint.first +
+                        "' pairs CPU rank " +
+                        std::to_string(endpoint.second) +
+                        " executing prepared layout '" +
+                        cpu::native_quantised::preparedLayoutName(
+                            owner->cpu_prepared_layout) +
+                        "' with CPU rank " +
+                        std::to_string(
+                            cpu_endpoint_owners.front().second) +
+                        " executing '" +
+                        cpu::native_quantised::preparedLayoutName(
+                            uniform) +
+                        "'; cross-layout CPU endpoint pairing is refused at "
+                        "planning time before any allocation or prepared-weight "
+                        "transfer");
+                }
+            }
+            return uniform;
+        }
 
         [[nodiscard]] const RoutedExpertDomain &requireDomain(
             const MoERoutedExpertPlacementPlan &plan,
@@ -398,7 +499,8 @@ namespace llaminar2
         int num_experts,
         const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
         const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-        const MoEOverlayCapacityAdmissionPolicy &policy)
+        const MoEOverlayCapacityAdmissionPolicy &policy,
+        const ClusterInventory *inventory)
     {
         if (!plan.usesExpertOverlayAuthority())
         {
@@ -576,13 +678,25 @@ namespace llaminar2
             physical_budgets.begin(), physical_budgets.end(),
             [](const MoEOverlayBoundPhysicalMemoryBudget &budget)
             { return budget.device().is_cpu(); });
-        if (has_cpu_resource && !plan.resolved_cpu_prepared_layout)
-            throw std::invalid_argument(
-                "ExpertOverlay capacity admission requires the inventory-bound "
-                "uniform CPU prepared layout for every CPU resource");
+        std::optional<cpu::native_quantised::CPUNativeQuantisedLayout>
+            resolved_observation = plan.resolved_cpu_prepared_layout;
+        if (has_cpu_resource && !resolved_observation)
+        {
+            if (inventory == nullptr)
+                throw std::invalid_argument(
+                    "ExpertOverlay capacity admission requires the inventory-bound "
+                    "uniform CPU prepared layout for every CPU resource");
+            // Producers that reach admission with live inventory (pipeline
+            // admission, candidate admission, the serving runner) derive the
+            // observation here with the SAME uniformity refusal the hardware
+            // binder applies; only API misuse without inventory keeps the
+            // hard refusal above. The throw is never silently defaulted.
+            resolved_observation =
+                resolveUniformCpuPreparedLayoutFromInventory(*inventory, plan);
+        }
         MoEOverlayCapacityResolverInput input;
         input.num_experts = num_experts;
-        input.cpu_prepared_layout = plan.resolved_cpu_prepared_layout.value_or(
+        input.cpu_prepared_layout = resolved_observation.value_or(
             cpu::native_quantised::kHostPreparedLayout);
         input.initial_residency_policy =
             policy.migrationEnabled()
@@ -789,33 +903,39 @@ namespace llaminar2
         int num_experts,
         const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
         const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-        const MoEOverlayCapacityAdmissionPolicy &policy)
+        const MoEOverlayCapacityAdmissionPolicy &policy,
+        const ClusterInventory *inventory)
     {
         const MoEOverlayStageCapacityRequest stage{
             plan, num_experts, layer_weight_manifest, physical_budgets, policy};
-        auto result = resolvePipelineCapacity(std::span(&stage, 1u));
+        auto result = resolvePipelineCapacity(
+            std::span(&stage, 1u), inventory);
         return std::move(result.front());
     }
 
     std::vector<MoEOverlayResolvedCapacityPlan>
     MoEOverlayCapacityAdmission::resolvePipelineCapacity(
-        std::span<const MoEOverlayStageCapacityRequest> stages)
+        std::span<const MoEOverlayStageCapacityRequest> stages,
+        const ClusterInventory *inventory)
     {
-        return resolvePipelineCapacityDraft(stages).admit();
+        return resolvePipelineCapacityDraft(stages, inventory).admit();
     }
 
     MoEOverlayCapacityDraft MoEOverlayCapacityAdmission::resolveCapacityDraft(
         const MoERoutedExpertPlacementPlan &plan,int num_experts,
         const std::vector<MoEOverlayLayerWeightManifest> &manifest,
         const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &budgets,
-        const MoEOverlayCapacityAdmissionPolicy &policy)
+        const MoEOverlayCapacityAdmissionPolicy &policy,
+        const ClusterInventory *inventory)
     {
         const MoEOverlayStageCapacityRequest stage{plan,num_experts,manifest,budgets,policy};
-        return resolvePipelineCapacityDraft(std::span(&stage,1u));
+        return resolvePipelineCapacityDraft(
+            std::span(&stage,1u), inventory);
     }
 
     MoEOverlayCapacityDraft MoEOverlayCapacityAdmission::resolvePipelineCapacityDraft(
-        std::span<const MoEOverlayStageCapacityRequest> stages)
+        std::span<const MoEOverlayStageCapacityRequest> stages,
+        const ClusterInventory *inventory)
     {
         if (stages.empty())
             throw std::invalid_argument("ExpertOverlay pipeline admission requires at least one stage");
@@ -874,7 +994,8 @@ namespace llaminar2
                         workspace.local_transfer_slot_count);
                 }
                 inputs.push_back(buildResolverInput(stage.plan, stage.num_experts,
-                    stage.layer_weight_manifest, stage.physical_budgets, candidate));
+                    stage.layer_weight_manifest, stage.physical_budgets,
+                    candidate, inventory));
             }
             auto result = MoEOverlayCapacityResolver::resolvePipelineDraft(inputs);
             std::vector<std::optional<MoEOverlayReplicaCacheCapacity>> admitted(stages.size());
@@ -930,14 +1051,16 @@ namespace llaminar2
         int num_experts,
         const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
         const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-        const MoEOverlayCapacityAdmissionPolicy &policy)
+        const MoEOverlayCapacityAdmissionPolicy &policy,
+        const ClusterInventory *inventory)
     {
         const auto capacity = resolveCapacity(
             plan,
             num_experts,
             layer_weight_manifest,
             physical_budgets,
-            policy);
+            policy,
+            inventory);
         return MoEOverlayCapacityResolver::installResolvedQuotas(
             plan, capacity);
     }
