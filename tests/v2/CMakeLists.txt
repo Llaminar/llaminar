@@ -42188,7 +42188,7 @@ if(HAVE_CUDA AND TARGET v2_integration_cuda_ops_parity)
         COMMAND $<TARGET_FILE:v2_integration_cuda_ops_parity>
             --gtest_filter=Test__CUDAOpsParity.ResidualAdd_*
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;ResidualAdd;ExplicitStream;Contract;Regression"
-        MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA)
+        MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA TIMEOUT 60)
     if(TEST V2_Integration_CUDAResidualAddInvocationContract)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAResidualAddInvocationContract)
     endif()
@@ -42198,7 +42198,7 @@ if(HAVE_CUDA AND TARGET v2_integration_cuda_attention_padding_parity)
         COMMAND $<TARGET_FILE:v2_integration_cuda_attention_padding_parity>
             --gtest_filter=Test__CUDAAttentionPaddingParity.LMHeadPaddedBucketUsesLastRealRowOnGPU:Test__CUDAAttentionPaddingParity.DecodeContinuationUsesRealKVLengthOnGPU
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;Attention;Workspace;Transfer;Contract;Regression"
-        MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA)
+        MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA TIMEOUT 60)
     if(TEST V2_Integration_CUDAAttentionPaddingInvocationContract)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAAttentionPaddingInvocationContract)
     endif()
