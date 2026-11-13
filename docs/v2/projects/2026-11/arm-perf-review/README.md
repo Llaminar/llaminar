@@ -3536,3 +3536,24 @@ outside the tree; (3) build-a1h+tip-a1h (artifacts preserved in
 a1h-results/, coordinator-verified) + old tip checkouts if <60G free.
 Then resume a2c (objects intact; failed links + ~440 targets only) ->
 test phase -> K14-A2CUDAB-B37537145 -> A3 boundary at c24673b2a.
+
+### WITNESS FAILURE AT A2C (08:20Z): envelope root-claim REFUTED; base-vs-lane discriminator dispatched
+
+Tile-register witness fails at a2c resume: 3 programs spill over
+budget (3:2:0:2:0:0 5>3; 3:2:1:2:0:0 5>3; 4:2:0:1:0:0 4>2), g++-14
+GNU-14 NEON_I8MM. Sparks' root claim ("a2c envelope adds +fp16fml,
+A1 was +i8mm-only and clean") REFUTED from the cfg logs: a1h and a2c
+configure IDENTICALLY (+simd+dotprod+i8mm+fp16fml, NEON_I8MM); the
+lane diff does not touch the envelope; the A1 TARGETED build never
+generated the witness (no A1 observation exists). This = the first
+witness run under container g++-14 on this branch. DISCRIMINATOR
+dispatched to lane: run the witness script on BASE d5e04fdce probe
+source with identical flags — base-fails = pre-existing base gap
+(clang-tuned budgets never validated under Debian g++-14; route to
+Main/reviewer, not a lane regression); base-clean = lane's Phase-0
+tile changes regressed g++-14 while clang-only 12/12 evidence stayed
+green (fix register pressure Phase-0-style, NO budget increase; add
+a g++-14 leg to the tile gate). Plus local Homebrew-g++-14 repro with
+exact ninja flags. Sparks: a2c resume HELD; no envelope reconfigure,
+no witness/budget edits. Disk event closed: pruned to 77-80G free,
+seal evidence preserved (a2b logs kept as reviewer evidence).
