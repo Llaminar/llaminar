@@ -681,15 +681,16 @@ canonical arm is a lane defect and blocks landing.
 
 ## 8. Phase plan (this branch; Unit green each phase; push per checkpoint)
 
-- **Current chain (seq 156, Main's sequencing ruling, option A):**
-  `d5e04fdce` → `…` → `609638aba` → `aa842a1be` → **`91e0437c6`
-  (T)**; PR side: `…` → `1011d0578` → `31dd1f7ee`. T = Main's
-  `fix(nccl): expect the host ISA's trap signal in the progress replay`
-  cherry-picked **verbatim** as ONE declared dependency commit:
-  `git diff --name-only aa842a1be..T` is exactly
-  `scripts/docker/native-completed-broadcast/progress_replay.py` (byte-
-  identical to the PR commit; py_compile + RECORD probe + Mac gates
-  green; Stage-A logic untouched). Gate-A/Stage-A gate targets T.
+- **Current chain (seq 156/167):** `d5e04fdce` → `…` → `609638aba` →
+  `aa842a1be` → **`91e0437c6` (T)** → **`091e32db3` (T′, A2-R1 fixup)**;
+  PR side: `…` → `1011d0578` → `31dd1f7ee`. T is Main's
+  `fix(nccl)` dependency cherry-picked **verbatim** as ONE declared
+  commit (`git diff --name-only aa842a1be..T` is exactly
+  `scripts/docker/native-completed-broadcast/progress_replay.py`).
+  T′ is the reviewer's A2 FINAL verdict fixup (noexcept bool/error
+  contract on the host reference + audit + doc truthfulness). The
+  Stage-A gate runs early-surface at T and binds to T′.
+>>>>>>> ed2dfdd9b (docs(arm-perf): record the A2-R1 fixup tip T' under the seq-167 verdict)
 
 - **Phase 0 — typed layout spine, zero byte change.** Layout enum, host
   constant, layout-aware stride functions (canonical arms delegate to the
