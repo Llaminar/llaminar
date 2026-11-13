@@ -4740,3 +4740,18 @@ prime), FULL-DOC conflict-marker grep proof (zero
 (docs-only; no instruction to change running gates per reviewer);
 Gate-A request names the docs commits docs-only. Reviewer's exact
 catch/regression/source assessment continues.
+
+### Main confirms docs HOLD; amended repair spec + standing rule (20:42Z)
+
+Main @ 03480d07e confirms the reviewer: §8:693 leftover conflict
+marker (`>>>>>>> ed2dfdd9b`), §8:685 stale T' SHA (091e32db3 pre-
+rebase vs 74104b6b6/03480d07e); tree-wide `git grep '^>>>>>>> '` =
+nothing else => docs-only, zero gate impact. LANE SPEC (Main): ONE
+append-only docs commit on 03480d07e: remove marker; chain record =
+91e0437c6 -> ee66b1ed6 (docs) -> 74104b6b6 (A2-R1) -> c848e4061
+(docs) -> 03480d07e (6ceae8219) -> [docs fix]; fix stale SHA.
+PROOF: git diff --name-only 03480d07e <new> == design doc only.
+DOCS TIP = REVIEW TIP (Gate-A request covers it; pins/Gate-A on
+the docs tip; gate seals name 03480d07e — binding unchanged).
+STANDING RULE (Main): after ANY rebase, `git grep -n '^<<<<<<< \|
+^>>>>>>> '` before every push — joins the RECORD-probe rule.
