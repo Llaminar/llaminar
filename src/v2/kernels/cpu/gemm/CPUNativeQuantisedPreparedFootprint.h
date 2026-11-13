@@ -288,6 +288,62 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Whether a layout's section tables satisfy the source data contract.
+     *
+     * This is a DATA-requirement contract, never an encoding-only presence
+     * table: it admits every layout whose tables carry the metadata the
+     * source format actually needs and rejects only real data loss.
+     *
+     * - Secondary (min) words are genuine source metadata: every asymmetric
+     *   source and the listed scale-carrying encodings must keep the plane.
+     * - Embedded effective minima belong to the super-block family. A
+     *   source that carries them (Q2_K) must retain the plane while it
+     *   stays in that family; other CompactMultiScale sources may drop it
+     *   or keep the canonical zero-filled plane, a re-encoded (rotated)
+     *   preparation legitimately consumes the minima into its payload, and
+     *   layouts outside the family must not invent the plane at all.
+     * - Compensation is a derived x86-kernel aid, not source metadata. Its
+     *   presence is owned by the layout tables themselves and checked only
+     *   by section geometry; GPU conversion writes and reads the plane
+     *   exactly when the endpoint layout has it, and x86 execution
+     *   admission already requires the canonical layout. No encoding may
+     *   demand or forbid it here.
+     *
+     * @param sections Layout table entry under validation.
+     * @param encoding Prepared CPU encoding of the endpoint.
+     * @param is_asymmetric Whether the source format carries min offsets.
+     * @param source Original source format descriptor.
+     * @return `true` when the tables keep every datum the source needs
+     *     without inventing a family-forbidden plane.
+     */
+    [[nodiscard]] constexpr bool sectionPresenceSatisfiesSourceContract(
+        const PreparedUnitSections &sections,
+        CPUNativeQuantisedEncoding encoding,
+        bool is_asymmetric,
+        const NativeQuantisedFormatInfo &source) noexcept
+    {
+        const bool secondary_required =
+            is_asymmetric || encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+            encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+            encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
+        if (sections.has_secondary != secondary_required)
+            return false;
+        // Q2_K and any other super-block source with embedded minima must
+        // keep the plane while it stays in that family; a rotated or
+        // otherwise re-encoded preparation consumes the minima into its
+        // payload and legitimately drops the plane.
+        if (source.has_emins &&
+            encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+            !sections.has_emins)
+            return false;
+        // Only the super-block family may carry it; canonical zero-filled
+        // planes for other CompactMultiScale sources stay admitted.
+        return encoding == CPUNativeQuantisedEncoding::CompactMultiScale ||
+               !sections.has_emins;
+    }
+
+    /**
      * @brief Exact resident bytes touched by one logical NativeQuantised tile unit.
      *
      * A weight unit is one 64-column N chunk by one 32-element K block and

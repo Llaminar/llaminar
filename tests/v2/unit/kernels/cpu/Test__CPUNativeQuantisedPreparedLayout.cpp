@@ -290,6 +290,86 @@ TEST(CPUNativeQuantisedPreparedLayout, SectionPresenceMatchesHistoricalFamilyPre
     }
 }
 
+/** @test Section presence is a source-data contract, not an encoding presence table.
+ *
+ * The endpoint validators must admit layouts that drop derived aids and
+ * optional planes — no compensation, and no embedded minima for super-block
+ * sources that do not need them — while still rejecting real data loss: a
+ * missing secondary plane, a Q2_K layout without embedded minima, or an
+ * invented emins plane outside the super-block family. Compensation presence
+ * is owned by the layout tables and never consulted here. */
+TEST(CPUNativeQuantisedPreparedLayout, SectionPresenceIsADataRequirementNotAnEncodingTable)
+{
+    // A minimal geometrically consistent table skeleton: the contract
+    // consults presence flags, the geometry only needs to stay orderable.
+    const auto syntheticSections = [](bool secondary, bool emins) {
+        PreparedUnitSections sections;
+        sections.payload_stride = 1024;
+        sections.scales_offset = 1024;
+        sections.block_stride = 1152 + (secondary ? 128u : 0u) + (emins ? 256u : 0u);
+        sections.has_secondary = secondary;
+        sections.has_emins = emins;
+        return sections;
+    };
+
+    // Q6_K without compensation and without emins: the derived x86 aid and
+    // the family-forbidden plane are both dropped, and the contract holds.
+    {
+        const NativeQuantisedFormatInfo &source = native_quantised_formats::Q6_K;
+        const auto sections = syntheticSections(true, false);
+        EXPECT_TRUE(sectionPresenceSatisfiesSourceContract(
+            sections, CPUNativeQuantisedEncoding::Q6KNativeDualScale, true, source));
+    }
+    // A super-block source without embedded minima may drop the emins plane…
+    {
+        const NativeQuantisedFormatInfo &source = native_quantised_formats::Q3_K;
+        const auto dropped = syntheticSections(true, false);
+        EXPECT_TRUE(sectionPresenceSatisfiesSourceContract(
+            dropped, CPUNativeQuantisedEncoding::CompactMultiScale, true, source));
+        // …and may equally retain the canonical zero-filled plane.
+        const auto zeroFilled = syntheticSections(true, true);
+        EXPECT_TRUE(sectionPresenceSatisfiesSourceContract(
+            zeroFilled, CPUNativeQuantisedEncoding::CompactMultiScale, true, source));
+    }
+    // Q2_K carries embedded minima: dropping them is real data loss.
+    {
+        const NativeQuantisedFormatInfo &source = native_quantised_formats::Q2_K;
+        ASSERT_TRUE(source.has_emins);
+        const auto sections = syntheticSections(true, false);
+        EXPECT_FALSE(sectionPresenceSatisfiesSourceContract(
+            sections, CPUNativeQuantisedEncoding::CompactMultiScale, true, source));
+    }
+    // Secondary words are source metadata: Q6_K without the plane loses data.
+    {
+        const NativeQuantisedFormatInfo &source = native_quantised_formats::Q6_K;
+        const auto sections = syntheticSections(false, false);
+        EXPECT_FALSE(sectionPresenceSatisfiesSourceContract(
+            sections, CPUNativeQuantisedEncoding::Q6KNativeDualScale, true, source));
+    }
+    // No encoding outside the super-block family may invent embedded minima.
+    {
+        const NativeQuantisedFormatInfo &source = native_quantised_formats::Q8_0;
+        const auto sections = syntheticSections(false, true);
+        EXPECT_FALSE(sectionPresenceSatisfiesSourceContract(
+            sections, CPUNativeQuantisedEncoding::ExpandedInt8, false, source));
+    }
+    // Canonical tables satisfy the contract tautologically for all 21 formats.
+    for (const NativeQuantisedSourceFormat &entry : native_quantised_formats::kAllSourceFormats)
+    {
+        const NativeQuantisedFormatInfo &source = *entry.metadata;
+        for (const bool rotation : {false, true})
+        {
+            SCOPED_TRACE(traceSource(source) + (rotation ? "/rotated" : ""));
+            const PreparedTuple tuple(source, rotation);
+            const PreparedUnitSections sections = preparedUnitSections(
+                kHostPreparedLayout, tuple.encoding, tuple.is_asymmetric, source);
+            ASSERT_TRUE(sections.isValid());
+            EXPECT_TRUE(sectionPresenceSatisfiesSourceContract(
+                sections, tuple.encoding, tuple.is_asymmetric, source));
+        }
+    }
+}
+
 /** @test The production estimator carries the layout and prices canonical bytes exactly. */
 TEST(CPUNativeQuantisedPreparedLayout, FootprintCarriesLayoutAndCanonicalBytes)
 {
