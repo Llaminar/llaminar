@@ -4041,3 +4041,24 @@ all-codebook 73x544 + 128x1024, external sha256/cmp; versioned
 wire excluded (tier v4 + archive v8 changed legitimately — the
 claim is prepared bytes). Base control gate at d5e04fdce queued
 for the clean failed-set delta. ARM leg on .79 in parallel.
+
+### Stage-A gate .79 NCCL block (14:16Z): DIAGNOSED = install staleness, not the chain
+
+Canonical NCCL proof-verify failed at BUILD (v2_nccl_thread_lifetime
++ shared_file_lifecycle + cascade; verbatim "does not match this
+source/runtime/build receipt"). Source diagnosis (coordinator):
+d5e04fdce..609638aba changed ZERO NCCL proof inputs (all GIN/thread-
+lifetime INPUTS file-by-file UNCHANGED); the mismatch source = PR
+#43's own lineage — d836a276f..d5e04fdce changed 5 native-completed-
+broadcast replay scripts (QFN ngram continuation, a76579b13), all in
+the GIN INPUTS digest set (source_identity = per-file sha256;
+receipt_prefix = REVISION+patch digests+proof identity). Consequence:
+.79's nccl-out (pre-PR script digests) fails identically AT
+d5e04fdce — staleness predates the idea08 chain. Discriminator
+routed to sparks (no build): installed receipt prefix vs the tree's
+receipt_prefix(). Resume path = Main's install-sync: canonical
+install-nccl.sh refresh at .79 at the current tree -> resume gate
+from the build phase (warm .o). BASE-OWNER NOTE routed: PR #43
+changes NCCL proof inputs -> every pre-PR nccl-out in the fleet goes
+stale at merge; install-refresh = merge-window checklist item.
+WSL x86 leg unaffected (CPU-only, no NCCL proofs).
