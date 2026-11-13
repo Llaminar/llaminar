@@ -5021,3 +5021,21 @@ ba2811e4c: worktree clean; 12/12; 297/297; RECORD probe PASS;
 A3-B1 DI probe green; 4/4; 5/5 (affected suites are Linux-only —
 standing rule; Linux evidence via .80 now). Ledger in the commit
 message. Lane idle pending the sparks/.80 result.
+
+### Qual probe #1 = shell still down (22:00Z); coordinator cross-check
+
+Qual: probe #1 (22:00Z) — bash tool returns "Tool bash not found";
+broker-side (intercom/memory/scheduling) OK; no command executed on
+the host since the crash; no relaunch attempted (cannot see host
+state). Plan holds (probe #2 22:15Z; 15-min cadence if that fails;
+survivors -> report -> T' -j4 sole container (incremental if tree
+survived else fresh) -> byte-identity serialized -> develop-control
+last; nothing concurrent). T' tree + sealed evidence on disk (only
+in-container state at crash moment at risk). COORDINATOR CROSS-
+CHECK (22:01Z): ping 12ms stable; TCP 2222 OPEN; SSH banner attempt
+from here did NOT complete => host network alive, SSH daemon not
+handshaking = matches the shell-binding-down diagnosis. .79/.80:
+no docker containers visible from host (limited visibility there —
+gate may run root/transient; sparks hasn't reported yet; no claims
+to contradict). Nothing pending from me until probe #2 / sparks'
+reports.
