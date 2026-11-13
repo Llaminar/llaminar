@@ -4910,3 +4910,23 @@ intentional-contract-vs-regression discriminator; rest = death-test
 unknown-file, need base+develop delta. Forwarded verbatim to the
 lane for the root-cause ledger. T' gate building (508/2779); byte-
 identity re-run at T' next.
+
+### WSL HOST SSH INCIDENT (21:52Z): host alive but kex-stalled; triage+qual evidence in flight
+
+Lane: triage fix ba2811e4c PUSHED (durable); WSL gate container
+armq-a512-ba2811e4c launched 20:59Z (8 cpus, run_production_
+prerequisites.py). Since ~21:10Z WSL SSH (192.168.178.20:2222)
+unreachable: ping OK, banner/kex reset. COORDINATOR VERIFICATION:
+ping 0% loss (6-84ms); port 2222 TCP connect OK (nc + /dev/tcp);
+SSH banner exchange stalls; **intercom bridge to WSL timed out** ->
+qual lane (01a1bd53) unreachable. Likely cause: resource
+contention (base-control + triage + qual T' gate + develop-control
+on one VM) / thrash; repeated SSH attempts add load (lane stopped
+retrying = correct; 10-min poll armed). IMPACT: triage run evidence
+in flight (fix safe on origin); qual T' x86 gate (508/2779 @
+20:51Z) evidence at risk (sealed artifacts on WSL disk = safe);
+its develop-control queued. FALLBACK (Main's offer; lane flagged):
+poll cycle -> verify container log/artifacts on recovery; if host
+dead -> .80 triage via sparks (ba2811e4c from origin). My lean:
+wait one cycle (container may be done; .80 restart duplicates).
+Main notified; qual T' gate may need a rerun post-recovery if lost.
