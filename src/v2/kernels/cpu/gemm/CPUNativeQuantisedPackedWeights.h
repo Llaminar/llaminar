@@ -168,6 +168,21 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Return the one section authority for this owner's stream.
+         * @details Cold admission/copier queries derive which sections exist
+         * from the layout tuple, never from the encoding family alone; the
+         * result is meaningful only when non-zero `block_stride` proves the
+         * layout is implemented.
+         */
+        [[nodiscard]] PreparedUnitSections preparedSections() const noexcept
+        {
+            const auto *const source = native_quantised_formats::forSourceIdentity(
+                codebook_id, is_superblock);
+            return source ? preparedUnitSections(layout, encoding, is_asymmetric, *source)
+                          : PreparedUnitSections{};
+        }
+
+        /**
          * @brief Return whether each prepared block carries weight compensation.
          *
          * Nibble and expanded-INT8 kernels bias signed weights by shifting the
@@ -441,14 +456,20 @@ namespace llaminar2::cpu::native_quantised
          * @brief Access the packed pair of Q2_K effective minima per output column.
          * @param c Output chunk of 64 columns.
          * @param kb Logical K block.
-         * @return Sixty-four packed FP16 pairs; zero for other compact formats.
+         * @return Sixty-four packed FP16 pairs.
+         * @throws std::logic_error If this stream's section layout has no
+         * effective-minimum section (presence derives from the layout tuple,
+         * not the encoding family alone).
          */
         inline const uint32_t *chunkEffectiveMins(int c, int kb) const
         {
-            if (!usesCompactMultiScale())
-                throw std::logic_error("Effective minima require compact multi-scale weights");
+            const PreparedUnitSections sections = preparedSections();
+            if (!sections.isValid() || !sections.has_emins)
+                throw std::logic_error(
+                    "Effective minima require a prepared layout with an effective-minimum section");
             const size_t offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
-            return reinterpret_cast<const uint32_t *>(interleavedBase() + offset + data_stride + 256);
+            return reinterpret_cast<const uint32_t *>(
+                interleavedBase() + offset + sections.emins_offset);
         }
 
         /// Native-interleaved B data for N-chunk c, K-block kb, group g, ZMM z (0..3)

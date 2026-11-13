@@ -236,6 +236,8 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedEncoding encoding; ///< Validated physical encoding.
         const CPUNativeQuantisedLayout layout; ///< Validated physical unit layout.
         const int metadata_delta; ///< Bytes between the payload end and the primary scale vector (0 or 128).
+        const bool metadata_secondary_; ///< Section authority: secondary words exist (resolved once at admission).
+        const bool metadata_emins_; ///< Section authority: packed effective minima exist (resolved once at admission).
         const CPUProjectionNumericalPolicy numerical_policy; ///< Immutable arithmetic identity.
         const int data_stride; ///< Weight data bytes before inline metadata.
         const int interleaved_block_stride; ///< Total physical bytes per 64-column/K block.
@@ -334,8 +336,7 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint16_t *chunkMins(int chunk, int block) const
         {
-            if (!is_asymmetric && !usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale() &&
-                !usesQ6KNativeDualScale() && !usesCompactMultiScale())
+            if (!metadata_secondary_)
                 throw std::logic_error("Native CPU weight encoding has no secondary metadata");
             return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + 128 + metadata_delta);
         }
@@ -366,8 +367,8 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint32_t *chunkEffectiveMins(int chunk, int block) const
         {
-            if (!usesCompactMultiScale())
-                throw std::logic_error("Effective minima require compact CPU weights");
+            if (!metadata_emins_)
+                throw std::logic_error("Effective minima require a prepared layout with an effective-minimum section");
             return reinterpret_cast<const std::uint32_t *>(unit(chunk, block) + data_stride + 256);
         }
 
@@ -493,6 +494,10 @@ namespace llaminar2::cpu::native_quantised
               layout(d.layout),
               metadata_delta(preparedUnitSections(
                   d.layout, d.encoding, d.is_asymmetric, source).has_compensation ? 128 : 0),
+              metadata_secondary_(preparedUnitSections(
+                  d.layout, d.encoding, d.is_asymmetric, source).has_secondary),
+              metadata_emins_(preparedUnitSections(
+                  d.layout, d.encoding, d.is_asymmetric, source).has_emins),
               numerical_policy(d.numerical_policy),
               data_stride(preparedDataStride(d.layout, d.encoding, d.is_asymmetric, source)),
               interleaved_block_stride(preparedInterleavedBlockStride(d.layout, d.encoding, d.is_asymmetric, source)),

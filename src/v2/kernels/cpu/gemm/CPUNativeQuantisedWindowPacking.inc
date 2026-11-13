@@ -159,7 +159,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                 const VnniPackContext context{.raw_bytes=nullptr,.N=1,.K=source_k,
                     .blocks_per_row=(source_k+31)/32,.payload_bytes=format.payload_bytes,
                     .payload_array=payload,.scales_array=primary,.mins_array=secondary,
-                    .emins_array=out.usesCompactMultiScale()?emins:nullptr,
+                    .emins_array=sections.has_emins?emins:nullptr,
                     .destination_block_origin=input_first,.destination_block_count=count};
                 for(int b=0;b<count;++b) {
                     source.packVnniBlock(context,actual_row,0,input_first+b);
@@ -179,8 +179,12 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     for(int byte=0;byte<format.payload_bytes;++byte)
                         target[(byte/4)*256+column*4+byte%4]=input[byte];
                     std::memcpy(target+sections.scales_offset+column*2,primary+b,2);
-                    std::memcpy(target+sections.mins_offset+column*2,secondary+b,2);
-                    std::memcpy(target+sections.emins_offset+column*4,emins+b,4);
+                    // Section-presence authority: writers never assume a
+                    // family implies a section; the layout's tables decide.
+                    if(sections.has_secondary)
+                        std::memcpy(target+sections.mins_offset+column*2,secondary+b,2);
+                    if(sections.has_emins)
+                        std::memcpy(target+sections.emins_offset+column*4,emins+b,4);
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     // The six-bit plane region lives inside the payload stride
@@ -197,7 +201,8 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         std::memcpy(planes,&low,8);std::memcpy(planes+8,&high,8);
                     }
                     std::memcpy(target+sections.scales_offset+column*2,primary+b,2);
-                    std::memcpy(target+sections.mins_offset+column*2,secondary+b,2);
+                    if(sections.has_secondary)
+                        std::memcpy(target+sections.mins_offset+column*2,secondary+b,2);
                 } else {
                     const bool nibble=out.usesNibbleLUT();
                     const int8_t* values=nibble?decoded:decoded+b*32;
@@ -207,7 +212,10 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     } else for(int g=0;g<8;++g)std::memcpy(target+g*256+column*4,values+g*4,4);
                     int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
                     const auto compensation=static_cast<int16_t>(sum);
-                    std::memcpy(target+sections.compensation_offset+column*2,&compensation,2);
+                    // Section-presence authority: compensation and secondary
+                    // writes follow the layout tables, never the family alone.
+                    if(sections.has_compensation)
+                        std::memcpy(target+sections.compensation_offset+column*2,&compensation,2);
                     uint16_t scale=0,minimum=0;
                     if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
@@ -221,7 +229,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     if(out.usesIQ3SExpandedSourceScale() && !native_quantised_iq3s_scale::valid(minimum))
                         throw std::invalid_argument("IQ3_S source nibble is invalid");
                     std::memcpy(target+sections.scales_offset+column*2,&scale,2);
-                    if(out.is_asymmetric || out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale())
+                    if(sections.has_secondary)
                         std::memcpy(target+sections.mins_offset+column*2,&minimum,2);
                 }
             }

@@ -260,42 +260,47 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     // --- Compute comp (sum of decoded INT8 values per column) ---
-                    int16_t *inline_comp = reinterpret_cast<int16_t *>(
-                        dst + repack_sections.compensation_offset);
-                    for (int col = 0; col < n_cols; ++col)
+                    // Presence derives from the section authority: a layout
+                    // without a compensation section must not write one.
+                    if (repack_sections.has_compensation)
                     {
-                        int8_t decoded[32];
-                        decode_native_block(codebook_id, payload_buf + col * pb, decoded);
+                        int16_t *inline_comp = reinterpret_cast<int16_t *>(
+                            dst + repack_sections.compensation_offset);
+                        for (int col = 0; col < n_cols; ++col)
+                        {
+                            int8_t decoded[32];
+                            decode_native_block(codebook_id, payload_buf + col * pb, decoded);
 #ifdef __AVX512F__
-                        // Vectorized sum of 32 signed int8 → int16
-                        __m256i v = _mm256_loadu_si256((const __m256i *)decoded);
-                        __m256i ones = _mm256_set1_epi8(1);
-                        __m256i pair_sums = _mm256_maddubs_epi16(ones, v); // 16 × int16
-                        __m256i ones16 = _mm256_set1_epi16(1);
-                        __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones16); // 8 × int32
-                        __m128i hi = _mm256_extracti128_si256(quad_sums, 1);
-                        __m128i lo = _mm256_castsi256_si128(quad_sums);
-                        __m128i sum128 = _mm_add_epi32(lo, hi);
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        inline_comp[col] = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
+                            // Vectorized sum of 32 signed int8 → int16
+                            __m256i v = _mm256_loadu_si256((const __m256i *)decoded);
+                            __m256i ones = _mm256_set1_epi8(1);
+                            __m256i pair_sums = _mm256_maddubs_epi16(ones, v); // 16 × int16
+                            __m256i ones16 = _mm256_set1_epi16(1);
+                            __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones16); // 8 × int32
+                            __m128i hi = _mm256_extracti128_si256(quad_sums, 1);
+                            __m128i lo = _mm256_castsi256_si128(quad_sums);
+                            __m128i sum128 = _mm_add_epi32(lo, hi);
+                            sum128 = _mm_hadd_epi32(sum128, sum128);
+                            sum128 = _mm_hadd_epi32(sum128, sum128);
+                            inline_comp[col] = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
 #else
-                        int32_t sum = 0;
-                        for (int i = 0; i < 32; ++i)
-                            sum += decoded[i];
-                        inline_comp[col] = static_cast<int16_t>(sum);
+                            int32_t sum = 0;
+                            for (int i = 0; i < 32; ++i)
+                                sum += decoded[i];
+                            inline_comp[col] = static_cast<int16_t>(sum);
 #endif
+                        }
+                        for (int col = n_cols; col < 64; ++col)
+                            inline_comp[col] = 0;
                     }
-                    for (int col = n_cols; col < 64; ++col)
-                        inline_comp[col] = 0;
 
                     // Write scales inline
                     uint16_t *inline_scales = reinterpret_cast<uint16_t *>(
                         dst + repack_sections.scales_offset);
                     std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
 
-                    // Write mins inline (if asymmetric)
-                    if (meta.is_asymmetric)
+                    // Write mins inline (section authority, not asymmetry alone)
+                    if (repack_sections.has_secondary)
                     {
                         uint16_t *inline_mins = reinterpret_cast<uint16_t *>(
                             dst + repack_sections.mins_offset);
@@ -411,16 +416,19 @@ namespace llaminar2::cpu::native_quantised
                         }
                     }
 
-                    // Write comp + scales
-                    int16_t *inline_comp = reinterpret_cast<int16_t *>(
-                        dst + repack_sections.compensation_offset);
-                    std::memcpy(inline_comp, comp_buf, 64 * sizeof(int16_t));
+                    // Write comp + scales (presence from the section authority)
+                    if (repack_sections.has_compensation)
+                    {
+                        int16_t *inline_comp = reinterpret_cast<int16_t *>(
+                            dst + repack_sections.compensation_offset);
+                        std::memcpy(inline_comp, comp_buf, 64 * sizeof(int16_t));
+                    }
 
                     uint16_t *inline_scales = reinterpret_cast<uint16_t *>(
                         dst + repack_sections.scales_offset);
                     std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
 
-                    if (meta.is_asymmetric)
+                    if (repack_sections.has_secondary)
                     {
                         uint16_t *inline_mins = reinterpret_cast<uint16_t *>(
                             dst + repack_sections.mins_offset);
@@ -651,35 +659,44 @@ namespace llaminar2::cpu::native_quantised
                             }
                         }
 
-                        auto *const compensation =
-                            reinterpret_cast<int16_t *>(
-                                destination + direct_sections.compensation_offset);
-                        auto *const inline_scales =
-                            reinterpret_cast<uint16_t *>(
-                                destination + direct_sections.scales_offset);
-                        if (source_column_valid)
+                        // Section authority: compensation and secondary
+                        // presence derive from the layout tuple, never from
+                        // the encoding family alone.
+                        if (direct_sections.has_compensation)
                         {
-                            int32_t sum = 0;
-                            // Fixed scalar order is the byte-deterministic
-                            // preparation contract shared by all codebooks.
-                            for (int value = 0;
-                                 value < kValuesPerBlock;
-                                 ++value)
+                            auto *const compensation =
+                                reinterpret_cast<int16_t *>(
+                                    destination + direct_sections.compensation_offset);
+                            if (source_column_valid)
                             {
-                                sum += values[value];
+                                int32_t sum = 0;
+                                // Fixed scalar order is the byte-deterministic
+                                // preparation contract shared by all codebooks.
+                                for (int value = 0;
+                                     value < kValuesPerBlock;
+                                     ++value)
+                                {
+                                    sum += values[value];
+                                }
+                                compensation[column] =
+                                    static_cast<int16_t>(sum);
                             }
-                            compensation[column] =
-                                static_cast<int16_t>(sum);
-                            inline_scales[column] = out.usesIQ3SExpandedSourceScale()
-                                ? source_bases[local_kb] : fp32_to_fp16(scales[local_kb]);
+                            else
+                            {
+                                compensation[column] = 0;
+                            }
                         }
-                        else
                         {
-                            compensation[column] = 0;
-                            inline_scales[column] = 0;
+                            auto *const inline_scales =
+                                reinterpret_cast<uint16_t *>(
+                                    destination + direct_sections.scales_offset);
+                            inline_scales[column] = source_column_valid
+                                ? (out.usesIQ3SExpandedSourceScale()
+                                    ? source_bases[local_kb] : fp32_to_fp16(scales[local_kb]))
+                                : 0;
                         }
 
-                        if (out.is_asymmetric || out.usesIQ3SExpandedSourceScale())
+                        if (direct_sections.has_secondary)
                         {
                             auto *const inline_mins =
                                 reinterpret_cast<uint16_t *>(

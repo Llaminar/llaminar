@@ -220,9 +220,11 @@ TEST(CPUNativeQuantisedPreparedLayout, UnimplementedLayoutFailsClosed)
 /** @test View and seal admission reject an unimplemented layout before any division (S1).
  * The zero-stride sentinel of an unimplemented layout's section tables must
  * surface as a precise admission rejection — never as a division operand in
- * the extent overflow guard. Both published-view entry points
- * (MetadataSeal::validate and fromPublished) enter through the one
- * admission this exercises. */
+ * the extent overflow guard. The first negative exercises the guard itself:
+ * MetadataSeal::validate's structural admission call. The second negative is
+ * the published-view structural entry (fromPublished) and proves sealed
+ * byte-range identity: the layout mismatch is rejected at seal.admits, not
+ * by a second pass through the admission guard. */
 TEST(CPUNativeQuantisedPreparedLayout, UnimplementedLayoutIsRejectedByViewAndSealAdmission)
 {
     for (const NativeQuantisedFormatInfo *source : kEncodingRepresentatives)
@@ -243,6 +245,47 @@ TEST(CPUNativeQuantisedPreparedLayout, UnimplementedLayoutIsRejectedByViewAndSea
         EXPECT_THROW(static_cast<void>(CPUNativeQuantisedWeightView::fromPublished(
                          compact, fixture.bytes, canonical_seal)),
                      std::invalid_argument);
+    }
+}
+
+/** @test Section presence and offsets equal the historical family predicates for all 21 formats.
+ * Every producer, copier and accessor now consumes PreparedUnitSections; this
+ * pins the tables against the legacy encoding-derived conditions so the
+ * presence guards are provably byte-identical for every canonical stream. */
+TEST(CPUNativeQuantisedPreparedLayout, SectionPresenceMatchesHistoricalFamilyPredicates)
+{
+    for (const NativeQuantisedSourceFormat &entry : native_quantised_formats::kAllSourceFormats)
+    {
+        const NativeQuantisedFormatInfo &source = *entry.metadata;
+        for (const bool rotation : {false, true})
+        {
+            SCOPED_TRACE(std::string{entry.quant_type} + (rotation ? "/rotated" : ""));
+            const PreparedTuple tuple(source, rotation);
+            const PreparedUnitSections sections = preparedUnitSections(
+                kHostPreparedLayout, tuple.encoding, tuple.is_asymmetric, source);
+            ASSERT_TRUE(sections.isValid());
+            // Presence equals the historical family conditions exactly.
+            EXPECT_EQ(sections.has_compensation,
+                tuple.encoding != CPUNativeQuantisedEncoding::Q6KNativeDualScale &&
+                tuple.encoding != CPUNativeQuantisedEncoding::CompactMultiScale);
+            EXPECT_EQ(sections.has_secondary, tuple.is_asymmetric ||
+                tuple.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+                tuple.encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+                tuple.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+                tuple.encoding == CPUNativeQuantisedEncoding::CompactMultiScale);
+            EXPECT_EQ(sections.has_emins,
+                tuple.encoding == CPUNativeQuantisedEncoding::CompactMultiScale);
+            // Offsets equal the historical unit arithmetic exactly.
+            EXPECT_EQ(sections.payload_stride, preparedDataStride(tuple.encoding));
+            EXPECT_EQ(sections.block_stride,
+                preparedInterleavedBlockStride(tuple.encoding, tuple.is_asymmetric));
+            EXPECT_EQ(sections.scales_offset,
+                sections.payload_stride + (sections.has_compensation ? 128u : 0u));
+            EXPECT_EQ(sections.mins_offset,
+                sections.has_secondary ? sections.scales_offset + 128u : 0u);
+            EXPECT_EQ(sections.emins_offset,
+                sections.has_emins ? sections.payload_stride + 256u : 0u);
+        }
     }
 }
 

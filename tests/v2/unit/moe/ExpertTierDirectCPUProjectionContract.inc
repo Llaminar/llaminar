@@ -115,5 +115,124 @@ TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossR
         }
     }
 }
+
+/**
+ * @test Mixed multi-scale strides side by side move exactly the section set.
+ *
+ * IQ2_S (live payload width 9) and Q2_K (width 8) share the CompactMultiScale
+ * payload region with different live widths; Q8_0 contrasts with inline
+ * compensation and no effective minima. Section presence — derived from the
+ * layout tables, never the encoding family name — must decide which bytes
+ * move for each, and an unimplemented prepared layout must fail closed at
+ * the storage layout before any encoded-column arithmetic runs.
+ */
+TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides)
+{
+    using P = MoEExpertProjectionOwnership::Projection;
+    using R = MoEProjectionResidence;
+    const P from{R::ParticipantOutputSlice, 256, 256, 13, 128, 32, 96};
+    const P to{R::ParticipantInputSlice, 256, 256, 72, 160, 64, 128};
+    const auto overlap = ExpertTierWeightProjectionIntersection::between(from, to);
+
+    const NativeQuantisedFormatInfo *const mixed_stride_formats[] = {
+        &native_quantised_formats::IQ2_S,
+        &native_quantised_formats::Q2_K,
+        &native_quantised_formats::Q8_0,
+    };
+    for (const NativeQuantisedFormatInfo *format : mixed_stride_formats)
+    {
+        SCOPED_TRACE(format->codebook_id);
+        const auto traits = directCPUFormat(*format, 64);
+        const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
+        const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+
+        // The storage layout's section authority must agree with the physical
+        // family for every canonical stream: multi-scale units carry packed
+        // effective minima, expanded bytes carry inline compensation.
+        const auto sections = source.cpuSections();
+        ASSERT_TRUE(sections.isValid());
+        const bool multi_scale =
+            traits.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
+        EXPECT_EQ(sections.has_emins, multi_scale);
+        EXPECT_EQ(sections.has_secondary, multi_scale ||
+            traits.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            traits.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+            traits.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+            traits.cpu_is_asymmetric != 0);
+        EXPECT_EQ(sections.has_compensation, !multi_scale &&
+            traits.cpu_encoding != cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale);
+
+        std::vector<uint8_t> bytes(source.cpuStorageBytes());
+        for (size_t index = 0; index < bytes.size(); ++index)
+            bytes[index] = uint8_t(index * 41 + 7);
+        std::vector<uint8_t> result(destination.cpuStorageBytes(), 0x5c);
+        const auto untouched = result;
+        size_t live_bytes = 0;
+        for (uint32_t first = 0; first < source.unit_count; )
+        {
+            const auto count = std::min({2u, source.unit_count - first,
+                source.maximum_units_per_chunk, destination.maximum_units_per_chunk});
+            ASSERT_TRUE(copyExpertTierCPUWeightChunk(source, bytes, destination, result, first, count));
+            live_bytes += source.chunkBytes(count, first);
+            first += count;
+        }
+        // Communication extent: exactly the live columns of each unit, one
+        // full column slice (payload region plus present sections) each.
+        EXPECT_EQ(live_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
+
+        for (size_t row = 0; row < 192; ++row)
+            for (size_t block = 0; block < 4; ++block)
+                if (row < 69 && block < 2)
+                    EXPECT_EQ(encodedTierColumn(result, destination, row, block),
+                        encodedTierColumn(bytes, source, 59 + row, 1 + block));
+                else EXPECT_EQ(encodedTierColumn(result, destination, row, block),
+                        encodedTierColumn(untouched, destination, row, block));
+
+        if (multi_scale)
+        {
+            // Effective minima are section data, not family trivia: both live
+            // payload widths must carry their packed word byte-exactly. This
+            // is the regression for the encoding-only emins access that read
+            // outside a trimmed unit on partial/rectangular paths.
+            for (size_t row : {size_t{0}, size_t{17}, size_t{68}})
+                for (size_t block : {size_t{0}, size_t{1}})
+                {
+                    // Source-local K blocks are 1..2; destination-local are
+                    // 0..1: the two roots carry independent window origins.
+                    const size_t source_n = 59 + row, destination_n = row;
+                    const size_t source_unit =
+                        ((source_n / 64) * (source.cpu_K / 32) + 1 + block) * source.cpu_block_stride;
+                    const size_t destination_unit =
+                        ((destination_n / 64) * (destination.cpu_K / 32) + block) * destination.cpu_block_stride;
+                    for (size_t byte = 0; byte < 4; ++byte)
+                        EXPECT_EQ(result[destination_unit + sections.emins_offset +
+                                (destination_n % 64) * 4 + byte],
+                            bytes[source_unit + sections.emins_offset +
+                                (source_n % 64) * 4 + byte]);
+                }
+        }
+    }
+
+    // An unimplemented prepared layout fails closed at the storage layout,
+    // before any encoded-column arithmetic can consume its sentinel strides.
+    auto unimplemented = directCPUFormat(native_quantised_formats::IQ2_S, 64);
+    unimplemented.cpu_layout = cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64;
+    EXPECT_FALSE(unimplemented.valid());
+    EXPECT_THROW(static_cast<void>(cpuExpertTierStorageLayoutForIntersection(
+                     unimplemented, from, overlap, 65536)), std::invalid_argument);
+
+    // A destination that disagrees with the source's prepared layout is
+    // rejected without mutation (the invalid layout fails valid() first;
+    // the copy never reaches encoded-column arithmetic).
+    const auto traits = directCPUFormat(native_quantised_formats::IQ2_S, 64);
+    const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
+    auto foreign = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+    foreign.cpu_layout = cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64;
+    std::vector<uint8_t> bytes(source.cpuStorageBytes(), 0x33);
+    std::vector<uint8_t> result(source.cpuStorageBytes(), 0x77);
+    const auto before = result;
+    EXPECT_FALSE(copyExpertTierCPUWeightChunk(source, bytes, foreign, result, 0, 1));
+    EXPECT_EQ(result, before);
+}
 }
 }

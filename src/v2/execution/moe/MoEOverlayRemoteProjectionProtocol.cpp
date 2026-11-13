@@ -200,12 +200,19 @@ namespace llaminar2
                 source_identity.is_superblock ? 1u : 0u;
             manifest.cpu_encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
+            // Wire strides derive from the host's canonical layout tuple
+            // (the wire carries no prepared-layout field until its versioned
+            // A3 update); the section authority, not the encoding family,
+            // owns the arithmetic.
             manifest.cpu_data_stride =
-                cpu::native_quantised::preparedDataStride(manifest.cpu_encoding);
+                cpu::native_quantised::preparedDataStride(
+                    cpu::native_quantised::kHostPreparedLayout,
+                    manifest.cpu_encoding, manifest.cpu_is_asymmetric != 0, *source);
             manifest.cpu_block_stride = static_cast<std::uint32_t>(
                 cpu::native_quantised::preparedInterleavedBlockStride(
+                    cpu::native_quantised::kHostPreparedLayout,
                     manifest.cpu_encoding,
-                    manifest.cpu_is_asymmetric != 0));
+                    manifest.cpu_is_asymmetric != 0, *source));
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
             return manifest;
         }

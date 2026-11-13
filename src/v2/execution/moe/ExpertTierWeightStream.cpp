@@ -283,24 +283,26 @@ namespace llaminar2
                 return reject(error, "CPU packed encoding is unknown");
             // Source provenance must identify exactly one of the 21 cataloged
             // formats even when its final CPU bytes have been normalized.
-            if (native_quantised_formats::forSourceIdentity(
-                    cpu.codebook_id, cpu.is_superblock) == nullptr)
+            const auto *const cpu_source = native_quantised_formats::forSourceIdentity(
+                cpu.codebook_id, cpu.is_superblock);
+            if (cpu_source == nullptr)
             {
                 return reject(
                     error,
                     "CPU packed source codebook/superblock identity is not cataloged");
             }
 
-            // Never trust serialized stride fields independently of encoding.
-            const uint32_t expected_data_stride =
-                cpu::native_quantised::preparedDataStride(cpu.encoding);
-            const int expected_block_stride =
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    cpu.encoding, cpu.is_asymmetric);
-            if (cpu.data_stride != static_cast<int>(expected_data_stride) ||
-                cpu.interleaved_block_stride != expected_block_stride)
+            // Never trust serialized stride fields independently of the layout
+            // tuple. An unimplemented layout fails closed here, before any
+            // section offset is consumed: the zero-stride sentinel is never a
+            // value a division or a copy may trust.
+            const auto cpu_sections = cpu::native_quantised::preparedUnitSections(
+                cpu.layout, cpu.encoding, cpu.is_asymmetric, *cpu_source);
+            if (!cpu_sections.isValid() ||
+                cpu.data_stride != static_cast<int>(cpu_sections.payload_stride) ||
+                cpu.interleaved_block_stride != static_cast<int>(cpu_sections.block_stride))
             {
-                return reject(error, "CPU packed stride does not match its prepared encoding");
+                return reject(error, "CPU packed stride does not match its prepared layout");
             }
 
             // Overflow-safe size reconstruction prevents truncated allocations.
@@ -391,12 +393,21 @@ namespace llaminar2
                  */
                 cpu.is_superblock = gpu.is_superblock;
             }
-            // Strides come from the CPU encoding's single source of truth.
-            cpu.data_stride = static_cast<int>(
-                cpu::native_quantised::preparedDataStride(cpu.encoding));
-            cpu.interleaved_block_stride =
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    cpu.encoding, cpu.is_asymmetric);
+            // Strides and section presence come from the receiving endpoint's
+            // layout tuple — today the host's canonical selector; A2 makes the
+            // endpoint's layout explicit — never from the encoding alone.
+            cpu.layout = cpu::native_quantised::kHostPreparedLayout;
+            const auto *const demotion_source = native_quantised_formats::forSourceIdentity(
+                cpu.codebook_id, cpu.is_superblock);
+            const auto demotion_sections = demotion_source != nullptr
+                ? cpu::native_quantised::preparedUnitSections(
+                      cpu.layout, cpu.encoding, cpu.is_asymmetric, *demotion_source)
+                : cpu::native_quantised::PreparedUnitSections{};
+            if (!demotion_sections.isValid())
+                throw std::invalid_argument(
+                    "GPU-to-CPU demotion requires a CPU layout with implemented section tables");
+            cpu.data_stride = static_cast<int>(demotion_sections.payload_stride);
+            cpu.interleaved_block_stride = static_cast<int>(demotion_sections.block_stride);
         }
 
         /**
@@ -591,12 +602,22 @@ namespace llaminar2
         }
         if (!cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding))
             return reject(error, "Tier stream CPU encoding is invalid");
-        // Re-derive strides rather than accepting redundant wire fields on trust.
-        const uint32_t expected_data_stride =
-            cpu::native_quantised::preparedDataStride(cpu_encoding);
-        const uint32_t expected_block_stride = static_cast<uint32_t>(
-            cpu::native_quantised::preparedInterleavedBlockStride(
-                cpu_encoding, cpu_is_asymmetric != 0));
+        // Re-derive strides rather than accepting redundant wire fields on
+        // trust. The wire carries no prepared-layout field until its
+        // versioned A3 update, so the canonical host layout is the section
+        // authority for this arithmetic (never the encoding family alone).
+        const auto *const wire_source = native_quantised_formats::forSourceIdentity(
+            cpu_codebook_id, cpu_is_superblock != 0);
+        const uint32_t expected_data_stride = wire_source != nullptr
+            ? cpu::native_quantised::preparedDataStride(
+                  cpu::native_quantised::kHostPreparedLayout, cpu_encoding,
+                  cpu_is_asymmetric != 0, *wire_source)
+            : 0u;
+        const uint32_t expected_block_stride = wire_source != nullptr
+            ? static_cast<uint32_t>(cpu::native_quantised::preparedInterleavedBlockStride(
+                  cpu::native_quantised::kHostPreparedLayout, cpu_encoding,
+                  cpu_is_asymmetric != 0, *wire_source))
+            : 0u;
         if (cpu_data_stride != expected_data_stride ||
             cpu_block_stride != expected_block_stride)
         {
@@ -752,14 +773,31 @@ namespace llaminar2
                     }
                     else destination[destination_base + 16 * destination_columns + group * destination_columns + destination_column] = value;
                 }
-            const bool compact = layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
-            const size_t planes = (layout.cpu_block_stride - layout.cpu_data_stride) / 128;
-            for (size_t plane = 0; plane < (compact ? 2 : planes); ++plane)
+            // Section authority: which metadata planes follow the payload,
+            // and whether packed effective minima exist, derive from the
+            // stream's layout tables — never from the encoding family alone
+            // (an encoding-only emins access reads outside a trimmed unit).
+            // Plane order matches the unit: compensation, scales, secondary.
+            const auto sections = layout.cpuSections();
+            size_t plane = 0;
+            if (sections.has_compensation)
+            {
                 copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 2,
                      destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 2, 2);
-            if (compact)
-                copy(source_base + payload_per_column * source_columns + 4 * source_columns + source_column * 4,
-                     destination_base + payload_per_column * destination_columns + 4 * destination_columns + destination_column * 4, 4);
+                ++plane;
+            }
+            copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 2,
+                 destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 2, 2);
+            ++plane;
+            if (sections.has_secondary)
+            {
+                copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 2,
+                     destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 2, 2);
+                ++plane;
+            }
+            if (sections.has_emins)
+                copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 4,
+                     destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 4, 4);
         }
         /** @brief Shared encoded plane copier; full and partial units use the same original coordinates. */
         template<bool Gather>
@@ -818,6 +856,7 @@ namespace llaminar2
         if (!from.valid() || !to.valid() || from.N != to.N || from.K != to.K ||
             from.cpu_codebook_id != to.cpu_codebook_id || from.cpu_is_superblock != to.cpu_is_superblock ||
             from.cpu_is_asymmetric != to.cpu_is_asymmetric || from.cpu_encoding != to.cpu_encoding ||
+            from.cpu_layout != to.cpu_layout ||
             from.cpu_data_stride != to.cpu_data_stride || from.cpu_block_stride != to.cpu_block_stride ||
             from.wire_columns_per_unit != to.wire_columns_per_unit || units == 0 || first >= from.unit_count ||
             units > from.unit_count - first || units > from.maximum_units_per_chunk ||
@@ -1270,6 +1309,11 @@ namespace llaminar2
         // Reject inconsistent strides or a non-streamable CPU format up front.
         if (!validateCpuWeights(cpu, error))
             return false;
+        // One section authority for every metadata read below: presence and
+        // offsets derive from the validated layout tuple, never the family.
+        const auto cpu_sections = cpu.preparedSections();
+        if (!cpu_sections.isValid())
+            return reject(error, "CPU packed layout has no implemented section tables");
 
         uint8_t gpu_codebook = 0;
         uint8_t payload_bytes = 0;
@@ -1344,15 +1388,15 @@ namespace llaminar2
                     std::memcpy(
                         &output.scales[linear],
                         cpu.native_interleaved.data() +
-                            unit + cpu.data_stride + 128u +
+                            unit + cpu_sections.scales_offset +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
-                    if (cpu.is_asymmetric || cpu.usesNibbleLUTSourceScale())
+                    if (cpu_sections.has_secondary)
                     {
                         std::memcpy(
                             &output.mins[linear],
                             cpu.native_interleaved.data() +
-                                unit + cpu.data_stride + 256u +
+                                unit + cpu_sections.mins_offset +
                                 static_cast<size_t>(n % 64) * sizeof(uint16_t),
                             sizeof(uint16_t));
                     }
@@ -1397,15 +1441,15 @@ namespace llaminar2
                     std::memcpy(
                         &output.scales[linear],
                         cpu.native_interleaved.data() +
-                            unit + cpu.data_stride + 128u +
+                            unit + cpu_sections.scales_offset +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
-                    if (cpu.is_asymmetric)
+                    if (cpu_sections.has_secondary)
                     {
                         std::memcpy(
                             &output.mins[linear],
                             cpu.native_interleaved.data() +
-                                unit + cpu.data_stride + 256u +
+                                unit + cpu_sections.mins_offset +
                                 static_cast<size_t>(n % 64) * sizeof(uint16_t),
                             sizeof(uint16_t));
                     }
@@ -1498,6 +1542,11 @@ namespace llaminar2
 
         CPUWeights output;
         configureCpuFromGpu(gpu, output);
+        // One section authority for every metadata write below: presence and
+        // offsets derive from the receiving layout tuple, never the family.
+        const auto output_sections = output.preparedSections();
+        if (!output_sections.isValid())
+            return reject(error, "Receiving CPU layout has no implemented section tables");
         const size_t unit_count =
             static_cast<size_t>(output.N_padded / 64) *
             static_cast<size_t>(output.blocks_per_row);
@@ -1527,10 +1576,14 @@ namespace llaminar2
                     for (int byte = 0; byte < output.payload_bytes; ++byte)
                         interleaved[
                             interleavedValueOffset(output, n, kb, byte)] = source[byte];
+                    if (gpu.has_emins && !output_sections.has_emins)
+                        return reject(error,
+                            "Receiving CPU layout cannot represent the source's effective minima");
                     uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
                     std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
-                    std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
-                    if (gpu.has_emins)
+                    if (output_sections.has_secondary)
+                        std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
+                    if (output_sections.has_emins && gpu.has_emins)
                         std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
                     continue;
                 }
@@ -1552,23 +1605,24 @@ namespace llaminar2
                     for (int value : decoded)
                         sum += value;
                     const int16_t compensation = static_cast<int16_t>(sum);
+                    if (output_sections.has_compensation)
+                        std::memcpy(
+                            interleaved.data() +
+                                unit + output_sections.compensation_offset +
+                                static_cast<size_t>(local_column) * sizeof(int16_t),
+                            &compensation,
+                            sizeof(compensation));
                     std::memcpy(
                         interleaved.data() +
-                            unit + output.data_stride +
-                            static_cast<size_t>(local_column) * sizeof(int16_t),
-                        &compensation,
-                        sizeof(compensation));
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride + 128u +
+                            unit + output_sections.scales_offset +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
                         sizeof(uint16_t));
-                    if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
+                    if (output_sections.has_secondary)
                     {
                         std::memcpy(
                             interleaved.data() +
-                                unit + output.data_stride + 256u +
+                                unit + output_sections.mins_offset +
                                 static_cast<size_t>(local_column) * sizeof(uint16_t),
                             &gpu.mins[linear],
                             sizeof(uint16_t));
@@ -1595,23 +1649,24 @@ namespace llaminar2
                         sum += decoded[value];
                     }
                     const int16_t compensation = static_cast<int16_t>(sum);
+                    if (output_sections.has_compensation)
+                        std::memcpy(
+                            interleaved.data() +
+                                unit + output_sections.compensation_offset +
+                                static_cast<size_t>(local_column) * sizeof(int16_t),
+                            &compensation,
+                            sizeof(compensation));
                     std::memcpy(
                         interleaved.data() +
-                            unit + output.data_stride +
-                            static_cast<size_t>(local_column) * sizeof(int16_t),
-                        &compensation,
-                        sizeof(compensation));
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride + 128u +
+                            unit + output_sections.scales_offset +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
                         sizeof(uint16_t));
-                    if (output.is_asymmetric || output.usesIQ3SExpandedSourceScale())
+                    if (output_sections.has_secondary)
                     {
                         std::memcpy(
                             interleaved.data() +
-                                unit + output.data_stride + 256u +
+                                unit + output_sections.mins_offset +
                                 static_cast<size_t>(local_column) * sizeof(uint16_t),
                             &gpu.mins[linear],
                             sizeof(uint16_t));

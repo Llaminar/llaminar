@@ -907,7 +907,8 @@ namespace llaminar2
                     .cpu_codebook_id = root.codebook_id,
                     .cpu_is_asymmetric = uint8_t(root.is_asymmetric),
                     .cpu_is_superblock = uint8_t(root.is_superblock),
-                    .cpu_encoding = root.encoding, .cpu_data_stride = uint32_t(root.data_stride),
+                    .cpu_encoding = root.encoding, .cpu_layout = root.layout,
+                    .cpu_data_stride = uint32_t(root.data_stride),
                     .cpu_block_stride = uint32_t(root.interleaved_block_stride)};
                 const size_t column_bytes = traits.cpu_block_stride / 64;
                 if (!column_bytes || capacity < column_bytes || capacity > UINT32_MAX)

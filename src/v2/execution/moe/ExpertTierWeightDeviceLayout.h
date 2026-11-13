@@ -131,20 +131,43 @@ namespace llaminar2
         int32_t cpu_N=0,cpu_K=0,cpu_first_row=0,cpu_first_column=0;
         uint8_t cpu_codebook_id=0,cpu_is_asymmetric=0,cpu_is_superblock=0;
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding=cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+        /// Physical prepared layout of the CPU stream this geometry moves.
+        cpu::native_quantised::CPUNativeQuantisedLayout cpu_layout=
+            cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
         uint32_t cpu_data_stride=0,cpu_block_stride=0,unit_count=0,maximum_units_per_chunk=0;
         unsigned wire_columns_per_unit=64;
+
+        /** @return Section authority for this stream; meaningful only while valid() holds. */
+        [[nodiscard]] constexpr cpu::native_quantised::PreparedUnitSections cpuSections() const noexcept
+        {
+            const auto *const source=native_quantised_formats::forSourceIdentity(
+                cpu_codebook_id,cpu_is_superblock!=0);
+            return source ? cpu::native_quantised::preparedUnitSections(
+                       cpu_layout,cpu_encoding,cpu_is_asymmetric!=0,*source)
+                : cpu::native_quantised::PreparedUnitSections{};
+        }
         /** @return Whether original local bounds, native physical traits and wire counts agree. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
+            const auto *const cpu_source=native_quantised_formats::forSourceIdentity(
+                cpu_codebook_id,cpu_is_superblock!=0);
             if(N<=0 || K<=0 || K%32 || blocks_per_row!=K/32 || cpu_N<=0 ||
                cpu_N>std::numeric_limits<int32_t>::max()-63 || cpu_K<=0 || cpu_K%32 ||
                cpu_first_row<0 || cpu_first_column<0 || cpu_first_column%32 ||
                cpu_first_row>cpu_N || N>cpu_N-cpu_first_row || cpu_first_column>cpu_K || K>cpu_K-cpu_first_column ||
                wire_columns_per_unit==0 || wire_columns_per_unit>64 || cpu_is_asymmetric>1 || cpu_is_superblock>1 ||
-               !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
+               !cpu_source ||
                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
-               cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding) ||
-               cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0))return false;
+               !cpu::native_quantised::isKnownPreparedLayout(cpu_layout))return false;
+            // Section authority: strides and section presence derive from the
+            // layout tuple, never from the encoding alone; a layout without
+            // implemented tables fails closed here, before any copier
+            // consumes an offset or a stride.
+            const auto sections=cpu::native_quantised::preparedUnitSections(
+                cpu_layout,cpu_encoding,cpu_is_asymmetric!=0,*cpu_source);
+            if(!sections.isValid() ||
+               cpu_data_stride!=sections.payload_stride ||
+               cpu_block_stride!=sections.block_stride)return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
             const uint64_t root_units=((uint64_t(cpu_N)+63)/64)*(cpu_K/32);
             return root_units<=std::numeric_limits<size_t>::max()/cpu_block_stride && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
@@ -204,6 +227,9 @@ namespace llaminar2
         std::uint8_t gpu_has_emins = 0;
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
             cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+        /// Physical prepared layout of the CPU endpoint's stream.
+        cpu::native_quantised::CPUNativeQuantisedLayout cpu_layout =
+            cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
         // CPU-unit and persistent staging capacity; no device allocation occurs.
         std::uint32_t cpu_data_stride = 0;
         std::uint32_t cpu_block_stride = 0;
@@ -216,7 +242,8 @@ namespace llaminar2
             return {.N=N,.K=K,.blocks_per_row=blocks_per_row,.cpu_N=cpu_N,.cpu_K=cpu_K,
                 .cpu_first_row=cpu_first_row,.cpu_first_column=cpu_first_column,
                 .cpu_codebook_id=cpu_codebook_id,.cpu_is_asymmetric=cpu_is_asymmetric,.cpu_is_superblock=cpu_is_superblock,
-                .cpu_encoding=cpu_encoding,.cpu_data_stride=cpu_data_stride,.cpu_block_stride=cpu_block_stride,
+                .cpu_encoding=cpu_encoding,.cpu_layout=cpu_layout,
+                .cpu_data_stride=cpu_data_stride,.cpu_block_stride=cpu_block_stride,
                 .unit_count=unit_count,.maximum_units_per_chunk=maximum_units_per_chunk,.wire_columns_per_unit=64};
         }
 
@@ -231,6 +258,12 @@ namespace llaminar2
                 direction == ExpertTierWeightConversionDirection::GpuToCpu;
             const bool cpu_to_gpu =
                 direction == ExpertTierWeightConversionDirection::CpuToGpu;
+            const auto *const cpu_source =
+                native_quantised_formats::forSourceIdentity(
+                    cpu_codebook_id, cpu_is_superblock != 0);
+            if (cpu_source == nullptr ||
+                !cpu::native_quantised::isKnownPreparedLayout(cpu_layout))
+                return false;
             // CPU kernels consume whole 32-K blocks and 64-column N units.
             if ((!gpu_to_cpu && !cpu_to_gpu) ||
                 N <= 0 || N>std::numeric_limits<int32_t>::max()-63 ||
@@ -248,12 +281,16 @@ namespace llaminar2
             {
                 return false;
             }
-            // Redundant wire strides must agree with the canonical encoding.
+            // Redundant wire strides must agree with the layout tuple's one
+            // section authority; an unimplemented layout fails closed here.
             if (cpu_data_stride !=
-                    cpu::native_quantised::preparedDataStride(cpu_encoding) ||
+                    cpu::native_quantised::preparedDataStride(
+                        cpu_layout, cpu_encoding, cpu_is_asymmetric != 0,
+                        *cpu_source) ||
                 cpu_block_stride !=
                     cpu::native_quantised::preparedInterleavedBlockStride(
-                        cpu_encoding, cpu_is_asymmetric != 0))
+                        cpu_layout, cpu_encoding, cpu_is_asymmetric != 0,
+                        *cpu_source))
             {
                 return false;
             }
