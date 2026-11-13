@@ -4540,3 +4540,18 @@ Main's spec (phase_rc DRIVER/FOCUS/CUDA + RC_* recorded,
 phase_fatal CFG/BUILD, OUT=/w/sa-results-91e0437c6 + wipe, trap
 ERR, DONE RC_ line). Full T SHA pinned: 91e0437c6198ca500ca2f6e0156
 b325a09730bed.
+
+### Main's delegation + pre-launch check (17:20Z)
+
+Main agreed with both deviations and the fixes (DEV-1 full SHA
+91e0437c6198ca500ca2f6e0156b325a09730bed; DEV-2 drop inner redirect
+-> ctest output in /w/sa-FOCUS.log, keep --output-junit, assert
+both). DELEGATION (Main): once I re-verify the two items and that
+nothing else changed vs the checked file, sparks MAY RESUME; no
+routing back to Main. PRE-LAUNCH CHECK (Main): bash -n + dry first
+phase — confirm the HEAD check passes and the script reaches
+"-- phase CFG start" before walking away. On-disk recheck at
+17:20Z: .79 sa-gated.sh UNCHANGED (18:18Z; D3 literal still short,
+FOCUS inner redirect still present) — holding for sparks' re-post;
+then re-verify + diff (expected delta = exactly D3 literal + FOCUS
+line), then the pre-launch check, then resume.
