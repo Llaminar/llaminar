@@ -898,6 +898,20 @@ canonical arm is a lane defect and blocks landing.
   format; execution vs scalar reference byte-exact for every
   encoding/family/tile. x86: untouched bytes, all green. Sequenced behind
   Gate A.
+- **Stage B hot-accessor design rule (Main, seq 118 — binding; recorded
+  after the A2 witness fix d0b43d81b, where A1's per-view runtime layout
+  members grew the tile-captured object, shifted the g++-14 spill frame,
+  and split a pre-existing q15/q20 stp/ldp pair into counted singles).**
+  Verbatim: "Stage B must NOT reintroduce per-view runtime layout state in
+  the hot accessors. Since view admission accepts exactly
+  kHostPreparedLayout, the hot accessors (chunkScales/chunkMins/chunkComp/
+  emins offsets) should compute offsets from **constexpr host-layout
+  tables**: compact on aarch64, canonical elsewhere. That means **zero new
+  members, no per-call branching on a stored layout, and offsets as
+  compile-time constants per encoding**. The Stage B tile proof and census
+  then become a real check of the compact addresses, not of object-layout
+  drift. The witness budgets stay as they are; any Stage-B delta has to be
+  explained instruction by instruction like this one."
 - **A3 detail (former Phase 2) — archive/wire/movement versioning.** Archive v8 + layout field
   + rejection tests; tier-stream/remote-projection/slot-pool/residency
   fabric layout identity; CUDA+ROCm conversion kernels layout-conditional
