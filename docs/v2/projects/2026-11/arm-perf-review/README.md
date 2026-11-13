@@ -2837,3 +2837,20 @@ admission + seal before any division, view/seal-level regression; the
 fail-closed invariant generalizes to every future layout. Lane informed
 (folds into its Phase-1 queue alongside the tiering addendum). Plan
 holds until the six-question review completes.
+
+### Q1 BANDWIDTH ARTIFACT SEALED+VERIFIED (00:11Z): K14-Q1BW-880429059-20261113 — NOT bandwidth-bound, >=13x slack
+
+Files: .80 /home/factory/llaminar-i8mm/q1bw/ (perf-nomtp/mtp.txt +
+plan + rider outs; counters re-verified directly: no-MTP 17.52M
+mem_access + 6.04M stall_backend_mem / 63.73s; MTP 6.10M + 2.58M).
+Method: host sudo perf stat (paranoid=4; read-only) around the existing
+35B rider binary per cell, greedy t0/s42/n=256. no-MTP ~10-21GB/s
+upper bound (32/64B line; whole-run incl. load+prefill so steady
+decode <= this) vs ~273GB/s ceiling = >=13x slack; MTP 2.4-4.8GB/s;
+stall/access ~34% = latency stalls not throughput cap. Decode
+reproduced 25.4-26.1 / 18.5 tok/s. VERDICT: L1 byte savings = capacity,
+not single-request latency — artifact-backed. Caveats in seal: PMU
+mem_access is not calibrated DRAM traffic; analytic bound (~0.75GB/token
+active set) remains normative; upper-bound direction only strengthens
+the conclusion. Relayed to Main (closes its Q1 plan input). Both hosts
+free.
