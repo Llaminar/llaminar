@@ -5,7 +5,8 @@ implementation gated on an operator capacity-value call** (arm-idea08,
 operator-authorized 2026-11-12T20:58Z). Pinned to `d5e04fdce` (PR #43 tip;
 this lane's read-only base).
 All `file:line` citations resolve at that commit unless prefixed with another
-SHA.
+SHA. **§10 is the tiered-residency addendum (gate context, design-only,
+2026-11-12T23:37Z operator request) — no implementation authorization.**
 
 Inputs of record:
 
@@ -628,6 +629,11 @@ canonical arm is a lane defect and blocks landing.
   `InterleavedCanonical` everywhere. All existing tests stay green on both
   ISAs (x86 byte fixtures unchanged; ARM still canonical). New device-free
   Unit tests: layout/stride/section table contract per encoding+source.
+  **Shipped at `d3e936fbd` (297/297 NEON portability; tile-register proof
+  PASS after the metadata-delta hot-path fix). Known latent gap, reviewer-
+  found post-push (Main-confirmed): view/seal admission divides by the
+  derived stride before rejecting an unimplemented layout — entry item 0
+  below fixes it before compact becomes real.**
 - **OPERATOR GATE — capacity value vs ABI cost.** After Phase 0 the lane
   reports and waits: the tournament removed the decode-speed prize (§1.5),
   no measured topology is admission-blocked (§2.3), and the remaining
@@ -636,6 +642,25 @@ canonical arm is a lane defect and blocks landing.
   Continue to Phase 1 only on an explicit operator confirmation that the
   capacity/residency value justifies the churn; otherwise the lane closes
   with the design + Phase 0 spine as its artifact.
+- **Phase 1 — entry item 0 (reviewer spine finding, Main-confirmed
+  2026-11-13, seq 45): fail-closed admission before any division.** At
+  `d3e936fbd`, `admitStructure` (`CPUNativeQuantisedWeightView.h:456-459`)
+  takes the stride from the layout-aware `preparedInterleavedBlockStride`
+  and immediately divides by it in the extent overflow guard; an
+  unimplemented layout returns the fail-closed ZERO stride
+  (`preparedUnitSections` compact arm, `CPUNativeQuantisedPreparedFootprint.h`),
+  so a compact descriptor reaches **division by zero** instead of a precise
+  rejection, and `MetadataSeal::validate` (`:539-542`) reaches the same
+  path. Latent in Phase 0 (no production caller selects compact; the packer
+  fixes `kHostPreparedLayout`), and the Phase-0
+  `UnimplementedLayoutFailsClosed` test covers tables/footprints only, not
+  view/seal admission. Fix BEFORE compact is real: explicit
+  unimplemented-layout/zero-stride rejection in view admission and the
+  seal, placed **before the overflow guard**, plus a view/seal-level
+  regression. **Generalized invariant: every future layout must fail closed
+  the same way — a layout without implemented section tables is rejected at
+  admission with a precise diagnostic; the zero stride is a sentinel for
+  pricing/admission tables, never a value a division may consume.**
 - **Phase 1 — compact layout on AArch64.** Compact stride tables; packer
   compact placement (`kHostPreparedLayout`-driven); view/seal/NEON admission;
   estimator overloads with layout (host default + explicit target).
@@ -692,3 +717,251 @@ canonical arm is a lane defect and blocks landing.
   decode-program trades for the IQ3_S family and the bandwidth-bound
   assumption at those shapes — nothing more. This design cites it as the
   reason its claims are capacity-only.
+7. **Tiered residency (§10)** is sized as a gate-context alternative: it can
+  beat Phase-1-only on resident bytes only with source-scale tier storage
+  (variant T2) and a hot set below ≈49 experts/layer, at the price of a
+  second representation in the ABI, a representation-aware migration cost
+  model, and — for its cold-serve path — production program-B kernels
+  across the full format sweep. The hot-set cardinality on real traffic is
+  unmeasured and is the decisive unknown for that option.
+
+---
+
+## 10. Addendum (gate context, design-only): tiered residency — compact at
+rest, expanded on promotion
+
+Operator question (2026-11-12T23:37Z): **are the byte savings achievable
+without ever putting compact bytes in the hot decode path** — i.e. without
+the tournament's 7.0–8.6× decode program? The option to size: all experts
+stored compact in the tier pool (~source bytes); an expert is expanded into
+the existing hot-expert-cache/residency machinery only on promotion (one
+expansion pass per expert-layer, off the decode critical path in maintenance
+streams); steady-state decode reads only expanded hot bytes; the ABI chain
+carries both representations with `PhysicalMemoryAuthority` accounting for
+each. This section sizes that option from sealed inputs only (census
+K14-I08A-CENSUS-5C2CEF47, tournament K14-I08A-TOURNEY-3B109793C, idea-16
+per-step attribution, idea-25 prefill split). No new runs; no implementation.
+
+### 10.1 Three representations, two tier variants
+
+| Representation | Bytes (35B) | Decode program | Speed |
+|---|---|---|---|
+| (a) canonical expanded (today) | 26.62 GB | A: inline gather from native payload regions | X (measured baseline) |
+| (b) Phase-1 compact (§2) | 20.6 GB | A unchanged — dead bytes never loaded (§2.1 read-set proof) | ≈X claimed, Phase-3 bench-gated |
+| (c) source-scale compact (tournament arm) | ≈15.3 GB | B: inline grid-decode | X/7.0–8.6 (sealed, IQ3_S family) |
+
+The tiered option holds (b) or (c) at rest and expands to (a) on promotion:
+
+- **T1 — compact-tier insurance**: tiers hold (b). Cold experts serve at
+  ≈X (program A on compact bytes — no miss penalty *if* §2.1 holds).
+  Promotion buys canonical hot bytes regardless of the Phase-3 bench
+  outcome. If §2.1 holds, promotion buys nothing measurable; if the bench
+  refutes it, T1 is the fallback that keeps the −4.5 GB tier trim while
+  restoring canonical hot-path speed.
+- **T2 — source-scale tiers**: tiers hold (c)-grade bytes (~source). This is
+  the only variant that beats Phase-1-only on resident bytes. Cold experts
+  either serve through program B (the sealed 7.0–8.6× on those reads) or
+  block until expanded; promotion is grid-decode + repack.
+
+The operator's framing ("~source bytes in the tier pool") is T2. Both
+variants reuse the same promotion fabric; they differ in tier format,
+cold-serve path, and kernel surface (§10.5, §10.8).
+
+### 10.2 Per-instance arithmetic (census-anchored)
+
+The 35B (Qwen3.6-35B-A3B) has 41 routed layers × 256 experts = 10 496
+expert-layer instances; each instance is gate+up (2 × 2048×512) + down
+(2048×512) = 3.15 M weights (idea-16 shapes; the tournament tile is exactly
+this shape — `kRows=512`, `kK=2048`, `Perf__CPUCompactIQ3SDecode.cpp:105`).
+
+Per typical instance (CMS gate/up + NLSS down; blk.39's IQ3S gate/up is a
+2.5 MB canonical outlier over 256/10 496 instances — negligible):
+
+| | source | Phase-1 compact | canonical expanded |
+|---|---|---|---|
+| gate/up | 0.67 MB | 1.05 MB | 1.57 MB |
+| down | 0.56 MB | 0.66 MB | 0.72 MB |
+| **total** | **1.23 MB** | **1.71 MB** | **2.29 MB** |
+
+Model-level anchors (census + §2.3): expert-routed 13.30 / 17.94 / 23.96 GB;
+non-expert rest (dense, lm/embd, shared, other — Q6K-native, untouched by
+Phase 1) ≈ 2.66 GB; totals 15.34 / 20.60 / 26.62 GB (±0.1 GB family
+rounding).
+
+### 10.3 (1) Hot-set sizing — resident bytes as a function of the hot set
+
+The residency machinery has **no fixed hot-set count**: promotion is
+demand-economics over histogram windows
+(`src/v2/execution/moe/DecodeExpertHistogram.h`; defaults in
+`src/v2/execution/moe/DeviceMoERebalancePolicyShared.h:30-84`: ≥64 window
+activations to be a candidate, 1300‰ imbalance threshold, ≥50‰ improvement,
+≤4 swaps/layer/wave, ≤16 plan entries/wave, 65 536-token payoff horizon;
+window 256 tokens growing 1.5× to 4096 — `RuntimeConfig.h:2000+`). The hot
+set is whatever persistently clears those bars; `--moe-hot-expert-cache`
+adds bounded *replicas* on top (`MoEHotExpertCacheConfig`,
+`RuntimeConfig.h:1814`, default `Off`). **The measured hot-set cardinality on
+real routing traffic does not exist in any seal — the census carries no
+routing histogram. It is the decisive unknown for this option and should be
+read as the gate input it is.** Until measured, the honest sizing is the
+resident-bytes function itself:
+
+Let h = promoted (expanded) instances per layer, 41 layers, keep-both
+accounting (the promoted expert's tier copy stays until demotion):
+
+| h/layer | instances | T2 rest+tiers+hot | T1 (compact tiers) | Phase-1 only | canonical only |
+|---|---|---|---|---|---|
+| 0 | 0 | 15.96 GB | 20.60 GB | 20.60 GB | 26.62 GB |
+| 8 (top-8 working set) | 328 | 16.71 GB | 21.35 GB | 20.60 GB | 26.62 GB |
+| 16 | 656 | 17.46 GB | 22.10 GB | 20.60 GB | 26.62 GB |
+| 32 | 1 312 | 18.97 GB | 23.61 GB | 20.60 GB | 26.62 GB |
+| 49 | 2 009 | 20.60 GB | 24.61 GB | 20.60 GB | 26.62 GB |
+| 64 | 2 624 | 21.97 GB | 26.62 GB | 20.60 GB | 26.62 GB |
+| 113 | 4 633 | 26.62 GB | — | — | 26.62 GB |
+
+Formulas: T2 keep-both = 15.96 + 0.0939·h GB; T1 keep-both = 20.60 + 0.0939·h;
+net-replace (tier slot released on promotion) = 15.96 + 0.0435·h (T2) and
+20.60 + 0.0238·h (T1). Self-checks: T2 net-replace at h=256 → 26.7 ≈ canonical;
+T1 keep-both at h=64 → 26.62 = canonical.
+
+**Reading:** T2 beats Phase-1-only iff h < ≈49/layer (net-replace: h < ≈107);
+T2 beats canonical-only iff h < ≈113 (net-replace: always, down to the
+15.96 GB floor). T1 never beats Phase-1-only on bytes — its value is
+hot-path insurance, not capacity.
+
+### 10.4 (2) Promotion cost — one expansion pass per expert-layer instance
+
+Grounded in the tournament's sealed timing (its tile **is** the expert
+tensor shape, §10.2): compact program-B decode runs at 30.1 Gw/s (M=1 I8MM,
+34.8 µs per 1.048 M weights) to 58.0 Gw/s (M=15, 271 µs per 15.7 M) at 20
+threads on GB10 (.79, GCC-14, Release). One instance = 3.15 M weights =
+three tournament matrices:
+
+- **54–105 µs of 20-thread work** per instance; ≈ **0.27–0.53 ms at the 4
+  default maintenance streams** (`kDefaultMigrationExecutionStreams = 4`);
+  ≈ 1–2 ms worst-case single-thread. Plus ≈3.6 MB UMA read+write — trivial.
+- **Maintenance-token bound:** the cold-serve penalty is ≈ +206–261 µs per
+  cold instance read (§10.5), so a 0.3–0.5 ms expansion **repays after ~2–3
+  activations** of that expert. The 65 536-token payoff horizon
+  (`kDefaultMigrationPayoffHorizonTokens`) is never the binding constraint;
+  the binding constraint is the **fabric throttle**: at ≤16 plan
+  entries/wave, filling h=32/layer (1 312 instances) takes ≈82 waves ≈
+  **25–30 minutes** at the 256-token window (~19 s at 75 ms/step; windows
+  grow toward 4096, stretching this). Slot/stream capacity is not the
+  throttle (16 entries × 0.4 ms through 5 slots ≈ 1.3 ms of stream work per
+  wave); the plan-entry cap is, and it is config, not code.
+
+A promotion is therefore cheap per instance but the hot set fills at
+minutes-scale at default fabric — relevant if the operator pictures
+burst-fill after a traffic shift.
+
+### 10.5 (3) Cold-miss behavior — honest options
+
+Per-step anchors (idea-16, post-bundle-fix, 35B MTP off, ~75 ms/step):
+routed experts ≈ 274 µs/layer (pooled 8-expert workshare) ≈ 34 µs per expert
+instance read expanded; GDN 440 µs; LM head 5.7 ms. MTP dynamic ≈ 27 tok/s.
+
+- **Serve-compact-slow (T2 only):** a cold instance read runs program B at
+  the sealed ratio: 34 µs → ≈240–295 µs, i.e. **+206–261 µs ≈ +0.3% of the
+  75 ms step per cold instance read** (additive in the pooled workshare). A
+  step with k cold reads pays ≈ +0.3·k%; the all-cold worst case (328
+  reads) is ≈ 2× the step — degraded but serving, no deadlock. **This option
+  requires production program-B kernels for every tier encoding family** —
+  the tournament built one bench-local family (IQ3_S); the repo's coverage
+  totality bar (every codebook, M sweep, backends) makes this a large
+  kernel surface, and it is the very program the tournament priced.
+- **Serve-compact-slow (T1):** no miss penalty *by construction* (compact
+  bytes are program-A bytes minus dead bytes; §2.1). This is the insurance
+  case — the penalty exists only if the Phase-3 bench refutes §2.1, in which
+  case it is the sealed ratio on the compact-read share.
+- **Block-until-expanded:** 0.3–0.5 ms + queueing per instance against 5
+  preallocated slots; a burst of newly-hot experts serialises decode behind
+  maintenance — a bounded stall risk that also cuts against the repo's
+  no-blocking-sync hot-path discipline. Rejected as a default; only
+  defensible as an explicit admission policy for a latency-insensitive
+  serving class.
+- **Verifier rows:** grouped MTP verifier rows are decode work routed to the
+  same experts as the accepting step, so steady-state verifier reads hit the
+  hot set; only newly-hot experts serve cold (experts ≈ 3.8 ms per grouped
+  call would become ≈ 30 ms only if *all* its members were cold — a
+  transient, not a steady state).
+
+### 10.6 (4) Combined-with-Phase-1 floor — the 35B theoretical resident minimum
+
+The combined option (dead-trimmed non-hot bulk + compact tiers + expanded
+hot set) minimises at the smallest viable hot set. With the top-8 working
+set (h=8):
+
+- **T2 net-replace: ≈ 16.3 GB** (15.96 floor + 8×41×(2.29−1.23) MB) — the
+  theoretical resident minimum for this option family on the 35B.
+- T2 keep-both: ≈ 16.7 GB.
+- For comparison: Phase-1-only 20.60 GB; canonical-only 26.62 GB; absolute
+  all-source floor (h=0, every read program-B — not a serving config)
+  15.96 GB; census source total 15.34 GB (the 0.6 GB gap is the Q6K-native
+  non-expert rest, which no variant trims).
+
+So the tiered family's realistic floor is **≈ 16.3–16.7 GB**, i.e. −3.9 to
+−4.3 GB beyond Phase-1-only, at h=8. The floor degrades toward Phase-1-only
+as h grows (break-even h≈49 keep-both / h≈107 net-replace).
+
+### 10.7 (5) Prefill and grouped-row interaction
+
+Prefill on this model is overhead-dominated, not expert-kernel-bound:
+measured marginal 3.01–3.22 ms/token vs captured stage kernels 0.60
+ms/token ⇒ ≈80% of prefill wall is bucket-pipeline replay/launch/sync +
+fixed intercept (idea-25, head numbers 2026-11-08; the operator's ~91%
+host-bound reference is this measurement's direction). Expert streaming is
+a slice of the 20% kernel share:
+
+- A 512-token batch touches up to min(256, 8·512) = 256 experts/layer;
+  grouped same-expert row sharing (pooled expert FFN, `408ff90e5`) streams
+  each touched instance once. Worst-case all-touched: expanded streaming
+  ≈ 73 ms of a ≈1.54 s prefill; compact-slow (58 Gw/s) ≈ 567 ms ⇒ **≈ +32%
+prefill marginal**. At 64/layer touched (2 624 instance-streams): ≈ **+8%**. So a cold-heavy prefill
+  costs single-digit to low-tens percent — prefill's overhead dominance
+  absorbs most of the 7.9×.
+- **Expand-on-prefill is not viable**: a 512-token batch can touch all
+  10 496 instances ≈ 4+ s of expansion work for transient demand. The
+  correct interaction is the existing one: prefill activations feed the
+  demand histograms (`DecodeExpertHistogram.h`), promotion follows
+  *persistent* demand, and transient prefill reads serve compact-slow at
+  the bounded cost above (T2) or ≈speed-neutral (T1).
+
+### 10.8 (6) Delta vs Phase-1-only
+
+| | Phase-1 only | T2 tiered (h=8…32) | T1 tiered |
+|---|---|---|---|
+| Resident bytes (35B) | 20.60 GB | 16.7–19.0 GB | ≥ 20.6 GB (21.3+ at h=8) |
+| Beyond Phase 1 | — | **−1.6…−3.9 GB** | none (costs extra) |
+| Cold experts per tier byte | 1/1.71 MB | 1/1.23 MB (**+36%**) | 1/1.71 MB |
+| Hot-path representation | compact (bench-gated ≈X) | canonical (X by construction) | canonical (X by construction) |
+| New kernels | none | program-B production sweep + expansion pass | expansion pass only |
+| ABI/PMA | one layout dim | **two representations**, dual accounting, representation-aware migration cost model | two representations, dual accounting |
+| Hot-set fill | — | minutes at default fabric | minutes |
+| Unknown dependency | §2.1 bench confirmation | **measured hot-set cardinality** + Phase-1 machinery anyway (tiers hold compact bytes) | §2.1 bench outcome |
+
+The honest summary for the gate:
+
+1. **Phase 1 alone** buys −6.0 GB with one representation, zero new kernels,
+   and a bench-gated speed-neutrality claim.
+2. **Tiering (T2)** buys −1.6 to −3.9 GB *more* (to a ≈16.3–16.7 GB floor)
+   and keeps the hot path canonical by construction — but requires Phase 1's
+   machinery anyway if tiers hold compact bytes, adds a second
+   representation end-to-end (tier store, expansion pass, dual PMA
+   accounting, representation-aware migration economics in
+   `DeviceMoERebalancePolicyShared.h`, representation identity in
+   `ExpertTierWeightStream.h`'s exact-migration-state validation), a
+   production program-B kernel sweep for cold serve, and its value pivots on
+   an unmeasured hot-set cardinality (break-even h≈49/layer keep-both).
+3. **T1** is not a capacity option; it is the insurance variant if the
+   Phase-3 bench refutes compact-read neutrality.
+
+### 10.9 What this addendum does not claim
+
+No topology unlock (same as §2.3 — no measured topology is admission-blocked
+at 26.62 GB). No decode-speed claim for any variant. All numbers are
+sealed-input arithmetic (census, tournament, idea-16/25 head numbers) —
+projections, not new measurements; per-instance values carry ±0.1 GB family
+rounding. The hot-set cardinality, the Phase-3 bench outcome, and the
+representation-aware migration cost model are the three inputs that would
+change this table, and none of them exists today. Implementation of anything
+in this section remains gated on the operator's CONTINUE/CLOSE decision.
