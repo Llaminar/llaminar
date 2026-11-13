@@ -2807,3 +2807,17 @@ stated; revisit only if the merge stalls indefinitely). Sparks
 dispatched the Q1 bandwidth-observation artifact (.80, no-MTP + dyn-MTP
 achieved GB/s vs ~273 ceiling, K14-Q1BW seal). Next: reviewer findings
 -> fix plan -> lane starts as implementer.
+
+### STATE AUDIT 23:53Z (exceptions-only): NO exceptions — all verified
+
+.80: sparks' Q1 bandwidth observation LAUNCHED live (q1bw container
+llaminar-arm-engine-sdk-py:e0d6d34e7, nohup + q1bw-run.log + 300s tail
+verification; base64-decode-on-host + bash -n — the post-silent-failure
+launch pattern, working). .79 idle (0 procs). Station: c290 idle, c527
+idle (CB C1 between phases — lead-owned, consistent). Sessions match:
+reviewer THINKING (Main's 6-question design pre-review — in flight),
+arm-idea08 THINKING (tiering addendum — in flight), sparks tool:bash
+(Q1 launch — matches host evidence), Main idle 41%, CB lead thinking
+(compacted, 50% ctx — healthy), i08repair idle. A2 rider exports
+confirmed landed (i16rider/ + i16rider-t2/ paths verified earlier this
+session). No claim-vs-artifact drift anywhere.
