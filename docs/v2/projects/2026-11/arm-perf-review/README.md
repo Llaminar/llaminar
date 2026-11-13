@@ -4989,3 +4989,24 @@ lane's 10-min poll is session-side/minimal, no collision. .79
 sealed gate + .80 focused ARM triage (sparks) unaffected (parallel
 hosts); lane's root-cause ledger independent. Nothing else pending
 from me until the probe result.
+
+### Lane's exact bucket-(b) filters relayed to sparks (.80 triage) (21:57Z)
+
+Lane provided the precise owner filters (unit + integration):
+OrcConfigDoc.EveryRequiredOrExtraObjectFieldIsRejected;
+MoEOverlayCapacityAdmission.CpuResourcesPriceOnlyTheBoundOverlay
+Layout + MoEOverlayCapacityResolver.PipelineStageAdmission
+AuthenticatesManifestOrigin; Test__MoEOverlayDistributedResidency
+Protocol.RemoteCpuWireBuildersRejectUnimplementedLayoutsBefore
+Arithmetic; AutomaticPlanningDiagnostics.CompleteAdmissionAnd
+SelectionRetainAllWorkWithoutDebugGeometryFlood; CPUTensorTP1
+PreparedStatic.OriginalSourceAndStaticSetupRetainWholeMatrixPolicy;
+CPUExpertShardAccounting x4; CPUJointStaticResidency x2;
+MoEPipelineMultiDeviceMemory.* (+_4Devices/_8Devices =
+MoEPipelineFixedMemory family); MoEPipelineNativePreparation x2
+(:1111/:1152 death tests); integration names 13-19 set. EXCLUDE on
+ARM: Perf__CPURootedPublicationTransport:306 (2-socket env class;
+base control discriminates on x86). Root-cause ledger = in
+ba2811e4c's commit message (all classified). Lane poll-only; WSL
+harvest (fresh OUT/rc/JUnit) report pending. .80 runner spec
+unchanged (regex, --no-tests=error, JUnit, gated pattern, one job).
