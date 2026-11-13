@@ -5085,3 +5085,13 @@ filtered.xml (22:59Z) => the sealed gate at 03480d07e has
 COMPLETED (seal dir on disk; sparks report imminent). .80 =
 llaminar-i8mm tree updated 23:15Z => focused ARM triage setup
 active. Both sparks legs healthy.
+
+### Qual probe #3 = still down (22:36Z)
+
+Shell path down ~85 min; broker-side functional; probe #4 armed
+00:06Z (30-min gap — cadence widening appropriately for the long
+outage; load-minimizing). Recovery plan unchanged (dockerd-clean
+check -> T' -j4 sole -> byte-identity serialized -> develop-control
+last). Nothing launched; all evidence sealed on disk. .79 seal dir
+complete (verified 22:24Z); .80 triage building (verified); sparks'
+formal reports pending.
