@@ -41,6 +41,7 @@ Use a GGUF file from one of these supported model families:
 * Qwen 2.5 (dense)
 * Qwen 3 (dense)
 * Qwen 3.5/3.6 (dense and MoE), including Qwen 3.8 dense GGUFs
+* Qwen Flash Next (MoE)
 
 The tested examples below include Qwen 3.8 27B, Qwen 3.6 MoE 35B,
 Ornith 1.5 MoE 35B, and Qwen 3.5 MoE 122B.
