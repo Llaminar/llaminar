@@ -3202,3 +3202,16 @@ admitted true for every entry; the duplicated-demotion branch (:454)
 is dead — remove the exclusion + comment, do not advertise a support
 gap. Binding handback retargets the NEW tip; sparks informed (stop/
 rerun pattern; 94679834d env-only label stands).
+
+### 94679834d ENV-VALIDATION COMPLETE (03:18Z): 7/10 pass, 3 fails = the fixup targets — standing rule vindicated
+
+sparks' labeled environment+surface run: 7/10 passed; the 3 failures
+(ExpertTierRectangularRemoteProtocol, ExpertTierGpuArrivalProjection
+Contract, ExpertTierNativeCPUCompactProtocol) are EXACTLY the A1
+fixup's target surfaces — the lane's Mac minimal runner had them green,
+real Linux caught them. Textbook vindication of Main's standing rule
+(lanes compile AND RUN Linux-only binaries natively before handback).
+JUnit+ctest artifacts: .79 /home/factory/idea25/a1h-results/. d8eff03bd
+build NOT started (correct hold); sparks waits for the FINAL tip after
+the reviewer's second narrow fixup, then runs the exact Main scope
+(--no-tests=error) and seals K14-A1HB-<tip>-<ts>.
