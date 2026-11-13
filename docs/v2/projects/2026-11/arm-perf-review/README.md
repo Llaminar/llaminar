@@ -3612,3 +3612,25 @@ also 5/5/4 = stale budgets = base gap. Sparks sequence: census ->
 A2 boundary at bc91b0d71 (target-set builds; witness not a seal
 blocker) -> A3 boundary at 365c29aeb. Main's A3 review can start on
 365c29aeb.
+
+### MAIN DECISIONS 08:58Z: A2/A3 source-OK; witness = option (a) source fix before the pin
+
+A2 @ bc91b0d71 source review OK (contract keeps secondary as source
+data; emins directional; rotated-Q2_K refinement right; compensation
+out of validators; regression shape right; pin waits on the fixed-tip
+boundary). A3 @ 365c29aeb first-pass source OK (archive v8 sealed
+byte/exactly-v7/global pre-v7/strides re-derived; stream v4 hashed;
+ABI 5 sealed+derivation+typed mismatch rejection — matches reviewer
+(c)); pin waits on its boundary. WITNESS: option (a) FIX THE SOURCE;
+budgets + witness policy UNCHANGED. Cause = A1's metadata_secondary_/
+metadata_emins_ view members changed the tile-carried object/frame
+(q15/q20 pair -> singles). Phase-0 lesson: restore base layout of
+tile-captured state — fold into existing member/padding (sizeof+
+order = base) OR keep out of tile state (presence via seal/section
+authority in cold accessors). Acceptance: container census reads
+base counts (3/3/2) at fixed tip + tile proof green on shipped
+arches; no budget edits/allowlist. GATE: fix only if census confirms
+base 3/3/2; if base 5/5/4 = stale budgets = base-owner item, STOP.
+Witness fix BEFORE the A2 pin (fixup on bc91b0d71, A3 rebases, A2
+boundary at the FIXED tip). Sparks re-dispatched: census routes;
+hold boundaries for tip update either way.
