@@ -5039,3 +5039,19 @@ no docker containers visible from host (limited visibility there —
 gate may run root/transient; sparks hasn't reported yet; no claims
 to contradict). Nothing pending from me until probe #2 / sparks'
 reports.
+
+### WSL triage container SURVIVED; dockerd down; harvest w/o docker (22:02Z)
+
+Lane: armq-a512-ba2811e4c triage container survived the host
+incident, actively building (driver.log fresh; ninja 197/2779;
+load 1-min 6.5 vs 15-min 83.9 = thrashers gone). CAVEAT: docker
+CLI/dockerd DOWN (no socket/process) — container processes =
+orphans (tini+ninja); ALL evidence bind-mounted at
+~/llaminar-work/armq/a512-ba2811e4c/{logs,receipt} => harvest
+WITHOUT docker (docker logs unavailable; gate script's own logs =
+the record: fresh OUT, rc from receipt, JUnit). Per Main: no
+relaunch, one container, poll-only; on DONE report gated-script
+result, then VM -> qual lane's serial queue. PLAN UPDATE: if the
+surviving run completes = the x86 triage CONFIRMATION (same code/
+suites); qual T' -j4 rerun = the full T' gate evidence; .80 ARM
+triage = primary. Main informed; stronger two-ISA provenance.
