@@ -4423,3 +4423,25 @@ progress_replay fix verified on GB10; new receipt written; .79
 NCCL current-for-T. Everything holds for Main's script pass ->
 gate resume at 91e0437c6 (K14-STAGEAGATE-91E0437C6). Pre-resume
 check dispatched to sparks (receipt-dir state).
+
+### Main's sa.sh review = NOT passed: D1-D3 + minor; fix pattern dispatched (16:50Z)
+
+Main's gate-logic review found D1 (abort-on-expected-red: DRIVER
+exits 8 with known reds -> set -e aborts; FOCUS regex includes the
+whole-binary CUDA ExpertTierWeightKernels which FAILS by no-skip on
+single-GPU GB10 -> FOCUS/CUDA would never run; fix = record rc
+without abort via set +e/rc=$?/set -e + eval RC_name, artifacts
+still asserted; only CFG/BUILD/artifact-checks fatal), D2 (stale
+artifacts fake success: /w/sa-results + JUnuts + logs from 14:05Z
+run pass test -s on OLD files; fix = rm -rf at start; better OUT=/
+w/sa-results-91e0437c6 -> also removes the driver FileExistsError),
+D3 (tip identity: assert git -C $T rev-parse HEAD == full
+91e0437c6 + clean status before CFG; tree configured at 609638aba
+-> incremental rebuild only with head check). Minor: trap ERR for
+FAILED line; final line DONE RC_DRIVER= RC_FOCUS= RC_CUDA= (non-
+zero DRIVER/FOCUS != success; Main classifies reds from JUnit vs
+known/inherited sets). Spec dispatched verbatim to sparks; corrected
+file expected; I verify D1-D3 on-disk before Main's pass (Main: no
+relay needed unless deviation). Main recorded: A2 pin ready
+(K14-A2CUDAB-1F92DCA1C) + routed; discriminator MISMATCH proven;
+INST=0 green at 91e0437c6.
