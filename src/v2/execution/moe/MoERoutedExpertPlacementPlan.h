@@ -424,9 +424,13 @@ namespace llaminar2
          * would pair endpoints whose builds execute different prepared
          * layouts (cross-ISA CPU pairing), and records the one uniform value
          * here for BOM pricing and runtime preparation. Absent when the bound
-         * overlay declares no CPU participant. Consumers that price or move
-         * CPU prepared bytes read this single typed field instead of
-         * re-deriving a layout from hardware or ambient build state.
+         * overlay declares no CPU participant. The observation is published
+         * losslessly in the apply document (symbolic layout name; a missing
+         * field is a pre-feature document), and binding re-checks it against
+         * the live inventory at apply instead of silently re-resolving.
+         * Consumers that price or move CPU prepared bytes read this single
+         * typed field instead of re-deriving a layout from hardware or
+         * ambient build state.
          */
         std::optional<cpu::native_quantised::CPUNativeQuantisedLayout>
             resolved_cpu_prepared_layout;

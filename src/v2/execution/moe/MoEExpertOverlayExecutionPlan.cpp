@@ -1255,6 +1255,22 @@ namespace llaminar2
                         "planning time before any allocation or prepared-weight "
                         "transfer");
             }
+            // A saved planning observation (an applied plan document) is
+            // authoritative for replay: the saved placement was planned, priced
+            // and captured against that layout. Refuse a live inventory that
+            // no longer matches it instead of silently re-resolving placement
+            // on apply — a saved ARM plan replayed on an x86 cluster fails
+            // here with a typed diagnostic, before allocation or weight wire.
+            if (bound->resolved_cpu_prepared_layout.has_value() &&
+                *bound->resolved_cpu_prepared_layout != uniform_layout)
+                throw std::invalid_argument(
+                    std::string("Saved MoE overlay plan resolved CPU prepared "
+                                "layout '") +
+                    cpu::native_quantised::preparedLayoutName(
+                        *bound->resolved_cpu_prepared_layout) +
+                    "' does not match the live inventory's uniform layout '" +
+                    cpu::native_quantised::preparedLayoutName(uniform_layout) +
+                    "'; apply is refused instead of re-resolving placement");
             bound->resolved_cpu_prepared_layout = uniform_layout;
         }
 

@@ -1114,6 +1114,77 @@ namespace llaminar2::test
         }
     }
 
+    TEST(Test__MoEExpertOverlayRuntimePlan, SavedPlanLayoutIsRecheckedAgainstLiveInventoryAtApply)
+    {
+        using cpu::native_quantised::CPUNativeQuantisedLayout;
+        const auto makeSaved = [](CPUNativeQuantisedLayout saved) {
+            auto plan = rankAgnosticThreeTierPlan();
+            plan->resolved_cpu_prepared_layout = saved;
+            return plan;
+        };
+
+        // A saved plan document carries the planning observation its
+        // placement was priced and captured against. Applying it to a live
+        // inventory whose CPU endpoints execute a different layout is a
+        // typed refusal — never a silent re-resolve of the placement.
+        {
+            const auto saved_compact = makeSaved(
+                CPUNativeQuantisedLayout::InterleavedCompactA64);
+            const auto inventory = syntheticTwoSocketInventory(0, 1);
+            try
+            {
+                static_cast<void>(bindMoEExpertOverlayPlanToClusterInventory(
+                    *saved_compact, inventory));
+                FAIL() << "mismatched saved layout must be refused at apply";
+            }
+            catch (const std::invalid_argument &error)
+            {
+                EXPECT_NE(std::string(error.what())
+                              .find("does not match the live inventory"),
+                          std::string::npos);
+                EXPECT_NE(std::string(error.what()).find(
+                              "interleaved-compact-a64"),
+                          std::string::npos);
+                EXPECT_NE(std::string(error.what()).find(
+                              "interleaved-canonical"),
+                          std::string::npos);
+                EXPECT_NE(std::string(error.what()).find(
+                              "apply is refused"),
+                          std::string::npos);
+            }
+        }
+
+        // Matching observation and inventory: the saved plan applies and
+        // keeps its resolved layout.
+        {
+            const auto saved_compact = makeSaved(
+                CPUNativeQuantisedLayout::InterleavedCompactA64);
+            auto inventory = syntheticTwoSocketInventory(0, 1);
+            for (auto &rank : inventory.ranks)
+                rank.cpu_prepared_layout =
+                    CPUNativeQuantisedLayout::InterleavedCompactA64;
+            const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(
+                *saved_compact, inventory);
+            ASSERT_NE(resolved, nullptr);
+            ASSERT_TRUE(resolved->resolved_cpu_prepared_layout.has_value());
+            EXPECT_EQ(*resolved->resolved_cpu_prepared_layout,
+                CPUNativeQuantisedLayout::InterleavedCompactA64);
+        }
+
+        // A saved canonical observation on a canonical cluster also applies.
+        {
+            const auto saved_canonical = makeSaved(
+                CPUNativeQuantisedLayout::InterleavedCanonical);
+            const auto inventory = syntheticTwoSocketInventory(0, 1);
+            const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(
+                *saved_canonical, inventory);
+            ASSERT_NE(resolved, nullptr);
+            ASSERT_TRUE(resolved->resolved_cpu_prepared_layout.has_value());
+            EXPECT_EQ(*resolved->resolved_cpu_prepared_layout,
+                CPUNativeQuantisedLayout::InterleavedCanonical);
+        }
+    }
+
     TEST(Test__MoEExpertOverlayRuntimePlan, HardwareBindingUsesObservedAffinityForBothGPUVendors)
     {
         auto requested = rankAgnosticThreeTierPlan();

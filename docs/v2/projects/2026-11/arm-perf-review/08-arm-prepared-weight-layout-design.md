@@ -1015,6 +1015,42 @@ canonical arm is a lane defect and blocks landing.
     `CpuResourcesPriceOnlyTheBoundOverlayLayout` (unbound CPU resource
     refuses; compact-bound plan fails closed at the section authority;
     canonical-bound input threads and prices build-default bytes).
+- **Record-visitor arity defect + document contract (seq 145/148, fixup on
+  609638aba):** 569de492b added `resolved_cpu_prepared_layout` to
+  `MoERoutedExpertPlacementPlan` without extending the MEMBERS list in
+  `OrchestrationConfigDocument.cpp`'s RECORD visitor — the structured
+  binding decomposes 20 members against 19 names and every build of that TU
+  fails (caught by the WSL x86 gate leg at BUILD; compiler- and
+  ISA-independent; the Mac lane never compiled this TU, which is how it
+  slipped). **Landing per Main's binding guidance:** the field is INCLUDED
+  in the lossless apply document, encoded as the symbolic layout name
+  (`InterleavedCanonical`/`InterleavedCompactA64`) with `null`/absent =
+  no CPU participant / pre-A4 document (additive-optional Reader arm, same
+  pattern as `local_hot_cache`; no schema bump); the binder RE-CHECKS the
+  saved observation against the live uniform inventory at apply and refuses
+  a mismatch with a typed diagnostic ("…does not match the live inventory…
+  apply is refused instead of re-resolving placement") — a saved ARM plan
+  replayed on an x86 cluster fails at admission, never by silently
+  re-resolving. Regressions: document round-trip with and without the
+  field (absent/null decode to nullopt; foreign values 3 /
+  "interleaved-compact-a64" / "Foreign" rejected; old schema still
+  rejected) and `SavedPlanLayoutIsRecheckedAgainstLiveInventoryAtApply`
+  (mismatch refused with both names pinned; matching compact and canonical
+  observations apply and keep their value). **Arity sweep of every
+  chain-touched struct:** both manifest equalities and the projection
+  identity equality are defaulted (auto-cover new members); the tier-stream
+  `computedHash` mixes `cpu_endpoint_layout` (A3); `RankInventory`'s
+  hand-rolled serializer is F1-version-gated with its tamper regression;
+  `ExpertTierWeightCPUStorageLayout` validates through `valid()` section
+  re-derivation; `CpuExpertSlotPool::Config` and
+  `MoEOverlayCapacityResolverInput` have no member enumerators; the RECORD
+  structured binding itself is the arity static check (it is what failed).
+  **Probe-gap closure:** the host syntax lane now carries a standing probe
+  for `OrchestrationConfigDocument.cpp` (the RECORD authority TU — it
+  compiles clean on macOS); its teeth were proven by re-introducing the
+  19-vs-20 MEMBERS list, which reproduces the exact gate diagnostic. The
+  lane rule going forward: any fixup touching a header with a RECORD-
+  visited struct runs that probe.
 - **Carried A4 work (seq 138 determination): participant-observed endpoint
   layout selection in the runtime fabric.** 569de492b does NOT cover it —
   A4 landed the planning/inventory/binder/estimator/pool boundary, not the

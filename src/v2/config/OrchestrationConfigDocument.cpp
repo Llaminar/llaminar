@@ -83,6 +83,7 @@ namespace
     ENUM(MoEOverlayAuthorityExecutionKind, VALUE(Unresolved), VALUE(HostResident), VALUE(DeviceResident))
     ENUM(MoEContinuationDensePolicyIntent, VALUE(Resolved), VALUE(Automatic), VALUE(Explicit))
     ENUM(MoEContinuationActivationLayout, VALUE(ReplicatedHidden), VALUE(RootOnlyHidden), VALUE(ShardedHiddenRequiresGather))
+    ENUM(cpu::native_quantised::CPUNativeQuantisedLayout, VALUE(InterleavedCanonical), VALUE(InterleavedCompactA64))
     ENUM(DenseParallelPolicy, VALUE(Replicated), VALUE(TensorParallel), VALUE(TensorParallelDecodeMirroredEmbedding), VALUE(PrefillTensorParallelDecodeReplicated))
 #undef ENUM
 #undef VALUE
@@ -206,7 +207,8 @@ namespace
 #define MEMBERS(X) X(topology) X(continuation_domain) X(base_model_domain) X(shared_expert_domain) \
     X(continuation_domain_spec) X(residency_policy) X(authority_execution) \
     X(observed_route_transport) X(observed_route_diagnostic) X(replica_cache_capacity) \
-    X(owner_order) X(dense_domains) X(domains) X(routed_tiers) X(initial_layer_order_overrides) \
+    X(owner_order) X(resolved_cpu_prepared_layout) X(dense_domains) X(domains) \
+    X(routed_tiers) X(initial_layer_order_overrides) \
     X(placements) X(continuation_dense_policy_intent) X(first_model_layer)
     RECORD(MoERoutedExpertPlacementPlan, enabled, MEMBERS)
 #undef MEMBERS
@@ -270,6 +272,13 @@ namespace
             // documents. Every original field remains mandatory and lossless.
             if constexpr (std::same_as<T, std::optional<AdaptiveGPULocalHotCacheRequest>>)
                 if (json.is_object() && !json.contains(name) && std::string_view(name) == "local_hot_cache")
+                { value.reset(); return; }
+            // Additive optional arm: resolved_cpu_prepared_layout is a
+            // planning observation published by A4. Pre-A4 saved plans carry
+            // no such field and apply against live inventory (nullopt), so a
+            // missing field is the pre-feature document, not an error.
+            if constexpr (std::same_as<T, std::optional<cpu::native_quantised::CPUNativeQuantisedLayout>>)
+                if (json.is_object() && !json.contains(name) && std::string_view(name) == "resolved_cpu_prepared_layout")
                 { value.reset(); return; }
             if (!json.is_object() || !json.contains(name)) invalid(field_path, "missing field");
             value = decode<T>(json.at(name), field_path);

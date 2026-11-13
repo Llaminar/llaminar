@@ -750,6 +750,47 @@ TEST(OrchestrationConfigDocument, ObservedRouteBindingRoundTripsLosslesslyAtCurr
     const auto json=Json::parse(text);EXPECT_EQ(json.at("schema_version"),13);
     EXPECT_EQ(json.at("configuration").at("moe_routed_expert_plan").at("observed_route_transport").at("decode"),"NativeCollective");
 }
+/** @test The resolved CPU prepared layout is a lossless planning observation with symbolic names. */
+TEST(OrchestrationConfigDocument, ResolvedCpuPreparedLayoutRoundTripsLosslesslyAtCurrentSchema) {
+    auto config=example(DeviceType::ROCm);
+    const auto unbound=serializeOrchestrationConfig(config);
+    EXPECT_EQ(deserializeOrchestrationConfig(unbound).moe_routed_expert_plan->resolved_cpu_prepared_layout,std::nullopt);
+    auto& plan=*config.moe_routed_expert_plan;
+    for(const auto layout:{cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
+                           cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64}) {
+        plan.resolved_cpu_prepared_layout=layout;
+        const auto text=serializeOrchestrationConfig(config);
+        const auto restored=deserializeOrchestrationConfig(text);
+        ASSERT_TRUE(restored.moe_routed_expert_plan);
+        EXPECT_EQ(restored.moe_routed_expert_plan->resolved_cpu_prepared_layout,layout);
+        EXPECT_EQ(serializeOrchestrationConfig(restored),text);
+        const auto json=Json::parse(text);
+        EXPECT_EQ(json.at("configuration").at("moe_routed_expert_plan").at("resolved_cpu_prepared_layout"),
+                  layout==cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64
+                      ? "InterleavedCompactA64" : "InterleavedCanonical");
+    }
+    EXPECT_NE(serializeOrchestrationConfig(config),unbound);
+}
+/** @test The additive optional layout field tolerates absent/null (pre-A4 document) and rejects foreign values. */
+TEST(OrchestrationConfigDocument, ResolvedCpuPreparedLayoutToleratesAbsentNullAndRejectsForeign) {
+    auto config=example(DeviceType::CUDA);
+    config.moe_routed_expert_plan->resolved_cpu_prepared_layout=
+        cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64;
+    const auto valid=Json::parse(serializeOrchestrationConfig(config));
+    const Json::json_pointer plan("/configuration/moe_routed_expert_plan");
+    auto absent=valid;absent[plan].erase("resolved_cpu_prepared_layout");
+    const auto pre_feature=deserializeOrchestrationConfig(absent.dump());
+    EXPECT_EQ(pre_feature.moe_routed_expert_plan->resolved_cpu_prepared_layout,std::nullopt);
+    auto null=valid;null[plan]["resolved_cpu_prepared_layout"]=nullptr;
+    EXPECT_EQ(deserializeOrchestrationConfig(null.dump()).moe_routed_expert_plan->resolved_cpu_prepared_layout,std::nullopt);
+    for(const auto& value:std::vector<Json>{Json(3),Json("interleaved-compact-a64"),Json("Foreign")}) {
+        auto malformed=valid;malformed[plan]["resolved_cpu_prepared_layout"]=value;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()),std::invalid_argument);
+    }
+    auto old=valid;old["schema_version"]=12;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
+}
+
 /** @test New required binding fields have strict types/enums and cannot enter through an old schema. */
 TEST(OrchestrationConfigDocument, ObservedRouteBindingRejectsMissingMalformedAndOldSchema) {
     auto config=example(DeviceType::CUDA);
