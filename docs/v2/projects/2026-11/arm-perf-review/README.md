@@ -3070,3 +3070,28 @@ with ExpertTierDirectCPUProjectionContract + prepared-layout +
 expert-tier stream tests, JUnit; seal K14-A1HB-94679834D). WSL x86
 takes the same set at the Stage-A gate. A2 parallel-approved on
 94679834d; rebase if A1 needs a fix.
+
+### BASE FINDING via A1 handback (02:15Z): preflight guard FATALs in no-parity-model configs — not a lane defect
+
+sparks' .79 full Integration configure @ 94679834d FATALs at
+tests/v2/CMakeLists.txt:38323: V2_Integration_
+DynamicConvergenceFiniteHorizonLifecycle named in the preflight list
+(:29675) but unregistered — its add_v2_test (:13862, NO_MODELS,
+FORCE_CPU_ONLY) sits in the Qwen35MoE parity block whose executable
+(:13802) did not register. COORDINATOR VERIFICATION: registration +
+list + guard byte-identical at base d5e04fdce; lane never touched
+tests/v2/CMakeLists.txt => BASE defect in the config class lacking
+parity model sources. Mechanism: the guard's prune covers BACKEND
+omissions only (V2_BACKEND_OMITTED_TESTS); model-source/parity-block
+omissions leave the name in the list — exactly the case the guard's
+comment claims cannot happen ("never as an unregistered name").
+Regression window: inside the PR's develop ancestry (tournament-era
+880429059 base configured the full suite fine on .79). PR CI passed =>
+canonical companions satisfy the block; non-canonical spark-side runs
+bite. ROUTED: Main (diagnosis confirm + fix path [develop-side prune,
+symmetric to backend prune, tip frozen] + sanctioned unblock [35B
+symlink candidate / official option / hold]); sparks holds .79 at
+94679834d, failed cfg preserved, no edits. Lane continues A2
+unaffected. BROADER FLAG: post-merge spark-side full-suite runs on
+develop hit this until fixed. Artifacts: .79 /home/factory/idea25/
+{a1h.sh, a1h-cfg.log}.
