@@ -111,8 +111,24 @@ namespace llaminar2
         bool is_superblock = false;
         bool present = false;
 
-        /** @brief Compare all provenance fields, including explicit presence. */
-        bool operator==(const NativeQuantisedSourceIdentity &) const = default;
+        /**
+         * @brief Compare all provenance fields, including explicit presence.
+         *
+         * Written member-wise instead of `= default`: the x86-64 g++-14 of
+         * the canonical build container rejects the defaulted form's
+         * implicit instantiation in otherwise-identical translation units
+         * that clang and the ARM g++-14 accept, while every member is a
+         * scalar. The explicit comparison is unconditionally well-formed,
+         * byte-identical in behavior, and keeps every existing
+         * `==`/`!=` caller (C++20 equality rewriting supplies `!=`).
+         */
+        [[nodiscard]] bool operator==(
+            const NativeQuantisedSourceIdentity &other) const noexcept
+        {
+            return codebook_id == other.codebook_id &&
+                   is_superblock == other.is_superblock &&
+                   present == other.present;
+        }
     };
 
     /**
