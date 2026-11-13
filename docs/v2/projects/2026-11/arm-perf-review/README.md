@@ -4884,3 +4884,29 @@ sparks' 03480d07e seal = confirmation. GATE CONSEQUENCE: T' NOT
 FINAL; 03480d07e seal = early surface; Gate-A binds to the TRIAGE
 tip. Dispatched: lane (full spec), WSL (verbatim lines), sparks
 (early-surface semantics + verbatim bucket-(b) lines).
+
+### WSL bucket-(b) verbatim forwarded to the lane (20:51Z)
+
+WSL posted all 19 diagnostics (seal file WSL-side, sha256 9a00d9cd):
+OrcConfigDoc:342 throws-nothing; OverlayCapacityResolver:867
+throws-nothing; PipelineStageAdmissionAuthenticatesManifestOrigin
+death (0ms); DistributedResidencyProtocol:697 "implemented section
+tables" not in what(); AutomaticPlanningDiagnostics debug-geometry
+death; CPUTensorTP1PreparedStatic death; CPUExpertShardAccounting
+x4 + CPUJointStaticResidency x2 death (0-5ms); Integration:
+ExpertTierEndpointLayoutIdentity / CPUTensorTP1PreparedStaticReplay
+/ CPUExpertShardAccounting / CPUJointStaticResidencyLifecycle /
+CPUJointSourceAuthorityLifecycle / AutomaticPlanningDiagnostics_
+CompleteSelection / MoEPipelineFixedMemoryOwners+_4Devices+_8Devices
+(exclusive, death-style). Additional unit.log: MoEPipelineFixed
+Memory:510 (expected PhysicalMemoryCapacityExhausted, got
+std::invalid_argument "requires the inventory-bound uniform CPU
+prepared layout for every CPU resource..."); MoEPipelineMemory
+Admission.cpp:1111/:1152 death; Perf__CPURootedPublicationTransport
+.cpp:306 Actual false/Expected true. WSL KEY OBSERVATION (= Main's
+lead): items 2 + MoEPipelineFixedMemory = same class (expected
+exception type vs the new A4 uniform-layout refusal) = strongest
+intentional-contract-vs-regression discriminator; rest = death-test
+unknown-file, need base+develop delta. Forwarded verbatim to the
+lane for the root-cause ledger. T' gate building (508/2779); byte-
+identity re-run at T' next.
