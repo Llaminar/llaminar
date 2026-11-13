@@ -1028,6 +1028,9 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
         EXPECT_EQ(bytes(retained,{0,DeviceId::cpu()},owner),bytes(service,{0,DeviceId::cpu()},owner));
 }
 }
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Shared directory pressure cannot starve feasible owners; C0/small owners do not limit the others. */
 TEST(GPUAdaptiveImmutableLookupAdmission, SharedDirectoryPressureBalancesEveryFeasibleOwner)
 {
@@ -1048,6 +1051,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, SharedDirectoryPressureBalancesEveryFe
                 std::cout.flush();std::cerr.flush();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
         }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Each replay owns its true original process/source/PMA; no authority reset bypass is used. */
 TEST(GPUAdaptiveImmutableLookupAdmission, SharedCoordinatorTP2OriginalPMAAndWireReplay)
 {

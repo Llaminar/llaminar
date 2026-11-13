@@ -11,5 +11,7 @@
 namespace llaminar2::test
 {
     inline constexpr CPUExecutionGeometry kSyntheticCPUExecutionGeometry{
-        .cache = {1u << 20, 32u << 20, 16, 16}, .maximum_native_row_tile = 4};
+        .cache = {1u << 20, 32u << 20, 16, 16}, .maximum_native_row_tile = 4,
+        .projection_abi = CPUProjectionScheduleABI::X86SharedK,
+        .compiled_isa = ISALevel::AVX512, .active_isa = ISALevel::AVX512};
 }

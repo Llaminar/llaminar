@@ -659,6 +659,9 @@ namespace llaminar2
         EXPECT_FALSE(fixed.host_demand_memory);
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     /** @test Complete source-owned fixed BOMs retain production prefix RAM/disk and dense predictor KV. */
     TEST(MoEOverlayMemoryPlanInputs, CompleteQwenSourcePrefixEnabledFixedBOMWholeAndPipeline)
     {
@@ -800,6 +803,7 @@ namespace llaminar2
                         if(f.rank.has_lm_head) EXPECT_EQ(continuation->weight_residency.selectedRoutedExpertsForLayer(48),0);
                     }
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     /** @test Device type and authored parent boundary own retained MTP graph counts. */
     TEST(MoEOverlayMemoryPlanInputs, GenerationDeclarationOwnsSharedVerifierInventory)

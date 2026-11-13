@@ -18,8 +18,11 @@
 #include "tensors/FP16Utils.h"
 #include "tensors/VnniPackContext.h"
 #include "tensors/NativeQuantisedQ6Scale.h"
+#if !defined(__aarch64__)
 #include "kernels/cpu/gemm/CPUNativeQuantisedQ6Kernels.h"
+#endif
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 
 namespace llaminar2::test
@@ -214,6 +217,29 @@ TEST_F(Q6SourceScale, ScalarAndSIMDUseOriginalFactorsWithQ8Activations)
                 EXPECT_EQ(std::memcmp(actual[row].data(), expected[row].data(), 64 * sizeof(float)), 0)
                     << "chunk=" << chunk << " row=" << row;
         };
+#if defined(__aarch64__)
+        // ARM: the production NEON M1 and shared-row programs over the same bank.
+        for (int row = 0; row < 4; ++row)
+        {
+            std::array<float, kN> full{};
+            gemv_native_quantised_preq(packed, activations[row].data(), full.data(), {});
+            std::copy_n(full.begin() + chunk * 64, std::min(64, kN - chunk * 64), actual[row].begin());
+        }
+        compare(4);
+        for (const auto policy : {VerifierRowsPolicy::Pairwise, VerifierRowsPolicy::WideRows})
+        {
+            std::array<Q8_1Block, 4 * kBlocks> bank{};
+            for (int row = 0; row < 4; ++row)
+                std::copy(activations[row].begin(), activations[row].end(), bank.begin() + row * kBlocks);
+            std::array<float, 4 * kN> rows_out{};
+            gemm_native_quantised_preq_decode_equivalent_rows(packed, bank.data(), rows_out.data(), {}, 4, kN,
+                ISAPath::AUTO, policy);
+            actual = {};
+            for (int row = 0; row < 4; ++row)
+                std::copy_n(rows_out.begin() + row * kN + chunk * 64, std::min(64, kN - chunk * 64), actual[row].begin());
+            compare(4);
+        }
+#else
         for (int row = 0; row < 4; ++row)
             gemvQ6KNativeAVX2Chunk(packed, activations[row].data(), actual[row].data(), chunk, 0, kBlocks);
         compare(4);
@@ -221,6 +247,7 @@ TEST_F(Q6SourceScale, ScalarAndSIMDUseOriginalFactorsWithQ8Activations)
         gemmQ6KNativeTwoRowsAVX2Chunk(packed, activations[0].data(), activations[1].data(),
             actual[0].data(), actual[1].data(), chunk, 0, kBlocks, false);
         compare(2);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
         actual = {};
         for (int row = 0; row < 4; ++row)

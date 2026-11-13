@@ -10,6 +10,9 @@
  * K blocks and publishes the same separately rounded contribution as CUDA/HIP.
  * The same primitive serves serial decode and grouped verification; no row
  * replay, temporary decoded matrix or inference-time allocation is used.
+ * AArch64's four-column native operations use the same decoder and rounded
+ * source-factor program as x86. Borrowed read views keep the owning storage
+ * dependency out of native leaves, and bounded stores support logical N tails.
  */
 #pragma once
 
@@ -17,13 +20,17 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
-#include <immintrin.h>
 #include <stdexcept>
 
-#include "CPUNativeQuantisedWeightPacker.h"
+#include "CPUNativeQuantisedDecode.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedActivationSums.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "CPUNativeNEONMultiScaleOps.h"
+#else
+#include <immintrin.h>
 #include "VNNIEmulation.h"
+#endif
 
 namespace llaminar2::cpu::native_quantised::multi_scale
 {
@@ -52,9 +59,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #define LLAMINAR_MULTISCALE_EXACT
 #endif
 
-    /** @brief ISA operations; vector arithmetic below is identical for both widths. */
+    /** @brief ISA operations; the decoded arithmetic is shared by all three widths. */
     template <int Lanes> struct SIMD;
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     /** @brief Eight-column AVX2 implementation, including saturation-safe VNNI. */
     template <> struct SIMD<8>
     {
@@ -127,6 +135,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static I words(const uint16_t *source)
         { return std::bit_cast<I>(_mm256_cvtepu16_epi32(_mm_loadu_si128(
             reinterpret_cast<const __m128i *>(source)))); }
+        /** @brief Reject reserved source coefficient bits across eight columns.
+         * @param metadata Zero-extended original source words.
+         * @param permitted_bits Source-owned coefficient bit positions.
+         * @return Whether all words obey the source metadata ABI.
+         */
+        static bool metadataFits(I metadata, uint32_t permitted_bits)
+        {
+            return _mm256_testz_si256(std::bit_cast<__m256i>(metadata),
+                _mm256_set1_epi32(static_cast<int>(~permitted_bits))) != 0;
+        }
         /** @return FP32 values from the low FP16 half of each packed word. */
         static F halfWords(I words)
         {
@@ -219,6 +237,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static I words(const uint16_t *source)
         { return std::bit_cast<I>(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
             reinterpret_cast<const __m256i *>(source)))); }
+        /** @brief Reject reserved source coefficient bits across sixteen columns.
+         * @param metadata Zero-extended original source words.
+         * @param permitted_bits Source-owned coefficient bit positions.
+         * @return Whether all words obey the source metadata ABI.
+         */
+        static bool metadataFits(I metadata, uint32_t permitted_bits)
+        {
+            return _mm512_test_epi32_mask(std::bit_cast<__m512i>(metadata),
+                _mm512_set1_epi32(static_cast<int>(~permitted_bits))) == 0;
+        }
         /** @return FP32 values from the low FP16 half of each packed word. */
         static F halfWords(I words)
         {
@@ -227,6 +255,14 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         }
     };
 #endif
+
+#endif // native x86 SIMD operations
+
+    /**
+     * @brief Whether an ISA operation set consumes shared-row tiles in row pairs.
+     * @tparam Ops Native operation set; only the AArch64 I8MM family declares row pairs.
+     */
+    template <typename Ops> inline constexpr bool usesRowPairs = requires { requires Ops::row_pairs; };
 
     /** @brief Load a SIMD value without imposing aliasing or alignment on the caller. */
     template <typename V> inline V load(const void *source)
@@ -245,14 +281,17 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param column Local output column.
      * @return GPU-ordered FP32 block contribution, including required corrections.
      */
+    template <typename Packed>
     LLAMINAR_MULTISCALE_EXACT
-    inline float scalarReferenceBlock(const CPUNativeQuantisedPackedWeights &packed,
+    inline float scalarReferenceBlock(const Packed &packed,
                                      const Q8_1Block &a, int chunk, int kb, int column)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
+        if (!packed.usesCompactMultiScale() || packed.payload_bytes <= 0 || packed.payload_bytes > 16)
+            throw std::invalid_argument("Multi-scale diagnostic requires its bounded compact source payload");
         uint8_t payload[16]{};
         int8_t values[32];
         for (int byte = 0; byte < packed.payload_bytes; ++byte)
@@ -292,16 +331,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @brief Decode one linear two/three-bit four-K group for SIMD columns.
      * @tparam Codebook Q3_K (9) or Q2_K (10) execution format.
      * @tparam Group Four-value group in [0,7].
-     * @tparam Lanes Eight AVX2 or sixteen AVX-512 columns.
+     * @tparam Lanes Four AArch64, eight AVX2 or sixteen AVX-512 columns.
      * @param unit Native CPU unit's first payload byte.
      * @param column First SIMD column within the 64-column unit.
      * @return Signed native grids on AVX2; unsigned-biased grids for AVX-512 VNNI.
      */
-    template <int Codebook, int Group, int Lanes>
-    inline typename SIMD<Lanes>::I decodeLinear(const uint8_t *unit, int column)
+    template <int Codebook, int Group, int Lanes, typename Ops = SIMD<Lanes>>
+    inline typename Ops::I decodeLinear(const uint8_t *unit, int column)
     {
         static_assert(Codebook == 9 || Codebook == 10);
-        using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         const auto word = [&](int index) { return load<I>(unit + index * 256 + column * 4); };
         I values = (word(Group / 4) >> ((Group % 4) * 2)) & 0x03030303;
@@ -310,10 +348,103 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             // Four high bits become bit two of four separate byte lanes.
             const I high = (word(2) >> (Group * 4)) & 15;
             values |= ((high * 0x02040810) & 0x10101010) >> 2;
-            if constexpr (Lanes == 8)
+            if constexpr (Lanes != 16)
                 values = Ops::subtractBytes(values, I{} + 0x04040404);
         }
         return values;
+    }
+
+    /**
+     * @brief Apply one half's four groups to row pairs with two-row matrix dots.
+     * @tparam Codebook Native source execution codebook.
+     * @tparam Half Zero for K0..15 or one for K16..31.
+     * @tparam Rows Shared rows in [2,4]; an odd last row keeps the single-row leaf.
+     * @param unit Native unit, shared by every row.
+     * @param column First SIMD output column.
+     * @param activation Persistent quantized rows.
+     * @param kb Source block index.
+     * @param dots One independent exact integer accumulator per row.
+     *
+     * Each group pair is decoded exactly as dotHalf decodes it and consumed in
+     * one pairDot per row pair. The integer sums cover the same products of
+     * the same half, so every row's INT32 result equals the single-row walk.
+     */
+    template <int Codebook, int Half, int Lanes, size_t Rows, typename Ops>
+    inline void dotHalfRowPairs(const uint8_t *unit, int column,
+                                const std::array<const Q8_1Block *, Rows> &activation,
+                                int kb, typename Ops::I (&dots)[Rows])
+    {
+        using I = typename Ops::I;
+        static_assert(Lanes == 4 && Rows >= 2 && Rows <= 4);
+        constexpr size_t pairs = Rows / 2;
+        I columns01[pairs]{}, columns23[pairs]{};
+        // Consume two adjacent four-value groups starting at activation byte
+        // `offset`. The odd last row retains the SDOT leaf in group order.
+        const auto consume = [&](I first, I second, int offset) {
+#pragma GCC unroll 2
+            for (size_t pair = 0; pair < pairs; ++pair)
+                Ops::pairDot(columns01[pair], columns23[pair],
+                    Ops::activationPair(activation[2 * pair][kb].qs + offset,
+                                        activation[2 * pair + 1][kb].qs + offset),
+                    first, second);
+            if constexpr (Rows % 2 != 0)
+            {
+                int word0 = 0, word1 = 0;
+                std::memcpy(&word0, activation[Rows - 1][kb].qs + offset, 4);
+                std::memcpy(&word1, activation[Rows - 1][kb].qs + offset + 4, 4);
+                dots[Rows - 1] = Ops::dot(dots[Rows - 1], first, I{} + word0);
+                dots[Rows - 1] = Ops::dot(dots[Rows - 1], second, I{} + word1);
+            }
+        };
+        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        {
+            const auto quarter = [&]<int Q>() {
+                const auto word = [&](int offset) {
+                    return load<I>(unit + offset * 256 + column * 4);
+                };
+                I index = (word(0) >> (Q * 8)) & 255;
+                if constexpr (Codebook == 17)
+                    index |= ((word(1) >> ((Q / 2) * 8 + (Q % 2) * 4)) & 7) << 8;
+                else
+                {
+                    constexpr int bits = Codebook == 13 ? 2 : 1;
+                    index |= ((word(1) >> (Q * bits)) & ((1 << bits) - 1)) << 8;
+                }
+                const uint64_t *table = Codebook == 17 ? iq1s_grid
+                    : Codebook == 13 ? iq2s_grid : iq2xs_grid;
+                I low, high;
+                Ops::gridPair(table, index, low, high);
+                if constexpr (Codebook != 17)
+                {
+                    constexpr int sign_byte = 5 + Q;
+                    const I signs = Ops::template repeatByte<sign_byte % 4>(word(sign_byte / 4));
+                    low = Ops::template signGrid<0>(low, signs);
+                    high = Ops::template signGrid<1>(high, signs);
+                }
+                // One grid entry is eight consecutive K values per column:
+                // its low/high halves are exactly one adjacent group pair.
+                consume(low, high, Q * 8);
+            };
+            quarter.template operator()<Half * 2>();
+            quarter.template operator()<Half * 2 + 1>();
+        }
+        else
+        {
+            const auto group_pair = [&]<int G>() {
+                consume(decodeLinear<Codebook, G, Lanes, Ops>(unit, column),
+                        decodeLinear<Codebook, G + 1, Lanes, Ops>(unit, column), G * 4);
+            };
+            group_pair.template operator()<Half * 4>();
+            group_pair.template operator()<Half * 4 + 2>();
+        }
+#pragma GCC unroll 2
+        for (size_t pair = 0; pair < pairs; ++pair)
+        {
+            I row0, row1;
+            Ops::splitPair(columns01[pair], columns23[pair], row0, row1);
+            dots[2 * pair] += row0;
+            dots[2 * pair + 1] += row1;
+        }
     }
 
     /**
@@ -328,14 +459,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * The decoded vector dies after reuse by all rows. It is never stored as a
      * temporary matrix; this bounds register pressure and preserves grouped reuse.
      */
-    template <int Codebook, int Half, int Lanes, size_t Rows>
+    template <int Codebook, int Half, int Lanes, size_t Rows, typename Ops = SIMD<Lanes>>
     inline void dotHalf(const uint8_t *unit, int column,
                         const std::array<const Q8_1Block *, Rows> &activation,
-                        int kb, typename SIMD<Lanes>::I (&dots)[Rows])
+                        int kb, typename Ops::I (&dots)[Rows])
     {
-        using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
-        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        if constexpr (usesRowPairs<Ops> && Rows >= 2)
+            return dotHalfRowPairs<Codebook, Half, Lanes, Rows, Ops>(unit, column, activation, kb, dots);
+        else if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
         {
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
@@ -384,7 +516,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         else
         {
             const auto group = [&]<int G>() {
-                const I weights = decodeLinear<Codebook, G, Lanes>(unit, column);
+                const I weights = decodeLinear<Codebook, G, Lanes, Ops>(unit, column);
 #pragma GCC unroll 4
                 for (size_t row = 0; row < Rows; ++row)
                 {
@@ -415,24 +547,38 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param accumulate Whether the output owns a preceding K partition.
      * @param partitions Exact number of ordered partitions; unused for Contiguous.
      * @param blocks_per_partition Exact K-block span; unused for Contiguous.
+     * @param columns Live output span in this chunk; padded x86 callers retain 64.
+     * @throws std::invalid_argument For invalid chunk, K, output or partition geometry.
      */
-    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous>
-    LLAMINAR_MULTISCALE_EXACT inline void rows(const CPUNativeQuantisedPackedWeights &packed,
+    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous,
+              typename Packed, typename Ops = SIMD<Lanes>>
+    LLAMINAR_MULTISCALE_EXACT inline void rows(const Packed &packed,
                                                const std::array<const Q8_1Block *, Rows> &activation,
                                                const std::array<float *, Rows> &output, int chunk, int begin,
                                                int end, bool accumulate, int partitions = 1,
-                                               int blocks_per_partition = 0)
+                                               int blocks_per_partition = 0, int columns = 64)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
-        using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         using F = typename Ops::F;
         static_assert(Rows >= 1 && Rows <= 4);
-        constexpr int center = Lanes == 8 || Codebook == 10 ? 0 : Codebook == 9 ? 4 : 128;
-        for (int column = 0; column < 64; column += Lanes)
+        // Ordered K tiles have a fixed count, so the trailing tiles of a short
+        // K start at or beyond blocks_per_row with a clamped end. Such an empty
+        // span reads no weight block and still publishes zero or the retained
+        // accumulator; only a nonempty span must lie inside the matrix.
+        if (chunk < 0 || chunk >= packed.N_padded / 64 || columns <= 0 || columns > 64 ||
+            (end > begin && (begin < 0 || end > packed.blocks_per_row)))
+            throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
+        if constexpr (Tree == Reduction::OrderedPartitions)
+            if (partitions <= 0 || blocks_per_partition <= 0 ||
+                static_cast<int64_t>(partitions) * blocks_per_partition < end - begin ||
+                static_cast<int64_t>(begin) + static_cast<int64_t>(partitions) * blocks_per_partition > INT32_MAX)
+                throw std::invalid_argument("Multi-scale CPU tile requires an exact bounded ordered K tree");
+        constexpr int center = Lanes != 16 || Codebook == 10 ? 0 : Codebook == 9 ? 4 : 128;
+        for (int column = 0; column < columns; column += Lanes)
         {
             F reduced[Rows]{};
             const int partition_count = Tree == Reduction::OrderedPartitions ? partitions : 1;
@@ -442,10 +588,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #pragma GCC unroll 4
                 for (size_t row = 0; row < Rows; ++row)
                 {
+                    acc[row] = F{};
                     if constexpr (Tree == Reduction::Contiguous)
-                        acc[row] = accumulate ? load<F>(output[row] + column) : F{};
-                    else
-                        acc[row] = F{};
+                        if (accumulate)
+                        {
+                            if (column + Lanes <= columns)
+                                acc[row] = load<F>(output[row] + column);
+                            else
+                                std::memcpy(&acc[row], output[row] + column, (columns - column) * sizeof(float));
+                        }
                 }
                 const int first =
                     Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
@@ -457,8 +608,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         packed.interleavedBase() + (static_cast<size_t>(chunk) * packed.blocks_per_row + kb) *
                                                        packed.interleaved_block_stride;
                     I low[Rows]{}, high[Rows]{};
-                    dotHalf<Codebook, 0, Lanes>(unit, column, activation, kb, low);
-                    dotHalf<Codebook, 1, Lanes>(unit, column, activation, kb, high);
+                    dotHalf<Codebook, 0, Lanes, Rows, Ops>(unit, column, activation, kb, low);
+                    dotHalf<Codebook, 1, Lanes, Rows, Ops>(unit, column, activation, kb, high);
                     F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
                     F scale1;
                     if constexpr (Codebook == 13)
@@ -467,6 +618,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         // Function contraction/reassociation is disabled above;
                         // each source multiply remains a separate FP32 edge.
                         const I metadata = Ops::words(packed.chunkMins(chunk, kb) + column);
+                        // A sealed view's coefficients were admitted at publication;
+                        // owners without a seal keep the per-block check.
+                        if constexpr (!requires { Packed::metadata_admitted; })
+                            if (!Ops::metadataFits(metadata, 255u))
+                                throw std::invalid_argument("IQ2_S coefficient contains reserved bits");
                         const F low_coefficient = __builtin_convertvector(metadata & 15, F);
                         const F high_coefficient = __builtin_convertvector((metadata >> 4) & 15, F);
                         const F base = scale0;
@@ -545,7 +701,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             }
 #pragma GCC unroll 4
             for (size_t row = 0; row < Rows; ++row)
-                std::memcpy(output[row] + column, &reduced[row], sizeof(F));
+            {
+                if (column + Lanes <= columns)
+                    std::memcpy(output[row] + column, &reduced[row], sizeof(F));
+                else
+                    std::memcpy(output[row] + column, &reduced[row], (columns - column) * sizeof(float));
+            }
         }
     }
 
@@ -558,18 +719,19 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param begin First K block.
      * @param end Exclusive K block bound.
      * @param accumulate Preserve prior K partition output.
+     * @param columns Live output columns; the padded x86 contract defaults to 64.
      */
-    template <int Lanes, size_t Rows>
-    inline void dispatch(const CPUNativeQuantisedPackedWeights &packed,
+    template <int Lanes, size_t Rows, typename Ops = SIMD<Lanes>, typename Packed>
+    inline void dispatch(const Packed &packed,
                          const std::array<const Q8_1Block *, Rows> &activation,
                          const std::array<float *, Rows> &output, int chunk, int begin, int end,
-                         bool accumulate)
+                         bool accumulate, int columns = 64)
     {
         if (!packed.usesCompactMultiScale())
             throw std::invalid_argument("Compact multi-scale kernel requires its native encoding");
         switch (packed.codebook_id)
         {
-#define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes>(packed, activation, output, chunk, begin, end, accumulate)
+#define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::Contiguous, Packed, Ops>(packed, activation, output, chunk, begin, end, accumulate, 1, 0, columns)
         LLAMINAR_MULTISCALE_CASE(9);
         LLAMINAR_MULTISCALE_CASE(10);
         LLAMINAR_MULTISCALE_CASE(13);
@@ -589,6 +751,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param blocks Complete logical K extent in 32-value blocks.
      * @param partitions Exact arithmetic partition count from the shared contract.
      * @param blocks_per_partition Consecutive K blocks per partial.
+     * @param columns Live output columns; the padded x86 contract defaults to 64.
      * @throws std::invalid_argument For inconsistent encoding or partition geometry.
      *
      * This changes physical traversal only. Each partial starts at positive
@@ -596,12 +759,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * as the independent producer/reducer path. No quantized bytes, dispatch
      * choice, output precision, or scratch capacity are changed.
      */
-    template <int Lanes, size_t Rows>
-    inline void dispatchOrdered(const CPUNativeQuantisedPackedWeights &packed,
+    template <int Lanes, size_t Rows, typename Ops = SIMD<Lanes>, typename Packed>
+    inline void dispatchOrdered(const Packed &packed,
                                 const std::array<const Q8_1Block *, Rows> &activation,
                                 const std::array<float *, Rows> &output,
                                 int chunk, int blocks, int partitions,
-                                int blocks_per_partition)
+                                int blocks_per_partition, int columns = 64)
     {
         if (!packed.usesCompactMultiScale() || blocks <= 0 ||
             blocks != packed.blocks_per_row || partitions <= 0 ||
@@ -611,7 +774,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             throw std::invalid_argument("Compact ordered dot requires its exact admitted K tree");
         switch (packed.codebook_id)
         {
-#define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition)
+#define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions, Packed, Ops>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition, columns)
         LLAMINAR_MULTISCALE_ORDERED_CASE(9);
         LLAMINAR_MULTISCALE_ORDERED_CASE(10);
         LLAMINAR_MULTISCALE_ORDERED_CASE(13);

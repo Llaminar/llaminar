@@ -16,6 +16,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/Assertions.h"
 #include "../../../kernels/cpu/primitives/RoPEPrimitives.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -79,7 +80,14 @@ namespace llaminar2
             return nullptr;
 
         const int tensor_type = static_cast<int>(Q_base->native_type());
-        if (!owned_kernel_ || cached_kernel_tensor_type_ != tensor_type)
+        // The operand is fixed at construction, so its element type cannot
+        // change: the stage-owned kernel and its workspace binding are created
+        // exactly once. A different type is an invalid state, never a rebuild.
+        if (owned_kernel_ && cached_kernel_tensor_type_ != tensor_type)
+            LLAMINAR_UNREACHABLE("[RoPEStage] stage-owned RoPE kernel was created for tensor type "
+                                 << cached_kernel_tensor_type_ << " but the operand now reports type "
+                                 << tensor_type << " (" << Q_base->dtype_name() << ")");
+        if (!owned_kernel_)
         {
             try
             {
@@ -827,6 +835,22 @@ namespace llaminar2
 
         // Cast to IWorkspaceConsumer (CUDA/ROCm RoPE kernels implement both ITensorRoPE and IWorkspaceConsumer)
         return dynamic_cast<IWorkspaceConsumer *>(kernel);
+    }
+
+    WorkspaceRequirements RoPEStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)n;
+        auto *consumer = const_cast<RoPEStage *>(this)->getKernelAsWorkspaceConsumer();
+        if (!consumer)
+            return {};
+        // Same effective width as execute(): a proper partial prefix, or the full head.
+        const int requested_rotary_dim = static_cast<int>(
+            static_cast<float>(params_.head_dim) * params_.partial_rotary_factor);
+        const int effective_rotary_dim =
+            requested_rotary_dim > 0 && requested_rotary_dim < params_.head_dim
+                ? requested_rotary_dim
+                : params_.head_dim;
+        return consumer->getWorkspaceRequirements(m, effective_rotary_dim, k);
     }
 
     StageBufferContract RoPEStage::bufferContract() const

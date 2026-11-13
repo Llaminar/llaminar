@@ -29,9 +29,13 @@
 #include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/OpenMPTeamForkEvidence.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include <chrono>
+#include <optional>
 
 #include <algorithm>
 #include <cstring>
@@ -1502,6 +1506,40 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Publish one bucketed prefill chunk's host wall and its preceding gap.
+     * @param input Chunk input; supplies the participant identity.
+     * @param plan Executed chunk plan; supplies bucket geometry and real rows.
+     * @param wall_ns Host wall time of runPrefillChunk for this chunk.
+     * @param gap_ns Host time since the previous chunk returned; absent for the first.
+     *
+     * Bucket length and real rows are bounded admitted geometry, so they are
+     * dimensions; the chunk ordinal and token range are sequence words.
+     */
+    static void recordPrefillChunkHostTiming(
+        const ForwardInput &input,
+        const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan,
+        uint64_t wall_ns,
+        std::optional<uint64_t> gap_ns)
+    {
+        const std::initializer_list<uint64_t> words = {
+            static_cast<uint64_t>(plan.chunk_index),
+            static_cast<uint64_t>(plan.chunk.token_offset),
+            static_cast<uint64_t>(plan.chunk.token_offset + plan.chunk.real_count)};
+        const PerfStatsCollector::Tags tags = {
+            {"bucket_seq_len", std::to_string(plan.chunk.bucket_seq_len)},
+            {"real_token_count", std::to_string(plan.chunk.real_count)},
+            {"timing_scope", "host_wall"},
+            {"sync_scope", "none"}};
+        PerfStatsCollector::recordTimingNsWithSequence(
+            "forward_graph", "prefill_chunk_host_wall", wall_ns, words,
+            "prefill", input.device.toString(), tags);
+        if (gap_ns)
+            PerfStatsCollector::recordTimingNsWithSequence(
+                "forward_graph", "prefill_inter_chunk_gap", *gap_ns, words,
+                "prefill", input.device.toString(), tags);
+    }
+
     bool ForwardExecutionEngine::runPrefillChunkSchedule(
         const ForwardInput &base_input,
         const PrefillChunkRuntimeSchedule &schedule,
@@ -1596,16 +1634,37 @@ namespace llaminar2
             }
         }
 
+        // Host wall clocks only: no event, synchronization or device read is
+        // added, so the unprofiled pipeline keeps its overlap. Per-chunk wall,
+        // the gap between consecutive chunks and the whole family attribute
+        // bucket-pipeline overhead against the per-replay launch/GPU timers.
+        const bool time_family = PerfStatsCollector::isDomainEnabled("forward_graph");
+        using Clock = std::chrono::steady_clock;
+        const auto elapsed_ns = [](Clock::time_point begin, Clock::time_point end)
+        {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        };
+        const auto family_start = time_family ? Clock::now() : Clock::time_point{};
+        Clock::time_point previous_end{};
         for (size_t index = 0; index < schedule.chunks.size(); ++index)
         {
             const auto &chunk_plan = schedule.chunks[index];
             const auto &chunk_base = chunk_inputs.empty() ? base_input : chunk_inputs[index];
+            const auto chunk_start = time_family ? Clock::now() : Clock::time_point{};
             if (!runPrefillChunk(chunk_base, chunk_plan, output, host))
             {
                 host.cancelPrefillChunkSnapshotDiagnostics();
                 LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule failed at chunk "
                           << chunk_plan.chunk_index);
                 return false;
+            }
+            if (time_family)
+            {
+                const auto chunk_end = Clock::now();
+                recordPrefillChunkHostTiming(chunk_base, chunk_plan, elapsed_ns(chunk_start, chunk_end),
+                    index > 0 ? std::optional<uint64_t>(elapsed_ns(previous_end, chunk_start)) : std::nullopt);
+                previous_end = chunk_end;
             }
         }
 
@@ -1615,6 +1674,21 @@ namespace llaminar2
             LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule produced "
                       "incomplete snapshot diagnostics");
             return false;
+        }
+
+        if (time_family)
+        {
+            const auto &last = schedule.chunks.back().chunk;
+            PerfStatsCollector::recordTimingNsWithSequence(
+                "forward_graph",
+                "prefill_family_host_wall",
+                elapsed_ns(family_start, Clock::now()),
+                {static_cast<uint64_t>(schedule.chunks.size()),
+                 static_cast<uint64_t>(schedule.chunks.front().chunk.token_offset),
+                 static_cast<uint64_t>(last.token_offset + last.real_count)},
+                "prefill",
+                base_input.device.toString(),
+                {{"timing_scope", "host_wall"}, {"sync_scope", "none"}});
         }
 
         return true;
@@ -3960,6 +4034,13 @@ namespace llaminar2
         bool executed_deferred_main_decode_sync = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();
+        /* The execution window between here and the cached-graph completion
+         * is the fork/join domain the wake-up work item optimizes. The scope
+         * is the window's owner cell on this executor thread: concurrent
+         * ranks/devices keep their own cells, so the delta attributes exactly
+         * without serializing production. GPU devices fork no OpenMP regions
+         * and the summary publisher refuses them. */
+        const llaminar::v2::OpenMPTeamForkScope openmp_forks_at_exec_entry;
         if (profiling_setup)
         {
             ForwardPassProfiler::resetReplayTimings();
@@ -4496,6 +4577,21 @@ namespace llaminar2
                 {{"phase3_active", forward_cache.phase3_active ? "true" : "false"},
                  {"sequence_rows", std::to_string(input.seq_len)},
                  {"used_graph_replay", used_graph_replay ? "true" : "false"}});
+        }
+
+        /* The always-on summary counter for the OpenMP wake-up work item: the
+         * exact team fork/join count of one cached-forward CPU decode step.
+         * The fork sites count whether or not anyone collects; the publisher
+         * owns the policy gate and the record shape, so default serving
+         * materializes nothing and every evidence run retains the structure it
+         * must be able to assert. */
+        if (success && is_decode && !input.device.is_gpu())
+        {
+            llaminar::v2::publishOpenMPTeamForkSummary(
+                openmp_forks_at_exec_entry,
+                input.device,
+                [this, &signature] { return forwardGraphPerfContext(signature); },
+                used_graph_replay);
         }
 
         // Decode step timing breakdown (enabled via TP_TIMING)
@@ -6300,6 +6396,12 @@ namespace llaminar2
          */
         void *execution_stream_used = nullptr;
 
+        /* A CPU decode cache miss executes its first step eagerly here rather
+         * than through executeCacheHit(). It owns the same per-step fork cell,
+         * so the first decode step is not silently missing from the summary
+         * that cache-hit steps publish. GPU first use returned above. */
+        const llaminar::v2::OpenMPTeamForkScope openmp_forks_at_exec_entry;
+
         // The graph and every producer stream belong to this participant.
         {
             LOG_DEBUG("[ForwardExecutionEngine] Getting device context for " << effective_input.device << "...");
@@ -6566,6 +6668,17 @@ namespace llaminar2
                 host,
                 host.getDeviceContext(effective_input.device),
                 is_decode, effective_input, start, stage_context);
+
+            // Same publisher, key and gate as the cache-hit step; a CPU cache
+            // miss never replays a captured graph.
+            if (is_decode && !effective_input.device.is_gpu())
+            {
+                llaminar::v2::publishOpenMPTeamForkSummary(
+                    openmp_forks_at_exec_entry,
+                    effective_input.device,
+                    [this, &signature] { return forwardGraphPerfContext(signature); },
+                    /*used_graph_replay=*/false);
+            }
         }
 
         if (success)

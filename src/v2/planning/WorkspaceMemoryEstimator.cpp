@@ -2060,22 +2060,42 @@ size_t exactKVConversionWorkspaceBytes(
 }
 
 /**
- * @brief Price the graph-stable RoPE publication ABI on GPU participants.
+ * @brief Price the graph-stable RoPE workspace on GPU and CPU participants.
  *
- * RoPE owns one row-varying position buffer, an initialize-once bank of inverse
- * frequencies, and a device-owned replay parameter.  The same contract is
- * returned by every CUDA/ROCm precision specialization.
+ * GPU RoPE owns one row-varying position buffer, an initialize-once bank of
+ * inverse frequencies, and a device-owned replay parameter; the same contract
+ * is returned by every CUDA/ROCm precision specialization. CPU RoPE owns one
+ * shared set of angle planes for the largest graph invocation's rows at the
+ * effective rotated width, priced by the same function the kernel declares.
  */
 size_t exactRoPEWorkspaceBytes(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
-    if (!geometry.device.is_gpu() ||
-        !hasFullAttentionLayer(
+    if (!hasFullAttentionLayer(
             profile, geometry.first_layer, geometry.last_layer))
     {
         return 0u;
     }
+    if (geometry.device.is_cpu())
+    {
+        // Prefill rows are batch x bucket; grouped verifier graphs rotate their
+        // own target rows. The serial graph family shares one maximum extent.
+        const size_t prefill_rows = checkedMultiply(
+            static_cast<size_t>(std::max(1, geometry.batch_size)),
+            static_cast<size_t>(std::max(1, geometry.resident_graph_rows)),
+            "CPU RoPE angle rows");
+        const int rows = checkedWorkspaceDimension(
+            std::max(prefill_rows, static_cast<size_t>(std::max(0, geometry.mtp_target_query_rows))),
+            "CPU RoPE angle rows");
+        return cpu_rope_workspace::requirements({
+                   .graph_rows = rows,
+                   .rotary_dim = profile.effectiveRotaryDimension(),
+               })
+            .total_bytes_with_alignment();
+    }
+    if (!geometry.device.is_gpu())
+        return 0u;
     return rope_workspace::requirements({
                .graph_rows = geometry.resident_graph_rows,
            })
@@ -2329,7 +2349,7 @@ size_t WorkspaceMemoryEstimator::estimate(
         kv_conversion_bytes,
         "KV precision-conversion requirements");
 
-    const size_t rope_bytes = exactRoPEWorkspaceBytes(profile, geometry);
+    const size_t rope_bytes = ropeWorkspaceBytes(profile, geometry);
     bytes = checkedAdd(
         bytes,
         rope_bytes,
@@ -2486,6 +2506,13 @@ size_t WorkspaceMemoryEstimator::estimate(
     return bytes;
 }
 
+
+size_t WorkspaceMemoryEstimator::ropeWorkspaceBytes(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+    return exactRoPEWorkspaceBytes(profile, geometry);
+}
 
 /** @brief One canonical compiler; callers provide only the two fixed source-owned service scopes. */
 static size_t estimateExpertServiceWorkspace(const ModelMemoryProfile& profile,

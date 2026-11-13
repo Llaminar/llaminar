@@ -58,15 +58,24 @@
 #include "../../../utils/PerfStatsCollector.h"
 #include "../primitives/ActivationTraits.h"
 #include "../CPUKernelBase.h"
+#include "../CPUWorkshareTiming.h"
 #include "../turboquant/TurboQuantRotation.h"
 #include "../turboquant/TurboQuantContext.h"
 #include "CPUFlashAttentionLaunchPolicy.h"
 #include "TQFusedAttentionPrimitives.h"
-#include "CPUAttentionKeyQ8.h"
+#include "CPUAttentionKeyQ8Dot.h"
+#include "CPUQ8AttentionValue.h"
+#include "CPUAttentionInvocationAdmission.h"
 #include "CPUQ16AttentionMath.h"
+#include "../primitives/VectorPrimitives.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONAttentionMath.h"
+#include "../primitives/NEONSoftmaxPrimitives.h"
+#endif
 #include "../../../tensors/AttentionKeyQ8Tensor.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -93,13 +102,22 @@ namespace llaminar2
 {
     namespace detail
     {
+        /** @brief Hint a checked original attention row into the native L1 cache.
+         * @param row Address inside the already admitted cache span.
+         * @details This is only a locality hint: it transfers no ownership and
+         * cannot replace cache publication or extend an original borrow's lease.
+         */
+        inline void prefetchCPUAttentionL1(const void *row) noexcept
+        { __builtin_prefetch(row, 0, 3); }
+
         /**
          * @brief Select one authenticated K/V tile from exact storage geometry.
          *
-         * The cache detector reports capacities per physical core. The caller
-         * supplies one stored K head row and one stored V head row so FP32,
-         * FP16, Q16, Q8, and TurboQuant all use the same normalized policy
-         * without lying about memory traffic. Debug tournament controls are
+         * The caller supplies original K/V storage widths. X86 consumes its
+         * private-cache observations; the native ARM canonical-span policy
+         * deliberately reads no x86 cache detector or guessed private capacity.
+         * FP32, FP16, Q16, Q8 and TurboQuant therefore retain their exact storage
+         * identities without changing arithmetic. Debug tournament controls are
          * exact: an uncompiled positive override is a fatal configuration error
          * rather than being rounded to a different experiment.
          *
@@ -119,36 +137,19 @@ namespace llaminar2
             std::size_t value_head_row_bytes,
             int explicit_tile)
         {
-            const CacheInfo &cache = cache_info();
-            const auto vector_isa = []
-            {
-                switch (activeISALevel())
-                {
-                case ISALevel::Scalar:
-                    return cpu::fa2_policy::CPUFA2VectorISA::Scalar;
-                case ISALevel::AVX2:
-                    return cpu::fa2_policy::CPUFA2VectorISA::AVX2;
-                case ISALevel::AVX512:
-                    return cpu::fa2_policy::CPUFA2VectorISA::AVX512;
-                }
-                return cpu::fa2_policy::CPUFA2VectorISA::Invalid;
-            }();
+            const auto codegen_isa = cpu::fa2_policy::compiledCPUFA2CodegenISA();
+            const auto vector_isa = cpu::fa2_policy::cpuFA2VectorISAFor(activeISALevel());
+            const auto observed_cache = cpu::fa2_policy::observedCPUFA2PolicyCache();
             const int tile = cpu::fa2_policy::selectCPUFA2KVTile(
                 {
                     .storage_pair = storage_pair,
                     .vector_isa = vector_isa,
-                    .codegen_isa =
-                        cpu::fa2_policy::compiledCPUFA2CodegenISA(),
+                    .codegen_isa = codegen_isa,
                     .head_dim = head_dim,
                     .kv_rows = kv_len,
                     .key_head_row_bytes = key_head_row_bytes,
                     .value_head_row_bytes = value_head_row_bytes,
-                    .cache = {
-                        .private_l1d_bytes = cache.l1_size,
-                        .private_l2_bytes = cache.l2_size,
-                        .shared_l3_bytes = cache.l3_size,
-                        .cache_line_bytes = cache.cache_line,
-                    },
+                    .cache = observed_cache,
                 },
                 explicit_tile);
             if (tile == 0)
@@ -206,6 +207,10 @@ namespace llaminar2
              * @param tensor_rows Number of physical rows in either Q16 tensor.
              * @param logical_rows Number of oldest-to-newest rows to consume.
              * @return True only when every translated block lies in the tensor.
+             * @details Covers blockIndex()'s whole envelope: a position-major
+             * row holds every K/V head's blocks (kv_heads x blocks_per_head),
+             * a head-major row is exactly one head's blocks, and the rows
+             * reachable through the logical view exist.
              */
             [[nodiscard]] constexpr bool valid(
                 std::size_t tensor_rows,
@@ -217,6 +222,11 @@ namespace llaminar2
                 {
                     return false;
                 }
+                const bool row_holds_heads = head_major
+                    ? blocks_per_tensor_row == blocks_per_head
+                    : blocks_per_head <= blocks_per_tensor_row / static_cast<std::size_t>(kv_heads);
+                if (!row_holds_heads)
+                    return false;
 
                 const std::size_t expected_rows = head_major
                                                       ? physical_rows_per_head *
@@ -590,6 +600,14 @@ namespace llaminar2
                 return false;
             }
 
+            // Admit the complete batch banks before the first slice runs: every
+            // slice inside its bank, and the whole output disjoint from all inputs.
+            const std::int64_t batch_rows = std::int64_t(batch_size) * seq_len;
+            if (batch_size <= 0 || batch_rows > std::numeric_limits<int>::max() ||
+                !admitInvocation(declaredRequest(Q, K, V, output, int(batch_rows), int(batch_rows), n_heads,
+                    n_kv_heads, head_dim, head_start, gqa_n_rep, sizeof(float))))
+                return false;
+
             const size_t q_stride = static_cast<size_t>(seq_len) * static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
             const size_t kv_stride = static_cast<size_t>(seq_len) * static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
             const float *mask = workspace_mask ? workspace_mask->data() : nullptr;
@@ -791,6 +809,11 @@ namespace llaminar2
                 {
                     if (!key_tensor || !value_tensor)
                         return false;
+                    if (!admitTensorExtents(Q, K, V, output, Q_ptr, key_tensor->typed_data(),
+                            value_tensor->typed_data(), O_ptr, seq_len,
+                            physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
+                            head_start, gqa_n_rep, sizeof(std::uint16_t)))
+                        return false;
                     return compute_native16kv<Format>(
                         Q_ptr,
                         key_tensor->typed_data(),
@@ -828,7 +851,7 @@ namespace llaminar2
             // and prefill. One implementation owns every M so all regimes use
             // identical canonical summaries and bounded wave workspace.
             // ---------------------------------------------------------------
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if (K->native_type() == TensorType::Q16_1 &&
                 V->native_type() == TensorType::Q16_1 &&
                 batch_size == 1)
@@ -860,7 +883,9 @@ namespace llaminar2
                             head_start,
                             gqa_n_rep,
                             execution_policy,
-                            kv_logical_view);
+                            kv_logical_view,
+                            Q16QueryLayout::RowMajor,
+                            ActualQueryBanks{fp32BankBytes(Q), output->size_bytes()});
                     }
                 }
             }
@@ -873,7 +898,7 @@ namespace llaminar2
             // modes and the production TQ8-K/TQ4-V asymmetric mode enter this
             // same scheduler and therefore share one arithmetic contract.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if ((K->native_type() == TensorType::TQ4 ||
                  K->native_type() == TensorType::TQ8) &&
                 (V->native_type() == TensorType::TQ4 ||
@@ -946,12 +971,14 @@ namespace llaminar2
             // decode, grouped verification, and prefill. No FP32 shadow cache
             // is materialized for any query-row count.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if (K->native_type() == TensorType::AQ8 && batch_size == 1)
                 return compute_aq8kv(Q_base->fp32_data(), dynamic_cast<const AttentionKeyQ8Tensor *>(K),
                     V, O_base->mutable_data(), seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                     causal, window_size, std::max(0, kv_len - seq_len), head_start, gqa_n_rep,
                     execution_policy, kv_logical_view);
+#endif // AQ8 has a genuine native decoder/dot/value program on ARM and x86.
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if (K->native_type() == TensorType::Q8_1 &&
                 V->native_type() == TensorType::Q8_1 &&
                 batch_size == 1)
@@ -1013,6 +1040,15 @@ namespace llaminar2
                 LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() null data pointer");
                 return false;
             }
+            // Batched requests are stacked rows of the same geometry.
+            const std::int64_t batch_rows = std::int64_t(batch_size) * seq_len;
+            if (batch_size <= 0 || batch_rows > std::numeric_limits<int>::max())
+                return false;
+            if (!admitTensorExtents(Q, K, V, output, Q_ptr, K_ptr, V_ptr, O_ptr,
+                    int(batch_rows),
+                    batch_size > 1 ? int(batch_rows) : physicalKVRows(kv_logical_view, kv_len),
+                    n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, sizeof(float)))
+                return false;
 
             if (batch_size > 1)
             {
@@ -1126,6 +1162,67 @@ namespace llaminar2
                 static_cast<size_t>(query_rows) *
                 static_cast<size_t>(n_heads) *
                 static_cast<size_t>(head_dim);
+            // Dense caches: admit each request's actual tensor extents; the
+            // implementations admit their declared geometry themselves.
+            // Admit the whole batch before any request runs. Query/output cover
+            // every request slice; the complete output is disjoint from the query
+            // bank and from every request's K/V allocation; and each request whose
+            // K/V rows feed the shared row programs (dense FP32/FP16/BF16, Q16) is
+            // admitted in full. Q8_1, TQ and AQ8 requests keep their own K/V
+            // validation inside their implementations.
+            const std::size_t query_bank_bytes = fp32BankBytes(Q), output_bank_bytes = output->size_bytes();
+            if (query_stride > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::size_t(request_count))
+                return false;
+            const std::size_t batch_bytes = query_stride * sizeof(float) * std::size_t(request_count);
+            const cpu::CPUAttentionBank written{out, batch_bytes};
+            bool batch_admitted = query_bank_bytes >= batch_bytes && output_bank_bytes >= batch_bytes &&
+                !cpu::CPUAttentionInvocationAdmission::overlaps(written, {q, batch_bytes});
+            for (int request = 0; batch_admitted && request < request_count; ++request)
+            {
+                const ITensor *key = K_by_request[request], *value = V_by_request[request];
+                if (cpu::CPUAttentionInvocationAdmission::overlaps(written, {key->raw_data(), key->size_bytes()}) ||
+                    cpu::CPUAttentionInvocationAdmission::overlaps(written, {value->raw_data(), value->size_bytes()}))
+                {
+                    batch_admitted = false;
+                    break;
+                }
+                const std::size_t offset = static_cast<std::size_t>(request) * query_stride * sizeof(float);
+                const float *request_q = q + static_cast<std::size_t>(request) * query_stride;
+                const float *request_output = out + static_cast<std::size_t>(request) * query_stride;
+                const ActualQueryBanks slice{query_bank_bytes - offset, output_bank_bytes - offset};
+                const auto dense = [&](std::size_t element_bytes) {
+                    auto admission = declaredRequest(request_q, key->raw_data(), value->raw_data(), request_output,
+                        query_rows, physicalKVRows(kv_logical_views[request], kv_lens[request]), n_heads, n_kv_heads,
+                        head_dim, head_start, gqa_n_rep, element_bytes);
+                    admission.query.bytes = slice.query_bytes;
+                    admission.output.bytes = slice.output_bytes;
+                    admission.key.bytes = key->size_bytes();
+                    admission.value.bytes = value->size_bytes();
+                    return admitInvocation(admission);
+                };
+                if (key_type == TensorType::FP32 && value_type == TensorType::FP32)
+                    batch_admitted = dense(sizeof(float));
+                else if ((key_type == TensorType::FP16 && value_type == TensorType::FP16) ||
+                         (key_type == TensorType::BF16 && value_type == TensorType::BF16))
+                    batch_admitted = dense(sizeof(std::uint16_t));
+                else if (key_type == TensorType::Q16_1 && value_type == TensorType::Q16_1)
+                {
+                    const auto *key_q16 = dynamic_cast<const Q16_1Tensor *>(key);
+                    const auto *value_q16 = dynamic_cast<const Q16_1Tensor *>(value);
+                    const auto admission = key_q16 && value_q16 &&
+                            q16KVLayout(key_q16, value_q16, n_kv_heads, head_dim, kv_lens[request],
+                                kv_logical_views[request])
+                        ? q16Request(request_q, key_q16, value_q16, request_output, query_rows, n_heads,
+                              n_kv_heads, head_dim, head_start, gqa_n_rep, slice)
+                        : std::nullopt;
+                    batch_admitted = admission && admitInvocation(*admission);
+                }
+            }
+            if (!batch_admitted)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Native request batch failed whole-batch admission");
+                return false;
+            }
             const auto run_requests = [&](auto &&launch_request)
             {
                 for (int request = 0; request < request_count; ++request)
@@ -1158,7 +1255,8 @@ namespace llaminar2
                             K_by_request[request]);
                         const auto *value = dynamic_cast<const FP32Tensor *>(
                             V_by_request[request]);
-                        return key && value && compute_flash_fp32(
+                        return key && value &&
+                            compute_flash_fp32(
                             request_q,
                             key->data(),
                             value->data(),
@@ -1192,7 +1290,8 @@ namespace llaminar2
                             K_by_request[request]);
                         const auto *value = dynamic_cast<const FP16Tensor *>(
                             V_by_request[request]);
-                        return key && value && compute_native16kv<
+                        return key && value &&
+                            compute_native16kv<
                             Native16BitKVFormat::FP16>(
                             request_q,
                             key->typed_data(),
@@ -1226,7 +1325,8 @@ namespace llaminar2
                             K_by_request[request]);
                         const auto *value = dynamic_cast<const BF16Tensor *>(
                             V_by_request[request]);
-                        return key && value && compute_native16kv<
+                        return key && value &&
+                            compute_native16kv<
                             Native16BitKVFormat::BF16>(
                             request_q,
                             key->typed_data(),
@@ -1246,7 +1346,7 @@ namespace llaminar2
                             view);
                     });
             }
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             else if (key_type == TensorType::AQ8)
             {
                 success = run_requests([&](int request, const float *query, float *result,
@@ -1258,6 +1358,8 @@ namespace llaminar2
                         execution_policy, view);
                 });
             }
+#endif // AQ8 request-sliced entry has the same native operand authority.
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             else if (key_type == TensorType::Q8_1 &&
                      value_type == TensorType::Q8_1)
             {
@@ -1352,7 +1454,7 @@ namespace llaminar2
                 }
             }
 #endif
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             else if (key_type == TensorType::Q16_1 &&
                      value_type == TensorType::Q16_1)
             {
@@ -1371,6 +1473,8 @@ namespace llaminar2
                             return false;
                         const int position_offset =
                             std::max(0, kv_len - query_rows);
+                        const std::size_t offset =
+                            static_cast<std::size_t>(request) * query_stride * sizeof(float);
                         return compute_prefill_q16kv(
                             request_q,
                             key,
@@ -1387,7 +1491,9 @@ namespace llaminar2
                             head_start,
                             gqa_n_rep,
                             execution_policy,
-                            view);
+                            view,
+                            Q16QueryLayout::RowMajor,
+                            ActualQueryBanks{query_bank_bytes - offset, output_bank_bytes - offset});
                     });
             }
 #endif
@@ -1489,11 +1595,19 @@ namespace llaminar2
              * transposing it here would allocate and copy in the verifier hot
              * path.
              */
+            // The row programs form heads x rows in int: reject an unrepresentable
+            // product before any expression below computes it.
+            const std::int64_t verifier_head_rows = std::int64_t(n_heads) * verifier_rows;
+            if (verifier_head_rows > std::numeric_limits<int>::max())
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Verifier heads x rows overflow the row programs' int indices");
+                return false;
+            }
             const auto &q_shape = Q_base->shape();
             const bool head_major_q =
                 Q_base->native_type() == TensorType::Q16_1 &&
                 q_shape.size() >= 2 &&
-                q_shape[0] == static_cast<size_t>(n_heads * verifier_rows) &&
+                q_shape[0] == static_cast<size_t>(verifier_head_rows) &&
                 q_shape[1] == static_cast<size_t>(head_dim);
 
             const int base_position_offset = kv_len - verifier_rows;
@@ -1518,7 +1632,8 @@ namespace llaminar2
                     kv_logical_view,
                     head_major_q
                         ? Q16QueryLayout::HeadMajor
-                        : Q16QueryLayout::RowMajor);
+                        : Q16QueryLayout::RowMajor,
+                    ActualQueryBanks{fp32BankBytes(Q), output->size_bytes()});
                 if (success)
                 {
                     PerfStatsCollector::addCounter(
@@ -1580,6 +1695,17 @@ namespace llaminar2
                     if (K->native_type() == TensorType::Q8_1 &&
                         V->native_type() == TensorType::Q8_1)
                         return "q8_1";
+                    if (K->native_type() == TensorType::AQ8)
+                    {
+                        using Pair = cpu::fa2_policy::CPUFA2KVStoragePair;
+                        switch (V->native_type())
+                        {
+                        case TensorType::Q8_1: return cpu::fa2_policy::cpuFA2KVStoragePairName(Pair::AQ8_Q8_1);
+                        case TensorType::TQ4: return cpu::fa2_policy::cpuFA2KVStoragePairName(Pair::AQ8_TQ4);
+                        case TensorType::TQ8: return cpu::fa2_policy::cpuFA2KVStoragePairName(Pair::AQ8_TQ8);
+                        default: LLAMINAR_UNREACHABLE("Successful AQ8 verifier call has no admitted value format");
+                        }
+                    }
                     if (K->native_type() == TensorType::TQ4 &&
                         V->native_type() == TensorType::TQ4)
                         return "tq4_k_tq4_v";
@@ -1634,9 +1760,209 @@ namespace llaminar2
         friend class ::AVX2Q16DotParityTest;
 
     private:
+        /**
+         * @brief Admit one invocation's banks and geometry before any worker team.
+         * @param request Declared banks and geometry (actual tensor extents where known).
+         * @return Whether the row programs may address the banks without per-call checks.
+         * @details Every ISA's row helpers rely on this proof; the NEON helpers
+         * no longer re-validate each 1/2/4-row call (measured on M1 at 3/6/11%
+         * of the dot and 5/10/20% of the update for head_dim 256/128/64).
+         */
+        static bool admitInvocation(const cpu::CPUAttentionInvocationRequest &request)
+        {
+            std::string error;
+            if (cpu::CPUAttentionInvocationAdmission::admit(request, &error))
+                return true;
+            LOG_ERROR("[CPUFlashAttentionKernelT] " << error);
+            return false;
+        }
+
+        /**
+         * @brief Admit actual tensor allocation extents for a tensor entry point.
+         * @param element_bytes Bytes of one K/V scalar of a dense native cache.
+         * @details Raw-pointer implementations below admit their declared
+         * geometry; this adds that the real allocations cover it.
+         */
+        static bool admitTensorExtents(const ITensor *Q, const ITensor *K, const ITensor *V, const ITensor *O,
+            const void *q, const void *k, const void *v, const void *o, int query_rows, int kv_physical_rows,
+            int n_heads, int n_kv_heads, int head_dim, int head_start, int gqa_n_rep, std::size_t element_bytes)
+        {
+            auto request = declaredRequest(q, k, v, o, query_rows, kv_physical_rows, n_heads, n_kv_heads,
+                head_dim, head_start, gqa_n_rep, element_bytes);
+            request.query.bytes = Q->size_bytes();
+            request.output.bytes = O->size_bytes();
+            request.key.bytes = K->size_bytes();
+            request.value.bytes = V->size_bytes();
+            return admitInvocation(request);
+        }
+
+        /** @brief Actual FP32 query/output allocation extents a tensor entry point owns. */
+        struct ActualQueryBanks
+        {
+            std::size_t query_bytes = 0;  ///< Bytes behind the FP32 query view.
+            std::size_t output_bytes = 0; ///< Bytes of the FP32 output allocation.
+        };
+
+        /** @return Bytes behind @p tensor's FP32 view: the allocation, or the dequantized view. */
+        static std::size_t fp32BankBytes(const ITensor *tensor)
+        {
+            return tensor->native_type() == TensorType::FP32 ? tensor->size_bytes() : tensor->numel() * sizeof(float);
+        }
+
+        /**
+         * @brief Admit a Q16 K/V pair's format and logical layout for one invocation.
+         * @return The layout every block index of the invocation goes through, or
+         * empty when the pair disagrees (block size, rows, row width), a row does
+         * not hold the addressed head blocks, or the logical view needs rows the
+         * tensors lack.
+         * @details Head-major storage is [kv_head][row][head blocks]; position-major
+         * is [row][kv_heads x head blocks]. The detection matches the kernels.
+         */
+        static std::optional<detail::Q16KVLogicalLayout> q16KVLayout(const Q16_1Tensor *K_q16,
+            const Q16_1Tensor *V_q16, int n_kv_heads, int head_dim, int kv_len,
+            const attention::AttentionKVLogicalView &view)
+        {
+            if (!K_q16 || !V_q16 || n_kv_heads <= 0 || head_dim <= 0 || kv_len <= 0 ||
+                K_q16->q16_block_size() != V_q16->q16_block_size() || K_q16->rows() != V_q16->rows() ||
+                K_q16->blocks_per_row() != V_q16->blocks_per_row())
+                return std::nullopt;
+            const std::size_t block_elems = q16_block_size_elements(K_q16->q16_block_size());
+            const std::size_t blocks_per_row = K_q16->blocks_per_row();
+            const std::size_t blocks_per_head = (static_cast<std::size_t>(head_dim) + block_elems - 1) / block_elems;
+            const bool head_major = blocks_per_row == blocks_per_head && n_kv_heads > 1;
+            const detail::Q16KVLogicalLayout layout{
+                .blocks_per_tensor_row = blocks_per_row,
+                .blocks_per_head = blocks_per_head,
+                .physical_rows_per_head = head_major ? K_q16->rows() / static_cast<std::size_t>(n_kv_heads)
+                                                     : K_q16->rows(),
+                .kv_heads = n_kv_heads,
+                .head_major = head_major,
+                .logical_view = view,
+            };
+            if (!layout.valid(K_q16->rows(), kv_len))
+                return std::nullopt;
+            return layout;
+        }
+
+        /**
+         * @brief Complete admission request of a Q16 K/V invocation.
+         * @param actual Actual FP32 query/output extents; raw-pointer callers pass none
+         * and admit their declared geometry.
+         * @return The request (actual K/V allocations, Q16 row bytes, the Q16 query
+         * scratch capacity), or empty for a K/V row count beyond int or a row
+         * byte stride that is not representable.
+         */
+        static std::optional<cpu::CPUAttentionInvocationRequest> q16Request(const float *Q,
+            const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16, const float *output, int seq_len, int n_heads,
+            int n_kv_heads, int head_dim, int head_start, int gqa_n_rep, std::optional<ActualQueryBanks> actual)
+        {
+            if (K_q16->rows() > std::size_t(std::numeric_limits<int>::max()))
+                return std::nullopt;
+            const auto *k_raw = K_q16->raw_data(), *v_raw = V_q16->raw_data();
+            auto request = declaredRequest(Q, k_raw, v_raw, output, seq_len, int(K_q16->rows()),
+                n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, 1);
+            if (actual)
+            {
+                request.query.bytes = actual->query_bytes;
+                request.output.bytes = actual->output_bytes;
+            }
+            request.key = {k_raw, K_q16->size_bytes()};
+            request.value = {v_raw, V_q16->size_bytes()};
+            // The row stride must be the real one: a wrapped product would let a
+            // small physical bank certify a much wider logical row. Admission then
+            // proves rows x stride against the actual allocations.
+            const std::size_t block_bytes = q16_block_size_bytes(K_q16->q16_block_size());
+            if (block_bytes == 0 || K_q16->blocks_per_row() > std::numeric_limits<std::size_t>::max() / block_bytes)
+                return std::nullopt;
+            request.key_row_bytes = request.value_row_bytes = K_q16->blocks_per_row() * block_bytes;
+            request.scratch_head_dim = detail::kMaxI16RowStride;
+            return request;
+        }
+
+        /** @return Physical K/V rows a logical view can address for @p kv_len logical rows. */
+        static int physicalKVRows(const attention::AttentionKVLogicalView &view, int kv_len) noexcept
+        {
+            return view.isContiguous() ? kv_len : view.physical_row_capacity;
+        }
+
+        /**
+         * @brief Request whose extents are exactly what a raw-pointer geometry declares.
+         * @param element_bytes Bytes of one K/V scalar.
+         */
+        static cpu::CPUAttentionInvocationRequest declaredRequest(const void *q, const void *k, const void *v,
+            const void *o, int query_rows, int kv_physical_rows, int n_heads, int n_kv_heads, int head_dim,
+            int head_start, int gqa_n_rep, std::size_t element_bytes) noexcept
+        {
+            const std::size_t query_bytes = std::size_t(std::max(query_rows, 0)) * std::size_t(std::max(n_heads, 0)) *
+                std::size_t(std::max(head_dim, 0)) * sizeof(float);
+            const std::size_t kv_row_bytes = std::size_t(std::max(n_kv_heads, 0)) * std::size_t(std::max(head_dim, 0)) * element_bytes;
+            const std::size_t kv_bytes = kv_row_bytes * std::size_t(std::max(kv_physical_rows, 0));
+            return {
+                .query = {q, query_bytes}, .output = {o, query_bytes},
+                .key = {k, kv_bytes}, .value = {v, kv_bytes},
+                .query_rows = query_rows, .kv_physical_rows = kv_physical_rows,
+                .query_heads = n_heads, .kv_heads = n_kv_heads, .head_dim = head_dim,
+                .head_start = head_start, .gqa_n_rep = gqa_n_rep,
+                .key_row_bytes = kv_row_bytes, .value_row_bytes = kv_row_bytes,
+            };
+        }
+
         // -----------------------------------------------------------------
         // Dot-product helpers
         // -----------------------------------------------------------------
+
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Run one native shared-query register program over admitted cache rows.
+         * @tparam Format Original physical cache encoding; @tparam Rows Native row count.
+         * @param query Original FP32 query; @param keys Original cache row addresses.
+         * @param count Admitted head width.
+         * @return Native original-row dot results, with no repacked/decoded cache bank.
+         * @pre The enclosing invocation passed CPUAttentionInvocationAdmission, which
+         * proved every row and the width once; like the x86 helpers, this call
+         * performs no per-row validation and cannot throw inside the team.
+         */
+        template<cpu::neon_attention::Storage Format,std::size_t Rows>
+        static auto native_cache_dot(const float*query,
+            const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&keys,int count) noexcept
+        {
+            return cpu::neon_attention::AdmittedRows::dotRows<Format,Rows>(query,keys,count);
+        }
+        /** @brief Stream admitted value rows through the increasing-row native FMA program.
+         * @tparam Format Original physical value encoding; @tparam Rows Original row count.
+         * @param output Original FP32 numerator; @param values Original disjoint cache row addresses.
+         * @param weights Finite weights, fatal otherwise; @param count Admitted head width.
+         * @pre As native_cache_dot.
+         */
+        template<cpu::neon_attention::Storage Format,std::size_t Rows>
+        static void native_cache_accumulate(float*output,
+            const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&values,
+            const std::array<float,Rows>&weights,int count) noexcept
+        {
+            cpu::neon_attention::AdmittedRows::accumulateRows<Format,Rows>(output,values,weights,count);
+        }
+#endif
+        /** @brief Retain the native pointwise exponential program in bounded tails and summary rescaling.
+         * @param argument Nonpositive original score/maximum difference.
+         * @return Native SIMD-program word, or the explicitly selected scalar diagnostic program.
+         * @details x86 retains its existing scalar-tail program; no native tail silently selects libm.
+         */
+        static float attention_exp(float argument)
+        {
+#if LLAMINAR_COMPILED_WITH_NEON
+            switch(activeISALevel())
+            {
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+                return vgetq_lane_f32(primitives::neon_softmax::exponential(vdupq_n_f32(argument)),0);
+            case ISALevel::Scalar:
+                return std::exp(argument);
+            default:
+                LLAMINAR_UNREACHABLE("CPU native attention exponential received a foreign ISA");
+            }
+#else
+            return std::exp(argument);
+#endif
+        }
 
         /**
          * @brief Scalar (no-SIMD) dot product of two FP32 vectors.
@@ -1701,10 +2027,21 @@ namespace llaminar2
             case ISALevel::AVX512:
                 return dot_fp32_avx512(a, b, n);
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 return dot_fp32_avx2(a, b, n);
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                return native_cache_dot<cpu::neon_attention::Storage::FP32,1>(a,{b},n)[0];
+            }
+#endif
+            case ISALevel::Scalar:
                 return dot_fp32_scalar(a, b, n);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_fp32 received an uncompiled or foreign ISA");
             }
         }
 
@@ -1713,6 +2050,7 @@ namespace llaminar2
          *
          * Processes 8 floats per iteration using `_mm256_fmadd_ps`.
          */
+        #if defined(__AVX2__)
         static float dot_fp32_avx2(const float *a, const float *b, int n)
         {
             __m256 acc = _mm256_setzero_ps();
@@ -1736,6 +2074,7 @@ namespace llaminar2
                 sum += a[i] * b[i];
             return sum;
         }
+#endif
 
 #if defined(__AVX512F__)
         /**
@@ -2308,8 +2647,18 @@ namespace llaminar2
             case ISALevel::AVX2:
                 return dot_native16_avx2<Format>(query, key, head_dim);
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                return native_cache_dot<storage,1>(query,{key},head_dim)[0];
+            }
+#endif
+            case ISALevel::Scalar:
                 return dot_native16_scalar<Format>(query, key, head_dim);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_native16 received an uncompiled or foreign ISA");
             }
         }
 
@@ -2343,10 +2692,22 @@ namespace llaminar2
                     score0, score1, score2, score3);
                 return;
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                const auto result=native_cache_dot<storage,4>(query,{key0,key1,key2,key3},head_dim);
+                score0=result[0];score1=result[1];score2=result[2];score3=result[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_native16_4row_scalar<Format>(
                     query, key0, key1, key2, key3, head_dim,
                     score0, score1, score2, score3);
+                return;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_native16_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2372,9 +2733,20 @@ namespace llaminar2
                     output, value, weight, head_dim);
                 return;
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                native_cache_accumulate<storage,1>(output,{value},{weight},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_native16_scalar<Format>(
                     output, value, weight, head_dim);
+                return;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_native16 received an uncompiled or foreign ISA");
             }
         }
 
@@ -2416,7 +2788,15 @@ namespace llaminar2
                     head_dim);
                 return;
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                native_cache_accumulate<storage,4>(output,{value0,value1,value2,value3},{weight0,weight1,weight2,weight3},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_native16_4row_scalar<Format>(
                     output,
                     value0, weight0,
@@ -2424,6 +2804,9 @@ namespace llaminar2
                     value2, weight2,
                     value3, weight3,
                     head_dim);
+                return;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_native16_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2502,12 +2885,24 @@ namespace llaminar2
                 dot_fp32_avx512_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 dot_fp32_avx2_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const auto result=native_cache_dot<cpu::neon_attention::Storage::FP32,4>(q,{k0,k1,k2,k3},head_dim);
+                s0=result[0];s1=result[1];s2=result[2];s3=result[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_fp32_4row_scalar(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_fp32_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2572,12 +2967,26 @@ namespace llaminar2
                 batch_exp_4_avx512(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 batch_exp_4_avx2(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const float scores[4]{s0,s1,s2,s3};float probabilities[4];
+                const auto shifted=vsubq_f32(vld1q_f32(scores),vdupq_n_f32(max_val));
+                vst1q_f32(probabilities,primitives::neon_softmax::exponential(shifted));
+                p0=probabilities[0];p1=probabilities[1];p2=probabilities[2];p3=probabilities[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 batch_exp_4_scalar(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention batch_exp_4 received an uncompiled or foreign ISA");
             }
         }
 
@@ -2698,12 +3107,23 @@ namespace llaminar2
                 accum_weighted_v_avx512(out, v, weight, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_avx2(out, v, weight, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::FP32,1>(out,{v},{weight},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_scalar(out, v, weight, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v received an uncompiled or foreign ISA");
             }
         }
 
@@ -2832,12 +3252,23 @@ namespace llaminar2
                 accum_weighted_v_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::FP32,4>(out,{v0,v1,v2,v3},{w0,w1,w2,w3},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_4row_scalar(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2905,12 +3336,23 @@ namespace llaminar2
                 scale_vec_avx512(out, alpha, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 scale_vec_avx2(out, alpha, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                primitives::vec_scale(out,alpha,head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 scale_vec_scalar(out, alpha, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention scale_vec received an uncompiled or foreign ISA");
             }
         }
 
@@ -3096,10 +3538,22 @@ namespace llaminar2
             case ISALevel::AVX512:
                 return quantize_row_i16_i12_avx512(src, dst, n, qmax);
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 return quantize_row_i16_i12_avx2(src, dst, n, qmax);
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                if(n<0)throw std::invalid_argument("CPU native query width is negative");
+                return cpu::neon_attention::quantizeQuery(cpu::neon_attention::originalRows<float,1>({src},n)[0],{dst,std::size_t(n)},qmax);
+            }
+#endif
+            case ISALevel::Scalar:
                 return quantize_row_i16_i12_scalar(src, dst, n, qmax);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention quantize_row_i16_i12 received an uncompiled or foreign ISA");
             }
         }
 
@@ -3161,7 +3615,8 @@ namespace llaminar2
         }
 
         /** @brief Runtime dispatch: i16 dot product. */
-        static int32_t dot_i16_i16_i32(const int16_t *a, const int16_t *b, int n)
+        static int32_t dot_i16_i16_i32(const int16_t *a, const int16_t *b, int n,
+            [[maybe_unused]] const cpu::Q16ReductionBound &bound)
         {
             switch (activeISALevel())
             {
@@ -3169,10 +3624,21 @@ namespace llaminar2
             case ISALevel::AVX512:
                 return dot_i16_i16_i32_vnni(a, b, n);
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 return dot_i16_i16_i32_avx2(a, b, n);
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                return cpu::neon_attention::AdmittedRows::integerDotRows<1>(bound,a,{b},n)[0];
+            }
+#endif
+            case ISALevel::Scalar:
                 return dot_i16_i16_i32_scalar(a, b, n);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_i16_i16_i32 received an uncompiled or foreign ISA");
             }
         }
 
@@ -3182,6 +3648,7 @@ namespace llaminar2
          * Uses `_mm256_madd_epi16` which computes adjacent pairs:
          * acc[k] += a[2k]*b[2k] + a[2k+1]*b[2k+1] for 8 output i32s.
          */
+        #if defined(__AVX2__)
         static int32_t dot_i16_i16_i32_avx2(const int16_t *a, const int16_t *b, int n)
         {
             __m256i acc = _mm256_setzero_si256();
@@ -3203,6 +3670,7 @@ namespace llaminar2
                 sum += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
             return sum;
         }
+#endif
 
         /**
          * @brief Dual-row VNNI dot product:  `out0 = q·k0` and `out1 = q·k1`.
@@ -3335,7 +3803,8 @@ namespace llaminar2
             const int16_t *k1,
             int n,
             int32_t &out0,
-            int32_t &out1)
+            int32_t &out1,
+            [[maybe_unused]] const cpu::Q16ReductionBound &bound)
         {
             switch (activeISALevel())
             {
@@ -3344,12 +3813,24 @@ namespace llaminar2
                 dot_i16_i16_i32_vnni_2row_avx512(q, k0, k1, n, out0, out1);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 dot_i16_i16_i32_vnni_2row_avx2(q, k0, k1, n, out0, out1);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const auto result=cpu::neon_attention::AdmittedRows::integerDotRows<2>(bound,q,{k0,k1},n);
+                out0=result[0];out1=result[1];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_i16_i16_i32_vnni_2row_scalar(q, k0, k1, n, out0, out1);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_i16_i16_i32_vnni_2row received an uncompiled or foreign ISA");
             }
         }
 
@@ -3483,7 +3964,8 @@ namespace llaminar2
         static void dot_i16_i16_i32_vnni_4row(
             const int16_t *q, const int16_t *k0, const int16_t *k1,
             const int16_t *k2, const int16_t *k3, int n,
-            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3,
+            [[maybe_unused]] const cpu::Q16ReductionBound &bound)
         {
             switch (activeISALevel())
             {
@@ -3492,12 +3974,24 @@ namespace llaminar2
                 dot_4row_separate_avx512(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 dot_4row_separate_avx2(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const auto result=cpu::neon_attention::AdmittedRows::integerDotRows<4>(bound,q,{k0,k1,k2,k3},n);
+                out0=result[0];out1=result[1];out2=result[2];out3=result[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_4row_separate_scalar(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_i16_i16_i32_vnni_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -3796,15 +4290,16 @@ namespace llaminar2
             }
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            std::uint64_t qk_duration_ns = 0;
-            std::uint64_t v_duration_ns = 0;
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
             const auto slot_index = [slots_per_row](int row, int slot)
             {
                 return static_cast<std::size_t>(row) * slots_per_row + slot;
             };
 
-            auto work = [&]()
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
                 Scratch scratch{};
                 alignas(64) float scores[detail::kMaxKVTile];
 
@@ -3831,7 +4326,7 @@ namespace llaminar2
                         canonical_summaries - wave_begin);
                     const int wave_items = output_rows * active_slots;
 
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+#pragma omp for schedule(static)
                     for (int item = 0; item < wave_items; ++item)
                     {
                         const int row = item / active_slots;
@@ -3913,20 +4408,14 @@ namespace llaminar2
                         partial_output_ + merged_slot * padded_head_dim,
                         partial_l_[merged_slot]);
                 }
-            };
+            });
 
             OMP_WORKSHARE_REGION(work);
-            if (profiling_enabled)
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_QK,
-                    qk_duration_ns,
-                    omp_get_max_threads());
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_V,
-                    v_duration_ns,
-                    omp_get_max_threads());
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 
@@ -4073,13 +4562,14 @@ namespace llaminar2
             const int work_items = output_rows;
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            std::uint64_t qk_duration_ns = 0;
-            std::uint64_t v_duration_ns = 0;
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
             const int requested_threads = computeOptimalAttentionThreads(
                 n_heads, query_rows, kv_len, head_dim, causal);
 
-            auto work = [&]()
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
                 Scratch scratch{};
                 alignas(64) float local_partial[kMaximumAttentionHeadDim];
                 alignas(64) float merged[kMaximumAttentionHeadDim];
@@ -4090,7 +4580,7 @@ namespace llaminar2
                 // in a fresh prefill. Cyclic whole-row ownership balances that
                 // triangle without splitting a reduction: every row still
                 // merges the same canonical summaries in ascending K/V order.
-#pragma omp for schedule(static, 1) reduction(+ : qk_duration_ns, v_duration_ns)
+#pragma omp for schedule(static, 1)
                 for (int item = 0; item < work_items; ++item)
                 {
                     const int row = item;
@@ -4151,35 +4641,30 @@ namespace llaminar2
                     finalize_row(row, merged, merged_l);
                 }
 
-            };
+            });
 
+            // A retained invocation already owns its team. A small standalone
+            // hint must never split those members into nested whole-row teams.
             const bool use_full_team =
-                kv_len > 100 || output_rows >= physical_workers;
-            int actual_threads = requested_threads;
+                omp_in_parallel() || kv_len > 100 || output_rows >= physical_workers;
             if (use_full_team)
             {
                 OMP_WORKSHARE_REGION(work);
-                actual_threads = physical_workers;
             }
             else
             {
+                ::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel num_threads(requested_threads)
                 {
                     work();
                 }
             }
 
-            if (profiling_enabled)
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_QK,
-                    qk_duration_ns,
-                    actual_threads);
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_V,
-                    v_duration_ns,
-                    actual_threads);
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 
@@ -4271,12 +4756,23 @@ namespace llaminar2
                 accum_weighted_v_q16_avx512(out, v_qs, combined, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_q16_avx2(out, v_qs, combined, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::I16,1>(out,{v_qs},{combined},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_q16_scalar(out, v_qs, combined, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v_q16 received an uncompiled or foreign ISA");
             }
         }
 
@@ -4432,12 +4928,23 @@ namespace llaminar2
                 accum_weighted_v_q16_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_q16_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::I16,4>(out,{v0,v1,v2,v3},{w0,w1,w2,w3},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_q16_4row_scalar(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v_q16_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -4527,6 +5034,10 @@ namespace llaminar2
             }
             if (!kv_logical_view.validFor(kv_len))
                 return false;
+            if (!admitInvocation(declaredRequest(Q, K, V, output, seq_len,
+                    physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
+                    head_start, gqa_n_rep, sizeof(float))))
+                return false;
 
             const auto physical_kv_row = [&](int logical_row) -> std::size_t
             {
@@ -4562,9 +5073,6 @@ namespace llaminar2
 
             // Profiling: track QK dot-product and V accumulation times separately.
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
             const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
                 cpu::fa2_policy::selectCPUFA2ParallelPlan({
                     .batch_size = 1,
@@ -4825,9 +5333,12 @@ namespace llaminar2
             const int attention_tasks =
                 partition_query_rows ? n_heads * seq_len : n_heads;
 
-            auto work = [&]()
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
+#pragma omp for schedule(static)
                 for (int task = 0; task < attention_tasks; ++task)
                 {
                     /*
@@ -5069,7 +5580,7 @@ namespace llaminar2
                         div_vec(out, running_l, head_dim, use_avx512);
                     } // end q_pos loop
                 } // end head loop
-            };
+            });
 
             // DECODE THREADING STRATEGY: prevent libgomp thread pool sleep.
             //
@@ -5092,43 +5603,38 @@ namespace llaminar2
             // prevent the inter-region sleep; libgomp's team-end idle path has
             // a fixed spin count independent of these settings.
             const bool is_decode_phase = (kv_len != seq_len);
-            const bool force_full_pool = is_decode_phase && kv_len > 100;
+            const bool force_full_pool = omp_in_parallel() || (is_decode_phase && kv_len > 100);
 
             // Use OMP_WORKSHARE_REGION for decode so the kernel is
             // compatible with a persistent outer parallel region (the
             // macro detects omp_in_parallel() and skips creating a new
             // team, eliminating ~16 µs fork/join overhead per call).
-            int actual_threads;
             if (force_full_pool)
             {
                 OMP_WORKSHARE_REGION(work);
-                actual_threads = omp_get_max_threads();
             }
             else
             {
+                ::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel num_threads(attn_threads)
                 {
                     work();
                 }
-                actual_threads = attn_threads;
             }
 
-            // Report profiling breakdown (QK vs V phase) if enabled.
-            // qk_duration_ns and v_duration_ns are thread-time sums from
-            // the OMP reduction — divide by active thread count to get
-            // wall-clock estimates that are consistent with other kernel
-            // timings in the profiler output.
-            if (profiling_enabled)
+            // Publish one complete thread-time sum using the team that actually
+            // executed, before any elected retained-team stack storage retires.
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
         /**
-         * @brief Prefill flash attention with Q16_1 KV cache (VNNI accelerated).
+         * @brief Native integer prefill/decode attention over original Q16 cache storage.
          *
          * Handles seq_len >= 1 (including prefill where seq_len == kv_len).
          * Uses the same VNNI QK dot products and Q16_1 V accumulation as
@@ -5152,7 +5658,8 @@ namespace llaminar2
             int gqa_n_rep = 0,
             const attention::AttentionExecutionPolicy &execution_policy = {},
             const attention::AttentionKVLogicalView &kv_logical_view = {},
-            Q16QueryLayout query_layout = Q16QueryLayout::RowMajor)
+            Q16QueryLayout query_layout = Q16QueryLayout::RowMajor,
+            std::optional<ActualQueryBanks> actual_query_banks = std::nullopt)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -5168,44 +5675,30 @@ namespace llaminar2
             const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-            // Q16_1 block layout
+            // Q16_1 block layout: one admission shared with the request-batch preflight.
+            const auto admitted_layout = q16KVLayout(K_q16, V_q16, n_kv_heads, head_dim, kv_len, kv_logical_view);
+            if (!admitted_layout)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid Q16 prefill K/V layout or logical ring view");
+                return false;
+            }
+            const detail::Q16KVLogicalLayout q16_layout = *admitted_layout;
             const Q16BlockSize blk_size = K_q16->q16_block_size();
             const size_t block_bytes = q16_block_size_bytes(blk_size);
             const size_t block_elems = q16_block_size_elements(blk_size);
             const size_t blocks_per_kv_row = K_q16->blocks_per_row();
             constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
-
-            const size_t blocks_per_head_detect =
-                (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-            const bool is_head_major =
-                (blocks_per_kv_row == blocks_per_head_detect && n_kv_heads > 1);
-            const size_t rows_per_head = is_head_major
-                                             ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
-                                             : 0;
-
-            const detail::Q16KVLogicalLayout q16_layout{
-                .blocks_per_tensor_row = blocks_per_kv_row,
-                .blocks_per_head = blocks_per_head_detect,
-                .physical_rows_per_head = is_head_major
-                                              ? rows_per_head
-                                              : K_q16->rows(),
-                .kv_heads = n_kv_heads,
-                .head_major = is_head_major,
-                .logical_view = kv_logical_view,
-            };
-            if (K_q16->q16_block_size() != V_q16->q16_block_size() ||
-                K_q16->rows() != V_q16->rows() ||
-                K_q16->blocks_per_row() != V_q16->blocks_per_row() ||
-                !q16_layout.valid(K_q16->rows(), kv_len))
-            {
-                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid Q16 prefill K/V layout or logical ring view");
-                return false;
-            }
-
+            const bool is_head_major = q16_layout.head_major;
             const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
             const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
             if (!k_raw || !v_raw)
                 return false;
+            {
+                const auto request = q16Request(Q, K_q16, V_q16, output, seq_len, n_heads, n_kv_heads,
+                    head_dim, head_start, gqa_n_rep, actual_query_banks);
+                if (!request || !admitInvocation(*request))
+                    return false;
+            }
 
             const int q_stride = n_heads * head_dim;
             const auto query_head = [&](int query_position,
@@ -5225,7 +5718,7 @@ namespace llaminar2
 
             // Physical cache tiling is independent of canonical arithmetic.
             const std::size_t q16_head_row_bytes =
-                blocks_per_head_detect * block_bytes;
+                q16_layout.blocks_per_head * block_bytes;
             const int kv_tile = detail::selectCPUFlashKVTile(
                 cpu::fa2_policy::CPUFA2KVStoragePair::Q16_1,
                 head_dim,
@@ -5235,17 +5728,16 @@ namespace llaminar2
                 launch_policy_.explicit_kv_tile);
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
             const int attn_threads = computeOptimalAttentionThreads(
                 n_heads, seq_len, kv_len, head_dim, causal);
 
             // Native K uses the full int16 range. Bound the complete block dot
             // product, not merely a SIMD lane: horizontal sums must fit too.
             // The same bound feeds scalar, AVX2 and AVX512 grouped/serial paths.
-            const int QMAX = cpu::q16AttentionQueryLimit(
+            // One typed bound feeds the query clamp and every integer dot.
+            const auto q16_bound = cpu::Q16ReductionBound::forTerms(
                 std::min(head_dim, static_cast<int>(block_elems)));
+            const int QMAX = q16_bound.queryLimit();
 
             const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
                 cpu::fa2_policy::selectCPUFA2ParallelPlan({
@@ -5376,7 +5868,8 @@ namespace llaminar2
                                 dot0,
                                 dot1,
                                 dot2,
-                                dot3);
+                                dot3,
+                                q16_bound);
                             const float values[4]{
                                 static_cast<float>(dot0) *
                                     scratch.combined_query_scale * scale0,
@@ -5420,7 +5913,7 @@ namespace llaminar2
                                 scratch.query + block * block_elems,
                                 reinterpret_cast<const std::int16_t *>(
                                     stored + QS_OFFSET),
-                                elements);
+                                elements, q16_bound);
                             score += static_cast<float>(dot) *
                                      scratch.combined_query_scale *
                                      stored_scale;
@@ -5573,11 +6066,14 @@ namespace llaminar2
             const int attention_tasks =
                 partition_query_rows ? n_heads * seq_len : n_heads;
 
-            auto work = [&]()
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
                 alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+#pragma omp for schedule(static)
                 for (int task = 0; task < attention_tasks; ++task)
                 {
                     /*
@@ -5671,18 +6167,14 @@ namespace llaminar2
 
                                         if (k + 7 < valid_end)
                                         {
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes);
                                         }
 
                                         float kd0, kd1, kd2, kd3;
@@ -5699,7 +6191,7 @@ namespace llaminar2
                                         int32_t dot0, dot1, dot2, dot3;
                                         dot_i16_i16_i32_vnni_4row(
                                             q_i16_buf, k_qs0, k_qs1, k_qs2, k_qs3,
-                                            head_dim, dot0, dot1, dot2, dot3);
+                                            head_dim, dot0, dot1, dot2, dot3, q16_bound);
 
                                         float s0 = static_cast<float>(dot0) * qk_combined_scale * kd0;
                                         float s1 = static_cast<float>(dot1) * qk_combined_scale * kd1;
@@ -5720,7 +6212,7 @@ namespace llaminar2
                                     float kd;
                                     std::memcpy(&kd, blk_s, sizeof(float));
                                     const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                    int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim);
+                                    int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim, q16_bound);
                                     float s = static_cast<float>(dot) * qk_combined_scale * kd;
                                     block_scores[static_cast<size_t>(k - k0)] = s;
                                     block_max = std::max(block_max, s);
@@ -5740,7 +6232,7 @@ namespace llaminar2
                                         const int elem_count = static_cast<int>(
                                             std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
                                         int32_t dot = dot_i16_i16_i32(
-                                            q_i16_buf + bi * block_elems, k_qs, elem_count);
+                                            q_i16_buf + bi * block_elems, k_qs, elem_count, q16_bound);
                                         s += static_cast<float>(dot) * q_scale * kd;
                                     }
                                     s *= scale;
@@ -5761,23 +6253,7 @@ namespace llaminar2
                             const float alpha = std::isfinite(running_m)
                                                     ? std::exp(running_m - new_m)
                                                     : 0.0f;
-                            {
-#if defined(__AVX512F__)
-                                const __m512 va = _mm512_set1_ps(alpha);
-                                int sd = 0;
-                                for (; sd + 15 < head_dim; sd += 16)
-                                    _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
-                                for (; sd < head_dim; ++sd)
-                                    out[sd] *= alpha;
-#else
-                                const __m256 va = _mm256_set1_ps(alpha);
-                                int sd = 0;
-                                for (; sd + 7 < head_dim; sd += 8)
-                                    _mm256_storeu_ps(out + sd, _mm256_mul_ps(va, _mm256_loadu_ps(out + sd)));
-                                for (; sd < head_dim; ++sd)
-                                    out[sd] *= alpha;
-#endif
-                            }
+                            scale_vec(out, alpha, head_dim, cpu_supports_avx512());
                             float new_l = running_l * alpha;
 
                             // --- V Phase: Q16_1 V weighted accumulation ---
@@ -5792,18 +6268,14 @@ namespace llaminar2
                                 {
                                     if (k + 7 < valid_end)
                                     {
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes);
                                     }
 
                                     alignas(16) float pp[4];
@@ -5885,35 +6357,19 @@ namespace llaminar2
                         if (running_l > 0.0f)
                         {
                             const float inv_l = 1.0f / running_l;
-#if defined(__AVX512F__)
-                            const __m512 vi = _mm512_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= inv_l;
-#else
-                            const __m256 vi = _mm256_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 7 < head_dim; sd += 8)
-                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= inv_l;
-#endif
+                            scale_vec(out, inv_l, head_dim, cpu_supports_avx512());
                         }
                     } // end q_pos loop
                 } // end head loop
-            };
+            });
 
-            // Threading: prefill has enough work for all threads
+            // Threading: prefill has enough work for all threads.
             OMP_WORKSHARE_REGION(work);
-            const int actual_threads = omp_get_max_threads();
-
-            if (profiling_enabled)
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 #endif // (__AVX512F__ && __AVX512VNNI__) || __AVX2__
@@ -5971,7 +6427,9 @@ namespace llaminar2
         /**
          * @brief Accumulate weighted dequantized Q8_1 V block into output.
          *
-         * out[d] += weight * (qs[d] * scale)  for d in [0, 32)
+         * Round combined=weight*scale, then intentionally FMA each original
+         * signed code into the numerator. Native ISA leaves share one checked
+         * original-block authority; no decoded value row or scalar replacement.
          *
          * @param out     Output accumulator (32 floats at current block offset)
          * @param v_block Pointer to Q8_1Block for V
@@ -5980,31 +6438,7 @@ namespace llaminar2
         static inline void accum_weighted_v_q8_1_block(
             float *out, const Q8_1Block *v_block, float weight)
         {
-#if defined(__AVX512F__) && defined(__F16C__)
-            const float v_scale = _cvtsh_ss(v_block->d);
-            const float combined = weight * v_scale;
-            const __m512 vw = _mm512_set1_ps(combined);
-
-            const __m256i qs_raw = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i *>(v_block->qs));
-            const __m512i lo_i32 = _mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs_raw));
-            const __m512i hi_i32 = _mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs_raw, 1));
-
-            const __m512 lo_f = _mm512_cvtepi32_ps(lo_i32);
-            const __m512 hi_f = _mm512_cvtepi32_ps(hi_i32);
-
-            __m512 o0 = _mm512_loadu_ps(out);
-            __m512 o1 = _mm512_loadu_ps(out + 16);
-            o0 = _mm512_fmadd_ps(lo_f, vw, o0);
-            o1 = _mm512_fmadd_ps(hi_f, vw, o1);
-            _mm512_storeu_ps(out, o0);
-            _mm512_storeu_ps(out + 16, o1);
-#else
-            const float v_scale = fp16_to_fp32(v_block->d);
-            const float combined = weight * v_scale;
-            for (int i = 0; i < 32; ++i)
-                out[i] += combined * static_cast<float>(v_block->qs[i]);
-#endif
+            cpu::q8_attention::accumulateValueBlock({out,32},*v_block,weight);
         }
 
         /**
@@ -6185,10 +6619,7 @@ namespace llaminar2
                                                            : physical_kv_row(kv_row + 1) *
                                                                      blocks_per_kv_row +
                                                                  scratch.head_base;
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                &k_blocks[next_index]),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(&k_blocks[next_index]);
                     }
                 }
             };
@@ -6238,10 +6669,7 @@ namespace llaminar2
                                                            : physical_kv_row(kv_row + 1) *
                                                                      blocks_per_kv_row +
                                                                  scratch.head_base;
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                &v_blocks[next_index]),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(&v_blocks[next_index]);
                     }
                 }
             };
@@ -6314,6 +6742,10 @@ namespace llaminar2
             if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
             if (!kv_logical_view.validFor(kv_len))
+                return false;
+            if (!admitInvocation(declaredRequest(Q, K_native, V_native, output, seq_len,
+                    physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
+                    head_start, gqa_n_rep, sizeof(std::uint16_t))))
                 return false;
 
             const auto physical_kv_row = [&](int logical_row) -> std::size_t
@@ -6545,7 +6977,7 @@ namespace llaminar2
         // V accumulation in rotated centroid space, one final Πᵀ at end.
         // Total: O(D² + kv_len·D) instead of O(kv_len·D²).
         // =================================================================
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
         /**
          * @brief Native TQ4/TQ8 attention for every supported K/V pairing.
          *
@@ -6756,13 +7188,8 @@ namespace llaminar2
                 {
                     if (kv_row + 4 < visible.end)
                     {
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                k_raw +
-                                physical_kv_row(kv_row + 4) *
-                                    k_row_stride +
-                                scratch.key_head_offset),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(
+                            k_raw + physical_kv_row(kv_row + 4) * k_row_stride + scratch.key_head_offset);
                     }
                     const std::uint8_t *key_block =
                         k_raw + physical_kv_row(kv_row) * k_row_stride +
@@ -6805,13 +7232,8 @@ namespace llaminar2
                 {
                     if (kv_row + 4 < visible.end)
                     {
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                v_raw +
-                                physical_kv_row(kv_row + 4) *
-                                    v_row_stride +
-                                scratch.value_head_offset),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(
+                            v_raw + physical_kv_row(kv_row + 4) * v_row_stride + scratch.value_head_offset);
                     }
                     const float probability = std::exp(
                         scores[static_cast<std::size_t>(kv_row - tile_begin)] -
@@ -6883,8 +7305,13 @@ namespace llaminar2
                 accumulate_tile,
                 finalize_row);
         }
+#endif // __AVX512F__ || __AVX2__ || NEON (TQ fused)
+
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
+        // AQ8 uses native shared codec/value authorities independently of the
+        // separate TQ-key adapter above; do not hide it in an x86-only section.
 #include "CPUFlashAttentionAQ8.inl"
-#endif // __AVX512F__ || __AVX2__ (TQ fused)
+#endif // Native AQ8 adapter; scalar production AQ8 is not advertised.
 
         /**
          * @brief Validate and expose prebound context-summary storage.

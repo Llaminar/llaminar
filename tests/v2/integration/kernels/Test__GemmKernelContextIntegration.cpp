@@ -42,6 +42,8 @@
 #include <hip/hip_runtime.h>
 #endif
 
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+
 #include <cmath>
 #include <random>
 #include <vector>

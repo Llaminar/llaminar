@@ -227,6 +227,28 @@ TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsArchitecture)
     EXPECT_EQ(profile.max_seq_len, 32768);
 }
 
+/** @test The declared partial rotary width is retained, wire-stable, and bounds the effective width. */
+TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsPartialRotaryDimension)
+{
+    auto model = createTestModel();
+    auto undeclared = ModelMemoryProfile::fromGGUF(model);
+    EXPECT_EQ(undeclared.rope_dimension_count, 0);
+    EXPECT_EQ(undeclared.effectiveRotaryDimension(), 64);
+
+    setUInt32Metadata(model, "qwen2.rope.dimension_count", 32);
+    const auto partial = ModelMemoryProfile::fromGGUF(model);
+    EXPECT_EQ(partial.rope_dimension_count, 32);
+    EXPECT_EQ(partial.effectiveRotaryDimension(), 32);
+    const auto wire = partial.serialize();
+    const auto restored = ModelMemoryProfile::deserialize(wire.data(), wire.size());
+    EXPECT_EQ(restored.rope_dimension_count, 32);
+    EXPECT_EQ(restored.effectiveRotaryDimension(), 32);
+
+    // A declared width that is not a proper prefix rotates the full head.
+    setUInt32Metadata(model, "qwen2.rope.dimension_count", 64);
+    EXPECT_EQ(ModelMemoryProfile::fromGGUF(model).effectiveRotaryDimension(), 64);
+}
+
 TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsExactMoEGeometry)
 {
     auto model = createTestModel();
@@ -345,6 +367,47 @@ TEST(Test__ModelMemoryProfile, FromGGUF_InfersDFFFromTensorShapes)
 
     // d_ff should be inferred from ffn_gate dimensions[0] = 4864
     EXPECT_EQ(profile.d_ff, 4864);
+}
+
+/**
+ * @brief The MoE router's expert axis must never become the dense FFN width.
+ *
+ * Qwen3.6-35B-A3B declares no `feed_forward_length`; its first tensor matching
+ * `ffn_gate` is the router `blk.0.ffn_gate_inp.weight` ([d_model, experts]).
+ * Planning once took 256 from it while graph construction used the 512-wide
+ * shared expert, under-admitting the CPU activation arena by two 8192x256
+ * FP32 roots. Planning and graph configuration now share one authority.
+ */
+TEST(Test__ModelMemoryProfile, FromGGUF_MoEDFFUsesSharedExpertNotRouterAxis)
+{
+    GGUFModel model;
+    model.architecture = "qwen35moe";
+    model.block_count = 1;
+    model.embedding_length = 2048;
+    model.head_count = 16;
+    model.head_count_kv = 2;
+    model.key_length = 256;
+    model.vocab_size = 248320;
+    model.context_length = 262144;
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+    setUInt32Metadata(model, "qwen35moe.expert_used_count", 8);
+    setUInt32Metadata(model, "qwen35moe.expert_feed_forward_length", 512);
+    setUInt32Metadata(model, "qwen35moe.expert_shared_feed_forward_length", 512);
+    GGUFTensorInfo router;
+    router.name = "blk.0.ffn_gate_inp.weight";
+    router.dimensions = {256, 2048};
+    router.type = GGUFTensorType::F32;
+    router.size_bytes = 256ULL * 2048 * 4;
+    model.tensors.push_back(router);
+
+    const auto profile = ModelMemoryProfile::fromGGUF(model);
+    EXPECT_EQ(profile.d_ff, 512);
+    EXPECT_EQ(static_cast<uint64_t>(profile.d_ff), ggufFeedForwardLength(model));
+
+    // An explicit dense width remains authoritative over expert widths.
+    setUInt32Metadata(model, "qwen35moe.feed_forward_length", 1536);
+    EXPECT_EQ(ModelMemoryProfile::fromGGUF(model).d_ff, 1536);
+    EXPECT_EQ(ggufFeedForwardLength(model), 1536u);
 }
 
 TEST(Test__ModelMemoryProfile, WeightBytesForLayers_FullRange)

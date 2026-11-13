@@ -1,6 +1,9 @@
-# Llaminar V2 build and public target contracts.
+# @file CMakeLists.txt
+# @brief Llaminar V2 build, native toolchain and public target contracts.
 # Backend dependencies, generated model resources, and public header usage
 # requirements are owned here so serving tools compile independently of tests.
+# Dependency phase owners distinguish resumable configured work from a proven
+# installation; incomplete builds never authorize a different serving route.
 cmake_minimum_required(VERSION 3.18)
 
 # Define custom build types BEFORE project() so they're recognized.
@@ -71,34 +74,10 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-# CPU ISA selection. Keep this explicit so the binary can be built for either
-# AVX512-capable hosts or an AVX2-only baseline without inheriting the builder's
-# full native ISA by accident.
-set(LLAMINAR_CPU_ISA "AVX512" CACHE STRING "Maximum x86 SIMD ISA to compile for: AVX512 or AVX2")
-set_property(CACHE LLAMINAR_CPU_ISA PROPERTY STRINGS AVX512 AVX2)
-string(TOUPPER "${LLAMINAR_CPU_ISA}" LLAMINAR_CPU_ISA_UPPER)
-
-set(LLAMINAR_CPU_AVX2_FLAGS "-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt")
-set(LLAMINAR_CPU_AVX512_FLAGS
-    "${LLAMINAR_CPU_AVX2_FLAGS} -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni")
-
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX512_FLAGS}")
-    add_compile_definitions(
-        LLAMINAR_COMPILED_WITH_AVX2=1
-        LLAMINAR_COMPILED_WITH_AVX512=1)
-elseif(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX2")
-    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX2_FLAGS}")
-    add_compile_definitions(
-        LLAMINAR_COMPILED_WITH_AVX2=1
-        LLAMINAR_COMPILED_WITH_AVX512=0)
-else()
-    message(FATAL_ERROR "Unsupported LLAMINAR_CPU_ISA='${LLAMINAR_CPU_ISA}'. Use AVX512 or AVX2.")
-endif()
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
-message(STATUS "V2: CPU ISA target: ${LLAMINAR_CPU_ISA_UPPER} (${LLAMINAR_CPU_COMPILE_FLAGS})")
+# The target toolchain selects the compiler envelope; never inject x86 flags
+# into an ARM compiler or silently reuse an incompatible cached ISA selection.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/CPUInstructionSet.cmake")
+llaminar_configure_cpu_instruction_set()
 
 # Backend options (Phase 6: Heterogeneous Multi-GPU)
 # CUDA and ROCm CAN coexist - compiled in separate translation units
@@ -108,6 +87,14 @@ option(HAVE_CUDA "Enable CUDA backend" ON)
 option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
+if(LLAMINAR_BUILD_TESTS AND CMAKE_VERSION VERSION_LESS 4.0)
+    # Earlier CTest versions execute timeout signals but omit their actual
+    # retirement properties from JSON. The mandatory ownership inventory must
+    # observe those fields; do not build a test image that cannot certify them.
+    message(FATAL_ERROR
+        "Llaminar test builds require CMake/CTest >=4.0 for timeout-owner JSON metadata. "
+        "Install the repository-pinned build tools; do not weaken MPI ownership checks.")
+endif()
 
 # Source-bound model policy: Automatic selects only the measured native owner
 # operation. Explicit Serial/Four remain first-class; no serving/env override.
@@ -187,6 +174,12 @@ message(STATUS "V2: ${LLAMINAR_OPENMPI_VERSION_LINE}")
 find_path(NUMA_INCLUDE_DIR NAMES numa.h)
 find_library(NUMA_LIBRARY NAMES numa)
 if(NOT NUMA_INCLUDE_DIR OR NOT NUMA_LIBRARY)
+    if(APPLE)
+        message(FATAL_ERROR
+            "Native macOS inference is not implemented: the CPU memory/placement backend requires Linux libnuma. "
+            "Do not substitute a NUMA stub. Focused native ARM primitive tests can be configured with "
+            "cmake -S tests/v2/portability -B build_arm_portability -G Ninja.")
+    endif()
     message(FATAL_ERROR
         "Llaminar requires libnuma headers and library. Install libnuma-dev/numactl-devel.")
 endif()
@@ -405,7 +398,18 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
-        kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu  # custom native-quantised prefill GEMM family (Q4_0 first)
+        # NativeQuantised prefill is physically sharded by codebook pair, like
+        # decode: eight complete, deterministic modules behind one host-only
+        # dispatcher that owns the public ABI and the launch-policy state.
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillDispatch.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard0.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard1.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard2.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard3.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard4.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard5.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard6.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard7.cu
         kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
         kernels/cuda/moe/CUDAMoEGroupedIntermediateExchange.cu # lossless SwiGLU/scales exchange boundary
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
@@ -421,7 +425,15 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
-        kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
+        # Flash Attention 2 and Flash Decoding are physically sharded by family
+        # and native KV type: seven complete, deterministic modules.
+        kernels/cuda/attention/CUDAFlashAttentionShard0.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard1.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard2.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard3.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard4.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard5.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard6.cu
         kernels/cuda/attention/CUDAQwenSparseAttention.cu # Flash Next selected-index attention
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
         kernels/cuda/kvcache/CUDAAttentionKeyQ8Kernels.cu # Quadratic-companded attention-key cache codec
@@ -453,24 +465,6 @@ if(HAVE_CUDA)
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
 
-    # Prefill still owns hundreds of independent device-template instantiations
-    # in one TU, so ask nvcc to split its internal optimization work. Decode is
-    # physically sharded above: keeping compiler-internal split work there would
-    # oversubscribe eight already independent Ninja jobs.
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
-        set_source_files_properties(
-            kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu
-            PROPERTIES COMPILE_OPTIONS "--split-compile=8"
-        )
-        # Attention owns one arithmetic body specialized across native formats,
-        # exact/partial widths, tile ownership and direct/context execution.
-        # Parallelize optimization of that complete family instead of making a
-        # single serial compiler worker dominate every local tuning rebuild.
-        set_source_files_properties(
-            kernels/cuda/attention/CUDAFlashAttentionKernels.cu
-            PROPERTIES COMPILE_OPTIONS "--split-compile=0"
-        )
-    endif()
     
     # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
@@ -608,16 +602,17 @@ if(HAVE_CUDA)
         set(CUTLASS_DIR "/opt/cutlass")
     endif()
     
+    # Host adapters use the project's C++23 dialect whether or not CUTLASS is
+    # present. CUDA translation units use the explicit C++20 device dialect
+    # above, the common fully-supported level across the pinned CUDA and ROCm
+    # toolchains.
+    target_compile_features(cuda_backend PUBLIC cxx_std_23)
+
     if(EXISTS "${CUTLASS_DIR}/include")
         message(STATUS "V2: Found CUTLASS at ${CUTLASS_DIR}")
         set(LLAMINAR_HAVE_CUTLASS ON)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
-        
-        # Host adapters use the project's C++23 dialect. CUDA translation units
-        # use the explicit C++20 device dialect above, which is the common
-        # fully-supported level across the pinned CUDA and ROCm toolchains.
-        target_compile_features(cuda_backend PUBLIC cxx_std_23)
         
         message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
     else()
@@ -1272,19 +1267,12 @@ if(USE_ONEDNN)
         file(MAKE_DIRECTORY ${REPO_ROOT}/external)
     endif()
 
-    # If an existing checkout points at the wrong remote (e.g. the old
-    # dbsanfte/oneDNN fork), wipe it so we re-clone the pinned upstream tag.
+    include("${REPO_ROOT}/cmake/OneDNNBuild.cmake")
+    # A failed Git probe is not evidence of a different origin. Neither case
+    # authorizes deleting an existing checkout (and its resumable build work).
     if(EXISTS "${ONEDNN_EXTERNAL_DIR}/.git")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} -C ${ONEDNN_EXTERNAL_DIR} remote get-url origin
-            OUTPUT_VARIABLE _ONEDNN_EXISTING_URL
-            ERROR_QUIET
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        if(NOT _ONEDNN_EXISTING_URL STREQUAL ONEDNN_GIT_URL)
-            message(STATUS "V2: OneDNN at ${ONEDNN_EXTERNAL_DIR} points at '${_ONEDNN_EXISTING_URL}', expected '${ONEDNN_GIT_URL}'; re-cloning")
-            file(REMOVE_RECURSE "${ONEDNN_EXTERNAL_DIR}")
-        endif()
+        llaminar_require_onednn_origin("${GIT_EXECUTABLE}"
+            "${ONEDNN_EXTERNAL_DIR}" "${ONEDNN_GIT_URL}")
     endif()
 
     if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}")
@@ -1329,120 +1317,21 @@ if(USE_ONEDNN)
         file(READ "${ONEDNN_SOURCE_REF_FILE}" ONEDNN_COMMIT_RAW)
         string(STRIP "${ONEDNN_COMMIT_RAW}" ONEDNN_COMMIT)
     else()
-        set(ONEDNN_COMMIT "${ONEDNN_GIT_REF}")
-        message(STATUS "V2: OneDNN source is not a git checkout and has no ref marker; using ${ONEDNN_COMMIT} for cache validation")
+        message(FATAL_ERROR "V2: OneDNN source has neither Git identity nor the required archive ref marker: ${ONEDNN_EXTERNAL_DIR}")
     endif()
 
-    # Keep one installed oneDNN tree per compiled ISA. AVX512 binaries are
-    # intentionally also exercised with AVX2 runtime dispatch by the CPU
-    # NativeQuantised trainer, while AVX2-only release artifacts remain separately
-    # runnable. A shared `build/` directory made configuring either tree erase
-    # and relink the other, invalidating both evidence provenance and Docker's
-    # dual-runtime image build.
-    string(TOLOWER "${LLAMINAR_CPU_ISA_UPPER}" ONEDNN_ISA_SUFFIX)
-    set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build-${ONEDNN_ISA_SUFFIX}")
-    set(ONEDNN_VERSION_FILE "${ONEDNN_BUILD_DIR}/.llaminar-onednn-commit")
-    set(ONEDNN_CACHE_KEY "${ONEDNN_COMMIT};isa=${LLAMINAR_CPU_ISA_UPPER}")
-
-    set(ONEDNN_BUILD_COMMIT "missing")
-    if(EXISTS "${ONEDNN_VERSION_FILE}")
-        file(READ "${ONEDNN_VERSION_FILE}" ONEDNN_BUILD_COMMIT_RAW)
-        string(STRIP "${ONEDNN_BUILD_COMMIT_RAW}" ONEDNN_BUILD_COMMIT)
-    endif()
-
-    if(EXISTS "${ONEDNN_BUILD_DIR}" AND NOT ONEDNN_BUILD_COMMIT STREQUAL ONEDNN_CACHE_KEY)
-        message(STATUS
-            "V2: OneDNN build cache (${ONEDNN_BUILD_COMMIT}) is stale vs ${ONEDNN_CACHE_KEY}, rebuilding...")
-        file(REMOVE_RECURSE "${ONEDNN_BUILD_DIR}")
-    endif()
-
-    if(NOT EXISTS "${ONEDNN_BUILD_DIR}/include/oneapi/dnnl/dnnl.hpp")
-        message(STATUS "V2: Building OneDNN (${ONEDNN_GIT_URL}@${ONEDNN_GIT_REF} @ ${ONEDNN_COMMIT}) from source...")
-
-        # Configure OneDNN
-        execute_process(
-            COMMAND ${CMAKE_COMMAND} -B ${ONEDNN_BUILD_DIR} -S ${ONEDNN_EXTERNAL_DIR}
-                    -DCMAKE_BUILD_TYPE=Release
-                    -DCMAKE_INSTALL_PREFIX=${ONEDNN_BUILD_DIR}
-                    -DDNNL_CPU_RUNTIME=OMP
-                    -DDNNL_BUILD_TESTS=OFF
-                    -DDNNL_BUILD_EXAMPLES=OFF
-                    -DDNNL_EXPERIMENTAL_UKERNEL=ON
-                    "-DCMAKE_CXX_FLAGS=${LLAMINAR_CPU_COMPILE_FLAGS}"
-                    "-DCMAKE_C_FLAGS=${LLAMINAR_CPU_COMPILE_FLAGS}"
-            RESULT_VARIABLE ONEDNN_CONFIG_RESULT
-            OUTPUT_VARIABLE ONEDNN_CONFIG_OUTPUT
-            ERROR_VARIABLE ONEDNN_CONFIG_ERROR
-        )
-
-        if(NOT ONEDNN_CONFIG_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to configure OneDNN: ${ONEDNN_CONFIG_ERROR}")
-        endif()
-
-        # Build OneDNN
-        execute_process(
-            COMMAND ${CMAKE_COMMAND} --build ${ONEDNN_BUILD_DIR} --parallel --target install
-            RESULT_VARIABLE ONEDNN_BUILD_RESULT
-            OUTPUT_VARIABLE ONEDNN_BUILD_OUTPUT
-            ERROR_VARIABLE ONEDNN_BUILD_ERROR
-        )
-
-        if(NOT ONEDNN_BUILD_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to build OneDNN: ${ONEDNN_BUILD_ERROR}")
-        endif()
-
-        file(WRITE "${ONEDNN_VERSION_FILE}" "${ONEDNN_CACHE_KEY}\n")
-
-        message(STATUS "V2: OneDNN built and installed to ${ONEDNN_BUILD_DIR}")
-    else()
-        message(STATUS "V2: OneDNN already built in ${ONEDNN_BUILD_DIR}")
-    endif()
-    
-    # Look for OneDNN in standard locations + our build dir
-    set(ONEDNN_SEARCH_PATHS
-        "${ONEDNN_BUILD_DIR}"           # Our freshly built version (highest priority)
-        "/opt/onednn"
-        "/usr/local"
-        "/usr"
-        "$ENV{HOME}/onednn"
-    )
-    
-    set(ONEDNN_FOUND FALSE)
-    # find_library() stores results in the CMake cache. Clear the previous ISA
-    # tree before searching so an existing build directory cannot retain a
-    # link to the mutable legacy external/onednn/build installation.
-    unset(ONEDNN_LIB CACHE)
-    unset(ONEDNN_LIB)
-    foreach(SEARCH_PATH ${ONEDNN_SEARCH_PATHS})
-        if(EXISTS "${SEARCH_PATH}/include/oneapi/dnnl/dnnl.hpp")
-            set(ONEDNN_ROOT "${SEARCH_PATH}")
-            set(ONEDNN_INCLUDE_DIR "${SEARCH_PATH}/include")
-            set(ONEDNN_FOUND TRUE)
-            
-            # Look for library
-            find_library(ONEDNN_LIB
-                NAMES dnnl
-                PATHS "${SEARCH_PATH}/lib" "${SEARCH_PATH}/lib64"
-                NO_DEFAULT_PATH
-            )
-            
-            if(ONEDNN_LIB)
-                message(STATUS "V2: OneDNN found at ${ONEDNN_ROOT}")
-                message(STATUS "V2: OneDNN include: ${ONEDNN_INCLUDE_DIR}")
-                message(STATUS "V2: OneDNN library: ${ONEDNN_LIB}")
-                message(STATUS "V2: OneDNN provides: INT8 s8s8s32, BF16 bf16bf16f32 matmul")
-                add_compile_definitions(HAVE_ONEDNN)
-                break()
-            endif()
-        endif()
-    endforeach()
-    
-    if(NOT ONEDNN_FOUND)
-        message(WARNING "V2: OneDNN build failed or library not found - INT8/BF16 GEMM will use fallback paths")
-        message(WARNING "V2: INT8: Falls back to AVX512-VNNI or scalar")
-        message(WARNING "V2: BF16: Falls back to FP32 expansion")
-        set(USE_ONEDNN OFF)
-    endif()
+    # One owner separates configured-object reuse from completed installation.
+    # Failed builds retain their authenticated objects; they never publish an
+    # install receipt or silently substitute a system library/another route.
+    llaminar_prepare_onednn("${ONEDNN_EXTERNAL_DIR}" "${ONEDNN_COMMIT}"
+        ONEDNN_BUILD_DIR ONEDNN_LIB)
+    set(ONEDNN_ROOT "${ONEDNN_BUILD_DIR}")
+    set(ONEDNN_INCLUDE_DIR "${ONEDNN_BUILD_DIR}/include")
+    # The owner returns an exact manifested library. A second name-based
+    # search could otherwise select an unlisted lib/ shadow over lib64/.
+    set(ONEDNN_FOUND TRUE)
+    add_compile_definitions(HAVE_ONEDNN)
+    message(STATUS "V2: Authenticated OneDNN library: ${ONEDNN_LIB}")
 endif()
 
 # Find Python3 for code generation scripts
@@ -2567,8 +2456,11 @@ find_library(LLAMINAR_MPI_ORTE_LIBRARY NAMES open-rte
     PATHS ${LLAMINAR_NATIVE_MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
 find_library(LLAMINAR_MPI_OPAL_LIBRARY NAMES open-pal
     PATHS ${LLAMINAR_NATIVE_MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
-add_library(llaminar_mpi_schizo MODULE utils/NativeMPISessionSchizo.cpp)
-target_compile_features(llaminar_mpi_schizo PRIVATE cxx_std_17)
+# ORTE internal atomics belong to the genuine C adapter; C++ retains the
+# single typed owned-environment policy through a narrow C ABI.
+add_library(llaminar_mpi_schizo MODULE
+    utils/NativeMPISessionSchizo.cpp utils/NativeMPISessionSchizoAdapter.c)
+target_compile_features(llaminar_mpi_schizo PRIVATE c_std_11 cxx_std_17)
 target_include_directories(llaminar_mpi_schizo PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${MPI_CXX_INCLUDE_DIRS})
 target_link_libraries(llaminar_mpi_schizo PRIVATE
@@ -2576,7 +2468,8 @@ target_link_libraries(llaminar_mpi_schizo PRIVATE
 set_target_properties(llaminar_mpi_schizo PROPERTIES
     PREFIX "" OUTPUT_NAME mca_schizo_llaminar
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/llaminar_mpi_components")
-add_library(llaminar_mpi_session_owner STATIC utils/MPISessionOwner.cpp)
+add_library(llaminar_mpi_session_owner STATIC
+    utils/MPISessionOwner.cpp utils/NativeCPUPlacement.cpp)
 target_compile_features(llaminar_mpi_session_owner PRIVATE cxx_std_20)
 set_target_properties(llaminar_mpi_session_owner PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(llaminar_mpi_session_owner PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

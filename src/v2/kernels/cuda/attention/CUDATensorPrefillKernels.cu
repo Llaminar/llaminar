@@ -311,7 +311,14 @@ __device__ __forceinline__ void run(const float *__restrict__ queries, const voi
                 for (int j = 0; j < kKeys/16; ++j)
                 {
                     const int row = j * 16 + (lane & 15);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+                    unsigned row_address = static_cast<unsigned>(__cvta_generic_to_shared(v + row * kWidth));
+                    asm volatile("" : "+r"(row_address));
+                    const unsigned address = row_address +
+                        static_cast<unsigned>(llaminar2::cuda::attention_primitives::key_column(row,n*8)) * 2u;
+#else
                     const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(v + row * kWidth + llaminar2::cuda::attention_primitives::key_column(row,n*8)));
+#endif
                     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(b[j][0]),"=r"(b[j][1]) : "r"(address));
                 }
                 unsigned h0=0,h1=0;

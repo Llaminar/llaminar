@@ -40,18 +40,26 @@ def main():
     outer = set(selected)
     with tempfile.TemporaryDirectory(prefix='mpi-process-affinity-') as temporary:
         root = Path(temporary)
-        for name, places, expected, bound in (
-                ('bound', ','.join(f'{{{cpu}}}' for cpu in selected), outer, True),
-                ('narrow', f'{{{selected[0]}}}', {selected[0]}, True),
-                ('unbound', None, outer, False)):
+        # 'shared' replays an external launcher's co-resident ranks with no
+        # authored OpenMP policy: each rank must keep the shared original
+        # partition rather than binding every master to the same first core.
+        for name, places, expected, bound, launcher_ranks in (
+                ('bound', ','.join(f'{{{cpu}}}' for cpu in selected), outer, True, None),
+                ('narrow', f'{{{selected[0]}}}', {selected[0]}, True, None),
+                ('unbound', None, outer, False, None),
+                ('shared', None, outer, False, '2')):
             for route in ('self-entry', 'public-helper'):
                 observation = root / f'{name}-{route}.txt'
                 workers = len(expected)
                 env = os.environ.copy()
-                for key in ('OMP_PLACES', 'OMP_PROC_BIND', 'GOMP_CPU_AFFINITY', 'OMP_THREAD_LIMIT'):
+                for key in ('OMP_PLACES', 'OMP_PROC_BIND', 'GOMP_CPU_AFFINITY', 'OMP_THREAD_LIMIT',
+                            'OMPI_COMM_WORLD_LOCAL_SIZE', 'MPI_LOCALNRANKS'):
                     env.pop(key, None)
-                env.update(OMP_NUM_THREADS=str(workers), OMP_DYNAMIC='false',
-                           OMP_PROC_BIND='close' if bound else 'false')
+                env.update(OMP_NUM_THREADS=str(workers), OMP_DYNAMIC='false')
+                if launcher_ranks:
+                    env['OMPI_COMM_WORLD_LOCAL_SIZE'] = launcher_ranks
+                else:
+                    env['OMP_PROC_BIND'] = 'close' if bound else 'false'
                 if places:
                     env['OMP_PLACES'] = places
                 command = [str(args.probe.resolve()), str(observation), str(workers)]

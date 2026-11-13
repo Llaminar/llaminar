@@ -2,18 +2,21 @@
  * @file MPIBootstrapPhase.h
  * @brief Pre-MPI topology planning, NUMA resolution, and MPI self-launch
  *
- * Extracted from Main.cpp: anonymous namespace helpers and the pre-MPI
- * bootstrap block that detects topology, resolves NUMA nodes, and
- * self-launches via mpirun if not already in an MPI context.
+ * Native OpenMP places are admitted before MPI and model state exists. Their
+ * order belongs to the runtime, so replacement workers retain the same physical
+ * ownership after team resizing. Bootstrap preserves each rank's own partition
+ * and original argv rather than projecting launcher-local CPU ids onto peers.
  */
 
 #pragma once
 
 #include "config/OrchestrationConfig.h"
 #include "utils/MPIBootstrap.h"
+#include "utils/NativeCPUPlacement.h"
 #include <set>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
@@ -99,6 +102,38 @@ namespace llaminar2
         static int detectCpuNumaNode(int cpu);
         /** @return First sibling representing the physical core containing a CPU. */
         static int physicalRepresentativeForCpu(int cpu);
+        /**
+         * @brief Relative compute capacity of one CPU for worker ordering.
+         * @param cpu Logical CPU id.
+         * @param sysfs_root Linux CPU sysfs root (a device-free fixture seam).
+         * @return Kernel `cpu_capacity` (ARM big.LITTLE/hybrid), otherwise
+         *         `cpufreq/cpuinfo_max_freq`, otherwise zero (unknown/uniform).
+         */
+        static long cpuCapacity(int cpu, const std::string &sysfs_root = "/sys/devices/system/cpu");
+        /**
+         * @brief Order physical-core representatives fastest first.
+         * @param cpus Allowed representative CPUs in any order.
+         * @param sysfs_root Linux CPU sysfs root (a device-free fixture seam).
+         * @return Descending capacity, CPU id ascending within one capacity.
+         *
+         * Heterogeneous hosts (GB10: X925 + A725) place OpenMP worker 0, which
+         * also runs serial sections, and the low worker ids on the fast cores.
+         * Homogeneous hosts keep plain CPU-id order.
+         */
+        static std::vector<int> capacityOrderedCpus(
+            std::vector<int> cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
+        /**
+         * @brief Plan OpenMP worker places: one physical core each, fastest first.
+         * @param allowed_cpus The rank's admitted CPU mask; never widened.
+         * @param sysfs_root Linux CPU sysfs root (a device-free fixture seam).
+         * @return One place per physical core with an allowed CPU, holding that
+         *         core's allowed siblings. Places follow capacityOrderedCpus()
+         *         over the cores' first allowed siblings.
+         * @details This is the OMP_PLACES=cores place list in capacity order.
+         * Without published capacities it is libgomp's own CPU-id core order.
+         */
+        static std::vector<std::vector<int>> capacityOrderedCorePlaces(
+            const std::vector<int> &allowed_cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
         /** @return Whether current thread affinity meets the requested socket/core policy. */
         static bool verifyStartupThreadAffinity(int required_numa,
                                                 bool require_physical_only,
@@ -120,9 +155,11 @@ namespace llaminar2
         /**
          * @brief Size a hostfile-launched rank's worker team from actual affinity.
          * @param config User thread override, otherwise discovered physical cores.
-         * @throws std::runtime_error when physical rank affinity is unavailable.
+         * @param places Native place admission for this exact process/thread.
+         * @throws std::runtime_error when physical rank affinity or native admission is invalid.
          */
-        static void configureClusterRankThreads(const OrchestrationConfig &config);
+        static void configureClusterRankThreads(const OrchestrationConfig &config,
+                                               const NativeOpenMPCorePlaces &places);
 
         /**
          * @brief Apply an explicit thread request before canonical inventory publication.
@@ -137,6 +174,15 @@ namespace llaminar2
 
         /** @brief Print the already initialized device inventory for diagnostics. */
         static void listDevices();
+
+    private:
+        /**
+         * @brief Restore the admission caller to the first already-native core place.
+         * @param places This caller's sealed native runtime geometry.
+         * @throws std::runtime_error for foreign/stale admission or failed affinity publication.
+         * @details No worker pool is manually rebound: native OpenMP owns its complete lifecycle.
+         */
+        static void bindNativeCoreMaster(const NativeOpenMPCorePlaces &places);
     };
 
 } // namespace llaminar2

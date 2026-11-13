@@ -20,10 +20,22 @@
 #pragma once
 #include "CPUNativeQuantisedGemv.h"
 #include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "CPUNativeNEONResidualCorrection.h"
+#endif
 #include <span>
 #include <type_traits>
+#include <atomic>
 #include "kernels/cpu/qwen4exp/CPUQwen4ExpSIMD.h"
 namespace llaminar2::cpu::native_quantised {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+/** @brief Native signed-byte instruction identity, resolved before publication. */
+using CPUQ8ResidualISA = multi_scale::NEONByteDot;
+#else
+/** @brief Existing x86 choice: true is AVX512, false is AVX2. */
+using CPUQ8ResidualISA = bool;
+#endif
 /** @brief Form one quantized residual against the first block's stored scale.
  * @param input Thirty-two original FP32 values.
  * @param primary Already published unchanged native primary Q8 block.
@@ -32,6 +44,9 @@ namespace llaminar2::cpu::native_quantised {
  */
 inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1Block&residual,
  CPUProjectionNumericalPolicy policy) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+ quantizeResidualBlockNEON(input,primary,residual,policy);
+#else
  alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeQuantisedFP16ScaleToFP32(primary.d));
  for(int i=0;i<32;i+=8) {
   const auto bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(primary.qs+i));
@@ -39,6 +54,7 @@ inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1
   _mm256_store_ps(values+i,_mm256_sub_ps(_mm256_loadu_ps(input+i),decoded));
  }
  quantizeActivationBlock(values,residual,32,policy);
+#endif
 }
 /** @brief Validate and borrow actual immutable native source storage.
  * @param packed Exact prepared engine export; no repack or duplicate source exists.
@@ -52,12 +68,17 @@ inline void validateCPUQ8ResidualSource(const CPUNativeQuantisedPackedWeights&pa
  const auto &format=requireQ8ResidualSourceFormat(
   NativeQuantisedSourceIdentity{packed.codebook_id,packed.is_superblock,true},m,n,k);
  if(packed.N!=n||packed.K!=k||packed.blocks_per_row!=k/32||!packed.hasInterleavedData()||
-    packed.is_asymmetric!=format.is_asymmetric||packed.payload_bytes!=format.payload_bytes||
+    packed.is_asymmetric!=format.is_asymmetric||
+    (packed.payload_bytes!=format.payload_bytes&&!(packed.usesExpandedInt8()&&packed.payload_bytes==32))||
     packed.encoding!=preparedEncodingForSource(format)||
-    packed.data_stride!=preparedDataStride(packed.encoding)||
-    packed.interleaved_block_stride!=preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric)||
+    std::int64_t(packed.data_stride)!=preparedDataStride(packed.encoding)||
+    std::int64_t(packed.interleaved_block_stride)!=preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric)||
     packed.numerical_policy!=CPUProjectionNumericalPolicy::BackendNative)
   throw std::invalid_argument("Two-term CPU quantized projection requires its exact canonical prepared source tuple and geometry");
+#if defined(__aarch64__) && defined(__ARM_NEON)
+ // Reject unsealed/deferred storage and unimplemented tuples before any team.
+ CPUNativeNEONProjectionTile<1>::requireExecutable(packed.readView());
+#endif
 }
 /**
  * @brief Evaluate two real rows as four independent original-source dot chains.
@@ -81,8 +102,24 @@ inline void validateCPUQ8ResidualSource(const CPUNativeQuantisedPackedWeights&pa
 inline void cpuNativeResidualChunk(const CPUNativeQuantisedPackedWeights &packed,
  const Q8_1Block *primary0,const Q8_1Block *residual0,
  const Q8_1Block *primary1,const Q8_1Block *residual1,
- float *destination0,float *destination1,int chunk,int valid,bool avx512)
+ float *destination0,float *destination1,int chunk,int valid,CPUQ8ResidualISA avx512)
 {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+ if(avx512==multi_scale::NEONByteDot::I8MM)
+  return nativeNEONResidualChunk<multi_scale::NEONByteDot::I8MM>(packed.readView(),primary0,residual0,primary1,residual1,
+    destination0,destination1,chunk,valid);
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+ if(avx512==multi_scale::NEONByteDot::DotProd)
+  return nativeNEONResidualChunk<multi_scale::NEONByteDot::DotProd>(packed.readView(),primary0,residual0,primary1,residual1,
+    destination0,destination1,chunk,valid);
+#endif
+ if(avx512!=multi_scale::NEONByteDot::ASIMD)
+  throw std::invalid_argument("Native ARM residual projection instruction was not compiled");
+ return nativeNEONResidualChunk<multi_scale::NEONByteDot::ASIMD>(packed.readView(),primary0,residual0,primary1,residual1,
+   destination0,destination1,chunk,valid);
+#else
  alignas(64) float term0[64],term1[64],term2[64],term3[64];
  const int blocks=packed.blocks_per_row;
  const bool nibble=packed.usesNibbleLUT();
@@ -119,6 +156,7 @@ inline void cpuNativeResidualChunk(const CPUNativeQuantisedPackedWeights &packed
  }
  std::copy_n(term0,valid,destination0);
  if(primary1)std::copy_n(term2,valid,destination1);
+#endif
 }
 /**
  * @brief Run one shared compiled projection workshare after either publication policy.
@@ -143,13 +181,19 @@ __attribute__((noipa))
 __attribute__((noinline))
 #endif
 inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeights&packed,
- float*output,int live,std::span<const Q8_1Block>primary,std::span<const Q8_1Block>residual,bool avx512) {
+ float*output,int live,std::span<const Q8_1Block>primary,std::span<const Q8_1Block>residual,CPUQ8ResidualISA avx512) {
  const int n=packed.N,bpr=packed.blocks_per_row;
  const std::int64_t tiles=(static_cast<std::int64_t>(live)+1)/2,chunks=(static_cast<std::int64_t>(n)+63)/64;
 #pragma omp for schedule(static)
   for(std::int64_t task=0;task<tiles*chunks;++task) {
    const auto row=task%tiles*2,chunk=task/tiles;
    const int valid=std::min<std::int64_t>(64,n-chunk*64);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+   const bool second=row+1<live;
+   cpuNativeResidualChunk(packed,primary.data()+row*bpr,residual.data()+row*bpr,
+     second?primary.data()+(row+1)*bpr:nullptr,second?residual.data()+(row+1)*bpr:nullptr,
+     output+row*n+chunk*64,second?output+(row+1)*n+chunk*64:nullptr,chunk,valid,avx512);
+#else
    // Preserve the original Q8_0 kernel and its register-store fold exactly.
    // All other canonical encodings retain their own source arithmetic above.
    if(packed.codebook_id!=native_quantised_formats::Q8_0.codebook_id||packed.is_superblock||
@@ -184,6 +228,7 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
         destination,nullptr,chunk,0,bpr,false);
     if(valid<64)std::copy_n(destination,valid,output+current*n+chunk*64);
    }
+#endif
   }
 }
 /** @brief Already-activated source retains the original publisher. */
@@ -215,21 +260,26 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
  const std::array reads{
   Q8ResidualStorageSpan{input,static_cast<std::size_t>(physical)*k*sizeof(float),alignof(float)},
   Q8ResidualStorageSpan{packed.interleavedBase(),interleavedWorkspaceSize(packed),1},
-  Q8ResidualStorageSpan{rows.countOwner(),rows.countOwner()?sizeof(std::int32_t):0,alignof(std::int32_t)}};
+  Q8ResidualStorageSpan{rows.countOwner(),rows.countOwner()?sizeof(std::int32_t):0,alignof(std::int32_t)},
+  Q8ResidualStorageSpan{&packed,sizeof(packed),alignof(CPUNativeQuantisedPackedWeights)}};
  validateQ8ResidualStorage(writes,reads);
  if constexpr(std::is_same_v<Publication,HCDownQ8Publication>) {
   const auto bytes=static_cast<std::size_t>(physical)*k*sizeof(float);
   const std::array activationWrites{Q8ResidualStorageSpan{publication.activated,bytes,alignof(float)}};
   const std::array activationReads{
    Q8ResidualStorageSpan{input,publication.activated==input?0:bytes,alignof(float)},
-   reads[1],reads[2],writes[0],writes[1],writes[2]};
+   reads[1],reads[2],reads[3],writes[0],writes[1],writes[2]};
   if(!publication.activated)throw std::invalid_argument("HC CPU requires its retained activation output");
   validateQ8ResidualStorage(activationWrites,activationReads);
  }
  const int live=rows.activeRowsFor(rows.countOwner()?*rows.countOwner():rows.countCapacity());
  if(live<0)throw std::invalid_argument("Two-term CPU Q8 live count exceeds retained capacity");
- if(live==0)return;
+ if(!llaminar::v2::beginWorkshare(live!=0))return;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+ const auto avx512=neon_execution::instruction(ISAPath::AUTO);
+#else
  const bool avx512=activeISALevel()>=ISALevel::AVX512;
+#endif
  const int publicationWidth=[] {
   if constexpr(std::is_same_v<Publication,HCDownQ8Publication>)return qwen4exp::cpu_detail::vectorWidth();
   else return 1;
@@ -242,6 +292,9 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
  // activated publication keeps one task per row and its original block loop.
  constexpr bool hcPublication=std::is_same_v<Publication,HCDownQ8Publication>;
  const std::int64_t publicationTilesPerRow=hcPublication?(static_cast<std::int64_t>(bpr)+7)/8:1;
+ // Only completion status is shared here. Validation reads finish before
+ // the last team edge; no caller rescans a bank already released for reuse.
+ std::atomic<bool> failed{false};
  const auto finitePublication=[&]() {
   for(std::size_t block=0;block<static_cast<std::size_t>(live)*bpr;++block)
    if((primary[block].d&0x7c00u)==0x7c00u)return false;
@@ -277,12 +330,16 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
   // The first workshare's implicit barrier authenticates every active primary
   // scale. All workers observe the same bank and skip output on any invalid
   // block, without a second flag authority or a throw inside this workshare.
-  if(finitePublication()) {
+  const bool valid=finitePublication();
+  if(valid) {
    cpuQ8ResidualProjectionWorkshare(packed,output,live,primary,residual,avx512);
+  } else {
+   failed.store(true,std::memory_order_relaxed);
+   (void)llaminar::v2::beginWorkshare(false);
   }
  };
  OMP_WORKSHARE_REGION(work);
- if(!finitePublication())throw std::invalid_argument("Two-term CPU Q8 activation is nonfinite or its native primary half scale overflows");
+ if(failed.load(std::memory_order_relaxed))throw std::invalid_argument("Two-term CPU Q8 activation is nonfinite or its native primary half scale overflows");
 }
 /** @brief Preserve the original already-activated CPU entrypoint and source program.
  * @param packed Exact retained prepared source.

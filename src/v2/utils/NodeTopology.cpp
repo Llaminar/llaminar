@@ -17,7 +17,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstring>
+#include <iterator>
 #include <set>
 #include <thread>
 
@@ -138,6 +140,12 @@ namespace llaminar2
             LOG_INFO("[NodeTopology] Fallback: 1 socket, " << num_cpus << " CPUs");
             return topology;
         }
+
+        // Firmware package numbering need not be dense or zero-based (GB10
+        // reports package 36). Every consumer indexes sockets in
+        // [0, numSockets()), so map the sorted distinct raw packages to dense
+        // indices once and retain the raw id for diagnostics.
+        densifySocketIds(topology.numa_nodes_);
 
         // Determine number of sockets from detected nodes
         topology.num_sockets_ = detectNumSockets(topology.numa_nodes_);
@@ -344,24 +352,31 @@ namespace llaminar2
 
     std::vector<NUMANode> NodeTopology::detectNUMANodes()
     {
+        return detectNUMANodesAt(SYSFS_NODE_PATH);
+    }
+
+    std::vector<NUMANode> NodeTopology::detectNUMANodesAt(const std::string &node_root)
+    {
         std::vector<NUMANode> nodes;
 
         // Check if sysfs node path exists
-        if (!std::filesystem::exists(SYSFS_NODE_PATH))
+        if (!std::filesystem::exists(node_root))
         {
-            LOG_DEBUG("[NodeTopology] " << SYSFS_NODE_PATH << " not found");
+            LOG_DEBUG("[NodeTopology] " << node_root << " not found");
             return nodes;
         }
 
         // Iterate over node directories
         try
         {
-            for (const auto &entry : std::filesystem::directory_iterator(SYSFS_NODE_PATH))
+            for (const auto &entry : std::filesystem::directory_iterator(node_root))
             {
                 const std::string &name = entry.path().filename().string();
 
                 // Look for directories named "node0", "node1", etc.
-                if (name.substr(0, 4) != "node")
+                if (name.size() <= 4 || name.substr(0, 4) != "node" ||
+                    !std::all_of(name.begin() + 4, name.end(),
+                                 [](unsigned char ch) { return std::isdigit(ch); }))
                 {
                     continue;
                 }
@@ -403,7 +418,7 @@ namespace llaminar2
         }
         catch (const std::filesystem::filesystem_error &e)
         {
-            LOG_WARN("[NodeTopology] Error iterating " << SYSFS_NODE_PATH << ": " << e.what());
+            LOG_WARN("[NodeTopology] Error iterating " << node_root << ": " << e.what());
         }
 
         // Sort by node_id
@@ -448,6 +463,19 @@ namespace llaminar2
                                             << (is_amd ? "AMD Infinity Fabric" : "Intel UPI") << " heuristic)");
 
         return links;
+    }
+
+    void NodeTopology::densifySocketIds(std::vector<NUMANode> &nodes)
+    {
+        std::set<int> packages;
+        for (const auto &node : nodes)
+            packages.insert(node.socket_id);
+        for (auto &node : nodes)
+        {
+            node.physical_package_id = node.socket_id;
+            node.socket_id = static_cast<int>(
+                std::distance(packages.begin(), packages.find(node.socket_id)));
+        }
     }
 
     int NodeTopology::detectNumSockets(const std::vector<NUMANode> &nodes)

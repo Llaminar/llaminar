@@ -61,11 +61,16 @@ namespace llaminar2::test
                 if (!packed) throw std::invalid_argument("Raw fused fixture has an absent prepared member");
                 int member_rows = rows;
                 if constexpr (requires { d.rows; }) if (d.rows > 0) member_rows = d.rows;
+#if defined(__aarch64__)
+                // Native ARM trees are register-resident; the canonical query is exact.
+                maximum = std::max(maximum, nativeQuantisedProjectionPartialEnvelopeFloats(*packed, member_rows));
+#else
                 const int workers = nativeQuantisedInvocationWorkerCount();
                 const auto config = serialTileConfigForPackedMatrix(*packed,
                     cpuNativeQuantisedSerialEquivalentPolicyN(packed->N), packed->K, workers);
                 maximum = std::max(maximum, cpuProjectionPartialEnvelopeFloats(
                     member_rows, packed->N, config.k_tiles, workers, 4));
+#endif
             }
             return maximum;
         }

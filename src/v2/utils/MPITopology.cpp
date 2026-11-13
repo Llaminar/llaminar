@@ -38,7 +38,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kInventoryMagic = 0x4c494e56u; ///< LINV, not an unversioned rank id.
-        constexpr uint32_t kInventoryVersion = 5u; ///< Carries original PCI ancestry for peer-domain grouping.
+        constexpr uint32_t kInventoryVersion = 7u; ///< Carries original PCI ancestry, native CPU projection ABI/ISA and typed accelerator physical-memory backing.
         /** @brief Lend a checked communicator to a standalone topology constructor. */
         MPIContext standaloneTopologyContext(MPI_Comm comm)
         {
@@ -173,6 +173,7 @@ namespace llaminar2
             writeValue(buffer, static_cast<uint32_t>(info.pcie_upstream_bdfs.size()));
             for (const auto &bridge : info.pcie_upstream_bdfs) writeString(buffer, bridge);
             writeValue(buffer, static_cast<uint64_t>(info.last_level_cache_bytes));
+            writeValue(buffer, static_cast<uint8_t>(info.memory_backing));
         }
 
         // Deserialize a single DeviceInfo
@@ -209,6 +210,9 @@ namespace llaminar2
             for (uint32_t index = 0; index < bridge_count; ++index)
                 info.pcie_upstream_bdfs.push_back(readString(ptr, end));
             info.last_level_cache_bytes = readValue<uint64_t>(ptr, end);
+            info.memory_backing = physicalMemoryBackingFromWire(readValue<uint8_t>(ptr, end));
+            if (info.memory_backing == PhysicalMemoryBacking::RankHostPool && !info.isGPU())
+                throw std::invalid_argument("Rank host pool backing requires a GPU device record");
             return info;
         }
     } // anonymous namespace
@@ -247,6 +251,9 @@ namespace llaminar2
         writeValue(buffer, inventory.cpu_execution.cache.private_l2_ways);
         writeValue(buffer, inventory.cpu_execution.cache.shared_l3_ways);
         writeValue(buffer, inventory.cpu_execution.maximum_native_row_tile);
+        writeValue(buffer, static_cast<uint32_t>(inventory.cpu_execution.projection_abi));
+        writeValue(buffer, static_cast<uint32_t>(inventory.cpu_execution.compiled_isa));
+        writeValue(buffer, static_cast<uint32_t>(inventory.cpu_execution.active_isa));
 
         // Write GPU count and GPU device infos
         writeValue(buffer, static_cast<int32_t>(inventory.gpus.size()));
@@ -310,6 +317,15 @@ namespace llaminar2
         inventory.cpu_execution.cache.private_l2_ways = readValue<uint32_t>(ptr, end);
         inventory.cpu_execution.cache.shared_l3_ways = readValue<uint32_t>(ptr, end);
         inventory.cpu_execution.maximum_native_row_tile = readValue<uint32_t>(ptr, end);
+        const auto projection_abi = readValue<uint32_t>(ptr, end);
+        const auto compiled_isa = readValue<uint32_t>(ptr, end);
+        const auto active_isa = readValue<uint32_t>(ptr, end);
+        if (projection_abi > uint32_t(CPUProjectionScheduleABI::ARMRegisterK) ||
+            compiled_isa > uint32_t(ISALevel::NEONDotProd) || active_isa > uint32_t(ISALevel::NEONDotProd))
+            throw std::invalid_argument("MPI inventory contains an unknown native CPU projection/ISA identity");
+        inventory.cpu_execution.projection_abi = static_cast<CPUProjectionScheduleABI>(projection_abi);
+        inventory.cpu_execution.compiled_isa = static_cast<ISALevel>(compiled_isa);
+        inventory.cpu_execution.active_isa = static_cast<ISALevel>(active_isa);
 
         // Read GPU count and GPU device infos
         int32_t gpu_count = readValue<int32_t>(ptr, end);

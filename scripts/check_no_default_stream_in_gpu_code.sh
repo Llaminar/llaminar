@@ -345,7 +345,9 @@ for dir in "${scan_dirs[@]}"; do
     # One directory-wide lexical candidate pass avoids spawning all seven
     # parsers for files that cannot contain any original pattern. Candidate
     # files still execute the unchanged parsers and diagnostics below.
-    mapfile -d '' source_files < <(find "$abs_dir" -type f \( -name '*.cu' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' \) -print0)
+    # Physical-shard implementation bodies (*.cu.inc) are CUDA translation-unit
+    # code included by the shard .cu files; they receive every CUDA rule.
+    mapfile -d '' source_files < <(find "$abs_dir" -type f \( -name '*.cu' -o -name '*.cu.inc' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' \) -print0)
     (( ${#source_files[@]} )) || continue
     declare -A candidates=() cuda_candidates=() hip_candidates=()
     declare -A async_candidates=() default_candidates=() null_candidates=() override_candidates=()
@@ -373,8 +375,8 @@ for dir in "${scan_dirs[@]}"; do
 
         file_violations=""
 
-        # Check Pattern 1: CUDA 3-arg launch (only for .cu files)
-        if [[ "$file" == *.cu && -n "${cuda_candidates[$file]:-}" ]]; then
+        # Check Pattern 1: CUDA 3-arg launch (CUDA sources and shard bodies)
+        if [[ ( "$file" == *.cu || "$file" == *.cu.inc ) && -n "${cuda_candidates[$file]:-}" ]]; then
             p1_hits=$(check_cuda_launch_no_stream "$file" || true)
             if [[ -n "$p1_hits" ]]; then
                 file_violations+="$p1_hits"$'\n'

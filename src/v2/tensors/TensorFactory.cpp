@@ -9,6 +9,7 @@
  */
 
 #include "TensorFactory.h"
+#include "../utils/OpenMPUtils.h"
 #include "BlockStructures.h"
 #include "TensorClasses.h"
 #include "../utils/Logger.h"
@@ -481,6 +482,7 @@ namespace llaminar2
         auto *d = static_cast<char *>(dst);
         const auto *s = static_cast<const char *>(src);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             int tid = omp_get_thread_num();

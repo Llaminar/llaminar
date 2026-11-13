@@ -21,6 +21,7 @@
  *   }
  */
 
+#include "utils/HostPageSize.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include <algorithm>
@@ -646,7 +647,7 @@ namespace llaminar2
                 // these threads allocate on the target NUMA node. This is more
                 // reliable than madvise(MADV_WILLNEED), whose async readahead
                 // completes on kernel worker threads that may be on any node.
-                const size_t page_size = 4096;
+                const size_t page_size = hostPageBytes();
                 const size_t num_pages = (file_size + page_size - 1) / page_size;
                 const volatile uint8_t *p = static_cast<const volatile uint8_t *>(base);
 #pragma omp parallel for schedule(static)

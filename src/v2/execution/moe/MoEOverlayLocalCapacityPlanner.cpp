@@ -23,6 +23,7 @@
 #include "planning/PlanningMemoryQuoteReuse.h"
 #include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
+#include "planning/PlanningObservedResource.h"
 #include "MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "MoEOverlayActivationBatchResources.h"
@@ -693,6 +694,13 @@ namespace llaminar2
                     ? debugEnv().gemm.qfn_gdn_qkv_activation
                     : QuantizedActivationOperandPrecision::SingleQ8;
                 config.device_total_bytes = total_bytes;
+                {
+                    const auto observed = withObservedBacking(
+                        {.world_rank = rank_plan.rank, .device = device, .total_bytes = total_bytes,
+                         .admission_available_bytes = available_bytes}, inventory);
+                    config.device_memory_backing = observed.backing;
+                    config.device_pool_available_bytes = observed.pool_available_bytes;
+                }
                 config.device_free_bytes = usableMemory(
                     available_bytes, device, input);
                 if (device.is_gpu())
@@ -1157,8 +1165,7 @@ namespace llaminar2
                 const auto& source=config.native_context_preparation;
                 if(source->memory()->worldRank()!=rank_plan.rank)throw std::logic_error("ExpertOverlay source crossed original rank authority");
                 if(config.device.is_gpu()){
-                    const auto& original=source->originalResource(config.device);
-                    config.device_total_bytes=original.total_bytes;config.device_free_bytes=original.admission_available_bytes;
+                    config.adoptDeviceResource(source->originalResource(config.device));
                 }
                 if(config.associated_host_memory)config.associated_host_memory=source->originalResource(DeviceId::cpu());
             }
@@ -1425,10 +1432,10 @@ namespace llaminar2
                         if (!endpoint.device.is_gpu())
                             throw std::invalid_argument("Native follower terminals require original GPU endpoints");
                         const auto [total, available] = inventoryMemory(inventory, endpoint.device);
-                        const PhysicalMemoryResource gpu{
+                        const PhysicalMemoryResource gpu = withObservedBacking({
                             .world_rank = rank_plan.rank, .device = endpoint.device,
                             .total_bytes = total,
-                            .admission_available_bytes = usableMemory(available, endpoint.device, input)};
+                            .admission_available_bytes = usableMemory(available, endpoint.device, input)}, inventory);
                         for (std::size_t cache = 0; cache < cache_count; ++cache)
                         {
                             if(!terminal_holder_priced){
@@ -1487,13 +1494,13 @@ namespace llaminar2
             {
                 const auto [total_bytes, available_bytes] =
                     inventoryMemory(inventory, device);
-                const PhysicalMemoryResource resource{
+                const PhysicalMemoryResource resource = withObservedBacking({
                     .world_rank = rank_plan.rank,
                     .device = device,
                     .total_bytes = total_bytes,
                     .admission_available_bytes = usableMemory(
                         available_bytes, device, input),
-                };
+                }, inventory);
                 const std::size_t activation_staging_bytes =
                     result.activation_channel_plan.stagingBytesFor(
                         rank_plan.rank, device);

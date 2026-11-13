@@ -8,6 +8,8 @@
  * Actual frontend entrypoints enter this ancestor before runtime initialization.
  * Child creation inherits the existing admitted OpenMP partition, never the
  * initial thread's single place or an independently widened host CPU domain.
+ * Authenticated original main-thread entry also owns native CPU place startup;
+ * late/foreign entry cannot discard live workers through a placement exec.
  * Missing roots retire only through original-FD zero-link proof after consumer exit.
  * No PID-name matching, shared /tmp sweep, model state or accelerator API is used.
  */
@@ -17,6 +19,7 @@
 #include "utils/MPISessionOwner.h"
 #include "utils/MPISessionEnvironment.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
+#include "utils/NativeCPUPlacement.h"
 #include <dlfcn.h>
 #include <array>
 #include <algorithm>
@@ -1218,8 +1221,16 @@ namespace
     std::optional<int> MPISessionOwner::enterProcess(int argc,char **argv)
     {
         try {
-            if(managedProcess())return std::nullopt;
-            if(externalMPI()) { requireNativeRankPublication();return std::nullopt; }
+            NativeCPUPlacement::claimProcessEntry();
+            if(managedProcess()) {
+                NativeCPUPlacement::prepareProcessEntry(argc,argv);
+                return std::nullopt;
+            }
+            if(externalMPI()) {
+                requireNativeRankPublication();
+                NativeCPUPlacement::prepareProcessEntry(argc,argv);
+                return std::nullopt;
+            }
             if(argc<1 || !argv || !argv[0])throw std::invalid_argument("Missing original frontend argv");
             const auto executable=std::filesystem::canonical("/proc/self/exe");
             std::vector<std::string> command;

@@ -1380,3 +1380,271 @@ TEST_F(Test__CPUFlashAttention_TP_GQA, BatchedPrefill_4xTP_Rank1)
     EXPECT_LE(mae, FP32_TOLERANCE) << "batch TP: max abs error " << mae;
     EXPECT_GE(cos, FP32_COSINE_THRESHOLD) << "batch TP: cosine sim " << cos;
 }
+
+/**
+ * @test Invocation admission: banks, head mapping and output disjointness are
+ * proved once before any worker team, on every ISA. A failed proof returns
+ * false without writing; the row programs themselves carry no per-call checks.
+ */
+TEST_F(Test__CPUFlashAttention_TP_GQA, InvocationAdmissionRejectsBeforeAnyWrite)
+{
+    constexpr int seq_len = 1, kv_len = 32, n_heads = 4, n_kv_heads = 2, head_dim = 64;
+    const std::size_t q_size = std::size_t(seq_len) * n_heads * head_dim;
+    const std::size_t kv_size = std::size_t(kv_len) * n_kv_heads * head_dim;
+    std::vector<float> Q(q_size), K(kv_size), V(kv_size + q_size), O(q_size, 123.0f);
+    fill_random(Q.data(), q_size);
+    fill_random(K.data(), kv_size);
+    fill_random(V.data(), V.size());
+    const auto V_before = V;
+
+    // Output inside the value bank.
+    EXPECT_FALSE(kernel_.compute_decode(Q.data(), K.data(), V.data(), V.data() + 64,
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1));
+    EXPECT_EQ(V, V_before);
+    // Output inside the query bank.
+    auto Q_alias = Q;
+    EXPECT_FALSE(kernel_.compute_decode(Q_alias.data(), K.data(), V.data(), Q_alias.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1));
+    EXPECT_EQ(Q_alias, Q);
+    EXPECT_TRUE(kernel_.compute_decode(Q.data(), K.data(), V.data(), O.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1));
+
+    TensorFactory factory(mpi_ctx_);
+    auto Q_tensor = factory.createFP32({std::size_t(seq_len), std::size_t(n_heads * head_dim)}, device_id_);
+    auto K_tensor = factory.createFP32({std::size_t(kv_len), std::size_t(n_kv_heads * head_dim)}, device_id_);
+    auto V_tensor = factory.createFP32({std::size_t(kv_len), std::size_t(n_kv_heads * head_dim)}, device_id_);
+    auto O_tensor = factory.createFP32({std::size_t(seq_len), std::size_t(n_heads * head_dim)}, device_id_);
+    fill_random(Q_tensor->mutable_data(), q_size);
+    fill_random(K_tensor->mutable_data(), kv_size);
+    fill_random(V_tensor->mutable_data(), kv_size);
+    std::fill(O_tensor->mutable_data(), O_tensor->mutable_data() + q_size, 123.0f);
+    const auto call = [&](int heads, int kv_heads, int head_start, int gqa, attention::AttentionKVLogicalView view) {
+        return kernel_.compute_tensor(Q_tensor.get(), K_tensor.get(), V_tensor.get(), O_tensor.get(),
+            1, seq_len, kv_len, heads, kv_heads, head_dim, true, -1, nullptr, nullptr, &mpi_ctx_, -1,
+            head_start, heads, kv_heads, gqa, {}, view);
+    };
+    // A ring capacity beyond the cache tensor's rows.
+    EXPECT_FALSE(call(n_heads, n_kv_heads, 0, 0, {.logical_row_origin = 0, .physical_row_capacity = 2 * kv_len}));
+    // Query heads that map past the declared K/V heads.
+    EXPECT_FALSE(call(n_heads, n_kv_heads, 4, 2, {}));
+    // More query heads than the query tensor holds.
+    EXPECT_FALSE(call(2 * n_heads, n_kv_heads, 0, 0, {}));
+    for (std::size_t i = 0; i < q_size; ++i) ASSERT_EQ(O_tensor->data()[i], 123.0f);
+    EXPECT_TRUE(call(n_heads, n_kv_heads, 0, 0, {}));
+}
+
+/**
+ * @test Whole-invocation admission at the owning public entries: raw batches,
+ * native request batches and Q16 tensor/verifier entries admit their complete
+ * actual banks before any request or slice runs. A rejected invocation leaves
+ * every output and input byte unchanged, including earlier requests' outputs.
+ */
+TEST_F(Test__CPUFlashAttention_TP_GQA, WholeInvocationAdmissionPrecedesEveryWrite)
+{
+    constexpr int seq_len = 2, kv_len = 8, n_heads = 2, n_kv_heads = 1, head_dim = 64;
+    const std::size_t q_size = std::size_t(seq_len) * n_heads * head_dim;
+    const std::size_t kv_size = std::size_t(kv_len) * n_kv_heads * head_dim;
+
+    // Raw batch: the output overlaps only the second slice's K rows.
+    {
+        constexpr int batch = 2;
+        const std::size_t batch_q = std::size_t(batch) * seq_len * n_heads * head_dim;
+        const std::size_t batch_kv = std::size_t(batch) * seq_len * n_kv_heads * head_dim;
+        std::vector<float> Q(batch_q), K(batch_kv + batch_q), V(batch_kv);
+        fill_random(Q.data(), Q.size());
+        fill_random(K.data(), K.size());
+        fill_random(V.data(), V.size());
+        const auto K_before = K;
+        float *aliased = K.data() + batch_kv / 2 + 16;
+        EXPECT_FALSE(kernel_.compute_batch(Q.data(), K.data(), V.data(), aliased, batch, seq_len, n_heads,
+            n_kv_heads, head_dim, true));
+        EXPECT_EQ(K, K_before);
+        std::vector<float> O(batch_q, 123.0f);
+        EXPECT_TRUE(kernel_.compute_batch(Q.data(), K.data(), V.data(), O.data(), batch, seq_len, n_heads,
+            n_kv_heads, head_dim, true));
+    }
+
+    TensorFactory factory(mpi_ctx_);
+    const auto fp32 = [&](std::size_t rows, std::size_t columns, float fill) {
+        auto tensor = factory.createFP32({rows, columns}, device_id_);
+        std::fill(tensor->mutable_data(), tensor->mutable_data() + rows * columns, fill);
+        return tensor;
+    };
+    const auto unchanged = [](const ITensor *tensor, float expected) {
+        const auto *values = dynamic_cast<const TensorBase *>(tensor)->data();
+        for (std::size_t i = 0; i < tensor->numel(); ++i)
+            if (values[i] != expected) return false;
+        return true;
+    };
+
+    // Native FP32 request batch: request 1's K allocation is short. Request 0
+    // is valid, so a per-request check would already have written its output.
+    {
+        constexpr int requests = 2;
+        auto Q = fp32(std::size_t(requests) * seq_len, std::size_t(n_heads) * head_dim, 0.25f);
+        auto O = fp32(std::size_t(requests) * seq_len, std::size_t(n_heads) * head_dim, 123.0f);
+        auto K0 = fp32(kv_len, std::size_t(n_kv_heads) * head_dim, 0.5f), V0 = fp32(kv_len, head_dim, 0.5f);
+        auto K1 = fp32(kv_len - 1, std::size_t(n_kv_heads) * head_dim, 0.5f), V1 = fp32(kv_len, head_dim, 0.5f);
+        const ITensor *keys[] = {K0.get(), K1.get()}, *values[] = {V0.get(), V1.get()};
+        const int kv_lens[] = {kv_len, kv_len};
+        const attention::AttentionKVLogicalView views[] = {{}, {}};
+        EXPECT_FALSE(kernel_.compute_request_batch_decode_equivalent(Q.get(), keys, values, kv_lens, O.get(),
+            requests, seq_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, views));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+
+        // The whole output bank aliases request 1's V allocation.
+        auto shared = fp32(std::size_t(requests) * seq_len, std::size_t(n_heads) * head_dim, 123.0f);
+        auto K_full = fp32(kv_len, std::size_t(n_kv_heads) * head_dim, 0.5f);
+        const ITensor *alias_keys[] = {K0.get(), K_full.get()}, *alias_values[] = {V0.get(), shared.get()};
+        EXPECT_FALSE(kernel_.compute_request_batch_decode_equivalent(Q.get(), alias_keys, alias_values, kv_lens,
+            shared.get(), requests, seq_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {},
+            views));
+        EXPECT_TRUE(unchanged(shared.get(), 123.0f));
+
+        // Positive control: the same batch with complete, disjoint banks runs.
+        const ITensor *good_keys[] = {K0.get(), K_full.get()}, *good_values[] = {V0.get(), V1.get()};
+        EXPECT_TRUE(kernel_.compute_request_batch_decode_equivalent(Q.get(), good_keys, good_values, kv_lens,
+            O.get(), requests, seq_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, views));
+    }
+
+    // Q16 entries: undersized FP32 query/output allocations are rejected,
+    // although the declared geometry alone would have admitted them.
+    {
+        const auto q16 = [&] {
+            auto tensor = std::make_unique<Q16_1Tensor>(
+                std::vector<std::size_t>{std::size_t(kv_len), std::size_t(n_kv_heads) * head_dim},
+                Q16BlockSize::BLOCK_64);
+            std::vector<float> source(kv_size, 0.125f);
+            EXPECT_TRUE(tensor->copyFrom_fp32_fixed_scale(source.data(), 1.0f / 2048.0f, head_dim));
+            return tensor;
+        };
+        auto K = q16(), V = q16();
+        auto Q = fp32(seq_len, std::size_t(n_heads) * head_dim, 0.25f);
+        auto short_O = fp32(seq_len - 1, std::size_t(n_heads) * head_dim, 123.0f);
+        auto short_Q = fp32(seq_len - 1, std::size_t(n_heads) * head_dim, 0.25f);
+        auto O = fp32(seq_len, std::size_t(n_heads) * head_dim, 123.0f);
+        const auto tensor_call = [&](const ITensor *query, ITensor *out) {
+            return kernel_.compute_tensor(query, K.get(), V.get(), out, 1, seq_len, kv_len, n_heads, n_kv_heads,
+                head_dim, true, -1, nullptr, nullptr, &mpi_ctx_, -1, 0, n_heads, n_kv_heads, 0, {}, {});
+        };
+        EXPECT_FALSE(tensor_call(Q.get(), short_O.get()));
+        EXPECT_TRUE(unchanged(short_O.get(), 123.0f));
+        EXPECT_FALSE(tensor_call(short_Q.get(), O.get()));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        const auto verifier_call = [&](const ITensor *query, ITensor *out) {
+            return kernel_.compute_verifier_rows_decode_equivalent(query, K.get(), V.get(), out, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, {});
+        };
+        EXPECT_FALSE(verifier_call(Q.get(), short_O.get()));
+        EXPECT_TRUE(unchanged(short_O.get(), 123.0f));
+        EXPECT_FALSE(verifier_call(short_Q.get(), O.get()));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        // Positive controls with complete banks.
+        EXPECT_TRUE(tensor_call(Q.get(), O.get()));
+        EXPECT_TRUE(verifier_call(Q.get(), O.get()));
+    }
+}
+
+/**
+ * @test Q16 format/layout admission is complete and precedes every write: a
+ * request batch rejects a short or mismatched later request before request 0
+ * publishes; a row that cannot hold the addressed head blocks and a history
+ * longer than the tensor are rejected at every Q16 entry; and the verifier
+ * rejects an int-overflowing heads x rows before forming it.
+ */
+TEST_F(Test__CPUFlashAttention_TP_GQA, Q16LayoutAdmissionPrecedesEveryWrite)
+{
+    constexpr int query_rows = 2, kv_len = 8, n_heads = 2, n_kv_heads = 1, head_dim = 64;
+    TensorFactory factory(mpi_ctx_);
+    const auto fp32 = [&](std::size_t rows, std::size_t columns, float fill) {
+        auto tensor = factory.createFP32({rows, columns}, device_id_);
+        std::fill(tensor->mutable_data(), tensor->mutable_data() + rows * columns, fill);
+        return tensor;
+    };
+    const auto unchanged = [](const ITensor *tensor, float expected) {
+        const auto *values = dynamic_cast<const TensorBase *>(tensor)->data();
+        for (std::size_t i = 0; i < tensor->numel(); ++i)
+            if (values[i] != expected) return false;
+        return true;
+    };
+    const auto q16 = [&](std::size_t rows, std::size_t columns, Q16BlockSize block) {
+        auto tensor = std::make_unique<Q16_1Tensor>(std::vector<std::size_t>{rows, columns}, block);
+        std::vector<float> source(rows * columns, 0.125f);
+        EXPECT_TRUE(tensor->copyFrom_fp32_fixed_scale(source.data(), 1.0f / 2048.0f, int(columns)));
+        return tensor;
+    };
+    const std::size_t width = std::size_t(n_heads) * head_dim;
+
+    // (A) Request batch: request 0 is valid; request 1 is short, then mismatched.
+    {
+        constexpr int requests = 2;
+        auto Q = fp32(std::size_t(requests) * query_rows, width, 0.25f);
+        auto O = fp32(std::size_t(requests) * query_rows, width, 123.0f);
+        auto K0 = q16(kv_len, head_dim, Q16BlockSize::BLOCK_64), V0 = q16(kv_len, head_dim, Q16BlockSize::BLOCK_64);
+        auto K_short = q16(kv_len - 1, head_dim, Q16BlockSize::BLOCK_64);
+        auto V_short = q16(kv_len - 1, head_dim, Q16BlockSize::BLOCK_64);
+        auto V_other_block = q16(kv_len, head_dim, Q16BlockSize::BLOCK_32);
+        const int kv_lens[] = {kv_len, kv_len};
+        const attention::AttentionKVLogicalView views[] = {{}, {}};
+        const auto batch = [&](const ITensor *k1, const ITensor *v1) {
+            const ITensor *keys[] = {K0.get(), k1}, *values[] = {V0.get(), v1};
+            return kernel_.compute_request_batch_decode_equivalent(Q.get(), keys, values, kv_lens, O.get(),
+                requests, query_rows, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, views);
+        };
+        EXPECT_FALSE(batch(K_short.get(), V_short.get()));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        auto K1 = q16(kv_len, head_dim, Q16BlockSize::BLOCK_64);
+        EXPECT_FALSE(batch(K1.get(), V_other_block.get()));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        auto V1 = q16(kv_len, head_dim, Q16BlockSize::BLOCK_64);
+        EXPECT_TRUE(batch(K1.get(), V1.get()));
+    }
+
+    // (B) A one-block row cannot hold a 128-wide head (two blocks), and a
+    // history longer than the tensor's rows is rejected, at every Q16 entry.
+    {
+        constexpr int wide = 128;
+        auto K = q16(kv_len, head_dim, Q16BlockSize::BLOCK_64), V = q16(kv_len, head_dim, Q16BlockSize::BLOCK_64);
+        auto Q = fp32(query_rows, std::size_t(n_heads) * wide, 0.25f);
+        auto O = fp32(query_rows, std::size_t(n_heads) * wide, 123.0f);
+        EXPECT_FALSE(kernel_.compute_tensor(Q.get(), K.get(), V.get(), O.get(), 1, query_rows, kv_len, n_heads,
+            n_kv_heads, wide, true, -1, nullptr, nullptr, &mpi_ctx_, -1, 0, n_heads, n_kv_heads, 0, {}, {}));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        EXPECT_FALSE(kernel_.compute_verifier_rows_decode_equivalent(Q.get(), K.get(), V.get(), O.get(),
+            query_rows, kv_len, n_heads, n_kv_heads, wide, true, -1, &mpi_ctx_, -1, 0, 0, {}, {}));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+
+        auto Q64 = fp32(query_rows, width, 0.25f);
+        auto O64 = fp32(query_rows, width, 123.0f);
+        EXPECT_FALSE(kernel_.compute_tensor(Q64.get(), K.get(), V.get(), O64.get(), 1, query_rows, kv_len + 1,
+            n_heads, n_kv_heads, head_dim, true, -1, nullptr, nullptr, &mpi_ctx_, -1, 0, n_heads, n_kv_heads, 0, {},
+            {}));
+        EXPECT_FALSE(kernel_.compute_verifier_rows_decode_equivalent(Q64.get(), K.get(), V.get(), O64.get(),
+            query_rows, kv_len + 1, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, {}));
+        EXPECT_TRUE(unchanged(O64.get(), 123.0f));
+        EXPECT_TRUE(kernel_.compute_verifier_rows_decode_equivalent(Q64.get(), K.get(), V.get(), O64.get(),
+            query_rows, kv_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, {}));
+    }
+
+    // A row width whose byte stride wraps size_t: B blocks of 136 bytes is
+    // 2^64 + 16. The constructor's checked extent rejects that geometry, so no
+    // tensor can present a wrapped row stride to the admission (which also
+    // refuses to form one); a [1, 64 B] Q16 tensor must not exist.
+    {
+        constexpr std::size_t B = ((std::size_t(1) << 61) + 2) / 17;
+        static_assert(B * 136 == 16, "the stride would wrap to 16 bytes");
+        EXPECT_THROW((void)std::make_unique<Q16_1Tensor>(std::vector<std::size_t>{1, 64 * B}, Q16BlockSize::BLOCK_64),
+            std::overflow_error);
+    }
+
+    // R2-3 ordering: heads x rows beyond int is rejected before it is formed
+    // (the head-major query predicate used to compute it first).
+    {
+        auto K = q16(3, head_dim, Q16BlockSize::BLOCK_64), V = q16(3, head_dim, Q16BlockSize::BLOCK_64);
+        auto Q = q16(2, head_dim, Q16BlockSize::BLOCK_64);
+        auto O = fp32(2, head_dim, 123.0f);
+        EXPECT_FALSE(kernel_.compute_verifier_rows_decode_equivalent(Q.get(), K.get(), V.get(), O.get(), 2, 3,
+            std::numeric_limits<int>::max(), 1, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, {}));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+    }
+}

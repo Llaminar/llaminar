@@ -26,6 +26,7 @@
 #include "transfer/TransferEngine.h"
 #include "utils/EmbeddingVerifierFormats.h"
 #include "utils/PooledNgramReplayTrace.h"
+#include <vector>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <array>
@@ -56,9 +57,21 @@ public:
 private:PreparedGPUWorkerThread thread_;
 };
 /** @test Serialized payload is shared while each actual graph/event program retains its own named commitment. */
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 TEST(PooledProviderOriginalProgramPlan, PayloadEnvelopeAndAdditiveNativeProgramsUseOneOriginalAuthority){
     using Source=NativeContextPreparationReplayAccess;using Fixture=PreparedNativeLookupFixtureReplayAccess;
-    for(const auto device:{DeviceId::cuda(47),DeviceId::rocm(47)}){
+    // Model retirement needs the compiled backend family, so a single-vendor
+    // build exercises only its own device.
+    std::vector<DeviceId> compiled;
+#if defined(HAVE_CUDA)
+    compiled.push_back(DeviceId::cuda(47));
+#endif
+#if defined(HAVE_ROCM)
+    compiled.push_back(DeviceId::rocm(47));
+#endif
+    for(const auto device:compiled){
         testing::installHardwareFreeGPUContextFactories();
         Source::seed(device,[device](std::shared_ptr<PreparedGPUWorkerStack> root){return Source::construct<ProgramPlanWorker>(std::move(root),device.gpu_ordinal());});
         const std::array observations{PhysicalMemoryResource{0,DeviceId::cpu(),16ULL<<30,16ULL<<30},PhysicalMemoryResource{0,device,1u<<30,1u<<30}};
@@ -96,4 +109,5 @@ TEST(PooledProviderOriginalProgramPlan, PayloadEnvelopeAndAdditiveNativePrograms
         Fixture::retire(*session);
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 }}

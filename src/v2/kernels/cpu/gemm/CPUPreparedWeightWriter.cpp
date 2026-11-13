@@ -336,7 +336,11 @@ CPUPreparedWeightResult CPUPreparedWeightWriter::finish() {
   throw std::logic_error("CPU final weights cannot publish incomplete, failed or already-finished coverage");
  }
  CPUPreparedWeightResult result;
- if(impl_->native_packed)result.kernel=std::make_shared<cpu::native_quantised::CPUNativeQuantisedGemmKernel>(std::move(impl_->packed),impl_->spec.numerical_policy);
+ if(impl_->native_packed) {
+  // Complete coverage is the last write: seal before the engine is reachable.
+  try { impl_->packed.sealPublication(); } catch(...) { impl_->failed=true; throw; }
+  result.kernel=std::make_shared<cpu::native_quantised::CPUNativeQuantisedGemmKernel>(std::move(impl_->packed),impl_->spec.numerical_policy);
+ }
  else {
   result.final_tensor=impl_->final;
   if(impl_->spec.consumer==CPUWeightConsumer::PreparedGemm)

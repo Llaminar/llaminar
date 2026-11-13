@@ -6,7 +6,8 @@ This CPU test cannot load a GPU runtime, create a completion authority or select
 inference work. Actual compiled device entry resources remain a separate proof.
 Deliberately fatal children alone are non-dumpable so external crash reporting
 cannot dominate this bounded replay. They still execute the literal native trap
-and must terminate by SIGILL; no signal is intercepted or replaced.
+and must terminate by the host ISA's trap signal (SIGILL from ud2 on x86-64,
+SIGTRAP from brk on AArch64); no signal is intercepted or replaced.
 """
 from pathlib import Path
 import os,json,shlex,subprocess,resource,hashlib
@@ -27,6 +28,12 @@ prefix=r'''
 #include <sys/prctl.h>
 #include <csignal>
 #include <unistd.h>
+// __builtin_trap() raises the host ISA's trap: ud2/SIGILL on x86-64, brk/SIGTRAP on AArch64.
+#if defined(__aarch64__)
+constexpr int kNativeTrapSignal=SIGTRAP;
+#else
+constexpr int kNativeTrapSignal=SIGILL;
+#endif
 struct ObservationThread {unsigned x=0;};
 ObservationThread observationThread,observationBlock;
 #define threadIdx observationThread
@@ -76,7 +83,7 @@ int main(){
     // These deliberately fatal provenance checks need the original trap, not
     // a userspace crash reporter. RLIMIT_CORE=0 alone does not suppress a
     // piped core handler. Disable dumping only in this diagnostic child;
-    // failure exits normally so it cannot masquerade as the expected SIGILL.
+    // failure exits normally so it cannot masquerade as the expected trap signal.
     if(prctl(PR_SET_DUMPABLE,0L,0L,0L,0L)!=0 || prctl(PR_GET_DUMPABLE,0L,0L,0L,0L)!=0){
      std::fprintf(stderr,"Cannot disable native progress replay child dumps\n");_exit(86);
     }
@@ -86,7 +93,7 @@ int main(){
       case 4:peer=-1;break;case 5:peer=8;break;case 6:peer=0;break;}
     ncclDevKernel_P2pProgressObservation(input,flag,peer,reinterpret_cast<ncclLlaminarP2pProgress*>(output.data()));_exit(0);
    }
-   int status=0;check(waitpid(child,&status,0)==child);check(WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
+   int status=0;check(waitpid(child,&status,0)==child);check(WIFSIGNALED(status) && WTERMSIG(status)==kNativeTrapSignal);
   }
  }
  printf("PASS original native connector observer:20 reset/replays,all actual channels/connections,immutable steps,140 fatal provenance cases\n");

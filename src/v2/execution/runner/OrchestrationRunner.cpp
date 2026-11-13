@@ -161,6 +161,7 @@
 #include "../../backends/NativeContextPreparation.h"
 #include "../../planning/MoEOverlayPlanningInputs.h"
 #include "../../planning/MoEOverlayMemoryPlanInputs.h"
+#include "../../planning/PlanningObservedResource.h"
 #include "../../backends/DeviceAddressAdapter.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorFactory.h"
@@ -22083,8 +22084,8 @@ namespace llaminar2
                     for(const auto device:unique_gpus){
                         const auto found=std::find_if(observed.gpus.begin(),observed.gpus.end(),[&](const auto& gpu){return gpu.type==device.type && gpu.local_device_id==device.ordinal;});
                         if(found==observed.gpus.end())throw std::invalid_argument("Selected source worker is absent from original rank inventory");
-                        resources.push_back({world_rank,device,found->memory_bytes,
-                            PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))});
+                        resources.push_back(withObservedBacking({world_rank,device,found->memory_bytes,
+                            PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))},observed));
                     }
                     if(config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesExpertOverlayAuthority()){
                         // The one source PMA must retain the SAME topology-wide

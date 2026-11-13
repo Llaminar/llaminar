@@ -19,6 +19,8 @@
  * destinations allocate new bytes through their own admitted storage authority.
  * Explicit output-job ownership is invocation-local and independent of row
  * arithmetic; both stable-FFN phases are authenticated before payload mutation.
+ * Empty retained-team work keeps its completion edge before a caller can publish
+ * new request/frontier data, just as a nonempty workshare does.
  */
 
 #pragma once
@@ -107,6 +109,83 @@ namespace llaminar2::cpu::native_quantised
         detail::OriginalOutputSlicePolicy previous_; ///< Immutable predecessor geometry.
         int previous_serial_; ///< Existing two-int predecessor policy.
     };
+
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    /**
+     * @brief Publish one semantic launch record per distinct executed native schedule.
+     *
+     * Installed as the native launcher's observer. The record family and its
+     * 21 tags are shared with the x86 launcher, so
+     * PerfStats consumers read one schema. Identity is geometry and policy,
+     * never the member's ordinal in a transient bundle: identical members
+     * share one key and contribute their multiplicity as observations.
+     * Shared-row I8MM members report isa NEON_I8MM and a grouped_neon_i8mm_*
+     * route, proving row-pair SMMLA ran; their lone rows report the SDOT leaf.
+     * @param descriptors Complete executed members.
+     * @param count Positive member count.
+     * @param plan The native schedule the launcher executed.
+     * @param tasks Producer tasks per member, from the bound batches.
+     * @param dot Native dot instruction used for the bundle.
+     */
+    inline void recordNativeNEONFusedLaunches(const FusedVerifierRowsDesc *descriptors, int count,
+        const NativeQuantisedFusedRowsPlan &plan, const std::array<std::int64_t, NativeQuantisedFusedRowsPlan::capacity> &tasks,
+        multi_scale::NEONByteDot dot)
+    {
+        if (!PerfStatsCollector::isDomainEnabled("kernel") || (omp_in_parallel() && omp_get_thread_num() != 0))
+            return;
+        std::vector<std::pair<PerfStatsCollector::Tags, std::uint64_t>> groups;
+        groups.reserve(std::size_t(count));
+        for (int p = 0; p < count; ++p)
+        {
+            const auto &d = descriptors[p];
+            const int rows = plan.rows[p];
+            const int tile = rows == 1 ? 1 : (plan.tiles[p] == NEONProjectionRowTile::Pair ? 2 : 4);
+            // A lone I8MM row executes the SDOT leaf; shared-row tiles run SMMLA pairs.
+            const bool row_pairs = dot == multi_scale::NEONByteDot::I8MM && rows > 1;
+            const char *isa = row_pairs ? "NEON_I8MM"
+                : dot == multi_scale::NEONByteDot::ASIMD ? "NEON" : "NEON_DOTPROD";
+            const char *effective_verifier = rows == 1 ? verifierRowsPolicyName(d.verifier_schedule)
+                : (tile == 2 ? verifierRowsPolicyName(VerifierRowsPolicy::Pairwise)
+                             : verifierRowsPolicyName(VerifierRowsPolicy::WideRows));
+            PerfStatsCollector::Tags tags{
+                {"m", std::to_string(rows)}, {"n", std::to_string(d.N)},
+                {"policy_n", std::to_string(d.policy_n ? d.policy_n : cpuNativeQuantisedSerialEquivalentPolicyN(d.N))},
+                {"k", std::to_string(d.packed->K)}, {"codebook", std::to_string(d.packed->codebook_id)},
+                {"purpose", projectionRowsPurposeName(d.purpose)},
+                {"isa", isa},
+                // ARM register-K tiles traverse full K: one K tile per output owner.
+                {"k_tiles", "1"}, {"k_tile_blocks", std::to_string(d.packed->blocks_per_row)},
+                {"ambient_n_block_chunks", std::to_string(plan.chunks[p])},
+                {"n_block_chunks", std::to_string(plan.chunks[p])},
+                {"requested_decode_policy", decodeSchedulePolicyName(d.decode_schedule)},
+                {"effective_decode_policy", "Nbc" + std::to_string(plan.chunks[p])},
+                {"requested_verifier_policy", verifierRowsPolicyName(d.verifier_schedule)},
+                {"effective_verifier_policy", effective_verifier},
+                {"physical_row_tile", std::to_string(tile)},
+                {"route", rows == 1 ? "decode_neon_full_k_row"
+                    : row_pairs ? (tile == 2 ? "grouped_neon_i8mm_pair_rows" : "grouped_neon_i8mm_four_rows")
+                    : (tile == 2 ? "grouped_neon_full_k_pair_rows" : "grouped_neon_full_k_four_rows")},
+                {"task_grid", "row_tile_n_block"},
+                {"producer_tasks", std::to_string(tasks[p])},
+                {"reduction_tasks", "0"},
+                {"bundle_scheduler", "layer_global_full_k"}};
+            const auto found = std::find_if(groups.begin(), groups.end(),
+                [&](const auto &group) { return group.first == tags; });
+            if (found == groups.end()) groups.emplace_back(std::move(tags), 1u);
+            else ++found->second;
+        }
+        for (const auto &[tags, observations] : groups)
+            PerfStatsCollector::addCounter("kernel", "cpu_native_quantised_fused_verifier_rows_projection_launch",
+                PerfStatsCollector::CounterObservationBatch{
+                    .observations = observations, .value = static_cast<double>(observations)},
+                "gemm", "cpu", tags);
+    }
+
+    /** Installs the PerfStats publisher in every core program that can issue a native launch. */
+    inline const bool kNativeNEONFusedLaunchEvidenceInstalled =
+        (nativeNEONFusedLaunchObserver().store(&recordNativeNEONFusedLaunches, std::memory_order_release), true);
+#endif
 
     /** @brief Prepared quantized weights with participant-owned invocation scratch. */
     class CPUNativeQuantisedGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
@@ -367,7 +446,7 @@ namespace llaminar2::cpu::native_quantised
             const auto projection_work=projectionWorkFor(m);
             const auto *work=projection_work?&*projection_work:nullptr;
             if(work&&m!=1)throw std::invalid_argument("CPU ordinary query work requires explicit M1 arithmetic");
-            if(work&&!CPUProjectionRowGrid(m,work).hasAny())return true;
+            if(work&&!CPUProjectionRowGrid(m,work).beginWorkshare())return true;
             const float *A_data = A->data() + static_cast<size_t>(activation_row_offset) * k;
             float *C_data = C->mutable_data();
 
@@ -402,18 +481,50 @@ namespace llaminar2::cpu::native_quantised
          * @brief Expose final storage to the ticket-gated overlay slot arena.
          *
          * The arena holds this engine for the model lifetime and writes only
-         * while its physical slot is inactive. Returning the vector's existing
-         * range does not resize, allocate, or change the GEMM object's address.
+         * while its physical slot is inactive. Returning the existing range
+         * does not resize, allocate, change the GEMM object's address or the
+         * current publication: an adopted static engine keeps serving until its
+         * slot is acquired, which opens a rewrite through
+         * beginRetiredCPUNativeQuantisedRewrite().
          */
         std::span<std::uint8_t>
         exportRetiredCPUNativeQuantisedStorage() noexcept override
         {
             if (!valid_ || packed_.native_interleaved.empty())
                 return {};
-            return {
-                packed_.native_interleaved.data(),
-                packed_.native_interleaved.size(),
-            };
+            return packed_.native_interleaved.retainedSlotRoot();
+        }
+
+        /**
+         * @brief Open a new publication generation for an acquired overlay slot.
+         * @return The same final byte range; it stays unadmitted until resealed.
+         */
+        std::span<std::uint8_t> beginRetiredCPUNativeQuantisedRewrite() noexcept override
+        {
+            if (!valid_ || packed_.native_interleaved.empty())
+                return {};
+            return packed_.native_interleaved.beginRewrite();
+        }
+
+        /**
+         * @brief Admit completely written slot bytes before their engine becomes reachable.
+         * @throws std::invalid_argument For reserved metadata bits or non-canonical storage; the engine stays unadmitted.
+         * @throws std::overflow_error For unrepresentable geometry.
+         * @throws std::logic_error For a retired engine or owner fields that disagree with the canonical geometry.
+         * @details A current seal is left untouched, so republishing an unchanged
+         * engine never writes state that concurrent readers observe.
+         */
+        void admitCPUNativeQuantisedPublication() override
+        {
+            if (!valid_)
+                throw std::logic_error("Retired CPU NativeQuantised engine cannot publish weights");
+            if (!packed_.publicationSealed())
+            {
+                // The arrival wrote live columns only; the publisher defines the
+                // final chunk's padding in the same generation, then seals.
+                packed_.normalizePaddingMetadata();
+                packed_.sealPublication();
+            }
         }
 
         // -------------------------------------------------------------------
@@ -474,6 +585,18 @@ namespace llaminar2::cpu::native_quantised
             if (!packed_.hasInterleavedData())
             {
                 LOG_ERROR("[CPUNativeQuantisedGemmKernel] Attached CPU_NATIVE_QUANTISED weights have no eager interleaved data");
+                packed_ = CPUNativeQuantisedPackedWeights{};
+                return false;
+            }
+            // Attachment publishes received or detached bytes to execution.
+            try
+            {
+                if (!packed_.publicationSealed())
+                    packed_.sealPublication();
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("[CPUNativeQuantisedGemmKernel] Attached CPU_NATIVE_QUANTISED weights failed metadata admission: " << error.what());
                 packed_ = CPUNativeQuantisedPackedWeights{};
                 return false;
             }
@@ -1069,7 +1192,11 @@ namespace llaminar2::cpu::native_quantised
             if (activation_rotation_)
                 (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation,
                     static_cast<size_t>(m) * k);
-            if(live_rows==0||(work&&!CPUProjectionRowGrid(m,work).hasAny()))return true;
+            if(live_rows==0) {
+                (void)llaminar::v2::beginWorkshare(false);
+                return true;
+            }
+            if(work&&!CPUProjectionRowGrid(m,work).beginWorkshare())return true;
 
             const bool perf_enabled =
                 PerfStatsCollector::isDomainEnabled("kernel");
@@ -1825,6 +1952,11 @@ namespace llaminar2::cpu::native_quantised
         static void requireBatchedOutputJobOwnership(const BatchedPrequantizedProjectionDesc *descriptors,
             int count, FusedOutputJobOwnership ownership)
         {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            // The native ARM schedule owns N directly; only Auto/Current exist.
+            (void)descriptors; (void)count;
+            requireNativeNEONFusedOutputJobOwnership(ownership);
+#else
             (void)fusedOutputJobOwnershipName(ownership);
             if (ownership == FusedOutputJobOwnership::Current || ownership == FusedOutputJobOwnership::Auto) return;
             alignas(FusedVerifierRowsDesc) std::array<std::byte,
@@ -1841,6 +1973,7 @@ namespace llaminar2::cpu::native_quantised
                 1, nativeQuantisedInvocationWorkerCount());
             detail::requireFusedOutputJobOwnership(ownership,
                 {fused, static_cast<size_t>(count)}, live_plan.projections(), bundle.partial_route);
+#endif
         }
 
         /**
@@ -1946,7 +2079,7 @@ namespace llaminar2::cpu::native_quantised
                 return input;
 
             const CPUProjectionRowGrid row_grid(m,work);
-            if(!row_grid.hasAny())return input;
+            if(!row_grid.beginWorkshare())return input;
             const size_t len = static_cast<size_t>(m) * k;
             auto rotated = CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, len);
             auto rotate_row = [&](int row) {

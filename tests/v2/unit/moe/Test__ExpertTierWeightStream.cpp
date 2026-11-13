@@ -5,6 +5,8 @@
  * Exercise source provenance, bounded receive/publication state and exact
  * layout transformations independently of backend launchers. Native grid
  * scales/minima must survive conversion, not merely a lossy round trip.
+ * Native read views also admit the real slot/demotion owners, separating source
+ * codec widths from physical expanded payloads without changing publications.
  */
 
 #include "execution/moe/ExpertTierWeightStream.h"
@@ -111,6 +113,39 @@ namespace llaminar2
                 }
             }
             return projection;
+        }
+
+        /** @test Real demotion publications retain native view geometry for every source. */
+        TEST(ExpertTierWeightStream, PreparedReadViewAcceptsAllMigratedSourceFormats)
+        {
+            for (const auto &source : native_quantised_formats::kAllSourceFormats)
+            {
+                SCOPED_TRACE(source.quant_type);
+                const auto physical = migrationStableDeviceVnniFormat(*source.metadata);
+                auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
+                    physical.is_asymmetric, source.metadata->is_superblock);
+                gpu.source_codebook_id = source.metadata->codebook_id;
+                gpu.has_emins = physical.has_emins;
+                if (physical.codebook_id == 11 || physical.codebook_id == 13)
+                    for (std::size_t block = 0; block < gpu.mins.size(); ++block)
+                        gpu.mins[block] = static_cast<std::uint16_t>(
+                            block & (physical.codebook_id == 11 ? 15u : 255u));
+                if (physical.has_emins)
+                    gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
+
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+                std::string error;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+                const auto view = cpu.readView();
+                EXPECT_EQ(view.interleavedBase(), cpu.native_interleaved.data());
+                EXPECT_EQ(view.bytes().size(), cpu.native_interleaved.size());
+                EXPECT_EQ(view.N, cpu.N);
+                EXPECT_EQ(view.K, cpu.K);
+                EXPECT_EQ(view.source_payload_bytes, source.metadata->payload_bytes);
+                EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : source.metadata->payload_bytes);
+                EXPECT_EQ(view.encoding, cpu.encoding);
+                EXPECT_EQ(view.numerical_policy, cpu.numerical_policy);
+            }
         }
 
         TEST(ExpertTierWeightStream, SingleScaleNativeGridsExpandWithoutRequantization)
@@ -767,10 +802,111 @@ namespace llaminar2
                             actual));
                     EXPECT_EQ(actual, source_identity);
                     EXPECT_FALSE(projection.destination_bytes.empty());
+                    const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights();
+                    ASSERT_NE(packed, nullptr);
+                    // An acquired slot is unadmitted until its arrival writes
+                    // every byte; zero words satisfy every metadata rule.
+                    EXPECT_FALSE(packed->publicationSealed());
+                    std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(), std::uint8_t{0});
+                    projection.engine->admitCPUNativeQuantisedPublication();
+                    const auto view = packed->readView();
+                    EXPECT_EQ(view.interleavedBase(), projection.destination_bytes.data());
+                    EXPECT_EQ(view.bytes().size(), projection.destination_bytes.size());
+                    EXPECT_EQ(view.source_payload_bytes, entry.metadata->payload_bytes);
+                    EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : entry.metadata->payload_bytes);
                 }
                 lease.reset();
                 EXPECT_EQ(pool->usedSlots(), 0u);
             }
+        }
+
+        /**
+         * @test Slot reuse: every acquisition opens a new publication generation
+         * at the same address, so bytes of an earlier epoch can never stay
+         * admitted, and reserved metadata written by an arrival fails admission.
+         */
+        TEST(CpuExpertSlotPool, AcquisitionWithdrawsAdmissionUntilArrival)
+        {
+            const NativeQuantisedSourceIdentity identity{
+                .codebook_id = native_quantised_formats::IQ3_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ3_S.is_superblock,
+                .present = true,
+            };
+            auto pool = CpuExpertSlotPool::createForTest({
+                .participant_id = 0,
+                .layer_idx = 0,
+                .capacity = 1,
+                .projections = cpuSlotProjectionSpecs(identity),
+                .memory_placement = CpuExpertSlotPool::MemoryPlacement::aggregateDomain(),
+                .perf_device = "cpu-slot-reuse-test",
+            });
+            const std::uint8_t *root = nullptr;
+            for (std::uint64_t epoch = 1; epoch <= 3; ++epoch)
+            {
+                SCOPED_TRACE(epoch);
+                auto lease = pool->acquire(4, epoch);
+                ASSERT_TRUE(lease.has_value());
+                const auto &projection = lease->projections.front();
+                const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights();
+                ASSERT_NE(packed, nullptr);
+                if (!root) root = projection.destination_bytes.data();
+                EXPECT_EQ(projection.destination_bytes.data(), root);
+                EXPECT_FALSE(packed->publicationSealed());
+                EXPECT_DEATH((void)packed->readView(), "not admitted");
+                // Epoch-distinct payload with in-range IQ3_S coefficient words
+                // (<= 15) in every unit; only epoch 3 then corrupts one word.
+                std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(),
+                    static_cast<std::uint8_t>(epoch));
+                const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
+                const auto secondary = [&](std::size_t unit) {
+                    return projection.destination_bytes.data() + unit * std::size_t(packed->interleaved_block_stride) +
+                        std::size_t(packed->data_stride) + 256;
+                };
+                for (std::size_t unit = 0; unit < units; ++unit)
+                    for (int column = 0; column < 64; ++column)
+                    {
+                        const std::uint16_t coefficient = static_cast<std::uint16_t>(epoch + column % 3);
+                        std::memcpy(secondary(unit) + column * 2, &coefficient, sizeof(coefficient));
+                    }
+                if (epoch == 3)
+                {
+                    const std::uint16_t reserved = 0x0010;
+                    std::memcpy(secondary(units / 2) + 17 * 2, &reserved, sizeof(reserved));
+                    EXPECT_THROW(projection.engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
+                    EXPECT_FALSE(packed->publicationSealed());
+                    continue;
+                }
+                projection.engine->admitCPUNativeQuantisedPublication();
+                EXPECT_TRUE(packed->publicationSealed());
+                EXPECT_EQ(packed->readView().interleavedBase(), root);
+                // Republishing an unchanged engine keeps its seal.
+                const auto generation = packed->native_interleaved.generation();
+                projection.engine->admitCPUNativeQuantisedPublication();
+                EXPECT_EQ(packed->native_interleaved.generation(), generation);
+            }
+        }
+
+        /** @test A deep copy of sealed bytes is admitted at its own root; a copy of stale bytes is not. */
+        TEST(CpuExpertSlotPool, PublicationCopyInheritsOnlyACurrentSeal)
+        {
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            const auto physical = migrationStableDeviceVnniFormat(native_quantised_formats::Q4_K);
+            auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
+                physical.is_asymmetric, native_quantised_formats::Q4_K.is_superblock);
+            gpu.source_codebook_id = native_quantised_formats::Q4_K.codebook_id;
+            gpu.has_emins = physical.has_emins;
+            if (physical.has_emins)
+                gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
+            std::string error;
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+            ASSERT_TRUE(cpu.publicationSealed());
+            const auto copy = cpu;
+            EXPECT_NE(copy.native_interleaved.data(), cpu.native_interleaved.data());
+            EXPECT_TRUE(copy.publicationSealed());
+            EXPECT_EQ(copy.readView().interleavedBase(), copy.native_interleaved.data());
+            (void)cpu.native_interleaved.beginRewrite();
+            const auto stale = cpu;
+            EXPECT_FALSE(stale.publicationSealed());
         }
 
         TEST(

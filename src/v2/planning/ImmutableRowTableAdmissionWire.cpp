@@ -2,7 +2,8 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version17 carries explicit independent local-hot intent; older frames cannot silently
+ * Version18 adds each allocator physical backing; Version17 carries explicit independent
+ * local-hot intent; older frames cannot silently
  * supply SSD defaults. Predictor head ownership remains beside resolved arithmetic and
  * the original attention schedule. Unknown values reject before narrowing; reloadable debug
  * state is never consulted when restoring an admitted remote provision.
@@ -19,7 +20,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 17;
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 18; // 18 adds allocator physical backing
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -99,6 +100,7 @@ void resource(std::vector<std::uint8_t> &out,const PhysicalMemoryResource &r)
     append(out,static_cast<std::uint32_t>(r.world_rank));append(out,static_cast<std::uint32_t>(r.device.type));
     append(out,static_cast<std::uint32_t>(r.device.ordinal));append(out,static_cast<std::uint64_t>(r.total_bytes));
     append(out,static_cast<std::uint64_t>(r.admission_available_bytes));
+    append(out,static_cast<std::uint32_t>(r.backing));append(out,static_cast<std::uint64_t>(r.pool_available_bytes));
 }
 /** @return Exact resource authenticated to the actual communicator sender. */
 PhysicalMemoryResource resource(Reader &in,int rank)
@@ -110,6 +112,9 @@ PhysicalMemoryResource resource(Reader &in,int rank)
         type!=static_cast<std::uint32_t>(DeviceType::ROCm))
         throw std::invalid_argument("Ngram admission wire device type is unknown");
     PhysicalMemoryResource r{rank,DeviceId{static_cast<DeviceType>(type),static_cast<int>(ordinal)},size(in),size(in)};
+    const auto backing=in.read<std::uint32_t>();
+    if(backing>std::numeric_limits<std::uint8_t>::max()) throw std::invalid_argument("Ngram admission wire backing is unknown");
+    r.backing=physicalMemoryBackingFromWire(static_cast<std::uint8_t>(backing));r.pool_available_bytes=size(in);
     if(!r.valid()) throw std::invalid_argument("Ngram admission wire contains an invalid physical resource");
     return r;
 }
@@ -418,7 +423,7 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
             if(gpu_resources.size()!=observed.size())throw std::invalid_argument("Non-adaptive wire invented storage-only observations");
             for(std::size_t i=0;i<observed.size();++i)
                 if(gpu_resources[i].world_rank!=observed[i].world_rank || gpu_resources[i].device!=observed[i].device ||
-                   gpu_resources[i].total_bytes!=observed[i].total_bytes || gpu_resources[i].admission_available_bytes!=observed[i].admission_available_bytes)
+                   !gpu_resources[i].sameAllocator(observed[i]))
                     throw std::invalid_argument("Non-adaptive wire changed original consumer observations");
         }
         const auto peerArm = in.read<std::uint32_t>();

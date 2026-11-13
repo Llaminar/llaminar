@@ -14,6 +14,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "backends/PhysicalMemoryBacking.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 
 #include <array>
@@ -158,10 +159,15 @@ namespace llaminar2
     /**
      * @brief Typed identity of one independently allocatable memory domain.
      *
-     * CPU currently denotes the rank-local host/NUMA allocation authority;
-     * CUDA and ROCm ordinals denote separate VRAM allocators.  `world_rank`
-     * may be `-1` only for device-free estimates that have not yet been bound
-     * to an orchestration topology.
+     * CPU denotes the rank-local host/NUMA allocation authority. A CUDA or
+     * ROCm ordinal is its own allocator; with `Dedicated` backing it draws on
+     * separate VRAM. With `RankHostPool` backing (an integrated GPU such as
+     * GB10) it draws on the same physical pool as that rank's CPU allocator.
+     * Such a GPU carries `pool_available_bytes`, the uncapped physical pool
+     * availability it observed; the plan then admits CPU plus every pool GPU
+     * of the rank jointly against that pool, in addition to each allocator's
+     * own (possibly capped) fit. `world_rank` may be `-1` only for
+     * device-free estimates that have not yet been bound to a topology.
      */
     struct PhysicalMemoryResource
     {
@@ -169,13 +175,25 @@ namespace llaminar2
         DeviceId device = DeviceId::invalid();
         std::size_t total_bytes = 0;
         std::size_t admission_available_bytes = 0;
+        PhysicalMemoryBacking backing = PhysicalMemoryBacking::Dedicated;
+        std::size_t pool_available_bytes = 0; ///< RankHostPool only: uncapped physical pool observation.
 
         /** @return Whether the resource has coherent allocator geometry. */
         [[nodiscard]] bool valid() const noexcept
         {
+            const bool coherent_backing =
+                backing == PhysicalMemoryBacking::Dedicated
+                    ? pool_available_bytes == 0
+                    : backing == PhysicalMemoryBacking::RankHostPool && device.is_gpu();
             return world_rank >= -1 && device.is_valid() &&
                    (device.is_cpu() || device.is_gpu()) && total_bytes > 0 &&
-                   admission_available_bytes <= total_bytes;
+                   admission_available_bytes <= total_bytes && coherent_backing;
+        }
+
+        /** @return Whether this allocator consumes its rank's host pool. */
+        [[nodiscard]] bool sharesRankHostPool() const noexcept
+        {
+            return backing == PhysicalMemoryBacking::RankHostPool;
         }
 
         /** @return Stable human/wire identity derived only from typed fields. */
@@ -189,6 +207,15 @@ namespace llaminar2
                    ";device=" + device.toString();
         }
 
+        /** @return Identity plus every observed capacity field, for diagnostics. */
+        [[nodiscard]] std::string observation() const
+        {
+            return id() + ";total=" + std::to_string(total_bytes) +
+                   ";available=" + std::to_string(admission_available_bytes) +
+                   ";backing=" + std::string(toString(backing)) +
+                   ";pool_available=" + std::to_string(pool_available_bytes);
+        }
+
         /** @return Whether two BOMs charge the same physical allocator. */
         [[nodiscard]] bool sameAllocator(
             const PhysicalMemoryResource &other) const noexcept
@@ -196,7 +223,9 @@ namespace llaminar2
             return world_rank == other.world_rank && device == other.device &&
                    total_bytes == other.total_bytes &&
                    admission_available_bytes ==
-                       other.admission_available_bytes;
+                       other.admission_available_bytes &&
+                   backing == other.backing &&
+                   pool_available_bytes == other.pool_available_bytes;
         }
     };
 
@@ -339,6 +368,9 @@ namespace llaminar2
                    << " incremental=" << incrementalBytes()
                    << " available="
                    << resource_.admission_available_bytes;
+            if (resource_.sharesRankHostPool())
+                output << " backing=" << toString(resource_.backing)
+                       << " pool_available=" << resource_.pool_available_bytes;
             return output.str();
         }
 

@@ -916,6 +916,10 @@ namespace llaminar2
             if (fragment_destination_ && !MoEOverlayPreparedCPUFragmentPayload::validateRole(
                 *fragment_destination_->cohort, fragment_destination_->member, projection, engine, error))
                 return false;
+            // Admit completely written CPU NativeQuantised bytes before any bank can
+            // reach the engine; a current seal of unchanged bytes is kept.
+            if (engine->exportCPUNativeQuantisedPackedWeights())
+                engine->admitCPUNativeQuantisedPublication();
             auto &field = projectionField(engines_, projection);
             if (field && (field.get() != engine.get() || (fragment_destination_ &&
                 (field.owner_before(engine) || engine.owner_before(field)))))

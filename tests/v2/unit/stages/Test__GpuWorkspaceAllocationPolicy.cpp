@@ -1512,8 +1512,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUStreamPresenceUsesTypedStageContract
         if (!entry.is_regular_file())
             continue;
         const auto extension = entry.path().extension().string();
+        // Physical-shard bodies (*.cu.inc) are CUDA translation-unit code.
         if (extension != ".cpp" && extension != ".h" &&
-            extension != ".cu" && extension != ".hip")
+            extension != ".cu" && extension != ".hip" &&
+            !entry.path().filename().string().ends_with(".cu.inc"))
         {
             continue;
         }
@@ -12297,7 +12299,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AttentionDeviceParamsCanDeriveFromDevic
     const auto cuda_source =
         readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.h") +
         readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp") +
-        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc");
     const auto rocm_source =
         readFile(repoRoot() / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.h") +
         readFile(repoRoot() / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp") +
@@ -13266,7 +13268,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHybridRecurrentStateHasNoHostMirror)
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedWorkspaceCriticalFilesHaveNoRawAllocations)
 {
     const std::vector<std::filesystem::path> files = {
-        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillShardImpl.cu.inc",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillDispatch.cu",
         "src/v2/kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh",
     };
 
@@ -14045,7 +14048,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUFlashAttentionDecodeStateIsWorkspace
         << "The CUDA graph-visible attention params must remain workspace-backed.";
 
     const auto cuda_kernel_source =
-        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc");
     expectNoRawGpuAllocationCalls(cuda_kernel_source, "CUDAFlashAttention kernel wrappers");
     EXPECT_NE(cuda_kernel_source.find("cuda_write_attention_params_from_geometry_kernel"),
               std::string::npos)
@@ -14844,7 +14847,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKernelsCannotOwnTensorPlacement)
             const auto extension = entry.path().extension().string();
             if (extension != ".cpp" && extension != ".cu" &&
                 extension != ".hip" && extension != ".h" &&
-                extension != ".cuh")
+                extension != ".cuh" &&
+                !entry.path().filename().string().ends_with(".cu.inc"))
             {
                 continue;
             }

@@ -11,6 +11,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "FP16Utils.h"
@@ -184,6 +185,7 @@ namespace llaminar2
                                                              << " rows (have scales) out of " << shape_[0] << " total rows (buffer size)");
             }
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows_to_dequantize > 100)
             for (size_t r = 0; r < rows_to_dequantize; ++r)
             {
@@ -200,6 +202,7 @@ namespace llaminar2
             if (rows_to_dequantize < total_rows)
             {
                 const size_t remaining_rows = total_rows - rows_to_dequantize;
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (remaining_rows > 100)
                 for (size_t r = rows_to_dequantize; r < total_rows; ++r)
                 {
@@ -214,6 +217,7 @@ namespace llaminar2
         else
         {
             // Global scale (default path for weight tensors)
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (total > 10000)
             for (size_t i = 0; i < total; ++i)
             {

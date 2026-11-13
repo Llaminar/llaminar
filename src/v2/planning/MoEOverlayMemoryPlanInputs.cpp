@@ -10,6 +10,7 @@
  * Restored-prefix MTP condition graphs retain their distinct bridge identity;
  * ordinary speculative/committed conditions cannot borrow that admission.
  */
+#include "planning/PlanningObservedResource.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
@@ -255,7 +256,8 @@ std::vector<PhysicalMemoryResource> originalMoEOverlayNativePreparationResources
             if(gpu==observed.gpus.end())throw std::invalid_argument("Native overlay registry device is absent from original rank inventory");
             total=gpu->memory_bytes;available=gpu->free_memory_bytes;
         }
-        PhysicalMemoryResource resource{rank,device,total,PhysicalMemoryAuthority::admissionCapacity(available,config.memoryLimitBytes(device.type))};
+        const PhysicalMemoryResource resource=withObservedBacking(
+            {rank,device,total,PhysicalMemoryAuthority::admissionCapacity(available,config.memoryLimitBytes(device.type))},observed);
         if(!resource.valid())throw std::invalid_argument("Native overlay registry has incomplete original capacity");
         result.push_back(resource);
     }

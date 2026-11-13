@@ -12,6 +12,7 @@
 #include "../../utils/Q8ResidualAllFormatCPUHarness.h"
 #include "utils/MPIBootstrap.h"
 #include "../../utils/HC103CPUControlChain.h"
+#include <bit>
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 
 /** @test All positive worker teams execute every format on a tiny complete
@@ -458,6 +459,18 @@ TEST(Q8ResidualAllFormatsCPU, CountedNativeVerifierFusedBankAdmission) {
  const std::array descriptors{FusedVerifierRowsDesc{packed,fixture.output.mutable_data(),nullptr,64,64},
   FusedVerifierRowsDesc{packed,sibling.mutable_data(),nullptr,64,64}};
  const auto plan=planNativeQuantisedFusedRows(descriptors,1,3);
+#if defined(__aarch64__)
+ // ARM native programs own full-K register trees: the same bundle declares no
+ // shared ordered bank and completes with only the admitted Q8 activation bank.
+ ASSERT_EQ(plan.sharedPartialFloats(),0u);
+ CPUProjectionTestWorkspace workspace(cpuProjectionQ8WorkspaceRequirements(1,131072));
+ std::fill_n(fixture.output.mutable_data(),64,-12345.f);std::fill_n(sibling.mutable_data(),64,-12345.f);
+ int live=1;auto scope=fixture.kernel->beginVerifierDecodeEquivalentScope(DeviceRowRange::deviceCounted(1,&live));
+ const std::vector<ITensorGemm::TensorProjectionDesc> projections{{fixture.kernel,&fixture.output,64,nullptr,"a"},{fixture.kernel,&sibling,64,nullptr,"b"}};
+ ASSERT_TRUE(fixture.kernel->multiply_fused_verifier_rows_decode_equivalent(&fixture.input,projections,1,131072,nullptr,workspace.get()));
+ // Both members consume the same prepared weights and input: identical complete rows.
+ for(int i=0;i<64;++i){ASSERT_NE(fixture.output.data()[i],-12345.f);ASSERT_EQ(std::bit_cast<std::uint32_t>(fixture.output.data()[i]),std::bit_cast<std::uint32_t>(sibling.data()[i]));}
+#else
  ASSERT_TRUE(plan.all_k_partitioned);
  ASSERT_EQ(plan.partial_route,NativeQuantisedFusedPartialRoute::SharedBank);
  ASSERT_GT(plan.sharedPartialFloats(),0u)<<"Chosen real K-partitioned bundle must require its shared ordered bank";
@@ -473,6 +486,7 @@ TEST(Q8ResidualAllFormatsCPU, CountedNativeVerifierFusedBankAdmission) {
  EXPECT_THROW(fixture.kernel->multiply_fused_verifier_rows_decode_equivalent(&fixture.input,projections,1,131072,nullptr,workspace.get()),std::runtime_error);
  for(std::size_t i=0;i<bytes;++i)ASSERT_EQ(reinterpret_cast<std::uint8_t*>(bank)[i],0x5a);
  for(int i=0;i<64;++i){ASSERT_EQ(fixture.output.data()[i],-12345.f);ASSERT_EQ(sibling.data()[i],-12345.f);}
+#endif
 }
 
 /** @brief Select physical workers without admitting logical siblings as the budget. */

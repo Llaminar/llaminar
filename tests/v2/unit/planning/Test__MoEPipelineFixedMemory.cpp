@@ -257,6 +257,9 @@ TEST(MoEPipelineFixedMemory, NoPeerHostTailRequiresNoRoutingEvidenceAllocation)
         }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test The fixed planner carries caches, exact boundary leaders and every receiving TP fanout owner. */
 TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProjection)
 {
@@ -326,6 +329,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), transport_host_bytes);
             }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @test Input groups cannot lose or reorder the authored stage membership. */
 TEST(MoEPipelineFixedMemory, RejectsMissingForeignAndOverflowingStageOwnership)
@@ -353,6 +357,9 @@ TEST(MoEPipelineFixedMemory, RejectsMissingForeignAndOverflowingStageOwnership)
     }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Individually fitting RAM tiers require one combined physical admission. */
 TEST(MoEPipelineFixedMemory, SharedHostCapacityMustAdmitAllStageContributions)
 {
@@ -368,6 +375,7 @@ TEST(MoEPipelineFixedMemory, SharedHostCapacityMustAdmitAllStageContributions)
     EXPECT_THROW((void)PhysicalMemoryPlanAdmissionCertificate(combined.build()), PhysicalMemoryCapacityExhausted);
     EXPECT_THROW((void)fixture.admit(plans), PhysicalMemoryCapacityExhausted);
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @test Invalid child or host identity must fail before publishing transfer owners. */
 TEST(MoEPipelineFixedMemory, TransferBindingRejectsForeignOrDuplicateOwners)
@@ -410,6 +418,9 @@ TEST(MoEPipelineFixedMemory, TransferBindingRejectsForeignOrDuplicateOwners)
 /** @brief Explicit four-/eight-device tests remain discoverable in preflight evidence. */
 class MoEPipelineMultiDeviceMemory : public ::testing::TestWithParam<int> {};
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Every middle stage, cache owner and channel survives complete joint admission. */
 TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
 {
@@ -482,6 +493,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
         }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @test The joint transaction rejects overcommit hidden by individually fitting stages. */
 TEST_P(MoEPipelineMultiDeviceMemory, AggregateHostBudgetCannotBeReusedByEveryStage)

@@ -3,7 +3,10 @@
  * @brief Typed RMSNorm kernel implementation with fused precision conversion
  *
  * Key optimization: Process data in row-sized chunks that fit in L1/L2 cache.
- * Never allocate full-sized FP32 scratch buffers - stream through the data.
+ * Native ARM floating normalization consumes original encoded rows directly,
+ * sharing gamma in bounded tiles. Residual/quantized conversion paths retain
+ * their separately declared arithmetic/workspace contracts; none is certified
+ * by an isolated floating-leaf result.
  *
  * @author David Sanftenberg
  * @date 2025-12-04
@@ -21,6 +24,8 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <stdexcept>
+#include <string>
 
 #include <omp.h>
 
@@ -33,10 +38,27 @@ namespace llaminar2
     // Constants for cache-friendly streaming and parallelization
     // =========================================================================
 
-    // Maximum row size we support with stack-allocated scratch (16KB per row)
-    // This covers d_model up to 4096 (16KB) which fits comfortably in L1 (32KB)
-    // For larger models, we fall back to heap allocation per-thread
-    static constexpr size_t MAX_STACK_ROW_SIZE = 4096;
+    // Widest row the decoded-row kernels convert through stack scratch: 32 KiB
+    // per plane covers hidden sizes 5120 and 7168. Wider rows are rejected by
+    // require_stack_row before any work; there is no heap path.
+    static constexpr size_t MAX_STACK_ROW_SIZE = 8192;
+
+    /**
+     * @brief Reject a row wider than the bounded decoded-row stack scratch.
+     * @param format Activation format of the calling kernel, for the diagnostic.
+     * @param cols Requested row width.
+     * @throws std::invalid_argument Naming the width and the bound, before any work.
+     *
+     * These BF16/FP16/Q8_1 conversion kernels own no admitted workspace, so
+     * the only storage they may use is a fixed per-member stack row.
+     */
+    inline void require_stack_row(const char *format, size_t cols)
+    {
+        if (cols > MAX_STACK_ROW_SIZE)
+            throw std::invalid_argument(std::string("CPU ") + format + " RMSNorm row width " +
+                                        std::to_string(cols) + " exceeds the bounded stack scratch of " +
+                                        std::to_string(MAX_STACK_ROW_SIZE) + " floats");
+    }
 
     // Minimum number of rows to justify OpenMP parallelization overhead.
     // For single-row decode, thread spawning cost (~200µs) dominates the
@@ -114,21 +136,25 @@ namespace llaminar2
         size_t cols,
         float epsilon)
     {
-#if defined(__AVX512F__)
-        if (cpu_supports_avx512())
+        switch(activeISALevel())
         {
-            primitives::rmsnorm_fused_row_avx512(input, gamma, output, cols, epsilon);
-            return;
-        }
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        case ISALevel::NEON:
+        case ISALevel::NEONDotProd:
+            primitives::rmsnorm_fused_row_neon(input,gamma,output,cols,epsilon);return;
+#endif
+#if defined(__AVX512F__)
+        case ISALevel::AVX512:
+            primitives::rmsnorm_fused_row_avx512(input,gamma,output,cols,epsilon);return;
 #endif
 #if defined(__AVX2__)
-        if (cpu_supports_avx2())
-        {
-            primitives::rmsnorm_fused_row_avx2(input, gamma, output, cols, epsilon);
-            return;
-        }
+        case ISALevel::AVX2:
+            primitives::rmsnorm_fused_row_avx2(input,gamma,output,cols,epsilon);return;
 #endif
-        primitives::rmsnorm_fused_row_scalar(input, gamma, output, cols, epsilon);
+        case ISALevel::Scalar:
+            primitives::rmsnorm_fused_row_scalar(input,gamma,output,cols,epsilon);return;
+        default:throw std::logic_error("RMSNorm row received an incompatible ISA");
+        }
     }
 
     // =========================================================================
@@ -257,7 +283,14 @@ namespace llaminar2
             return false;
         }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // Native encoded rows stay in their original storage: no invocation-time
+        // decoded bank, heap allocation or host shadow is admitted.
+        primitives::rmsnorm_fused_bf16_vectorized(input,gamma,output,
+            std::size_t(rows),std::size_t(cols),epsilon);
+#else
         const size_t ucols = static_cast<size_t>(cols);
+        require_stack_row("BF16", ucols);
         const bool use_parallel = want_parallel(rows, ucols);
 
         // Lambda for processing a single row
@@ -282,13 +315,8 @@ namespace llaminar2
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-                std::vector<float> heap_fp32_in, heap_fp32_out;
-                float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
-                                     ? stack_fp32_in.data()
-                                     : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
-                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
-                                      ? stack_fp32_out.data()
-                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+                float *fp32_in = stack_fp32_in.data();
+                float *fp32_out = stack_fp32_out.data();
 
 #pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
@@ -303,19 +331,16 @@ namespace llaminar2
             // Serial path for small workloads
             std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
             std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fp32_in, heap_fp32_out;
-            float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
-                                 ? stack_fp32_in.data()
-                                 : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
-            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
-                                  ? stack_fp32_out.data()
-                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+            float *fp32_in = stack_fp32_in.data();
+            float *fp32_out = stack_fp32_out.data();
 
             for (int row = 0; row < rows; ++row)
             {
                 process_row(row, fp32_in, fp32_out);
             }
         }
+
+#endif
 
         record_grouped_rmsnorm_call("bf16", "bf16", rows, cols);
         return true;
@@ -422,7 +447,14 @@ namespace llaminar2
             return false;
         }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // Native encoded rows stay in their original storage: no invocation-time
+        // decoded bank, heap allocation or host shadow is admitted.
+        primitives::rmsnorm_fused_fp16_vectorized(input,gamma,output,
+            std::size_t(rows),std::size_t(cols),epsilon);
+#else
         const size_t ucols = static_cast<size_t>(cols);
+        require_stack_row("FP16", ucols);
         const bool use_parallel = want_parallel(rows, ucols);
 
         // Lambda for processing a single row
@@ -447,13 +479,8 @@ namespace llaminar2
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-                std::vector<float> heap_fp32_in, heap_fp32_out;
-                float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
-                                     ? stack_fp32_in.data()
-                                     : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
-                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
-                                      ? stack_fp32_out.data()
-                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+                float *fp32_in = stack_fp32_in.data();
+                float *fp32_out = stack_fp32_out.data();
 
 #pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
@@ -468,19 +495,16 @@ namespace llaminar2
             // Serial path for small workloads
             std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
             std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fp32_in, heap_fp32_out;
-            float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
-                                 ? stack_fp32_in.data()
-                                 : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
-            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
-                                  ? stack_fp32_out.data()
-                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+            float *fp32_in = stack_fp32_in.data();
+            float *fp32_out = stack_fp32_out.data();
 
             for (int row = 0; row < rows; ++row)
             {
                 process_row(row, fp32_in, fp32_out);
             }
         }
+
+#endif
 
         record_grouped_rmsnorm_call("fp16", "fp16", rows, cols);
         return true;
@@ -578,7 +602,8 @@ namespace llaminar2
         int rows,
         int cols,
         float epsilon,
-        int device_idx)
+        int device_idx,
+        const std::weak_ptr<const void> &gamma_owner)
     {
         (void)device_idx;
 
@@ -602,13 +627,15 @@ namespace llaminar2
         opts.allow_parallel = want_parallel(rows, ucols);
 
         primitives::rmsnorm_q8_1_pure_integer(
-            input, gamma, output,
+            input, primitives::rmsnorm_gamma_q11_for_owner(gamma, ucols, gamma_owner), output,
             static_cast<size_t>(rows), blocks_per_row,
             epsilon, opts);
 
         record_grouped_rmsnorm_call("q8_1", "q8_1", rows, cols);
         return true;
 #else
+        (void)gamma_owner; // FP32 gamma is consumed directly; nothing is cached.
+        require_stack_row("Q8_1", ucols);
         const bool use_parallel = want_parallel(rows, ucols);
 
         auto process_row = [&](int row, float *fp32_in, float *fp32_out)
@@ -627,13 +654,8 @@ namespace llaminar2
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-                std::vector<float> heap_fp32_in, heap_fp32_out;
-                float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
-                                     ? stack_fp32_in.data()
-                                     : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
-                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
-                                      ? stack_fp32_out.data()
-                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+                float *fp32_in = stack_fp32_in.data();
+                float *fp32_out = stack_fp32_out.data();
 
 #pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
@@ -647,13 +669,8 @@ namespace llaminar2
         {
             std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
             std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fp32_in, heap_fp32_out;
-            float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
-                                 ? stack_fp32_in.data()
-                                 : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
-            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
-                                  ? stack_fp32_out.data()
-                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+            float *fp32_in = stack_fp32_in.data();
+            float *fp32_out = stack_fp32_out.data();
 
             for (int row = 0; row < rows; ++row)
             {

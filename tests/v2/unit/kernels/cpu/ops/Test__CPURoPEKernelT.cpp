@@ -33,6 +33,8 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include "../../../../utils/CPURoPETestBinding.h"
+#include "../../../../utils/RoPEAngleTestStorage.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -416,6 +418,7 @@ namespace llaminar2
                 const size_t q_row_bytes = q_serial->size_bytes() / rows;
                 const size_t k_row_bytes = k_serial->size_bytes() / rows;
                 CPURoPEKernelT<Precision> kernel;
+                const test::CPURoPETestBinding kernel_angles(kernel);
                 for (int row = 0; row < rows; ++row)
                 {
                     auto q_row = make_native_rope_tensor<Precision>(
@@ -522,6 +525,9 @@ namespace llaminar2
         int n_heads_;
         int n_kv_heads_;
         int head_dim_;
+        /// Angle planes for direct primitive calls; kernels use their own bindings.
+        test::RoPEAngleTestStorage q8_angles{test::CPURoPETestBinding::kDefaultRows,
+                                             test::CPURoPETestBinding::kDefaultHeadDim / 2};
     };
 
     // =========================================================================
@@ -553,6 +559,7 @@ namespace llaminar2
 
         // Test typed kernel (operates in-place)
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
 
         // Call the kernel's apply_typed method
         ASSERT_TRUE(kernel.apply_typed(
@@ -575,6 +582,7 @@ namespace llaminar2
     TEST_F(CPURoPEKernelTTest, FP32_precision_metadata)
     {
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         EXPECT_EQ(kernel.precision(), ActivationPrecision::FP32);
         EXPECT_STREQ(kernel.precision_name(), "FP32");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 1.0f);
@@ -596,6 +604,7 @@ namespace llaminar2
                        position_ids.data(), ROPE_THETA);
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         ASSERT_TRUE(kernel.apply_typed(
             q_data.data(), nullptr,
             position_ids.data(),
@@ -633,6 +642,7 @@ namespace llaminar2
                                position_ids.data(), ROPE_THETA);
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         ASSERT_TRUE(kernel.apply_typed(q_data.data(), k_data.data(), position_ids.data(),
                                        local_seq_len, local_n_heads, local_n_kv_heads,
                                        local_head_dim, ROPE_THETA, -1, local_rotary_dim));
@@ -686,6 +696,7 @@ namespace llaminar2
                                position_ids.data(), ROPE_THETA);
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         ASSERT_TRUE(kernel.apply_typed(q_data.data(), k_data.data(), position_ids.data(),
                                        local_seq_len, local_n_heads, local_n_kv_heads,
                                        local_head_dim, ROPE_THETA, -1, local_rotary_dim));
@@ -703,6 +714,7 @@ namespace llaminar2
         const int q_cols = local_n_heads * local_head_dim;
         const int k_cols = local_n_kv_heads * local_head_dim;
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
 
         for (int rows : test::kGroupedVerifierRuntimeRows)
         {
@@ -812,6 +824,7 @@ namespace llaminar2
         std::copy(k_seed.begin(), k_seed.end(), k_grouped.mutable_data());
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         for (int r = 0; r < rows; ++r)
         {
             FP32Tensor q_row({1, static_cast<size_t>(q_cols)});
@@ -941,6 +954,7 @@ namespace llaminar2
                     const size_t q_bytes = q_whole->size_bytes() / rows;
                     const size_t k_bytes = k_whole->size_bytes() / rows;
                     CPURoPEKernelT<precision> kernel;
+                    const test::CPURoPETestBinding kernel_angles(kernel);
                     ASSERT_TRUE(kernel.apply_tensor(q_whole.get(), k_whole.get(), positions.data(),
                         rows, heads, kv_heads, dimension, 1000000.0f, nullptr, -1, start, rotary));
                     for (const int chunk : {1, 7, 139})
@@ -1000,6 +1014,7 @@ namespace llaminar2
                 auto q_expected = make_native_rope_tensor<precision>({rows, heads * dimension}, q_source.data());
                 auto k_expected = make_native_rope_tensor<precision>({rows, kv_heads * dimension}, k_source.data());
                 CPURoPEKernelT<precision> kernel;
+                const test::CPURoPETestBinding kernel_angles(kernel);
                 ASSERT_TRUE(kernel.apply_typed(static_cast<Native *>(q_expected->raw_mutable_data()),
                     static_cast<Native *>(k_expected->raw_mutable_data()), positions.data(),
                     rows, heads, kv_heads, dimension, 1000000.0f, -1, rotary));
@@ -1056,6 +1071,7 @@ namespace llaminar2
 
         // Apply RoPE to BF16 data using the kernel
         CPURoPEKernelT<ActivationPrecision::BF16> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         ASSERT_TRUE(kernel.apply_typed(
             bf16_q.data(), nullptr,
             position_ids.data(),
@@ -1079,6 +1095,7 @@ namespace llaminar2
     TEST_F(CPURoPEKernelTTest, BF16_precision_metadata)
     {
         CPURoPEKernelT<ActivationPrecision::BF16> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         EXPECT_EQ(kernel.precision(), ActivationPrecision::BF16);
         EXPECT_STREQ(kernel.precision_name(), "BF16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
@@ -1111,6 +1128,7 @@ namespace llaminar2
 
         // Apply RoPE to FP16 data using the kernel
         CPURoPEKernelT<ActivationPrecision::FP16> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         ASSERT_TRUE(kernel.apply_typed(
             fp16_q.data(), nullptr,
             position_ids.data(),
@@ -1134,6 +1152,7 @@ namespace llaminar2
     TEST_F(CPURoPEKernelTTest, FP16_precision_metadata)
     {
         CPURoPEKernelT<ActivationPrecision::FP16> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         EXPECT_EQ(kernel.precision(), ActivationPrecision::FP16);
         EXPECT_STREQ(kernel.precision_name(), "FP16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
@@ -1173,7 +1192,8 @@ namespace llaminar2
             seq_len_,
             n_heads_, 0,
             head_dim_,
-            ROPE_THETA);
+            ROPE_THETA,
+            q8_angles.view(seq_len_, head_dim_ / 2));
 
         // Dequantize result for comparison
         std::vector<float> fp32_result(q_size);
@@ -1193,6 +1213,7 @@ namespace llaminar2
     TEST_F(CPURoPEKernelTTest, Q8_1_precision_metadata)
     {
         CPURoPEKernelT<ActivationPrecision::Q8_1> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         EXPECT_EQ(kernel.precision(), ActivationPrecision::Q8_1);
         EXPECT_STREQ(kernel.precision_name(), "Q8_1");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 4.0f);
@@ -1218,7 +1239,8 @@ namespace llaminar2
             seq_len_,
             n_heads_, 0,
             bad_head_dim, // Not cleanly divisible
-            ROPE_THETA);
+            ROPE_THETA,
+            q8_angles.view(seq_len_, head_dim_ / 2));
 
         // No assertion - just verifying no crash
     }
@@ -1260,7 +1282,8 @@ namespace llaminar2
             seq_len_,
             n_heads_, n_kv_heads_,
             head_dim_,
-            ROPE_THETA);
+            ROPE_THETA,
+            q8_angles.view(seq_len_, head_dim_ / 2));
 
         // Dequantize results
         std::vector<float> fp32_q_result(q_size);
@@ -1296,6 +1319,7 @@ namespace llaminar2
         // FP32 result (ground truth)
         std::vector<float> fp32_q = fp32_original;
         CPURoPEKernelT<ActivationPrecision::FP32> kernel_fp32;
+        const test::CPURoPETestBinding kernel_fp32_angles(kernel_fp32);
         kernel_fp32.apply_typed(
             fp32_q.data(), nullptr,
             position_ids.data(),
@@ -1306,6 +1330,7 @@ namespace llaminar2
         std::vector<uint16_t> bf16_q(q_size);
         simd::convert_fp32_to_bf16(fp32_original.data(), bf16_q.data(), q_size);
         CPURoPEKernelT<ActivationPrecision::BF16> kernel_bf16;
+        const test::CPURoPETestBinding kernel_bf16_angles(kernel_bf16);
         kernel_bf16.apply_typed(
             bf16_q.data(), nullptr,
             position_ids.data(),
@@ -1318,6 +1343,7 @@ namespace llaminar2
         std::vector<uint16_t> fp16_q(q_size);
         simd::convert_fp32_to_fp16(fp32_original.data(), fp16_q.data(), q_size);
         CPURoPEKernelT<ActivationPrecision::FP16> kernel_fp16;
+        const test::CPURoPETestBinding kernel_fp16_angles(kernel_fp16);
         kernel_fp16.apply_typed(
             fp16_q.data(), nullptr,
             position_ids.data(),
@@ -1331,6 +1357,7 @@ namespace llaminar2
         std::vector<Q8_1Block> q8_q(num_blocks);
         simd::quantize_fp32_to_q8_1_blocks(fp32_original.data(), q8_q.data(), q_size);
         CPURoPEKernelT<ActivationPrecision::Q8_1> kernel_q8;
+        const test::CPURoPETestBinding kernel_q8_angles(kernel_q8);
         kernel_q8.apply_typed(
             q8_q.data(), nullptr,
             position_ids.data(),
@@ -1369,6 +1396,7 @@ namespace llaminar2
         std::vector<int> position_ids = {0, -1, 2, 3};
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         kernel.apply_typed(
             q_data.data(), nullptr,
             position_ids.data(),
@@ -1401,6 +1429,7 @@ namespace llaminar2
                            position_ids.data(), theta);
 
             CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+            const test::CPURoPETestBinding kernel_angles(kernel);
             kernel.apply_typed(
                 q_data.data(), nullptr,
                 position_ids.data(),
@@ -1427,6 +1456,7 @@ namespace llaminar2
                        position_ids.data(), ROPE_THETA);
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
         kernel.apply_typed(
             q_data.data(), nullptr,
             position_ids.data(),
@@ -1506,8 +1536,7 @@ namespace llaminar2
             seq_len_,
             n_heads_, 0,
             head_dim_,
-            ROPE_THETA,
-            nullptr);
+            ROPE_THETA);
 
         // Dequantize result for comparison
         std::vector<float> fp32_result(q_size);
@@ -1602,7 +1631,8 @@ namespace llaminar2
         std::vector<Q8_1Block> q8_q(num_blocks);
         simd::quantize_fp32_to_q8_1_blocks(fp32_q.data(), q8_q.data(), q_size);
         primitives::apply_rope_q8_1_integer(q8_q.data(), nullptr, position_ids.data(),
-                                            seq_len_, n_heads_, 0, head_dim_, ROPE_THETA);
+                                            seq_len_, n_heads_, 0, head_dim_, ROPE_THETA,
+            q8_angles.view(seq_len_, head_dim_ / 2));
         std::vector<float> q8_result(q_size);
         simd::dequantize_q8_1_to_fp32(q8_q.data(), q8_result.data(), q_size);
         float q8_max_diff = max_abs_diff(q8_result.data(), fp32_expected.data(), q_size);
@@ -1632,7 +1662,7 @@ namespace llaminar2
             block.sum_qs = static_cast<int32_t>(sum);
         }
         primitives::apply_rope_q16_1_integer(q16_q.data(), nullptr, position_ids.data(),
-                                             seq_len_, n_heads_, 0, head_dim_, ROPE_THETA, nullptr);
+                                             seq_len_, n_heads_, 0, head_dim_, ROPE_THETA);
         std::vector<float> q16_result(q_size);
         for (size_t b = 0; b < num_blocks; ++b)
         {
@@ -1664,6 +1694,7 @@ namespace llaminar2
         std::iota(position_ids.begin(), position_ids.end(), 0);
 
         CPURoPEKernelT<ActivationPrecision::FP32> fp32_kernel;
+        const test::CPURoPETestBinding fp32_kernel_angles(fp32_kernel);
         fp32_kernel.apply_typed(fp32_result.data(), nullptr, position_ids.data(),
                                 seq_len_, n_heads_, 0, head_dim_, ROPE_THETA);
 
@@ -1701,7 +1732,7 @@ namespace llaminar2
             q16_blocks.data(), nullptr,
             position_ids.data(),
             seq_len_, n_heads_, 0, head_dim_,
-            ROPE_THETA, nullptr);
+            ROPE_THETA);
 
         // Step 2c: Dequantize Q16_1 result to FP32
         std::vector<float> q16_result(q_size);

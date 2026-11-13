@@ -7,6 +7,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
@@ -16,6 +17,10 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONInt8BlockRequantize.h"
+#endif
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -220,6 +225,7 @@ namespace llaminar2
             size_t K = shape_[1];
             size_t blocks_per_row = (K + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
@@ -445,6 +451,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -459,6 +466,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -475,6 +483,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -702,6 +711,20 @@ namespace llaminar2
                         _mm512_cvtsepi32_epi8(r));
                 }
             }
+        }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Native NEON row maximum, byte-identical to the scalar leaf. */
+        float q8_0_find_max_abs_neon(const Q8_0Block *row_blocks, size_t blocks_per_row)
+        {
+            return neon_int8_block::findMaxAbs(row_blocks, blocks_per_row);
+        }
+        /** @brief Native NEON requantization, byte-identical to the scalar leaf. */
+        void q8_0_requantize_neon(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                                  float inv_row_scale, int8_t *output)
+        {
+            neon_int8_block::requantize(row_blocks, blocks_per_row, inv_row_scale, output);
         }
 #endif
 

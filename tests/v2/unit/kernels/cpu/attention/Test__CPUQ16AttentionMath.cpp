@@ -33,8 +33,27 @@ TEST(CPUQ16AttentionMath, PhysicalBlocksAndInvalidGeometry)
     static_assert(q16AttentionQueryLimit(32) == 2047);
     static_assert(q16AttentionQueryLimit(64) == 1023);
     static_assert(q16AttentionQueryLimit(128) == 511);
-    EXPECT_THROW(q16AttentionQueryLimit(0), std::invalid_argument);
-    EXPECT_THROW(q16AttentionQueryLimit(-1), std::invalid_argument);
-    EXPECT_THROW(q16AttentionQueryLimit(65536), std::invalid_argument);
-    EXPECT_THROW(q16AttentionQueryLimit(std::numeric_limits<int>::max()), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(0)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(-1)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(65536)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(std::numeric_limits<int>::max())), std::invalid_argument);
+}
+
+/** The typed bound is the closed form's single authority for the quantizer limit and the dot width. */
+TEST(CPUQ16AttentionMath, TypedReductionBoundMatchesTheClosedForm)
+{
+    using llaminar2::cpu::Q16ReductionBound;
+    constexpr std::int64_t maximum = std::numeric_limits<std::int32_t>::max();
+    for (int terms = 1; terms <= maximum / 32768; terms += terms < 512 ? 1 : 97)
+    {
+        const auto bound = Q16ReductionBound::forTerms(terms);
+        ASSERT_EQ(bound.queryLimit(), llaminar2::cpu::q16AttentionQueryLimit(terms));
+        ASSERT_EQ(bound.terms(), terms);
+        ASSERT_EQ(bound.worstMagnitude(), std::int64_t(bound.queryLimit()) * 32768 * terms);
+        ASSERT_LE(bound.worstMagnitude(), maximum);
+    }
+    static_assert(Q16ReductionBound::forTerms(256).queryLimit() == 255);
+    static_assert(Q16ReductionBound::forTerms(128).worstMagnitude() == 2143289344);
+    EXPECT_THROW(static_cast<void>(Q16ReductionBound::forTerms(0)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(Q16ReductionBound::forTerms(65536)), std::invalid_argument);
 }

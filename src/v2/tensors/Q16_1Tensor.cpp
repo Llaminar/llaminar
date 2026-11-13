@@ -16,6 +16,7 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../utils/Logger.h"
 #include "../utils/Assertions.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
@@ -81,9 +82,8 @@ namespace llaminar2
 
         const size_t rows = shape[0];
         const size_t cols = shape[1];
-        const size_t blocks_per_row = (cols + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-        const size_t n_blocks = rows * blocks_per_row;
-        const size_t expected_bytes = n_blocks * sizeof(Q16_1Block);
+        const size_t expected_bytes =
+            nativeMatrixExtent(rows, cols, Q16_1Block::BLOCK_SIZE, sizeof(Q16_1Block));
 
         if (raw_data_.size() < expected_bytes)
         {
@@ -109,8 +109,9 @@ namespace llaminar2
 
         const size_t rows = shape[0];
         const size_t cols = shape[1];
-        const size_t blocks_per_row_ = (cols + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-        const size_t expected_blocks = rows * blocks_per_row_;
+        const size_t required_bytes =
+            nativeMatrixExtent(rows, cols, Q16_1Block::BLOCK_SIZE, sizeof(Q16_1Block));
+        const size_t expected_blocks = required_bytes / sizeof(Q16_1Block);
 
         if (num_blocks < expected_blocks)
         {
@@ -119,7 +120,6 @@ namespace llaminar2
                                         std::to_string(expected_blocks) + ")");
         }
 
-        const size_t required_bytes = expected_blocks * sizeof(Q16_1Block);
         raw_data_.resize(required_bytes);
         std::memcpy(raw_data_.data(), blocks, required_bytes);
 
@@ -171,9 +171,9 @@ namespace llaminar2
 
         const size_t rows = shape[0];
         const size_t cols = shape[1];
-        const size_t blocks_per_row_ = (cols + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-        const size_t n_blocks = rows * blocks_per_row_;
-        const size_t required_bytes = n_blocks * sizeof(Q16_1Block);
+        const size_t required_bytes =
+            nativeMatrixExtent(rows, cols, Q16_1Block::BLOCK_SIZE, sizeof(Q16_1Block));
+        const size_t n_blocks = required_bytes / sizeof(Q16_1Block);
 
         raw_data_.resize(required_bytes, 0);
 
@@ -198,8 +198,6 @@ namespace llaminar2
         const size_t rows = shape[0];
         const size_t cols = shape[1];
         const size_t bs = static_cast<size_t>(block_size);
-        const size_t blocks_per_row_ = (cols + bs - 1) / bs;
-        const size_t n_blocks = rows * blocks_per_row_;
 
         // Calculate bytes based on block size
         size_t block_bytes = 0;
@@ -215,7 +213,10 @@ namespace llaminar2
             block_bytes = sizeof(Q16_1Block_128);
             break;
         }
-        const size_t required_bytes = n_blocks * block_bytes;
+        // Checked authority: a wrapped extent would size a buffer far smaller
+        // than the published shape.
+        const size_t required_bytes = nativeMatrixExtent(rows, cols, bs, block_bytes);
+        const size_t n_blocks = required_bytes / block_bytes;
 
         raw_data_.resize(required_bytes, 0);
 
@@ -309,6 +310,7 @@ namespace llaminar2
         case Q16BlockSize::BLOCK_32:
         {
             const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for collapse(2) if (total_elements > 10000)
             for (size_t r = 0; r < rows; ++r)
             {
@@ -332,6 +334,7 @@ namespace llaminar2
         case Q16BlockSize::BLOCK_64:
         {
             const Q16_1Block_64 *blocks = reinterpret_cast<const Q16_1Block_64 *>(data_ptr);
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for collapse(2) if (total_elements > 10000)
             for (size_t r = 0; r < rows; ++r)
             {
@@ -355,6 +358,7 @@ namespace llaminar2
         case Q16BlockSize::BLOCK_128:
         {
             const Q16_1Block_128 *blocks = reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for collapse(2) if (total_elements > 10000)
             for (size_t r = 0; r < rows; ++r)
             {
@@ -534,6 +538,7 @@ namespace llaminar2
 
         Q16_1Block *blocks = mutable_q16_1_blocks();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -817,6 +822,7 @@ namespace llaminar2
         // Then quantize FP32 to Q16_1
         Q16_1Block *blocks = mutable_q16_1_blocks();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (total_blocks > 4)
         for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
         {
@@ -891,6 +897,7 @@ namespace llaminar2
         // Then quantize FP32 to Q8_1
         Q8_1Block *out_blocks = static_cast<Q8_1Block *>(q8_1_buffer);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -952,6 +959,7 @@ namespace llaminar2
 
         Q16_1Block *blocks = mutable_q16_1_blocks();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -1010,6 +1018,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -1023,6 +1032,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -1038,6 +1048,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -1128,6 +1139,7 @@ namespace llaminar2
         // Quantize FP32 to Q8_1
         Q8_1Block *out_blocks = q8_1_tensor->mutable_typed_data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -1272,6 +1284,7 @@ namespace llaminar2
         std::vector<uint8_t> raw_data(total_bytes);
         Q16_1Block *blocks = reinterpret_cast<Q16_1Block *>(raw_data.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -1350,6 +1363,7 @@ namespace llaminar2
 
         Q16_1Block *blocks = mutable_q16_1_blocks();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -1417,6 +1431,7 @@ namespace llaminar2
             constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
             BlockType *blocks = static_cast<BlockType *>(dst_blocks);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
             for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
             {
@@ -1538,6 +1553,7 @@ namespace llaminar2
             std::atomic<size_t> total_processed{0};
 #endif
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks > 4)
             for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
             {

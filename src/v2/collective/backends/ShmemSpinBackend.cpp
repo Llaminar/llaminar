@@ -29,7 +29,11 @@
 #include <cstddef>
 #include <cstring>    // memcpy
 #include <fcntl.h>    // O_CREAT, O_RDWR
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <limits>
 #include <mpi.h>
 #include <omp.h>
@@ -598,7 +602,11 @@ namespace llaminar2
                 MPI_Abort(MPI_COMM_WORLD, 1);
                 return false;
             }
+#if defined(__x86_64__) || defined(__i386__)
             _mm_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
         }
     }
 
@@ -742,6 +750,7 @@ namespace llaminar2
             if (parallelize)
             {
                 bool protocol_ok = true;
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel shared(payload, protocol_ok)
                 {
                     for (size_t chunk_offset = 0;
@@ -1576,6 +1585,22 @@ namespace llaminar2
 #endif
     }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    void ShmemSpinBackend::reduce_neon(float *out,
+                                       const float *a,
+                                       const float *b,
+                                       size_t count)
+    {
+        // Elementwise FP32 add: byte-identical to the scalar program. out may
+        // alias a; each lane is loaded before its store.
+        size_t i = 0;
+        for (; i + 4 <= count; i += 4)
+            vst1q_f32(out + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+        for (; i < count; ++i)
+            out[i] = a[i] + b[i];
+    }
+#endif
+
     void ShmemSpinBackend::reduce(float *out,
                                   const float *a,
                                   const float *b,
@@ -1589,6 +1614,12 @@ namespace llaminar2
         case ISALevel::AVX2:
             reduce_avx2(out, a, b, count);
             break;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        case ISALevel::NEON:
+        case ISALevel::NEONDotProd:
+            reduce_neon(out, a, b, count);
+            break;
+#endif
         default:
             reduce_scalar(out, a, b, count);
             break;

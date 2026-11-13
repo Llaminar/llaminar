@@ -631,7 +631,22 @@ namespace llaminar2
             auto bid = static_cast<BufferId>(i);
             // Native CPU constructors adopt backing-owned leases; ordinary
             // shared ownership now preserves the exact physical owner naturally.
-            std::shared_ptr<TensorBase> tensor(createTensorForBuffer(b,bid));
+            std::shared_ptr<TensorBase> tensor;
+            try
+            {
+                tensor.reset(createTensorForBuffer(b,bid).release());
+            }
+            catch (const std::exception &error)
+            {
+                // Name the exact graph buffer whose materialization failed (a
+                // physical admission failure must identify which declared
+                // owner exceeded its BOM), then rethrow the original exception
+                // unchanged so callers still observe its exact type.
+                LOG_ERROR("[BufferArena] Materializing buffer '" << bufferIdName(bid) << "' rows=" << b.rows
+                          << " cols=" << b.cols << " dtype=" << (b.dtype ? b.dtype : "?")
+                          << " device=" << b.home_device.toString() << " failed: " << error.what());
+                throw;
+            }
             if (!tensor)
             {
                 LOG_ERROR("[BufferArena] Failed to allocate buffer '"

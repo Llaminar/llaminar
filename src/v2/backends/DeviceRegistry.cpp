@@ -16,6 +16,7 @@
 #include "GPUEnumeration.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
+#include "../utils/NodeTopology.h"
 
 #include <fstream>
 #include <sstream>
@@ -149,60 +150,27 @@ namespace llaminar2
             return;
         }
 
-        // Enumerate NUMA nodes
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != nullptr)
-        {
-            if (entry->d_name[0] == '.')
-                continue;
-
-            // Match "node0", "node1", etc.
-            if (strncmp(entry->d_name, "node", 4) == 0)
-            {
-                int numa_node = atoi(entry->d_name + 4);
-
-                GlobalDeviceAddress addr = GlobalDeviceAddress::cpu(numa_node);
-                std::string key = getKey(addr);
-
-                devices_.push_back(addr);
-                device_index_[key] = devices_.size() - 1;
-
-                DeviceInfo info;
-                info.name = "CPU:NUMA" + std::to_string(numa_node);
-                info.numa_affinity = numa_node;
-
-                // Read NUMA node memory from sysfs
-                // Format: "Node 0 MemTotal:       12345678 kB"
-                std::string meminfo_path = numa_path + "/" + entry->d_name + "/meminfo";
-                std::ifstream meminfo(meminfo_path);
-                if (meminfo.is_open())
-                {
-                    std::string line;
-                    while (std::getline(meminfo, line))
-                    {
-                        if (line.find("MemTotal:") != std::string::npos)
-                        {
-                            // Parse "Node X MemTotal:       NNNNN kB"
-                            // Find the colon and parse the number after it
-                            size_t colon_pos = line.find(':');
-                            if (colon_pos != std::string::npos)
-                            {
-                                std::string value_part = line.substr(colon_pos + 1);
-                                std::istringstream iss(value_part);
-                                size_t mem_kb;
-                                iss >> mem_kb;
-                                info.memory_capacity = mem_kb * 1024; // Convert to bytes
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                device_info_[key] = info;
-            }
-        }
-
         closedir(dir);
+
+        // NodeTopology is the NUMA node authority: it registers only nodes
+        // with CPUs, in ascending node order. Raw readdir registered
+        // CPU-less memory nodes (Grace GPU/CXL memory) and in directory
+        // order, so cpu:0 could be a node without CPUs or capacity.
+        const NodeTopology topology = NodeTopology::detect();
+        for (const auto &node : topology.numaNodes())
+        {
+            GlobalDeviceAddress addr = GlobalDeviceAddress::cpu(node.node_id);
+            std::string key = getKey(addr);
+
+            devices_.push_back(addr);
+            device_index_[key] = devices_.size() - 1;
+
+            DeviceInfo info;
+            info.name = "CPU:NUMA" + std::to_string(node.node_id);
+            info.numa_affinity = node.node_id;
+            info.memory_capacity = node.memory_bytes;
+            device_info_[key] = info;
+        }
     }
 
     // =========================================================================

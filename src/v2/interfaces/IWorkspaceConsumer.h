@@ -312,6 +312,7 @@ namespace llaminar2
         constexpr const char *POSITION_IDS = "rope_position_ids";   ///< [max_seq_len] INT32 position IDs
         constexpr const char *INV_FREQ = "rope_inv_freq";           ///< Fixed slots of immutable [head_dim/2] FP32 frequency tables
         constexpr const char *DEVICE_PARAMS = "rope_device_params"; ///< RoPEDeviceParams struct for graph capture
+        constexpr const char *CPU_ANGLES = "cpu_rope_angles";      ///< CPU absolute-position angle planes, rows x head_dim/2
     }
 
 } // namespace llaminar2

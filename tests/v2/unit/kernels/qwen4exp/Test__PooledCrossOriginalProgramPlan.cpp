@@ -53,6 +53,9 @@ public:
     ~CrossPlanWorker()override{thread_.join();}
 private:PreparedGPUWorkerThread thread_;
 };
+// Cross-vendor source/owner pairs construct and retire GPU-native objects on
+// both families, so this needs CUDA and ROCm compiled together.
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 TEST(PooledCrossOriginalProgramPlan, SourceAndStorageRolesPriceBothChannelsBeforeOriginalAdmission){
     using Source=NativeContextPreparationReplayAccess;using Fixture=PreparedNativeLookupFixtureReplayAccess;
     for(const bool reverse:{false,true}){
@@ -93,6 +96,7 @@ TEST(PooledCrossOriginalProgramPlan, SourceAndStorageRolesPriceBothChannelsBefor
         Fixture::retire(*session);
     }
 }
+#endif // defined(HAVE_CUDA) && defined(HAVE_ROCM)
 /** @test Sparse backing cannot invent terminal reference bytes for unauthored rows. */
 TEST(PooledCrossOriginalProgramPlan,SparseOracleRejectsUnauthoredRowsBeforeNativeInput){
     ProviderFile file;const std::array valid{std::uint64_t{7},ProviderFile::High};

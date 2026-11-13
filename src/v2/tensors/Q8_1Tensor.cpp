@@ -8,6 +8,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
@@ -20,6 +21,10 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
+
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONInt8BlockRequantize.h"
+#endif
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -400,6 +405,7 @@ namespace llaminar2
         const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
         const size_t blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for collapse(2) if (total_elements > 10000)
         for (size_t r = 0; r < rows; ++r)
         {
@@ -611,6 +617,7 @@ namespace llaminar2
             col_scales,
             bias);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (total_blocks > 4)
         for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
         {
@@ -794,6 +801,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -808,6 +816,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -824,6 +833,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -965,6 +975,7 @@ namespace llaminar2
             return false;
         }
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (n_blocks >= 128)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -1005,6 +1016,7 @@ namespace llaminar2
         Q8_1Block *blocks = reinterpret_cast<Q8_1Block *>(raw_data.data());
 
         // Quantize each block
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (n_blocks >= 128)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
@@ -1073,6 +1085,7 @@ namespace llaminar2
         else
         {
             // Copy row by row (handle different k vs cols)
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
             for (int i = 0; i < m; ++i)
             {
@@ -1137,6 +1150,7 @@ namespace llaminar2
         Q8_1Block *dst_blocks = result->mutable_typed_data();
 
         // Copy blocks row by row (cannot be a zero-copy view since we're slicing columns)
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
         for (size_t row = 0; row < rows; ++row)
         {
@@ -1280,6 +1294,20 @@ namespace llaminar2
                         _mm512_cvtsepi32_epi8(r));
                 }
             }
+        }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Native NEON row maximum, byte-identical to the scalar leaf. */
+        float q8_1_find_max_abs_neon(const Q8_1Block *row_blocks, size_t blocks_per_row)
+        {
+            return neon_int8_block::findMaxAbs(row_blocks, blocks_per_row);
+        }
+        /** @brief Native NEON requantization, byte-identical to the scalar leaf. */
+        void q8_1_requantize_neon(const Q8_1Block *row_blocks, size_t blocks_per_row,
+                                  float inv_row_scale, int8_t *output)
+        {
+            neon_int8_block::requantize(row_blocks, blocks_per_row, inv_row_scale, output);
         }
 #endif
 

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/HostMemoryCapacity.h"
+#include "backends/HardwareInventory.h"
 
 #include <cstddef>
 #include <string>
@@ -90,5 +91,44 @@ namespace llaminar2::test
         EXPECT_LE(
             observation.admission_available_bytes,
             observation.total_bytes);
+    }
+    /**
+     * @brief A host without NUMA memory topology is one memory domain.
+     *
+     * Regression: on Docker Desktop's linuxkit kernel (no node sysfs, libnuma
+     * unavailable) every socket kept zero memory and `llaminar2 plan` failed
+     * with "Physical memory BOM requires a valid resource" before reading the
+     * model. The single package now receives the system observation; ambiguous
+     * multi-package or partial topologies fail with a precise diagnostic.
+     */
+    TEST(HostMemoryCapacity, NonNUMAHostAttributesSystemMemoryToItsSinglePackage)
+    {
+        HostMemoryCapacityObservation system;
+        system.total_bytes = 32ull << 30;
+        system.free_bytes = 30ull << 30;
+        system.admission_available_bytes = 29ull << 30;
+
+        std::vector<CPUSocketInfo> single(1);
+        single[0].socket_id = 0;
+        single[0].numa_node = 0;
+        assignNonNUMAHostMemory(single, system);
+        EXPECT_EQ(single[0].memory_bytes, system.total_bytes);
+        EXPECT_EQ(single[0].available_memory_bytes, system.admission_available_bytes);
+
+        // NUMA-observed sockets are never replaced.
+        std::vector<CPUSocketInfo> numa(2);
+        numa[0].memory_bytes = numa[1].memory_bytes = 64ull << 30;
+        numa[0].available_memory_bytes = numa[1].available_memory_bytes = 60ull << 30;
+        assignNonNUMAHostMemory(numa, system);
+        EXPECT_EQ(numa[0].memory_bytes, 64ull << 30);
+        EXPECT_EQ(numa[1].available_memory_bytes, 60ull << 30);
+
+        std::vector<CPUSocketInfo> ambiguous(2);
+        EXPECT_THROW(assignNonNUMAHostMemory(ambiguous, system), std::runtime_error);
+        std::vector<CPUSocketInfo> partial(2);
+        partial[0].memory_bytes = 1;
+        EXPECT_THROW(assignNonNUMAHostMemory(partial, system), std::runtime_error);
+        std::vector<CPUSocketInfo> unobservable(1);
+        EXPECT_THROW(assignNonNUMAHostMemory(unobservable, HostMemoryCapacityObservation{}), std::runtime_error);
     }
 } // namespace llaminar2::test
