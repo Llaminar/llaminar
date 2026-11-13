@@ -4025,3 +4025,19 @@ set w/ filtered UNQUALIFIED naming + ARM byte identity vs d5e04fdce)
 + WSL x86 (K14-STAGEAGATE-X86-609638ABA: Integration CPU-only +
 Unit/preflight + x86 byte identity). Then A3-fixup + A4 pins ->
 Gate-A reviewer pass d5e04fdce..609638aba.
+
+### Stage-A gate x86 leg phase 1/3 (14:02Z): configure OK; driver running
+
+WSL K14-STAGEAGATE-X86-609638ABA: fetch+verify OK (609638aba exact;
+d5e04fdce ancestor; range = 19 commits, 55 files +5703/-340);
+configure rc=0 (gate image eefa0550c same digest as C1; oneDNN
+v3.11.3 pin verified exact; 309 CUDA/ROCm registrations correctly
+absent). Disclosed infra fault (WSL session's, no work lost): pre-
+created receipt/ dir tripped the driver's exist_ok=False; relaunched
+clean. Driver (build + Unit + ProductionTestPreflight, JUnit,
+--no-tests=error) running since 14:01Z. Byte-identity plan: one
+dump tool at BOTH SHAs, same image, production flags, 21 formats,
+all-codebook 73x544 + 128x1024, external sha256/cmp; versioned
+wire excluded (tier v4 + archive v8 changed legitimately — the
+claim is prepared bytes). Base control gate at d5e04fdce queued
+for the clean failed-set delta. ARM leg on .79 in parallel.
