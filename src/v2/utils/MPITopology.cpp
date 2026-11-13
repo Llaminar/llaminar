@@ -38,7 +38,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kInventoryMagic = 0x4c494e56u; ///< LINV, not an unversioned rank id.
-        constexpr uint32_t kInventoryVersion = 7u; ///< Carries original PCI ancestry, native CPU projection ABI/ISA and typed accelerator physical-memory backing.
+        constexpr uint32_t kInventoryVersion = 8u; ///< Carries original PCI ancestry, native CPU projection ABI/ISA, typed accelerator physical-memory backing and the rank's prepared NativeQuantised layout byte.
         /** @brief Lend a checked communicator to a standalone topology constructor. */
         MPIContext standaloneTopologyContext(MPI_Comm comm)
         {

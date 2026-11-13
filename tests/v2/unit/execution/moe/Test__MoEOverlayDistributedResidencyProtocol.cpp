@@ -540,22 +540,164 @@ namespace llaminar2::test
             },
             std::invalid_argument);
 
-        // A compact byte is a known layout, so the identity admits it once
-        // the hash matches — but the device-layout re-derivation still
-        // fails closed: compact section tables are not implemented, and no
-        // sealed hash can substitute for them.
+        // Hash-contribution discrimination: changing ONLY the layout byte
+        // without resealing leaves a stale hash that fails authentication.
+        // If the layout were removed from the hash contribution, this
+        // control would validate — removal is detectable.
+        auto compact_stale = manifest;
+        compact_stale.identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCompactA64);
+        EXPECT_FALSE(compact_stale.valid(&error)) << error;
+
+        // Reseled compact: the hash differs from the canonical original's
+        // (the layout byte contributes), but the manifest itself is a
+        // substitution — its canonical strides disagree with the compact
+        // identity's section tables, and no sealed hash can substitute for
+        // them. The full consumer chain rejects the substituted manifest:
+        // device-layout re-derivation, and the CPU storage layout that
+        // drives the host chunk cursor and destination admission, both
+        // refuse it as an unauthenticated transaction.
         auto compact = manifest;
         compact.identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
             cpu::native_quantised::CPUNativeQuantisedLayout::
                 InterleavedCompactA64);
         compact.manifest_hash = compact.computedHash();
-        EXPECT_TRUE(compact.valid(&error)) << error;
+        EXPECT_NE(compact.manifest_hash, manifest.manifest_hash);
+        EXPECT_FALSE(compact.valid(&error)) << error;
+        EXPECT_NE(error.find("provenance"), std::string::npos);
         EXPECT_THROW(
             {
                 [[maybe_unused]] const auto rejected =
                     remoteCpuProjectionDeviceLayout(compact);
             },
             std::invalid_argument);
+        EXPECT_THROW(
+            {
+                [[maybe_unused]] const auto rejected =
+                    remoteCpuProjectionStorageLayout(
+                        compact,
+                        MoEOverlayRemoteCPUStorageEndpoint::Source);
+            },
+            std::invalid_argument);
+        EXPECT_THROW(
+            {
+                [[maybe_unused]] const auto rejected =
+                    remoteCpuProjectionStorageLayout(
+                        compact,
+                        MoEOverlayRemoteCPUStorageEndpoint::Destination);
+            },
+            std::invalid_argument);
+
+        // Reseled-structural control: resealing is not a validity grant.
+        // A structural geometry tamper whose hash was recomputed still
+        // fails the manifest's independent geometry invariants.
+        auto structural = manifest;
+        structural.N += 64;
+        structural.manifest_hash = structural.computedHash();
+        EXPECT_FALSE(structural.valid(&error)) << error;
+
+        // Real remote wire: the sealed manifest survives an actual
+        // encode/decode round trip byte-exactly, and an in-wire layout
+        // tamper (hash bytes untouched) fails decode authentication.
+        std::array<std::uint8_t,
+            MoEOverlayRemoteProjectionManifest::kWireBytes>
+            wire{};
+        std::string wire_error;
+        ASSERT_TRUE(encodeMoEOverlayRemoteProjectionManifest(
+            manifest, wire, &wire_error))
+            << wire_error;
+        MoEOverlayRemoteProjectionManifest decoded;
+        ASSERT_TRUE(decodeMoEOverlayRemoteProjectionManifest(
+            wire, &decoded, &wire_error))
+            << wire_error;
+        EXPECT_EQ(decoded, manifest);
+        EXPECT_TRUE(decoded.valid());
+
+        // In-wire tamper: flipping the trailing hash byte breaks decode
+        // authentication — the packet's sealed hash is load-bearing on the
+        // real wire, and the struct-level stale-hash control above already
+        // discriminates the layout byte's own hash contribution.
+        auto tampered_wire = wire;
+        tampered_wire[tampered_wire.size() - 1u] ^=
+            static_cast<std::uint8_t>(0x01u);
+        MoEOverlayRemoteProjectionManifest tampered;
+        EXPECT_FALSE(decodeMoEOverlayRemoteProjectionManifest(
+            tampered_wire, &tampered, &wire_error));
+    }
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyProtocol,
+        RemoteCpuWireBuildersRejectUnimplementedLayoutsBeforeArithmetic)
+    {
+        auto fixture = makeTransaction();
+        const auto cpu_bytes = cpuAsymmetricProjectionBytes();
+        // A compact-labelled identity names a layout whose section tables
+        // are not implemented. Both CPU-root builders must reject it at the
+        // section authority — BEFORE any stride is assigned, before the
+        // root-equality check could accept a matching zero-stride root, and
+        // before seal-time column arithmetic could divide by a zero stride.
+        auto identity = remoteProjectionIdentity(
+            fixture.transaction, DeviceId::cpu(), DeviceId::cuda(0));
+        identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCompactA64);
+        const auto stream = makeCpuToGpuExpertTierWeightStreamManifest(
+            cpu_bytes,
+            identity.candidate_epoch,
+            identity.layer_idx,
+            identity.expert_id,
+            identity.projection,
+            /*maximum_units_per_chunk=*/1);
+        // The compact-labelled zero-stride root the old equality check
+        // would have accepted: matching layout label, zero strides, no bytes.
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights zero_root;
+        zero_root.layout =
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCompactA64;
+        zero_root.N = stream.N;
+        zero_root.K = stream.K;
+        zero_root.N_padded = stream.N_padded;
+        zero_root.blocks_per_row = stream.blocks_per_row;
+        zero_root.codebook_id = stream.cpu_codebook_id;
+        zero_root.is_asymmetric = stream.cpu_is_asymmetric;
+        zero_root.is_superblock = stream.cpu_is_superblock;
+        zero_root.encoding = stream.cpu_encoding;
+
+        try
+        {
+            [[maybe_unused]] const auto rejected =
+                makeMoEOverlayRemoteCpuProjectionManifest(
+                    identity, zero_root, /*maximum_chunk_bytes=*/4096);
+            FAIL() << "compact-labelled wire must be refused before arithmetic";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what())
+                          .find("implemented section tables"),
+                      std::string::npos);
+            EXPECT_NE(std::string(error.what())
+                          .find("interleaved-compact-a64"),
+                      std::string::npos);
+        }
+
+        try
+        {
+            [[maybe_unused]] const auto rejected =
+                makeMoEOverlayRemoteCpuDestinationProjectionManifest(
+                    identity, zero_root,
+                    ExpertTierWeightProjectionIntersection::between(
+                        stream.source_projection,
+                        stream.destination_projection),
+                    /*capacity=*/4096);
+            FAIL() << "compact-labelled destination wire must be refused before arithmetic";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what())
+                          .find("implemented section tables"),
+                      std::string::npos);
+        }
     }
 
     TEST(

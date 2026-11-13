@@ -501,9 +501,15 @@ namespace llaminar2::cpu::native_quantised
             if (!usesInlineCompensation())
                 throw std::logic_error(
                     "Q6_K native dual-scale weights do not carry compensation metadata");
-            // The compensation plane address derives from the layout's
-            // section tables like every other metadata plane.
+            // Guard at the admitted boundary like the other metadata planes:
+            // an uncataloged source or a section layout without a
+            // compensation plane is a typed rejection here, never an
+            // unvalidated offset resolved to the payload base.
             const PreparedUnitSections sections = preparedSections();
+            if (!sections.isValid() || !sections.has_compensation)
+                throw std::logic_error(
+                    "Compensation metadata require a prepared layout with a "
+                    "compensation section");
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const int16_t *>(
                 interleavedBase() + block_offset + sections.compensation_offset);

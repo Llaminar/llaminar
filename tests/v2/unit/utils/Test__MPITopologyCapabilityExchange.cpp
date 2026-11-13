@@ -11,6 +11,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstring>
+
 #include "utils/MPITopology.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
@@ -203,6 +206,51 @@ TEST_F(Test__MPITopologyCapabilityExchange, SerializeDeserialize_CPUPreparedLayo
     observed.cpu_prepared_layout = cpu::native_quantised::kHostPreparedLayout;
     EXPECT_EQ(observed.cpu_prepared_layout,
         cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical);
+
+    // A pre-layout (version 7) record shape is rejected BY VERSION, never
+    // parsed as shifted fields: rebuild the exact v7 shape (current record
+    // minus the layout byte) and stamp the old version.
+    {
+        RankInventory canonical = createTestInventory(0, "layout-node", 0, 0);
+        RankInventory compact = canonical;
+        compact.cpu_prepared_layout =
+            cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64;
+        const std::vector<uint8_t> canonical_wire =
+            MPITopology::serializeRankInventory(canonical);
+        const std::vector<uint8_t> compact_wire =
+            MPITopology::serializeRankInventory(compact);
+        ASSERT_EQ(canonical_wire.size(), compact_wire.size());
+        std::vector<size_t> differing;
+        for (size_t byte = 0; byte < canonical_wire.size(); ++byte)
+            if (canonical_wire[byte] != compact_wire[byte])
+                differing.push_back(byte);
+        ASSERT_EQ(differing.size(), 1u);
+        std::vector<uint8_t> v7_shaped;
+        v7_shaped.reserve(canonical_wire.size() - 1u);
+        for (size_t byte = 0; byte < canonical_wire.size(); ++byte)
+            if (byte != differing.front())
+                v7_shaped.push_back(canonical_wire[byte]);
+        // The version word directly follows the magic; verify before patching
+        // so the probe owns no unverified wire offset.
+        std::uint32_t observed_version = 0;
+        std::memcpy(&observed_version, v7_shaped.data() + 4u,
+            sizeof(observed_version));
+        ASSERT_EQ(observed_version, 8u);
+        const std::uint32_t v7 = 7u;
+        std::memcpy(v7_shaped.data() + 4u, &v7, sizeof(v7));
+        try
+        {
+            static_cast<void>(MPITopology::deserializeRankInventory(
+                v7_shaped.data(), v7_shaped.size()));
+            FAIL() << "a v7-shaped record must be rejected by version";
+        }
+        catch (const std::runtime_error &error)
+        {
+            EXPECT_NE(std::string(error.what())
+                          .find("Incompatible MPI inventory ABI"),
+                      std::string::npos);
+        }
+    }
 
     // Unknown layout byte: fatal, not defaulted. Locate the layout byte
     // differentially so the wire probe owns no hand-computed field offsets.

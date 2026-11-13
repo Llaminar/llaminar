@@ -77,9 +77,12 @@ namespace llaminar2
             ExpertTierWeightProjection::Gate;
         // The CPU endpoint layout contract — the layout the sender derived
         // `cpu_data_stride`/`cpu_block_stride` from (destination layout for
-        // GPU-to-CPU, source layout for CPU-to-GPU). Canonical is zero, so
-        // canonical streams are byte-identical to their pre-layout form;
-        // from version 4 the field is sealed in `manifest_hash`.
+        // GPU-to-CPU, source layout for CPU-to-GPU). Canonical is zero and
+        // the field carves its byte from the former reserved tail, so the
+        // record width is unchanged; however, version 4 is a distinct wire
+        // generation — the version word, the hash that now covers this
+        // field, and the pinned reserved tail all differ from version 3, so
+        // canonical v4 streams are NOT byte-identical to v3 streams.
         uint8_t cpu_endpoint_layout = 0;
         uint8_t reserved_identity[2]{};
 

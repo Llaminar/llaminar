@@ -53,7 +53,7 @@ static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little
 /// Version6 preserves IQ4_XS original half bases and encoded signed coefficients.
 /// Version5 and earlier archives are rejected before any section is adopted.
 /// Version7 retains IQ3_S original half bases and raw nibbles in CPU encoding5.
-/// Version8 carries the prepared CPU layout in the sealed header identity:
+/// Version8 carries the prepared CPU layout as a versioned header tag:
 /// receivers decode `prepared_layout` and re-derive both strides from that
 /// layout's section tables before adopting any payload. Exactly version 7
 /// remains admissible as an explicitly canonical archive — its implied layout
@@ -83,7 +83,7 @@ struct PackedWeightsHeader
     int32_t  data_stride;              //  4B
     int32_t  interleaved_block_stride; //  4B
     int32_t  native_block_size;        //  4B
-    uint8_t  prepared_layout;          //  1B  v8: sealed CPU layout identity
+    uint8_t  prepared_layout;          //  1B  v8: versioned CPU layout tag
     uint8_t  reserved[17];            // 17B  zero-padded
 };
 
@@ -144,7 +144,7 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
 /**
  * @brief Decode and validate the prepared CPU layout stored on the wire.
  *
- * Version-8 headers name the layout in their sealed identity; receivers
+ * Version-8 headers name the layout in a versioned tag; receivers
  * never trust the byte without confirming it names a known layout. Knowing
  * a value is not the same as the build implementing it — section tables
  * decide implementability and fail closed in the stride re-derivation.
@@ -168,7 +168,7 @@ inline cpu::native_quantised::CPUNativeQuantisedLayout decodePreparedLayout(
 /**
  * @brief Resolve the admitted layout for an archive or transfer header.
  *
- * Exactly version 8 decodes the sealed `prepared_layout` byte; exactly
+ * Exactly version 8 decodes the recorded `prepared_layout` byte; exactly
  * version 7 is admissible as an explicitly canonical archive (the implied
  * layout is a versioned statement, never a guess about the sender); every
  * earlier version is rejected globally, not per-format.
@@ -190,13 +190,14 @@ inline cpu::native_quantised::CPUNativeQuantisedLayout admittedPreparedLayout(
 }
 
 /**
- * @brief Cold-path section resolution for archive and transfer validation.
+ * @brief Section resolution for archive and transfer validation.
  *
- * Production resolves the sealed layout through the sole section-table
- * authority. Tests proving receive-side gates against layouts whose tables
- * are not yet implemented (the compact AArch64 unit) install an explicit
- * resolver for the lifetime of one assertion; the archive cold path is the
- * only consumer, so no hot-path table lookup gains an indirection.
+ * Validation resolves the recorded layout through a resolver parameter so
+ * admission is a pure function of its inputs: the production entrypoints
+ * pass the sole section-table authority, while receive-gate regressions
+ * inject explicit-layout resolvers for layouts whose tables are not yet
+ * implemented (the compact AArch64 unit). No mutable process state can
+ * change what a concurrent receive validates.
  */
 using PreparedSectionsResolver = cpu::native_quantised::PreparedUnitSections (*)(
     cpu::native_quantised::CPUNativeQuantisedLayout,
@@ -204,51 +205,18 @@ using PreparedSectionsResolver = cpu::native_quantised::PreparedUnitSections (*)
     bool,
     const NativeQuantisedFormatInfo &);
 
-namespace detail
-{
-    inline PreparedSectionsResolver explicit_prepared_sections_for_test = nullptr;
-}
-
-/**
- * @brief Scoped explicit-layout section source for receive-gate regressions.
- *
- * Installs one resolver for the enclosing scope and removes it on
- * destruction; a second concurrent installation is a hard error because two
- * live overrides would disagree about the same sealed layout. The default
- * (production) resolution always remains the section tables.
- */
-class ExplicitPreparedSectionsForTest
-{
-public:
-    explicit ExplicitPreparedSectionsForTest(PreparedSectionsResolver resolver)
-    {
-        if (!resolver || detail::explicit_prepared_sections_for_test)
-            throw std::invalid_argument(
-                "One explicit prepared-section resolver may be active at a time");
-        detail::explicit_prepared_sections_for_test = resolver;
-    }
-    ExplicitPreparedSectionsForTest(const ExplicitPreparedSectionsForTest &) = delete;
-    ExplicitPreparedSectionsForTest &operator=(
-        const ExplicitPreparedSectionsForTest &) = delete;
-    ~ExplicitPreparedSectionsForTest() noexcept
-    {
-        detail::explicit_prepared_sections_for_test = nullptr;
-    }
-};
-
-/** @brief Resolve validation sections from the authority or the active test override. */
+/** @brief Production section resolution: the sole section-table authority. */
 inline cpu::native_quantised::PreparedUnitSections
-resolveArchivePreparedUnitSections(
+resolvePreparedSectionsFromAuthority(
     cpu::native_quantised::CPUNativeQuantisedLayout layout,
     cpu::native_quantised::CPUNativeQuantisedEncoding encoding,
     bool is_asymmetric,
     const NativeQuantisedFormatInfo &source)
 {
-    if (const auto override = detail::explicit_prepared_sections_for_test)
-        return override(layout, encoding, is_asymmetric, source);
     return cpu::native_quantised::preparedUnitSections(
         layout, encoding, is_asymmetric, source);
 }
+
 
 /**
  * @brief Require the admitted layout to be executable by this build's CPU.
@@ -261,7 +229,7 @@ resolveArchivePreparedUnitSections(
  * Planning refuses cross-layout CPU pairings before any wire exists; this
  * gate is the fail-closed backstop when planning is bypassed.
  *
- * @throws std::invalid_argument naming the sealed layout whenever it is not
+ * @throws std::invalid_argument naming the recorded layout whenever it is not
  *         this build's executable prepared layout.
  */
 inline void requireHostExecutablePreparedLayout(
@@ -273,12 +241,13 @@ inline void requireHostExecutablePreparedLayout(
             "prepared layout '" +
             std::string(cpu::native_quantised::preparedLayoutName(
                 cpu::native_quantised::kHostPreparedLayout)) +
-            "' only; the archive sealed '" +
+            "' only; the archive recorded '" +
             std::string(cpu::native_quantised::preparedLayoutName(
                 admitted_layout)) +
             "'. Cross-layout CPU endpoints are refused at planning time; "
             "this receive fails closed when planning is bypassed");
 }
+
 
 /**
  * @brief Re-derive both strides from the admitted layout before adoption.
@@ -295,14 +264,15 @@ inline void requireHostExecutablePreparedLayout(
  */
 inline void requirePreparedLayoutStrides(
     const PackedWeightsHeader &header,
-    cpu::native_quantised::CPUNativeQuantisedLayout layout)
+    cpu::native_quantised::CPUNativeQuantisedLayout layout,
+    PreparedSectionsResolver resolve_sections)
 {
     const auto *const source = native_quantised_formats::forSourceIdentity(
         header.codebook_id, header.is_superblock);
     if (!source)
         throw std::invalid_argument(
             "Packed-weight transfer received an uncataloged source identity");
-    const auto sections = resolveArchivePreparedUnitSections(
+    const auto sections = resolve_sections(
         layout,
         decodePreparedEncoding(header.prepared_encoding),
         header.is_asymmetric != 0,
@@ -319,30 +289,94 @@ inline void requirePreparedLayoutStrides(
     }
 }
 
+/** @brief Production stride re-derivation through the section-table authority. */
+inline void requirePreparedLayoutStrides(
+    const PackedWeightsHeader &header,
+    cpu::native_quantised::CPUNativeQuantisedLayout layout)
+{
+    requirePreparedLayoutStrides(
+        header, layout, resolvePreparedSectionsFromAuthority);
+}
+
+namespace detail
+{
+    /**
+     * @brief Complete receive-layout admission with an injected section resolver.
+     *
+     * One shared boundary for both execution-bound receive paths
+     * (archive deserialization and direct-transfer allocation): versioned
+     * layout decoding, stride re-derivation through the injected resolver,
+     * and the host-executability gate, all before any receive buffer or
+     * payload byte is adopted. Production entrypoints pass the section-table
+     * authority; receive-gate regressions inject explicit-layout resolvers
+     * so a table-valid foreign layout is rejected by the executability gate
+     * itself, never by an incidental stride mismatch.
+     *
+     * @throws std::invalid_argument for an unsupported version, an unknown
+     *         layout byte, uncataloged source identity, disagreeing strides,
+     *         or a layout this build cannot execute.
+     */
+    [[nodiscard]] inline cpu::native_quantised::CPUNativeQuantisedLayout
+    admitReceiveLayout(
+        const PackedWeightsHeader &header,
+        PreparedSectionsResolver resolve_sections)
+    {
+        const auto admitted_layout = admittedPreparedLayout(header);
+        requirePreparedLayoutStrides(header, admitted_layout, resolve_sections);
+        requireHostExecutablePreparedLayout(admitted_layout);
+        return admitted_layout;
+    }
+} // namespace detail
+
+
 /** @brief Validate IQ3_S/IQ4_XS source tuples before adopting CPU sections.
  * @param header Archive or direct-transfer scalar header.
+ * @param admitted_layout Layout whose admission already reproduced the
+ *        header's strides; owns the exact section strides compared here.
  * @return Whether encoding4 identifies exactly the IQ4_XS source tuple, and
- *         ordinary IQ4_XS does not claim the retired derived-half nibble encoding.
+ *         ordinary IQ4_XS does not claim the retired derived-half nibble
+ *         encoding. The source tuple, payload extent and native-block
+ *         semantics are header facts; the STRIDES belong to the admitted
+ *         layout's section tables, never to the encoding family alone, so
+ *         a non-canonical admitted layout validates its own tuple geometry.
  */
-inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header) noexcept
+inline bool validNativeSourceScaleTupleHeader(
+    const PackedWeightsHeader &header,
+    cpu::native_quantised::CPUNativeQuantisedLayout admitted_layout) noexcept
 {
     using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
+    const auto tuple_strides_match = [&](Encoding encoding, bool asymmetric)
+    {
+        const auto *const source = native_quantised_formats::forSourceIdentity(
+            header.codebook_id, header.is_superblock != 0);
+        if (!source)
+            return false;
+        const auto sections = cpu::native_quantised::preparedUnitSections(
+            admitted_layout, encoding, asymmetric, *source);
+        return sections.isValid() &&
+            header.data_stride == static_cast<int32_t>(sections.payload_stride) &&
+            header.interleaved_block_stride ==
+                static_cast<int32_t>(sections.block_stride);
+    };
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale))
         return header.codebook_id == 11 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 13 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(Encoding::IQ3SExpandedSourceScale)) &&
-               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_quantised::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false)) &&
-               header.has_native_blocks == 0;
+               header.has_native_blocks == 0 &&
+               tuple_strides_match(Encoding::IQ3SExpandedSourceScale, false);
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUTSourceScale))
         return header.codebook_id == 4 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 16 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(
-                   Encoding::NibbleLUTSourceScale)) &&
-               header.interleaved_block_stride == static_cast<int32_t>(
-                   cpu::native_quantised::preparedInterleavedBlockStride(Encoding::NibbleLUTSourceScale, false)) &&
-               header.has_native_blocks == 0;
+               header.has_native_blocks == 0 &&
+               tuple_strides_match(Encoding::NibbleLUTSourceScale, false);
     return !(header.codebook_id == 4 && header.is_superblock != 0 &&
              header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUT));
+}
+
+/** @brief Production source-tuple validation with the canonical layout admission. */
+inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header) noexcept
+{
+    return validNativeSourceScaleTupleHeader(
+        header, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical);
 }
 
 /**
@@ -448,7 +482,7 @@ inline bool describeTransfer(
     header.interleaved_block_stride = packed.interleaved_block_stride;
     header.native_block_size =
         static_cast<int32_t>(native_block_size);
-    // The sealed layout identity: receivers re-derive both strides from
+    // The versioned layout tag: receivers re-derive both strides from
     // this byte's section tables before adopting any payload section.
     header.prepared_layout = static_cast<uint8_t>(packed.layout);
     std::memset(header.reserved, 0, sizeof(header.reserved));
@@ -511,23 +545,37 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     const auto &header = descriptor.header;
     const auto &sections = descriptor.sections;
     if (header.magic != PACKED_WEIGHTS_MAGIC ||
-        !validNativeSourceScaleTupleHeader(header) ||
         header.format !=
             static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
     {
         throw std::invalid_argument(
             "Direct packed-weight transfer received invalid format metadata");
     }
-    // Versioned layout admission: v8 decodes the sealed byte, exactly v7 is
-    // explicitly canonical, anything earlier rejects globally. The decoded
-    // layout must reproduce the header's strides from its section tables
-    // before any receive buffer is adopted.
-    const auto admitted_layout = admittedPreparedLayout(header);
-    requirePreparedLayoutStrides(header, admitted_layout);
-    // Execution-bound receive: the allocated target adopts bytes this host's
-    // CPU executes, so a table-valid foreign layout is rejected before the
-    // first receive buffer exists.
-    requireHostExecutablePreparedLayout(admitted_layout);
+    // A direct descriptor pairs one sender and one receiver of the same
+    // build epoch: only the current version can legitimately appear, and
+    // version 7 remains an archive-compatibility statement for deserialize
+    // alone. Older, newer or archive versions reject before admission.
+    if (header.version != PACKED_WEIGHTS_VERSION)
+    {
+        throw std::invalid_argument(
+            "Direct packed-weight transfer requires the current archive version " +
+            std::to_string(PACKED_WEIGHTS_VERSION) + ", received " +
+            std::to_string(header.version));
+    }
+    // Versioned layout admission: v8 decodes the recorded byte. The decoded
+    // layout must reproduce the header's strides from its section tables and
+    // be executable by this build's CPU, all before any receive buffer is
+    // adopted. Production passes the section-table authority only.
+    const auto admitted_layout = detail::admitReceiveLayout(
+        header, resolvePreparedSectionsFromAuthority);
+    // Source-tuple semantics are header facts, but their strides belong to
+    // the admitted layout's section tables (never the encoding family
+    // alone), so the check follows admission.
+    if (!validNativeSourceScaleTupleHeader(header, admitted_layout))
+    {
+        throw std::invalid_argument(
+            "Direct packed-weight transfer received invalid format metadata");
+    }
     if (header.N <= 0 || header.K <= 0 || header.N_padded < header.N ||
         header.blocks_per_row <= 0 || header.data_stride <= 0 ||
         header.interleaved_block_stride <= 0)
@@ -739,14 +787,14 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
     try
     {
-        // Exactly v8 decodes the sealed layout byte; exactly v7 is admitted
+        // Exactly v8 decodes the recorded layout byte; exactly v7 is admitted
         // as an explicitly canonical archive; earlier versions reject
         // globally, never per-format.
-        admitted_layout = admittedPreparedLayout(header);
-        requirePreparedLayoutStrides(header, admitted_layout);
-        // Execution-bound receive: reject a table-valid foreign layout before
-        // the archive's storage is adopted, not at view admission later.
-        requireHostExecutablePreparedLayout(admitted_layout);
+        // Complete receive-layout admission through the section authority:
+        // a table-valid foreign layout is rejected before the archive's
+        // storage is adopted, not at view admission later.
+        admitted_layout = detail::admitReceiveLayout(
+            header, resolvePreparedSectionsFromAuthority);
     }
     catch (const std::invalid_argument &error)
     {
@@ -760,7 +808,10 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         return nullptr;
     }
 
-    if (!validNativeSourceScaleTupleHeader(header))
+    // Source-tuple semantics are header facts; their strides belong to the
+    // admitted layout's section tables (never the encoding family alone),
+    // so the check follows admission.
+    if (!validNativeSourceScaleTupleHeader(header, admitted_layout))
         return nullptr;
 
     // Read section table.

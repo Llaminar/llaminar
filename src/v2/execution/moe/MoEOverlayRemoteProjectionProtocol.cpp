@@ -208,22 +208,29 @@ namespace llaminar2
                 cpu::native_quantised::preparedEncodingForSource(*source);
             // Wire strides derive from the layout sealed in the
             // transaction identity (ABI 5) — the section authority, not the
-            // encoding family, owns the arithmetic, and an unimplemented
-            // layout yields zero strides that manifest validity rejects
-            // before any byte moves. GPU-blob transactions carry zero
-            // (canonical) and derive the same canonical CPU-side strides.
+            // encoding family, owns the arithmetic. GPU-blob transactions
+            // carry zero (canonical) and derive the same canonical CPU-side
+            // strides. The unit sections are derived ONCE here and an
+            // unimplemented layout is rejected BEFORE any stride is
+            // assigned: a zero-stride sentinel must never flow into
+            // seal-time division or a root-equality check that would accept
+            // a matching zero-stride root.
             const auto endpoint_layout = static_cast<
                 cpu::native_quantised::CPUNativeQuantisedLayout>(
                 identity.cpu_endpoint_layout);
-            manifest.cpu_data_stride =
-                cpu::native_quantised::preparedDataStride(
-                    endpoint_layout,
-                    manifest.cpu_encoding, manifest.cpu_is_asymmetric != 0, *source);
-            manifest.cpu_block_stride = static_cast<std::uint32_t>(
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    endpoint_layout,
-                    manifest.cpu_encoding,
-                    manifest.cpu_is_asymmetric != 0, *source));
+            const auto endpoint_sections =
+                cpu::native_quantised::preparedUnitSections(
+                    endpoint_layout, manifest.cpu_encoding,
+                    manifest.cpu_is_asymmetric != 0, *source);
+            if (!endpoint_sections.isValid())
+                throw std::invalid_argument(
+                    "Remote projection wire requires a CPU layout with "
+                    "implemented section tables '" +
+                    std::string(cpu::native_quantised::preparedLayoutName(
+                        endpoint_layout)) +
+                    "'");
+            manifest.cpu_data_stride = endpoint_sections.payload_stride;
+            manifest.cpu_block_stride = endpoint_sections.block_stride;
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
             return manifest;
         }
@@ -489,11 +496,23 @@ namespace llaminar2
                 cpu_is_superblock != source_is_superblock ||
                 cpu_encoding !=
                     cpu::native_quantised::preparedEncodingForSource(*source) ||
-                cpu_data_stride !=
-                    cpu::native_quantised::preparedDataStride(cpu_encoding) ||
-                cpu_block_stride !=
-                    cpu::native_quantised::preparedInterleavedBlockStride(
-                        cpu_encoding, cpu_is_asymmetric != 0))
+                [&]
+                {
+                    // Identity-bound sections: the sealed endpoint layout —
+                    // never the encoding family alone — owns the strides a
+                    // valid manifest may carry. A compact-labelled manifest
+                    // with canonical strides is a substitution, not a valid
+                    // transaction, and fails closed here.
+                    const auto sections =
+                        cpu::native_quantised::preparedUnitSections(
+                            static_cast<cpu::native_quantised::
+                                CPUNativeQuantisedLayout>(
+                                identity.cpu_endpoint_layout),
+                            cpu_encoding, cpu_is_asymmetric != 0, *source);
+                    return !sections.isValid() ||
+                        cpu_data_stride != sections.payload_stride ||
+                        cpu_block_stride != sections.block_stride;
+                }())
             {
                 return reject(
                     error,
@@ -626,6 +645,13 @@ namespace llaminar2
             uint32_t maximum_chunk_bytes)
         {
             manifest.packing = MoEOverlayRemoteProjectionPacking::CpuNativeQuantisedInterleaved;
+            // Defense in depth for the column arithmetic below: the unit
+            // stride is 64-aligned by construction for every implemented
+            // layout, and no admitted stride may ever be zero here.
+            if (manifest.cpu_block_stride < 64u ||
+                manifest.cpu_block_stride % 64u != 0u)
+                throw std::invalid_argument(
+                    "Native CPU wire geometry requires a positive 64-aligned unit stride");
             if (maximum_chunk_bytes < manifest.cpu_block_stride / 64)
                 throw std::invalid_argument("Native CPU capacity cannot contain one exact encoded column");
             manifest.cpu_wire_columns_per_unit = std::min<uint32_t>(64, maximum_chunk_bytes / (manifest.cpu_block_stride / 64));
@@ -838,6 +864,11 @@ namespace llaminar2
         ExpertTierWeightCPUStorageLayout format{
             .cpu_codebook_id = manifest.cpu_codebook_id, .cpu_is_asymmetric = manifest.cpu_is_asymmetric,
             .cpu_is_superblock = manifest.cpu_is_superblock, .cpu_encoding = manifest.cpu_encoding,
+            // The storage layout executes the layout the transaction
+            // identity sealed; its own section re-derivation follows it.
+            .cpu_layout = static_cast<cpu::native_quantised::
+                CPUNativeQuantisedLayout>(
+                manifest.identity.cpu_endpoint_layout),
             .cpu_data_stride = manifest.cpu_data_stride, .cpu_block_stride = manifest.cpu_block_stride,
             .wire_columns_per_unit = manifest.cpu_wire_columns_per_unit};
         return cpuExpertTierStorageLayoutForIntersection(format, owned,

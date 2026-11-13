@@ -670,14 +670,44 @@ TEST(CPUNativeQuantisedPreparedLayout,
         ASSERT_FALSE(sections.has_compensation);
         ASSERT_TRUE(sections.has_secondary);
         const auto *const base = packed.native_interleaved.data();
-        EXPECT_THROW(static_cast<void>(packed.chunkComp(0, 0)),
-            std::logic_error);
+        try
+        {
+            static_cast<void>(packed.chunkComp(0, 0));
+            FAIL() << "valid Q6_K must reject compensation by family";
+        }
+        catch (const std::logic_error &error)
+        {
+            // The family guard — distinct from the malformed-source guard.
+            EXPECT_NE(std::string(error.what()).find("Q6_K"),
+                      std::string::npos);
+        }
         EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
                       reinterpret_cast<const void *>(packed.chunkScales(0, 0))),
             base + sections.scales_offset);
         EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
                       reinterpret_cast<const void *>(packed.chunkMins(0, 0))),
             base + sections.mins_offset);
+    }
+
+    // Malformed source, tested separately from valid-Q6 absence: an
+    // uncataloged codebook has no section tables, and a compensation
+    // request must be rejected by the admitted-boundary guard — never
+    // resolved through a zero compensation offset to the payload base.
+    {
+        auto packed = buildOwner(Q4_0);
+        packed.codebook_id = 255;
+        ASSERT_FALSE(packed.preparedSections().isValid());
+        ASSERT_TRUE(packed.usesInlineCompensation());
+        try
+        {
+            static_cast<void>(packed.chunkComp(0, 0));
+            FAIL() << "malformed source must reject compensation before any offset";
+        }
+        catch (const std::logic_error &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("compensation section"),
+                      std::string::npos);
+        }
     }
 }
 

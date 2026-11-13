@@ -923,17 +923,26 @@ canonical arm is a lane defect and blocks landing.
   fabric layout identity; CUDA+ROCm conversion kernels layout-conditional
   comp write (CMS kernels already parameterized); cross-layout rejection
   regressions; estimator/BOM byte-equality per-ISA in preflight.
-- **Carried offsets — LANDED in A3 (seq 94):** the copier payload group
-  ordinal offsets, the CMS host demotion relative metadata arithmetic, the
-  Q6 reference 1536/1664 constants, and the `PackedWeights`
-  `chunkScales/chunkMins/chunkComp` arithmetic plus the owner `chunkMins`
-  absence guard are section-offset-driven (or guarded) now — see the A3
-  record above. `ResidencyFabric::requireCompatibleCpuWeights` includes
-  the prepared layout in its compatibility set. Still carried: the
-  absent-emins trimmed-unit control for the tier-copy regression, which
-  becomes representable when the compact stride tables exist as pure-data
-  entries (test-only via the explicit layout argument, after the A2 pin
-  ACK per Main's constraint).
+- **Carried offsets — CORRECTED A3 record (seq 138 reviewer finding):**
+  the CMS host demotion relative metadata arithmetic, the Q6 reference
+  1536/1664 constants (now the named `kQ6LowPlaneBytesPerColumn` quotient),
+  and the `PackedWeights` `chunkScales/chunkMins/chunkComp` arithmetic plus
+  the owner metadata absence guards are section-offset-driven (or guarded)
+  now. `ResidencyFabric::requireCompatibleCpuWeights` includes the prepared
+  layout in its compatibility set. **The earlier "copier payload group
+  ordinal offsets landed" claim overstated the state**:
+  `copyCPUEncodedColumn` still addresses payload groups by the DENSE L1
+  interleave arithmetic (`group × columns × 4 + column × 4`, with the Q6
+  high plane at the named low-plane quotient) — true for the current
+  canonical L1 geometry, where the payload plane is exactly the dense
+  4-byte group interleave, but it is NOT section-ordinal-driven, and a
+  layout family whose payload plane is arranged differently (compact
+  CMS's tight `ceil(payload_bytes/4)×256` groups among the candidates)
+  needs its own copy arithmetic. **Carried item:** the section-ordinal
+  copier refactor, to be landed with the compact tier-copy regression.
+  Still carried: the absent-emins trimmed-unit control for the tier-copy
+  regression, which becomes representable when the compact stride tables
+  exist as pure-data entries (test-only via the explicit layout argument).
 - **A4 + A3-B1 — planning/inventory/PMA + executable receive (seq 121/122
   dispatch, landed after the Q6 window fix 1f92dca1c).** Stage A's final
   implementation stage; both halves reported together per the dispatch.
@@ -1006,6 +1015,22 @@ canonical arm is a lane defect and blocks landing.
     `CpuResourcesPriceOnlyTheBoundOverlayLayout` (unbound CPU resource
     refuses; compact-bound plan fails closed at the section authority;
     canonical-bound input threads and prices build-default bytes).
+- **Carried A4 work (seq 138 determination): participant-observed endpoint
+  layout selection in the runtime fabric.** 569de492b does NOT cover it —
+  A4 landed the planning/inventory/binder/estimator/pool boundary, not the
+  fabric's movement construction. Concrete state:
+  `MoEOverlayPhysicalResidencyFabric.cpp:6137/:6153` (the GPU→CPU demotion
+  probe/stream pair) still passes a hard-coded
+  `InterleavedCanonical` destination layout, while the adjacent sites
+  (`:6297+`) correctly use `destination_packed->layout`; transaction
+  identities default `cpu_endpoint_layout` to zero (canonical) at their
+  construction sites. Stage-B-safe today because every build executes
+  canonical and the receiver's Exact manifest match rejects disagreement,
+  but the participant-observed selection (destination root layout or the
+  plan's `resolved_cpu_prepared_layout`, threaded through the transaction
+  identity) is required before any non-canonical layout exists, and the
+  hard-coded sites are the same bug class the A4-2 refusal guards at
+  planning time.
 - **Gate-A evidence (former Phase 3) — bench + focused preflight
   regressions.** The §7 bench in the
   performance namespace (non-regression reading); focused regressions
