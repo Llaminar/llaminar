@@ -4272,3 +4272,38 @@ final + CUDA=127 + focus-include verbatim diagnoses owed to Main.
 MERGE-WINDOW: land the progress fix with/before merge (else the
 fleet refresh re-fails on the merged tip); beb2389d7 + progress =
 fleet-wide install-nccl.sh re-run after merge.
+
+### OPERATOR DIRECTION (received ~16:40Z): FINAL MERGE PHASE — STABILIZATION ONLY
+
+OPERATOR VERBATIM (recorded per the literal-quote rule): "Ok direction
+change, base branch got merged, so we are no[w] in final merge phase,
+this means only stabilization — every test needs to go green on spark,
+m1 and wsl platform."
+
+MEANING: scope = stabilization only. No new ideas/perf work (idea16
+holds; MXFP4 activation still gated on PR #43 merge, and only
+stabilization now in any case). The merge candidate = PR #43 tip
+1011d0578 + the 4-failure fix-forward (Main) + the beb2389d7-
+extension progress_replay.py fix (PR lineage) + the Stage-A chain
+rebased onto it. PLATFORM-GREEN MATRIX (the acceptance bar):
+- WSL x86: base-control gate at d5e04fdce (running) + head gate at
+  aa842a1be (dispatched 15:17Z, round 2; CPU-only, Unit + preflight
+  + byte identity) + post-rebase focused rerun.
+- Spark .79: ARM+CUDA canonical gate — BLOCKED on NCCL progress_
+  replay.py fix (real PR finding; Main sequencing ruling A/B) +
+  Main's sa.sh pass; then full Integration+Unit+preflight+byte
+  identity at the gate tip.
+- Spark .80: canonical CPU-only at 1011d0578 = 3619/0/10 (6 inherited
+  + 4 new develop-interaction; fix-forward in flight by Main) ->
+  rerun at the fixed tip.
+- M1 Mac: lane's Mac gates at every tip (12/12, 297/297, 4/4, 5/5 +
+  probes at aa842a1be) -> re-run at the rebased tip.
+
+OPEN CALLS ROUTED TO MAIN: (1) sequencing — Stage-A gate at
+aa842a1be (old base) first per his plan vs rebase-now for one
+stabilization board (lean: keep his plan; name both tips); (2)
+classify the 6 inherited failures (4 ROCm trainer + CPURootedGather
+ParallelCopyReplay + ShmemSpinAbsorbingAbortReplay): env/hardware-
+absent => UNQUALIFIED per the A2 precedent, real => in stabilization
+scope. Merge-window checklist retains: NCCL fleet-wide install-nccl
+refresh (beb2389d7 + progress fix) post-merge.
