@@ -3705,3 +3705,19 @@ K14-A2CUDAB-D0B43D81B from the complete run; report the container
 re-census (step 1, still outstanding); runbook note — DONE markers
 must reflect per-phase exit codes. A3 boundary (848030067) queues
 after. .80 idle; sessions staged as designed; PR 43 OPEN.
+
+### PARALLEL WORK ROUTED (10:30Z): A4 dispatched; Main A3-review completion + pin pre-staging
+
+Operator question "forced to wait for sparks?" -> NO: only the two
+PINS sit behind sparks' full build + census. Parallel dispatches:
+(1) A4 (final Stage-A stage) to the lane on 848030067 — typed
+inventory publication, cross-ISA CPU<->CPU topology-time refusal
+(typed diagnostic before allocation/wire), PMA sole-ledger alignment;
+rebases if boundaries demand fix-forwards; Mac gates at checkpoint.
+(2) Main (idle) to complete the FULL A3 source review at 848030067
+(clean rebase of the first-pass-OK 365c29aeb) so the A3 pin fires on
+the seal alone. (3) Pre-stage the reviewer A2 pin package (verbatim
+bundle + census evidence + corrected diagnosis + witness provenance)
+for immediate successor request on green. With A4 in flight, every
+session productive; pins release with zero added latency once the
+boundaries land. Sparks: full-build corrective running (a2d).
