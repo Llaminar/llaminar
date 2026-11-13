@@ -4611,3 +4611,29 @@ compiles; watcher armed). Base d5e04fdce retry AFTER the head gate
 objects). Develop-control @118930745 queued last. Order note: WSL
 ran (4) before (2) — static evidence, harmless. Sparks audit
 probe still out (.79 gate-launch absence).
+
+### DRIVER TIMEOUT-VALIDATION FINDING — PR-introduced, classified (19:47Z)
+
+Sparks' new driver block: RuntimeError "production test preflight
+timeout must be in (0,120] seconds: V2_Integration_CUDAResidualAdd
+InvocationContract has 0.0". COORDINATOR VERIFICATION (source,
+complete): PR #43's own commit 889d59ccd "test(cuda): repair
+residual ABI and padding fixture admission" added BOTH preflight-
+listed CUDA registrations WITHOUT TIMEOUT: CUDAResidualAdd
+InvocationContract (CMakeLists.txt 42187-42191 @ gate tree) +
+CUDAAttentionPaddingInvocationContract (42197-42201); blocks =
+COMMAND/LABELS/MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA) no
+TIMEOUT; sibling convention = TIMEOUT 30+ (AutomaticPlanning
+Diagnostics_CompleteSelection). NOT develop-inherent (absent from
+develop history; 1011d0578 carries same at :42807-42814). Block-
+accurate sweep (paren-depth + preflight membership): exactly these
+TWO lack TIMEOUT; 8 other no-TIMEOUT registrations = NON-preflight
+(no driver impact). FIX = add explicit TIMEOUT (120 per (0,120]
++ sibling convention) to both. SEQUENCING CALL TO MAIN: (A) amend
+T' charter (+ TIMEOUT one-liner x2) — my lean (2 lines; the class
+is the chain's own; drives the early-surface evidence) vs (B) PR
+fix-forward + post-verdict rebase (early-surface = CFG/BUILD/
+FOCUS/CUDA only). Sparks: continue per script (RC_DRIVER recorded),
+NO seal, no self-fix; driver re-runs at Main's chosen tip.
+Audit flag CLOSED (sparks answered; .79 gate RUNNING, tree
+91e0437c6 clean; D2 mkdir note resolved).
