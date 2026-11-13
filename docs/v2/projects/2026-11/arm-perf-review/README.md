@@ -2762,3 +2762,48 @@ compact kernel is not the path (structural gather cost stays above the
 2.2x breakeven). arm-idea08 dispatched a design addendum (hot-set math,
 promotion cost, cold-miss policy, combined floor, prefill interaction,
 delta vs Phase-1-only) while holding at the gate.
+
+### OPERATOR WEIGHT-COMPACTION TASK (Main-relayed, 23:41Z): L1/L2/Q5_K plan — details settled, decision delegated + made
+
+Operator task (verbatim intent): discuss the compaction idea with the
+coordinator to settle details, then reviewer, then back to coordinator
+to decide the plan, then start. Validation hosts: WSL x86 + sparks ARM.
+FACTS from Main (source + census + GGUF): 35B gate/up experts = 78
+IQ2_S + 2 IQ3_S + 2 Q2_K; CMS unit 1536B anatomy (4 planes, IQ2_S uses
+planes 0..2, plane 3 padding; emins Q2_K-only; u16 coefficient; d
+repeated per K block). L1 stride-only: 1536->1024 (IQ1_M->768), CMS
+16.1->10.7GB (~-5.4GB). L2 IQ2_S-exact (loads-only changes: sign byte
+plane, u8 coefficient, superblock d): 656B/unit = source size, CMS
+->~6.9GB. 27B: Q5_K->ExpandedInt8 1.73x; native-Q5_K bitplane form
+(Q6 precedent) ~1.3-1.4KB. Coupled surfaces: strides->estimator/PMA/
+slot pool; ExpertTierWeightDeviceLayout + CUDA/ROCm tier repack
+(cpu_data_stride); PackedWeightsSerialization; AVX2/512 shared template
+(x86 gate); scalar reference + tests hard-coding 1536.
+COORDINATOR DETAIL-SETTLING (delivered 23:5xZ): Q1 = speed-neutral/
+capacity-win (bandwidth slack; Main corrected my active-set figure to
+~1.0B weights/token ~=0.75GB prepared — accepted, recorded); Q2 = L1
+first, L2 SEPARATE later gated phase (IN-PLAN per operator intent
+"save LIKE IT DID", not out-of-scope; design §2.2/§9.3 to be revised at
+plan consolidation); Q3 = +7 measurement additions (ratchet gate both
+ISAs, direct byte-economy evidence PMA/RSS/DRAM counter, full sweep +
+Q2_K has_emins mixed strides, mixed-stride cross-tier migration,
+prefill cell, Q2_K/Q3_K canonical cell + IQ1_M Unit-level, x86
+same-or-better framing stated); Q4 = base d836a276f disjoint (3 ROCm
+perf commits, verified); only arm-idea08 in-flight on these files.
+Q5 = no persistent prepared-byte stream known (transient wire/tier/
+slot-pool only; rider "shutdown persisted" = KV payload); wire version
+bump regardless + pre-flight source audit.
+RECONCILIATION ACCEPTED by Main: no parallel ABI — Phase 1 (= L1)
+builds on the spine d3e936fbd; design pre-review with the reviewer (6
+questions: read-set proof incl. residual correction/verifier/
+diagnostics/absolute offsets; GB10 CUDA<->ARM tier repack under
+compact-A64 both GPU backends; mixed-ISA cluster movement/
+reinterpretation; cross-ISA PMA pricing target layout;
+PackedWeightsSerialization archive v7 persistence; L2 admissibility).
+LANDING DECISION: operator verbatim "perf is responsible" (~23:59Z) —
+coordinator CONFIRMED post-merge fast-follow (implement+validate now
+on the spine branch, land after the develop merge; topology-run cost
+stated; revisit only if the merge stalls indefinitely). Sparks
+dispatched the Q1 bandwidth-observation artifact (.80, no-MTP + dyn-MTP
+achieved GB/s vs ~273 ceiling, K14-Q1BW seal). Next: reviewer findings
+-> fix plan -> lane starts as implementer.
