@@ -2878,3 +2878,29 @@ Conclusion unchanged and strengthened with Main's corrected 0.75GB/
 token active set: expert-read bandwidth ceiling ~363 tok/s vs 25.31
 achieved (>=14x slack); Q1 artifact (10-21GB/s whole-run, 4-8% of
 peak, ~34% stall/access) consistent.
+
+### PLAN CONSOLIDATION PROGRESS (00:19-00:24Z): IQ2_S premise verified, tiering descoped, mirror corrected
+
+MAIN'S IQ2_S READ VERIFIED IN SOURCE (d5e04fdce): dotHalfRowPairs
+Codebook 13 (CPUNativeQuantisedMultiScaleKernels.h:399-416/:470)
+decodes the native iq2s_grid in-kernel via Ops::gridPair — program A
+INCLUDES the grid decode; the 1536B unit = native payload + layout
+overhead, NOT decoded weights; L2 (656B) = same program, load-shape
+changes only. The addendum's §10.1 premise (canonical=expanded,
+source-scale=program B) was wrong — contradicted its own §1.5; lane
+informed with the correction. CONSEQUENCES (accepted into the plan):
+Phase 1 + L2 reaches ~source bytes ON THE HOT PATH with no tiering
+(15.96GB floor territory); T2 tiering only for expanded-baseline
+formats (35B's 2 IQ3_S tensors ~0.4GB; 27B Q5_K); h measurement off
+the critical path (cheap background evidence only). PLAN SKELETON
+AGREED: Phase 1 spine-fix + compact-A64 strides -> Phase 2 versioning
+(wire v8, layout-conditional CUDA/ROCm repack) -> Phase 3 L2 behind
+register-ratchet proof + own paired bench -> Q5_K-native separately;
+tiering-for-expanded-forms parked. MIRROR OPTION (pre-expand IQ2_S for
+speed) PARKED with corrected bound: coordinator's initial ~45% decode-
+share estimate was WRONG (single-core rates without 20-core scaling —
+Main corrected): honest bound ~1.5-3ms/token (~4-8% of 39.5ms, likely
+less: IQ2_S u64 grid 8 lanes/lookup cheaper than the measured IQ3_S
+grid), cost +10GB against the byte goal. Evidence gate: measured
+expert-FFN stage share at decode; dead if the share is small. NOT part
+of this plan. Awaiting the reviewer's six answers to fix the plan.
