@@ -3232,3 +3232,15 @@ layout + expert-tier stream, --no-tests=error, JUnit; seal K14-A1HB-
 9222E9C7A-<ts>; cross-check: the 3 env-run failures must pass). A2
 resumed on the new tip (second stash popped; manifest endpoint-layout
 parameter settled; v3 wire canonical-bytes until A3 v8).
+
+### A1 REVIEWER BOUNDED SOURCE ACK (03:27Z): 9222e9c7a — A1-1/2/3 closed; handback = ACK + green binding seal
+
+Bounded SOURCE ACK at exact 9222e9c7a: control coordinates verified;
+21-format x both-directions x both-labels sweep noted as DEVICE-FREE
+coverage (not GPU execution qualification). CARRIED (not closed):
+compact absent-section producer/copier/accessor controls BEFORE Gate
+A; remaining section-offset/owner contracts (A3 list); A2, A3
+(transport/raw-copy identity/v8), A4, Gate A/activation, L2. ACK does
+NOT transfer to A2. HANDBACK FORMULA: this ACK + sparks' green binding
+Linux seal K14-A1HB-9222E9C7A = A1 handed back. Lane continues A2
+(pin to Main when ready).
